@@ -31,7 +31,7 @@ Single living reference for `native/`, replacing v1's scattered P2-CORE-*/P2-EXE
 
 **Nothing here is live-ready, and this document does not change that.** Specifically:
 
-- No real `SubmitPort` implementation exists. See `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` for the design-only spec — implementation requires Level 3 delegation-policy spec approval before any code is written.
+- No real `SubmitPort` implementation exists. See `docs/BINANCE_PRIVATE_REST_L4_SPEC.md` (signed read-only foundation: environment binding, signing discipline, reconciliation, symbol registry, rate-limit accounting) and `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (the L5 POST adapter, depends on the L4 spec) — both design-only, both revised after a real Architect-role review rejected the original single-file draft for missing reconciliation, unreachable testnet, an incomplete ABI, and non-durable audit. Implementation requires both specs accepted first, then a code-level Architect/Senior-Reviewer pass — see `CLAUDE.md`'s boundary section.
 - No real Binance testnet or production credentials have ever been used against this code.
 - The operator manual-takeover procedure (`docs/NATIVE_EXIT_SAFETY_RUNBOOK.md`) exists as a document; it has not been drilled by a human against a real Binance account.
 - The ADR-018 operational D3-LIVE checklist and the code-layer CODE-PREFLIGHT checklist have never both been executed for real and recorded — only exercised via unit tests / synthetic fixtures.
