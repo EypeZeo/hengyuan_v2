@@ -45,7 +45,7 @@ jobs:
       # _deps) also gives incremental rebuilds of unchanged project files
       # across runs, not just dependency reuse.
       - name: Cache CMake build tree (FetchContent deps + incremental objects)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: native/build
           key: native-build-${{ runner.os }}-gcc14-${{ hashFiles('native/CMakeLists.txt') }}

@@ -34,7 +34,7 @@ jobs:
 
       - name: Cache CMake build tree
         if: ${{ !github.event.repository.private }}
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: native/build
           key: native-build-${{ runner.os }}-gcc14-${{ hashFiles('native/CMakeLists.txt') }}
