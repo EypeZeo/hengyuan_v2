@@ -15,6 +15,15 @@ Ported from `hengyuan/research/backtests/`, `hengyuan/research/risk/`, `hengyuan
 - `app/infrastructure/exchanges/` — live exchange adapters.
 - `research/paper_trading/` — the Python-side paper-trading engine. Left in v1 because it's an execution-adjacent simulation of order lifecycle/reconciliation that overlaps conceptually with the native C++ orchestrator's job; porting it here would blur which repo owns "order lifecycle," not simplify anything.
 
+## Setup (independent of v1)
+
+```powershell
+cd py_core
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -e . --no-deps
+```
+
 ## Verification
 
-`pytest py_core/tests/ -v` — 104/104 passing (copied from v1's existing test suite for these exact modules, imports rewritten, zero test-logic changes). Run against v1's `.venv` (`pydantic 2.13.2`, `pandas 2.3.3`, `numpy 2.4.4`) since v2 doesn't have its own venv yet.
+`.venv\Scripts\python -m pytest tests/ -v` — 104/104 passing (copied from v1's existing test suite for these exact modules, imports rewritten, zero test-logic changes). Runs entirely from this repo's own venv — no dependency on `hengyuan/.venv`.

@@ -7,7 +7,8 @@ Split out of the original HengYuan monorepo (`D:\My_Projects\hengyuan`) on 2026-
 - `native/` — the full C++20/23 low-latency execution kernel (market data parsing, order book, risk gates, kill switch, audit trail, order lifecycle, and the D12-9 live-submit orchestrator). See `docs/NATIVE_ARCHITECTURE.md` for the module map and current gate-level status.
 - `py_core/` — reusable Python research/backtest utilities (vectorized backtest engine, risk-sizing simulator, OHLCV data model). See `py_core/README.md` for exactly what was ported and why the boundary is where it is (no live execution, no risk gate, no exchange adapter code came along).
 - `docs/adr/` — ADR-016/018/019, carried over verbatim as engineering reference.
-- `docs/NATIVE_ARCHITECTURE.md`, `docs/NATIVE_EXIT_SAFETY_RUNBOOK.md`, `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` — consolidated native reference, operator manual-takeover runbook, and the design-only spec for a real order-submission client (not implemented — needs Level 3 spec approval first).
+- `docs/NATIVE_ARCHITECTURE.md`, `docs/NATIVE_EXIT_SAFETY_RUNBOOK.md` — consolidated native reference and the operator manual-takeover runbook.
+- `docs/BINANCE_PRIVATE_REST_L4_SPEC.md` + `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` — design-only specs for real Binance private REST (signed read-only foundation) and real order submission (L5 POST, depends on the L4 spec). Revision 2 after an Architect-role review rejected the original draft — see that file's changelog. Not implemented; not authorized.
 - `.github/workflows/` — CI Native (build+test), CodeQL, main-merge-guard, Dependabot (github-actions ecosystem only), all ported from v1 and re-tuned for the 2000 min/month private-repo Actions budget (narrower Boost install, build-tree caching, timeouts).
 
 ## Build (native)
@@ -22,9 +23,14 @@ cd native/build-msvc && ctest -C Release --output-on-failure
 ## Test (py_core)
 
 ```powershell
-# using v1's venv until v2 has its own
-D:\My_Projects\hengyuan\.venv\Scripts\python.exe -m pytest py_core/tests/ -v
+cd py_core
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\pip install -e . --no-deps
+.venv\Scripts\python -m pytest tests/ -v
 ```
+
+See `py_core/README.md` for details. Fully independent of `hengyuan/.venv` — v1 is no longer a runtime dependency of v2.
 
 ## Live-trading status
 
