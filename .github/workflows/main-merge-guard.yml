@@ -133,6 +133,7 @@ jobs:
             let detailSummary = "status-check-rollup-unavailable";
 
             for (let attempt = 1; attempt <= 15; attempt += 1) {
+              let rollupIsNull = false;
               try {
                 const result = await github.graphql(query, {
                   owner,
@@ -141,8 +142,22 @@ jobs:
                 });
 
                 const rollup = result.repository.pullRequest.statusCheckRollup;
-                finalState = rollup?.state ?? "PENDING";
-                detailSummary = `rollup-state:${finalState}`;
+                // `statusCheckRollup` itself is null when the commit has zero
+                // associated check runs/statuses — this is the expected,
+                // intentional state for a PR whose changed paths didn't match
+                // any workflow's `paths:` filter (e.g. docs/Python-only PRs
+                // that don't touch native/**). That is NOT "still running" —
+                // there is nothing to wait for, ever. Only distinguish this
+                // from a genuinely pending rollup (rollup exists, state is
+                // PENDING/EXPECTED) which DOES warrant retrying.
+                if (rollup === null || rollup === undefined) {
+                  rollupIsNull = true;
+                  finalState = "NO_CHECKS";
+                  detailSummary = "status-check-rollup-null (no workflow matched changed paths)";
+                } else {
+                  finalState = rollup.state ?? "PENDING";
+                  detailSummary = `rollup-state:${finalState}`;
+                }
               } catch (error) {
                 finalState = "PENDING";
                 detailSummary = `status-query-error: ${error.message}`;
@@ -151,9 +166,9 @@ jobs:
               core.info(`Attempt ${attempt}: PR #${mergedPr.number} rollup=${finalState}`);
               core.info(detailSummary);
 
-              if (finalState === "SUCCESS") {
+              if (finalState === "SUCCESS" || rollupIsNull) {
                 core.setOutput("mode", "ok");
-                core.setOutput("reason", "pr_checks_success");
+                core.setOutput("reason", rollupIsNull ? "pr_no_checks_required" : "pr_checks_success");
                 core.setOutput("state", finalState);
                 core.setOutput("details", detailSummary);
                 return;
