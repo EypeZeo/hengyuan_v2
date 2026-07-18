@@ -37,6 +37,11 @@ if(_simdjson_inc)
 endif()
 hengyuan_set_warnings(hengyuan_dataplane)
 
+# --- D12-9 dry-run evidence harness (header-only, no Boost/OpenSSL needed) ---
+add_executable(live_submit_evidence_harness src/live_submit_evidence_harness.cpp)
+target_link_libraries(live_submit_evidence_harness PRIVATE hengyuan_core)
+hengyuan_set_warnings(live_submit_evidence_harness)
+
 # --- Binance feed demo (optional, requires Boost + OpenSSL) ---
 option(HY_BUILD_DEMO "Build binance_feed_demo (requires Boost + OpenSSL)" OFF)
 

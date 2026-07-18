@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: proprietary
-// preflight_gate.hpp — D3-LIVE manual confirmation gate.
+// preflight_gate.hpp — CODE-PREFLIGHT manual confirmation gate.
 //
-// Before ANY live execution can activate, the operator must pass a
+// Naming note: this is a *code-layer* 7-item checklist (kill switch / risk
+// gate / depth / heartbeat / signer / confirm / regression). It is a
+// DIFFERENT checklist from ADR-018's "D3-LIVE" section, which is an
+// *operational* 7-item checklist (no-withdrawal key + IP allowlist,
+// account-truth reconciliation, fail-closed on stale data, hard risk caps,
+// manual out-of-band drills, geo/service re-verification, SSH+firewall
+// hardening). Both gate "entering L5 live," but neither substitutes for
+// the other — passing this one does NOT mean ADR-018's D3-LIVE items are
+// satisfied, and vice versa. Historically both were called "D3-LIVE 7
+// items," which was a naming collision; this file now calls its own
+// checklist "CODE-PREFLIGHT" to keep the two distinct in logs and code.
+//
+// Before ANY live execution can activate, the operator must pass this
 // preflight checklist that verifies system state and requires explicit
 // typed confirmation. Fail-closed: without confirmation, the system
 // stays in simulation-only mode.
 //
-// D3-LIVE 7 prerequisites (all must be ✅):
+// CODE-PREFLIGHT 7 prerequisites (all must be ✅):
 //   1. Kill switch state machine
 //   2. Pre-trade risk gate
 //   3. Depth snapshot bootstrap
@@ -16,8 +28,12 @@
 //   7. Regression test certification
 //
 // Governance: L5 gate infrastructure. Does NOT enable live by itself —
-// it is one of 7 prerequisites that must ALL pass.
-// SIMULATION ONLY until D3-LIVE is fully satisfied.
+// it is one of 7 prerequisites that must ALL pass. It is also NOT a
+// substitute for ADR-018's separate D3-LIVE operational checklist — both
+// must independently pass before live submission (see ADR-019 D1's "双
+// 清单制度": ADR-018 D3-LIVE 7/7 + this file's CODE-PREFLIGHT 7/7, each
+// verified independently, neither self-reported).
+// SIMULATION ONLY until both checklists are fully satisfied.
 
 #pragma once
 
@@ -59,7 +75,7 @@ struct PreflightStatus {
 
 inline void print_preflight(const PreflightStatus& s) noexcept {
     auto mark = [](bool v) { return v ? "PASS" : "FAIL"; };
-    std::printf("=== D3-LIVE Preflight Checklist ===\n");
+    std::printf("=== CODE-PREFLIGHT Checklist (distinct from ADR-018 D3-LIVE) ===\n");
     std::printf("  [%s] 1. Kill switch state machine\n", mark(s.kill_switch_normal));
     std::printf("  [%s] 2. Pre-trade risk gate configured\n", mark(s.risk_gate_configured));
     std::printf("  [%s] 3. Depth snapshot synced\n", mark(s.depth_synced));
