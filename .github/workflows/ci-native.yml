@@ -1,0 +1,65 @@
+name: CI Native
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+    paths: ['native/**', '.github/workflows/ci-native.yml']
+  pull_request:
+    branches: [master]
+    paths: ['native/**', '.github/workflows/ci-native.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  native-build-test:
+    runs-on: ubuntu-24.04
+    # Safety cap: a hung job shouldn't silently burn the private-repo 2000
+    # min/month Actions budget. A clean run is a few minutes; 20 is generous
+    # headroom, not a target.
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Minutes optimization #1: libboost-all-dev pulls in every Boost
+      # component (thread, filesystem, regex, python bindings, ...) when this
+      # codebase only needs Boost.System (compiled) plus Boost.Asio/Beast
+      # (header-only, covered by libboost-dev). Installing only what's used
+      # cuts apt install time noticeably on every single run.
+      - name: Install build tools (targeted Boost components only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake libboost-dev libboost-system-dev libssl-dev
+
+      # Minutes optimization #2: without this, every run does a fresh
+      # FetchContent clone + full from-source build of GoogleTest (v1.15.2)
+      # and simdjson (v3.12.3) before a single line of this repo's own code
+      # compiles. Caching native/build (the whole CMake build tree, not just
+      # _deps) also gives incremental rebuilds of unchanged project files
+      # across runs, not just dependency reuse.
+      - name: Cache CMake build tree (FetchContent deps + incremental objects)
+        uses: actions/cache@v4
+        with:
+          path: native/build
+          key: native-build-${{ runner.os }}-gcc14-${{ hashFiles('native/CMakeLists.txt') }}
+          restore-keys: |
+            native-build-${{ runner.os }}-gcc14-
+
+      - name: Configure (C++20, Release, with demo)
+        working-directory: native
+        run: cmake -B build -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=Release -DHY_BUILD_DEMO=ON
+
+      - name: Build
+        working-directory: native
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        working-directory: native/build
+        run: ctest --output-on-failure
