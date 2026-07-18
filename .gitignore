@@ -1,0 +1,21 @@
+# Build artifacts
+native/build/
+native/build-msvc/
+**/CMakeFiles/
+**/CMakeCache.txt
+*.vcxproj*
+*.sln
+.vs/
+
+# Secrets — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
