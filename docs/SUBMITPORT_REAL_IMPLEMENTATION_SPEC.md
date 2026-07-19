@@ -2,7 +2,7 @@
 
 ## Status
 
-**Draft, revision 3.** No code from this spec has been written. This is **L5** (per `docs/NATIVE_ARCHITECTURE.md`'s gate table — signed order-*submission*, the highest gate in this repo), and it **depends entirely on `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`** being accepted first: environment binding, signing discipline, server-time sync, reconciliation, symbol registry, and rate-limit accounting all live there now, not here.
+**Draft, revision 4.** No code from this spec has been written. This is **L5** (per `docs/NATIVE_ARCHITECTURE.md`'s gate table — signed order-*submission*, the highest gate in this repo), and it **depends entirely on `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`** being accepted first: environment binding, signing discipline, server-time sync, reconciliation, symbol registry, and rate-limit accounting all live there now, not here.
 
 ### Revision 2 changelog (Architect review round 1, rejected)
 
@@ -28,6 +28,16 @@ Round 2 found that round 2's fixes were correct in *direction* but stopped at pr
 - **P1**: `FULL` response validation used `fills[]` presence as the branching signal; fixed to use `status` with full schema/field validation in §4.2.
 - **P1**: `EnvironmentBinding` was a public aggregate, not actually exclusive by construction. Fixed in L4 §1 — private constructor, factory-only.
 - **P1**: `RequestWeightTracker` had no correction-from-header API, no order-count bucket, no freeze API. Fixed in L4 §7.
+
+### Revision 4 changelog (Architect review round 3, rejected — revision required)
+
+Round 3 found two genuine safety bugs (not just missing detail) plus two more incomplete-wiring findings. Verified against actual code before fixing, not just against the review's description:
+
+- **P0 (self-contradiction)**: `RateLimited` was specified as "never reached the matching engine, no `Submitting` transition, release in-flight" — but a direct read of the orchestrator's gate ordering shows `InFlightRegistry` registration and the `Submitting` transition **already happen before `SubmitPort::call()` is invoked** (Gate 12b/12c, then the transition, then the actual call). By the time any HTTP response — including 429/418 — comes back, the order is already `Submitting` and already in-flight; "never reached the engine" cannot be asserted about a response that only exists because a request was sent. Binance's own docs don't promise 429/418 means pre-matching-engine rejection either. Fixed (§4.3/§4.4): a post-send `RateLimited` response now routes through `Ambiguous` like any other network-level uncertainty, reconciled via L4 §6 — the only thing distinct about it is reading `Retry-After` to freeze future sends. The genuinely safe "never touched the network" case was already fully handled by the *existing*, unmodified pre-flight `RateLimitExhausted` gate (Gate 8, `can_send()`) — that path needed no new outcome value at all; conflating it with a post-send outcome was the error.
+- **P0 (safety bug carried from L4)**: see `BINANCE_PRIVATE_REST_L4_SPEC.md`'s revision 3 changelog — `Found` no longer forces `Reconciled` (terminal); this spec's §4.3 routing table is updated to match.
+- **P0**: `rules_version` reached `BinancePrivateRestClient::submit_order()` but never reached `SubmitPort::SubmitFn`/`call()` — the actual injection-point ABI the orchestrator calls — so the value pre-trade validated against could never actually arrive at an implementation sitting behind `SubmitPort`. Fixed in §2 below: `SubmitFn`'s signature gains the parameter, matching `submit_order()`.
+- **P1**: "recognized Binance error code (e.g. `-1013`, `-2010`)" wasn't an exhaustive definition — anything not on an explicit list could be silently miscategorized. Fixed in §4.4: a bounded allowlist of codes confirmed pre-matching-engine, everything else defaults to `Ambiguous`.
+- **P1**: `ctx.durable_audit` was used in §6.2's pseudocode without being declared as a required field anywhere, and no null-pointer behavior was defined. Fixed in §6.2: added to the proposed `OrchestratorContext` extension, with explicit fail-closed behavior on null (matching the existing pattern for `ctx.audit`).
 
 ## Goal
 
@@ -85,7 +95,9 @@ public:
     std::uint32_t current_rules_version() const noexcept;
 
     // Blocking. Called only from the L5 runtime thread that owns SubmitPort,
-    // never from the hot path.
+    // never from the hot path. Signature matches SubmitPort::SubmitFn (§2.1
+    // below) parameter-for-parameter — this is what the function pointer
+    // ultimately calls into, so the two signatures must never drift apart.
     SubmitResponse submit_order(
         std::string_view client_order_id,
         std::uint32_t symbol_id, OrderSide side, OrderType type,
@@ -108,6 +120,41 @@ private:
     // properties of THIS class, not inherited from binance_rest_snapshot.hpp.
 };
 ```
+
+### 2.1 `SubmitPort` ABI change — fixes round-3 P0 (`rules_version` stopped one layer short of where it needed to go)
+
+Round 3's fixes threaded `expected_rules_version` into `submit_order()` (§2 above), but that function is only ever *called from* `SubmitPort` — the actual injection-point ABI in `live_submit_orchestrator.hpp` — and that ABI was never updated to carry the parameter. A real implementation sitting behind `SubmitPort::fn` would receive no way to know which registry version pre-trade validation used, making §2's whole fail-closed check unreachable in practice.
+
+```cpp
+// live_submit_orchestrator.hpp — SubmitPort::SubmitFn and call() both gain
+// the parameter, matching submit_order()'s signature exactly:
+struct SubmitPort {
+    using SubmitFn = SubmitResponse(*)(
+        const char* client_order_id,
+        std::uint32_t symbol_id,
+        OrderSide side,
+        OrderType type,
+        std::int64_t price_ticks,
+        std::int64_t qty_ticks,
+        std::uint32_t expected_rules_version,  // NEW — threads L4 §5.3's version through
+        void* user_data);
+
+    SubmitFn fn{nullptr};
+    void* user_data{nullptr};
+
+    SubmitResponse call(const char* coid, std::uint32_t sym,
+                        OrderSide side, OrderType type,
+                        std::int64_t price, std::int64_t qty,
+                        std::uint32_t expected_rules_version) const noexcept {  // NEW param
+        if (!fn) return {SubmitOutcome::NetworkError, 0, -1};
+        return fn(coid, sym, side, type, price, qty, expected_rules_version, user_data);
+    }
+
+    bool is_valid() const noexcept { return fn != nullptr; }
+};
+```
+
+The orchestrator's actual call site (currently `ctx.submit_port.call(coid.id, ctx.symbol_id, ctx.side, ctx.order_type, ctx.price_ticks, ctx.qty_ticks)`) passes `ctx.pre_trade_rules_version` (L4 §5.3's `OrchestratorContext` field) as the new argument — this is the concrete, unbroken chain: `validate_pre_trade()` → `OrchestratorContext::pre_trade_rules_version` → `SubmitPort::call()` → `SubmitFn` → `BinancePrivateRestClient::submit_order()`, with no layer silently dropping the value.
 
 ## 3. Gates checked before every send
 
@@ -140,9 +187,21 @@ enum class SubmitOutcome : std::uint8_t {
     Rejected = 1,          // unchanged
     Timeout = 2,           // unchanged
     NetworkError = 3,      // unchanged
-    RateLimited = 4,       // NEW — 429/418, request never reached order processing
-    StaleRulesVersion = 5, // NEW — L4 §5.3's local pre-flight fail-closed check;
-                            // never sent over the wire, caught before formatting
+    RateLimited = 4,       // NEW — 429/418 received AFTER the request was sent.
+                            // Fixes round-3 P0: this is NOT "never reached order
+                            // processing" — by the time any HTTP response exists,
+                            // Submitting/in-flight registration has already
+                            // happened (Gate 12b/12c precede the actual send).
+                            // Routes through Ambiguous like Timeout/NetworkError
+                            // (§4.3) — Binance does not document 429/418 as a
+                            // pre-matching-engine guarantee, so this cannot be
+                            // treated as safely "never submitted."
+    StaleRulesVersion = 5, // NEW — L4 §5.3's local pre-flight fail-closed check.
+                            // Unlike RateLimited, this genuinely never sends
+                            // anything: it's caught before request formatting,
+                            // before Submitting/in-flight registration — the
+                            // one case in this enum where "never touched the
+                            // network" is actually true.
 };
 
 // SubmitResponse gains fill-detail fields, populated only when outcome
@@ -169,11 +228,14 @@ enum class OrchestratorGate : std::uint8_t {
     // ... existing 18 values unchanged ...
     SubmitPartialFill = 18,     // NEW — success terminal, not a failure gate
     SubmitFilled = 19,          // NEW — success terminal, not a failure gate
-    SubmitRateLimited = 20,     // NEW — freezes RequestWeightTracker (L4 §7),
-                                 // clientOrderId released from InFlightRegistry
-                                 // (order never reached the exchange)
-    SubmitStaleRulesVersion = 21, // NEW — local fail-closed, never sent;
-                                   // clientOrderId released (never submitted)
+    SubmitRateLimited = 20,     // NEW — routes to Ambiguous (§4.3); freezes
+                                 // RequestWeightTracker + OrderCountTrackerSet
+                                 // (L4 §7); clientOrderId STAYS in InFlightRegistry
+                                 // (fixes round-3 P0 — see SubmitOutcome::RateLimited's
+                                 // comment above for why release-on-RateLimited was wrong)
+    SubmitStaleRulesVersion = 21, // NEW — local fail-closed, genuinely never sent;
+                                   // clientOrderId released (never submitted) —
+                                   // this one IS safe to release, unlike RateLimited
     AuditWriteNotAcked = 22,    // NEW — see §6.2
 };
 ```
@@ -195,10 +257,12 @@ enum class OrchestratorGate : std::uint8_t {
 | `Accepted`, `exchange_status == FILLED` | `SubmitFilled` (**new**) | `Submitting → Accepted → Filled` (or the direct `Submitting → Filled` transition `order_lifecycle.hpp` already permits for immediate fills) | released (terminal) |
 | `Rejected` | `SubmitRejected` | `Submitting → Rejected` (unchanged) | released (terminal) |
 | `Timeout` / `NetworkError` | `SubmitAmbiguous` / `SubmitNetworkError` | `Submitting → Ambiguous` (unchanged) | stays registered (unresolved) |
-| `RateLimited` (**new**) | `SubmitRateLimited` (**new**) | **No transition from `Submitting`** — this outcome means the request never reached the matching engine, so the order was never in flight; `OrderRecord` stays at `Intent`/pre-submit and the attempt is simply not-yet-made | released — this `clientOrderId` is available for a later, consciously-decided resubmission, since nothing was ever sent to Binance under it |
-| `StaleRulesVersion` (**new**, local-only) | `SubmitStaleRulesVersion` (**new**) | No transition — caught before any network call | released |
+| `RateLimited` (**new**, fixed round-3) | `SubmitRateLimited` (**new**) | `Submitting → Ambiguous` — **identical treatment to Timeout/NetworkError.** By the time this response exists, `Submitting`/in-flight registration already happened; nothing distinguishes a 429/418 from any other post-send uncertainty except that its cause is known (rate limiting) | **stays registered** — reconciled via L4 §6 exactly like any other `Ambiguous` order; additionally freezes `RequestWeightTracker`/`OrderCountTrackerSet` per `Retry-After` so the *next* attempt (whether this order's reconciliation query or a future order's submit) waits appropriately |
+| `StaleRulesVersion` (**new**, local-only, genuinely pre-send) | `SubmitStaleRulesVersion` (**new**) | No transition — caught at Gate 4 (§3), before `Submitting`, before in-flight registration | released — this is the one outcome in this table where "never touched the network" is actually true |
 
-**Principle**: default to `Ambiguous` unless a response is unambiguously, schema-validated interpretable as accepted, cleanly rejected, or never-reached-the-engine (`RateLimited`).
+Reconciliation `Found` results (L4 §6.5) route into this same table via their mapped confirmed state — `Accepted`/`PartialFill`/`Filled`/`Rejected`/`Cancelled`/`Expired` — never through a separate "Reconciled" terminal that would hide a still-open order.
+
+**Principle**: default to `Ambiguous` unless a response is unambiguously, schema-validated interpretable as accepted or cleanly rejected *before* the matching engine — and "before the matching engine" is provable only for responses that occur before any network call is made (`StaleRulesVersion`) or for HTTP-level conditions L4/this spec have positively confirmed occur pre-matching-engine (§4.4's allowlist). Everything else, including `RateLimited`, defaults to `Ambiguous`.
 
 ### 4.4 HTTP-level condition → outcome mapping
 
@@ -206,20 +270,42 @@ enum class OrchestratorGate : std::uint8_t {
 |---|---|---|
 | HTTP 200, passes §4.2's full schema + field-match validation | `Accepted` | Branch then selected by `status` per §4.2/§4.3 — never by `fills[]` presence. |
 | HTTP 200, but body fails to parse, schema mismatch, or any of §4.2's cross-checked fields (`symbol`/`clientOrderId`/`side`/`price`) doesn't match the sent request | `NetworkError` → `Ambiguous` | A 200 status code alone is never sufficient — the payload must positively identify *this exact* order. |
-| HTTP 400 with a recognized Binance error code (e.g. `-1013`, `-2010`) | `Rejected` | Order never reached matching-engine acceptance. |
+| HTTP 400 with a code from §4.4.1's allowlist below | `Rejected` | Order never reached matching-engine acceptance — but only for the specific, enumerated codes; anything else defaults to the next row. |
+| HTTP 400 with any code NOT on §4.4.1's allowlist (fixes round-3 P1 — "e.g." was not exhaustive) | `NetworkError` → `Ambiguous` | Fail closed on unfamiliar codes rather than guessing they're safe to treat as a clean rejection. |
 | HTTP 400 with `-1021` | *(handled at L4 §2.2, not here)* | Forces a clock resync; not a terminal outcome for this order — the request is retried only after resync, still respecting no-blind-retry (a pre-send correction, not a post-send retry of an ambiguous state). |
 | HTTP 403 | `Rejected` | Blocked before reaching the matching engine (WAF/geo); nothing was submitted. |
-| HTTP 429 | `RateLimited` | Read `Retry-After`, call `RequestWeightTracker::freeze_until()` (L4 §7) — freezes **all** sends, not just retries of this order. |
-| HTTP 418 (IP auto-ban) | `RateLimited` | Same handling as 429, typically longer `Retry-After`. |
+| HTTP 429 (fixed round-3 — was incorrectly `RateLimited`-as-never-submitted) | `RateLimited` → routes to `Ambiguous` (§4.3) | Read `Retry-After`, call `RequestWeightTracker::freeze_until()` + `OrderCountTrackerSet::freeze_all_until()` (L4 §7.2) — freezes **all** sends. Does **not** release in-flight; reconciled via L4 §6 like any other `Ambiguous` order. |
+| HTTP 418 (IP auto-ban) | `RateLimited` → `Ambiguous` | Same handling as 429, typically longer `Retry-After`. |
 | HTTP 5xx (500/502/503/504), including error code `-1007` (matching-engine timeout) | `NetworkError` → `Ambiguous` | The request may or may not have reached the matching engine — must reconcile via L4 §6. |
 | Connect timeout / read timeout | `Timeout` → `Ambiguous` | |
 | DNS failure / connection reset / TLS handshake failure | `NetworkError` → `Ambiguous` | |
 | Truncated/incomplete response body (connection dropped mid-read) | `NetworkError` → `Ambiguous` | Never assume success on partial data. |
-| Local `rules_version` mismatch (before any request is sent) | `StaleRulesVersion` | Never reaches the network — see §2/L4 §5.3. |
+| Local `rules_version` mismatch (before any request is sent) | `StaleRulesVersion` | Never reaches the network — see §2.1/L4 §5.3. This is the one condition in this table that genuinely precedes `Submitting`/in-flight registration. |
+
+### 4.4.1 HTTP 400 error-code allowlist (fixes round-3 P1: "e.g." was not exhaustive)
+
+Only codes on this list may be classified `Rejected`. This list must be validated and, if necessary, extended by whoever implements this against Binance's current published error-code documentation at implementation time — Binance's list can change, and treating an unrecognized code as `Rejected` by default (rather than `Ambiguous`) is exactly the kind of silent-optimism this whole spec exists to prevent.
+
+| Code | Meaning | Why it's safe to treat as `Rejected` |
+|---|---|---|
+| `-1013` | Filter failure (`LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL`, etc.) | Input-validation layer, before matching-engine routing. |
+| `-1100` | Illegal characters in a parameter | Input-validation layer. |
+| `-1101`/`-1104`/`-1105`/`-1106` | Parameter count/format errors | Input-validation layer. |
+| `-1102`/`-1103` | Missing/unknown mandatory parameter | Input-validation layer. |
+| `-1111` | Precision beyond what the symbol allows | Input-validation layer. |
+| `-1116` | Invalid order type | Input-validation layer (this codebase only ever sends `LIMIT`, so this indicates a local bug, not exchange state — still safely `Rejected`, never `Ambiguous`). |
+| `-1117` | Invalid side | Input-validation layer, same reasoning as `-1116`. |
+| `-1118` | Empty `newClientOrderId` | Input-validation layer — indicates a local bug in ID generation, not exchange state. |
+| `-1121` | Invalid symbol | Input-validation layer. |
+| `-2010` | New order rejected (e.g. insufficient balance) | Documented as an order-validation rejection, not a matching-engine-state-dependent outcome. |
+
+Any code not on this list — including any future Binance code this list hasn't been updated for — defaults to `Ambiguous`.
 
 ## 5. Reconciliation wiring
 
-Any `Ambiguous` outcome routes to `order_lifecycle.hpp::determine_reconcile_action()`, which already returns `QueryOrder` (up to `kMaxQueryAttempts` = 3) or `EscalateToOperator`. `QueryOrder` now has a real implementation: `BinancePrivateRestClient::query_order()` (§2), which is L4 §6's `GET /api/v3/order` with the documented Memory→Database-lag retry/backoff. This spec does not change the state machine — it wires a real network call into an action the state machine already models correctly.
+Any `Ambiguous` outcome (§4.3 — including `Timeout`, `NetworkError`, and, after round-3's fix, `RateLimited`) routes to L4 §6.2's orchestrator-level reconciliation loop, which calls `order_lifecycle.hpp::determine_reconcile_action()` to decide `QueryOrder` vs. `EscalateToOperator`, calling `BinancePrivateRestClient::query_order()` (§2) — a single attempt per call — for the former, incrementing and durably persisting `OrderRecord::query_attempts` after each attempt.
+
+L4's revision 3 does propose one change to the state machine: `order_lifecycle.hpp::validate_transition()`'s `Ambiguous` case is extended (L4 §6.5) to permit transitioning into the real confirmed state (`Accepted`/`PartialFill`/`Filled`/`Rejected`/`Cancelled`/`Expired`) rather than forcing every `Found` result through the terminal `Reconciled` state, which would incorrectly mark a still-open order as done. This is the one place across both specs where an existing state machine's transition table needs an actual code change, not just a new caller wired into it.
 
 ## 6. Persistent audit — hard precondition, not deferred
 
@@ -257,9 +343,28 @@ public:
 
 ### 6.2 Orchestrator wiring (was: "audit confirmed" as prose; now: the actual gate)
 
+Fixes round-3 P1: `ctx.durable_audit` was used below without being declared anywhere, and no null behavior was defined.
+
 ```cpp
-// live_submit_orchestrator.hpp — Gate 6 (currently a fire-and-forget append(ar)
-// with the return value discarded) becomes:
+// live_submit_orchestrator.hpp — OrchestratorContext gains a required field:
+struct OrchestratorContext {
+    // ... existing fields ...
+    DurableAuditSink* durable_audit{nullptr};  // NEW — required for the L5 path;
+                                                 // null is checked explicitly below,
+                                                 // matching the existing pattern for
+                                                 // ctx.audit (AuditRingSink) at Gate 1.
+};
+
+// Gate 6 (currently a fire-and-forget append(ar) with the return value
+// discarded) becomes:
+
+if (!ctx.durable_audit) {
+    result.gate = OrchestratorGate::AuditWriteNotAcked;  // null sink fails closed
+                                                           // identically to a failed write —
+                                                           // there is no "proceed without
+                                                           // durable audit" path
+    return result;
+}
 
 AuditRecord intent_record = /* ... OrderIntentCreated, as today ... */;
 if (ctx.durable_audit->append_durable(intent_record) != AuditAppendResult::Acked) {
