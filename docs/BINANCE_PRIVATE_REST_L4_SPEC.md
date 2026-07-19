@@ -2,13 +2,15 @@
 
 ## Status
 
-**Draft.** No code from this spec has been written. Per `docs/NATIVE_ARCHITECTURE.md`'s gate table, everything in this spec is **L4** — signed *read-only* requests. Nothing here submits an order; `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (L5, POST) depends on this spec's primitives and must not be implemented before this one is accepted.
+**Draft, revision 2.** No code from this spec has been written. Per `docs/NATIVE_ARCHITECTURE.md`'s gate table, everything in this spec is **L4** — signed *read-only* requests. Nothing here submits an order; `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (L5, POST) depends on this spec's primitives and must not be implemented before this one is accepted.
 
 This spec exists because the original L5-only draft was rejected on review (see that file's changelog) for treating reconciliation, environment binding, signing discipline, and rate-limit accounting as someone else's problem "for later." They aren't — they're the shared foundation both reconciliation-after-ambiguous and the POST adapter need, and per ADR-019 D8, reconciliation specifically cannot be deferred past the first live submit path.
 
-## 1. Environment binding (fixes: testnet unreachable in the original draft)
+Revision 2 (this revision) fixes 3 P0 and 2 P1 findings from the second Architect review round: exhaustive reconciliation-query failure semantics (§6), concrete `rules_version` data model and call-chain wiring (§5), factory-only `EnvironmentBinding` construction (§1), and a concrete `RequestWeightTracker` correction/freeze API + order-count bucket (§7). See `SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md`'s revision 3 changelog for the full point-by-point mapping — both files were revised together in response to the same review.
 
-The original draft defaulted to `api.binance.com` with no testnet in the allowlist, while separately requiring a testnet run first — self-contradictory. Fix:
+## 1. Environment binding (fixes: testnet unreachable in the original draft; fixes rev-2 P1: was a freely-constructible aggregate, not actually structurally exclusive)
+
+The original draft defaulted to `api.binance.com` with no testnet in the allowlist, while separately requiring a testnet run first — self-contradictory. Revision 2 fixed the allowlist split but left `EnvironmentBinding` as a public aggregate — anyone could construct `EnvironmentBinding{Testnet, "api.binance.com", prod_policy, prod_cred_key}` and the type system would accept it, which contradicts the "structurally impossible to cross environments" claim. Fix: constructor is private; only two named factories can produce a valid instance, each hardcoding its own correct host+allowlist pairing so the caller cannot mix them.
 
 ```cpp
 enum class BinanceEnvironment : std::uint8_t {
@@ -16,22 +18,53 @@ enum class BinanceEnvironment : std::uint8_t {
     Production = 1,
 };
 
-struct EnvironmentBinding {
-    BinanceEnvironment environment;
-    std::string_view base_host;           // "testnet.binance.vision" or "api.binance.com"
-    TransportPolicy transport_policy;     // allowlist scoped to ONLY this environment's host(s)
-    std::string_view credential_env_key;  // e.g. HENGYUAN_BINANCE_TESTNET_SECRET vs
-                                           // HENGYUAN_BINANCE_LIVE_SECRET — distinct names so
-                                           // a testnet key can never be silently loaded where a
-                                           // production key was expected, or vice versa
+class EnvironmentBinding {
+public:
+    // Only these two factories construct a valid instance. Each hardcodes the
+    // correct (environment, base_host, allowlist) triple internally — the
+    // caller supplies only the credential env-var key name, so there is no
+    // parameter combination that produces a Testnet-enum-with-production-host
+    // (or vice versa) instance. This is what makes the exclusivity structural
+    // rather than a documentation promise.
+    static EnvironmentBinding testnet(std::string_view secret_env_key) noexcept {
+        return EnvironmentBinding(BinanceEnvironment::Testnet, "testnet.binance.vision",
+                                   testnet_transport_policy(), secret_env_key);
+    }
+    static EnvironmentBinding production(std::string_view secret_env_key) noexcept {
+        return EnvironmentBinding(BinanceEnvironment::Production, "api.binance.com",
+                                   production_transport_policy(), secret_env_key);
+    }
+
+    BinanceEnvironment environment() const noexcept { return environment_; }
+    std::string_view base_host() const noexcept { return base_host_; }
+    const TransportPolicy& transport_policy() const noexcept { return transport_policy_; }
+    std::string_view credential_env_key() const noexcept { return credential_env_key_; }
+
+private:
+    EnvironmentBinding(BinanceEnvironment env, std::string_view host,
+                       TransportPolicy policy, std::string_view cred_key) noexcept
+        : environment_(env), base_host_(host), transport_policy_(policy),
+          credential_env_key_(cred_key) {}
+
+    // Returns a TransportPolicy whose endpoint_allowlist contains ONLY
+    // testnet.binance.vision — never shares state with production_transport_policy().
+    static TransportPolicy testnet_transport_policy() noexcept;
+    // Returns a TransportPolicy whose endpoint_allowlist contains ONLY
+    // api.binance.com + api1/2/3.binance.com — never shares state with testnet.
+    static TransportPolicy production_transport_policy() noexcept;
+
+    BinanceEnvironment environment_;
+    std::string_view base_host_;
+    TransportPolicy transport_policy_;
+    std::string_view credential_env_key_;
 };
 ```
 
 Rules:
 
-- `EnvironmentBinding` is chosen once at process startup and is **immutable** for the process lifetime — no setter, no runtime flag to flip it later.
-- Testnet's `TransportPolicy::endpoint_allowlist` contains only `testnet.binance.vision`; production's contains only `api.binance.com` + `api1/2/3.binance.com`. **Never share an allowlist between environments** — this is the concrete mechanism that makes "dry-run accidentally pointing at production" structurally impossible rather than a documentation promise.
-- The credential env-var name is environment-specific so `env_loader.hpp`'s allowlist (`EnvAllowlist`) naturally rejects a testnet key presented under the production variable name, and vice versa.
+- An `EnvironmentBinding` is chosen once at process startup via `EnvironmentBinding::testnet(...)` or `::production(...)` and is **immutable** for the process lifetime — no setter, no runtime flag to flip it later, no public constructor to bypass the factories.
+- The two `*_transport_policy()` functions are the only place either allowlist is defined; they must never read from a shared/parameterized source that could let one environment's allowlist leak into the other.
+- The credential env-var key is environment-specific (e.g. caller passes `"HENGYUAN_BINANCE_TESTNET_SECRET"` to `testnet()`, `"HENGYUAN_BINANCE_LIVE_SECRET"` to `production()`) so `env_loader.hpp`'s allowlist (`EnvAllowlist`) naturally rejects a key presented under the wrong variable name.
 
 ## 2. Signing discipline (fixes: query-string/percent-encoding/timestamp gaps)
 
@@ -62,45 +95,162 @@ Backs `account_truth.hpp`'s `AccountSnapshot`. Same signing pipeline as §2. Res
 
 ## 5. `GET /api/v3/exchangeInfo` (public, unauthenticated, large response) — Symbol Registry
 
-Fixes: SubmitPort's ABI only carries `symbol_id` + integer ticks, but Binance's wire format needs a `symbol` string and decimal `price`/`quantity` strings matching exchange filter precision. This section defines the missing, immutable mapping.
+Fixes: SubmitPort's ABI only carries `symbol_id` + integer ticks, but Binance's wire format needs a `symbol` string and decimal `price`/`quantity` strings matching exchange filter precision. Revision 2 named this gap (`SymbolRegistryEntry`, `rules_version`) but only as prose — `account_truth.hpp`'s actual `SymbolRules` struct has no `rules_version`, `price_scale`, or `qty_scale` field, and `validate_pre_trade()`'s signature has no way to report which version it validated against. This revision fixes the data model and the call-chain wiring, not just the intent.
+
+### 5.1 Extend `SymbolRules` — one struct, not two competing ones
+
+Rather than introducing a separate `SymbolRegistryEntry` that could drift out of sync with `account_truth.hpp`'s existing `SymbolRules`, **extend `SymbolRules` itself** with the three missing fields:
 
 ```cpp
-struct SymbolRegistryEntry {
-    char symbol[12]{};           // e.g. "BTCUSDT"
-    std::uint8_t price_scale{};  // decimal places implied by PRICE_FILTER.tickSize
-    std::uint8_t qty_scale{};    // decimal places implied by LOT_SIZE.stepSize
-    std::uint32_t rules_version{}; // monotonically increasing, bumped on every registry refresh
+// Proposed addition to native/include/hengyuan/account_truth.hpp's SymbolRules:
+struct SymbolRules {
+    char symbol[kSymbolNameLen]{};
+    bool is_trading{false};
+    std::int64_t min_qty_ticks{0};
+    std::int64_t max_qty_ticks{0};
+    std::int64_t step_size_ticks{0};
+    std::int64_t min_price_ticks{0};
+    std::int64_t max_price_ticks{0};
+    std::int64_t tick_size_ticks{0};
+    std::int64_t min_notional_ticks{0};
+
+    // NEW — required for wire-format construction (§5.2) and version binding (§5.3):
+    std::uint8_t price_scale{};      // decimal places implied by tick_size_ticks
+    std::uint8_t qty_scale{};        // decimal places implied by step_size_ticks
+    std::uint32_t rules_version{};   // shared across the whole registry snapshot this
+                                     // entry came from — see §5.3, not per-symbol-independent
 };
 ```
 
-Rules:
+One registry, one refresh operation, one `rules_version` for the whole snapshot (all symbols refreshed atomically together) — not a per-symbol version that could have some symbols stale and others fresh within the same submitted order.
 
-- Populated once at startup (and on an explicit, operator-triggered refresh — never silently mid-session) from `exchangeInfo`.
-- `rules_version` must be cross-checked between `account_truth.hpp`'s `validate_pre_trade()` (which already carries `SymbolRules`) and whatever later constructs the wire request: **if the registry version used for pre-trade validation doesn't match the version used to format the request, fail closed** rather than submit an order sized under filter assumptions that may no longer hold.
-- **Lossless tick→decimal formatting**: converting an integer tick count back to Binance's expected decimal string must use integer arithmetic (division/modulo against `10^price_scale` / `10^qty_scale`), never a floating-point round-trip — matching this codebase's existing `fixed_point.hpp` discipline. No scientific notation, no silently-dropped trailing precision.
+### 5.2 Lossless tick→decimal formatting
+
+Converting an integer tick count back to Binance's expected decimal string uses integer arithmetic (division/modulo against `10^price_scale` / `10^qty_scale`), never a floating-point round-trip — matching this codebase's existing `fixed_point.hpp` discipline. No scientific notation, no silently-dropped trailing precision.
+
+### 5.3 Carrying `rules_version` through the call chain (was: "must be cross-checked", now: concrete signatures)
+
+```cpp
+// account_truth.hpp — validate_pre_trade() gains an out-parameter reporting
+// which rules_version it validated against, so the caller can carry it forward:
+PreTradeCheck validate_pre_trade(
+    const SymbolRules& rules, OrderSide side, std::int64_t price_ticks,
+    std::int64_t qty_ticks, const AccountSnapshot& account,
+    std::string_view base_asset, std::string_view quote_asset,
+    std::int64_t now_ms, const ExposureLimits& limits,
+    std::uint32_t& validated_rules_version_out) noexcept;  // NEW out-param
+
+// live_submit_orchestrator.hpp — OrchestratorContext carries the version
+// forward from Gate 6+7 (pre-trade) to Gate 12 (submit):
+struct OrchestratorContext {
+    // ... existing fields ...
+    std::uint32_t pre_trade_rules_version{0}; // set by the orchestrator after
+                                               // validate_pre_trade() succeeds
+};
+
+// binance_private_rest.hpp (SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md's §2) —
+// submit_order() receives the SAME version pre-trade validated against, and
+// must compare it to its own currently-loaded registry version before
+// formatting the wire request:
+SubmitResponse submit_order(
+    std::string_view client_order_id, std::uint32_t symbol_id,
+    OrderSide side, OrderType type,
+    std::int64_t price_ticks, std::int64_t qty_ticks,
+    std::uint32_t expected_rules_version) noexcept;  // NEW param
+// If expected_rules_version != registry_.current_version(), the request is
+// NEVER formatted or sent — return SubmitOutcome::StaleRulesVersion (a new,
+// visually distinct outcome, never conflated with an exchange-side Rejected
+// or a NetworkError — this is a purely local, pre-flight fail-closed check).
+```
+
+This is the concrete mechanism: the version travels as a real function parameter from `validate_pre_trade()` through `OrchestratorContext` to `submit_order()`, and a mismatch is a distinct, checkable outcome — not a prose promise that two independently-refreshed structures "should" agree.
 
 ## 6. `GET /api/v3/order` (signed, reconciliation query) — fixes: reconciliation was explicitly out of scope, must not be
 
-ADR-019 D8 requires reconciliation-after-ambiguous to exist before any live POST path is authorized. The original draft excluded it "for later"; that's the review's first blocking finding, and it's fixed here.
+ADR-019 D8 requires reconciliation-after-ambiguous to exist before any live POST path is authorized. The original draft excluded it "for later" — the review's first blocking finding. Revision 2 fixed the omission but only defined retry semantics for one specific error code (`-2013`); it left every other failure mode of the query *itself* (5xx, `-1007`, `429`/`418`, DNS/TLS failure, timeout, truncated body, 200-with-schema-mismatch, 200-with-COID-mismatch) undefined. Revision 3 fixes this by collapsing every non-definitive response into one explicit outcome, so there is no code path left that could accidentally treat "the query failed" as "the order doesn't exist."
 
 ```
 GET /api/v3/order?symbol={symbol}&origClientOrderId={coid}&recvWindow={ms}&timestamp={now}&signature={...}
 ```
 
-- Same signing pipeline as everything else in this spec (§2).
-- **Memory→Database visibility lag**: Binance's REST query layer can transiently report `-2013 Order does not exist` even when the order was in fact accepted by the matching engine moments earlier, under load. This is a documented characteristic, not a bug to route around by assuming the first negative answer is authoritative.
-- **Retry policy**: on `-2013`, retry the *same* query (not the original POST — that's still forbidden) up to `order_lifecycle.hpp::OrderRecord::kMaxQueryAttempts` (already defined as 3) with backoff (1s, 2s, 4s). This is the network call that `order_lifecycle.hpp::determine_reconcile_action()`'s `QueryOrder` action already models in the state machine — this section defines what actually executes when that action fires.
-- If still inconclusive after 3 attempts, the existing state machine already resolves to `EscalateToOperator` — no new logic needed there, just this network implementation feeding it real answers instead of a mock.
+Same signing pipeline as everything else in this spec (§2).
 
-## 7. Rate-limit header accounting (fixes: local-only weight=1 assumption)
+### 6.1 Query outcome model
+
+```cpp
+enum class ReconcileQueryOutcome : std::uint8_t {
+    Found = 0,         // Binance definitively confirmed the order's state.
+    Inconclusive = 1,  // The query itself did not produce a trustworthy answer —
+                       // see the exhaustive list below. This is the ONLY other
+                       // outcome; there is no "confirmed does not exist" outcome.
+};
+
+struct ReconcileQueryResult {
+    ReconcileQueryOutcome outcome;
+    OrderState confirmed_state{OrderState::Ambiguous}; // valid only if outcome == Found
+    std::int64_t exchange_order_id{0};                 // valid only if outcome == Found
+    std::uint32_t retry_after_seconds{0};               // valid only if Inconclusive was
+                                                         // caused by 429/418 — see §6.3
+};
+```
+
+**Every one of the following collapses to `Inconclusive`** — none of them, individually or repeated, may ever be read as "the order does not exist" or as any other definitive conclusion:
+
+- `-2013 Order does not exist` (the specific case revision 2 handled) — Binance's Memory→Database visibility lag means this can be transiently wrong even when the order was accepted moments earlier.
+- HTTP 5xx (including `-1007` matching-engine timeout).
+- HTTP `429`/`418` (rate limited — `retry_after_seconds` populated from the `Retry-After` header).
+- DNS failure, connection reset, TLS handshake failure, connect/read timeout.
+- Truncated/incomplete response body.
+- HTTP 200 but the body fails schema validation, or the returned `origClientOrderId` doesn't match what was queried.
+
+### 6.2 Retry policy
+
+On `Inconclusive`, retry the *same query* (never the original POST — that remains forbidden by idempotency) up to `order_lifecycle.hpp::OrderRecord::kMaxQueryAttempts` (already defined as 3), with backoff `1s, 2s, 4s`. This is the network call that `order_lifecycle.hpp::determine_reconcile_action()`'s `QueryOrder` action already models in the state machine — this section defines what actually executes when that action fires, and it always returns one of the two outcomes above, never a third "definitively absent" state.
+
+### 6.3 Rate-limit interaction
+
+If a retry's `Inconclusive` was caused by `429`/`418`, the next attempt's wait time is `max(scheduled_backoff, retry_after_seconds)` — the query loop must never re-send while a rate-limit freeze (§7) is in effect, even if the fixed backoff schedule would otherwise allow it sooner.
+
+### 6.4 Exhaustion
+
+If all `kMaxQueryAttempts` (3) queries return `Inconclusive`, the existing state machine's `EscalateToOperator` path fires — **this is "we don't know, a human decides," never "the order was confirmed absent."** No new logic is needed in `order_lifecycle.hpp` for this; it already resolves correctly. What was missing was this network implementation feeding it real, exhaustively-categorized answers instead of a mock that only ever returned one shape of failure.
+
+### 6.5 Transition on `Found`
+
+`order_lifecycle.hpp::validate_transition()` only permits `Ambiguous → Reconciled` or `Ambiguous → EscalatedToOperator` — there is no direct `Ambiguous → Filled`/`PartialFill` transition. A `Found` result therefore transitions the record to `Reconciled` (the only legal target); `ReconcileQueryResult::confirmed_state` is recorded as auxiliary audit detail (what Binance actually reported) alongside that transition, not used to bypass the state machine's transition table.
+
+## 7. Rate-limit header accounting (fixes: local-only weight=1 assumption; fixes rev-2 P1: "feed back" had no concrete API)
 
 After **every** response (success or error), parse:
 
 - `X-MBX-USED-WEIGHT-*` (interval-suffixed, e.g. `X-MBX-USED-WEIGHT-1M`) — Binance's authoritative view of request-weight consumption.
-- `X-MBX-ORDER-COUNT-*` (e.g. `X-MBX-ORDER-COUNT-10S`, `X-MBX-ORDER-COUNT-1D`) — **a separate rate-limit bucket from request weight**, specific to order-placing endpoints.
-- `Retry-After` (present on `429`/`418` responses, seconds) — see §8's response-mapping for how this feeds the freeze behavior.
+- `X-MBX-ORDER-COUNT-*` (e.g. `X-MBX-ORDER-COUNT-10S`, `X-MBX-ORDER-COUNT-1D`) — **a separate rate-limit bucket from request weight**, enforced independently by Binance, specific to order-placing endpoints.
+- `Retry-After` (present on `429`/`418` responses, seconds).
 
-Feed the actual `X-MBX-USED-WEIGHT-*` value back into `RequestWeightTracker` (`transport_policy.hpp`) after each response, correcting any drift from the local static per-call estimate (currently a hardcoded `order_weight` field) — the local tracker is a *pre-check* to fail fast, not the source of truth; Binance's own headers are.
+Revision 2 said this should "feed back into `RequestWeightTracker`" without defining how. Concretely, `RequestWeightTracker` (`transport_policy.hpp`) gains two new methods, and orchestration wires up a **second, separately-configured instance** for order-count (Binance enforces weight and order-count as independent buckets; one tracker's single-window model cannot represent both):
+
+```cpp
+class RequestWeightTracker {
+public:
+    // ... existing reset/try_consume/can_send/used/remaining, unchanged ...
+
+    // NEW: corrects the local estimate toward Binance's authoritative reported
+    // value after a response. Takes max(local_estimate, server_reported) so a
+    // disagreement never makes the tracker LESS conservative than before.
+    void correct_from_response_header(std::uint32_t server_reported_used_weight,
+                                       TimePoint now = Clock::now()) noexcept;
+
+    // NEW: global freeze, independent of the weight/window accounting above.
+    // Set on 429/418 from ANY call site (order submit, reconciliation query,
+    // account fetch — anything using this environment's transport). While
+    // frozen, can_send()/try_consume() both return false regardless of
+    // remaining weight budget.
+    void freeze_until(TimePoint until) noexcept;
+    bool is_frozen(TimePoint now = Clock::now()) const noexcept;
+};
+```
+
+Orchestration wiring: one `RequestWeightTracker` instance tracks request weight (as today); a second, distinctly-configured instance tracks order-count (separate limit values, e.g. 10s/1d windows per Binance's published limits for the account). **Both** must pass their `can_send()` pre-check (L5 spec's Gate 8) before a submit attempt proceeds, and **either** tracker's `freeze_until()` being active blocks all sends until it clears — a 429 on the order-count bucket freezes exactly as hard as one on the weight bucket.
 
 ## 8. Security contract for this client — distinct from `binance_rest_snapshot.hpp`
 
