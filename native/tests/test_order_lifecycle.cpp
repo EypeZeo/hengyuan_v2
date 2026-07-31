@@ -100,8 +100,27 @@ TEST(OrderLifecycle, CancelRequestedToFilled) {
 
 // --- Ambiguous transitions (M6) ---
 
-TEST(OrderLifecycle, AmbiguousToReconciled) {
+// docs/SPEC_INVARIANTS.md's "Reconciled" entry: SUBMITPORT spec round 24 is
+// authoritative that no live transition ever targets Reconciled. Code used to
+// disagree (Ambiguous -> Reconciled was Ok) until this was resolved by fixing
+// the code side, not the spec side. Pinned as permanently InvalidTransition so
+// a future "helpful" re-add is caught here.
+TEST(OrderLifecycle, AmbiguousToReconciledIsInvalid) {
     EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Reconciled),
+              TransitionResult::InvalidTransition);
+}
+
+// Reconciliation resolves Ambiguous directly to whichever exchange-final state
+// the query actually discovered — never to a generic bucket that would discard
+// which outcome it was.
+TEST(OrderLifecycle, AmbiguousResolvesToDiscoveredExchangeFinalState) {
+    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Filled),
+              TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Cancelled),
+              TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Rejected),
+              TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Expired),
               TransitionResult::Ok);
 }
 
@@ -117,7 +136,9 @@ TEST(OrderLifecycle, AmbiguousCannotRetry) {
 }
 
 TEST(OrderLifecycle, AmbiguousCannotDirectAccept) {
-    // Must go through Reconciled, not directly to Accepted
+    // Accepted/PartialFill ("still live, keep tracking") are deliberately NOT
+    // reachable from Ambiguous by this state machine alone — that belongs to the
+    // not-yet-built reconcile/poll loop, not a one-shot terminal resolution.
     EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Accepted),
               TransitionResult::InvalidTransition);
 }
@@ -164,8 +185,9 @@ TEST(OrderRecord, AmbiguousReconciliationPath) {
     // Cannot retry
     EXPECT_EQ(rec.transition_to(OrderState::Submitting), TransitionResult::InvalidTransition);
 
-    // Can reconcile
-    EXPECT_EQ(rec.transition_to(OrderState::Reconciled), TransitionResult::Ok);
+    // Reconciliation query discovered the order was actually filled — resolves
+    // directly to Filled, not to a generic Reconciled bucket.
+    EXPECT_EQ(rec.transition_to(OrderState::Filled), TransitionResult::Ok);
 }
 
 // --- Client order ID ---
@@ -242,7 +264,7 @@ TEST(Reconcile, NonAmbiguousNoAction) {
 // Expected values are derived from order_lifecycle.hpp's own contract:
 //   * is_terminal(from) short-circuits to AlreadyTerminal for all 12 targets,
 //     regardless of `to`. Six terminal states x 12 = 72 pairs.
-//   * The 17 Ok transitions are listed explicitly in kValidTransitions below.
+//   * The 20 Ok transitions are listed explicitly in kValidTransitions below.
 //   * Everything else is InvalidTransition.
 namespace {
 
@@ -277,8 +299,13 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::Accepted,        OrderState::Filled},
     {OrderState::Accepted,        OrderState::CancelRequested},
     {OrderState::Accepted,        OrderState::Expired},
-    // Ambiguous: reconciliation or escalation only — never a blind resubmit.
-    {OrderState::Ambiguous,       OrderState::Reconciled},
+    // Ambiguous: reconciliation resolves to whichever exchange-final state the
+    // query discovered, or escalation — never a blind resubmit, and never the
+    // generic Reconciled bucket (docs/SPEC_INVARIANTS.md's "Reconciled" entry).
+    {OrderState::Ambiguous,       OrderState::Filled},
+    {OrderState::Ambiguous,       OrderState::Cancelled},
+    {OrderState::Ambiguous,       OrderState::Rejected},
+    {OrderState::Ambiguous,       OrderState::Expired},
     {OrderState::Ambiguous,       OrderState::EscalatedToOperator},
     // PartialFill: still open.
     {OrderState::PartialFill,     OrderState::Filled},
@@ -290,7 +317,7 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::CancelRequested, OrderState::Expired},
 };
 constexpr std::size_t kValidCount = sizeof(kValidTransitions) / sizeof(kValidTransitions[0]);
-static_assert(kValidCount == 17, "the Ok set changed size — update deliberately");
+static_assert(kValidCount == 20, "the Ok set changed size — update deliberately");
 
 bool is_listed_valid(OrderState from, OrderState to) {
     for (std::size_t i = 0; i < kValidCount; ++i) {
@@ -325,9 +352,9 @@ TEST(TransitionRelation, EveryOneOf144PairsMatchesTheTable) {
     // Guards against the table silently going vacuous (e.g. a future edit that
     // empties kAllStates would otherwise "pass" with zero comparisons).
     EXPECT_EQ(ok_count + invalid_count + terminal_count, 144);
-    EXPECT_EQ(ok_count, 17);
+    EXPECT_EQ(ok_count, 20);
     EXPECT_EQ(terminal_count, 72) << "6 terminal states x 12 targets";
-    EXPECT_EQ(invalid_count, 55);
+    EXPECT_EQ(invalid_count, 52);
 }
 
 // Called out separately because these four were the specific blind spot: no test

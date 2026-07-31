@@ -1,0 +1,10 @@
+# Force LF line endings for POSIX shell scripts and Python tools, regardless of
+# core.autocrlf on the committing machine. This isn't cosmetic: these files run
+# with a `#!/usr/bin/env bash` shebang inside WSL2 and GitHub Actions (Linux),
+# and CRLF is a hard parse error there — `set -euo pipefail\r` fails with
+# "invalid option name" because bash treats the trailing \r as part of the
+# token. Found the hard way: tools/wsl_sync.sh and tools/wsl_verify.sh were
+# committed from Windows with core.autocrlf converting LF -> CRLF, and broke
+# the instant they were run inside WSL2.
+*.sh text eol=lf
+*.py text eol=lf

@@ -52,12 +52,19 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **不要**把 `order_lifecycle.hpp:93`（`validate_transition` 开头的 `is_terminal(from)` →
     `AlreadyTerminal`）改成 `is_exchange_final`：那里是纯状态机守卫（"没有任何自动转移离开此状态"），
     改了会**放行** `Reconciled →` 和 `EscalatedToOperator →` 的自动转移，是回归而非修复。
-- **[待裁决分歧] `Reconciled` 是否为活跃转移目标** — spec round 24 的措辞是"no code path in this
-  design ever targets it as a live transition"，但实际代码 `order_lifecycle.hpp` 的
-  `validate_transition` 在 `case OrderState::Ambiguous` 下**明确放行** `Ambiguous → Reconciled`。
-  两者不能同时为真。叠加影响：`is_exchange_final(Reconciled) == false`，意味着一旦订单真的走到
-  `Reconciled`，它既不会被 compaction 判定为可丢弃，其 COID 也永不释放。
-  **本轮不擅自改任一侧**——改 spec 还是改代码是设计裁决，不是笔误修正。裁决前请勿"顺手统一"。
+- **[已裁决] `Reconciled` 不是活跃转移目标** — 曾经的分歧：spec round 24 说"no code path in this
+  design ever targets it as a live transition"，但代码 `order_lifecycle.hpp` 的 `validate_transition`
+  在 `case OrderState::Ambiguous` 下曾**明确放行** `Ambiguous → Reconciled`，两者不能同时为真。
+  **裁决：改代码，采纳 spec 一侧。** `Ambiguous` 现在直接指向 reconciliation 查询实际发现的具体
+  exchange-final 状态（`Filled`/`Cancelled`/`Rejected`/`Expired`）或 `EscalatedToOperator`，不再有
+  任何路径指向 `Reconciled`——这也更贴近 L4 spec 里 `apply_confirmed_state()` 的真实设计（把
+  `confirmed_state` 映射到对应的具体 `OrderState`，而不是丢弃细节塞进一个通用"已核实"桶）。
+  `Reconciled` 枚举值本身**保留**（不像 `AbortedPreSend` 那样整体删除），仅作为历史/文档意义上的
+  标记——`is_terminal(Reconciled)` 仍为 `true`，`is_exchange_final(Reconciled)` 仍为 `false`，
+  但由于该值现在彻底不可达，这两个判定实际上已经不会再被触发。
+  **刻意未做的事**：`Ambiguous → Accepted`/`Ambiguous → PartialFill`（"发现订单其实还活着，需要继续
+  跟踪"这类结果）没有加进来——这属于轨道 A 第 3 项（reconcile/poll 循环）的范围，不属于这次纯状态机
+  层面的裁决，留到那时候一起设计,避免本次改动的范围超出"消除 spec/代码矛盾"这一件事。
 - `OrderState::AbortedPreSend` — **已被移除，不是活跃状态**。round 17 的结论：`Submitting` 只在 Gate 9
   `OrderSubmitPrepared` 真正 `.acked()` 之后才会被设置一次，pre-send 失败根本不会经过 `Submitting`，
   因此这个状态、它的 transition、`is_terminal()`/`is_exchange_final()` 里的特判全部撤销。**任何 spec
