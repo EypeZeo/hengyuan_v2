@@ -1,0 +1,178 @@
+name: CI Native Sanitizers
+
+# Runtime instrumentation for the native core. Complements ci-native.yml (which
+# builds Release, no instrumentation) — it does NOT replace it and must not be
+# merged into it: sanitizer builds are several times slower, and ci-native.yml is
+# the fast per-PR gate.
+#
+# DIVISION OF LABOUR, stated because it is easy to over-read a green run:
+#   * ASan+UBSan   memory safety and undefined behaviour. Says NOTHING about
+#                  memory ordering — it will not notice an acquire/release pair
+#                  downgraded to relaxed.
+#   * TSan         data races and memory-ordering bugs, via the C++ memory
+#                  model rather than what x86 hardware happened to do. This is
+#                  the ONLY check in the repo that can catch such a downgrade on
+#                  an x86 runner.
+#   * ARM64 job    a hardware verdict rather than a model verdict: on weak
+#                  memory a relaxed downgrade genuinely reorders, and the
+#                  payload checksums in test_spsc_concurrency.cpp observe it
+#                  with no tooling involved.
+#
+# Weekly rather than nightly: ci-native.yml's own comment flags the private-repo
+# 2000 min/month Actions budget as a real constraint. Nightly full-ASan would
+# spend roughly a third of it on findings that are rarely time-critical.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # Mondays 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  asan-ubsan:
+    name: "ASan+UBSan: full suite"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake libboost-dev libboost-system-dev libssl-dev
+
+      # RelWithDebInfo, not Release: sanitizer reports without symbols are close
+      # to useless, and NDEBUG would also compile out every assert() in the tree.
+      - name: Configure (ASan+UBSan)
+        working-directory: native
+        run: |
+          cmake -B build-asan \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DHY_SANITIZER=address \
+            -DHY_BUILD_DEMO=ON
+
+      - name: Build
+        working-directory: native
+        run: cmake --build build-asan -j$(nproc)
+
+      - name: Test
+        working-directory: native/build-asan
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1:abort_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: ctest --output-on-failure
+
+  tsan-concurrency:
+    name: "TSan: concurrency tests + negative control"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake
+
+      - name: Configure (TSan)
+        working-directory: native
+        run: |
+          cmake -B build-tsan \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DHY_SANITIZER=thread \
+            -DHY_BUILD_TSAN_CONTROL=ON \
+            -DHY_BUILD_DEMO=OFF
+
+      # Only the concurrency targets. Building all 27 test binaries under TSan
+      # would roughly triple this job for zero added signal: every other test in
+      # the tree is single-threaded, and TSan reports nothing in a program with
+      # one thread.
+      - name: Build concurrency targets only
+        working-directory: native
+        run: |
+          cmake --build build-tsan -j$(nproc) \
+            --target test_spsc_concurrency tsan_control_relaxed_ring
+
+      # history_size=7 (the maximum) is the single biggest lever on whether a
+      # race whose two halves are separated in time gets reported at all — it
+      # multiplies how much per-thread access history TSan retains.
+      - name: Run concurrency tests under TSan
+        working-directory: native/build-tsan
+        env:
+          TSAN_OPTIONS: "history_size=7:halt_on_error=1:exitcode=66"
+        run: ctest -L concurrency --output-on-failure
+
+      # NEGATIVE CONTROL — this binary MUST fail. Same discipline as the
+      # expected-to-fail TLA+ configs in ci-spec-verification.yml.
+      #
+      # A "no data races found" result above is evidence only if TSan on this
+      # runner, with these flags, would actually have reported one. The control
+      # is a ring with the release/acquire pair removed; if it passes, the gate
+      # is broken and every clean TSan run above is unsubstantiated.
+      #
+      # The grep is not redundant with the exit-code check: a non-zero exit could
+      # equally mean a missing runtime, flag drift, or a build error, any of which
+      # would silently disable this control while looking like it was working.
+      - name: "Control: TSan MUST flag the deliberately-relaxed ring"
+        working-directory: native/build-tsan
+        env:
+          TSAN_OPTIONS: "history_size=7:halt_on_error=1:exitcode=66"
+        run: |
+          set -u
+          if ./tsan_control_relaxed_ring > control.log 2>&1; then
+            echo "::error::tsan_control_relaxed_ring exited 0. TSan did NOT detect the injected missing release/acquire pair on this runner. Every 'no data races found' result in this job is unsubstantiated — do not trust the TSan gate until this is fixed."
+            tail -50 control.log
+            exit 1
+          fi
+          if ! grep -q "WARNING: ThreadSanitizer: data race" control.log; then
+            echo "::error::tsan_control_relaxed_ring failed, but NOT with a ThreadSanitizer data-race report. It is probably failing for an unrelated reason (missing runtime, flag drift, build error), which would silently disable this control."
+            tail -50 control.log
+            exit 1
+          fi
+          echo "OK: TSan reported the injected race as expected — the gate is live."
+
+  arm64-weak-memory:
+    name: "ARM64 Release: hardware weak-memory verdict"
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    # The only HARDWARE check of spsc_ring.hpp's memory orders. TSan gives a
+    # model verdict on x86; this runs uninstrumented Release on an architecture
+    # where a relaxed downgrade actually reorders, and the payload checksums in
+    # test_spsc_concurrency.cpp are what observe it.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 cmake
+
+      - name: Configure (Release, no sanitizer)
+        working-directory: native
+        run: |
+          cmake -B build-arm \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHY_BUILD_DEMO=OFF
+
+      - name: Build concurrency targets only
+        working-directory: native
+        run: cmake --build build-arm -j$(nproc) --target test_spsc_concurrency
+
+      # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
+      # probabilistic per run. Ten Release-speed runs cost seconds and raise the
+      # detection floor substantially.
+      - name: Run concurrency tests (10x)
+        working-directory: native/build-arm
+        run: ctest -L concurrency --output-on-failure --repeat until-fail:10
