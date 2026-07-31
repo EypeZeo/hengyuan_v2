@@ -73,6 +73,22 @@ inline bool is_terminal(OrderState s) noexcept {
            s == OrderState::EscalatedToOperator;
 }
 
+// is_terminal(EscalatedToOperator) is true (no further automatic transition ever
+// leaves it), but that does NOT mean the order is done: it may still be live on
+// the exchange, awaiting operator resolution. Compaction/COID-release logic that
+// uses is_terminal() as its retention filter can silently drop state an escalated
+// order still needs — this exact bug is docs/SPEC_INVARIANTS.md's `is_exchange_final`
+// entry (SUBMITPORT spec round 9 introduced this split; round 24 separately found
+// Reconciled had been wrongly included here — it is not, and must not be, in this
+// set). Use is_exchange_final(), never is_terminal(), for any decision about
+// whether an order can still be resting on the exchange.
+inline bool is_exchange_final(OrderState s) noexcept {
+    return s == OrderState::Filled ||
+           s == OrderState::Cancelled ||
+           s == OrderState::Rejected ||
+           s == OrderState::Expired;
+}
+
 inline TransitionResult validate_transition(OrderState from, OrderState to) noexcept {
     if (is_terminal(from)) return TransitionResult::AlreadyTerminal;
 
