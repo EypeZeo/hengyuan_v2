@@ -223,3 +223,142 @@ TEST(Reconcile, NonAmbiguousNoAction) {
     rec.state = OrderState::Accepted;
     EXPECT_EQ(determine_reconcile_action(rec), ReconcileAction::NoAction);
 }
+
+// ===========================================================================
+// EXHAUSTIVE TRANSITION RELATION — all 12 x 12 = 144 (from, to) pairs
+// ===========================================================================
+//
+// WHY: before this table, the tests above pinned 19 of 144 pairs (13.2%). The
+// gaps were not harmless. Every one of the four VALID Expired transitions was
+// unpinned, so deleting `to == OrderState::Expired` from validate_transition()
+// — which would strand every expiring order in a live state — passed the entire
+// suite. So did 70 of the 72 terminal-state pairs.
+//
+// This table states the COMPLETE relation in one place, so the state machine's
+// behaviour can be diffed against the spec by reading rather than by inferring
+// it from scattered examples. A change to validate_transition() must now be
+// accompanied by a deliberate change here.
+//
+// Expected values are derived from order_lifecycle.hpp's own contract:
+//   * is_terminal(from) short-circuits to AlreadyTerminal for all 12 targets,
+//     regardless of `to`. Six terminal states x 12 = 72 pairs.
+//   * The 17 Ok transitions are listed explicitly in kValidTransitions below.
+//   * Everything else is InvalidTransition.
+namespace {
+
+constexpr OrderState kAllStates[] = {
+    OrderState::Intent,          OrderState::Submitting,
+    OrderState::Accepted,        OrderState::Rejected,
+    OrderState::Ambiguous,       OrderState::PartialFill,
+    OrderState::Filled,          OrderState::CancelRequested,
+    OrderState::Cancelled,       OrderState::Expired,
+    OrderState::Reconciled,      OrderState::EscalatedToOperator,
+};
+static_assert(sizeof(kAllStates) / sizeof(kAllStates[0]) == 12,
+              "OrderState gained or lost a value — update this table deliberately, "
+              "do not just resize it");
+
+struct Transition {
+    OrderState from;
+    OrderState to;
+};
+
+// The complete Ok set. Anything not here (and not from a terminal state) must be
+// InvalidTransition.
+constexpr Transition kValidTransitions[] = {
+    {OrderState::Intent,          OrderState::Submitting},
+    // Submitting: exchange responded, or the response was ambiguous.
+    {OrderState::Submitting,      OrderState::Accepted},
+    {OrderState::Submitting,      OrderState::Rejected},
+    {OrderState::Submitting,      OrderState::Ambiguous},
+    {OrderState::Submitting,      OrderState::Filled},   // immediate fill
+    // Accepted: resting on the book.
+    {OrderState::Accepted,        OrderState::PartialFill},
+    {OrderState::Accepted,        OrderState::Filled},
+    {OrderState::Accepted,        OrderState::CancelRequested},
+    {OrderState::Accepted,        OrderState::Expired},
+    // Ambiguous: reconciliation or escalation only — never a blind resubmit.
+    {OrderState::Ambiguous,       OrderState::Reconciled},
+    {OrderState::Ambiguous,       OrderState::EscalatedToOperator},
+    // PartialFill: still open.
+    {OrderState::PartialFill,     OrderState::Filled},
+    {OrderState::PartialFill,     OrderState::CancelRequested},
+    {OrderState::PartialFill,     OrderState::Expired},
+    // CancelRequested: cancel may lose the race to a fill or an expiry.
+    {OrderState::CancelRequested, OrderState::Cancelled},
+    {OrderState::CancelRequested, OrderState::Filled},
+    {OrderState::CancelRequested, OrderState::Expired},
+};
+constexpr std::size_t kValidCount = sizeof(kValidTransitions) / sizeof(kValidTransitions[0]);
+static_assert(kValidCount == 17, "the Ok set changed size — update deliberately");
+
+bool is_listed_valid(OrderState from, OrderState to) {
+    for (std::size_t i = 0; i < kValidCount; ++i) {
+        if (kValidTransitions[i].from == from && kValidTransitions[i].to == to) return true;
+    }
+    return false;
+}
+
+TransitionResult expected_result(OrderState from, OrderState to) {
+    if (is_terminal(from)) return TransitionResult::AlreadyTerminal;
+    return is_listed_valid(from, to) ? TransitionResult::Ok : TransitionResult::InvalidTransition;
+}
+
+}  // namespace
+
+TEST(TransitionRelation, EveryOneOf144PairsMatchesTheTable) {
+    int ok_count = 0, invalid_count = 0, terminal_count = 0;
+    for (OrderState from : kAllStates) {
+        for (OrderState to : kAllStates) {
+            const TransitionResult expected = expected_result(from, to);
+            const TransitionResult actual = validate_transition(from, to);
+            EXPECT_EQ(actual, expected)
+                << "validate_transition(" << order_state_name(from) << ", "
+                << order_state_name(to) << ") disagrees with the exhaustive table";
+            switch (expected) {
+                case TransitionResult::Ok: ++ok_count; break;
+                case TransitionResult::InvalidTransition: ++invalid_count; break;
+                case TransitionResult::AlreadyTerminal: ++terminal_count; break;
+            }
+        }
+    }
+    // Guards against the table silently going vacuous (e.g. a future edit that
+    // empties kAllStates would otherwise "pass" with zero comparisons).
+    EXPECT_EQ(ok_count + invalid_count + terminal_count, 144);
+    EXPECT_EQ(ok_count, 17);
+    EXPECT_EQ(terminal_count, 72) << "6 terminal states x 12 targets";
+    EXPECT_EQ(invalid_count, 55);
+}
+
+// Called out separately because these four were the specific blind spot: no test
+// anywhere used Expired as a destination, so the branches enabling them could be
+// deleted with the whole suite still green.
+TEST(TransitionRelation, ExpiryIsReachableFromEveryLiveRestingState) {
+    EXPECT_EQ(validate_transition(OrderState::Accepted, OrderState::Expired), TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::PartialFill, OrderState::Expired), TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::CancelRequested, OrderState::Expired), TransitionResult::Ok);
+    // ...but not from Submitting: the exchange cannot expire an order it has not
+    // yet acknowledged.
+    EXPECT_EQ(validate_transition(OrderState::Submitting, OrderState::Expired),
+              TransitionResult::InvalidTransition);
+}
+
+// No path back into Submitting from anywhere. This is the state-machine half of
+// the no-blind-resubmit guarantee (InFlightRegistry is the other half).
+TEST(TransitionRelation, NothingEverReturnsToSubmitting) {
+    for (OrderState from : kAllStates) {
+        if (from == OrderState::Intent) continue;  // the one legal entry
+        EXPECT_NE(validate_transition(from, OrderState::Submitting), TransitionResult::Ok)
+            << order_state_name(from) << " -> Submitting must never be Ok: a second POST for a "
+            << "client-order-id that may already rest on the exchange is a duplicate order";
+    }
+}
+
+// Self-loops are never Ok. Same-state re-assertion is handled at the replay layer
+// as an accepted no-op, NOT by transitioning through the state machine.
+TEST(TransitionRelation, NoSelfLoopIsOk) {
+    for (OrderState s : kAllStates) {
+        EXPECT_NE(validate_transition(s, s), TransitionResult::Ok)
+            << order_state_name(s) << " -> itself must not be a valid transition";
+    }
+}
