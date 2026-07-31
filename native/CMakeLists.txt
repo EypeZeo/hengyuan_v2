@@ -7,6 +7,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(cmake/CompilerWarnings.cmake)
+include(cmake/Sanitizers.cmake)
+
+# MUST come before FetchContent: sanitizer flags are applied directory-wide so
+# that GoogleTest and simdjson are instrumented too. An uninstrumented GoogleTest
+# under TSan both invents false positives and loses real happens-before edges.
+hengyuan_enable_sanitizers()
+
+# Needed unconditionally by the concurrency tests below. Previously this lived
+# inside if(HY_BUILD_DEMO), which meant a tests-only configure had no thread
+# support at all.
+find_package(Threads REQUIRED)
+
 include(FetchContent)
 
 # --- simdjson (IO-01: Binance JSON parser) ---
@@ -48,7 +60,8 @@ option(HY_BUILD_DEMO "Build binance_feed_demo (requires Boost + OpenSSL)" OFF)
 if(HY_BUILD_DEMO)
     find_package(Boost REQUIRED COMPONENTS system)
     find_package(OpenSSL REQUIRED)
-    find_package(Threads REQUIRED)
+    # Threads is found unconditionally at the top of this file (the concurrency
+    # tests need it whether or not demos are built).
 
     add_executable(binance_feed_demo src/binance_feed_demo.cpp)
     target_link_libraries(binance_feed_demo PRIVATE
@@ -103,6 +116,12 @@ if(HY_BUILD_TESTS)
 
     enable_testing()
     include(GoogleTest)
+
+    # gtest_discover_tests RUNS each test binary at build time to enumerate its
+    # tests. The default 5s timeout is routinely exceeded under a sanitizer
+    # runtime, and the failure surfaces as a confusing BUILD error rather than a
+    # test failure. 120s is generous headroom for instrumented startup.
+    set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_TIMEOUT 120)
 
     add_executable(test_market_event_layout tests/test_market_event_layout.cpp)
     target_link_libraries(test_market_event_layout PRIVATE hengyuan_core GTest::gtest_main)
@@ -243,6 +262,50 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_env_loader PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_env_loader)
     gtest_discover_tests(test_env_loader)
+
+    # Layer 2 of docs/SPEC_INVARIANTS.md: durable_control_plane.hpp ABI surface
+    add_executable(test_durable_control_plane_abi tests/test_durable_control_plane_abi.cpp)
+    target_link_libraries(test_durable_control_plane_abi PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_control_plane_abi)
+    gtest_discover_tests(test_durable_control_plane_abi)
+
+    # Real two-thread stress for the lock-free SPSC primitives. Labelled
+    # "concurrency" so the TSan CI job can select just these (`ctest -L
+    # concurrency`) — building all 27 test binaries under TSan triples the job
+    # for zero added signal, since every other test in the tree is single-threaded
+    # and TSan finds nothing in a single-threaded program.
+    add_executable(test_spsc_concurrency tests/test_spsc_concurrency.cpp)
+    target_link_libraries(test_spsc_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_spsc_concurrency)
+
+    # TSan's shadow-memory setup can fail with "FATAL: ThreadSanitizer:
+    # unexpected memory mapping" under WSL2, because WSL2's default ASLR
+    # layout doesn't match what TSan expects for its fixed shadow region.
+    # CROSSCOMPILING_EMULATOR is CMake's existing mechanism for prefixing
+    # every invocation of a test binary with a wrapper command (designed for
+    # running cross-compiled binaries under an emulator); `setarch -R`
+    # disables ASLR for just this process and needs no root. It is applied
+    # here, not only in the CI/local verify script, because
+    # gtest_discover_tests() ALSO runs the binary once at build time to
+    # enumerate test names, and that invocation hits the same fatal error if
+    # left unwrapped — CROSSCOMPILING_EMULATOR is honored by both.
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_spsc_concurrency PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_spsc_concurrency PROPERTIES LABELS concurrency)
+
+    # Negative control for the TSan gate: a deliberately-racy ring that TSan MUST
+    # report. Built only on demand — it is NOT registered with ctest, because a
+    # deliberate data race must never look like a suite failure. CI runs the
+    # binary directly and inverts the exit code (see ci-native-sanitizers.yml).
+    option(HY_BUILD_TSAN_CONTROL "Build the deliberately-racy TSan negative control" OFF)
+    if(HY_BUILD_TSAN_CONTROL)
+        add_executable(tsan_control_relaxed_ring tests/tsan_control_relaxed_ring.cpp)
+        target_link_libraries(tsan_control_relaxed_ring PRIVATE hengyuan_core Threads::Threads)
+        hengyuan_set_warnings(tsan_control_relaxed_ring)
+    endif()
 
     # P2-EXEC-LIVE-01: HMAC signer (requires OpenSSL)
     if(HY_BUILD_DEMO)

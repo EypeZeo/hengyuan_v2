@@ -37,6 +37,56 @@
   
   # 4. Execute unit test harness
   cd native/build-msvc && ctest -C Release --output-on-failure
+  ```
+
+  ## Local Validation Runbook (WSL2 + GCC, sanitizers)
+
+  **MSVC passing does not mean GCC passes, and neither means the sanitizers pass.** CI
+  (`ci-native.yml`, `ci-native-sanitizers.yml`) builds with GCC-14 on `ubuntu-24.04`, and only
+  the sanitizer jobs can see memory-safety and data-race bugs at all — MSVC has never once
+  caught one of those in this repo, and the reverse is also true (GCC's `-Wconversion`/
+  `-Wmaybe-uninitialized` have flagged things MSVC's `/W4` didn't). Both toolchains must be run
+  before trusting a change; treat one green build as half a signal, not a full one.
+
+  WSL2 (Ubuntu-24.04, matching CI's runner exactly) is the local way to run the GCC side and the
+  sanitizers MSVC cannot provide (ASan/UBSan; MSVC has ASan but no TSan/UBSan).
+
+  One-time setup (interactive — `sudo` needs a password, this cannot be scripted/run headlessly):
+  ```bash
+  wsl -d Ubuntu-24.04 -- bash -lc "sudo apt-get update && sudo apt-get install -y g++-14 cmake libboost-dev libboost-system-dev libssl-dev"
+  ```
+
+  Then, for every run:
+  ```powershell
+  # Sync the current working tree (including uncommitted changes) into WSL2's native
+  # filesystem — building on /mnt/... crosses the 9p protocol and is markedly slower
+  # for FetchContent's many-small-file simdjson/googletest builds.
+  wsl -d Ubuntu-24.04 -- bash -lc "bash ~/repos/hengyuan_v2/tools/wsl_sync.sh"
+
+  # none = mirrors ci-native.yml (plain GCC-14 Release)
+  # address = mirrors ci-native-sanitizers.yml's ASan+UBSan job
+  # thread = mirrors the TSan concurrency job, INCLUDING the negative control
+  #          (tsan_control_relaxed_ring) that must itself fail with a reported
+  #          data race — see tools/wsl_verify.sh and formal/README.md's TLA+
+  #          controls for the same "the control must still fail" discipline.
+  wsl -d Ubuntu-24.04 -- bash -lc "bash ~/repos/hengyuan_v2/tools/wsl_verify.sh all"
+  ```
+
+  **A real finding from standing this up, worth remembering**: on this toolchain (GCC 14.2,
+  WSL2), TSan silently misses races on multi-word struct copies at `-O1` and even at `-O2`
+  (RelWithDebInfo's default) — confirmed with standalone repros before touching the real code.
+  `native/cmake/Sanitizers.cmake` therefore forces `-O0` specifically for `HY_SANITIZER=thread`,
+  overriding the build type's default optimization. Do not "clean up" that override without
+  re-running `tsan_control_relaxed_ring` and confirming it still reports a race at whatever
+  optimization level you switch to — a TSan job that stops detecting races reports the same
+  "no error" output as one that's actually working.
+
+  Also WSL2-specific: TSan can fail outright at startup with `FATAL: ThreadSanitizer: unexpected
+  memory mapping`, caused by WSL2's default ASLR layout conflicting with TSan's fixed shadow-memory
+  region. `native/CMakeLists.txt` works around this via `CROSSCOMPILING_EMULATOR` (wrapping every
+  invocation, including CMake's own build-time `gtest_discover_tests` enumeration, with
+  `setarch <arch> -R`); `tools/wsl_verify.sh` applies the same wrapper to the TSan control binary,
+  which isn't ctest-registered. Harmless on runners that don't need it (plain Ubuntu CI).
 
 ## The one thing that isn't a "role" and can't be toggled off
 

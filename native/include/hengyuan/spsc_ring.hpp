@@ -57,7 +57,16 @@ class SpscRing {
     alignas(kCacheLine) std::size_t cached_head_{0};  // consumer-private
 
     // Slot storage, allocated once with the object. No per-push allocation.
-    alignas(kCacheLine) T buf_[N];
+    // Value-initialized (not left indeterminate): GCC's -Wmaybe-uninitialized
+    // flags try_pop()'s `buf_[t & kMask]` read under -O2 combined with ASan
+    // instrumentation (RelWithDebInfo + -DHY_SANITIZER=address) — it cannot
+    // prove, across the producer/consumer happens-before relationship, that a
+    // slot is never read before its first try_push. Neither plain Release GCC
+    // nor MSVC /W4 flags this; it is GCC-under-ASan specific. This zero-init
+    // happens once at construction (not on the hot push/pop path), so it does
+    // not conflict with CLAUDE.md's hot-path zero-allocation mandate — it is
+    // the same one-time-cost pattern already used for head_/tail_ above.
+    alignas(kCacheLine) T buf_[N]{};
 
 public:
     SpscRing() = default;
@@ -105,10 +114,44 @@ public:
 
     // Approximate occupancy for telemetry only. Not synchronized; do not use
     // for control flow (use try_push/try_pop return values instead).
+    //
+    // LOAD ORDER IS LOAD-BEARING: tail_ must be read FIRST. The producer only
+    // ever advances head_ and the consumer only ever advances tail_, so
+    // head_ >= tail_ always holds for a consistent snapshot — but these are two
+    // independent loads with no atomicity between them. Reading head_ first
+    // allowed the consumer to advance tail_ PAST the observed head_ in the gap,
+    // making the unsigned subtraction underflow: head=5, tail=3 at the first
+    // load; consumer pops twice; second load sees tail=6; 5 - 6 wraps to
+    // ~SIZE_MAX. A telemetry gauge that intermittently reports
+    // 18446744073709551615 reads as memory corruption to whoever sees it.
+    //
+    // Reading tail_ first inverts the skew: the head_ observed afterwards can
+    // only have grown, so h >= t is guaranteed (see the acquire-load ordering
+    // note below) and the subtraction can never underflow.
+    //
+    // THE OVER-REPORT IS **NOT** BOUNDED BY RING CAPACITY — an earlier version
+    // of this comment claimed it was; that reasoning was wrong. `t` is a
+    // snapshot from before `h` is read; if the consumer keeps advancing tail_
+    // during the gap between the two loads (e.g. this thread is preempted),
+    // `h - t` grows by however much tail_ moved in that gap, which has no
+    // upper bound — `SpscRingConcurrency.SizeApproxStaysInRangeUnderConcurrentPolling`
+    // (test_spsc_concurrency.cpp) reproduces values above capacity() under real
+    // producer/consumer contention, not just in theory. Explicitly clamped
+    // below so the documented contract ("approximate occupancy") is actually
+    // true by construction instead of merely usually true.
+    //
+    // Ordering proof (why tail-then-head prevents underflow): each load here
+    // is memory_order_acquire, which forbids any later operation in this
+    // thread's program order — including the second load — from being
+    // reordered before it. So the head_ load is guaranteed to observe a value
+    // from no earlier than the tail_ load's real time, and since head_ only
+    // increases, head_at_or_after(tail_read_time) >= head_at(tail_read_time)
+    // >= tail_at(tail_read_time) = t.
     std::size_t size_approx() const noexcept {
-        const std::size_t h = head_.load(std::memory_order_acquire);
         const std::size_t t = tail_.load(std::memory_order_acquire);
-        return h - t;
+        const std::size_t h = head_.load(std::memory_order_acquire);
+        const std::size_t raw = h - t;  // never underflows, see above
+        return raw > N ? N : raw;       // but IS only bounded once clamped
     }
 
     bool empty_approx() const noexcept { return size_approx() == 0; }
