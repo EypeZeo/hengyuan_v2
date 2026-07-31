@@ -1,0 +1,162 @@
+name: CI Spec Verification
+
+# Mechanized enforcement for Layers 1 and 3 of docs/SPEC_INVARIANTS.md.
+#
+# Why this workflow exists: ci-native.yml is path-filtered to 'native/**', so
+# changes to docs/, tools/, or formal/ triggered NO checks at all. That made the
+# invariant ledger and the TLA+ model manual-only mechanisms — exactly the kind
+# that rot silently. It also interacts with main-merge-guard.yml, which treats a
+# null statusCheckRollup ("no workflow matched the changed paths") as a pass: a
+# docs-only or formal-only PR previously merged with zero verification.
+#
+# Deliberately does NOT touch ci-native.yml — the two are independent and a
+# failure in one must not mask or block the other.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'docs/SPEC_INVARIANTS.md'
+      - 'docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md'
+      - 'docs/BINANCE_PRIVATE_REST_L4_SPEC.md'
+      - 'tools/**'
+      - 'formal/**'
+      - 'native/include/hengyuan/durable_control_plane.hpp'
+      - 'native/include/hengyuan/order_lifecycle.hpp'
+      - '.github/workflows/ci-spec-verification.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'docs/SPEC_INVARIANTS.md'
+      - 'docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md'
+      - 'docs/BINANCE_PRIVATE_REST_L4_SPEC.md'
+      - 'tools/**'
+      - 'formal/**'
+      - 'native/include/hengyuan/durable_control_plane.hpp'
+      - 'native/include/hengyuan/order_lifecycle.hpp'
+      - '.github/workflows/ci-spec-verification.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  # Pinned to match what the model was developed and verified against locally.
+  # Bumping this is a deliberate act: re-run the saturation check afterwards.
+  TLA_TOOLS_VERSION: v1.7.4
+
+jobs:
+  spec-invariant-xref:
+    name: "L1: invariant ledger cross-reference"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Exit code is the gate: 0 = every registered symbol resolves somewhere,
+      # 1 = a registered symbol was found in neither the specs nor the ported
+      # headers (stale ledger, or a rename applied on one side only),
+      # 2 = the ledger itself could not be parsed.
+      - name: Cross-reference registered invariants against specs and headers
+        run: python tools/spec_xref_check.py --quiet
+
+      # Definition-level check, distinct from the name-level one above. A port can
+      # use every right name and still be wrong in the way that matters most:
+      # different enumerator VALUES. Three types in durable_control_plane.hpp were
+      # once invented rather than transcribed — wrong names AND wrong numbering on
+      # a persisted wire discriminator — and both the full unit suite and the
+      # name-level check above passed them. Only this catches that.
+      # Exit 1 = VALUE_CONFLICT or NAME_CONFLICT; spec-ahead-of-code is a warning.
+      - name: Diff spec enum definitions against the real headers
+        run: python tools/spec_enum_diff.py
+
+  tla-model-check:
+    name: "L3: TLA+ model checking"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # tla2tools.jar is gitignored (a 2MB binary does not belong in the tree),
+      # so CI fetches the pinned release the same way the local setup does.
+      - name: Cache TLA+ tools
+        id: cache-tla
+        uses: actions/cache@v4
+        with:
+          path: formal/tools/tla2tools.jar
+          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
+
+      - name: Download TLA+ tools
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p formal/tools
+          curl -sSfL -o formal/tools/tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
+          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
+            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
+
+      # The current design must verify clean.
+      - name: "Safety: current design must find no violation"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config durable_log_recovery.cfg durable_log_recovery.tla
+
+      # Progress property. Note this config intentionally has no CONSTRAINT
+      # (see formal/README.md) — do not "fix" it by adding one.
+      - name: "Liveness: EventualResolution must hold"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config durable_log_recovery_liveness.cfg durable_log_recovery.tla
+
+      # These three MUST fail. TLC exits 12 on an invariant violation, so the
+      # check is inverted: a clean exit here means the model has stopped
+      # discriminating and every "no violation" result above is worth less.
+      # Without this inversion the regression controls would be decorative.
+      - name: "Controls: the three expected-to-fail configs must still fail"
+        working-directory: formal
+        run: |
+          set -u
+          fail=0
+          for pair in \
+            "durable_log_recovery_buggy.cfg|NoDoubleSend|pre-rev14 recovery bug (Prepared-only frame recovers as Submitting)" \
+            "durable_log_recovery_abortedpresend.cfg|NoDoubleSend|pre-rev14 AbortedPreSend compensation (treats Failed append as proof nothing happened)" \
+            "durable_log_recovery_probe.cfg|LateFsyncUnreachable|late-fsync reachability probe"
+          do
+            cfg="${pair%%|*}"; rest="${pair#*|}"
+            inv="${rest%%|*}"; desc="${rest#*|}"
+            echo "::group::$cfg — expecting $inv to be violated"
+            echo "  control: $desc"
+            if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+                 -workers auto -config "$cfg" durable_log_recovery.tla > "/tmp/$cfg.log" 2>&1; then
+              echo "::error::$cfg PASSED but was expected to violate $inv. The model has stopped discriminating; do not trust the safety runs until this is fixed."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            elif grep -q "Invariant $inv is violated" "/tmp/$cfg.log"; then
+              echo "  OK: $inv violated as expected"
+            else
+              echo "::error::$cfg failed, but NOT with the expected '$inv is violated'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
