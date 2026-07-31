@@ -3,7 +3,7 @@
 //
 // Governance: L1 (pure state machine logic, no network, no secret).
 // ADR-019 D8 + Architect M6:
-//   ✅ Full lifecycle: Intent→Submitting→Accepted/Rejected/Ambiguous→Fill→Reconciled
+//   ✅ Full lifecycle: Intent→Submitting→Accepted/Rejected/Ambiguous→discovered exchange-final state
 //   ✅ newClientOrderId idempotency key generation
 //   ✅ POST timeout → Ambiguous (not "stop and discard")
 //   ✅ Ambiguous → query via same clientOrderId → reconcile
@@ -34,7 +34,12 @@ enum class OrderState : std::uint8_t {
     CancelRequested = 7,  // Cancel in-flight
     Cancelled = 8,        // Confirmed cancelled
     Expired = 9,          // Exchange expired the order
-    Reconciled = 10,      // Final state after query confirms actual status
+    Reconciled = 10,      // UNREACHABLE by design (docs/SPEC_INVARIANTS.md's "Reconciled"
+                          // entry): no validate_transition() case ever targets this value.
+                          // Kept only as a historical/documentation marker — reconciliation
+                          // resolves Ambiguous directly to whichever real exchange-final
+                          // state the query discovered (Filled/Cancelled/Rejected/Expired),
+                          // never to this generic bucket. Do not add a transition into it.
     EscalatedToOperator = 11, // Ambiguous could not be resolved → human takeover
 };
 
@@ -111,8 +116,21 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
                 return TransitionResult::Ok;
             break;
         case OrderState::Ambiguous:
-            // From Ambiguous, only reconciliation or escalation
-            if (to == OrderState::Reconciled ||
+            // From Ambiguous, reconciliation resolves to whichever exchange-final
+            // state the query actually discovered, or escalation if it couldn't be
+            // resolved. `Reconciled` is deliberately NOT a target here (see
+            // docs/SPEC_INVARIANTS.md's "Reconciled" entry): SUBMITPORT spec round 24
+            // is authoritative that no live transition ever targets it, and
+            // apply_confirmed_state()'s design maps a reconciliation query's
+            // confirmed_state directly onto the matching OrderState, never onto a
+            // generic "reconciled" bucket that would discard which outcome it was.
+            // Deliberately excludes Accepted/PartialFill: those are "still live,
+            // keep tracking" outcomes belonging to the not-yet-built reconcile/poll
+            // loop, not this state-machine-only fix.
+            if (to == OrderState::Filled ||
+                to == OrderState::Cancelled ||
+                to == OrderState::Rejected ||
+                to == OrderState::Expired ||
                 to == OrderState::EscalatedToOperator)
                 return TransitionResult::Ok;
             break;
