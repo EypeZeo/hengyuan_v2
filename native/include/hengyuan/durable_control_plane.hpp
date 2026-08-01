@@ -44,25 +44,50 @@
 // copyability and standard layout for anything crossing a durable-write or
 // cross-thread boundary.
 //
-// Types in L4 §10's canonical block that are NOT yet transcribed here (they are
-// simply absent, which spec_enum_diff.py reports as NOT_PORTED rather than as a
-// conflict): DurableControlPlaneSink itself (the 14-pure-virtual-method
-// interface -- see docs/SPEC_INVARIANTS.md's durable-audit-log entry for why
-// DurableAuditSink deliberately does NOT inherit from it), and everything on
-// the compaction/generation-switch/seal-journal side: SymbolRegistrySnapshotPayload,
-// RateLimitUsageSnapshotPayload, OperatorOverridePayload, GenerationBridgePayload,
-// GenerationSeal, SealIdWatermark, SealJournalCommitWatermark, the whole
-// Seal*Wire/CompactionCandidateIntentWire/.xgc family, ExternalAnchorClient,
-// OperatorOverrideSidecar. Transcribe them when a consumer needs them.
+// This file's second governance mode, added when it first gained an abstract
+// class (DurableControlPlaneSink/ExternalAnchorClient/OperatorOverrideSidecar,
+// below): interfaces get NO sizeof()/is_trivially_copyable_v/is_standard_layout_v
+// assertions (meaningless for a type with a vtable) -- instead
+// static_assert(std::is_abstract_v<T>) (this type cannot be instantiated
+// because it has >=1 pure virtual -- the interface analog of "layout matches
+// the spec") and static_assert(std::has_virtual_destructor_v<T>) (safe deletion
+// through a base pointer -- the one property every caller of these three
+// classes actually depends on). "No behavior" means every method body is `= 0`;
+// no default implementations, no data members, no helper methods with bodies.
+// tools/spec_enum_diff.py has no method-signature-diff equivalent -- it only
+// parses `enum class` blocks -- so it says nothing at all about whether these
+// interfaces match the spec byte-for-byte; the compensating check is a
+// hand-written stub subclass per interface in the test file that overrides
+// every pure virtual (a signature mismatch there is a compile error, the same
+// proof-of-shape role is_trivially_copyable_v plays for a struct).
+//
+// The one type NOT yet transcribed here (everything else L4 §10 names now is):
+// the entire seal-journal / .xgc wire-format family, spanning
+// docs/BINANCE_PRIVATE_REST_L4_SPEC.md's ~2,400 densely cross-referenced lines
+// on generation switch / compaction / seal journal apply, explicitly deferred
+// to a future, separately-scoped round (see docs/SPEC_INVARIANTS.md's
+// durable-audit-log entry: "compaction / generation 切换 / seal journal 不做，
+// 日志无限增长，这是已知缺口，等后续单独排期"). Named explicitly rather than
+// compressed to a family name, so a future search for any one of them finds
+// this note: SealIdWatermark, SealJournalCommitWatermark,
+// SealJournalIntakeCloseControl, SealJournalTombstoneWire, SealExportStartedWire
+// (and its variants), CompactionCandidateIntentWire, CompactionIntentTransitionWire,
+// CompactionIntentGcAuthorizedWire, SealJournalOriginKey,
+// is_seal_journal_embeddable_type, SealJournalAppliedView. The last of these is
+// forward-declared (incomplete type only) immediately above
+// DurableControlPlaneSink below, because append_seal_journal_apply's spec
+// signature requires it -- see that forward declaration's own comment.
 
 #pragma once
 
+#include <hengyuan/account_truth.hpp>  // SymbolRules -- append_snapshot's payload
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/spsc_ring.hpp>  // hy::kCacheLine
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace hy {
@@ -468,6 +493,170 @@ struct FreezeEpochWatermarkPayload {
 static_assert(std::is_trivially_copyable_v<FreezeEpochWatermarkPayload>);
 static_assert(std::is_standard_layout_v<FreezeEpochWatermarkPayload>);
 
+// ===========================================================================
+// DurableControlPlaneSink dependency structs (轨道 C) -- the 6 payload types
+// the sink interface's method signatures require, transcribed together with
+// (and immediately before) the interface itself below. Ordering follows spec
+// line order among these six; EndpointWeightConfig is the one exception,
+// grouped here with its five §10 siblings (all seven are exclusively consumed
+// by the interfaces added in this same round) rather than placed at global
+// spec-line position, which would be BINANCE_PRIVATE_REST_L4_SPEC.md:2339 --
+// far ahead of AuditAppendResult at the top of this file and 500+ lines away
+// from the group it belongs with for a reason.
+// ===========================================================================
+
+// --- EndpointWeightConfig ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2339
+//
+// §7.4 versioned runtime weight table -- starts as a pinned default; may be
+// replaced only by an operator-loaded, checksummed config whose
+// config_version is audited. Online Binance weight changes are NOT
+// auto-scraped from undocumented fields.
+
+struct EndpointWeightConfig {
+    std::uint32_t config_version{0};
+    std::uint32_t weights[6]{};
+    std::uint32_t safety_pad{0};
+};
+static_assert(std::is_trivially_copyable_v<EndpointWeightConfig>);
+static_assert(std::is_standard_layout_v<EndpointWeightConfig>);
+
+// --- SymbolRegistrySnapshotPayload ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2880
+
+struct SymbolRegistrySnapshotPayload {
+    std::int64_t timestamp_ms{0};
+    std::uint32_t rules_version{0};
+    std::uint32_t symbol_count{0};  // <= kMaxSymbols; followed by symbol_count
+                                     // SymbolRules entries in the same frame
+};
+static_assert(std::is_trivially_copyable_v<SymbolRegistrySnapshotPayload>);
+static_assert(std::is_standard_layout_v<SymbolRegistrySnapshotPayload>);
+
+// --- RateLimitUsageSnapshotPayload ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2889
+//
+// §7.5.1 -- per-tracker/per-interval usage at clean shutdown. Fixed capacity,
+// no heap: at most kMaxUsageEntries (weight intervals + raw intervals) rows.
+
+struct RateLimitUsageSnapshotPayload {
+    std::int64_t recorded_utc_ms{0};
+    std::uint32_t entry_count{0};   // <= kMaxUsageEntries (= 8)
+    struct Entry {
+        std::uint8_t tracker{0};    // 0=REQUEST_WEIGHT, 1=RAW_REQUESTS
+        char interval_suffix[7]{};  // "1M", "5M", ...
+        std::int64_t bucket_start_server_ms{0};
+        std::uint32_t used{0};
+    } entries[8]{};
+};
+static_assert(std::is_trivially_copyable_v<RateLimitUsageSnapshotPayload>);
+static_assert(std::is_standard_layout_v<RateLimitUsageSnapshotPayload>);
+
+// --- OperatorOverridePayload ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2903
+//
+// Round-12 P0 -- evidence that an operator authorized startup despite
+// ExternalAnchorUnavailable. Written to the *sidecar* path (§10.2), not
+// into a store that recovery has already refused.
+
+struct OperatorOverridePayload {
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint64_t local_tip_seq{0};
+    std::uint8_t local_tip_mac[32]{}; // binds the exact tip bytes, not seq alone
+    std::uint32_t local_generation{0};
+    // Round-19 P0 -- bind the durable export baseline this override authorizes
+    // against. A new override MUST copy the on-disk LastRemoteAckedTip (or
+    // zeros if never exported); it must NOT invent a "fresh empty backlog."
+    std::uint32_t last_remote_acked_generation{0};
+    std::uint64_t last_remote_acked_seq{0};
+    std::uint8_t last_remote_acked_mac[32]{};
+    std::uint8_t admit_mode{0};       // 0=AppendAllowedIfUnderHardLag,
+                                        // 1=ReadOnlyDrain (forced when
+                                        // inherited backlog already exceeds
+                                        // hard-lag at issue time)
+    std::int64_t wall_utc_ms{0};
+    std::int64_t expires_utc_ms{0};  // short-lived, operator-selected
+    std::uint64_t nonce{0};          // one-shot replay protection
+    std::uint32_t kek_key_id{0};
+    std::uint32_t reason_code{0};     // enumerated: ExternalAnchorDown=1, ...
+    char operator_id[32]{};           // fixed, not heap
+    std::uint8_t mac[32]{};           // HMAC under KEK over the above fields
+};
+static_assert(std::is_trivially_copyable_v<OperatorOverridePayload>);
+static_assert(std::is_standard_layout_v<OperatorOverridePayload>);
+
+// --- GenerationBridgePayload ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2940
+//
+// Round-12 P0 -- compaction predecessor seal bridging generation N -> N+1.
+// CHANGED -- fixes that round's P0: bridge_mac was described as "under the
+// tip key" with no field saying WHICH key -- the predecessor generation's
+// last-used key_id and the new generation's key_id are not guaranteed to be
+// the same. Both prev_key_id and new_key_id are explicit, MAC'd fields, and
+// the MAC domain is pinned to new_key_id (the bridge frame lives IN the new
+// generation) -- never "whichever key is current now."
+
+struct GenerationBridgePayload {
+    std::uint32_t prev_generation{0};
+    std::uint64_t prev_tip_seq{0};
+    std::uint8_t prev_tip_mac[32]{};
+    std::uint32_t prev_key_id{0};       // the key_id prev_tip_mac was actually
+                                          // computed under; verifying
+                                          // prev_tip_mac uses THIS key, never
+                                          // "whichever key is current now"
+    std::uint32_t new_generation{0};
+    std::uint64_t new_genesis_seq{0};  // usually 0
+    std::uint32_t new_key_id{0};        // the key_id this bridge frame ITSELF
+                                          // (and the new generation's
+                                          // subsequent frames) is written under
+    std::uint8_t bridge_mac[32]{};     // HMAC(new_key_id, "HY-GENBRIDGE-v1" ||
+                                          // prev_generation || prev_tip_seq ||
+                                          // prev_tip_mac || prev_key_id ||
+                                          // new_generation || new_genesis_seq),
+                                          // canonical declaration-order
+                                          // little-endian encoding matching
+                                          // §10.2's GenerationSeal convention.
+                                          // Always keyed by new_key_id;
+                                          // prev_key_id is carried as
+                                          // authenticated DATA (covered by
+                                          // bridge_mac) so a verifier who
+                                          // already trusts new_key_id can look
+                                          // up prev_key_id from the verified
+                                          // payload itself, rather than
+                                          // needing to already know it
+                                          // out-of-band.
+};
+static_assert(std::is_trivially_copyable_v<GenerationBridgePayload>);
+static_assert(std::is_standard_layout_v<GenerationBridgePayload>);
+
+// --- GenerationSeal ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2973
+
+struct GenerationSeal {
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    GenerationBridgePayload bridge{};
+    std::uint64_t final_seq{0};
+    std::uint8_t final_tip_mac[32]{};
+    std::uint32_t key_id{0};
+    std::uint8_t content_root[32]{}; // SHA-256 root -- see §10.2 point 4
+                                       // content-root rule
+    // Round-37/39 -- idempotency key. MUST equal SealExportStarted.request_id.
+    // Allocated only via SealIdWatermark (§10.1); never a free-running RNG /
+    // wall-clock / reused counter across restart.
+    std::uint64_t request_id{0};
+    // Round-38 -- normative MAC domain (little-endian field order, no
+    // padding): HMAC(key_id, "HY-GENSEAL-v1" || store_uuid_lo ||
+    //   store_uuid_hi || bridge_mac || final_seq || final_tip_mac || key_id ||
+    //   content_root || request_id)
+    // where bridge_mac is GenerationBridgePayload::bridge_mac (already covers
+    // the prev/new bridge fields). key_id in the domain is this seal's key_id.
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<GenerationSeal>);
+static_assert(std::is_standard_layout_v<GenerationSeal>);
+
 // --- OrderRecoveryCheckpoint ---
 // SPEC-STRUCT: docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:1289
 //
@@ -506,6 +695,31 @@ struct OrderRecoveryCheckpoint {
 };
 static_assert(std::is_trivially_copyable_v<OrderRecoveryCheckpoint>);
 static_assert(std::is_standard_layout_v<OrderRecoveryCheckpoint>);
+
+// --- LastRemoteAckedTip ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4586
+//
+// Durable export baseline -- breadcrumb directory, outside store root. Updated
+// on every remote Ack BEFORE ring pop, under monotonic (generation, sequence)
+// CAS / single-writer (§10.2.1). Survives crash/restart; degraded-mode
+// reconstruction baseline when remote down.
+//
+// Retroactive gap fix (轨道 C): this §10.2.1 type sits immediately beside
+// ExportTuple/ExportOutboxRing below (both already transcribed in an earlier
+// round) but was itself never transcribed, and wasn't even named in this
+// file's own "not yet transcribed" list -- fixed this round.
+
+struct LastRemoteAckedTip {
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint32_t generation{0};
+    std::uint64_t sequence{0};
+    std::array<std::uint8_t, 32> tip_mac{};
+    std::uint32_t key_id{0};
+    std::uint8_t mac[32]{};  // HMAC under KEK over the above
+};
+static_assert(std::is_trivially_copyable_v<LastRemoteAckedTip>);
+static_assert(std::is_standard_layout_v<LastRemoteAckedTip>);
 
 // --- ExportTuple ---
 // SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4611
@@ -640,5 +854,469 @@ private:
     } tail_;
     std::array<ExportTuple, kCapacity> slots_{};  // fixed, no heap
 };
+
+// ===========================================================================
+// DurableControlPlaneSink interface family (轨道 C) -- the L4-owned interface
+// surface of §10. Method bodies are `= 0` only: no fsync, no MAC verification,
+// no network I/O, no recovery_scan() -- same "shape, not implementation"
+// discipline as every struct above, extended to a vtable type. See this file's
+// top-of-file comment for the is_abstract_v/has_virtual_destructor_v
+// governance rule these three classes use in place of
+// is_trivially_copyable_v/is_standard_layout_v.
+// ===========================================================================
+
+// --- ExternalAnchorClient ---
+// SPEC-CLASS: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4659
+//
+// Pure remote-transport client -- fixes that round's P0 (ownership
+// contradiction): holds NO queue, NO backlog, NO retry state. Every
+// enqueue/dequeue/backpressure decision belongs to ExportOutboxRing above,
+// owned by the sink -- never here.
+
+class ExternalAnchorClient {
+public:
+    virtual ~ExternalAnchorClient() = default;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4673
+    // Called by the export worker for exactly the tuple ExportOutboxRing::
+    // peek_oldest() currently returns -- one outstanding export at a time
+    // (single consumer, single in-flight call). This method has no notion
+    // of "too far behind" and does no queueing of its own; that's the
+    // ring's job (§10.2.1).
+    // Round-40: remote MUST hard-reject any tip that is lexicographically
+    // lagging vs the remote's last accepted (generation, sequence) for this
+    // store_uuid (soft-accept / silent overwrite of a newer tip is forbidden).
+    // Local client maps that reject to Failed (not Acked); the tuple stays at
+    // ring head until policy resolves -- after a seal tip@N+1, PreSeal drain
+    // guarantees no gen-N tuple remains to send (§10.1 / §10.2.1).
+    virtual AuditAppendResult export_tip_and_wait_bounded(
+        std::uint64_t store_uuid_lo, std::uint64_t store_uuid_hi,
+        std::uint32_t generation, std::uint64_t sequence,
+        std::span<const std::uint8_t, 32> tip_mac, std::uint32_t key_id) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4680
+    // Round-37: seal MUST already have a durable SealExportStarted whose
+    // request_id == seal.request_id BEFORE the first network write of this
+    // call. Implementations MUST NOT send seal bytes if that breadcrumb is
+    // missing.
+    virtual AuditAppendResult export_and_wait_ack(const GenerationSeal&) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4685
+    // Authenticated, monotonic read. Unavailable is distinct from malformed,
+    // equivocal or stale data; only the latter three are Corrupt. Used both
+    // for §10.2's rollback check and §10.2.1's durable-outbox reconstruction
+    // at startup.
+    virtual RecoveryScanStatus read_latest(GenerationSeal& out) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4686
+    virtual RecoveryScanStatus read_latest_tip(
+        std::uint64_t store_uuid_lo, std::uint64_t store_uuid_hi,
+        std::uint32_t& out_generation, std::uint64_t& out_sequence,
+        std::array<std::uint8_t, 32>& out_tip_mac, std::uint32_t& out_key_id) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4702
+    // Round-37/39 -- recovery query by SealExportStarted.request_id.
+    // Returns SealQueryStatus -- NEVER RecoveryScanStatus (no Found/NotFound
+    // there).
+    // Found: out filled; caller MUST field-bind to SealExportStarted + local
+    //   N+1 including Started baseline 4-tuple == bridge.prev_* (full, incl.
+    //   prev_generation / prev_key_id) -- see §10.1 recovery step 0.
+    // NotFound: authenticated permanent-negative only -> may abandon IFF N
+    //   tip still equals Started/bridge baseline 4-tuple; else Corrupt
+    //   (§10.1). Abandon ONLY via ClrAbandoned (.abd A0 first) whether C
+    //   present or not (§10 ABI round-59...63) -- never clear Started without
+    //   durable A; never leave unauthorized C occupying the name.
+    // TransportUnavailable: keep SealExportStarted; fence; re-query; never
+    //   .abd.
+    // Corrupt: MAC/equivocation/bind failure.
+    virtual SealQueryStatus query_seal_by_request_id(
+        std::uint64_t store_uuid_lo, std::uint64_t store_uuid_hi,
+        std::uint64_t request_id, GenerationSeal& out) noexcept = 0;
+};
+static_assert(std::is_abstract_v<ExternalAnchorClient>);
+static_assert(std::has_virtual_destructor_v<ExternalAnchorClient>);
+
+// Forward-declared ONLY -- never defined in this file. SealJournalAppliedView
+// is part of the seal-journal/.xgc wire-format family (§10.1/§10.3, ~2,400
+// spec lines), explicitly out of scope this round -- see this file's
+// top-of-file comment and docs/SPEC_INVARIANTS.md's durable-audit-log entry
+// ("compaction / generation 切换 / seal journal 不做...已知缺口，等后续单独
+// 排期"). A reference to an incomplete type is legal in a function
+// DECLARATION (never called against this forward declaration alone -- only a
+// future round that also defines SealJournalAppliedView can construct an
+// argument to call DurableControlPlaneSink::append_seal_journal_apply for
+// real). Its signature below is transcribed byte-for-byte including this
+// parameter type; do NOT substitute a stub/alias/placeholder type "to make it
+// compile more easily" -- that invents a shape the spec never wrote.
+struct SealJournalAppliedView;
+
+// --- DurableControlPlaneSink ---
+// SPEC-CLASS: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4707
+//
+// 14 pure-virtual append_* methods + 1 pure-virtual recover_control_plane =
+// 15 pure-virtual declarations total (the destructor below is defaulted, not
+// pure virtual, and does not add to that count). See docs/SPEC_INVARIANTS.md's
+// durable-audit-log entry for why DurableAuditSink deliberately does NOT
+// inherit from this class.
+
+class DurableControlPlaneSink {
+public:
+    virtual ~DurableControlPlaneSink() = default;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4710
+    // Round-31/32: sink MUST reject append_rate_freeze if
+    //   freeze.conservative_wait_ms > 0 &&  // THIS frame's contribution
+    //   (freeze.wait_generation == 0  // wait-bearing frames must be explicit
+    //    || prior folded wait_generation == UINT32_MAX  // overflow fence
+    //    || freeze.wait_generation != prior_folded_wait_generation + 1);
+    // and if freeze.conservative_wait_ms == 0 &&
+    //   freeze.wait_generation != prior_folded_wait_generation (must copy-forward).
+    // New episode (no prior): wait_generation must be 1 if wait>0, else 0.
+    // Legacy-wait migration (prior max==0, wait>0): first post-upgrade
+    // wait-bearing frame MUST be wait_generation==1 (same rule as new episode
+    // step from prior 0).
+    // On Ack of a frame that advances wait_generation: any in-process
+    // arm_ack_steady for a prior generation is immediately invalid (must re-Arm).
+    // LIVE OWNER ONLY -- compaction MUST NOT call this for retained aggregates.
+    virtual AuditAppendResult append_rate_freeze(
+        const RateLimitFreezePayload& freeze,
+        FrameTimeKind time_kind) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4759
+    // Round-33/34 P0 -- compaction-only folded freeze into non-CURRENT gen-N+1.
+    // Writes DurableRecordType::RateLimitFreezeSnapshot.
+    // Sink MUST:
+    //  - reject unless compaction session is active for target generation
+    //    == CURRENT+1 (writing only into gen-N+1/ while CURRENT still names N);
+    //  - reject if source_generation == UINT32_MAX (no target+1) -- fence +
+    //    offline store migration required (round-34 P1);
+    //  - reject if proof.target_generation != source_generation + 1;
+    //  - reject if proof.source_* tip does not equal the session's
+    //    CompactionSourceBaseline (and that baseline must still match live
+    //    CURRENT tip -- caller re-verifies after yields; sink may re-read);
+    //  - reject if proof.source_generation / tip MAC / folded fields do not
+    //    match the compaction retain scan (bind fold evidence);
+    //  - accept wait_generation == proof.folded_wait_generation (including
+    //    values > 1 and legacy-seal 1) -- NO prior_folded+1 check;
+    //  - treat payload.conservative_wait_ms / deadline_utc_ms / wait_generation
+    //    as FOLDED snapshot values (not live event contributions);
+    //  - NOT touch arm_ack_steady / reserved probe state;
+    //  - reject if invoked by the live owner actor outside compaction.
+    struct CompactionFreezeSnapshotProof {
+        std::uint32_t source_generation{0};
+        std::uint64_t source_tip_seq{0};        // CompactionSourceBaseline tip
+        std::uint8_t source_tip_mac[32]{};
+        std::uint32_t source_key_id{0};
+        std::uint32_t target_generation{0};     // MUST be source+1; refuse at MAX
+        std::uint32_t freeze_epoch{0};
+        std::int64_t folded_deadline_utc_ms{0};
+        std::int64_t folded_conservative_wait_ms{0};
+        std::uint32_t folded_wait_generation{0};
+        std::uint8_t folded_source{0};
+    };
+    virtual AuditAppendResult append_compacted_freeze_snapshot(
+        const RateLimitFreezePayload& folded_snapshot,
+        FrameTimeKind time_kind,
+        const CompactionFreezeSnapshotProof& proof) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4789
+    // Round-33/34/36 -- compaction-only SINGLE frame CompactedFreezeWaitEvidence.
+    // Payload is CompactedFreezeWaitEvidencePayload ONLY -- never a pair of
+    // live Arm/Satisfy record types. Sink MUST:
+    //  - same compaction-session / non-CURRENT / baseline-tip gates as snapshot;
+    //  - reject source_generation == UINT32_MAX / target != source+1;
+    //  - require evidence.wait_generation > 0 and == folded snapshot gen;
+    //  - require satisfy_arm_frame_seq == source_arm_seq;
+    //  - require evidence.source_baseline_{tip_seq,tip_mac,key_id} ==
+    //    CompactionSourceBaseline / proof.source_* (round-36 key_id on frame);
+    //  - for legacy path-3: require source_arm_seq and source_satisfy_seq both
+    //    strictly > every wait-bearing live RateLimitFreeze in source epoch
+    //    at baseline scan time, bound matches folded wait;
+    //  - for ordinary retain: require pair was current-gen evidence in scan;
+    //  - NOT create/update arm_ack_steady; NOT re-validate steady elapsed;
+    //  - reject live-owner calls outside compaction.
+    struct CompactionWaitEvidenceProof {
+        std::uint32_t source_generation{0};
+        std::uint64_t source_tip_seq{0};
+        std::uint8_t source_tip_mac[32]{};
+        std::uint32_t source_key_id{0};
+        std::uint32_t target_generation{0};
+        std::uint32_t freeze_epoch{0};
+        std::uint32_t wait_generation{0};       // explicit; > 0
+        bool legacy_sequence_proven_rewrite{false};
+    };
+    virtual AuditAppendResult append_compacted_wait_evidence(
+        const CompactedFreezeWaitEvidencePayload& evidence,
+        FrameTimeKind time_kind,
+        const CompactionWaitEvidenceProof& proof) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4794
+    virtual AuditAppendResult append_snapshot(
+        const SymbolRegistrySnapshotPayload& snap,
+        std::span<const SymbolRules> entries) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4797
+    virtual AuditAppendResult append_weight_config(
+        const EndpointWeightConfig& cfg) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4799
+    virtual AuditAppendResult append_usage_snapshot(
+        const RateLimitUsageSnapshotPayload& usage) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4803
+    // Appends GenerationBridge into the *new* generation before CURRENT flips
+    // (§10.2 / L5 §6.1.3). Not usable as a general post-refuse recovery write.
+    virtual AuditAppendResult append_generation_bridge(
+        const GenerationBridgePayload& bridge) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4807
+    // Post-admission audit mirror ONLY -- never the admission evidence itself
+    // (that lives in OperatorOverrideSidecar). Called once the sink is open.
+    virtual AuditAppendResult append_operator_override(
+        const OperatorOverridePayload& ov) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4845
+    // NEW -- fixes this round's P0: §7.3.1's FreezeProbeCredit claimed a
+    // durable, recoverable attempt count backed by this write, but no
+    // DurableControlPlaneSink method for it ever existed -- the only append
+    // path available was L5's DurableAuditSink::append_durable(), which
+    // would have reintroduced the exact L4-depends-on-L5 cycle round 9
+    // closed (§7.3.1's probe runs on L4-only paths too -- account refresh,
+    // startup baseline -- that have no L5 DurableAuditSink to call at all).
+    // This method is the correct, L4-owned home for it, alongside every
+    // other control-plane append above.
+    // Round-26/27/28 -- FreezeProbeAttempt. Sink MUST:
+    //  - reject attempt.cleared == true;
+    //  - reject if freeze_epoch is not the single active uncleared epoch;
+    //  - reject if attempt_ordinal != (max durable ordinal for that epoch) + 1
+    //    (no gaps, no duplicates, no rewind);
+    //  - reject if folded deadline_utc_ms > 0 and
+    //    attempt.not_before_utc_ms < folded deadline_utc_ms;
+    //  - reject if attempt_ordinal == 0 or > kMaxTotalAttempts;
+    //  - NEW (round-30/31/32 P0): reject if folded conservative_wait_ms > 0
+    //    and there is no already-Acked, sink-verified FreezeWaitSatisfied for
+    //    this epoch with bound_conservative_wait_ms == folded wait AND
+    //    wait_generation == folded wait_generation AND wait_generation > 0
+    //    (stale-generation Satisfy after equal-wait rematch MUST reject --
+    //    round-31; legacy gen 0/missing MUST reject -- round-32);
+    //    also reject while legacy-wait (folded wait>0 && folded gen==0) --
+    //    migration seal required before any probe attempt;
+    //    try_reserve_probe(..., bool wait_ok) remains a FAST-PATH hint only;
+    //  - accept purpose in {DeadlineOrVerify, ClockRepublishOrVerify}; both
+    //    burn the same 8-cap (round-28/29 -- neither is a free lane);
+    //  - reject ClockRepublishOrVerify if a trustworthy clock is already
+    //    published (that purpose is only for now_utc-absent re-publish+verify);
+    //  - on Ack: return AuditAppendResult with .sequence set; caller MUST
+    //    pass that full result into confirm_attempt_acked before any /time
+    //    send (round-27 P1). sequence==0 is legal (generation genesis).
+    //  - Note: FreezeClear{ProbeVerified} after ClockRepublishOrVerify is
+    //    legal when proof+deadline+WaitSatisfied(current gen) hold
+    //    (round-29/31) -- append path is append_freeze_clear, not this method.
+    virtual AuditAppendResult append_freeze_probe_attempt(
+        const FreezeProbeAttemptPayload& attempt,
+        FrameTimeKind time_kind) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4871
+    // Round-22/25/26/31 -- terminal-clear path. Sink MUST:
+    //  - reject attempt.cleared==true on append_freeze_probe_attempt;
+    //  - reject ProbeVerified/ConservativeWaitCompleted if folded source==2;
+    //  - ProbeVerified: verify FreezeTimeProbeProof (extended MAC domain,
+    //      including proof.tls_verified_host in allowlist + MAC domain);
+    //    if folded conservative_wait_ms > 0: REQUIRE an already-Acked
+    //      sink-verified FreezeWaitSatisfied for this epoch with
+    //      bound_conservative_wait_ms == folded wait AND
+    //      wait_generation == folded wait_generation AND wait_generation > 0
+    //      (required-present at clear Ack -- do NOT mark "consumed" before
+    //      clear succeeds; a Failed clear must leave WaitSatisfied reusable
+    //      for this gen); reject clear while legacy-wait (folded gen==0);
+    //      equality of FreezeClearPayload.bound_conservative_wait_ms alone
+    //      is NOT sufficient; stale-generation / legacy-gen Satisfy is NOT
+    //      sufficient (round-25/26/31/32);
+    //    clear.bound_wait_generation MUST equal folded wait_generation when
+    //      wait>0; MUST be 0 when wait==0;
+    //    if conservative_wait_ms == 0: WaitSatisfied not required;
+    //  - ConservativeWaitCompleted ONLY when folded deadline_utc_ms == 0;
+    //    if conservative_wait_ms > 0: SAME generation-bound WaitSatisfied
+    //      requirement (round-26/31 -- not optional);
+    //  - OperatorAuthorized: published clock + KEK MAC + tip bind + nonce;
+    //  - Ack before in-memory lift / release_probe clear.
+    virtual AuditAppendResult append_freeze_clear(
+        const FreezeClearPayload& clear,
+        FrameTimeKind time_kind) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4886
+    // Round-26/31/32 P0 -- arm a conservative wait. Sink MUST:
+    //  - reject if no active freeze for freeze_epoch;
+    //  - reject if bound_conservative_wait_ms != folded wait;
+    //  - reject if folded wait > 0 && wait_generation == 0 (gen 0 illegal
+    //    whenever a wait is active -- blocks Arm-before-migration on legacy-wait);
+    //  - reject if wait_generation != folded wait_generation;
+    //    (legacy-wait folded gen==0: Arm impossible until migration seals gen>=1);
+    //  - reject if source==2;
+    //  - on Ack: record process-local arm_ack_steady[epoch] = steady_now,
+    //    arm_frame_seq, arm_ordinal, bound, wait_generation (OVERWRITE prior
+    //    incomplete arm when generation or arm_ordinal advances);
+    //  - NOT clear the episode.
+    virtual AuditAppendResult append_freeze_wait_arm(
+        const FreezeWaitArmPayload& arm,
+        FrameTimeKind time_kind) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4903
+    // Round-25/26/31/32 P0 -- non-terminal wait evidence. Sink MUST:
+    //  - reject if no active freeze for freeze_epoch;
+    //  - reject if bound_conservative_wait_ms != folded wait;
+    //  - reject if folded wait > 0 && wait_generation == 0;
+    //  - reject if wait_generation != folded wait_generation (stale gen);
+    //  - reject if source==2 (permanent has no timed wait to satisfy);
+    //  - reject if no live-session Arm for (epoch, arm_ordinal, wait_generation)
+    //    whose arm_frame_seq matches payload.arm_frame_seq;
+    //  - reject unless (steady_now_at_satisfy_ack - arm_ack_steady) >= bound
+    //    AND elapsed_steady_ms_claimed >= bound;
+    //  - NOT clear the episode / NOT set out_has_freeze false;
+    //  - after wait_generation advances, prior WaitSatisfied is insufficient
+    //    even if bound ms is equal (round-31 equal-wait rematch);
+    //  - legacy gen-0 Satisfy is never acceptable as current evidence (round-32).
+    virtual AuditAppendResult append_freeze_wait_satisfied(
+        const FreezeWaitSatisfiedPayload& wait,
+        FrameTimeKind time_kind) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4912
+    // NEW -- freeze_epoch durable high-water: next allocatable epoch.
+    // Ack watermark with next=E+1 BEFORE using epoch E (round-21 P0).
+    // Only for NEW episodes (round-22); merges skip this.
+    // Never derive by scanning (compaction may drop resolved freeze/probe
+    // history). time_kind REQUIRED (round-20) -- Phase-B episodes use
+    // UnknownBootstrap matching the freeze that follows.
+    virtual AuditAppendResult append_freeze_epoch_watermark(
+        std::uint32_t next_freeze_epoch,
+        FrameTimeKind time_kind) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4936
+    // Round-40...46 -- exactly-once seal-journal APPLY as ONE durable frame.
+    // Call shape: SealJournalAppliedView ONLY (time_* + baseline + kek_key_id).
+    // FORBIDDEN: separate FrameTimeKind arg; FORBIDDEN: MAC-omitted baseline;
+    // FORBIDDEN: opaque-only entry_mac compare without HY-SEALJRN-v1 recompute.
+    // Ambient: CURRENT store_uuid + KEK table (same class as SealExportStarted).
+    // Sink MUST on EVERY call (see SealJournalAppliedView comment, deferred to
+    // the round that defines it):
+    //  - allowlist + size + schema + FrameTimeKind rules;
+    //  - MUST recompute HY-SEALJRN-v1 over ambient store_uuid + view fields;
+    //    view.entry_mac != expected -> Corrupt; zero business effects;
+    //  - index {candidate_id, journal_seq} ONLY; present -> byte-equal stored
+    //    Applied authenticated fields + same entry_mac -> idempotent Ack;
+    //    else Corrupt; absent -> one framed apply + Ack;
+    //  - store frame MAC is NOT a substitute for entry_mac recompute;
+    //  - refuse naked append_* of embedded payload as journal apply;
+    //  - span valid until return.
+    // Caller / recovery: §10.1 baseline + wire MAC-valid before call.
+    // Compaction: while any seal-journal entry for candidate_id remains,
+    // retain every SealJournalApplied for that candidate (or refuse
+    // compaction). Retained Applied MUST keep baseline 4-tuple + kek_key_id
+    // + entry_mac intact until the frame is dropped entirely.
+    //
+    // SealJournalAppliedView is deliberately still an incomplete type in this
+    // header (see the forward declaration above) -- this method's signature
+    // is transcribed byte-for-byte, but it cannot be called (an argument of
+    // incomplete type cannot be constructed) until a future round defines
+    // the seal-journal family. The test file's stub subclass declares this
+    // override but cannot exercise it for the same reason.
+    virtual AuditAppendResult append_seal_journal_apply(
+        const SealJournalAppliedView& apply) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4972
+    // Recovery (round-22/25/26/27/31/32):
+    //  - out_has_freeze / out_active_freeze = folded active state (§7.3.1)
+    //    including folded wait_generation (raw max; 0 means legacy/unspecified
+    //    when wait>0 -- see legacy-wait migration, do NOT synthesize match)
+    //  - out_permanent_latch / out_uncleared_epoch_count as before
+    //  - out_has_wait_satisfied = true ONLY if FreezeWaitSatisfied OR
+    //    CompactedFreezeWaitEvidence (single CompactedFreezeWaitEvidencePayload)
+    //    matches binding epoch AND wait_generation == folded wait_generation
+    //    AND wait_generation > 0 (legacy gen 0/missing -> always false)
+    //  - CompactedFreezeWaitEvidence counts as Satisfy for recovery gates
+    //    but does NOT restore arm_ack_steady (if compacted Satisfy present for
+    //    current gen, skip re-wait -- same as live Satisfy Acked in prior process)
+    //  - legacy-wait (wait>0 && folded gen==0): out_has_wait_satisfied=false;
+    //    caller MUST migration/compaction-seal before probe/clear (§7.3.1)
+    //  - out_has_wait_arm = latest FreezeWaitArm for binding epoch+generation
+    //    WITHOUT a subsequent matching WaitSatisfied -- informational only;
+    //    live process MUST re-Arm if no current-gen Satisfy (prior arm_ack_steady
+    //    is gone across restart); legacy Arm never counts as live-session Arm
+    //  - After return, caller MUST
+    //      credit.restore_from_recovery(
+    //          out_has_freeze ? out_active_freeze.freeze_epoch : 0,
+    //          {out_freeze_probe_attempts.data(),
+    //           out_freeze_probe_attempt_count},
+    //          out_has_freeze ? out_active_freeze.deadline_utc_ms : 0,
+    //          steady_now, now_utc_ms_or_nullopt);
+    //    before any try_reserve_probe (round-25/27). folded deadline is
+    //    REQUIRED so multi-day UTC bans survive crash without short-backoff
+    //    probe storms.
+    //  - After a NEW episode's watermark+freeze Ack:
+    //      credit.bind_new_episode_after_durable_create(
+    //          epoch, payload.deadline_utc_ms);
+    //  - After legacy-wait migration freeze Ack (round-32): treat like a
+    //    wait-generation advance -- no Satisfy yet; Arm under gen 1.
+    virtual RecoveryScanStatus recover_control_plane(
+        RateLimitFreezePayload& out_active_freeze,
+        bool& out_has_freeze,
+        bool& out_permanent_latch,
+        std::uint8_t& out_uncleared_epoch_count,
+        EndpointWeightConfig& out_weights,
+        bool& out_has_weights,
+        RateLimitUsageSnapshotPayload& out_usage,
+        bool& out_has_usage,
+        GenerationBridgePayload& out_bridge,
+        bool& out_has_bridge,
+        std::uint32_t& out_next_freeze_epoch,
+        bool& out_has_freeze_epoch_watermark,
+        std::array<FreezeProbeAttemptPayload, 8>& out_freeze_probe_attempts,
+        std::size_t& out_freeze_probe_attempt_count,
+        FreezeClearPayload& out_latest_clear,
+        bool& out_has_clear,
+        FreezeWaitSatisfiedPayload& out_wait_satisfied,
+        bool& out_has_wait_satisfied,
+        FreezeWaitArmPayload& out_wait_arm,       // NEW round-26
+        bool& out_has_wait_arm) noexcept = 0;     // NEW round-26
+};
+static_assert(std::is_abstract_v<DurableControlPlaneSink>);
+static_assert(std::has_virtual_destructor_v<DurableControlPlaneSink>);
+static_assert(std::is_trivially_copyable_v<DurableControlPlaneSink::CompactionFreezeSnapshotProof>);
+static_assert(std::is_standard_layout_v<DurableControlPlaneSink::CompactionFreezeSnapshotProof>);
+static_assert(std::is_trivially_copyable_v<DurableControlPlaneSink::CompactionWaitEvidenceProof>);
+static_assert(std::is_standard_layout_v<DurableControlPlaneSink::CompactionWaitEvidenceProof>);
+
+// --- OperatorOverrideSidecar ---
+// SPEC-CLASS: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4999
+//
+// Sidecar-only API (same header, separate class) -- round-12 P0. Lives beside
+// the breadcrumb path, OUTSIDE the store root. Does not require the
+// hash-chained log to be open for append. Offline operator tool + recovery
+// admission both use this; the running fenced L5 process does not.
+
+class OperatorOverrideSidecar {
+public:
+    virtual ~OperatorOverrideSidecar() = default;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:5006
+    // Creates final nonce-named evidence with OS no-replace semantics
+    // (POSIX linkat/renameat2(RENAME_NOREPLACE); Windows CREATE_NEW). A
+    // replace-capable rename is forbidden. Canonical bytes + file and parent
+    // durability barriers are required; an existing nonce is a hard failure.
+    virtual AuditAppendResult write_override(
+        const OperatorOverridePayload& ov) noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:5008
+    virtual bool read_override(OperatorOverridePayload& out) const noexcept = 0;
+
+    // SPEC-METHOD: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:5012
+    // Atomically creates an immutable nonce-named consumed tombstone outside
+    // the store (CREATE_NEW/no-replace, MAC-protected, fsynced). It is never
+    // deleted by compaction. Recovery rejects a nonce with any tombstone.
+    virtual AuditAppendResult consume_after_successful_admission(
+        std::uint64_t nonce) noexcept = 0;
+};
+static_assert(std::is_abstract_v<OperatorOverrideSidecar>);
+static_assert(std::has_virtual_destructor_v<OperatorOverrideSidecar>);
 
 }  // namespace hy

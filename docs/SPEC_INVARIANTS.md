@@ -309,6 +309,52 @@ include/hengyuan/durable_control_plane.hpp` 里 L4 §10（`docs/BINANCE_PRIVATE_
   epoch"（round 21 P0 措辞裁决）；默认值必须是 `1`，不是 `0`——`0` 是保留值。首次移植 this round
   （`BINANCE_PRIVATE_REST_L4_SPEC.md:2810`）。
 
+### DurableControlPlaneSink 接口族（L4 §10 接口表面收尾）
+
+**[已实现]** L4 §10（`BINANCE_PRIVATE_REST_L4_SPEC.md:2449-5327`）此前只转写了 6 个原始类型 +
+freeze-episode 一轮的 3 枚举 8 struct。这一轮补上 L4-owned 接口本身——三个抽象类
+（`DurableControlPlaneSink`/`ExternalAnchorClient`/`OperatorOverrideSidecar`）连同它们方法签名
+依赖的 7 个 payload 结构体。补完之后，L4 §10 唯一仍未转写的是 seal-journal/`.xgc` wire-format
+家族（§10.1/§10.3，约 2,400 行，密集互相引用），维持既有裁决——"compaction / generation 切换 /
+seal journal 不做，日志无限增长，这是已知缺口，等后续单独排期"（上面 durable 审计日志条目原话）。
+
+- `LastRemoteAckedTip` — 追溯性补漏：这是紧邻已转写的 `ExportTuple`/`ExportOutboxRing` 的
+  §10.2.1 类型（导出 worker 与 compaction seal 路径共同维护的 tip 断点），此前完全缺失，连文件
+  自己的"尚未转写"清单都没点名——本轮修正这个疏漏。首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:4586`）。
+- `EndpointWeightConfig` — 唯一来自 §7.4 而非 §10 的类型，因为 `append_weight_config`/
+  `recover_control_plane` 硬依赖它才必须挂在这个文件里；已用 grep 核实 `native/include/hengyuan/
+  *.hpp` 里此前完全不存在这个符号（只有作为枚举判别符的 `EndpointWeightConfigSet` 是同名不同物）。
+  首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:2339`）。
+- `SymbolRegistrySnapshotPayload` / `RateLimitUsageSnapshotPayload` / `OperatorOverridePayload` /
+  `GenerationBridgePayload` / `GenerationSeal` — 首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:2880` / `2889` / `2903` / `2940` / `2973`）。
+  `GenerationBridgePayload::bridge_mac` 的 MAC 域固定用 `new_key_id`（而非"当前生效的 key"）——照抄，
+  不要"简化"。`GenerationSeal` 内嵌一个 `GenerationBridgePayload bridge{}` 成员。
+- `DurableControlPlaneSink`（`BINANCE_PRIVATE_REST_L4_SPEC.md:4707`）——**口径更正**：14 个
+  `append_*` + 1 个 `recover_control_plane` = **15 个纯虚声明**，不是此前准备文档里写的 16；
+  `virtual ~DurableControlPlaneSink() = default;` 不是纯虚，不计入。**已知的、本轮刻意不解决的
+  接口差距**：`append_seal_journal_apply` 的 spec 签名参数类型 `SealJournalAppliedView` 属于仍然
+  排除在外的 seal-journal 家族——本轮只前向声明该类型（不完整类型，仅出现在函数声明里合法，不定义
+  它），这保住了接口签名的逐字转写，同时不把 seal-journal wire format 本身提前拖进这一轮。
+  `ExternalAnchorClient`（5 个纯虚方法，`:4659`）与 `OperatorOverrideSidecar`（3 个纯虚方法，
+  `:4999`）两者均无 seal-journal 依赖，完整转写、无前向声明需要。
+- **抽象类治理规则（本文件第一次出现 vtable 类型）**：不再适用
+  `is_trivially_copyable_v`/`is_standard_layout_v`；改用 `static_assert(std::is_abstract_v<T>)` +
+  `static_assert(std::has_virtual_destructor_v<T>)`。`tools/spec_enum_diff.py` 对方法签名没有
+  等价的 diff 能力（只解析 `enum class` 块）——这是本轮明确承认、不解决的验证缺口，补偿手段是
+  `test_durable_control_plane_sink_interface_abi.cpp` 里手写的 stub 子类：每个接口一个具体子类
+  覆写全部纯虚方法，覆写签名与基类纯虚不完全一致就是编译错误，起到 `is_trivially_copyable_v` 对
+  结构体同等的"证明形状为真"作用。
+- 补充上面 durable 审计日志条目：`DurableControlPlaneSink` 现在是 `durable_control_plane.hpp`
+  里真实存在的类（此前只是 spec 里的假设性引用）；`DurableAuditSink` 不继承它的裁决维持不变，
+  本轮不重新审视。
+
+`spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——前者对本轮新增的 3 个接口类 + 7 个结构体
+没有任何 `enum class` 需要处理（match tally 数字不变）；后者的搜索文件列表已经包含
+`durable_control_plane.hpp` 与 `account_truth.hpp`，新符号通过 ledger 反引号自动被下一次抓取，
+无需手工登记列表。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
