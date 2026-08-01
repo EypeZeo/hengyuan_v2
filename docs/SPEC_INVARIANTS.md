@@ -229,6 +229,32 @@ spec 字面文本的地方，连同理由——**不是遗漏，是范围裁决*
   `live_submit_orchestrator.hpp` 的 Gate 6/8/9**（即 `orchestrate_submit()` 本身还不会真的调用
   `append_durable()`）——那是触及热提交路径 gate 顺序的独立大改动，留到后续排期。
 
+**[已实现]** 以上全部决策已落地：`sha256.hpp`（vendored SHA-256/HMAC-SHA256，RFC 4231 + NIST 已知答案
+测试向量钉死正确性）、`durable_frame_codec.hpp`（纯内存帧编解码，spec 定义的 version+record_type+
+sequence_number+time_kind+recorded_utc_ms+length+payload+prev_mac+mac 格式，HMAC 覆盖包括 prev_mac
+在内的全部字段，构成真正的哈希链）、`durable_audit_sink.hpp`（`DurableAuditSink`：跨平台文件锁
+POSIX flock/Windows 无共享 CreateFileA、每次 append 同步 fsync、本地 tip anchor 原子替换含 POSIX
+目录 fsync（Windows 侧诚实声明不做等价的目录持久化）、`recovery_scan()` 含截断/校验和损坏两类失败
+分离处理 + tip anchor 交叉核对 + 逐 COID 重放）、`checkpoint_to_order_record()`/
+`repopulate_in_flight_registry()`（启动恢复集成辅助函数）。
+
+测试阶段（`test_durable_audit_sink.cpp`，真实文件 I/O）抓到的真实问题：
+- **GCC-only 编译错误**：`durable_audit_sink.hpp` 只 include 了 `<fcntl.h>`，没有 `<sys/file.h>`。
+  `<fcntl.h>` 自己也定义了一个叫 `flock` 的 POSIX record-lock **struct**，和 `<sys/file.h>` 里
+  BSD 风格的 `flock()` **函数**同名——没有后者的声明时，GCC 把 `::flock(fd, LOCK_EX|LOCK_NB)` 解析成
+  了对 `struct flock` 的聚合初始化，而不是函数调用。MSVC 这条分支完全不存在（Windows 侧用的是
+  `CreateFileA` 独占打开），两边工具链都要跑的规则又抓到一次真正的分歧。
+- **测试自己的建模错误，不是实现 bug，但值得记录**：最初的"截断写入"测试是先让两次 `append_durable()`
+  都真正成功（tip anchor 正确前进到 seq 1），再事后截断日志文件字节——这其实模拟的是"删除日志尾部"
+  （tip anchor 指向的 seq 在截断后的日志里已经读不到），必然是 `Corrupt`，而不是真实崩溃场景（真实
+  崩溃时，只有日志字节的写入可能被打断，tip anchor 从未被更新到那笔未完成的 append，所以 anchor 应该
+  还停在上一笔成功的 seq）。改用"只写入一笔真实帧的前缀字节、绕过 `append_durable()`"才是真正复现
+  崩溃场景，验证通过——这个反例反而确认了"anchor 领先于日志尾 = 尾部删除攻击"这条判定规则本身是对的，
+  留作 test_durable_audit_sink.cpp 的 AnchorAheadOfTruncatedLogIsCorruptTailDeletion 测试单独钉死这个场景。
+
+验证：MSVC 481/481、WSL2 GCC-14 none/address/thread 三模式全绿（TSan 负控制仍正确报出注入的竞争）、
+`spec_xref_check.py`/`spec_enum_diff.py` 均 exit 0。
+
 ### 崩溃恢复 / Freeze 子系统
 
 - `FreezeProbeCredit` — 8 次总尝试上限，durable-persisted attempt count（跨崩溃循环不重置），
