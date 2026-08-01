@@ -168,6 +168,19 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     在生命周期驱动器落地前，每一笔非拒绝订单都单调消耗容量，64 笔后提交通道停摆。
   - 行为已由 `test_durable_control_plane_abi.cpp` 的 `InFlightRegistryCapacity.*` 钉死——那两个测试是
     **把现状记录为"正确但不完整"**，不是 bug 报告。
+  - **[已关闭，Ambiguous 分支]**：`order_tracker.hpp`（新文件）新增 `OrderTracker`/`poll_once()`/
+    `drain_reconcile_events()`，是 `determine_reconcile_action()` 的第一个生产调用点。热线程
+    （`live_submit_orchestrator.hpp` 的 `orchestrate_submit()`）与对账线程之间只通过两条
+    `SpscRing<T,N>`（`ToReconcileRing`/`ReconcileEventRing`）交接，`InFlightRegistry`/`AuditRingSink`
+    继续保持单一写者（热线程），`OrderTracker` 单一写者（对账线程）——没有给这两个结构体加原子量。
+    `InFlightRegistry` 新增 `InFlightHandle{slot_index, generation}` + `mark_resolved_handle()`
+    防止跨线程陈旧消息误释放被复用的槽位（ABA）。第二个 `mark_resolved*()` 调用点现在存在于
+    `drain_reconcile_events()`，仅当 `is_exchange_final(resulting_state)` 为真时才释放。跨线程真实
+    并发由 `test_reconcile_concurrency.cpp` 验证（WSL2 TSan 通过，见 `tools/wsl_verify.sh thread`）。
+    **仍未关闭的部分**：`Accepted`/`PartialFill`（"仍然存活"而非"已解决"）发现后不会被持续轮询直到
+    成交/撤单——那是 spec L4 §6.6 的独立机制，不在这次范围内，见 `order_tracker.hpp` 文件头的
+    "明确排除的范围"。`OrderTracker` 本身仍是纯内存态，进程崩溃后其查询次数/退避进度归零，效率损失
+    而非正确性问题（`InFlightRegistry` 现状同等级别，不是新引入的回归）。
 
 ### 崩溃恢复 / Freeze 子系统
 
