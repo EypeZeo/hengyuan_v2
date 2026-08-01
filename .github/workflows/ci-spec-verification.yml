@@ -160,3 +160,84 @@ jobs:
             echo "::endgroup::"
           done
           exit $fail
+
+  tla-model-check-freeze:
+    name: "L3: TLA+ model checking (freeze-episode slice, 轨道 C)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Separate job, not folded into tla-model-check: freeze_episode_recovery.tla
+    # is a second, independent model (see formal/README.md) -- a failure in one
+    # must not mask or block the other, same reasoning this workflow's own
+    # header gives for staying independent of ci-native.yml.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache TLA+ tools
+        id: cache-tla
+        uses: actions/cache@v4
+        with:
+          path: formal/tools/tla2tools.jar
+          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
+
+      - name: Download TLA+ tools
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p formal/tools
+          curl -sSfL -o formal/tools/tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
+          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
+            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
+
+      - name: "Safety: current design must find no violation"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config freeze_episode_recovery.cfg freeze_episode_recovery.tla
+
+      # Progress property. Note this config intentionally has no CONSTRAINT
+      # (see formal/README.md) -- do not "fix" it by adding one.
+      - name: "Liveness: EventualFreezeResolution must hold"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config freeze_episode_recovery_liveness.cfg freeze_episode_recovery.tla
+
+      # These three MUST fail -- same inversion discipline as tla-model-check's
+      # own controls step, applied to this model's two regression controls
+      # (round 30, round 31/32) plus its reachability probe.
+      - name: "Controls: the three expected-to-fail configs must still fail"
+        working-directory: formal
+        run: |
+          set -u
+          fail=0
+          for pair in \
+            "freeze_episode_recovery_wait_ok_bug.cfg|NoPrematureConservativeClear|round-30 forged WaitSatisfied Ack (sink trusts a caller-claimed wait instead of independently verifying)" \
+            "freeze_episode_recovery_generation_bug.cfg|WaitSatisfiedOnlyForCurrentGeneration|round-31/32 legacy generation re-match (a stale generation's WaitSatisfied satisfies a newer one)" \
+            "freeze_episode_recovery_probe.cfg|AbandonedArmUnreachable|abandoned-Arm-across-restart reachability probe"
+          do
+            cfg="${pair%%|*}"; rest="${pair#*|}"
+            inv="${rest%%|*}"; desc="${rest#*|}"
+            echo "::group::$cfg — expecting $inv to be violated"
+            echo "  control: $desc"
+            if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+                 -workers auto -config "$cfg" freeze_episode_recovery.tla > "/tmp/$cfg.log" 2>&1; then
+              echo "::error::$cfg PASSED but was expected to violate $inv. The model has stopped discriminating; do not trust the safety runs until this is fixed."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            elif grep -q "Invariant $inv is violated" "/tmp/$cfg.log"; then
+              echo "  OK: $inv violated as expected"
+            else
+              echo "::error::$cfg failed, but NOT with the expected '$inv is violated'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail

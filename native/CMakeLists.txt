@@ -292,6 +292,13 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_control_plane_abi)
     gtest_discover_tests(test_durable_control_plane_abi)
 
+    # 轨道 C: L4 §10 freeze-episode 垂直切片 (ABI-only, 见 durable_control_plane.hpp
+    # 里对应的 SPEC-STRUCT 注释块)
+    add_executable(test_durable_control_plane_freeze_abi tests/test_durable_control_plane_freeze_abi.cpp)
+    target_link_libraries(test_durable_control_plane_freeze_abi PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_control_plane_freeze_abi)
+    gtest_discover_tests(test_durable_control_plane_freeze_abi)
+
     # 轨道 A 第三项: reconcile/poll loop (order_tracker.hpp). Single-threaded here
     # (poll_once()/drain_reconcile_events() are plain functions) -- the real
     # cross-thread claim is verified separately by test_reconcile_concurrency.

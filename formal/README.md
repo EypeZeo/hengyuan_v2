@@ -6,6 +6,11 @@ crash-safety properties of the durable-log design in
 with TLC (exhaustive model checking) instead of relying on another round of human/LLM
 review to notice a contradiction.
 
+Two independent models live here: `durable_log_recovery.tla` (the OrderEvent/Gate 8-9
+crash-safety boundary) and `freeze_episode_recovery.tla` (the L4 §10 freeze-episode
+probe/Arm/WaitSatisfied/Clear state machine, further down this file). Each has its own
+config table and MUST be run separately.
+
 ## Setup (one-time)
 
 TLC needs Java (already available locally — `java -version`). Fetch the official
@@ -148,3 +153,97 @@ development before being fixed.
   that the extra translation step isn't worth it at this scope).
 - `durable_log_recovery*.cfg` — see the table above.
 - `tools/tla2tools.jar` — gitignored; fetch with the command at the top.
+
+---
+
+# `freeze_episode_recovery.tla` — L4 §10 freeze-episode slice (轨道 C)
+
+A second, **separate** model — not an extension of `durable_log_recovery.tla`, which
+explicitly disclaims the freeze/rate-limit subsystem in its own header (see this
+file's earlier section). Grounding for just the freeze-episode slice now exists
+(`docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2570-2816`), so this model covers exactly that
+slice: the probe → Arm → WaitSatisfied → Clear state machine backing
+`docs/SPEC_INVARIANTS.md`'s three already-documented freeze-subsystem invariants
+(`FreezeProbeCredit`, `wait_ok`, `wait_generation`). It does **not** cover the much
+larger compaction/generation-switch/seal-journal machinery in the rest of §10.
+
+## The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `freeze_episode_recovery.cfg` | **No error found** — the current (correct) design |
+| `freeze_episode_recovery_wait_ok_bug.cfg` | **`NoPrematureConservativeClear` violated** — regression control #1 (round 30) |
+| `freeze_episode_recovery_generation_bug.cfg` | **`WaitSatisfiedOnlyForCurrentGeneration` violated** — regression control #2 (round 31/32) |
+| `freeze_episode_recovery_probe.cfg` | **`AbandonedArmUnreachable` violated** — reachability probe |
+| `freeze_episode_recovery_liveness.cfg` | **No error found** — `EventualFreezeResolution` holds |
+| `freeze_episode_recovery_saturation.cfg` | **No error found** — bound-saturation check, manual only |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -config freeze_episode_recovery.cfg freeze_episode_recovery.tla
+```
+
+### Why three configs must fail
+
+- **`_wait_ok_bug`** reintroduces round 30's bug: the sink Acks a `WaitSatisfied`
+  frame without independently verifying real elapsed wait time, trusting whatever the
+  caller's frame claims instead. `SinkVerifiesWaitIndependently = FALSE` drops the
+  `AckAppend` guard that would otherwise refuse to Ack a forged claim.
+- **`_generation_bug`** reintroduces round 31/32's bug: a `ConservativeWaitCompleted`
+  clear accepts a `WaitSatisfied` bound to any generation `<=` the current one, not
+  just an exact match — `PromoteLegacyGenerationCorrectly = FALSE` loosens the
+  generation check that `AckAppend`/`LandAfterAbandon` re-verify at durability time
+  (deliberately re-verified there, not at request time — see the model's own comment
+  on `ClearViaConservativeWaitCompleted` for why a request-time-only check would be
+  racy against `BumpGeneration`).
+- **`_probe`** asserts `AbandonedArmUnreachable`, a claim we *want* refuted:
+  `armed.active` alongside `~armedThisSession` and `~satisfied.active` is the unique
+  signature of "this session Armed, then crashed before ever claiming
+  `WaitSatisfied`" (spec:2745's "abandoned across process restart" rule). If TLC
+  cannot violate this, that rule is never actually exercised.
+
+## Recorded results (2026-08-01, TLC 2.19)
+
+| Config | States (distinct) | Depth | Result |
+|---|---|---|---|
+| main | 4,995,065 | 61 | no error |
+| wait_ok_bug | 588 | — | `NoPrematureConservativeClear` violated ✓ |
+| generation_bug | 2,393 | — | `WaitSatisfiedOnlyForCurrentGeneration` violated ✓ |
+| probe | 31 | — | `AbandonedArmUnreachable` violated ✓ |
+| liveness | 70,835 | 32 | no error (`EventualFreezeResolution` holds) |
+| saturation | 6,978,870 | 61 | no error |
+
+**Saturation check**: main at `MaxCrashes=2` (others held at
+`Fails=2/Probes=9/Episodes=3`) → 4,995,065 states; saturation at `MaxCrashes=3` (same
+others) → 6,978,870 states. State count grew 1.4×, violations stayed at zero. Unlike
+`durable_log_recovery.tla`'s saturation check (which bumps 2 independent budgets
+together), this one bumps only `MaxCrashes` — an earlier attempt bumping all 4
+independent budgets simultaneously (`Crashes=3/Fails=3/Probes=10/Episodes=4`) was
+still growing past 17M states after 4 minutes with no end in sight, since this
+model's 4 independent budgets multiply combinatorially in a way
+`durable_log_recovery.tla`'s 2 do not.
+
+## Design notes specific to this model
+
+- **No growing append-only log.** Unlike `durable_log_recovery.tla`'s `durableLog`
+  sequence, this model tracks only the LATEST record of each frame kind as scalar
+  durable state (`armed`, `satisfied`, `clearKind`) — matching what
+  `recover_control_plane()` actually reconstructs (latest-per-kind, not a full
+  replay). One consequence: an abandoned write's durable effect applies directly at
+  land time (`DurableEffect`), not via a separate log-scanning `Recover()` action —
+  there is no log to scan.
+- **A cleared episode's evidence is not wiped by the clear itself** — only
+  `DetectFreeze` (starting the next episode) resets `armed`/`satisfied`/
+  `probeAttempts`. This is what lets `NoPrematureConservativeClear` and
+  `WaitSatisfiedOnlyForCurrentGeneration` check what justified a clear *after* it
+  happened, without the check racing its own side effect.
+- **Known resolution limit**: `ClearViaProbeVerified`'s actual ground-truth condition
+  (serverTime genuinely past deadline) is not modeled — the guard only requires a
+  genuine attempt was made. Neither regression target involves that path, so a full
+  ghost-truth treatment would add complexity without discriminating power for a real
+  historical bug.
+
+## Files
+
+- `freeze_episode_recovery.tla` — the model.
+- `freeze_episode_recovery*.cfg` — see the table above.
