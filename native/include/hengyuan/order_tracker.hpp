@@ -415,6 +415,9 @@ inline void drain_reconcile_events(InFlightRegistry& in_flight,
                                  : AuditEventType::OrderReconciled;
             ar.exchange_order_id = ev.exchange_order_id;
             ar.set_client_order_id(ev.coid.view());
+            ar.resulting_state = ev.resulting_state;
+            ar.filled_qty_ticks = ev.filled_qty_ticks;
+            ar.avg_fill_price_ticks = ev.avg_fill_price_ticks;
             audit->append(ar);
         }
         if (is_exchange_final(ev.resulting_state)) {

@@ -91,6 +91,18 @@ struct AuditRecord {
     std::int64_t detail_code{0};  // binance error code, pre-trade check code, etc.
     char detail_msg[64]{};        // short sanitized message (no secrets)
 
+    // Precise post-event order state and fill progress. Added for the durable
+    // audit log's recovery_scan() (docs/SPEC_INVARIANTS.md's "durable 审计日志"
+    // entry): without these, a replay can tell THAT an order was reconciled but
+    // not WHICH of the six exchange-final states it actually landed in, nor how
+    // much filled. event_type alone is not enough -- e.g. OrderReconciled is
+    // emitted for Accepted/PartialFill/Filled/Cancelled/Rejected/Expired alike
+    // (order_tracker.hpp's drain_reconcile_events()), so the specific outcome
+    // would otherwise be lost the instant the record is written.
+    OrderState resulting_state{OrderState::Intent};
+    std::int64_t filled_qty_ticks{0};
+    std::int64_t avg_fill_price_ticks{0};
+
     void set_client_order_id(std::string_view coid) noexcept {
         auto len = coid.size() < kClientOrderIdLen ? coid.size() : kClientOrderIdLen;
         std::memcpy(client_order_id, coid.data(), len);

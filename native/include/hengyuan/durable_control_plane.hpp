@@ -184,6 +184,18 @@ struct OrderRecoveryCheckpoint {
     std::uint32_t rules_version{0};
     std::uint8_t query_attempts{0};
     std::int64_t last_poll_completed_utc_ms{0};
+
+    // Additive beyond the spec's current flat shape at the line cited above
+    // (docs/SPEC_INVARIANTS.md's "durable 审计日志" entry): AuditRecord already
+    // carries both, and OrderRecord needs both restored for correctness (order
+    // book/exposure accounting needs symbol_id; a resolved order's exchange
+    // identity needs exchange_order_id), not just diagnostics. Deliberately NOT
+    // chasing the spec text's other proposed fields (side, order_type, a
+    // rules_snapshot-at-submit SymbolRules join, an escalated-ledger array) --
+    // those pull in symbol-registry-snapshot recovery, out of scope for the
+    // minimal durable-log slice this struct currently serves.
+    std::uint32_t symbol_id{0};
+    std::int64_t exchange_order_id{0};
 };
 static_assert(std::is_trivially_copyable_v<OrderRecoveryCheckpoint>);
 static_assert(std::is_standard_layout_v<OrderRecoveryCheckpoint>);

@@ -182,6 +182,53 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     "明确排除的范围"。`OrderTracker` 本身仍是纯内存态，进程崩溃后其查询次数/退避进度归零，效率损失
     而非正确性问题（`InFlightRegistry` 现状同等级别，不是新引入的回归）。
 
+### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
+
+上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/
+`OrderTracker` 的在途订单追踪全部丢失。两份 spec 里"durable 审计日志"字面上是一整套很大的子系统
+（HMAC 链式帧格式 + tip anchor 本地文件 + 外部锚定服务网络客户端 + compaction/generation 切换 +
+seal journal + L4 冻结子系统持久化 + group-commit 批量提交 SLA）；已和用户确认范围，这一轮只做能
+真正闭环解决"崩溃后 InFlightRegistry/OrderRecord 状态丢失"的最小垂直切片。以下是这一轮决定要偏离
+spec 字面文本的地方，连同理由——**不是遗漏，是范围裁决**：
+
+- **`AuditRecord`（`audit_trail.hpp`）新增 `resulting_state`/`filled_qty_ticks`/`avg_fill_price_ticks`
+  三个字段** [已实现]。不是可选项：`order_tracker.hpp` 的 `drain_reconcile_events()` 对六种
+  exchange-final 状态（`Accepted`/`PartialFill`/`Filled`/`Cancelled`/`Rejected`/`Expired`）里的
+  Reconciled 结果统一写 `AuditEventType::OrderReconciled`，具体是哪一种、成交了多少，在这三个字段
+  加上去之前会在写审计记录的那一刻就永久丢失——`recovery_scan()` 不可能凭空补回来。
+  `live_submit_orchestrator.hpp` 里所有带 `client_order_id` 的审计记录（`OrderIntentCreated` 到
+  `OrderAccepted`/`OrderRejected`/`OrderAmbiguous` 全部路径，含提前失败的 `PreflightFailed`/
+  `RateLimitApproaching`）也同步补上 `ar.resulting_state = result.order.state`，否则逐 COID 重放只
+  在"被 reconcile 过"的那一段有精确状态，其余路径全靠 `event_type` 猜，猜不出具体状态。
+- **`OrderRecoveryCheckpoint`（`durable_control_plane.hpp`）加 `symbol_id`/`exchange_order_id`
+  两个字段** [已实现]，不追随 spec 当前文本（`SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:1289`）那个更大
+  的、带 `RecoveredOrderRecord`/`side`/`order_type`/`rules_snapshot_at_submit: SymbolRules` 联查/
+  `kMaxEscalated` 升级台账的版本——那个版本本身在代码里从未移植过，追上去会把 symbol registry 快照
+  恢复也拖进这一轮。`rules_version`/`query_attempts`/`last_poll_completed_utc_ms` 恢复后一律归零/
+  never-polled，这是效率损失不是正确性问题（同上一条 `OrderTracker` 纯内存态的定性）。
+- **`DurableAuditSink` 这一轮做成独立的具体类，不继承 spec 里的 `DurableControlPlaneSink`**
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:4707`，14 个纯虚 L4-owned 方法：`append_rate_freeze`/
+  `append_freeze_probe_attempt`/`append_seal_journal_apply`/... 已用 grep 核实）。字面继承会强迫这
+  14 个方法全部 stub 才能实例化，而这些全部是 L4 冻结/合规子系统的持久化，明确排除在这一轮之外。
+- **只写 `DurableRecordType::OrderEvent` 帧**，L4-owned 的其余 16 种记录类型（`RateLimitFreeze`/
+  `SymbolRegistrySnapshot`/`GenerationBridge`/`FreezeProbeAttempt`/... ）这一轮都不产生。
+- **`ExternalAnchorClient` 真实网络实现不做**，比照 `SubmitPort`/`QueryPort` 先例。`ExportOutboxRing`
+  （已有，纯内存）每次 `append_durable()` 成功 Acked 后照常 push 一个 tip 记录进去保留接线点；
+  `try_push()` 失败（环满，因为还没有消费者）不 fail/fence 本地写入——本地落盘才是正确性关键的部分。
+- **compaction / generation 切换 / seal journal 不做**，日志无限增长，这是已知缺口，等后续单独排期。
+- **§6.1.1.2 密钥派生/轮换/KEK 包裹存储不做**：`DurableAuditSink` 构造时接收一个预先派生好的原始
+  key，`key_id` 固定为 0，不做轮换。**真实上线前这一点必须补上**，不是可以无限期搁置的简化。
+- **只读写帧格式 v3，不做 v1/v2 历史格式解码**：这个代码库从未写过 durable 帧，没有历史格式要兼容；
+  版本号不等于 3 一律 `IoError`。
+- **HMAC-SHA256 用 vendored 实现（新文件 `sha256.hpp`），不用 `binance_signer.hpp` 已有的 OpenSSL
+  封装**：`native/CMakeLists.txt` 里 OpenSSL 只在 `HY_BUILD_DEMO=ON` 时才链接，而 `tools/wsl_verify.sh`
+  的 TSan job 和 `CLAUDE.md` 自己文档化的 MSVC 标准验证流程都没有传这个开关——挂在它后面意味着
+  durable log 在这个仓库自己的两条"标准验证流程"里都不会被默认测试到，是实质性覆盖率倒退。用 RFC
+  4231 + NIST 官方已知答案测试向量钉死正确性，不是凭感觉相信自制实现。
+- **这一轮的"启动恢复集成"只做 `recovery_scan()` 输出重建 `InFlightRegistry`，不改
+  `live_submit_orchestrator.hpp` 的 Gate 6/8/9**（即 `orchestrate_submit()` 本身还不会真的调用
+  `append_durable()`）——那是触及热提交路径 gate 顺序的独立大改动，留到后续排期。
+
 ### 崩溃恢复 / Freeze 子系统
 
 - `FreezeProbeCredit` — 8 次总尝试上限，durable-persisted attempt count（跨崩溃循环不重置），
