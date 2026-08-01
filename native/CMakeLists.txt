@@ -215,6 +215,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_env_parser)
     gtest_discover_tests(test_env_parser)
 
+    # 轨道 A 第四项: vendored SHA-256/HMAC-SHA256 (L1, no OpenSSL -- see
+    # sha256.hpp's own header comment for why). Foundation for the durable
+    # audit log's frame checksum; independently testable/verifiable first.
+    add_executable(test_sha256_hmac tests/test_sha256_hmac.cpp)
+    target_link_libraries(test_sha256_hmac PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_sha256_hmac)
+    gtest_discover_tests(test_sha256_hmac)
+
     # P2-EXEC-LIVE-01 D12-9: live submit orchestrator (L1, mock submit port)
     add_executable(test_live_submit_orchestrator tests/test_live_submit_orchestrator.cpp)
     target_link_libraries(test_live_submit_orchestrator PRIVATE hengyuan_core GTest::gtest_main)
