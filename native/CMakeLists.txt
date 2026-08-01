@@ -223,6 +223,13 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_sha256_hmac)
     gtest_discover_tests(test_sha256_hmac)
 
+    # 轨道 A 第四项: durable 日志帧编解码 (L1, 纯内存, 无文件 I/O -- 真正的文件
+    # 落盘在 durable_audit_sink.hpp，这里只验证帧格式本身)
+    add_executable(test_durable_frame_codec tests/test_durable_frame_codec.cpp)
+    target_link_libraries(test_durable_frame_codec PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_frame_codec)
+    gtest_discover_tests(test_durable_frame_codec)
+
     # P2-EXEC-LIVE-01 D12-9: live submit orchestrator (L1, mock submit port)
     add_executable(test_live_submit_orchestrator tests/test_live_submit_orchestrator.cpp)
     target_link_libraries(test_live_submit_orchestrator PRIVATE hengyuan_core GTest::gtest_main)
