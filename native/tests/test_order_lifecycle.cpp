@@ -124,6 +124,19 @@ TEST(OrderLifecycle, AmbiguousResolvesToDiscoveredExchangeFinalState) {
               TransitionResult::Ok);
 }
 
+// SUBMITPORT spec line 961's full Ambiguous target set also includes the two
+// "actually still live" outcomes -- order_tracker.hpp's poll_once() is the first
+// caller that can discover these via reconciliation. Not exchange-final
+// (is_exchange_final() stays false for both), so a caller reaching one of these
+// must keep tracking the order under the separate open-order-polling mechanism
+// (spec L4 §6.6) -- out of scope here, this test only pins the transition itself.
+TEST(OrderLifecycle, AmbiguousResolvesToStillLiveState) {
+    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Accepted),
+              TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::PartialFill),
+              TransitionResult::Ok);
+}
+
 TEST(OrderLifecycle, AmbiguousToEscalated) {
     EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::EscalatedToOperator),
               TransitionResult::Ok);
@@ -132,14 +145,6 @@ TEST(OrderLifecycle, AmbiguousToEscalated) {
 TEST(OrderLifecycle, AmbiguousCannotRetry) {
     // Ambiguous → Submitting is NOT valid (no blind retry, M6)
     EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Submitting),
-              TransitionResult::InvalidTransition);
-}
-
-TEST(OrderLifecycle, AmbiguousCannotDirectAccept) {
-    // Accepted/PartialFill ("still live, keep tracking") are deliberately NOT
-    // reachable from Ambiguous by this state machine alone — that belongs to the
-    // not-yet-built reconcile/poll loop, not a one-shot terminal resolution.
-    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Accepted),
               TransitionResult::InvalidTransition);
 }
 
@@ -264,7 +269,7 @@ TEST(Reconcile, NonAmbiguousNoAction) {
 // Expected values are derived from order_lifecycle.hpp's own contract:
 //   * is_terminal(from) short-circuits to AlreadyTerminal for all 12 targets,
 //     regardless of `to`. Six terminal states x 12 = 72 pairs.
-//   * The 20 Ok transitions are listed explicitly in kValidTransitions below.
+//   * The 22 Ok transitions are listed explicitly in kValidTransitions below.
 //   * Everything else is InvalidTransition.
 namespace {
 
@@ -299,9 +304,12 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::Accepted,        OrderState::Filled},
     {OrderState::Accepted,        OrderState::CancelRequested},
     {OrderState::Accepted,        OrderState::Expired},
-    // Ambiguous: reconciliation resolves to whichever exchange-final state the
-    // query discovered, or escalation — never a blind resubmit, and never the
-    // generic Reconciled bucket (docs/SPEC_INVARIANTS.md's "Reconciled" entry).
+    // Ambiguous: reconciliation resolves to whichever state the query discovered
+    // (exchange-final, or still-live Accepted/PartialFill per spec line 961), or
+    // escalation — never a blind resubmit, and never the generic Reconciled
+    // bucket (docs/SPEC_INVARIANTS.md's "Reconciled" entry).
+    {OrderState::Ambiguous,       OrderState::Accepted},
+    {OrderState::Ambiguous,       OrderState::PartialFill},
     {OrderState::Ambiguous,       OrderState::Filled},
     {OrderState::Ambiguous,       OrderState::Cancelled},
     {OrderState::Ambiguous,       OrderState::Rejected},
@@ -317,7 +325,7 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::CancelRequested, OrderState::Expired},
 };
 constexpr std::size_t kValidCount = sizeof(kValidTransitions) / sizeof(kValidTransitions[0]);
-static_assert(kValidCount == 20, "the Ok set changed size — update deliberately");
+static_assert(kValidCount == 22, "the Ok set changed size — update deliberately");
 
 bool is_listed_valid(OrderState from, OrderState to) {
     for (std::size_t i = 0; i < kValidCount; ++i) {
@@ -352,9 +360,9 @@ TEST(TransitionRelation, EveryOneOf144PairsMatchesTheTable) {
     // Guards against the table silently going vacuous (e.g. a future edit that
     // empties kAllStates would otherwise "pass" with zero comparisons).
     EXPECT_EQ(ok_count + invalid_count + terminal_count, 144);
-    EXPECT_EQ(ok_count, 20);
+    EXPECT_EQ(ok_count, 22);
     EXPECT_EQ(terminal_count, 72) << "6 terminal states x 12 targets";
-    EXPECT_EQ(invalid_count, 52);
+    EXPECT_EQ(invalid_count, 50);
 }
 
 // Called out separately because these four were the specific blind spot: no test
