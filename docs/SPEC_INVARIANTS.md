@@ -355,6 +355,65 @@ seal journal 不做，日志无限增长，这是已知缺口，等后续单独�
 `durable_control_plane.hpp` 与 `account_truth.hpp`，新符号通过 ledger 反引号自动被下一次抓取，
 无需手工登记列表。
 
+### Seal-journal Round A（`.xgc` 家族 3 轮之第 1 轮）
+
+**[已实现]** L4 §10 唯一仍未转写的 seal-journal/`.xgc` wire-format 家族体量巨大（约 2,400 spec 行，
+密集互相引用），一轮做不完，研究确认自然分成 3 轮：**Round A**（这一轮，id/journal 管理集群 +
+`SealJournalAppliedView` 收尾）、**Round B**（未来，Started 五元组：`SealExportStartedWire`/
+`SealExportStartedMigrationWire`/`SealStartedCleanupTombstoneWire`/`SealStartedAbandonWire`，
+依赖本轮的 `SealJournalIntakeCloseControl` 拓扑字段）、**Round C**（未来，编译意图 GC 家族：
+`CompactionCandidateIntentWire`/`CompactionIntentTransitionWire`/`CompactionIntentGcAuthorizedWire`，
+耦合最密集、体量最大，研究确认不可再切）。崩溃窗口表格（`BINANCE_PRIVATE_REST_L4_SPEC.md:5080-
+5146`）、§10.1/10.2/10.3 程序性说明文字、must-pass 故障注入清单（`:5259-5327`）——两轮并行研究均
+确认零新增具名类型，纯行为/程序文本，和 `DurableControlPlaneSink` 方法体本身同一治理级别（只转写
+签名不实现行为），不转写，也不做"仅作 TLA+ 模型锚点"式的部分转写（会引用尚不存在的类型，产生
+半成品）。
+
+- `SealIdWatermark` / `SealJournalCommitWatermark` — 首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:3009` / `3028`）。`SealIdWatermark` 的 next_candidate_id/
+  next_request_id 字段默认值是 **1 不是 0**（"next_* is the NEXT allocatable value"，同
+  `FreezeEpochWatermarkPayload` 的 next_freeze_epoch 字段裁决同源）。
+- `kMaxSealHandoffProducers`/`kSealJournalIntakeCloseDeadlineMs`/`kSealJournalIntakeCloseMaxPollIters`/
+  `SealHandoffRingId`（类型别名）— 首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:3050-3057`）。
+  spec 原文自带 `static_assert(kMaxSealHandoffProducers <= 8, ...)`（`registered_producer_mask` 是
+  `uint8_t`，位宽上限），照抄，不省略。
+- **`SealJournalIntakeCloseProducerSlot`/`SealJournalIntakeCloseControl` — 本文件第二次出现
+  atomic 承载的 RAM-only 治理类型**（第一次是 `ExportOutboxRing`）：spec 原文显式声明"RAM control
+  block; NOT a durable breadcrumb"，两者都含 `std::atomic<...>` 成员，**不是**
+  `is_trivially_copyable_v`。治理沿用 `ExportOutboxRing` 已有先例：`struct`（不是 `class`，因为
+  spec 里零方法体、零行为，和 `ExportOutboxRing` 不同）+ 显式 `= default` 构造函数 + 四个
+  `= delete`（拷贝/移动构造+赋值——一旦声明拷贝构造 `= delete`，编译器会抑制隐式默认构造函数生成，
+  这一步不能省略）+ `hy::kCacheLine` 替换 spec 原文的
+  `alignas(std::hardware_destructive_interference_size)`（GCC 12+ 对裸 std 常量报
+  `-Winterference-size`，本仓库 `-Werror`，`ExportOutboxRing` 自己的注释已经解释过这条偏离，不
+  重复）。spec 第 3092-3095 行有一段**注释掉的伪字段**（`close_deadline_steady`）——不是真实成员，
+  转写时保留为注释，不当作真字段加入。
+- `SealJournalTombstoneWire` — 首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:3116`）。
+  和这个头文件其余每一个"Wire"类型同规矩：C++ struct 本身只有 `mac[32]`，完整 108 字节 packed
+  布局只记在注释里，不展开成真实字段。
+- `SealJournalOriginKey` — 首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:4363`）。spec
+  原文明确 `entry_mac` **故意不**是这个 de-dup key 的一部分。
+- `is_seal_journal_embeddable_type` — 首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:4373`）。对 `DurableRecordType` 17 个值里的 8 个返回
+  `true`（`OrderEvent`/`OrderCheckpoint`/`RateLimitFreeze`/`FreezeEpochWatermark`/
+  `FreezeProbeAttempt`/`FreezeClear`/`FreezeWaitArm`/`FreezeWaitSatisfied`），其余 9 个 `false`——
+  已用完整枚举值核对穷举覆盖，不是抽样。
+- `kSealJournalFormatVersion`/`kSealJournalFixedMetaBytes`/`kSealJournalMaxEmbeddedBytes`/
+  `kSealJournalMaxEntryBytes` — 首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:4448-4452`）。
+  最后一个是求和表达式（`kSealJournalFixedMetaBytes + kSealJournalMaxEmbeddedBytes` = 4234），spec
+  自己就没写成独立字面量，转写时保留表达式形式。
+- **`SealJournalAppliedView` 从前向声明变成真实定义**（`BINANCE_PRIVATE_REST_L4_SPEC.md:4478`）——
+  这是本轮的核心收尾：`DurableControlPlaneSink::append_seal_journal_apply` 此前因为这个类型是
+  不完整类型而无法在测试里真正调用，本轮之后和其余 14 个方法一样可以构造真实参数、通过基类引用
+  真正调用；`test_durable_control_plane_sink_interface_abi.cpp` 相应更新，删除此前描述这个限制的
+  文件头注释段落。类型本身的定义位置也从"紧邻 `DurableControlPlaneSink` 类之前的前向声明"移到
+  "和 Round A 其余家族成员一起、更靠前的位置"——`DurableControlPlaneSink` 现在像看到
+  `GenerationSeal`/`RateLimitFreezePayload` 等其他依赖类型一样，自然看到一个完整类型，不再需要
+  前向声明这个折中手段。
+
+`spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——本轮零新增枚举；`durable_control_plane.hpp`
+已在 xref 搜索列表里，新符号靠 ledger 反引号自动被下一次抓取。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
