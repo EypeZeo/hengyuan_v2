@@ -299,6 +299,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_control_plane_freeze_abi)
     gtest_discover_tests(test_durable_control_plane_freeze_abi)
 
+    # 轨道 C: L4 §10 DurableControlPlaneSink 接口族收尾 (3 个抽象接口 + 7 个依赖
+    # 结构体, ABI-only, 见 durable_control_plane.hpp 里对应的 SPEC-CLASS/SPEC-METHOD
+    # 注释块)
+    add_executable(test_durable_control_plane_sink_interface_abi tests/test_durable_control_plane_sink_interface_abi.cpp)
+    target_link_libraries(test_durable_control_plane_sink_interface_abi PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_control_plane_sink_interface_abi)
+    gtest_discover_tests(test_durable_control_plane_sink_interface_abi)
+
     # 轨道 A 第三项: reconcile/poll loop (order_tracker.hpp). Single-threaded here
     # (poll_once()/drain_reconcile_events() are plain functions) -- the real
     # cross-thread claim is verified separately by test_reconcile_concurrency.
