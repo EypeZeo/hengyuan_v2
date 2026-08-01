@@ -14,8 +14,21 @@ static SubmitResponse g_mock_response{};
 static SubmitResponse mock_submit(
     const char* /*coid*/, std::uint32_t /*sym*/,
     OrderSide /*side*/, OrderType /*type*/,
-    std::int64_t /*price*/, std::int64_t /*qty*/, void* /*ud*/) {
+    std::int64_t /*price*/, std::int64_t /*qty*/,
+    const SymbolRules& /*rules_snapshot*/, void* /*ud*/) {
     return g_mock_response;
+}
+
+// Fixed non-zero version so the default-constructed SymbolRules in the test
+// fixture (rules_version left at 0, its default) mismatches by default unless
+// a test explicitly sets rules_.rules_version to match -- lets
+// StaleRulesVersion-path tests opt in without disturbing every other test's
+// default "both sides are 0" pass-through (see mock_submit's own comment
+// history: existing tests never touch rules_version at all).
+static std::uint32_t g_mock_current_rules_version{0};
+
+static std::uint32_t mock_current_rules_version(void* /*ud*/) {
+    return g_mock_current_rules_version;
 }
 
 // --- Test fixture ---
@@ -81,8 +94,14 @@ protected:
         // Bind the operator confirmation to the exact order set above (F3).
         bind_confirmation();
 
+        // Both sides matching and non-zero by default -- a stronger baseline
+        // than relying on "both happen to be 0", which would mask a Gate 1
+        // comparison that got accidentally skipped entirely.
+        rules_.rules_version = 1;
+        g_mock_current_rules_version = 1;
+
         g_mock_response = {SubmitOutcome::Accepted, 12345, 0};
-        ctx_.submit_port = {mock_submit, nullptr};
+        ctx_.submit_port = {mock_submit, nullptr, mock_current_rules_version};
     }
 
     // Build a confirmation that authorizes the current ctx_ order params.
@@ -171,6 +190,52 @@ TEST_F(LiveSubmitTest, DepthNotSyncedBlocks) {
 
 // --- Gate 6+7: Pre-trade ---
 
+// --- Gate "1" (spec 2.1/2.2/3): symbol registry version fast-reject ---
+
+TEST_F(LiveSubmitTest, MatchingRulesVersionPasses) {
+    // SetUp already binds both sides to 1 -- this pins that as a deliberate,
+    // asserted baseline rather than an incidental default.
+    ASSERT_EQ(rules_.rules_version, 1u);
+    ASSERT_EQ(g_mock_current_rules_version, 1u);
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+}
+
+TEST_F(LiveSubmitTest, StaleRulesVersionBlocksBeforePreTrade) {
+    g_mock_current_rules_version = 2;  // registry moved on; snapshot is now stale
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitStaleRulesVersion);
+    // Fails closed before ANY state mutation: no Submitting transition, no
+    // in-flight registration.
+    EXPECT_EQ(r.order.state, OrderState::Intent);
+    EXPECT_EQ(in_flight_.count(), 0u);
+}
+
+TEST_F(LiveSubmitTest, MissingCurrentRulesVersionFnFailsClosedAgainstNonZeroVersion) {
+    // A real (non-zero) rules_version with no way to confirm it against the
+    // registry must never be treated as "trust it" -- current_rules_version()
+    // returns 0 when the function pointer is null, and 0 never matches a real
+    // (>=1) version by construction.
+    ctx_.submit_port = {mock_submit, nullptr, nullptr};
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitStaleRulesVersion);
+}
+
+TEST_F(LiveSubmitTest, SnapshotCapturedFromSymbolRulesAtCallTime) {
+    // Deliberately does NOT perturb any pre-trade-validated field (price/qty/
+    // notional bounds) -- this test is about capture fidelity, not pre-trade
+    // logic. tick_size_ticks is read by validate_pre_trade for step alignment
+    // but ctx_.price_ticks (1000) already aligns to both the fixture default
+    // (100) and this new value (50), so changing it doesn't also change
+    // whether the order passes.
+    rules_.tick_size_ticks = 50;
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(ctx_.pre_trade_rules_snapshot.tick_size_ticks, 50);
+}
+
+// --- Gate 6+7: Pre-trade validation ---
+
 TEST_F(LiveSubmitTest, PreTradeInsufficientBalance) {
     account_.assets[0].free_ticks = 1;
     auto r = orchestrate_submit(ctx_);
@@ -221,7 +286,13 @@ TEST_F(LiveSubmitTest, OperatorNotConfirmedBlocks) {
 // --- Gate 12: Submit port ---
 
 TEST_F(LiveSubmitTest, SubmitPortInvalidBlocks) {
-    ctx_.submit_port = {nullptr, nullptr};
+    // Keep current_rules_version_fn wired so Gate 1 (which runs earlier, at the
+    // pre-trade block) passes and execution actually reaches this gate -- an
+    // all-null submit_port would fail Gate 1 first (current_rules_version()
+    // fails closed to 0 when the fn pointer is null) and never exercise the
+    // thing this test is named for. is_valid() checks fn specifically, so only
+    // fn needs to be null here.
+    ctx_.submit_port = {nullptr, nullptr, mock_current_rules_version};
     auto r = orchestrate_submit(ctx_);
     EXPECT_EQ(r.gate, OrchestratorGate::SubmitPortInvalid);
 }

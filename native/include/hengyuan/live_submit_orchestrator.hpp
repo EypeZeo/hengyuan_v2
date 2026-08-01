@@ -46,6 +46,19 @@ enum class SubmitOutcome : std::uint8_t {
     Rejected = 1,
     Timeout = 2,    // → Ambiguous (M6)
     NetworkError = 3,
+    // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §4.1: exists for ABI/logging
+    // symmetry with OrchestratorGate::SubmitStaleRulesVersion below. Gate 1 (top
+    // of orchestrate_submit()) catches a stale rules_version BEFORE
+    // SubmitPort::call() is ever invoked, so no SubmitFn implementation can
+    // actually produce this value — see the defensive-only case in
+    // orchestrate_submit()'s result-routing switch.
+    //
+    // = 5, not 4: matches the spec's own numbering exactly (spec line 780/789 —
+    // RateLimited = 4 sits between NetworkError and this value there). Value 4
+    // is deliberately left unclaimed here rather than "helpfully" renumbered to
+    // the next free slot — RateLimited is out of scope for this round
+    // (tools/spec_enum_diff.py tracks it as MISSING_IN_CODE, not a conflict).
+    StaleRulesVersion = 5,
 };
 
 struct SubmitResponse {
@@ -58,6 +71,12 @@ struct SubmitPort {
     // side + type are part of the ABI: a Binance POST /order is meaningless without
     // BUY/SELL and an order type. type is frozen to LIMIT for the first path but is
     // passed explicitly so the real runtime constructs the correct request.
+    //
+    // rules_snapshot (spec §2.1, round-5 P0): the caller's OWN captured
+    // SymbolRules copy, not a fresh lookup — this is what actually closes the
+    // TOCTOU window Gate 1 below only narrows. A real implementation must format
+    // the wire request from THIS parameter alone, never from a second registry
+    // read at send time.
     using SubmitFn = SubmitResponse(*)(
         const char* client_order_id,
         std::uint32_t symbol_id,
@@ -65,16 +84,37 @@ struct SubmitPort {
         OrderType type,
         std::int64_t price_ticks,
         std::int64_t qty_ticks,
+        const SymbolRules& rules_snapshot,
         void* user_data);
+
+    // Lightweight, side-effect-free query (spec §2.1), deliberately separate
+    // from SubmitFn so Gate 1 can call it before any audit write, CONFIRM
+    // check, or in-flight registration. Never used for wire formatting.
+    using CurrentRulesVersionFn = std::uint32_t(*)(void* user_data);
 
     SubmitFn fn{nullptr};
     void* user_data{nullptr};
+    // Placed after the two original fields (not between them) so existing
+    // 2-value aggregate-inits (`{fn, user_data}`) keep compiling unchanged and
+    // keep defaulting to nullptr here -- a real implementation must supply this
+    // explicitly to get real version-fencing instead of the fail-closed default.
+    CurrentRulesVersionFn current_rules_version_fn{nullptr};
 
     SubmitResponse call(const char* coid, std::uint32_t sym,
                         OrderSide side, OrderType type,
-                        std::int64_t price, std::int64_t qty) const noexcept {
+                        std::int64_t price, std::int64_t qty,
+                        const SymbolRules& rules_snapshot) const noexcept {
         if (!fn) return {SubmitOutcome::NetworkError, 0, -1};
-        return fn(coid, sym, side, type, price, qty, user_data);
+        return fn(coid, sym, side, type, price, qty, rules_snapshot, user_data);
+    }
+
+    // 0 is reserved as "unknown/unavailable" and never matches a real
+    // rules_version (account_truth.hpp's SymbolRules comment) -- a missing
+    // function pointer therefore fails closed by construction: Gate 1 below
+    // will see a mismatch against any real (non-zero) snapshot version.
+    std::uint32_t current_rules_version() const noexcept {
+        if (!current_rules_version_fn) return 0;
+        return current_rules_version_fn(user_data);
     }
 
     bool is_valid() const noexcept { return fn != nullptr; }
@@ -133,6 +173,23 @@ enum class OrchestratorGate : std::uint8_t {
     ConfirmationMismatch = 15,       // confirmed=true but bound summary/expiry mismatch (F3)
     DuplicateInFlight = 16,          // client_order_id already submitted, no blind retry (F4)
     InFlightRegistryUnavailable = 17,  // no registry wired → fail-closed (F4)
+    // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §2.2/§3 Gate 1: symbol registry
+    // version fast-reject. Pure local comparison, no network, no audit write, no
+    // state mutation. Deliberately positioned where the existing pre-trade
+    // block already dereferences ctx.symbol_rules, NOT moved to literally the
+    // top of orchestrate_submit() ahead of Audit/KillSwitch/DryRun/Signer/Depth
+    // -- the spec's full gate-chain renumbering (transport-policy/
+    // clock-freshness gates, audit-intent-before-CONFIRM reordering) is
+    // separate, larger, not-yet-scoped follow-up work; this round is deliberately
+    // limited to the fast-reject + snapshot-carrying mechanism only, so every
+    // gate that runs before the pre-trade block is completely unaffected.
+    //
+    // = 21, not 18: matches the spec's own numbering exactly (spec line
+    // 835-842 — SubmitPartialFill=18, SubmitFilled=19, SubmitRateLimited=20 sit
+    // between this file's existing values and this one there). 18-20 are
+    // deliberately left unclaimed rather than "helpfully" renumbered to the
+    // next free slot — those three gates are out of scope for this round.
+    SubmitStaleRulesVersion = 21,
 };
 
 struct OrchestratorResult {
@@ -156,6 +213,13 @@ struct OrchestratorContext {
 
     // Order parameters
     const SymbolRules* symbol_rules{nullptr};
+    // Captured by value from *symbol_rules at the top of orchestrate_submit(),
+    // before Gate 1's version fast-reject even runs -- see spec §2.2. This is
+    // the ONE copy that travels all the way to SubmitPort::call(); nothing after
+    // capture re-reads *symbol_rules. Caller-visible so tests/callers can
+    // inspect what was actually captured, but callers should treat this as
+    // orchestrate_submit()'s own working copy, not an input to set themselves.
+    SymbolRules pre_trade_rules_snapshot{};
     const AccountSnapshot* account{nullptr};
     OrderSide side{OrderSide::Buy};
     OrderType order_type{OrderType::Limit};  // frozen (spec 6.8)
@@ -241,8 +305,28 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         result.gate = OrchestratorGate::PreTradeFailed;
         return result;
     }
+
+    // Capture the snapshot BEFORE the version fast-reject and before validation
+    // reads any of its fields (spec §2.2): this is the ONE copy that travels
+    // unchanged all the way to SubmitPort::call() below. validate_pre_trade()
+    // and every gate after this point read ctx.pre_trade_rules_snapshot, never
+    // *ctx.symbol_rules again -- that is what actually closes the TOCTOU window;
+    // the version comparison right below only narrows it (see SubmitPort::
+    // current_rules_version()'s doc comment for the fail-closed default).
+    ctx.pre_trade_rules_snapshot = *ctx.symbol_rules;
+
+    // Gate "1" (spec §2.1/§2.2/§3) -- named SubmitStaleRulesVersion, not
+    // renumbered into this function's own gate sequence; see that enumerator's
+    // doc comment for why it sits here rather than ahead of Audit/KillSwitch/
+    // DryRun/Signer/Depth. Pure local comparison: no network, no audit write, no
+    // state mutation has happened yet at this point.
+    if (ctx.submit_port.current_rules_version() != ctx.pre_trade_rules_snapshot.rules_version) {
+        result.gate = OrchestratorGate::SubmitStaleRulesVersion;
+        return result;
+    }
+
     auto ptc = validate_pre_trade(
-        *ctx.symbol_rules, ctx.side, ctx.price_ticks, ctx.qty_ticks,
+        ctx.pre_trade_rules_snapshot, ctx.side, ctx.price_ticks, ctx.qty_ticks,
         *ctx.account, ctx.base_asset, ctx.quote_asset, ctx.now_ms, ctx.exposure_limits);
     if (ptc != PreTradeCheck::Ok) {
         result.gate = OrchestratorGate::PreTradeFailed;
@@ -376,10 +460,11 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ctx.audit->append(ar);
     }
 
-    // Execute submit
+    // Execute submit. Passes the captured snapshot, not *ctx.symbol_rules --
+    // see the capture site above for why (TOCTOU).
     auto resp = ctx.submit_port.call(
         coid.id, ctx.symbol_id, ctx.side, ctx.order_type,
-        ctx.price_ticks, ctx.qty_ticks);
+        ctx.price_ticks, ctx.qty_ticks, ctx.pre_trade_rules_snapshot);
 
     // Gate 13: Result routing
     switch (resp.outcome) {
@@ -446,6 +531,32 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.symbol_id = ctx.symbol_id;
                 ar.set_client_order_id(coid.view());
                 ar.set_detail("network error - ambiguous");
+                ctx.audit->append(ar);
+            }
+            break;
+
+        case SubmitOutcome::StaleRulesVersion:
+            // UNREACHABLE by construction under this file's own gate ordering:
+            // the top-of-block check above catches a stale version before
+            // SubmitPort::call() is ever invoked (see SubmitOutcome::
+            // StaleRulesVersion's doc comment -- this value exists only for ABI/
+            // logging symmetry with OrchestratorGate::SubmitStaleRulesVersion).
+            // Defensive fallback, not dead code with undefined behaviour: if a
+            // SubmitFn implementation ever returns this anyway, treat it the
+            // same as every other "uncertain, already sent" outcome in this
+            // switch rather than silently miscounting it as success -- matching
+            // spec §4's "default to Ambiguous unless positively proven otherwise"
+            // principle.
+            result.order.transition_to(OrderState::Ambiguous);
+            result.gate = OrchestratorGate::SubmitAmbiguous;
+            {
+                AuditRecord ar{};
+                ar.timestamp_ms = ctx.now_ms;
+                ar.event_type = AuditEventType::OrderAmbiguous;
+                ar.mode = ctx.mode;
+                ar.symbol_id = ctx.symbol_id;
+                ar.set_client_order_id(coid.view());
+                ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
                 ctx.audit->append(ar);
             }
             break;

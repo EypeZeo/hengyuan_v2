@@ -131,6 +131,29 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   clear Intent → unlink `.xgc`**。`TipExportProducerResume` 是幂等操作，**不是** Mode B 恢复判定的
   证据来源（round 72 明确排除这个曾经的误用）。
 
+### `SubmitOutcome` / `OrchestratorGate`（rules_version fast-reject，部分落地）
+
+- `SubmitOutcome::StaleRulesVersion = 5`、`OrchestratorGate::SubmitStaleRulesVersion = 21` — **数值
+  照抄 spec**（`SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:789`/`:842`），故意跳过 `SubmitOutcome::
+  RateLimited = 4` 和 `OrchestratorGate` 的 `SubmitPartialFill=18`/`SubmitFilled=19`/
+  `SubmitRateLimited=20` 三个值——这三个值在代码里**尚未存在**，编号上留空，不是"下一个可用位置往上排"。
+  `tools/spec_enum_diff.py` 把 `RateLimited` 记为 `MISSING_IN_CODE`（警告，非冲突），这是故意的当前
+  状态，不是待修的 bug。
+- `rules_version`（`SymbolRules` 的字段，`account_truth.hpp`）+ `SubmitPort::CurrentRulesVersionFn`/
+  `current_rules_version()`（`live_submit_orchestrator.hpp`）+ `orchestrate_submit()` 里紧跟在
+  `pre_trade_rules_snapshot` 捕获之后的 Gate 1 快速拒绝——这是 spec §2.1/§2.2 TOCTOU 防护链**已落地
+  的部分**。`ctx.pre_trade_rules_snapshot` 是从 `*ctx.symbol_rules` 捕获的唯一副本，全程只用它，
+  `validate_pre_trade()` 和 `SubmitPort::call()` 都不再二次解引用原始指针——这才是真正关闭 TOCTOU
+  窗口的机制，Gate 1 本身只是快速失败，不是正确性的来源（spec 原话）。
+  - **刻意未做的事**（都不是遗漏，是明确的范围裁决）：Gate 1 的位置是插在既有"Gate 6+7 预交易校验"
+    块的开头，**不是**挪到整个函数最前面（spec 自己的 §3 把它排在 Audit 之前）——把它挪到最前面等于
+    要连带重排 Audit/KillSwitch/DryRun/Signer/Depth 这几个既有 gate 的顺序，是单独一件更大的事。
+    `SubmitOutcome::RateLimited`、`PartialFill`/`Filled` 的 fill-data 路由、L4 的限流冻结接线，全部
+    留待后续。
+  - **一个真实的 GCC-only 发现**：`live_submit_evidence_harness.cpp` 里有第二个 `switch
+    (OrchestratorGate)`（`gate_name()` 辅助函数），MSVC `/W4` 没有对新增枚举值缺失 case 报警，GCC
+    `-Wswitch` 报了——本仓库"两边工具链都要跑"这条规则又抓到一次真实分歧。
+
 ### 容量 / 生命周期
 
 - `InFlightRegistry` / `kMaxInFlight` — 容量 64，`register_submit()` 在满时**失败关闭**（拒绝第 65 笔，

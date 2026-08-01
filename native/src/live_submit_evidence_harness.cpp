@@ -48,12 +48,18 @@ SubmitOutcome g_mock_outcome{SubmitOutcome::Accepted};
 SubmitResponse mock_submit(const char* /*coid*/, std::uint32_t /*sym*/,
                            OrderSide /*side*/, OrderType /*type*/,
                            std::int64_t /*price*/, std::int64_t /*qty*/,
+                           const SymbolRules& /*rules_snapshot*/,
                            void* /*ud*/) {
     switch (g_mock_outcome) {
         case SubmitOutcome::Accepted:     return {SubmitOutcome::Accepted, 999001, 0};
         case SubmitOutcome::Rejected:     return {SubmitOutcome::Rejected, 0, -1013};
         case SubmitOutcome::Timeout:      return {SubmitOutcome::Timeout, 0, 0};
         case SubmitOutcome::NetworkError: return {SubmitOutcome::NetworkError, 0, 0};
+        // See live_submit_orchestrator.hpp's SubmitOutcome::StaleRulesVersion doc
+        // comment: unreachable via a real SubmitFn under this codebase's gate
+        // ordering (Gate 1 catches it before call() is ever invoked). Included
+        // only so this switch stays exhaustive under -Wswitch.
+        case SubmitOutcome::StaleRulesVersion: return {SubmitOutcome::NetworkError, 0, -1};
     }
     return {SubmitOutcome::NetworkError, 0, -1};
 }
@@ -78,6 +84,7 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::ConfirmationMismatch: return "ConfirmationMismatch";
         case OrchestratorGate::DuplicateInFlight: return "DuplicateInFlight";
         case OrchestratorGate::InFlightRegistryUnavailable: return "InFlightRegistryUnavailable";
+        case OrchestratorGate::SubmitStaleRulesVersion: return "SubmitStaleRulesVersion";
     }
     return "?";
 }

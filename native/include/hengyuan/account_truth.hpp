@@ -95,6 +95,16 @@ struct SymbolRules {
     // MIN_NOTIONAL / NOTIONAL filter
     std::int64_t min_notional_ticks{0};
 
+    // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §2.1/§2.2/L4 §5.3: the version this
+    // particular snapshot was read from a symbol registry at. 0 is reserved for
+    // "unknown/unavailable" and never matches a real registry version (L4 §5.1's
+    // registry versions start at 1) — a caller with no registry wired up
+    // therefore fails closed by construction against live_submit_orchestrator's
+    // Gate 1 stale-version check, not by an extra null check anyone has to
+    // remember. No SymbolRegistry class exists in this codebase yet; this field
+    // is the data-model half of that future integration.
+    std::uint32_t rules_version{0};
+
     std::string_view symbol_name() const noexcept {
         return {symbol, std::strlen(symbol)};
     }
