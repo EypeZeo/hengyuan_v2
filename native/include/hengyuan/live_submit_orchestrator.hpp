@@ -32,6 +32,7 @@
 #include <hengyuan/exit_safety.hpp>
 #include <hengyuan/kill_switch.hpp>
 #include <hengyuan/order_lifecycle.hpp>
+#include <hengyuan/order_tracker.hpp>
 #include <hengyuan/transport_policy.hpp>
 
 #include <cstdint>
@@ -211,6 +212,16 @@ struct OrchestratorContext {
     OrderConfirmation confirmation{};       // F3: bound operator CONFIRM
     InFlightRegistry* in_flight{nullptr};   // F4: idempotency / no-blind-retry guard
 
+    // Reconcile/poll loop wiring (order_tracker.hpp). Both nullable and default
+    // to nullptr for backward compatibility with existing callers/tests that
+    // don't yet run a reconcile thread -- orchestrate_submit() behaves exactly
+    // as before when either is unset. reconcile_events is drained at the top of
+    // every call (piggy-backing on the hot thread's own cadence, not a separate
+    // timer); to_reconcile receives {handle, order} for every order that leaves
+    // this function Ambiguous, so the reconcile thread has something to poll.
+    ToReconcileRing* to_reconcile{nullptr};
+    ReconcileEventRing* reconcile_events{nullptr};
+
     // Order parameters
     const SymbolRules* symbol_rules{nullptr};
     // Captured by value from *symbol_rules at the top of orchestrate_submit(),
@@ -245,6 +256,17 @@ struct OrchestratorContext {
 
 inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept {
     OrchestratorResult result{};
+
+    // Drain any reconcile-thread resolutions before processing this new order.
+    // Unconditional on gates below (even a KillSwitch-halted or audit-unavailable
+    // call still owns the only writer access to ctx.in_flight/ctx.audit on this
+    // thread, per order_tracker.hpp's thread-ownership contract) -- deferring
+    // this would let resolved slots sit unreleased for an arbitrarily long time
+    // if this thread's gates keep failing closed. Both ctx.in_flight and
+    // ctx.reconcile_events must be wired for there to be anything to drain into.
+    if (ctx.in_flight && ctx.reconcile_events) {
+        drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms);
+    }
 
     // Gate 1: Audit available
     if (!ctx.audit || !can_submit_order(*ctx.audit)) {
@@ -434,7 +456,12 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         return result;
     }
 
-    if (!ctx.in_flight->register_submit(coid.view())) {
+    // Handle-returning form (not the bool-only register_submit()) so a
+    // reconcile-bound handle is on hand below if this submit ends up Ambiguous
+    // -- see order_lifecycle.hpp's InFlightHandle doc comment for why the
+    // reconcile path needs {slot_index, generation} rather than just the coid.
+    InFlightHandle in_flight_handle = ctx.in_flight->register_submit_handle(coid.view());
+    if (!in_flight_handle.valid()) {
         result.gate = OrchestratorGate::DuplicateInFlight;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
@@ -518,6 +545,16 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.set_detail("POST timeout - ambiguous, do NOT retry");
                 ctx.audit->append(ar);
             }
+            if (ctx.to_reconcile) {
+                // Cannot genuinely fail under correct wiring: ToReconcileRing's
+                // capacity equals kMaxInFlight (order_tracker.hpp), and this
+                // push only ever happens for an order that just consumed one of
+                // ctx.in_flight's <= kMaxInFlight slots, so unconsumed pushes
+                // can never outnumber ring capacity. The check is kept anyway
+                // (not asserted) because this function is noexcept and has no
+                // error-reporting channel back to the caller.
+                (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
+            }
             break;
 
         case SubmitOutcome::NetworkError:
@@ -532,6 +569,9 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.set_client_order_id(coid.view());
                 ar.set_detail("network error - ambiguous");
                 ctx.audit->append(ar);
+            }
+            if (ctx.to_reconcile) {
+                (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
             }
             break;
 
@@ -558,6 +598,9 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.set_client_order_id(coid.view());
                 ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
                 ctx.audit->append(ar);
+            }
+            if (ctx.to_reconcile) {
+                (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
             }
             break;
     }

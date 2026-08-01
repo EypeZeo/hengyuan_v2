@@ -456,3 +456,145 @@ TEST_F(LiveSubmitTest, RejectedReleasesInFlight) {
     ASSERT_EQ(r.gate, OrchestratorGate::SubmitRejected);
     EXPECT_EQ(in_flight_.count(), 0u);  // terminal → slot released
 }
+
+// --- Reconcile/poll loop wiring (order_tracker.hpp) ---
+//
+// ctx_.to_reconcile/ctx_.reconcile_events are left null by SetUp() -- every
+// test above this section already exercises that backward-compatible path
+// (both fields default to nullptr, orchestrate_submit() behaves exactly as
+// before this wiring existed). This section wires them explicitly.
+
+class LiveSubmitReconcileTest : public LiveSubmitTest {
+protected:
+    ToReconcileRing to_reconcile_{};
+    ReconcileEventRing reconcile_events_{};
+
+    void SetUp() override {
+        LiveSubmitTest::SetUp();
+        ctx_.to_reconcile = &to_reconcile_;
+        ctx_.reconcile_events = &reconcile_events_;
+    }
+};
+
+TEST_F(LiveSubmitReconcileTest, TimeoutPushesToReconcileRing) {
+    g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitAmbiguous);
+
+    ReconcileIngress in{};
+    ASSERT_TRUE(to_reconcile_.try_pop(in));
+    EXPECT_EQ(in.record.client_order_id.view(), r.order.client_order_id.view());
+    EXPECT_EQ(in.record.state, OrderState::Ambiguous);
+    EXPECT_TRUE(in.handle.valid());
+}
+
+TEST_F(LiveSubmitReconcileTest, NetworkErrorPushesToReconcileRing) {
+    g_mock_response = {SubmitOutcome::NetworkError, 0, 0};
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitNetworkError);
+
+    ReconcileIngress in{};
+    ASSERT_TRUE(to_reconcile_.try_pop(in));
+    EXPECT_EQ(in.record.client_order_id.view(), r.order.client_order_id.view());
+}
+
+TEST_F(LiveSubmitReconcileTest, StaleRulesVersionGateDoesNotPushBeforeSubmit) {
+    // Gate 1's fast-reject happens BEFORE any in-flight registration or submit
+    // attempt -- it must never reach the to_reconcile push at all, regardless
+    // of ctx_.to_reconcile being wired.
+    g_mock_current_rules_version = 2;
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitStaleRulesVersion);
+
+    ReconcileIngress in{};
+    EXPECT_FALSE(to_reconcile_.try_pop(in));
+}
+
+TEST_F(LiveSubmitReconcileTest, AcceptedAndRejectedDoNotPushToReconcileRing) {
+    auto r1 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r1.gate, OrchestratorGate::SubmitAccepted);
+    ReconcileIngress in{};
+    EXPECT_FALSE(to_reconcile_.try_pop(in));
+
+    ctx_.sequence = 2;
+    g_mock_response = {SubmitOutcome::Rejected, 0, -1013};
+    auto r2 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r2.gate, OrchestratorGate::SubmitRejected);
+    EXPECT_FALSE(to_reconcile_.try_pop(in));
+}
+
+TEST_F(LiveSubmitReconcileTest, PushedHandleReleasesTheSameSlotItRegistered) {
+    g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitAmbiguous);
+    ASSERT_EQ(in_flight_.count(), 1u);
+
+    ReconcileIngress in{};
+    ASSERT_TRUE(to_reconcile_.try_pop(in));
+    EXPECT_TRUE(in_flight_.mark_resolved_handle(in.handle, r.order.client_order_id.view()))
+        << "the handle pushed alongside an Ambiguous order must be the real "
+           "handle from this order's own in-flight registration";
+    EXPECT_EQ(in_flight_.count(), 0u);
+}
+
+TEST_F(LiveSubmitReconcileTest, ReconcileEventsDrainedAtTopOfNextCall) {
+    // Submit order #1, let it go Ambiguous, then feed back a resolution via
+    // reconcile_events_ as if the reconcile thread had found it -- the NEXT
+    // orchestrate_submit() call (for an unrelated order #2) must drain it.
+    g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+    auto r1 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r1.gate, OrchestratorGate::SubmitAmbiguous);
+    ASSERT_EQ(in_flight_.count(), 1u);
+
+    ReconcileIngress in{};
+    ASSERT_TRUE(to_reconcile_.try_pop(in));
+
+    ReconcileEvent ev{};
+    ev.handle = in.handle;
+    ev.coid = r1.order.client_order_id;
+    ev.resulting_state = OrderState::Filled;
+    ev.exchange_order_id = 777;
+    ASSERT_TRUE(reconcile_events_.try_push(ev));
+
+    ctx_.sequence = 2;
+    g_mock_response = {SubmitOutcome::Accepted, 999, 0};
+    auto r2 = orchestrate_submit(ctx_);
+    EXPECT_EQ(r2.gate, OrchestratorGate::SubmitAccepted);
+
+    // Order #1's slot must have been released by the drain at the top of this
+    // second call, and its resolution audited -- leaving only order #2 in flight.
+    EXPECT_FALSE(in_flight_.is_in_flight(r1.order.client_order_id.view()));
+    EXPECT_EQ(in_flight_.count(), 1u);
+    EXPECT_TRUE(in_flight_.is_in_flight(r2.order.client_order_id.view()));
+
+    bool found_reconciled = false;
+    for (std::size_t i = 0; i < audit_.count(); ++i) {
+        auto* ar = audit_.at(i);
+        if (ar && ar->event_type == AuditEventType::OrderReconciled) found_reconciled = true;
+    }
+    EXPECT_TRUE(found_reconciled);
+}
+
+TEST_F(LiveSubmitReconcileTest, DrainRunsEvenWhenThisCallFailsAnEarlyGate) {
+    // The drain must not be gated behind THIS call's own success -- a resolved
+    // slot from a previous order should not sit unreleased just because this
+    // particular call happens to hit KillSwitchNotNormal.
+    g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+    auto r1 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r1.gate, OrchestratorGate::SubmitAmbiguous);
+
+    ReconcileIngress in{};
+    ASSERT_TRUE(to_reconcile_.try_pop(in));
+    ReconcileEvent ev{};
+    ev.handle = in.handle;
+    ev.coid = r1.order.client_order_id;
+    ev.resulting_state = OrderState::Cancelled;
+    ASSERT_TRUE(reconcile_events_.try_push(ev));
+
+    kill_switch_.trigger();
+    auto r2 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r2.gate, OrchestratorGate::KillSwitchNotNormal);
+
+    EXPECT_FALSE(in_flight_.is_in_flight(r1.order.client_order_id.view()));
+    EXPECT_EQ(in_flight_.count(), 0u);
+}

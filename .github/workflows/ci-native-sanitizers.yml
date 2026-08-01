@@ -93,15 +93,19 @@ jobs:
             -DHY_BUILD_TSAN_CONTROL=ON \
             -DHY_BUILD_DEMO=OFF
 
-      # Only the concurrency targets. Building all 27 test binaries under TSan
+      # Only the concurrency targets. Building all test binaries under TSan
       # would roughly triple this job for zero added signal: every other test in
       # the tree is single-threaded, and TSan reports nothing in a program with
-      # one thread.
+      # one thread. test_reconcile_concurrency is the real two-thread test for
+      # order_tracker.hpp's hot-thread/reconcile-thread split (InFlightRegistry/
+      # AuditRingSink owned by one, OrderTracker by the other, synchronized only
+      # via SpscRing) -- without it here, that design's actual thread-safety
+      # claim would never run under TSan at all.
       - name: Build concurrency targets only
         working-directory: native
         run: |
           cmake --build build-tsan -j$(nproc) \
-            --target test_spsc_concurrency tsan_control_relaxed_ring
+            --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
       # race whose two halves are separated in time gets reported at all — it

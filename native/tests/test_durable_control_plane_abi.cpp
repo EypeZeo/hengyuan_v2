@@ -340,3 +340,93 @@ TEST(InFlightRegistryCapacity, OnlyExplicitResolutionReturnsCapacity) {
     EXPECT_TRUE(reg.register_submit("HY-A"));
     EXPECT_EQ(reg.count(), 2u);
 }
+
+// --- InFlightHandle / generation (order_tracker.hpp's cross-thread release path) ---
+//
+// register_submit()/mark_resolved() (COID-string-only) remain correct and
+// sufficient for Gate 12b's synchronous call site, which has no cross-thread
+// staleness window. The handle-returning pair exists specifically for
+// order_tracker.hpp's reconcile thread, which learns about a resolution at some
+// later, independently-scheduled time -- generation is what lets a stale handle
+// be detected instead of silently matching whatever now occupies that slot index.
+
+TEST(InFlightHandle, RegisterSubmitHandleReturnsValidHandle) {
+    hy::InFlightRegistry reg;
+    auto h = reg.register_submit_handle("HY-A");
+    EXPECT_TRUE(h.valid());
+    EXPECT_LT(h.slot_index, hy::kMaxInFlight);
+}
+
+TEST(InFlightHandle, InvalidOnEmptyCoidOrDuplicateOrCapacityExhausted) {
+    hy::InFlightRegistry reg;
+    EXPECT_FALSE(reg.register_submit_handle("").valid());
+
+    auto first = reg.register_submit_handle("HY-DUP");
+    ASSERT_TRUE(first.valid());
+    EXPECT_FALSE(reg.register_submit_handle("HY-DUP").valid()) << "already in-flight";
+
+    char id[32];
+    for (std::size_t i = 1; i < hy::kMaxInFlight; ++i) {
+        std::snprintf(id, sizeof(id), "HY-FILL-%zu", i);
+        ASSERT_TRUE(reg.register_submit_handle(id).valid());
+    }
+    EXPECT_EQ(reg.count(), hy::kMaxInFlight);
+    EXPECT_FALSE(reg.register_submit_handle("HY-ONE-TOO-MANY").valid());
+}
+
+TEST(InFlightHandle, MarkResolvedHandleReleasesOnExactMatch) {
+    hy::InFlightRegistry reg;
+    auto h = reg.register_submit_handle("HY-A");
+    ASSERT_TRUE(h.valid());
+    EXPECT_TRUE(reg.mark_resolved_handle(h, "HY-A"));
+    EXPECT_FALSE(reg.is_in_flight("HY-A"));
+    EXPECT_EQ(reg.count(), 0u);
+}
+
+TEST(InFlightHandle, MismatchedCoidDoesNotRelease) {
+    hy::InFlightRegistry reg;
+    auto h = reg.register_submit_handle("HY-A");
+    ASSERT_TRUE(h.valid());
+    // Same slot_index/generation, wrong coid -- must not release someone else's
+    // (hypothetical) tracked order under a mismatched string.
+    EXPECT_FALSE(reg.mark_resolved_handle(h, "HY-NOT-A"));
+    EXPECT_TRUE(reg.is_in_flight("HY-A"));
+}
+
+// The scenario the generation field exists to prevent: a handle issued for an
+// order that has ALREADY been resolved and whose slot has since been reused for
+// a different order must not release the new occupant, even if (hypothetically)
+// the new occupant happened to reuse the exact same coid string.
+TEST(InFlightHandle, StaleGenerationDoesNotReleaseReusedSlot) {
+    hy::InFlightRegistry reg;
+    auto stale = reg.register_submit_handle("HY-A");
+    ASSERT_TRUE(stale.valid());
+    reg.mark_resolved("HY-A");  // released via the ordinary COID path
+    ASSERT_FALSE(reg.is_in_flight("HY-A"));
+
+    // Slot reused (likely the same slot_index, since it's now the only free one
+    // in a small registry) for a genuinely different order under the same coid
+    // string -- a caller bug (non-unique coid), but exactly the case generation
+    // exists to defend against.
+    auto fresh = reg.register_submit_handle("HY-A");
+    ASSERT_TRUE(fresh.valid());
+
+    // The stale handle must fail even though the coid string matches again.
+    EXPECT_FALSE(reg.mark_resolved_handle(stale, "HY-A"))
+        << "a handle from a previous occupant of this slot must never release "
+           "the current occupant, even under coid string reuse";
+    EXPECT_TRUE(reg.is_in_flight("HY-A")) << "the fresh order must still be tracked";
+
+    // The fresh handle, correctly, still works.
+    EXPECT_TRUE(reg.mark_resolved_handle(fresh, "HY-A"));
+    EXPECT_FALSE(reg.is_in_flight("HY-A"));
+}
+
+TEST(InFlightHandle, InvalidHandleNeverReleasesAnything) {
+    hy::InFlightRegistry reg;
+    ASSERT_TRUE(reg.register_submit("HY-A"));
+    hy::InFlightHandle invalid{};
+    EXPECT_FALSE(invalid.valid());
+    EXPECT_FALSE(reg.mark_resolved_handle(invalid, "HY-A"));
+    EXPECT_TRUE(reg.is_in_flight("HY-A"));
+}

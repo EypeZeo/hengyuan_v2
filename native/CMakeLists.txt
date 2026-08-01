@@ -269,6 +269,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_control_plane_abi)
     gtest_discover_tests(test_durable_control_plane_abi)
 
+    # 轨道 A 第三项: reconcile/poll loop (order_tracker.hpp). Single-threaded here
+    # (poll_once()/drain_reconcile_events() are plain functions) -- the real
+    # cross-thread claim is verified separately by test_reconcile_concurrency.
+    add_executable(test_order_tracker tests/test_order_tracker.cpp)
+    target_link_libraries(test_order_tracker PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_order_tracker)
+    gtest_discover_tests(test_order_tracker)
+
     # Real two-thread stress for the lock-free SPSC primitives. Labelled
     # "concurrency" so the TSan CI job can select just these (`ctest -L
     # concurrency`) — building all 27 test binaries under TSan triples the job
@@ -295,6 +303,23 @@ if(HY_BUILD_TESTS)
     endif()
 
     gtest_discover_tests(test_spsc_concurrency PROPERTIES LABELS concurrency)
+
+    # Real two-thread stress for the reconcile/poll loop (order_tracker.hpp +
+    # live_submit_orchestrator.hpp's drain_reconcile_events() wiring) -- the
+    # cross-thread claim test_order_tracker.cpp deliberately does NOT make
+    # (that file is single-threaded by design, see its own header). Same
+    # "concurrency" label/CROSSCOMPILING_EMULATOR treatment as
+    # test_spsc_concurrency above, for the same reasons.
+    add_executable(test_reconcile_concurrency tests/test_reconcile_concurrency.cpp)
+    target_link_libraries(test_reconcile_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_reconcile_concurrency)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_reconcile_concurrency PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_reconcile_concurrency PROPERTIES LABELS concurrency)
 
     # Negative control for the TSan gate: a deliberately-racy ring that TSan MUST
     # report. Built only on demand — it is NOT registered with ctest, because a

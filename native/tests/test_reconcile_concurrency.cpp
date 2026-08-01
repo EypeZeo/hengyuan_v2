@@ -1,0 +1,291 @@
+// Real two-thread stress test for the reconcile/poll loop (order_tracker.hpp)
+// wired through live_submit_orchestrator.hpp.
+//
+// WHY THIS FILE EXISTS
+// ---------------------
+// test_order_tracker.cpp and test_live_submit_orchestrator.cpp both exercise
+// poll_once()/drain_reconcile_events()/orchestrate_submit() as plain,
+// single-threaded functions -- real, but they cannot fall over on a missing
+// memory_order edge because nothing ever actually crosses a thread boundary in
+// those tests. order_tracker.hpp's whole reason to exist is the claim that
+// InFlightRegistry/AuditRingSink (hot-thread-owned) and OrderTracker
+// (reconcile-thread-owned) can be driven from two REAL concurrent threads,
+// synchronized only by the two SpscRing<T,N> queues, with no atomics on either
+// owned structure. This file is what actually tests that claim, in the same
+// spirit as test_spsc_concurrency.cpp (see that file's header for the fuller
+// explanation of what a green run can and cannot prove on its own -- the same
+// caveats apply here: this proves the LOGICAL contract across the boundary;
+// ThreadSanitizer (-DHY_SANITIZER=thread, see native/cmake/Sanitizers.cmake and
+// tools/wsl_verify.sh) is what actually proves no missing acquire/release edge,
+// and is required, not optional, before trusting this file's design.
+//
+// SIMULATED THREAD ROLES
+// -----------------------
+//   Hot thread:       repeatedly calls orchestrate_submit() -- which itself
+//                      calls drain_reconcile_events() at its own top, exactly
+//                      as a real trading hot loop would. Owns ctx_.in_flight
+//                      and ctx_.audit exclusively for the whole run.
+//   Reconcile thread:  repeatedly calls poll_once() -- owns its OrderTracker
+//                      exclusively for the whole run, never touches
+//                      ctx_.in_flight or ctx_.audit directly (see
+//                      order_tracker.hpp's file header, the thread-ownership
+//                      contract this test exists to falsify-or-confirm).
+//
+// Only 5 of this run's orders are left Accepted (never resolved, by design --
+// open-order polling until fill/cancel is explicitly out of scope, see
+// order_tracker.hpp's file header) so they permanently hold a slot each; the
+// rest are forced Ambiguous (mock Timeout) so the registry churns through
+// reconcile continuously, which is the actual condition under test.
+//
+// GTEST + THREADS DISCIPLINE: never ASSERT_* on a worker thread (see
+// test_spsc_concurrency.cpp's header for why) -- each thread records into its
+// own result container; all assertions run after both threads join.
+//
+// Governance: L1, no network/token/order. GTest only.
+
+#include <gtest/gtest.h>
+#include <hengyuan/live_submit_orchestrator.hpp>
+
+#include <atomic>
+#include <cstring>
+#include <thread>
+#include <vector>
+
+using namespace hy;
+
+namespace {
+
+// --- Mock SubmitPort (hot thread only touches this) ---
+
+thread_local SubmitOutcome t_next_submit_outcome{SubmitOutcome::Accepted};
+
+SubmitResponse mock_submit(
+    const char* /*coid*/, std::uint32_t /*sym*/,
+    OrderSide /*side*/, OrderType /*type*/,
+    std::int64_t /*price*/, std::int64_t /*qty*/,
+    const SymbolRules& /*rules_snapshot*/, void* /*ud*/) {
+    if (t_next_submit_outcome == SubmitOutcome::Accepted) {
+        return SubmitResponse{SubmitOutcome::Accepted, 42, 0};
+    }
+    return SubmitResponse{t_next_submit_outcome, 0, 0};
+}
+
+std::uint32_t mock_current_rules_version(void* /*ud*/) { return 1; }
+
+// --- Mock QueryPort (reconcile thread only touches this) ---
+// Always resolves Found -> Filled on the very first attempt: this test's
+// point is the cross-thread handoff, not backoff/retry timing (already
+// covered single-threaded by test_order_tracker.cpp).
+
+QueryResult mock_query(const char* /*coid*/, void* /*ud*/) {
+    return QueryResult{QueryOutcome::Found, OrderState::Filled,
+                        /*exchange_order_id=*/777, /*filled_qty=*/10,
+                        /*avg_price=*/5000};
+}
+
+struct SubmittedOrder {
+    ClientOrderId coid;
+    OrchestratorGate gate;
+};
+
+}  // namespace
+
+TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
+    // Bounded well under AuditRingSink's fixed kAuditRingCapacity (1024,
+    // audit_trail.hpp) -- that capacity is a deliberate fail-closed production
+    // limit (ADR-019 D10: audit unavailable -> no new orders), not something
+    // this test should grow into. Each Accepted order writes ~3 records
+    // (intent/submitted/accepted); each Ambiguous order writes ~4 (the same 3
+    // plus one OrderReconciled once resolved). 200 iterations stays far below
+    // the cap with margin, while still forcing many full churn cycles through
+    // InFlightRegistry's 64-slot capacity -- the actual condition under test.
+    constexpr int kIterations = 200;
+    constexpr int kAcceptedPrefix = 5;  // first N orders: never resolved, stay in-flight
+
+    AuditRingSink audit;
+    KillSwitch kill_switch;
+    DryRunEvidenceChain evidence;
+    RequestWeightTracker rate_tracker;
+    InFlightRegistry in_flight;
+    SymbolRules rules{};
+    AccountSnapshot account{};
+    ToReconcileRing to_reconcile;
+    ReconcileEventRing reconcile_events;
+
+    audit.set_available(true);
+    kill_switch.operator_reset();
+    evidence.record(EvidencePath::SubmitSuccess, 1, 0xABCD, 1);
+    evidence.record(EvidencePath::SubmitReject, 2, 0xABCD, 1);
+    evidence.record(EvidencePath::SubmitAmbiguous, 3, 0xABCD, 1);
+    evidence.record(EvidencePath::KillSwitch, 4, 0xABCD, 1);
+    rate_tracker.reset(100000, 500);  // headroom well above kIterations
+
+    std::strncpy(rules.symbol, "BTCUSDT", sizeof(rules.symbol) - 1);
+    rules.is_trading = true;
+    rules.min_price_ticks = 100;
+    rules.max_price_ticks = 10000000;
+    rules.tick_size_ticks = 100;
+    rules.min_qty_ticks = 10;
+    rules.max_qty_ticks = 1000000;
+    rules.step_size_ticks = 10;
+    rules.min_notional_ticks = 1000;
+    rules.rules_version = 1;
+
+    std::strncpy(account.assets[0].asset, "USDT", 5);
+    account.assets[0].free_ticks = 999999999;
+    account.asset_count = 1;
+    account.can_trade = true;
+    account.timestamp_ms = 900;
+
+    std::vector<SubmittedOrder> results;
+    results.reserve(kIterations);
+    std::atomic<bool> hot_done{false};
+    std::atomic<bool> reconcile_ready{false};
+
+    std::thread hot_thread([&] {
+        // Wait for the reconcile thread to actually be executing before
+        // submitting anything. Without this, OS thread-creation/scheduling
+        // latency can let the hot thread burn through most or all of
+        // kIterations solo before the reconcile thread's first instruction
+        // ever runs, which starves InFlightRegistry's 64 slots (nothing is
+        // draining them) and degenerates this into an accidentally-sequential
+        // run instead of the genuinely concurrent one this file exists to be.
+        while (!reconcile_ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int i = 0; i < kIterations; ++i) {
+            OrchestratorContext ctx{};
+            ctx.audit = &audit;
+            ctx.kill_switch = &kill_switch;
+            ctx.evidence = &evidence;
+            ctx.signer_ready = true;
+            ctx.depth_synced = true;
+            ctx.rate_tracker = &rate_tracker;
+            ctx.in_flight = &in_flight;
+            ctx.symbol_rules = &rules;
+            ctx.account = &account;
+            ctx.side = OrderSide::Buy;
+            ctx.order_type = OrderType::Limit;
+            ctx.base_asset = "BTC";
+            ctx.quote_asset = "USDT";
+            ctx.now_ms = 1000 + i;
+            ctx.exposure_limits.freshness_max_age_ms = 3'000'000;
+            ctx.exposure_limits.single_order_notional_cap = 500000;
+            ctx.exposure_limits.total_exposure_notional_cap = 100'000'000;
+            ctx.price_ticks = 1000;
+            ctx.qty_ticks = 10;
+            ctx.symbol_id = 1;
+            ctx.sequence = static_cast<std::uint32_t>(i);
+            ctx.mode = ExecutionMode::Live;
+            ctx.order_weight = 1;
+            ctx.to_reconcile = &to_reconcile;
+            ctx.reconcile_events = &reconcile_events;
+
+            ctx.confirmation.confirmed = true;
+            ctx.confirmation.symbol_id = ctx.symbol_id;
+            ctx.confirmation.side = ctx.side;
+            ctx.confirmation.type = ctx.order_type;
+            ctx.confirmation.price_ticks = ctx.price_ticks;
+            ctx.confirmation.qty_ticks = ctx.qty_ticks;
+            ctx.confirmation.max_notional = 1000000;
+            ctx.confirmation.valid_until_ms = ctx.now_ms + 60000;
+
+            t_next_submit_outcome = (i < kAcceptedPrefix) ? SubmitOutcome::Accepted
+                                                            : SubmitOutcome::Timeout;
+            ctx.submit_port = {mock_submit, nullptr, mock_current_rules_version};
+
+            auto r = orchestrate_submit(ctx);
+            results.push_back(SubmittedOrder{r.order.client_order_id, r.gate});
+
+            // Keeps ceding the core between iterations so a fast hot thread
+            // doesn't simply outrun the reconcile thread's scheduling slice
+            // for the whole loop -- pacing only, not a change to what's tested.
+            std::this_thread::yield();
+        }
+        hot_done.store(true, std::memory_order_release);
+    });
+
+    std::thread reconcile_thread([&] {
+        OrderTracker tracker;
+        QueryPort query_port{mock_query, nullptr};
+        ReconcilePollPolicy policy{};
+        std::int64_t now_ms = 0;
+
+        reconcile_ready.store(true, std::memory_order_release);
+
+        // Keep polling until the hot thread is done AND every order it handed
+        // off has been drained out of the tracker -- a couple of extra passes
+        // after observing hot_done covers the "pushed just before done was
+        // set" straggler case (poll_once's inbound drain is a full `while`
+        // loop, so a single post-done pass is sufficient in practice; looping
+        // a few extra times costs nothing and removes any doubt).
+        int extra_passes_after_done = 0;
+        while (true) {
+            poll_once(tracker, to_reconcile, reconcile_events, query_port, policy, now_ms++);
+            if (hot_done.load(std::memory_order_acquire)) {
+                if (tracker.count() == 0) {
+                    ++extra_passes_after_done;
+                    if (extra_passes_after_done >= 3) break;
+                } else {
+                    extra_passes_after_done = 0;
+                }
+            }
+        }
+    });
+
+    hot_thread.join();
+    reconcile_thread.join();
+
+    // Both threads have joined -- no concurrent access remains. Catch any
+    // ReconcileEvent the reconcile thread pushed after the hot thread's last
+    // own drain_reconcile_events() call (its own top-of-call drain only runs
+    // while the hot thread is still making calls).
+    drain_reconcile_events(in_flight, &audit, reconcile_events, /*now_ms=*/999999);
+
+    ReconcileEvent leftover{};
+    EXPECT_FALSE(reconcile_events.try_pop(leftover)) << "reconcile_events ring must be fully drained by now";
+
+    ASSERT_EQ(results.size(), static_cast<std::size_t>(kIterations));
+
+    int accepted_count = 0, ambiguous_count = 0, other_count = 0;
+    for (int i = 0; i < kIterations; ++i) {
+        const auto& r = results[static_cast<std::size_t>(i)];
+        if (r.gate == OrchestratorGate::SubmitAccepted) {
+            ++accepted_count;
+            EXPECT_TRUE(in_flight.is_in_flight(r.coid.view()))
+                << "Accepted order (never reconciled in this test) must still hold its slot, i=" << i;
+        } else if (r.gate == OrchestratorGate::SubmitAmbiguous) {
+            ++ambiguous_count;
+            EXPECT_FALSE(in_flight.is_in_flight(r.coid.view()))
+                << "Ambiguous order must have been resolved and released by the reconcile "
+                   "thread + drain by now, i=" << i;
+        } else {
+            // OrchestratorGate::DuplicateInFlight (registry momentarily at
+            // capacity) is the only other reachable outcome here -- every
+            // earlier gate is satisfied unconditionally by this fixture's
+            // setup. Not asserted against: natural backpressure, not a bug.
+            ++other_count;
+            EXPECT_EQ(r.gate, OrchestratorGate::DuplicateInFlight)
+                << "unexpected gate at i=" << i;
+        }
+    }
+
+    EXPECT_EQ(accepted_count, kAcceptedPrefix);
+    EXPECT_EQ(in_flight.count(), static_cast<std::size_t>(accepted_count))
+        << "only the never-reconciled Accepted orders should still occupy a slot";
+
+    RecordProperty("ambiguous_resolved", ambiguous_count);
+    RecordProperty("duplicate_or_capacity_exhausted", other_count);
+
+    // Sanity: this run must actually have exercised the reconcile path, not
+    // degenerated into "everything hit capacity exhaustion immediately." The
+    // per-order invariants above (is_in_flight matching gate outcome) are the
+    // real correctness check; this threshold only guards against a scheduling
+    // fluke making the whole run accidentally-sequential and vacuous. Deliberately
+    // loose (not "> kIterations/2"): OS thread scheduling is not something this
+    // test controls precisely, and the startup barrier + per-iteration yield
+    // above only make good interleaving LIKELY, not guaranteed on every run.
+    EXPECT_GT(ambiguous_count, kIterations / 8)
+        << "too few orders reached the reconcile path -- test may not be exercising the "
+           "cross-thread handoff it exists to verify";
+}

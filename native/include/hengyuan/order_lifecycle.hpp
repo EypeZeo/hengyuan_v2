@@ -116,18 +116,22 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
                 return TransitionResult::Ok;
             break;
         case OrderState::Ambiguous:
-            // From Ambiguous, reconciliation resolves to whichever exchange-final
-            // state the query actually discovered, or escalation if it couldn't be
-            // resolved. `Reconciled` is deliberately NOT a target here (see
+            // From Ambiguous, reconciliation resolves to whichever state the query
+            // actually discovered, or escalation if it couldn't be resolved.
+            // `Reconciled` is deliberately NOT a target here (see
             // docs/SPEC_INVARIANTS.md's "Reconciled" entry): SUBMITPORT spec round 24
             // is authoritative that no live transition ever targets it, and
             // apply_confirmed_state()'s design maps a reconciliation query's
             // confirmed_state directly onto the matching OrderState, never onto a
             // generic "reconciled" bucket that would discard which outcome it was.
-            // Deliberately excludes Accepted/PartialFill: those are "still live,
-            // keep tracking" outcomes belonging to the not-yet-built reconcile/poll
-            // loop, not this state-machine-only fix.
-            if (to == OrderState::Filled ||
+            // Accepted/PartialFill included (SUBMITPORT spec line 961's full target
+            // set) now that order_tracker.hpp's poll_once() is the first real caller
+            // that can discover "actually still live" via reconciliation — an earlier
+            // revision of this file deliberately left these two out pending that
+            // work; this is that work.
+            if (to == OrderState::Accepted ||
+                to == OrderState::PartialFill ||
+                to == OrderState::Filled ||
                 to == OrderState::Cancelled ||
                 to == OrderState::Rejected ||
                 to == OrderState::Expired ||
@@ -245,24 +249,53 @@ inline ReconcileAction determine_reconcile_action(const OrderRecord& rec) noexce
 // is already tracked, so the orchestrator can fail-closed instead of double-sending.
 static constexpr std::size_t kMaxInFlight = 64;
 
+// A slot reference that stays valid across the reconcile/poll loop's cross-thread
+// handoff (order_tracker.hpp). `slot_index` alone is an ABA hazard: if a stale
+// handle from an already-resolved order arrives after that slot has been reused
+// for a genuinely different order, matching on index alone would release the
+// WRONG (new) order's slot. `generation` (bumped every time a slot transitions
+// inactive -> active) makes a stale handle detectable and rejected instead of
+// silently matching. In ordinary operation client_order_id's own
+// timestamp+sequence+symbol construction should never collide across two live
+// orders, so this is defense-in-depth against a misbehaving caller (e.g. a
+// non-monotonic sequence), not a fix for an observed collision.
+struct InFlightHandle {
+    std::size_t slot_index{kMaxInFlight};  // == kMaxInFlight means invalid
+    std::uint32_t generation{0};
+
+    bool valid() const noexcept { return slot_index < kMaxInFlight; }
+};
+
 class InFlightRegistry {
 public:
     // Attempt to record a submit for `coid`. Returns false if this id is already
     // tracked (in-flight or unresolved) or if capacity is exhausted (fail-closed).
     bool register_submit(std::string_view coid) noexcept {
-        if (coid.empty()) return false;
-        if (find_index(coid) != kNotFound) return false;  // already in-flight
+        return register_submit_handle(coid).valid();
+    }
+
+    // Handle-returning variant of register_submit(), for callers that need to hand
+    // the reservation across a thread boundary (order_tracker.hpp) and release it
+    // later via mark_resolved_handle() rather than by COID string alone. Behaves
+    // identically to register_submit() otherwise -- same fail-closed rules, same
+    // slot selection -- this is purely an additive overload, not a replacement;
+    // Gate 12b's existing synchronous call site has no cross-thread staleness
+    // hazard and can keep using the bool-returning form unchanged.
+    InFlightHandle register_submit_handle(std::string_view coid) noexcept {
+        if (coid.empty()) return {};
+        if (find_index(coid) != kNotFound) return {};  // already in-flight
         for (std::size_t i = 0; i < kMaxInFlight; ++i) {
             if (!slots_[i].active) {
                 auto len = coid.size() < kClientOrderIdLen ? coid.size() : kClientOrderIdLen;
                 std::memcpy(slots_[i].id, coid.data(), len);
                 slots_[i].id[len] = '\0';
                 slots_[i].active = true;
+                ++slots_[i].generation;  // bump on every inactive -> active transition
                 ++count_;
-                return true;
+                return InFlightHandle{i, slots_[i].generation};
             }
         }
-        return false;  // capacity exhausted → fail-closed
+        return {};  // capacity exhausted → fail-closed
     }
 
     bool is_in_flight(std::string_view coid) const noexcept {
@@ -273,10 +306,23 @@ public:
     void mark_resolved(std::string_view coid) noexcept {
         auto idx = find_index(coid);
         if (idx != kNotFound) {
-            slots_[idx].active = false;
-            slots_[idx].id[0] = '\0';
-            if (count_ > 0) --count_;
+            release_slot(idx);
         }
+    }
+
+    // Handle-checked release: only succeeds if `h` still refers to a slot that is
+    // (a) active, (b) on the same generation as when the handle was issued, and
+    // (c) still holds the same coid -- all three must agree, or this is a no-op.
+    // This is the release path order_tracker.hpp's drain_reconcile_events() uses;
+    // mark_resolved() (COID-only) remains for Gate 12b's synchronous Rejected path.
+    bool mark_resolved_handle(InFlightHandle h, std::string_view coid) noexcept {
+        if (!h.valid() || h.slot_index >= kMaxInFlight) return false;
+        Slot& slot = slots_[h.slot_index];
+        if (!slot.active || slot.generation != h.generation) return false;
+        std::string_view sv(slot.id, std::strlen(slot.id));
+        if (sv != coid) return false;
+        release_slot(h.slot_index);
+        return true;
     }
 
     std::size_t count() const noexcept { return count_; }
@@ -286,6 +332,7 @@ private:
 
     struct Slot {
         bool active{false};
+        std::uint32_t generation{0};
         char id[kClientOrderIdLen + 1]{};
     };
 
@@ -298,6 +345,12 @@ private:
             }
         }
         return kNotFound;
+    }
+
+    void release_slot(std::size_t idx) noexcept {
+        slots_[idx].active = false;
+        slots_[idx].id[0] = '\0';
+        if (count_ > 0) --count_;
     }
 
     std::array<Slot, kMaxInFlight> slots_{};
