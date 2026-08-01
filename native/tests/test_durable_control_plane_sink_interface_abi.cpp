@@ -15,16 +15,6 @@
 // compile error, the same "proof of shape" role static_assert(is_trivially_
 // copyable_v<T>) plays for a struct.
 //
-// One deliberate asymmetry: DurableControlPlaneSink::append_seal_journal_apply
-// takes a `const SealJournalAppliedView&`, and that type is still an
-// incomplete forward declaration in durable_control_plane.hpp (the
-// seal-journal family stays out of scope this round). The stub below declares
-// and overrides that method (proving the signature itself compiles), but the
-// test body cannot construct an argument to actually CALL it -- an argument
-// of incomplete type cannot be constructed. Every other method on all three
-// interfaces IS called with real constructed argument values below, which is
-// a strictly stronger proof for those.
-//
 // Governance: L1, no network/token/order. GTest only.
 
 #include <gtest/gtest.h>
@@ -51,6 +41,7 @@ using hy::OperatorOverrideSidecar;
 using hy::RateLimitFreezePayload;
 using hy::RateLimitUsageSnapshotPayload;
 using hy::RecoveryScanStatus;
+using hy::SealJournalAppliedView;
 using hy::SealQueryStatus;
 using hy::SymbolRegistrySnapshotPayload;
 using hy::SymbolRules;
@@ -250,12 +241,8 @@ public:
         std::uint32_t, FrameTimeKind) noexcept override {
         return {};
     }
-    // Cannot be called from a test body -- SealJournalAppliedView is
-    // deliberately still incomplete this round (see the file-level comment
-    // above and durable_control_plane.hpp's forward declaration). Overriding
-    // it here still proves the signature itself is well-formed C++.
     AuditAppendResult append_seal_journal_apply(
-        const hy::SealJournalAppliedView&) noexcept override {
+        const SealJournalAppliedView&) noexcept override {
         return {};
     }
     RecoveryScanStatus recover_control_plane(
@@ -273,10 +260,9 @@ public:
 };
 
 // ===========================================================================
-// Instantiate through the base reference and call every method that CAN be
-// called (everything except append_seal_journal_apply -- see above) with
-// real constructed argument values. Only compilation and return-type shape
-// are asserted; this is an ABI-shape test, not a behavior test.
+// Instantiate through the base reference and call every method with real
+// constructed argument values. Only compilation and return-type shape are
+// asserted; this is an ABI-shape test, not a behavior test.
 // ===========================================================================
 
 TEST(ExternalAnchorClientStub, AllMethodsCallableThroughBaseReference) {
@@ -362,6 +348,14 @@ TEST(DurableControlPlaneSinkStub, AllCallableMethodsThroughBaseReference) {
     EXPECT_FALSE(iface.append_freeze_wait_satisfied(wait, FrameTimeKind::UnknownBootstrap).acked());
 
     EXPECT_FALSE(iface.append_freeze_epoch_watermark(1, FrameTimeKind::UnknownBootstrap).acked());
+
+    std::array<std::uint8_t, 4> payload_bytes{1, 2, 3, 4};
+    SealJournalAppliedView view{};
+    view.candidate_id = 1;
+    view.journal_seq = 1;
+    view.embedded_type = hy::DurableRecordType::OrderEvent;  // must be embeddable
+    view.embedded_payload = std::span<const std::uint8_t>(payload_bytes);
+    EXPECT_FALSE(iface.append_seal_journal_apply(view).acked());
 
     RateLimitFreezePayload out_freeze{};
     bool out_has_freeze{};

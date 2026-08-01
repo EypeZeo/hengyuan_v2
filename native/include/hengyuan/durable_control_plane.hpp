@@ -61,22 +61,18 @@
 // every pure virtual (a signature mismatch there is a compile error, the same
 // proof-of-shape role is_trivially_copyable_v plays for a struct).
 //
-// The one type NOT yet transcribed here (everything else L4 §10 names now is):
-// the entire seal-journal / .xgc wire-format family, spanning
-// docs/BINANCE_PRIVATE_REST_L4_SPEC.md's ~2,400 densely cross-referenced lines
-// on generation switch / compaction / seal journal apply, explicitly deferred
-// to a future, separately-scoped round (see docs/SPEC_INVARIANTS.md's
-// durable-audit-log entry: "compaction / generation 切换 / seal journal 不做，
-// 日志无限增长，这是已知缺口，等后续单独排期"). Named explicitly rather than
-// compressed to a family name, so a future search for any one of them finds
-// this note: SealIdWatermark, SealJournalCommitWatermark,
-// SealJournalIntakeCloseControl, SealJournalTombstoneWire, SealExportStartedWire
-// (and its variants), CompactionCandidateIntentWire, CompactionIntentTransitionWire,
-// CompactionIntentGcAuthorizedWire, SealJournalOriginKey,
-// is_seal_journal_embeddable_type, SealJournalAppliedView. The last of these is
-// forward-declared (incomplete type only) immediately above
-// DurableControlPlaneSink below, because append_seal_journal_apply's spec
-// signature requires it -- see that forward declaration's own comment.
+// What's NOT yet transcribed here (everything else L4 §10 names now is): the
+// remaining two-thirds of the seal-journal/.xgc wire-format family (seal-journal
+// Round A -- the id/journal-housekeeping cluster, plus SealJournalAppliedView's
+// real definition -- is done; see the banner comment above GenerationSeal's
+// dependents), explicitly deferred to future, separately-scoped rounds (see
+// docs/SPEC_INVARIANTS.md's "Seal-journal Round A" entry for the exact 3-round
+// split). Named explicitly rather than compressed to a family name: Round B
+// (Started quintet) = SealExportStartedWire (and its variants
+// SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/
+// SealStartedAbandonWire); Round C (compaction-intent GC family, confirmed by
+// research to not subdivide further) = CompactionCandidateIntentWire,
+// CompactionIntentTransitionWire, CompactionIntentGcAuthorizedWire.
 
 #pragma once
 
@@ -657,6 +653,255 @@ struct GenerationSeal {
 static_assert(std::is_trivially_copyable_v<GenerationSeal>);
 static_assert(std::is_standard_layout_v<GenerationSeal>);
 
+// ===========================================================================
+// Seal-journal Round A (轨道 C, round 1 of 3) -- the id/journal-housekeeping
+// cluster of the seal-journal/.xgc family, plus SealJournalAppliedView's real
+// definition (previously forward-declared incomplete, see the comment that
+// used to sit just above DurableControlPlaneSink -- deleted this round).
+// Round B (future, deferred): SealExportStartedWire, SealExportStartedMigrationWire,
+// SealStartedCleanupTombstoneWire, SealStartedAbandonWire (depends on this
+// round's SealJournalIntakeCloseControl topology fields, MAC-bound into
+// SealExportStartedWire). Round C (future, deferred): CompactionCandidateIntentWire,
+// CompactionIntentTransitionWire, CompactionIntentGcAuthorizedWire (confirmed
+// by research to not subdivide further -- densest, most tightly coupled part
+// of the family). The crash-window table and §10.1/10.2/10.3 procedural prose
+// (BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5327) contain zero new named types --
+// pure behavioral text, same treatment as DurableControlPlaneSink's
+// un-implemented method bodies; not transcribed, not even as anchoring
+// comments (would reference types that don't exist yet).
+// ===========================================================================
+
+// --- SealIdWatermark ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3009
+//
+// Durable high-water for seal ids (breadcrumb, outside store). next_* is the
+// NEXT allocatable value (like FreezeEpochWatermark) -- never decreases,
+// never reuses.
+
+struct SealIdWatermark {
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint64_t next_candidate_id{1};
+    std::uint64_t next_request_id{1};
+    // HMAC(KEK, "HY-SEALIDWM-v1" || store_uuid_lo || store_uuid_hi ||
+    //   next_candidate_id || next_request_id)
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<SealIdWatermark>);
+static_assert(std::is_standard_layout_v<SealIdWatermark>);
+
+// --- SealJournalCommitWatermark ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3028
+//
+// Per-candidate journal commit high-water (breadcrumb directory). File:
+// seal-journal/<store_uuid...>/<candidate_id_hex16>.jhw. Sole authoritative
+// source for next journal_seq (= highest + 1). Advanced ONLY after the final
+// .sj1 for that seq is durable; monotonic.
+
+struct SealJournalCommitWatermark {
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t highest_committed_journal_seq{0};  // 0 = none yet
+    std::uint32_t kek_key_id{0};
+    // HMAC(KEK[kek_key_id], "HY-SEALJRNHW-v1" || store_uuid_lo ||
+    //   store_uuid_hi || candidate_id || highest_committed_journal_seq ||
+    //   kek_key_id)
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<SealJournalCommitWatermark>);
+static_assert(std::is_standard_layout_v<SealJournalCommitWatermark>);
+
+// --- Seal-journal intake-close constants/alias ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3050
+//
+// kMaxSealHandoffProducers is the ARRAY CAPACITY (<=8), NOT the wait set (the
+// wait set is SealJournalIntakeCloseControl::registered_producer_mask,
+// below). mask is uint8_t => capacity MUST stay <=8 (round-54 P1).
+
+constexpr std::size_t kMaxSealHandoffProducers = 8;
+static_assert(kMaxSealHandoffProducers <= 8,
+              "registered_producer_mask is uint8_t; raise mask width before kMax");
+// Default close budget (owner may tighten); process-kill / hung producer must
+// not busy-spin forever (round-53 P1).
+constexpr std::uint64_t kSealJournalIntakeCloseDeadlineMs = 5'000;
+constexpr std::uint32_t kSealJournalIntakeCloseMaxPollIters = 1'000'000;
+using SealHandoffRingId = std::uint32_t;  // compile-time / config ring identity
+
+// --- SealJournalIntakeCloseProducerSlot / SealJournalIntakeCloseControl ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3058 / 3065
+//
+// Linearizable PostSeal handoff intake-close (RAM control block; NOT a
+// durable breadcrumb -- after process restart, close_epoch resets to 0 and
+// the owner MUST re-run the full protocol before GC A; never trust a prior
+// process's quiesce). One instance per active candidate_id. Fixed-size, NO
+// heap; atomics cacheline-aligned (CLAUDE.md false-sharing rule).
+//
+// Second occurrence in this file of an atomic-bearing RAM-only type (first is
+// ExportOutboxRing, above) -- NOT is_trivially_copyable_v. Governance mirrors
+// ExportOutboxRing exactly: struct (not class -- spec declares zero method
+// bodies for either type, unlike ExportOutboxRing's real try_push/
+// peek_oldest/etc.), explicit `= default` constructor + four `= delete`
+// special members (deleting the copy constructor alone would otherwise
+// suppress the implicit default constructor -- the explicit `= default` is
+// load-bearing, not decorative), and hy::kCacheLine in place of the spec's
+// std::hardware_destructive_interference_size (see ExportOutboxRing's own
+// deviation comment above for the GCC -Winterference-size/-Werror reason;
+// not repeated here to avoid two copies drifting apart).
+
+struct alignas(kCacheLine) SealJournalIntakeCloseProducerSlot {
+    SealJournalIntakeCloseProducerSlot() = default;
+    SealJournalIntakeCloseProducerSlot(const SealJournalIntakeCloseProducerSlot&) = delete;
+    SealJournalIntakeCloseProducerSlot& operator=(const SealJournalIntakeCloseProducerSlot&) = delete;
+    SealJournalIntakeCloseProducerSlot(SealJournalIntakeCloseProducerSlot&&) = delete;
+    SealJournalIntakeCloseProducerSlot& operator=(SealJournalIntakeCloseProducerSlot&&) = delete;
+
+    // Written by producer i with release after it has: observed close_epoch==E,
+    // refused new try_push for E, and finished any admit that already incremented
+    // in_flight_admit_guard. 0 = not quiesced for current epoch.
+    std::atomic<std::uint64_t> quiesced_ack_epoch{0};
+};
+
+struct SealJournalIntakeCloseControl {
+    SealJournalIntakeCloseControl() = default;
+    SealJournalIntakeCloseControl(const SealJournalIntakeCloseControl&) = delete;
+    SealJournalIntakeCloseControl& operator=(const SealJournalIntakeCloseControl&) = delete;
+    SealJournalIntakeCloseControl(SealJournalIntakeCloseControl&&) = delete;
+    SealJournalIntakeCloseControl& operator=(SealJournalIntakeCloseControl&&) = delete;
+
+    // Frozen BEFORE SealExportStarted / PostSeal handoff start (single-writer
+    // owner). Immutable until drain-complete. popcount(mask)==producer_count;
+    // bit i set => producers[i] + ring_id[i] are in the close wait set.
+    // Round-54: same tuple is MAC-bound into SealExportStarted (durable).
+    std::uint64_t candidate_id{0};             // MUST match this candidate
+    std::uint8_t registered_producer_mask{0};  // bits 0..kMax-1 only
+    std::uint8_t producer_count{0};            // 1..kMax; 0 illegal after freeze
+    SealHandoffRingId ring_id[kMaxSealHandoffProducers]{};  // per-slot ring bind
+    bool topology_frozen{false};               // true after freeze; false=>no close
+
+    // Owner stores non-zero close_epoch E with release to begin close.
+    // Producers load with acquire; if close_epoch != 0 they must not start a
+    // new try_push. 0 = intake open for Path B handoff admits.
+    // After timeout: epoch stays armed; same-process retry MUST store E+1
+    // (prior quiesced_ack_epoch==old E is void -- round-54 P1).
+    alignas(kCacheLine) std::atomic<std::uint64_t> close_epoch{0};
+    // Producer increments (acq_rel) BEFORE claiming a ring slot / publishing
+    // tail; decrements after successful publish OR abandoned push.
+    // ONLY producers whose bit is set in registered_producer_mask may touch
+    // this guard; unset-bit fetch_add / try_push -> immediate hard fence.
+    // Owner may treat rings as finally empty only when this is 0 (acquire).
+    alignas(kCacheLine) std::atomic<std::uint32_t> in_flight_admit_guard{0};
+    SealJournalIntakeCloseProducerSlot producers[kMaxSealHandoffProducers]{};
+
+    // Owner-local (single-writer), set when close begins:
+    // std::chrono::steady_clock::time_point close_deadline_steady;
+    // (conceptual -- implement with steady_clock, not wall clock. Not a real
+    // member -- the spec itself leaves this commented out; do not add it as
+    // struct state.)
+    // Owner-local: set true only after close protocol SUCCESS.
+    bool path_b_prohibited{false};
+};
+
+// --- SealJournalTombstoneWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3116
+//
+// Per-seq clear receipt after Applied Ack (breadcrumb directory). File:
+// seal-journal/<store_uuid...>/<candidate_id_hex16>-<journal_seq_hex16>.jts
+// Conceptual; on-disk is packed LE, 108 bytes, no padding:
+//   +0 u32 format_version(=1) / +4 u32 total_bytes(=108) / +8 u64 store_uuid_lo
+//   / +16 u64 store_uuid_hi / +24 u32 kek_key_id / +28 u64 candidate_id /
+//   +36 u64 journal_seq / +44 u8 entry_mac[32] (MUST equal the Applied /
+//   journal entry_mac) / +76 u8 mac[32] (trailer)
+// MAC domain (LE, no padding): HMAC(KEK[kek_key_id], "HY-SEALJRNTS-v1" ||
+//   format_version || total_bytes || store_uuid_lo || store_uuid_hi ||
+//   kek_key_id || candidate_id || journal_seq || entry_mac)
+
+constexpr std::uint32_t kSealJournalTombstoneFormatVersion = 1;
+constexpr std::size_t kSealJournalTombstoneBytes = 108;
+
+struct SealJournalTombstoneWire {
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<SealJournalTombstoneWire>);
+static_assert(std::is_standard_layout_v<SealJournalTombstoneWire>);
+
+// --- SealJournalOriginKey ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4363
+//
+// De-dup index key for seal-journal entries. entry_mac is deliberately NOT
+// part of this key -- see SealJournalAppliedView below.
+
+struct SealJournalOriginKey {
+    std::uint64_t candidate_id{0};
+    std::uint64_t journal_seq{0};
+};
+static_assert(std::is_trivially_copyable_v<SealJournalOriginKey>);
+static_assert(std::is_standard_layout_v<SealJournalOriginKey>);
+
+// --- is_seal_journal_embeddable_type ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4373
+//
+// Round-42 P1 -- closed allowlist for seal-journal / SealJournalApplied
+// embed. Anything else (GenerationBridge, OperatorOverride, SealJournalApplied,
+// compaction-only snapshots, registry/weight/usage, TransportFailover) is NOT
+// embeddable -- journal admit and apply MUST Corrupt / refuse.
+
+constexpr bool is_seal_journal_embeddable_type(DurableRecordType t) noexcept {
+    switch (t) {
+        case DurableRecordType::OrderEvent:
+        case DurableRecordType::OrderCheckpoint:
+        case DurableRecordType::RateLimitFreeze:
+        case DurableRecordType::FreezeEpochWatermark:
+        case DurableRecordType::FreezeProbeAttempt:
+        case DurableRecordType::FreezeClear:
+        case DurableRecordType::FreezeWaitArm:
+        case DurableRecordType::FreezeWaitSatisfied:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// --- Seal-journal entry-wire constants ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4448
+//
+// Derived constants for the SealJournalEntryWire on-disk layout (that wire
+// format itself has no corresponding C++ struct -- documented byte layout
+// only, same as SealJournalTombstoneWire above).
+
+constexpr std::uint32_t kSealJournalFormatVersion = 1;
+constexpr std::size_t kSealJournalFixedMetaBytes = 138;   // bytes excl. payload
+constexpr std::size_t kSealJournalMaxEmbeddedBytes = 4096;
+constexpr std::size_t kSealJournalMaxEntryBytes =
+    kSealJournalFixedMetaBytes + kSealJournalMaxEmbeddedBytes;  // 4234
+
+// --- SealJournalAppliedView ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4478
+//
+// In-memory call shape (zero heap; payload owned by caller until Ack) for
+// DurableControlPlaneSink::append_seal_journal_apply, below. Previously a
+// bare forward declaration (incomplete type only) sitting just above that
+// class; now a real definition here, with the family it belongs to --
+// append_seal_journal_apply is now genuinely callable (see that method's
+// updated comment) and the sink-interface test now exercises it like every
+// other method.
+
+struct SealJournalAppliedView {
+    std::uint64_t candidate_id{0};
+    std::uint64_t journal_seq{0};
+    std::uint8_t entry_mac[32]{};           // MUST equal recomputed HY-SEALJRN-v1
+    std::uint32_t kek_key_id{0};            // selects KEK for recompute
+    std::uint32_t source_generation{0};     // CompactionSourceBaseline.generation
+    std::uint64_t baseline_tip_seq{0};
+    std::uint8_t baseline_tip_mac[32]{};
+    std::uint32_t baseline_key_id{0};
+    FrameTimeKind time_kind{FrameTimeKind::ServerCorrectedUtc};
+    std::int64_t recorded_utc_ms{0};        // MUST be 0 iff UnknownBootstrap
+    DurableRecordType embedded_type{DurableRecordType::OrderEvent};
+    std::span<const std::uint8_t> embedded_payload{};  // caller-owned; sink
+                                                        // copies under Ack
+};
+
 // --- OrderRecoveryCheckpoint ---
 // SPEC-STRUCT: docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:1289
 //
@@ -936,20 +1181,6 @@ public:
 static_assert(std::is_abstract_v<ExternalAnchorClient>);
 static_assert(std::has_virtual_destructor_v<ExternalAnchorClient>);
 
-// Forward-declared ONLY -- never defined in this file. SealJournalAppliedView
-// is part of the seal-journal/.xgc wire-format family (§10.1/§10.3, ~2,400
-// spec lines), explicitly out of scope this round -- see this file's
-// top-of-file comment and docs/SPEC_INVARIANTS.md's durable-audit-log entry
-// ("compaction / generation 切换 / seal journal 不做...已知缺口，等后续单独
-// 排期"). A reference to an incomplete type is legal in a function
-// DECLARATION (never called against this forward declaration alone -- only a
-// future round that also defines SealJournalAppliedView can construct an
-// argument to call DurableControlPlaneSink::append_seal_journal_apply for
-// real). Its signature below is transcribed byte-for-byte including this
-// parameter type; do NOT substitute a stub/alias/placeholder type "to make it
-// compile more easily" -- that invents a shape the spec never wrote.
-struct SealJournalAppliedView;
-
 // --- DurableControlPlaneSink ---
 // SPEC-CLASS: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4707
 //
@@ -1197,8 +1428,8 @@ public:
     // FORBIDDEN: separate FrameTimeKind arg; FORBIDDEN: MAC-omitted baseline;
     // FORBIDDEN: opaque-only entry_mac compare without HY-SEALJRN-v1 recompute.
     // Ambient: CURRENT store_uuid + KEK table (same class as SealExportStarted).
-    // Sink MUST on EVERY call (see SealJournalAppliedView comment, deferred to
-    // the round that defines it):
+    // Sink MUST on EVERY call (see SealJournalAppliedView's own definition,
+    // above, for the full field list):
     //  - allowlist + size + schema + FrameTimeKind rules;
     //  - MUST recompute HY-SEALJRN-v1 over ambient store_uuid + view fields;
     //    view.entry_mac != expected -> Corrupt; zero business effects;
@@ -1214,12 +1445,9 @@ public:
     // compaction). Retained Applied MUST keep baseline 4-tuple + kek_key_id
     // + entry_mac intact until the frame is dropped entirely.
     //
-    // SealJournalAppliedView is deliberately still an incomplete type in this
-    // header (see the forward declaration above) -- this method's signature
-    // is transcribed byte-for-byte, but it cannot be called (an argument of
-    // incomplete type cannot be constructed) until a future round defines
-    // the seal-journal family. The test file's stub subclass declares this
-    // override but cannot exercise it for the same reason.
+    // SealJournalAppliedView is now a real, complete type (seal-journal Round
+    // A, 轨道 C) -- this method is genuinely callable, and the sink-interface
+    // test exercises it like every other method on this class.
     virtual AuditAppendResult append_seal_journal_apply(
         const SealJournalAppliedView& apply) noexcept = 0;
 
