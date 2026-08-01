@@ -215,6 +215,29 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_env_parser)
     gtest_discover_tests(test_env_parser)
 
+    # 轨道 A 第四项: vendored SHA-256/HMAC-SHA256 (L1, no OpenSSL -- see
+    # sha256.hpp's own header comment for why). Foundation for the durable
+    # audit log's frame checksum; independently testable/verifiable first.
+    add_executable(test_sha256_hmac tests/test_sha256_hmac.cpp)
+    target_link_libraries(test_sha256_hmac PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_sha256_hmac)
+    gtest_discover_tests(test_sha256_hmac)
+
+    # 轨道 A 第四项: durable 日志帧编解码 (L1, 纯内存, 无文件 I/O -- 真正的文件
+    # 落盘在 durable_audit_sink.hpp，这里只验证帧格式本身)
+    add_executable(test_durable_frame_codec tests/test_durable_frame_codec.cpp)
+    target_link_libraries(test_durable_frame_codec PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_frame_codec)
+    gtest_discover_tests(test_durable_frame_codec)
+
+    # 轨道 A 第四项: DurableAuditSink 核心 (L2, 真实文件 I/O -- 跨平台锁/fsync/
+    # tip anchor 原子替换/recovery_scan()). 真实文件测试见
+    # test_durable_audit_sink.cpp；纯内存帧格式测试见上面的 test_durable_frame_codec。
+    add_executable(test_durable_audit_sink tests/test_durable_audit_sink.cpp)
+    target_link_libraries(test_durable_audit_sink PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_audit_sink)
+    gtest_discover_tests(test_durable_audit_sink)
+
     # P2-EXEC-LIVE-01 D12-9: live submit orchestrator (L1, mock submit port)
     add_executable(test_live_submit_orchestrator tests/test_live_submit_orchestrator.cpp)
     target_link_libraries(test_live_submit_orchestrator PRIVATE hengyuan_core GTest::gtest_main)

@@ -395,6 +395,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.price_ticks = ctx.price_ticks;
         ar.qty_ticks = ctx.qty_ticks;
         ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
         ctx.audit->append(ar);
     }
 
@@ -417,6 +418,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.mode = ctx.mode;
         ar.symbol_id = ctx.symbol_id;
         ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
         ar.set_detail("confirmation does not authorize this order");
         ctx.audit->append(ar);
         return result;
@@ -430,6 +432,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.event_type = AuditEventType::PreflightFailed;
         ar.mode = ctx.mode;
         ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
         ar.set_detail("submit port invalid");
         ctx.audit->append(ar);
         return result;
@@ -452,6 +455,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.event_type = AuditEventType::RateLimitApproaching;
         ar.mode = ctx.mode;
         ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
         ctx.audit->append(ar);
         return result;
     }
@@ -468,6 +472,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.event_type = AuditEventType::PreflightFailed;
         ar.mode = ctx.mode;
         ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
         ar.set_detail("duplicate in-flight - reconcile, do NOT resubmit");
         ctx.audit->append(ar);
         return result;
@@ -484,6 +489,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.price_ticks = ctx.price_ticks;
         ar.qty_ticks = ctx.qty_ticks;
         ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
         ctx.audit->append(ar);
     }
 
@@ -507,6 +513,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.symbol_id = ctx.symbol_id;
                 ar.exchange_order_id = resp.exchange_order_id;
                 ar.set_client_order_id(coid.view());
+                ar.resulting_state = result.order.state;
                 ctx.audit->append(ar);
             }
             break;
@@ -526,6 +533,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.symbol_id = ctx.symbol_id;
                 ar.detail_code = resp.error_code;
                 ar.set_client_order_id(coid.view());
+                ar.resulting_state = result.order.state;
                 ar.set_detail("exchange rejected");
                 ctx.audit->append(ar);
             }
@@ -542,6 +550,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.mode = ctx.mode;
                 ar.symbol_id = ctx.symbol_id;
                 ar.set_client_order_id(coid.view());
+                ar.resulting_state = result.order.state;
                 ar.set_detail("POST timeout - ambiguous, do NOT retry");
                 ctx.audit->append(ar);
             }
@@ -567,6 +576,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.mode = ctx.mode;
                 ar.symbol_id = ctx.symbol_id;
                 ar.set_client_order_id(coid.view());
+                ar.resulting_state = result.order.state;
                 ar.set_detail("network error - ambiguous");
                 ctx.audit->append(ar);
             }
@@ -596,6 +606,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 ar.mode = ctx.mode;
                 ar.symbol_id = ctx.symbol_id;
                 ar.set_client_order_id(coid.view());
+                ar.resulting_state = result.order.state;
                 ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
                 ctx.audit->append(ar);
             }

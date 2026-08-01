@@ -54,6 +54,8 @@ SEARCH_FILES = [
     REPO_ROOT / "native" / "include" / "hengyuan" / "audit_trail.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "account_truth.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "order_tracker.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "durable_frame_codec.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "durable_audit_sink.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
