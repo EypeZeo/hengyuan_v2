@@ -269,6 +269,46 @@ POSIX flock/Windows 无共享 CreateFileA、每次 append 同步 fsync、本地 
   之后）不得重新匹配旧代的 `WaitSatisfied`（round 31 引入，round 32 发现 legacy `gen=0→1` 升级路径
   重新打开了这个漏洞，round 32 修复：绝不 promote legacy Satisfy）。
 
+**[已实现，最小垂直切片]** 以上三条不变量此前只有行为描述，没有对应的持久化类型可指——`native/
+include/hengyuan/durable_control_plane.hpp` 里 L4 §10（`docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2449-
+5327`，占整份 spec 文件一半以上，约 35 个类型）此前只转写了 6 个，freeze 子系统的 payload 类型全部
+缺失。这一轮补上这三条不变量的 ABI 载体（只转写字段，不实现行为，和这个头文件其余部分同一治理级别：
+"no append(), no fsync, no MAC verification, no recovery_scan()"）：
+
+- `SealQueryStatus` — 4 值（`Found=0`/`NotFound=1`/`TransportUnavailable=2`/`Corrupt=3`）。spec 原文
+  显式警告**不可复用 `RecoveryScanStatus`**：那个枚举没有 `Found`，且会把"传输层不可用"和"记录确实
+  不存在"混为一谈（round 39 P0）。首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:2501`）。
+- `FreezeClearKind` — 3 值（`ProbeVerified=0`/`ConservativeWaitCompleted=1`/`OperatorAuthorized=2`），
+  为下面 `FreezeClearPayload` 的 clear_kind 字段提供载体，也是 `wait_ok`/`wait_generation` 两条不变量
+  第一次有类型可以挂。首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:2570`）。
+- `FreezeProbePurpose` — 2 值（`DeadlineOrVerify=0`/`ClockRepublishOrVerify=1`）；`ClockRepublishOrVerify`
+  可以在同一响应上以 `ProbeVerified` 清除冻结（round 29 P0 撤回了此前"republish 永不清除"的判断）。
+  首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:2616`）。
+- `RateLimitFreezePayload` — `FreezeProbeCredit`/`wait_generation` 两条不变量的持久化载体；
+  `conservative_wait_ms` 字段是**这一帧自己的**等待贡献量，不是重新陈述的运行时最大值——恢复重放/
+  在线所有者都必须对同一 epoch 下的全部帧取 `max(deadline)`/`max(wait)`/`max(wait_generation)`，
+  绝不能只看最新一帧（round 23/31）。`pad[3]` 字段是 spec 原文自带的，不是本轮计算出来的对齐字节。
+  首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:2576`）。
+- `FreezeProbeAttemptPayload` — `FreezeProbeCredit`（8 次上限 + 指数退避上限 5 分钟）的持久化载体；
+  `cleared` 字段写入时必须是 `false`（sink 拒绝调用方传入 `true`）。首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:2623`）。
+- `FreezeTimeProbeProof` — MAC 覆盖范围含 `freeze_epoch`/`bound_deadline_utc_ms`/`request_nonce`，
+  防的是跨 episode 重放，不是第三方可验证证明，只是本地防篡改。首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:2694`）。
+- `FreezeClearPayload` — 唯一的终态清除记录；`bound_conservative_wait_ms` 字段**仅供参考**——sink
+  必须要求一条独立的、sink 自己验证过的 `FreezeWaitSatisfied` 记录（`wait_ok` 不变量，round 30），
+  不能仅凭这个字段数值相等就放行。首次移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:2715`）。
+- `FreezeWaitArmPayload` / `FreezeWaitSatisfiedPayload` — `wait_ok`/`wait_generation`（round 30/31/32）
+  现在有了对应的持久化结构；`FreezeWaitSatisfiedPayload` 的 arm_ordinal/arm_frame_seq 字段与对应 Arm
+  记录的绑定关系，此前只在不变量文字里隐含，没有类型可以指。首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:2747` / `2760`）。
+- `CompactedFreezeWaitEvidencePayload` — compaction-only 单帧折叠替代品；**禁止**用一对
+  `FreezeWaitArm`+`FreezeWaitSatisfied` 双帧代替（round 33/34）。首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:2779`）。
+- `FreezeEpochWatermarkPayload` — `next_freeze_epoch` 命名的是**下一个未使用的值**，不是"正在消费的
+  epoch"（round 21 P0 措辞裁决）；默认值必须是 `1`，不是 `0`——`0` 是保留值。首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:2810`）。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
