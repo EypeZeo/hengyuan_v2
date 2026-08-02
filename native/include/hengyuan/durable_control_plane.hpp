@@ -62,17 +62,17 @@
 // proof-of-shape role is_trivially_copyable_v plays for a struct).
 //
 // What's NOT yet transcribed here (everything else L4 §10 names now is): the
-// remaining two-thirds of the seal-journal/.xgc wire-format family (seal-journal
-// Round A -- the id/journal-housekeeping cluster, plus SealJournalAppliedView's
-// real definition -- is done; see the banner comment above GenerationSeal's
-// dependents), explicitly deferred to future, separately-scoped rounds (see
-// docs/SPEC_INVARIANTS.md's "Seal-journal Round A" entry for the exact 3-round
-// split). Named explicitly rather than compressed to a family name: Round B
-// (Started quintet) = SealExportStartedWire (and its variants
+// last third of the seal-journal/.xgc wire-format family -- Round C, the
+// compaction-intent GC family (confirmed by research to not subdivide
+// further): CompactionCandidateIntentWire, CompactionIntentTransitionWire,
+// CompactionIntentGcAuthorizedWire. Seal-journal Round A (id/journal-
+// housekeeping cluster + SealJournalAppliedView's real definition) and Round B
+// (the Started quintet: SealExportStartedWire and its variants
 // SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/
-// SealStartedAbandonWire); Round C (compaction-intent GC family, confirmed by
-// research to not subdivide further) = CompactionCandidateIntentWire,
-// CompactionIntentTransitionWire, CompactionIntentGcAuthorizedWire.
+// SealStartedAbandonWire) are both done -- see their banner comments above
+// GenerationSeal's dependents and above SealJournalOriginKey respectively, and
+// docs/SPEC_INVARIANTS.md's "Seal-journal Round A"/"Seal-journal Round B"
+// entries for the full 3-round split.
 
 #pragma once
 
@@ -658,13 +658,12 @@ static_assert(std::is_standard_layout_v<GenerationSeal>);
 // cluster of the seal-journal/.xgc family, plus SealJournalAppliedView's real
 // definition (previously forward-declared incomplete, see the comment that
 // used to sit just above DurableControlPlaneSink -- deleted this round).
-// Round B (future, deferred): SealExportStartedWire, SealExportStartedMigrationWire,
-// SealStartedCleanupTombstoneWire, SealStartedAbandonWire (depends on this
-// round's SealJournalIntakeCloseControl topology fields, MAC-bound into
-// SealExportStartedWire). Round C (future, deferred): CompactionCandidateIntentWire,
-// CompactionIntentTransitionWire, CompactionIntentGcAuthorizedWire (confirmed
-// by research to not subdivide further -- densest, most tightly coupled part
-// of the family). The crash-window table and §10.1/10.2/10.3 procedural prose
+// Round B is DONE -- see the "Seal-journal Round B" banner further below,
+// right after SealJournalTombstoneWire. Round C (future, deferred):
+// CompactionCandidateIntentWire, CompactionIntentTransitionWire,
+// CompactionIntentGcAuthorizedWire (confirmed by research to not subdivide
+// further -- densest, most tightly coupled part of the family). The
+// crash-window table and §10.1/10.2/10.3 procedural prose
 // (BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5327) contain zero new named types --
 // pure behavioral text, same treatment as DurableControlPlaneSink's
 // un-implemented method bodies; not transcribed, not even as anchoring
@@ -824,6 +823,256 @@ struct SealJournalTombstoneWire {
 };
 static_assert(std::is_trivially_copyable_v<SealJournalTombstoneWire>);
 static_assert(std::is_standard_layout_v<SealJournalTombstoneWire>);
+
+// ===========================================================================
+// Seal-journal Round B (轨道 C, round 2 of 3) -- the "Started quintet":
+// SealExportStartedWire (L, alias SealExportStarted), SealExportStartedMigrationWire
+// (M), SealStartedCleanupTombstoneWire (C), SealStartedAbandonWire (A). Depends
+// on Round A's SealJournalIntakeCloseControl -- its frozen topology tuple
+// (registered_producer_mask/producer_count/ring_id[]) is MAC-bound into
+// SealExportStartedWire below.
+//
+// "V" (seal-export-started.v2) is NOT a separate type -- it is the identical
+// SealExportStartedWire shape written to a second file (the migration
+// companion), differing from L only in the topology tuple + kek_key_id per the
+// spec's L<->V closed-field-bind rule (BINANCE_PRIVATE_REST_L4_SPEC.md:3900-
+// 3914). Do not invent a second struct for it.
+//
+// Filenames (breadcrumb dir, outside the store root) -- round-56/57/64:
+//   seal-export-started       -- greenfield v2 OR legacy 192B final (immutable)
+//   seal-export-started.v2    -- migration companion (CREATE_NEW / no-replace)
+//   seal-export-started.mig   -- migration commit (CREATE_NEW / no-replace)
+//   seal-export-started.clr   -- cleanup tombstone (CREATE_NEW; phase via REPLACE)
+//   seal-export-started.abd   -- ClrAbandoned proof (CREATE_NEW; phase via REPLACE)
+// Forbidden for L/V/M: §10.3 REPLACE / replace-MoveFileExW / delete-then-recreate
+// of a live final (power-cut -> lose PostSeal gate). `.clr`/`.abd` phase advances
+// MAY use §10.3 REPLACE (watermark class) -- monotonic raise only.
+//
+// Round C (future, deferred): CompactionCandidateIntentWire,
+// CompactionIntentTransitionWire, CompactionIntentGcAuthorizedWire (confirmed
+// by research to not subdivide further).
+//
+// All four types below follow this file's established "Wire type has only
+// mac[32]" rule -- the full packed on-disk layout is documented in a comment,
+// never expanded into real struct members. phase/started_kind/abandon_reason
+// are free constexpr std::uint8_t constants (not enum class), matching both
+// the spec's own convention for this family and the already-transcribed
+// RateLimitFreezePayload::source precedent -- they are not real struct fields
+// at all, since the structs themselves are mac[32]-only.
+// ===========================================================================
+
+// --- SealExportStartedWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3185
+//
+// Durable breadcrumb OUTSIDE the store root (same class as LastRemoteAckedTip /
+// OperatorOverrideSidecar). Written+fsynced BEFORE any seal network byte is
+// sent. Presence forces PostSeal recovery even when no local seal Ack was
+// observed. Conceptual layout (packed LE, NO padding), format_version == 2:
+//   +0    u32 format_version (=2)
+//   +4    u32 total_bytes    (= 238 == kSealExportStartedWireBytes)
+//   +8    u64 store_uuid_lo
+//   +16   u64 store_uuid_hi
+//   +24   u64 candidate_id
+//   +32   u32 source_generation
+//   +36   u64 baseline_tip_seq
+//   +44   u8  baseline_tip_mac[32]
+//   +76   u32 baseline_key_id
+//   +80   u32 new_generation
+//   +84   u64 new_final_seq
+//   +92   u8  new_final_tip_mac[32]
+//   +124  u32 new_key_id
+//   +128  u64 request_id
+//   +136  u8  content_root[32]
+//   +168  u32 kek_key_id          // round-57 P0 -- selects KEK[kek_key_id]
+//   +172  u8  registered_producer_mask
+//   +173  u8  producer_count
+//   +174  u32 ring_id[8]          // kMaxSealHandoffProducers; unset -> 0
+//   +206  u8  mac[32]             // trailer
+
+constexpr std::uint32_t kSealExportStartedFormatVersion = 2;
+constexpr std::size_t kSealExportStartedWireBytes = 238;
+// Legacy pre-topology conceptual length (r37...r53, no format_version header):
+// 192 = fields through content_root + mac under "HY-SEALSTART-v1" (no kek_key_id).
+constexpr std::size_t kSealExportStartedLegacyV1Bytes = 192;
+// Draft-only 234B (r55/r56 before kek_key_id) -- never admit; treat as Corrupt.
+constexpr std::size_t kSealExportStartedDraft234Bytes = 234;
+static_assert(kSealExportStartedWireBytes == 238);
+static_assert(4 + 4 + 8 + 8 + 8 + 4 + 8 + 32 + 4 + 4 + 8 + 32 + 4 + 8 + 32 + 4 + 1 + 1
+                  + (4 * kMaxSealHandoffProducers) + 32
+              == kSealExportStartedWireBytes);
+
+struct SealExportStartedWire {
+    // Conceptual; on-disk packed as above. MAC domain (LE, no padding):
+    // HMAC(KEK[kek_key_id], "HY-SEALSTART-v2" || format_version || total_bytes ||
+    //   store_uuid_lo || store_uuid_hi || candidate_id || source_generation ||
+    //   baseline_tip_seq || baseline_tip_mac || baseline_key_id ||
+    //   new_generation || new_final_seq || new_final_tip_mac || new_key_id ||
+    //   request_id || content_root || kek_key_id || registered_producer_mask ||
+    //   producer_count || ring_id[0] || ... || ring_id[kMax-1])
+    // Topology MUST match frozen SealJournalIntakeCloseControl (round-54/55).
+    // Forbidden: write format_version!=2; Forbidden: total_bytes!=238;
+    // Forbidden: invent mask=0 / empty topology; Forbidden: try-all / current-key
+    // fallback when kek_key_id wrapper missing (L5 §6.1.1.2).
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<SealExportStartedWire>);
+static_assert(std::is_standard_layout_v<SealExportStartedWire>);
+// Alias used in prose: SealExportStarted == SealExportStartedWire v2 fields.
+using SealExportStarted = SealExportStartedWire;
+
+// --- SealExportStartedMigrationWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3224
+//
+// Migration commit (companion strategy). File: seal-export-started.mig.
+// Fields are SHA-256 digests + trailer MACs of the L and V files, not copies
+// of their business fields. Packed LE, NO padding, format_version == 2:
+//   +0   u32 format_version (=2)
+//   +4   u32 total_bytes    (= 208)
+//   +8   u64 store_uuid_lo
+//   +16  u64 store_uuid_hi
+//   +24  u64 candidate_id
+//   +32  u64 request_id
+//   +40  u32 legacy_kek_key_id  // sole KEK used to verify L (explicit; no try-all)
+//   +44  u32 v2_kek_key_id      // == V.kek_key_id; selects KEK for V + M MACs
+//   +48  u8  legacy_file_digest[32]  // SHA-256(entire L file bytes)
+//   +80  u8  v2_file_digest[32]      // SHA-256(entire V file bytes)
+//   +112 u8  legacy_mac[32]          // L trailer MAC
+//   +144 u8  v2_mac[32]              // V trailer MAC
+//   +176 u8  mac[32]
+
+constexpr std::uint32_t kSealExportStartedMigrationFormatVersion = 2;
+constexpr std::size_t kSealExportStartedMigrationWireBytes = 208;
+// Draft-only r56 mig (macs+ids, no kek ids / no full-file digests) -- Corrupt.
+constexpr std::size_t kSealExportStartedMigrationDraft136Bytes = 136;
+static_assert(4 + 4 + 8 + 8 + 8 + 8 + 4 + 4 + 32 + 32 + 32 + 32 + 32
+              == kSealExportStartedMigrationWireBytes);
+
+struct SealExportStartedMigrationWire {
+    // HMAC(KEK[v2_kek_key_id], "HY-SEALSTARTMIG-v2" || format_version ||
+    //   total_bytes || store_uuid_lo || store_uuid_hi || candidate_id ||
+    //   request_id || legacy_kek_key_id || v2_kek_key_id ||
+    //   legacy_file_digest || v2_file_digest || legacy_mac || v2_mac)
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<SealExportStartedMigrationWire>);
+static_assert(std::is_standard_layout_v<SealExportStartedMigrationWire>);
+
+// --- SealStartedCleanupTombstoneWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3278
+//
+// Cleanup tombstone (authorizes Started unlink ONLY after PostSeal committed:
+// CURRENT flipped + tip persisted + bridge bound + journal drain-complete).
+// File: seal-export-started.clr. Packed LE, NO padding, format_version == 2:
+//   +0    u32 format_version (=2)
+//   +4    u32 total_bytes    (= 304 == kSealStartedCleanupWireBytes)
+//   +8    u64 store_uuid_lo
+//   +16   u64 store_uuid_hi
+//   +24   u64 candidate_id
+//   +32   u64 request_id
+//   +40   u32 kek_key_id
+//   +44   u8  started_kind     // 1=NativeV2, 2=MigratedV2
+//   +45   u8  present_mask     // bit0=L, bit1=V, bit2=M at authorize time
+//   +46   u8  phase            // 0=Authorized ... see cleanup order below
+//   +47   u8  reserved0 (=0)
+//   // PostSealCommittedProof (round-58 P0) -- MAC-bound; all MUST hold at
+//   // CREATE and at every CleanupInProgress resume:
+//   +48   u32 source_generation      // == Started.source_generation == bridge.prev_generation
+//   +52   u64 baseline_tip_seq       // == Started.baseline_tip_seq == bridge.prev_tip_seq
+//   +60   u8  baseline_tip_mac[32]   // == Started / bridge.prev_tip_mac
+//   +92   u32 baseline_key_id        // == Started / bridge.prev_key_id
+//   +96   u32 new_generation         // == Started.new_generation; CURRENT MUST == this
+//   +100  u64 new_final_seq          // == Started.new_final_seq
+//   +108  u8  new_final_tip_mac[32]  // == Started.new_final_tip_mac
+//   +140  u32 new_key_id             // == Started.new_key_id
+//   +144  u8  content_root[32]       // == Started.content_root == GenerationSeal.content_root
+//   +176  u8  digest_L[32]           // SHA-256(L) or zeros if bit0 clear
+//   +208  u8  digest_V[32]
+//   +240  u8  digest_M[32]
+//   +272  u8  mac[32]
+
+constexpr std::uint32_t kSealStartedCleanupFormatVersion = 2;
+constexpr std::size_t kSealStartedCleanupWireBytes = 304;
+// Draft-only r57 .clr (ids/digests only; no PostSealCommittedProof) -- Corrupt /
+// never CleanupInProgress (never pad to 304).
+constexpr std::size_t kSealStartedCleanupDraft176Bytes = 176;
+constexpr std::uint8_t kSealStartedKindNativeV2 = 1;
+constexpr std::uint8_t kSealStartedKindMigratedV2 = 2;
+constexpr std::uint8_t kSealStartedCleanupPhaseAuthorized = 0;
+constexpr std::uint8_t kSealStartedCleanupPhaseMGone = 1;
+constexpr std::uint8_t kSealStartedCleanupPhaseVGone = 2;
+constexpr std::uint8_t kSealStartedCleanupPhaseLGone = 3;
+constexpr std::uint8_t kSealStartedCleanupPhaseClrPending = 4;  // only CLR left
+static_assert(4 + 4 + 8 + 8 + 8 + 8 + 4 + 1 + 1 + 1 + 1
+                  + 4 + 8 + 32 + 4 + 4 + 8 + 32 + 4 + 32
+                  + 32 + 32 + 32 + 32
+              == kSealStartedCleanupWireBytes);
+
+struct SealStartedCleanupTombstoneWire {
+    // HMAC(KEK[kek_key_id], "HY-SEALSTARTCLR-v2" || format_version ||
+    //   total_bytes || store_uuid_lo || store_uuid_hi || candidate_id ||
+    //   request_id || kek_key_id || started_kind || present_mask || phase ||
+    //   reserved0 || source_generation || baseline_tip_seq ||
+    //   baseline_tip_mac || baseline_key_id || new_generation ||
+    //   new_final_seq || new_final_tip_mac || new_key_id || content_root ||
+    //   digest_L || digest_V || digest_M)
+    // phase advances are monotonic; REPLACE of .clr allowed only to raise phase
+    // (proof fields immutable after Authorized CREATE_NEW).
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<SealStartedCleanupTombstoneWire>);
+static_assert(std::is_standard_layout_v<SealStartedCleanupTombstoneWire>);
+
+// --- SealStartedAbandonWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3326
+//
+// ClrAbandoned proof (converges ClrUnauthorized + NotFound). File:
+// seal-export-started.abd. Packed LE, NO padding, format_version == 1:
+//   +0    u32 format_version (=1)
+//   +4    u32 total_bytes    (= 192 == kSealStartedAbandonWireBytes)
+//   +8    u64 store_uuid_lo
+//   +16   u64 store_uuid_hi
+//   +24   u64 candidate_id
+//   +32   u64 request_id
+//   +40   u32 kek_key_id
+//   +44   u8  started_kind     // 1=NativeV2, 2=MigratedV2
+//   +45   u8  abandon_reason   // 1=AuthenticatedNotFound
+//   +46   u8  present_mask     // bit0=L, bit1=V, bit2=M, bit3=C at authorize
+//   +47   u8  phase            // see ClrAbandoned order below
+//   +48   u32 source_generation
+//   +52   u64 baseline_tip_seq
+//   +60   u8  baseline_tip_mac[32]
+//   +92   u32 baseline_key_id
+//   +96   u8  content_root[32]
+//   +128  u8  digest_C[32]     // SHA-256(unauthorized C) or zeros if absent/torn
+//   +160  u8  mac[32]
+
+constexpr std::uint32_t kSealStartedAbandonFormatVersion = 1;
+constexpr std::size_t kSealStartedAbandonWireBytes = 192;
+constexpr std::uint8_t kSealStartedAbandonReasonNotFound = 1;
+constexpr std::uint8_t kSealStartedAbandonPhaseAuthorized = 0;
+constexpr std::uint8_t kSealStartedAbandonPhaseCGone = 1;
+constexpr std::uint8_t kSealStartedAbandonPhaseMGone = 2;
+constexpr std::uint8_t kSealStartedAbandonPhaseVGone = 3;
+constexpr std::uint8_t kSealStartedAbandonPhaseLGone = 4;
+constexpr std::uint8_t kSealStartedAbandonPhaseGenGone = 5;  // gen-N+1 abandoned
+constexpr std::uint8_t kSealStartedAbandonPhaseResumeAuthorized = 6;  // tip ok; A kept; producer paused
+constexpr std::uint8_t kSealStartedAbandonPhaseAbdPending = 7;  // unlink A next; resume after A gone
+static_assert(4 + 4 + 8 + 8 + 8 + 8 + 4 + 1 + 1 + 1 + 1
+                  + 4 + 8 + 32 + 4 + 32 + 32 + 32
+              == kSealStartedAbandonWireBytes);
+
+struct SealStartedAbandonWire {
+    // HMAC(KEK[kek_key_id], "HY-SEALSTARTABD-v1" || format_version ||
+    //   total_bytes || store_uuid_lo || store_uuid_hi || candidate_id ||
+    //   request_id || kek_key_id || started_kind || abandon_reason ||
+    //   present_mask || phase || source_generation || baseline_tip_seq ||
+    //   baseline_tip_mac || baseline_key_id || content_root || digest_C)
+    // phase advances monotonic; REPLACE .abd only to raise phase
+    // (all other fields immutable after Authorized CREATE_NEW).
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<SealStartedAbandonWire>);
+static_assert(std::is_standard_layout_v<SealStartedAbandonWire>);
 
 // --- SealJournalOriginKey ---
 // SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4363

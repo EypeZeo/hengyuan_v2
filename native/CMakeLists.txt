@@ -308,12 +308,18 @@ if(HY_BUILD_TESTS)
     gtest_discover_tests(test_durable_control_plane_sink_interface_abi)
 
     # 轨道 C: L4 §10 seal-journal Round A（SealIdWatermark 家族，ABI-only；
-    # Round B=Started 五件套 / Round C=CompactionCandidateIntent GC 家族 未做，
-    # 见 durable_control_plane.hpp 顶部注释与 SPEC_INVARIANTS.md）
+    # Round C=CompactionCandidateIntent GC 家族 未做，见 durable_control_plane.hpp
+    # 顶部注释与 SPEC_INVARIANTS.md）
     add_executable(test_durable_control_plane_seal_journal_abi tests/test_durable_control_plane_seal_journal_abi.cpp)
     target_link_libraries(test_durable_control_plane_seal_journal_abi PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_durable_control_plane_seal_journal_abi)
     gtest_discover_tests(test_durable_control_plane_seal_journal_abi)
+
+    # 轨道 C: L4 §10 seal-journal Round B（Started 五元组，ABI-only；Round C 仍未做）
+    add_executable(test_durable_control_plane_seal_journal_started_abi tests/test_durable_control_plane_seal_journal_started_abi.cpp)
+    target_link_libraries(test_durable_control_plane_seal_journal_started_abi PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_control_plane_seal_journal_started_abi)
+    gtest_discover_tests(test_durable_control_plane_seal_journal_started_abi)
 
     # 轨道 A 第三项: reconcile/poll loop (order_tracker.hpp). Single-threaded here
     # (poll_once()/drain_reconcile_events() are plain functions) -- the real
