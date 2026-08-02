@@ -61,18 +61,23 @@
 // every pure virtual (a signature mismatch there is a compile error, the same
 // proof-of-shape role is_trivially_copyable_v plays for a struct).
 //
-// What's NOT yet transcribed here (everything else L4 §10 names now is): the
-// last third of the seal-journal/.xgc wire-format family -- Round C, the
-// compaction-intent GC family (confirmed by research to not subdivide
-// further): CompactionCandidateIntentWire, CompactionIntentTransitionWire,
-// CompactionIntentGcAuthorizedWire. Seal-journal Round A (id/journal-
-// housekeeping cluster + SealJournalAppliedView's real definition) and Round B
-// (the Started quintet: SealExportStartedWire and its variants
-// SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/
-// SealStartedAbandonWire) are both done -- see their banner comments above
-// GenerationSeal's dependents and above SealJournalOriginKey respectively, and
-// docs/SPEC_INVARIANTS.md's "Seal-journal Round A"/"Seal-journal Round B"
-// entries for the full 3-round split.
+// Every type L4 §10 names is now transcribed -- the 3-round seal-journal
+// split (Round A: id/journal-housekeeping cluster + SealJournalAppliedView's
+// real definition; Round B: the Started quintet; Round C: the
+// CompactionCandidateIntent GC family) is complete. See the three "Seal-
+// journal Round A/B/C" banner comments below (above GenerationSeal's
+// dependents, above SealJournalOriginKey, and above SealJournalOriginKey
+// again respectively) and docs/SPEC_INVARIANTS.md's matching ledger entries.
+//
+// This is declaration-only completeness, not implementation completeness --
+// see this file's SCOPE paragraph above and the "Seal-journal Round C" ledger
+// entry's explicit scope boundary: no type in this file has encode/decode,
+// filesystem publish, MAC verification, a recovery state machine, or a
+// concurrency/ownership protocol. The one thing genuinely NOT transcribed
+// here, and permanently so: the crash-window table and §10.1/10.2/10.3
+// procedural prose (BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5327) -- zero new
+// named types, pure behavioral text, same treatment as
+// DurableControlPlaneSink's un-implemented method bodies.
 
 #pragma once
 
@@ -658,16 +663,16 @@ static_assert(std::is_standard_layout_v<GenerationSeal>);
 // cluster of the seal-journal/.xgc family, plus SealJournalAppliedView's real
 // definition (previously forward-declared incomplete, see the comment that
 // used to sit just above DurableControlPlaneSink -- deleted this round).
-// Round B is DONE -- see the "Seal-journal Round B" banner further below,
-// right after SealJournalTombstoneWire. Round C (future, deferred):
-// CompactionCandidateIntentWire, CompactionIntentTransitionWire,
-// CompactionIntentGcAuthorizedWire (confirmed by research to not subdivide
-// further -- densest, most tightly coupled part of the family). The
-// crash-window table and §10.1/10.2/10.3 procedural prose
-// (BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5327) contain zero new named types --
-// pure behavioral text, same treatment as DurableControlPlaneSink's
-// un-implemented method bodies; not transcribed, not even as anchoring
-// comments (would reference types that don't exist yet).
+// Round B and Round C are both DONE -- see the "Seal-journal Round B" banner
+// further below (right after SealJournalTombstoneWire) and the "Seal-journal
+// Round C" banner further still (right after SealStartedAbandonWire). That
+// completes the 3-round seal-journal split -- L4 §10's type-level surface is
+// now fully transcribed. The crash-window table and §10.1/10.2/10.3
+// procedural prose (BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5327) contain zero
+// new named types -- pure behavioral text, same treatment as
+// DurableControlPlaneSink's un-implemented method bodies; not transcribed,
+// not even as anchoring comments (would reference types that don't exist
+// yet), and this exclusion is permanent, not a future round.
 // ===========================================================================
 
 // --- SealIdWatermark ---
@@ -1073,6 +1078,400 @@ struct SealStartedAbandonWire {
 };
 static_assert(std::is_trivially_copyable_v<SealStartedAbandonWire>);
 static_assert(std::is_standard_layout_v<SealStartedAbandonWire>);
+
+// ===========================================================================
+// Seal-journal Round C (轨道 C, round 3 of 3 -- LAST round) -- the
+// CompactionCandidateIntent GC family: CompactionCandidateIntentWire (Intent
+// lifecycle), CompactionIntentTransitionWire (.x1, crash-verifiable path
+// proof), CompactionIntentGcAuthorizedWire (.xgc, GC authorization receipt --
+// the spec's own words: "the single densest individual type in the whole
+// section").
+//
+// DECLARATION-ONLY, same governance as every Wire type in this file since
+// round 1 -- see this file's top-of-file SCOPE paragraph ("not an
+// implementation of the durable log... no wire (de)serialization"). After
+// this round, every type L4 §10 names is transcribed; the only thing left
+// out of this file is the crash-window table and §10.1/10.2/10.3 procedural
+// prose (BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5327), which contain zero named
+// types and stay permanently excluded (same treatment as
+// DurableControlPlaneSink's un-implemented method bodies). That means this
+// round can claim "L4 §10's named types are all declared" -- it CANNOT claim
+// ".x1/.xgc persistence, GC, or recovery are implemented," because (same as
+// every other type here) these three structs are mac[32]-only: no encode/
+// decode, no filesystem publish, no MAC verification, no recovery state
+// machine, no concurrency/ownership protocol exists for them anywhere in this
+// codebase. See docs/SPEC_INVARIANTS.md's "Seal-journal Round C" entry for
+// the design input recorded for a future codec/recovery round that would
+// actually implement this.
+// ===========================================================================
+
+// --- CompactionCandidateIntentWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3375
+//
+// Distinguishes a legal PreSeal-build remnant from a Started-cleared-without-
+// A0 corruption. File: compaction-candidate-intent (breadcrumb dir, same
+// durability class as SealExportStarted). Packed LE, NO padding,
+// format_version == 1, wire size stays 140B (phase enum extended in r65 with
+// no layout growth):
+//   +0    u32 format_version (=1)
+//   +4    u32 total_bytes    (= 140 == kCompactionCandidateIntentWireBytes)
+//   +8    u64 store_uuid_lo
+//   +16   u64 store_uuid_hi
+//   +24   u32 kek_key_id
+//   +28   u8  phase            // 0=Building ... 4=AbandonFinalizing
+//   +29   u8  reserved0 (=0)   // MUST be 0; no completion_kind (phase is the
+//                                live discriminator; path proof is .x1, r66)
+//   +30   u16 reserved1 (=0)
+//   +32   u32 source_generation
+//   +36   u32 target_generation  // == source_generation + 1 (UINT32_MAX refuse)
+//   +40   u64 baseline_tip_seq
+//   +48   u8  baseline_tip_mac[32]
+//   +80   u32 baseline_key_id
+//   +84   u64 build_nonce        // unique per build attempt; never reused
+//   +92   u64 candidate_id       // 0 while Building; bound at Reserved
+//   +100  u64 request_id         // 0 while Building; bound at Reserved
+//   +108  u8  mac[32]
+
+constexpr std::uint32_t kCompactionCandidateIntentFormatVersion = 1;
+constexpr std::size_t kCompactionCandidateIntentWireBytes = 140;
+constexpr std::uint8_t kCompactionCandidateIntentPhaseBuilding = 0;
+constexpr std::uint8_t kCompactionCandidateIntentPhaseReserved = 1;
+constexpr std::uint8_t kCompactionCandidateIntentPhaseStartedPublished = 2;
+constexpr std::uint8_t kCompactionCandidateIntentPhasePostSealFinalizing = 3;  // r65
+constexpr std::uint8_t kCompactionCandidateIntentPhaseAbandonFinalizing = 4;   // r65
+static_assert(4 + 4 + 8 + 8 + 4 + 1 + 1 + 2 + 4 + 4 + 8 + 32 + 4 + 8 + 8 + 8 + 32
+              == kCompactionCandidateIntentWireBytes);
+
+struct CompactionCandidateIntentWire {
+    // HMAC(KEK[kek_key_id], "HY-COMPINTENT-v1" || format_version ||
+    //   total_bytes || store_uuid_lo || store_uuid_hi || kek_key_id ||
+    //   phase || reserved0 || reserved1 || source_generation ||
+    //   target_generation || baseline_tip_seq || baseline_tip_mac ||
+    //   baseline_key_id || build_nonce || candidate_id || request_id)
+    // CREATE_NEW / no-replace for phase=Building (before any gen-N+1 write).
+    // Genesis = this CREATE_NEW (no none->Building transition receipt).
+    // REPLACE allowed ONLY to raise phase along ONE legal chain, and ONLY
+    // AFTER a durable matching CompactionIntentTransitionWire `.x1` for
+    // that edge exists (r66 -- Intent.phase alone is NOT crash-verifiable
+    // path proof; monotonic REPLACE does NOT prove no-cross after reboot):
+    //   Building->Reserved->StartedPublished->PostSealFinalizing
+    //   OR Building->Reserved->StartedPublished->AbandonFinalizing
+    // Forbidden: PostSealFinalizing<->AbandonFinalizing cross; Forbidden: jump
+    // Building|Reserved->*Finalizing; Forbidden: any phase regression;
+    // Forbidden: Intent REPLACE without prior durable matching `.x1`.
+    // Proof fields (baseline 4-tuple, generations, build_nonce, store_uuid,
+    // kek_key_id) immutable after CREATE_NEW. candidate_id/request_id may
+    // change from 0->nonzero exactly once at Reserved (must match
+    // SealIdWatermark reservation); nonzero->other nonzero -> Corrupt.
+    // reserved0/reserved1 MUST stay 0 -- **no** parallel completion_kind field
+    // (phase is the live terminal/non-terminal discriminator; crash-verifiable
+    // path / no-cross proof is CompactionIntentTransitionWire `.x1`, r66).
+    // Hot-path: preallocated fixed 140B buffer; no heap; no std::string.
+    // Flush: same class as SealExportStarted (§10.3) -- file + parent.
+    // Windows: complete MAC-valid Intent => durable Intent present
+    // (parent-dir flush undecidable; do not invent "not durable" PreSeal
+    // on a complete file -- same honesty rule as Started).
+    // Clear (CAPTURE cleanup evidence -> unlink C/A -> CREATE `.xgc` ->
+    // TipExportProducerResume idempotent -> GC matching `.x1` -> unlink Intent ->
+    // unlink `.xgc` last; parent flush after each create/unlink) ONLY after
+    // this candidate's final cleanup complete (r67/r70/r71 -- `.xgc` authorizes
+    // partial `.x1` absence only when CREATE-time + Mode-B
+    // PhysicalCleanupPreconditions hold; Mode B reads DurableCleanupAuthEvidence
+    // from `.xgc`, never deleted `.clr`/`.abd`):
+    //   (a) PreSeal-abandon (Building|Reserved): after G/T/journal/Started/A/C
+    //       cleanup as applicable (GenGone rules for pre-Started) -> CREATE
+    //       `.xgc` (PreSealAbandonClear; evidence zeros; Building-only
+    //       terminal_transition_mac=0) -> TipExportProducerResume if pause
+    //       armed (idempotent) -> GC `.x1` -> Intent -> `.xgc`;
+    //   (b) PostSeal success: after Intent PostSealFinalizing + ordered unlink
+    //       M->V->L -> CAPTURE from C -> unlink C -> CREATE `.xgc`
+    //       (PostSealFinalizingClear; DurableCleanupAuthEvidence bound) ->
+    //       TipExportProducerResume (idempotent) -> GC `.x1` -> Intent -> `.xgc`;
+    //   (c) ClrAbandoned: after Intent AbandonFinalizing + GenGone +
+    //       ResumeAuthorized -> CAPTURE from A -> unlink A -> CREATE `.xgc`
+    //       (AbandonFinalizingClear; DurableCleanupAuthEvidence bound) ->
+    //       TipExportProducerResume (idempotent) -> GC `.x1` -> Intent -> `.xgc` --
+    //       Intent clear AFTER A unlink, never before GenGone; never leave
+    //       Intent forever blocking new build.
+    // Forbidden: CREATE Intent while prior Intent still present (dual /
+    // leftover Intent incl. *Finalizing / leftover `.xgc` -> finish prior
+    // cleanup first; never overwrite);
+    // Forbidden: CREATE `.xgc` before the matching (a)/(b)/(c) authorization
+    // moment / while Started|A|C (or PostSeal L/V/M) still gates cleanup /
+    // wrong disposition / without DurableCleanupAuthEvidence capturable;
+    // Forbidden: write G before durable Building Intent;
+    // Forbidden: raise Reserved without durable SealIdWatermark advance
+    // binding the same candidate_id/request_id;
+    // Forbidden: raise StartedPublished before durable NativeV2/
+    // MigratedV2 Started for those ids;
+    // Forbidden: raise PostSealFinalizing before `.clr` Authorized +
+    // PostSealCommittedProof;
+    // Forbidden: raise AbandonFinalizing before ResumeAuthorized while A
+    // present (or without GenGone done);
+    // Forbidden: clear Intent while Started / `.abd` / live G for this
+    // build still gates cleanup (except after *Finalizing proves the
+    // terminal path and those names are already gone / finishable);
+    // Forbidden: clear Intent without prior durable matching `.xgc`;
+    // Forbidden: unlink any matching `.x1` without prior durable `.xgc`.
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<CompactionCandidateIntentWire>);
+static_assert(std::is_standard_layout_v<CompactionCandidateIntentWire>);
+
+// --- CompactionIntentTransitionWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3494
+//
+// No-replace transition receipt. Intent.phase alone is REPLACE-overwriteable
+// and CANNOT prove historical path (no-skip / no PostSeal<->Abandon cross)
+// across reboot -- every phase RAISE must first publish a durable transition
+// receipt; recovery verifies the full chain. Genesis: CREATE_NEW Intent
+// phase=Building IS the genesis -- there is NO none->Building transition
+// file. Transition chain starts at seq=1:
+//   Building->Reserved->StartedPublished->PostSealFinalizing
+//   OR Building->Reserved->StartedPublished->AbandonFinalizing
+// File (breadcrumb dir; same durability class as .sj1 finals -- NEVER REPLACE):
+//   compaction-intent-x-<build_nonce_hex16>-<transition_seq_hex16>.x1
+// Publish recipe (align journal §10.1 / Windows): encode preallocated buffer ->
+//   exclusive-create `*.x1.tmp` -> fsync(file) -> no-replace publish
+//   (POSIX renameat2(RENAME_NOREPLACE)/linkat; Windows preferred
+//   CreateHardLinkW -> parent FlushFileBuffers -> unlink tmp; CREATE_NEW copy
+//   fallback only) -> parent dir flush. If final exists: MAC-verify + byte-equal
+//   -> idempotent; any difference -> Corrupt, original unchanged.
+// Forbidden: §10.3 REPLACE / replace-MoveFileExW / delete-then-recreate of a
+// live `.x1` (power-cut would erase the only crash-verifiable edge).
+// Packed LE, NO padding, format_version == 1, fixed 176B:
+//   +0    u32 format_version (=1)
+//   +4    u32 total_bytes    (= 176 == kCompactionIntentTransitionWireBytes)
+//   +8    u64 store_uuid_lo
+//   +16   u64 store_uuid_hi
+//   +24   u32 kek_key_id
+//   +28   u8  from_phase       // Intent phase BEFORE this raise
+//   +29   u8  to_phase         // Intent phase AFTER this raise
+//   +30   u16 reserved0 (=0)
+//   +32   u32 transition_seq   // 1-based; first raise Building->Reserved = 1
+//   +36   u32 source_generation
+//   +40   u32 target_generation
+//   +44   u64 baseline_tip_seq
+//   +52   u8  baseline_tip_mac[32]
+//   +84   u32 baseline_key_id
+//   +88   u64 build_nonce      // MUST equal Intent.build_nonce
+//   +96   u64 candidate_id     // post-raise bind (0 only illegal for seq>=1)
+//   +104  u64 request_id       // post-raise bind (nonzero from seq=1 onward)
+//   +112  u8  prev_transition_mac[32]  // all-zero iff transition_seq==1;
+//                                      // else == trailer mac of seq-1 `.x1`
+//   +144  u8  mac[32]
+
+constexpr std::uint32_t kCompactionIntentTransitionFormatVersion = 1;
+constexpr std::size_t kCompactionIntentTransitionWireBytes = 176;
+static_assert(4 + 4 + 8 + 8 + 4 + 1 + 1 + 2 + 4 + 4 + 4 + 8 + 32 + 4
+                  + 8 + 8 + 8 + 32 + 32
+              == kCompactionIntentTransitionWireBytes);
+
+struct CompactionIntentTransitionWire {
+    // HMAC(KEK[kek_key_id], "HY-COMPINTENT-X-v1" || format_version ||
+    //   total_bytes || store_uuid_lo || store_uuid_hi || kek_key_id ||
+    //   from_phase || to_phase || reserved0 || transition_seq ||
+    //   source_generation || target_generation || baseline_tip_seq ||
+    //   baseline_tip_mac || baseline_key_id || build_nonce ||
+    //   candidate_id || request_id || prev_transition_mac)
+    // Legal edges ONLY (from_phase->to_phase):
+    //   0->1 Building->Reserved                 (seq must be 1)
+    //   1->2 Reserved->StartedPublished         (seq must be 2)
+    //   2->3 StartedPublished->PostSealFinalizing (seq must be 3)
+    //   2->4 StartedPublished->AbandonFinalizing  (seq must be 3)
+    // Forbidden edges (always Corrupt if present): 3->4, 4->3, any skip
+    // (0->2/0->3/0->4/1->3/1->4/...), any regression, duplicate seq, seq gap.
+    // Bind MUST match Intent: store_uuid, kek_key_id, baseline 4-tuple,
+    // generations, build_nonce. candidate_id/request_id MUST equal the
+    // post-Reserved Intent ids (nonzero from seq=1). Transition for a
+    // foreign build_nonce / wrong baseline while Intent exists -> Corrupt.
+    // Hot-path: preallocated fixed 176B buffer; no heap; no std::string.
+    // Control-plane I/O only.
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<CompactionIntentTransitionWire>);
+static_assert(std::is_standard_layout_v<CompactionIntentTransitionWire>);
+
+// --- CompactionIntentGcAuthorizedWire ---
+// SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3602
+//
+// No-replace GC authorization ("the single densest individual type in the
+// whole section"). r66's `.x1` chain + "gap => Corrupt" + "GC all `.x1`
+// before Intent" created a false-Corrupt power window: legal mid-GC (e.g.
+// deleted x1[1] from {1,2,3}, Intent still present) looks like an
+// unauthorized seq gap. Fixed by a durable GC-authorization receipt that
+// must exist BEFORE any `.x1` unlink. r70 required Mode B to re-check
+// physical cleanup preconditions, but those checks re-read `.clr`/`.abd`
+// which normative order already unlinked -- legal mid-GC crash made Mode B
+// non-constructible. r71 embeds DurableCleanupAuthEvidence into `.xgc` itself
+// (one coherent artifact; no TerminalCleanupProof sibling) and verifies Mode
+// B from that evidence + live gate absence.
+// File (breadcrumb dir; same durability class as `.x1` / `.sj1` -- NEVER
+// REPLACE): compaction-intent-gc-<build_nonce_hex16>.xgc
+// Publish recipe: encode preallocated 316B -> exclusive-create `*.xgc.tmp` ->
+//   fsync(file) -> no-replace publish (POSIX renameat2(RENAME_NOREPLACE)/linkat;
+//   Windows preferred CreateHardLinkW -> parent FlushFileBuffers -> unlink tmp;
+//   CREATE_NEW copy fallback only) -> parent dir flush. If final exists:
+//   MAC-verify + byte-equal -> idempotent; any difference -> Corrupt, original
+//   unchanged. Forbidden: §10.3 REPLACE / replace-MoveFileExW / delete-then-
+//   recreate of a live `.xgc`.
+// Packed LE, NO padding, format_version == 2, fixed 316B:
+//   +0    u32 format_version (=2)
+//   +4    u32 total_bytes    (= 316 == kCompactionIntentGcAuthorizedWireBytes)
+//   +8    u64 store_uuid_lo
+//   +16   u64 store_uuid_hi
+//   +24   u32 kek_key_id
+//   +28   u8  terminal_disposition
+//         // 0 = PreSealAbandonClear
+//         // 1 = PostSealFinalizingClear
+//         // 2 = AbandonFinalizingClear
+//   +29   u8  intent_phase_at_auth  // MUST == Intent.phase at CREATE time
+//   +30   u16 reserved0 (=0)
+//   +32   u32 source_generation
+//   +36   u32 target_generation
+//   +40   u64 baseline_tip_seq
+//   +48   u8  baseline_tip_mac[32]
+//   +80   u32 baseline_key_id
+//   +84   u64 build_nonce          // MUST equal Intent.build_nonce
+//   +92   u64 candidate_id
+//   +100  u64 request_id
+//   +108  u8  intent_mac[32]       // Intent trailer mac at CREATE time
+//   +140  u8  terminal_transition_mac[32]
+//         // trailer mac of last (highest-seq) matching `.x1` at CREATE;
+//         // all-zero IFF no `.x1` exist AND disposition==PreSealAbandonClear
+//         // AND intent_phase_at_auth==Building (Building-only clear)
+//   // DurableCleanupAuthEvidence (r71) -- Mode B reconstructible w/o live C/A:
+//   +172  u8  cleanup_auth_flags
+//         // bit0 = journal_drain_complete_at_auth
+//         // bit1 = post_seal_committed_bound   (PostSealFinalizingClear)
+//         // bit2 = gen_gone_complete_at_auth   (AbandonFinalizingClear)
+//         // bit3 = resume_authorized_bound     (AbandonFinalizingClear;
+//         //         gate_trailer_mac is A.mac at phase>=ResumeAuthorized)
+//         // bit4 = gate_absent_at_create       (1 only on recovery CREATE when
+//         //         C/A already unlinked; live crash-free path MUST be 0)
+//         // bit5..7 = 0
+//   +173  u8  started_kind          // 0 PreSeal; else C/A.started_kind (1/2)
+//   +174  u8  present_mask_at_auth  // 0 PreSeal; C mask (L/V/M) or A mask
+//   +175  u8  reserved1 (=0)
+//   +176  u64 proof_new_final_seq           // PostSeal: C.new_final_seq; else 0
+//   +184  u8  proof_new_final_tip_mac[32]   // PostSeal: C.new_final_tip_mac
+//   +216  u32 proof_new_key_id              // PostSeal: C.new_key_id; else 0
+//   +220  u8  proof_content_root[32]        // PostSeal C / Abandon A; PreSeal 0
+//   +252  u8  gate_trailer_mac[32]
+//         // PostSeal: C.mac captured before unlink C (live path);
+//         // Abandon: A.mac at phase>=ResumeAuthorized captured before unlink A;
+//         // PreSeal: all-zero;
+//         // gate_absent_at_create=1: MUST be all-zero (recovery reconstruction)
+//   +284  u8  mac[32]
+// Legacy v1 204B / domain HY-COMPINTENT-GC-v1 (r67...r70): fail-closed --
+// never Mode B; never pad/truncate to 316; offline migration only.
+
+constexpr std::uint32_t kCompactionIntentGcAuthorizedFormatVersion = 2;
+constexpr std::size_t kCompactionIntentGcAuthorizedWireBytes = 316;
+constexpr std::size_t kCompactionIntentGcAuthorizedLegacyV1Bytes = 204;
+constexpr std::uint8_t kCompactionIntentGcDispositionPreSealAbandonClear = 0;
+constexpr std::uint8_t kCompactionIntentGcDispositionPostSealFinalizingClear = 1;
+constexpr std::uint8_t kCompactionIntentGcDispositionAbandonFinalizingClear = 2;
+constexpr std::uint8_t kCompactionIntentGcAuthFlagJournalDrain = 1u << 0;
+constexpr std::uint8_t kCompactionIntentGcAuthFlagPostSealBound = 1u << 1;
+constexpr std::uint8_t kCompactionIntentGcAuthFlagGenGone = 1u << 2;
+constexpr std::uint8_t kCompactionIntentGcAuthFlagResumeAuthorized = 1u << 3;
+constexpr std::uint8_t kCompactionIntentGcAuthFlagGateAbsentAtCreate = 1u << 4;
+static_assert(4 + 4 + 8 + 8 + 4 + 1 + 1 + 2 + 4 + 4 + 8 + 32 + 4
+                  + 8 + 8 + 8 + 32 + 32
+                  + 1 + 1 + 1 + 1 + 8 + 32 + 4 + 32 + 32 + 32
+              == kCompactionIntentGcAuthorizedWireBytes);
+
+struct CompactionIntentGcAuthorizedWire {
+    // HMAC(KEK[kek_key_id], "HY-COMPINTENT-GC-v2" || format_version ||
+    //   total_bytes || store_uuid_lo || store_uuid_hi || kek_key_id ||
+    //   terminal_disposition || intent_phase_at_auth || reserved0 ||
+    //   source_generation || target_generation || baseline_tip_seq ||
+    //   baseline_tip_mac || baseline_key_id || build_nonce ||
+    //   candidate_id || request_id || intent_mac || terminal_transition_mac ||
+    //   cleanup_auth_flags || started_kind || present_mask_at_auth ||
+    //   reserved1 || proof_new_final_seq || proof_new_final_tip_mac ||
+    //   proof_new_key_id || proof_content_root || gate_trailer_mac)
+    //
+    // === CREATE-time PhysicalCleanupPreconditions (may read live C/A) ===
+    // CREATE_NEW / no-replace ONLY when terminal cleanup already authorizes
+    // Intent clear **AND** DurableCleanupAuthEvidence is captured into the
+    // wire (r71 -- phase alone is insufficient; TipExportProducerResume is
+    // NOT a CREATE/Mode-B authorization fact):
+    //   PreSealAbandonClear (0): Intent.phase in {Building, Reserved};
+    //     PreSeal cleanup complete for G/T/journal/Started/A/C as applicable
+    //     (pre-Started GenGone rules); no admitted Started; A absent; C absent;
+    //     cleanup_auth_flags bits1..4 == 0; started_kind/present_mask/
+    //     proof_new_*/proof_content_root/gate_trailer_mac all zero;
+    //     bit0 journal_drain as applicable (1 if candidate had journal work).
+    //   PostSealFinalizingClear (1): Intent.phase == PostSealFinalizing;
+    //     **L/V/M already cleared**; C was readable in the capture window
+    //     (live path) OR gate_absent_at_create recovery reconstruction;
+    //     PostSealCommittedProof held at capture (CURRENT==new_generation;
+    //     tip equal-or-forward covers seal tip; bridge binds baseline +
+    //     content_root; journal drain-complete); wire MUST set bit0+bit1;
+    //     gate_trailer_mac = C.mac (live path, bit4=0) or 0 (bit4=1);
+    //     proof_new_* / proof_content_root / started_kind / present_mask
+    //     from C (or GenerationSeal/bridge/tip reconstruction when bit4=1).
+    //     NOTE: Intent.phase / intent_phase_at_auth == PostSealFinalizing is
+    //     **NOT** proof cleanup complete -- that phase is raised **before**
+    //     Started/C unlink.
+    //   AbandonFinalizingClear (2): Intent.phase == AbandonFinalizing;
+    //     GenGone + ResumeAuthorized done; Started/C already cleared; A was
+    //     readable in the capture window (live path) OR gate_absent_at_create
+    //     recovery reconstruction; wire MUST set bit0+bit2+bit3;
+    //     gate_trailer_mac = A.mac at phase>=ResumeAuthorized (live, bit4=0)
+    //     or 0 (bit4=1); proof_content_root = A.content_root (or T bind when
+    //     bit4=1); proof_new_* = 0; started_kind/present_mask from A.
+    //
+    // === Crash-safe capture -> unlink -> CREATE order (r71; mandatory) ===
+    //   PostSeal (after Intent PostSealFinalizing + ordered unlink M->V->L,
+    //   C still present at ClrPending):
+    //     1) CAPTURE into preallocated buffer (same actor critical section;
+    //        **no yield** / no schedule point): C.mac, C.started_kind,
+    //        C.present_mask, C.new_final_seq/mac/key_id, C.content_root,
+    //        journal_drain_complete, PostSealCommittedProof live-hold.
+    //     2) unlink C -> parent flush.
+    //     3) CREATE `.xgc` binding captured digests + Intent binds
+    //        (bit4=0; gate_trailer_mac=captured C.mac).
+    //     4) TipExportProducerResume (**idempotent**; not durable auth).
+    //     5) GC matching `.x1` -> clear Intent -> unlink `.xgc` last.
+    //   Abandon (after ResumeAuthorized + Intent AbandonFinalizing, A present):
+    //     1) CAPTURE: A.mac (>=ResumeAuthorized), A.started_kind/present_mask/
+    //        content_root, gen_gone + resume_authorized facts.
+    //     2) unlink A -> parent flush.
+    //     3) CREATE `.xgc` (bit4=0; gate_trailer_mac=captured A.mac).
+    //     4) TipExportProducerResume (idempotent).
+    //     5) GC `.x1` -> clear Intent -> unlink `.xgc` last.
+    //   Crash after C/A unlink, before CREATE `.xgc`: nearly-finished path
+    //     (Intent *Finalizing, no `.xgc`) reconstructs evidence with bit4=1
+    //     (no live gate_trailer_mac) then CREATEs `.xgc` -- NOT Corrupt.
+    //   Forbidden: yield between capture and CREATE on the live path;
+    //   Forbidden: CREATE while L/V/M/Started still present (PostSeal) or
+    //     while A/Started/C still present (Abandon) -- capture-then-unlink
+    //     first; Forbidden: CREATE while Intent absent; Forbidden: separate
+    //     TerminalCleanupProof sibling (dual-artifact); Forbidden: Mode B
+    //     that re-reads deleted `.clr`/`.abd`.
+    //
+    // Bind MUST match Intent at CREATE: store_uuid, kek_key_id, baseline
+    // 4-tuple, generations, build_nonce, candidate_id/request_id,
+    // intent_mac == Intent.mac, intent_phase_at_auth == Intent.phase,
+    // disposition<->phase pairing above. terminal_transition_mac MUST equal
+    // last `.x1` trailer mac when any `.x1` exist; zeros only for Building-
+    // only PreSeal clear. Forbidden: CREATE while StartedPublished mid-path;
+    // Forbidden: CREATE before DurableCleanupAuthEvidence is capturable /
+    // reconstructible; Forbidden: dual `.xgc` (same or foreign build_nonce)
+    // while prior GC incomplete; Forbidden: REPLACE / overwrite live `.xgc`;
+    // Forbidden: wrong disposition vs Intent.phase; Forbidden: intent_mac /
+    // transition mac / baseline / build_nonce / cleanup-evidence mismatch
+    // (forged -> Corrupt); Forbidden: format_version!=2 / total_bytes!=316 /
+    // legacy v1 204B admitted as Mode B.
+    // Hot-path: preallocated fixed 316B buffer; no heap; no std::string.
+    // Control-plane I/O only.
+    std::uint8_t mac[32]{};
+};
+static_assert(std::is_trivially_copyable_v<CompactionIntentGcAuthorizedWire>);
+static_assert(std::is_standard_layout_v<CompactionIntentGcAuthorizedWire>);
 
 // --- SealJournalOriginKey ---
 // SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4363
