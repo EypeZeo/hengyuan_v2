@@ -414,6 +414,55 @@ seal journal 不做，日志无限增长，这是已知缺口，等后续单独�
 `spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——本轮零新增枚举；`durable_control_plane.hpp`
 已在 xref 搜索列表里，新符号靠 ledger 反引号自动被下一次抓取。
 
+### Seal-journal Round B（Started 五元组，`.xgc` 家族 3 轮之第 2 轮）
+
+**[已实现]** 按上一小节写死的 3 轮划分，这一轮做 Round B——`SealExportStartedWire`（含别名
+`SealExportStarted`）、`SealExportStartedMigrationWire`、`SealStartedCleanupTombstoneWire`、
+`SealStartedAbandonWire`。Round C（`CompactionCandidateIntentWire`/`CompactionIntentTransitionWire`/
+`CompactionIntentGcAuthorizedWire`）维持"耦合最密集、不可再切"的既有裁决，这一轮不碰。
+
+- `SealExportStartedWire`（`L`，别名 `using SealExportStarted = SealExportStartedWire;`）——首次
+  移植 this round（`BINANCE_PRIVATE_REST_L4_SPEC.md:3124-3200`）。v2/238B 当前版
+  （`kSealExportStartedFormatVersion=2`/`kSealExportStartedWireBytes=238`）；legacy v1/192B
+  （`kSealExportStartedLegacyV1Bytes=192`，fail-closed、immutable、never rewritten）；draft-only
+  234B（`kSealExportStartedDraft234Bytes=234`，永远 Corrupt）。MAC 域 `HY-SEALSTART-v2`。**拓扑
+  字段（`registered_producer_mask`/`producer_count`/`ring_id[8]`）必须与
+  `SealJournalIntakeCloseControl`（Round A）冻结拓扑字节相等**——spec 原文"Topology MUST match
+  frozen SealJournalIntakeCloseControl (round-54/55)"，连同"Forbidden: try-all / current-key
+  fallback when kek_key_id wrapper missing"这句禁止性文字一并照抄进 MAC 域注释，这是 Round A→
+  Round B 唯一的跨轮次绑定关系，Round A 小节（上方）已经预告过。
+- **`V`（`seal-export-started.v2`）不是独立类型**——是同一个 `SealExportStartedWire` C++ 类型用于
+  第二个文件，只有拓扑元组 + `kek_key_id` 允许和 L 不同（L↔V closed-field-bind 规则，
+  `BINANCE_PRIVATE_REST_L4_SPEC.md:3900-3914`），不需要为 V 建第二个 struct——记录这个判断避免
+  未来误以为漏转写了一个类型。
+- `SealExportStartedMigrationWire`（`M`/`.mig`）——首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:3202-3230`）。`kSealExportStartedMigrationFormatVersion=2`/
+  `kSealExportStartedMigrationWireBytes=208`，草稿态 `kSealExportStartedMigrationDraft136Bytes=136`。
+  MAC 域 `HY-SEALSTARTMIG-v2`。字段本质是 L/V 两个文件的 SHA-256 摘要 + trailer MAC，不是业务字段
+  的拷贝——"sole KEK used to verify L (explicit; no try-all)"这句禁止性文字照抄。
+- `SealStartedCleanupTombstoneWire`（`C`/`.clr`）——首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:3232-3289`）。`kSealStartedCleanupFormatVersion=2`/
+  `kSealStartedCleanupWireBytes=304`，草稿态 `kSealStartedCleanupDraft176Bytes=176`（"never
+  CleanupInProgress; never pad to 304"）。MAC 域 `HY-SEALSTARTCLR-v2`。`phase` 单调递增，5 个值
+  （`kSealStartedCleanupPhaseAuthorized=0`/`MGone=1`/`VGone=2`/`LGone=3`/`ClrPending=4`）。
+- `SealStartedAbandonWire`（`A`/`.abd`）——首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:3291-3335`）。`kSealStartedAbandonFormatVersion=1`/
+  `kSealStartedAbandonWireBytes=192`。MAC 域 `HY-SEALSTARTABD-v1`。`phase` 单调递增，8 个值
+  （`kSealStartedAbandonPhaseAuthorized=0`/`CGone=1`/`MGone=2`/`VGone=3`/`LGone=4`/`GenGone=5`/
+  `ResumeAuthorized=6`/`AbdPending=7`）；`abandon_reason` 只定义了一个值
+  （`kSealStartedAbandonReasonNotFound=1`，spec 字段注释写"AuthenticatedNotFound"、常量名是
+  `NotFound`，两处措辞都照抄不统一）。`kSealStartedKindNativeV2=1`/`kSealStartedKindMigratedV2=2`
+  两个 `started_kind` 常量被 Cleanup 和 Abandon 两个类型共享，只定义一次。
+- **`phase`/`started_kind`/`abandon_reason` 一律 `constexpr std::uint8_t` 命名常量，不用
+  `enum class`**——spec 原文对这整个家族的小状态字段（含尚未转写的 Round C 的
+  `terminal_disposition`）统一这么写；本仓库已转写的 `RateLimitFreezePayload` 的 source 字段也是裸
+  `std::uint8_t` 先例。这四个类型本身又都只有 `mac[32]`（同 Round A 的"Wire 类型只有 mac[32]"规矩），
+  这些常量只作为自由 `constexpr` 存在，不是任何 struct 的真实字段。
+
+`spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——本轮零新增枚举（全部是 `constexpr
+std::uint8_t`/`std::uint32_t`/`std::size_t` 常量，不是 `enum class`）；xref 搜索列表已覆盖
+`durable_control_plane.hpp`。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
