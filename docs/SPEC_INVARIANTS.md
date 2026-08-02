@@ -295,10 +295,18 @@ POSIX flock/Windows 无共享 CreateFileA、每次 append 同步 fsync、本地 
   新增两阶段解码能力（先读 `key_id`，查 key，再验证整帧 MAC）供 Phase 2 接入时使用。
 - **tip-anchor 的 `key_id` 落地，wire 格式不变**：tip-anchor 布局（`durable_audit_sink.hpp`）本来
   就有 `key_id` 字段（`kTipAnchorSize` 已经把这 4 字节算进去了），只是 `encode_tip_anchor`/
-  `decode_tip_anchor` 硬编码成 0/直接丢弃——这一轮只改这两个纯函数本身，不改 `DurableAuditSink`
-  类的调用逻辑（那是 Phase 2 的范围）。顺带发现并修正一个小问题：tip-anchor 的版本字节此前直接
-  复用 `kFrameFormatVersion` 这同一个常量，不是独立版本号——拆成独立的 kTipAnchorFormatVersion，
-  避免"帧格式以后再变一次"被迫连带绑架 tip-anchor 格式。
+  `decode_tip_anchor` 硬编码成 0/直接丢弃——这一轮让这两个纯函数真正读写 `key_id`。顺带发现并
+  修正一个小问题：tip-anchor 的版本字节此前直接复用 `kFrameFormatVersion` 这同一个常量，不是
+  独立版本号——拆成独立的 `kTipAnchorFormatVersion`，避免"帧格式以后再变一次"被迫连带绑架
+  tip-anchor 格式。**订正一处本轮早先记录里的不准确表述**：原计划设想"这一轮只改这两个纯函数
+  本身，不改 `DurableAuditSink` 类的调用逻辑"——实际执行时发现这站不住脚：`durable_frame_codec.hpp`
+  的 `encode_order_event_frame` 签名新增了必填的 `key_id` 参数后，`DurableAuditSink::
+  append_durable()`（调用帧编码）和两个 `write_tip_anchor()` 平台分支（调用 tip-anchor 编码）
+  **不加任何参数就无法编译**——这不是可以绕开的选择，是编译期的硬约束。实际做法：在这些既有调用点
+  插入字面量 `/*key_id=*/0u`（明确注释标注"这是编译兼容占位，不是功能变化，真正的 KeyRing 接入是
+  Phase 2 的范围"），行为和这一轮之前完全一致（一直都是隐式的固定 key，现在只是变成显式的 0）——
+  没有引入任何新的运行时行为，只是把"能编译"这个约束诚实地记下来，而不是假装这一轮真的完全没碰
+  `DurableAuditSink`。
 - **单写者 + recovery 契约（文档化，Phase 2/4 落地时照做）**：写入必须由单一 owner 线程串行化；
   recovery 遇到未知/已退役 `key_id` 必须直接 fence，不允许"试其他 key"——spec 原文
   （`SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:1230`）已经这么要求，这里只是把它落成这个仓库自己的

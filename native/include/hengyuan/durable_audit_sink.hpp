@@ -64,9 +64,18 @@ namespace hy {
 // on-disk layout; see durable_frame_codec.hpp's own header comment for the
 // same kind of flagged, deliberate width choice on payload_length) ---
 //
-//   [format_version: u8 = 3][sequence_number: u64 LE][mac: 32 bytes]
-//   [key_id: u32 LE = 0][anchor_mac: 32 bytes =
+//   [format_version: u8][sequence_number: u64 LE][mac: 32 bytes]
+//   [key_id: u32 LE][anchor_mac: 32 bytes =
 //       HMAC-SHA256(format_version||sequence_number||mac||key_id)]
+//
+// kTipAnchorFormatVersion is INDEPENDENT of durable_frame_codec.hpp's
+// kFrameFormatVersion (Phase 0, 轨道 key-rotation substrate) -- it used to
+// silently reuse that same constant as its own version byte, which meant a
+// future frame-format-only change would have forced an unrelated tip-anchor
+// rewrite too. The tip-anchor's own byte layout has not changed shape here
+// (kTipAnchorSize is unchanged, key_id's slot already existed) -- only
+// encode/decode's HANDLING of key_id changes, from hardcoded-0 to real.
+inline constexpr std::uint8_t kTipAnchorFormatVersion = 1;
 inline constexpr std::size_t kTipAnchorSize = 1 + 8 + kMacLen + 4 + kMacLen;  // 77 bytes
 
 namespace detail {
@@ -74,13 +83,14 @@ namespace detail {
 inline std::size_t encode_tip_anchor(std::span<std::byte, kTipAnchorSize> out,
                                       std::uint64_t sequence_number,
                                       std::span<const std::byte, kMacLen> mac,
+                                      std::uint32_t key_id,
                                       std::span<const std::byte> hmac_key) noexcept {
     std::byte* p = out.data();
     const std::byte* const content_start = p;
-    write_u8(p, kFrameFormatVersion);
+    write_u8(p, kTipAnchorFormatVersion);
     write_u64_le(p, sequence_number);
     write_bytes(p, mac.data(), kMacLen);
-    write_u32_le(p, 0);  // key_id, fixed this round
+    write_u32_le(p, key_id);
     const std::size_t content_len = static_cast<std::size_t>(p - content_start);
     const auto anchor_mac = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
     write_bytes(p, anchor_mac.bytes.data(), kMacLen);
@@ -90,6 +100,7 @@ inline std::size_t encode_tip_anchor(std::span<std::byte, kTipAnchorSize> out,
 struct DecodedTipAnchor {
     std::uint64_t sequence_number{0};
     std::array<std::byte, kMacLen> mac{};
+    std::uint32_t key_id{0};
 };
 
 // false = anchor is absent-shaped/malformed/tampered -- caller decides what
@@ -99,17 +110,17 @@ inline bool decode_tip_anchor(std::span<const std::byte> in, std::span<const std
     if (in.size() != kTipAnchorSize) return false;
     const std::byte* p = in.data();
     const std::byte* const content_start = p;
-    if (read_u8(p) != kFrameFormatVersion) return false;
+    if (read_u8(p) != kTipAnchorFormatVersion) return false;
     const std::uint64_t seq = read_u64_le(p);
     std::array<std::byte, kMacLen> mac{};
     read_bytes(p, mac.data(), kMacLen);
     const std::uint32_t key_id = read_u32_le(p);
-    (void)key_id;  // fixed 0 this round, not independently validated
     const std::size_t content_len = static_cast<std::size_t>(p - content_start);
     const auto expected = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
     if (std::memcmp(expected.bytes.data(), in.data() + content_len, kMacLen) != 0) return false;
     out.sequence_number = seq;
     out.mac = mac;
+    out.key_id = key_id;
     return true;
 }
 
@@ -201,7 +212,14 @@ public:
         }
 
         std::array<std::byte, kOrderEventFrameSize> buf{};
-        const auto n = encode_order_event_frame(buf, next_sequence_, FrameTimeKind::ServerCorrectedUtc,
+        // key_id stays the fixed 0 this class has always used (class header's
+        // own "no key rotation this round" scope note) -- durable_frame_codec.hpp
+        // gained a real key_id field in its v4 bump (Phase 0, 轨道 key-rotation
+        // substrate), but wiring THIS class to a KeyRing for real per-frame
+        // key selection is Phase 2's job, not this one. This literal 0 is a
+        // compile-compatibility placeholder, not a functional change.
+        const auto n = encode_order_event_frame(buf, /*key_id=*/0u, next_sequence_,
+                                                 FrameTimeKind::ServerCorrectedUtc,
                                                  now_ms, rec, tip_mac_, key_span());
         if (n != kOrderEventFrameSize) {
             fenced_ = true;
@@ -461,7 +479,11 @@ private:
     }
     bool write_tip_anchor(std::uint64_t sequence_number, std::array<std::byte, kMacLen> mac) noexcept {
         std::array<std::byte, kTipAnchorSize> buf{};
-        detail::encode_tip_anchor(buf, sequence_number, mac, key_span());
+        // key_id stays 0 here for the same reason append_durable()'s frame
+        // write does -- this tip-anchor's key_id must match whatever key_id
+        // actually signed the corresponding log frame, and that's hardcoded
+        // to 0 until Phase 2 wires this class to a real KeyRing.
+        detail::encode_tip_anchor(buf, sequence_number, mac, /*key_id=*/0u, key_span());
 
         const std::string tmp_path = tip_path_ + ".tmp";
         HANDLE h = CreateFileA(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -560,7 +582,11 @@ private:
     }
     bool write_tip_anchor(std::uint64_t sequence_number, std::array<std::byte, kMacLen> mac) noexcept {
         std::array<std::byte, kTipAnchorSize> buf{};
-        detail::encode_tip_anchor(buf, sequence_number, mac, key_span());
+        // key_id stays 0 here for the same reason append_durable()'s frame
+        // write does -- this tip-anchor's key_id must match whatever key_id
+        // actually signed the corresponding log frame, and that's hardcoded
+        // to 0 until Phase 2 wires this class to a real KeyRing.
+        detail::encode_tip_anchor(buf, sequence_number, mac, /*key_id=*/0u, key_span());
 
         const std::string tmp_path = tip_path_ + ".tmp";
         int fd = ::open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);

@@ -103,7 +103,8 @@ TEST(OrderEventFrameCodec, RoundTripAtSequenceZero) {
     auto key = as_key("test-hmac-key");
     std::vector<std::byte> buf(kOrderEventFrameSize);
 
-    auto n = encode_order_event_frame(buf, /*sequence_number=*/0, FrameTimeKind::ServerCorrectedUtc,
+    auto n = encode_order_event_frame(buf, /*key_id=*/7, /*sequence_number=*/0,
+                                       FrameTimeKind::ServerCorrectedUtc,
                                        1'700'000'000'000, rec, kZeroMac, key);
     ASSERT_EQ(n, kOrderEventFrameSize);
 
@@ -113,6 +114,7 @@ TEST(OrderEventFrameCodec, RoundTripAtSequenceZero) {
     ASSERT_EQ(status, FrameDecodeStatus::Ok);
     EXPECT_EQ(frame_size, kOrderEventFrameSize);
     EXPECT_EQ(decoded.record_type, DurableRecordType::OrderEvent);
+    EXPECT_EQ(decoded.key_id, 7u);
     EXPECT_EQ(decoded.sequence_number, 0u);
     EXPECT_EQ(decoded.time_kind, FrameTimeKind::ServerCorrectedUtc);
     EXPECT_EQ(decoded.recorded_utc_ms, 1'700'000'000'000);
@@ -128,7 +130,7 @@ TEST(OrderEventFrameCodec, ChainedFramesLinkViaPrevMac) {
     auto key = as_key("test-hmac-key");
 
     std::vector<std::byte> buf1(kOrderEventFrameSize);
-    auto n1 = encode_order_event_frame(buf1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec1, kZeroMac, key);
+    auto n1 = encode_order_event_frame(buf1, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec1, kZeroMac, key);
     ASSERT_EQ(n1, kOrderEventFrameSize);
 
     DecodedOrderFrame d1{};
@@ -136,7 +138,7 @@ TEST(OrderEventFrameCodec, ChainedFramesLinkViaPrevMac) {
     ASSERT_EQ(decode_order_event_frame(buf1, key, d1, sz1), FrameDecodeStatus::Ok);
 
     std::vector<std::byte> buf2(kOrderEventFrameSize);
-    auto n2 = encode_order_event_frame(buf2, 1, FrameTimeKind::ServerCorrectedUtc, 2000, rec2, d1.mac, key);
+    auto n2 = encode_order_event_frame(buf2, /*key_id=*/1, 1, FrameTimeKind::ServerCorrectedUtc, 2000, rec2, d1.mac, key);
     ASSERT_EQ(n2, kOrderEventFrameSize);
 
     DecodedOrderFrame d2{};
@@ -150,7 +152,7 @@ TEST(OrderEventFrameCodec, TooSmallBufferForHeaderIsTruncated) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
 
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
@@ -163,9 +165,10 @@ TEST(OrderEventFrameCodec, TruncatedMidPayloadIsTruncatedNotCorrupt) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
 
-    // Header (23 bytes) fully present, but the frame is cut off partway
+    // Header (27 bytes, v4 -- includes the 4-byte key_id field) fully
+    // present, but the frame is cut off partway
     // through the payload -- this is exactly the "torn tail write" scenario
     // recovery_scan() must discard without treating as Corrupt.
     DecodedOrderFrame decoded{};
@@ -181,9 +184,9 @@ TEST(OrderEventFrameCodec, SingleByteCorruptionInPayloadIsChecksumMismatch) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
 
-    // Flip a byte inside the payload region (well past the 23-byte header).
+    // Flip a byte inside the payload region (well past the 27-byte v4 header).
     buf[40] ^= std::byte{0x01};
 
     DecodedOrderFrame decoded{};
@@ -200,7 +203,7 @@ TEST(OrderEventFrameCodec, SingleByteCorruptionOnLastByteIsAlsoChecksumMismatchN
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
 
     buf[kOrderEventFrameSize - 1] ^= std::byte{0x01};  // last byte of the mac itself
 
@@ -216,7 +219,7 @@ TEST(OrderEventFrameCodec, CorruptedPrevMacIsChecksumMismatch) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
 
     const std::size_t prev_mac_offset = kOrderEventFrameSize - kMacLen - kMacLen;
     buf[prev_mac_offset] ^= std::byte{0x01};
@@ -229,7 +232,7 @@ TEST(OrderEventFrameCodec, CorruptedPrevMacIsChecksumMismatch) {
 TEST(OrderEventFrameCodec, WrongKeyFailsChecksum) {
     AuditRecord rec = make_sample_record();
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, as_key("key-a"));
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, as_key("key-a"));
 
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
@@ -241,8 +244,8 @@ TEST(OrderEventFrameCodec, WrongFormatVersionRejected) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
-    buf[0] = std::byte{4};  // valid-looking but not kFrameFormatVersion(3)
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    buf[0] = std::byte{5};  // valid-looking but not kFrameFormatVersion(4)
 
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
@@ -253,7 +256,7 @@ TEST(OrderEventFrameCodec, OutOfRangeRecordTypeRejected) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
     buf[1] = std::byte{255};  // record_type byte
 
     DecodedOrderFrame decoded{};
@@ -265,8 +268,8 @@ TEST(OrderEventFrameCodec, OutOfRangeTimeKindRejected) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
-    buf[10] = std::byte{99};  // time_kind byte (offset 1+1+8=10)
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    buf[14] = std::byte{99};  // time_kind byte (offset 1+1+4+8=14, v4: format_version+record_type+key_id+sequence_number)
 
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
@@ -277,10 +280,12 @@ TEST(OrderEventFrameCodec, WrongPayloadLengthRejected) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
 
-    // payload_length is bytes [19,23) LE u32. Corrupt just the low byte.
-    buf[19] ^= std::byte{0x01};
+    // payload_length is bytes [23,27) LE u32 (v4: format_version+record_type+
+    // key_id+sequence_number+time_kind+recorded_utc_ms = 23). Corrupt just
+    // the low byte.
+    buf[23] ^= std::byte{0x01};
 
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
@@ -293,9 +298,9 @@ TEST(OrderEventFrameCodec, MalformedPayloadEnumRejected) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
-    encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
 
-    constexpr std::size_t kHeaderSize = 23;
+    constexpr std::size_t kHeaderSize = 27;  // v4: includes the 4-byte key_id field
     buf[kHeaderSize + 8] = std::byte{200};  // event_type is payload offset 8
 
     DecodedOrderFrame decoded{};
@@ -307,5 +312,42 @@ TEST(OrderEventFrameCodec, EncodeFailsOnBufferTooSmall) {
     AuditRecord rec = make_sample_record();
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize - 1);
-    EXPECT_EQ(encode_order_event_frame(buf, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key), 0u);
+    EXPECT_EQ(encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key), 0u);
+}
+
+// --- peek_frame_key_id (Phase 0, 轨道 key-rotation substrate) ---
+
+TEST(PeekFrameKeyId, ReadsKeyIdWithoutFullDecode) {
+    AuditRecord rec = make_sample_record();
+    auto key = as_key("k");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    encode_order_event_frame(buf, /*key_id=*/12345, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+
+    std::uint32_t peeked_key_id = 0;
+    ASSERT_TRUE(peek_frame_key_id(buf, peeked_key_id));
+    EXPECT_EQ(peeked_key_id, 12345u);
+}
+
+TEST(PeekFrameKeyId, FalseWhenBufferTooShortToContainKeyId) {
+    // format_version(1) + record_type(1) + key_id(4) = 6 bytes minimum.
+    std::array<std::byte, 5> buf{};
+    std::uint32_t peeked_key_id = 999;
+    EXPECT_FALSE(peek_frame_key_id(buf, peeked_key_id));
+    EXPECT_EQ(peeked_key_id, 999u) << "out param must be untouched on failure";
+}
+
+TEST(OrderEventFrameCodec, TamperedKeyIdIsChecksumMismatch) {
+    // key_id is inside the MAC-covered header -- corrupting it independent of
+    // the payload must still be caught (it's part of frame identity, not
+    // just a hint for key selection).
+    AuditRecord rec = make_sample_record();
+    auto key = as_key("k");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
+
+    buf[2] ^= std::byte{0x01};  // key_id occupies bytes [2,6)
+
+    DecodedOrderFrame decoded{};
+    std::size_t frame_size = 0;
+    EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::ChecksumMismatch);
 }

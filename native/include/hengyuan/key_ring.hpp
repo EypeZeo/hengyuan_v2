@@ -310,7 +310,13 @@ private:
                                      const std::array<std::byte, 32>& b) noexcept {
         std::uint8_t diff = 0;
         for (std::size_t i = 0; i < 32; ++i) {
-            diff |= static_cast<std::uint8_t>(a[i]) ^ static_cast<std::uint8_t>(b[i]);
+            // The XOR of two uint8_t operands promotes to int (integer
+            // promotion) -- the explicit cast back to uint8_t before |= is
+            // required, not decorative: GCC's -Wconversion flags the
+            // implicit narrowing that MSVC /W4 does not, a real dual-
+            // toolchain divergence caught by WSL2 verification.
+            diff = static_cast<std::uint8_t>(
+                diff | (static_cast<std::uint8_t>(a[i]) ^ static_cast<std::uint8_t>(b[i])));
         }
         return diff == 0;
     }
