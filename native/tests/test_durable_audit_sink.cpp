@@ -156,7 +156,8 @@ protected:
                                         std::array<std::byte, kMacLen> prev_mac, std::size_t prefix_len) {
         std::array<std::byte, kOrderEventFrameSize> full_frame{};
         auto key = test_key();
-        auto n = encode_order_event_frame(full_frame, sequence_number, FrameTimeKind::ServerCorrectedUtc,
+        auto n = encode_order_event_frame(full_frame, /*key_id=*/0u, sequence_number,
+                                           FrameTimeKind::ServerCorrectedUtc,
                                            2000, rec, prev_mac, key);
         ASSERT_EQ(n, kOrderEventFrameSize);
         ASSERT_LE(prefix_len, kOrderEventFrameSize);

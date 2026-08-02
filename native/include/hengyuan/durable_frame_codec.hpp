@@ -12,7 +12,7 @@
 // into the wire format, per SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md's own
 // stated rule):
 //
-//   [format_version: u8 = 3][record_type: u8][sequence_number: u64]
+//   [format_version: u8 = 4][record_type: u8][key_id: u32][sequence_number: u64]
 //   [time_kind: u8][recorded_utc_ms: i64][payload_length: u32]
 //   [payload: payload_length bytes -- an encoded AuditRecord, always exactly
 //    kAuditRecordWireSize bytes for DurableRecordType::OrderEvent, the only
@@ -21,12 +21,26 @@
 //    sequence_number == 0]
 //   [mac: 32 bytes = HMAC-SHA256(everything above, INCLUDING prev_mac)]
 //
-// Fixed per-frame overhead (everything except the payload): 1+1+8+1+8+4+32+32
-// = 87 bytes. payload_length is a spec-unpinned width choice (u32) -- flagged
-// as such, not derived from spec text byte-for-byte; AuditRecord is far under
-// 4 GiB. See docs/SPEC_INVARIANTS.md's durable-audit-log entry for the full
-// set of this round's scope decisions (only OrderEvent frames, v3-only, no
-// compaction/external-anchor networking, etc).
+// Fixed per-frame overhead (everything except the payload):
+// 1+1+4+8+1+8+4+32+32 = 91 bytes. payload_length is a spec-unpinned width
+// choice (u32) -- flagged as such, not derived from spec text byte-for-byte;
+// AuditRecord is far under 4 GiB. See docs/SPEC_INVARIANTS.md's
+// durable-audit-log entry for the full set of this round's scope decisions
+// (only OrderEvent frames, no compaction/external-anchor networking, etc).
+//
+// FORMAT v3 -> v4 (Phase 0, 轨道 key-rotation substrate): v3 had no key_id
+// field at all -- callers passed a single hmac_key span with zero key-
+// selection logic, which made real key rotation (SUBMITPORT_REAL_
+// IMPLEMENTATION_SPEC.md:1225, §6.1.1.2) structurally impossible to verify
+// correctly on decode. v4 inserts key_id right after record_type (an
+// identity field belongs with the other identity fields at the front of the
+// header, same placement philosophy as the tip-anchor's own key_id field in
+// durable_audit_sink.hpp). This is a real wire-format break, not an additive
+// change -- deliberately so: v3 landed one day before this decision with
+// zero real deployed data anywhere in this repo's history (confirmed via
+// `git log`), so the migration cost of the break is genuinely zero, same
+// reasoning this file's original scope note already used to justify skipping
+// v1/v2 legacy decode support entirely.
 
 #pragma once
 
@@ -41,7 +55,7 @@
 
 namespace hy {
 
-inline constexpr std::uint8_t kFrameFormatVersion = 3;
+inline constexpr std::uint8_t kFrameFormatVersion = 4;
 inline constexpr std::size_t kMacLen = 32;
 
 // --- AuditRecord wire encoding (the OrderEvent payload) ---
@@ -219,15 +233,20 @@ inline bool decode_audit_record(std::span<const std::byte, kAuditRecordWireSize>
 // every frame this round ever writes is exactly this many bytes (no
 // variable-length payloads exist for this record type).
 inline constexpr std::size_t kOrderEventFrameSize =
-    1 + 1 + 8 + 1 + 8 + 4 +          // format_version..payload_length
+    1 + 1 + 4 + 8 + 1 + 8 + 4 +      // format_version..payload_length (incl. key_id)
     kAuditRecordWireSize +
     kMacLen +                        // prev_mac
     kMacLen;                         // mac
 
 // Encodes one DurableRecordType::OrderEvent frame into `out`. Returns
-// kOrderEventFrameSize on success, 0 if `out` is smaller than that.
+// kOrderEventFrameSize on success, 0 if `out` is smaller than that. `key_id`
+// identifies which KeyRing-managed key `hmac_key` actually is -- the caller
+// must have already resolved `hmac_key` from a KeyRing lookup for this
+// exact `key_id` (key_ring.hpp); this function has no key-selection logic
+// of its own, it only writes the identifier into the frame header.
 inline std::size_t encode_order_event_frame(
     std::span<std::byte> out,
+    std::uint32_t key_id,
     std::uint64_t sequence_number,
     FrameTimeKind time_kind,
     std::int64_t recorded_utc_ms,
@@ -241,6 +260,7 @@ inline std::size_t encode_order_event_frame(
 
     detail::write_u8(p, kFrameFormatVersion);
     detail::write_u8(p, static_cast<std::uint8_t>(DurableRecordType::OrderEvent));
+    detail::write_u32_le(p, key_id);
     detail::write_u64_le(p, sequence_number);
     detail::write_u8(p, static_cast<std::uint8_t>(time_kind));
     detail::write_i64_le(p, recorded_utc_ms);
@@ -278,6 +298,7 @@ enum class FrameDecodeStatus : std::uint8_t {
 
 struct DecodedOrderFrame {
     DurableRecordType record_type{DurableRecordType::OrderEvent};
+    std::uint32_t key_id{0};
     std::uint64_t sequence_number{0};
     FrameTimeKind time_kind{FrameTimeKind::ServerCorrectedUtc};
     std::int64_t recorded_utc_ms{0};
@@ -290,10 +311,30 @@ struct DecodedOrderFrame {
                                                   // against its content by the time Ok is returned
 };
 
+// Reads ONLY the key_id field from a frame's header, without validating
+// format_version/record_type/checksum or anything else -- callers use this
+// to select the correct hmac_key from a KeyRing (key_ring.hpp) BEFORE
+// calling decode_order_event_frame, which is what actually verifies the
+// frame. Returns false (out_key_id untouched) if `in` is too short to even
+// contain the key_id field; this is deliberately not a full decode and
+// returning false here does NOT imply Corrupt -- the caller falls through
+// to decode_order_event_frame for the real Truncated/UnknownVersion/etc.
+// classification.
+inline bool peek_frame_key_id(std::span<const std::byte> in, std::uint32_t& out_key_id) noexcept {
+    constexpr std::size_t kKeyIdOffset = 1 + 1;  // format_version, record_type
+    constexpr std::size_t kMinBytes = kKeyIdOffset + 4;
+    if (in.size() < kMinBytes) return false;
+    const std::byte* p = in.data() + kKeyIdOffset;
+    out_key_id = detail::read_u32_le(p);
+    return true;
+}
+
 // Decodes one frame starting at the beginning of `in`. `in` is expected to be
 // "all bytes available from the current read offset through EOF" -- the
 // caller (recovery_scan()) is what turns Truncated into "stop scanning,
-// that's the torn tail" vs a real corruption.
+// that's the torn tail" vs a real corruption. `hmac_key` MUST already be the
+// key resolved for this frame's own key_id (via peek_frame_key_id() + a
+// KeyRing lookup) -- this function does not resolve keys itself.
 //
 // out_frame_size is set to kOrderEventFrameSize whenever the frame's own
 // length fields were read successfully (i.e. on Ok and on every failure
@@ -307,8 +348,8 @@ inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
     out_frame_size = 0;
 
     // Enough to read format_version..payload_length (the fixed header before
-    // the payload) -- 23 bytes.
-    constexpr std::size_t kHeaderSize = 1 + 1 + 8 + 1 + 8 + 4;
+    // the payload) -- 27 bytes (includes the 4-byte key_id field, v4).
+    constexpr std::size_t kHeaderSize = 1 + 1 + 4 + 8 + 1 + 8 + 4;
     if (in.size() < kHeaderSize) return FrameDecodeStatus::Truncated;
 
     const std::byte* p = in.data();
@@ -319,6 +360,8 @@ inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
 
     const std::uint8_t record_type_raw = detail::read_u8(p);
     if (!detail::is_legal_durable_record_type(record_type_raw)) return FrameDecodeStatus::MalformedEnum;
+
+    const std::uint32_t key_id = detail::read_u32_le(p);
 
     const std::uint64_t sequence_number = detail::read_u64_le(p);
 
@@ -355,6 +398,7 @@ inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
     }
 
     out.record_type = static_cast<DurableRecordType>(record_type_raw);
+    out.key_id = key_id;
     out.sequence_number = sequence_number;
     out.time_kind = static_cast<FrameTimeKind>(time_kind_raw);
     out.recorded_utc_ms = recorded_utc_ms;
