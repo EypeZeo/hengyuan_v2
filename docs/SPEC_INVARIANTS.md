@@ -463,6 +463,82 @@ seal journal 不做，日志无限增长，这是已知缺口，等后续单独�
 std::uint8_t`/`std::uint32_t`/`std::size_t` 常量，不是 `enum class`）；xref 搜索列表已覆盖
 `durable_control_plane.hpp`。
 
+### Seal-journal Round C（CompactionCandidateIntent GC 家族，`.xgc` 家族 3 轮之第 3/最后一轮）
+
+**[已实现，声明层]** 按 3 轮划分做完最后一轮——`CompactionCandidateIntentWire`（Intent 生命周期）、
+`CompactionIntentTransitionWire`（`.x1`，crash-verifiable 路径证明）、
+`CompactionIntentGcAuthorizedWire`（`.xgc`，GC 授权凭证）。**范围边界，务必明确**：这一轮和 Round
+A/B 同一治理级别——只转写字段布局/常量/spec 原文注释，**不实现 encode/decode、不实现真实文件发布、
+不实现 MAC 验证、不实现恢复状态机、不实现并发所有权协议**。合并后只能宣称"L4 §10 的具名类型声明
+已经齐全"，`.x1`/`.xgc` 的持久化、GC、恢复逻辑**没有落地，也不是"P0 已关闭"**——这三个类型和这个
+文件里其余每一个"Wire"类型一样只有 `mac[32]` 一个真实成员，`cleanup_auth_flags`/`phase`/
+`terminal_transition_mac` 等字段目前只存在于注释里的 packed 布局描述中，代码里没有可读可写的真实
+字段。
+
+- `CompactionCandidateIntentWire` — 首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:3375-3447`）。`phase` 5 个值（`kCompactionCandidateIntent
+  PhaseBuilding=0`/`Reserved=1`/`StartedPublished=2`/`PostSealFinalizing=3`/
+  `AbandonFinalizing=4`）——**这是独立于上面 Round B `SealStartedCleanupTombstoneWire`/
+  `SealStartedAbandonWire` 各自 phase 的第三套状态机，命名空间不重叠，语义也不能混用**。合法链只有
+  两条：`Building→Reserved→StartedPublished→PostSealFinalizing` 或
+  `Building→Reserved→StartedPublished→AbandonFinalizing`；REPLACE 只能沿链单调前进，且必须先有
+  对应的 `CompactionIntentTransitionWire`（见下条）。
+- `CompactionIntentTransitionWire`（`.x1`）— 首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:3494-3515`）。没有自己的 phase 枚举，`from_phase`/`to_phase`
+  引用上面 `CompactionCandidateIntentWire` 的同一套 phase 常量。存在的唯一理由：`Intent.phase`
+  单独 REPLACE 无法证明历史路径（跨重启不能验证 no-cross/no-skip），必须靠这个 no-replace 的
+  transition 收据链（`prev_transition_mac` 形成哈希链）补上crash-verifiable 的路径证明。
+- `CompactionIntentGcAuthorizedWire`（`.xgc`）— 首次移植 this round
+  （`BINANCE_PRIVATE_REST_L4_SPEC.md:3602-3689`，这一轮体量最大、注释最密的类型）。延伸本文件第
+  124-132 行既有条目（v2/316B 权威版本 + CAPTURE→unlink C/A→CREATE .xgc→
+  TipExportProducerResume→GC .x1→clear Intent→unlink .xgc 清理顺序，不重复）。这一轮新增记录：
+  `terminal_disposition` 3 个值（`PreSealAbandonClear=0`/`PostSealFinalizingClear=1`/
+  `AbandonFinalizingClear=2`）；`cleanup_auth_flags` 是**位标志**（不是顺序枚举）——
+  `kCompactionIntentGcAuthFlagJournalDrain=1u<<0`/`PostSealBound=1u<<1`/`GenGone=1u<<2`/
+  `ResumeAuthorized=1u<<3`/`GateAbsentAtCreate=1u<<4`，转写时保留 `1u << N` 移位写法而非算成
+  十进制字面量。legacy v1/204B（`kCompactionIntentGcAuthorizedLegacyV1Bytes`）继续 fail-closed
+  only，不是活跃写入格式。
+
+**里程碑（声明层，非实现层）**：这一轮完成后，`durable_control_plane.hpp` 顶部"尚未转写清单"清空
+——L4 §10 除了永久排除的崩溃窗口表格（`BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5146`）和
+§10.1/10.2/10.3 程序性说明文字（纯行为文本，和 `DurableControlPlaneSink` 方法体不实现行为同一
+治理级别）之外，全部具名类型已经转写。这不等于 L4 §10 已经实现——见下方"为未来 codec/recovery
+轮记录的设计输入"。
+
+`spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——本轮零新增枚举。
+
+#### 为未来 codec/recovery 轮记录的设计输入（这一轮不实现，只记录供复用）
+
+两轮外部（GPT）评审对这三个类型提出了实现级约束，判定为未来 codec/recovery 轮（真正给这些类型写
+encode/decode、真实文件发布、MAC 验证、恢复状态机、并发锁）的输入，不是这一轮的缺口——记录在这里
+避免真正做那一轮时重新分析一遍 spec：
+
+- **`cleanup_auth_flags` 按 disposition 的合法组合真值表**（需要真实字段可读后才能测）：
+  `PreSealAbandonClear` 必须 `bit1..4 == 0`；`PostSealFinalizingClear` 必须
+  `bit0(JournalDrain) | bit1(PostSealBound)` 都置位；`AbandonFinalizingClear` 必须
+  `bit0 | bit2(GenGone) | bit3(ResumeAuthorized)` 都置位；`bit4(GateAbsentAtCreate)` 只允许在
+  recovery reconstruction 路径出现，且此时 `gate_trailer_mac` 必须全零；live path 下 `bit4`
+  必须是 0 且必须捕获真实 C/A 的 trailer MAC；未定义的高位必须是 0。
+- **candidate-scoped 单写者/lease 契约**：`.x1`/Intent/`.xgc` 的写入必须由同一 owner actor 串行化
+  （按 `build_nonce` 加锁）；`.x1` 完整落盘 + 父目录 flush 之后才能 REPLACE Intent phase；`.xgc`
+  只能由完成终态前置校验的同一 owner 创建；recovery 必须先取得排他所有权才能补 REPLACE/GC `.x1`/
+  清 Intent；不允许多个线程或多个 recovery 实例同时扫描清理同一 candidate。
+- **CAPTURE→unlink→CREATE `.xgc` 的故障注入矩阵**：capture/校验/unlink/`.xgc` create 之间禁止
+  yield；C/A unlink 后、`.xgc` 尚未创建时崩溃只能走 reconstruction 分支；reconstruction 必须重新
+  验证 GenerationSeal/bridge/tip/Intent/`.x1`，不能从已删除的 C/A 或进程内缓存恢复；每个关键步骤
+  （capture 后/unlink 后/`.xgc` publish 前后/每条 `.x1` unlink 后/Intent unlink 后/`.xgc` unlink
+  前后）都需要独立的断电测试点。
+- **`terminal_transition_mac`/`intent_mac` 必须是 owner 重新验证后导出的，不能信任调用者传入**：
+  创建 `.xgc` 时必须重新走完整 `.x1` 链验证，`intent_mac` 必须等于当前 Intent 的真实 trailer
+  MAC，`terminal_transition_mac` 必须等于链上最高 seq 的 `.x1` 真实 trailer MAC，唯一允许全零的
+  情况是 Building-only PreSeal clear。
+- **性能/内存/文件名边界**（真正写 codec 时的约束，不是这一轮 ABI 声明的约束）：固定
+  `std::array<std::byte, 316>` 预分配缓冲，不用 `memcpy` 整个 C++ struct 当磁盘格式、不用
+  reinterpret_cast/`#pragma pack`；文件名用固定长度 hex buffer，不用可空 `const char*`／
+  `snprintf` 截断；`.x1` 最多 3 条，recovery 应定点读取而非全目录扫描；
+  `SealJournalIntakeCloseControl` 的拓扑字段必须先由 owner 复制成不可变快照，再进入任何 MAC 输入，
+  不能在编码时读取会被其他线程并发修改的 live 控制块。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
