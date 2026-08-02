@@ -223,6 +223,20 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_sha256_hmac)
     gtest_discover_tests(test_sha256_hmac)
 
+    # Phase 0 (密钥轮换共享基础设施): KEK 文件加载器 (L3, 镜像 env_loader.hpp
+    # 的权限检查/反符号链接/mlock/安全擦除模式，见 kek_loader.hpp)
+    add_executable(test_kek_loader tests/test_kek_loader.cpp)
+    target_link_libraries(test_kek_loader PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_kek_loader)
+    gtest_discover_tests(test_kek_loader)
+
+    # Phase 0: HY-KEKWRAP-v1 key wrap/unwrap (L1, 纯内存, 无文件 I/O -- 见
+    # key_ring.hpp 头部注释，这不是标准 AEAD，正确性靠往返+篡改测试)
+    add_executable(test_key_ring tests/test_key_ring.cpp)
+    target_link_libraries(test_key_ring PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_key_ring)
+    gtest_discover_tests(test_key_ring)
+
     # 轨道 A 第四项: durable 日志帧编解码 (L1, 纯内存, 无文件 I/O -- 真正的文件
     # 落盘在 durable_audit_sink.hpp，这里只验证帧格式本身)
     add_executable(test_durable_frame_codec tests/test_durable_frame_codec.cpp)
