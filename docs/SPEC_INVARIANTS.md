@@ -218,8 +218,15 @@ spec 字面文本的地方，连同理由——**不是遗漏，是范围裁决*
 - **compaction / generation 切换 / seal journal 不做**，日志无限增长，这是已知缺口，等后续单独排期。
 - **§6.1.1.2 密钥派生/轮换/KEK 包裹存储不做**：`DurableAuditSink` 构造时接收一个预先派生好的原始
   key，`key_id` 固定为 0，不做轮换。**真实上线前这一点必须补上**，不是可以无限期搁置的简化。
+  **[Phase 0 已补上底座]**——见下方"Phase 0：共享 durability 基础设施"小节；`DurableAuditSink`
+  本身接入这套底座是 Phase 2 的范围，这一轮（Phase 0）还没有做。
 - **只读写帧格式 v3，不做 v1/v2 历史格式解码**：这个代码库从未写过 durable 帧，没有历史格式要兼容；
-  版本号不等于 3 一律 `IoError`。
+  版本号不对时，实际代码路径是 `decode_order_event_frame` 返回 `UnknownVersion`，
+  `run_recovery_scan()` 把它和其他非 `Ok`/`Truncated` 状态一样映射成 `RecoveryScanStatus::Corrupt`
+  ——**订正**：这条记录原文写的"一律 `IoError`"是描述失真，`IoError` 在这个类里专门留给文件锁/打开
+  失败、读日志 I/O 失败、非空日志缺失 tip-anchor 三种场景，版本不匹配走的是 `Corrupt` 路径，不是
+  `IoError`。**[Phase 0 已升级到 v4]**——见下方小节，v3 落地当天到升级只隔了一天，零真实数据，
+  零迁移成本。
 - **HMAC-SHA256 用 vendored 实现（新文件 `sha256.hpp`），不用 `binance_signer.hpp` 已有的 OpenSSL
   封装**：`native/CMakeLists.txt` 里 OpenSSL 只在 `HY_BUILD_DEMO=ON` 时才链接，而 `tools/wsl_verify.sh`
   的 TSan job 和 `CLAUDE.md` 自己文档化的 MSVC 标准验证流程都没有传这个开关——挂在它后面意味着
@@ -254,6 +261,50 @@ POSIX flock/Windows 无共享 CreateFileA、每次 append 同步 fsync、本地 
 
 验证：MSVC 481/481、WSL2 GCC-14 none/address/thread 三模式全绿（TSan 负控制仍正确报出注入的竞争）、
 `spec_xref_check.py`/`spec_enum_diff.py` 均 exit 0。
+
+### Phase 0：共享 durability 基础设施（KEK/密钥轮换底座 + keyed frame v4）
+
+**[已实现]** `DurableControlPlaneSink` 真实实现 / `orchestrate_submit` 热路径接入 / 密钥轮换 /
+`ExternalAnchorClient` 总路线图（5 个 Phase）的第一个执行单元。给 `§6.1.1.2` 的密钥轮换建一个真正
+可用的底座，并把这个底座接进现有帧格式——**这一轮不做**`DurableAuditSink` 本身切换到用这套底座
+（Phase 2）、真正的运行时轮换生命周期（Phase 4）、`ControlPlaneSink`（Phase 1）。
+
+- **KEK 权威来源 = 独立的 0600/0400 权限文件**（用户决策），复用 `env_loader.hpp` 已有的权限检查/
+  反符号链接/mlock/安全擦除模式，但独立成新类 KekLoader（`kek_loader.hpp`）——载荷是定长 32
+  字节原始 KEK，不是 .env key=value 文本，硬凑复用 SecureEnvLoader 会让权限检查和载荷解析逻辑
+  纠缠，所以是并列的新类，不是继承/复用。KEK 文件路径与 Binance API secret 文件路径分开。
+- **KEK 包裹算法 = 基于已有 HMAC-SHA256 的 keystream 构造**（用户决策，不引入 OpenSSL、不新
+  vendor AES-GCM，理由同 `sha256.hpp` 自己的"两条标准 CI 验证链都要覆盖"原则）：`HY-KEKWRAP-v1`——
+  从 KEK 派生独立的 encrypt/tag 子密钥（`HMAC-SHA256(KEK, "HY-KEKWRAP-v1-ENC"/"HY-KEKWRAP-v1-TAG")`，
+  密钥分离，不用同一把 key 既加密又算完整性标签）；keystream 按 32 字节分块用
+  `HMAC-SHA256(enc_subkey, "HY-KEKWRAP-v1" || key_id || salt || block_counter)` 生成，和明文 HMAC
+  key 逐块异或得到 `wrapped_key_blob`；完整性标签
+  `tag = HMAC-SHA256(tag_subkey, "HY-KEKWRAP-v1-TAG" || key_id || salt || wrapped_key_blob)`。
+  **这不是标准库/第三方提供的 AEAD，是这个仓库自己拼的构造**，没有第三方 known-answer 向量可以
+  对照，正确性靠往返测试 + 篡改测试（`test_key_ring.cpp`）+ 结构化推理，测试文件头部必须显式声明
+  这一点，不能含糊成"标准算法"。KeyRing（`key_ring.hpp`）持有这套逻辑，未知 `key_id` 查找返回
+  明确失败（不是默认值/静默失败），`retire(key_id)` 只做"退役请求一到就真退役 + 安全擦除进程内
+  明文副本"，不追踪"谁还在用哪个 key_id"——那是调用方（Phase 2/4）的责任。
+- **帧格式 v3 → v4**：当前帧格式（`durable_frame_codec.hpp`）完全没有 `key_id` 字段——已直接读
+  代码确认布局是 `[format_version][record_type][sequence_number][time_kind][recorded_utc_ms]
+  [payload_length][payload][prev_mac][mac]`，87 字节固定开销，`encode_order_event_frame`/
+  `decode_order_event_frame` 对 key 选择完全无感知。v4 在 `format_version`/`record_type` 之后、
+  `sequence_number` 之前插入 `key_id: u32 LE`，固定开销变成 91 字节，`kFrameFormatVersion` 从 3
+  改成 4。**v3 落地到升级只隔一天，`git log` 核实全仓库历史里没有任何真实 v3 日志产物、没有任何
+  deploy/prod 分支**——升版本零迁移成本，和"这个代码库从未写过 durable 帧"这条既有理由完全一致。
+  新增两阶段解码能力（先读 `key_id`，查 key，再验证整帧 MAC）供 Phase 2 接入时使用。
+- **tip-anchor 的 `key_id` 落地，wire 格式不变**：tip-anchor 布局（`durable_audit_sink.hpp`）本来
+  就有 `key_id` 字段（`kTipAnchorSize` 已经把这 4 字节算进去了），只是 `encode_tip_anchor`/
+  `decode_tip_anchor` 硬编码成 0/直接丢弃——这一轮只改这两个纯函数本身，不改 `DurableAuditSink`
+  类的调用逻辑（那是 Phase 2 的范围）。顺带发现并修正一个小问题：tip-anchor 的版本字节此前直接
+  复用 `kFrameFormatVersion` 这同一个常量，不是独立版本号——拆成独立的 kTipAnchorFormatVersion，
+  避免"帧格式以后再变一次"被迫连带绑架 tip-anchor 格式。
+- **单写者 + recovery 契约（文档化，Phase 2/4 落地时照做）**：写入必须由单一 owner 线程串行化；
+  recovery 遇到未知/已退役 `key_id` 必须直接 fence，不允许"试其他 key"——spec 原文
+  （`SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:1230`）已经这么要求，这里只是把它落成这个仓库自己的
+  ledger 记录。
+
+`spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——本轮零新增枚举。
 
 ### 崩溃恢复 / Freeze 子系统
 
