@@ -31,6 +31,7 @@
 
 #include <hengyuan/durable_control_plane.hpp>
 #include <hengyuan/durable_frame_codec.hpp>
+#include <hengyuan/durable_log_store.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 
 #include <array>
@@ -39,23 +40,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/file.h>  // flock() -- the BSD advisory-lock function, distinct
-                        // from <fcntl.h>'s POSIX `struct flock` record-lock
-                        // type of the same name. Omitting this header makes
-                        // GCC resolve `flock(...)` as a struct-flock
-                        // aggregate-init instead of the function call (a real,
-                        // GCC-only compile failure -- MSVC has no such
-                        // ambiguity since this whole branch is POSIX-only).
-#include <unistd.h>
-#endif
 
 namespace hy {
 
@@ -133,7 +117,7 @@ public:
     // hmac_key: pre-derived raw key material, copied and retained for the
     // lifetime of this instance (no rotation this round -- see class header).
     DurableAuditSink(const std::string& path, std::span<const std::byte> hmac_key) noexcept
-        : log_path_(path), lock_path_(path + ".lock"), tip_path_(path + ".tip") {
+        : log_store_(path, path + ".lock", path + ".tip") {
         const std::size_t key_len = hmac_key.size() < kKeyBlockSize ? hmac_key.size() : kKeyBlockSize;
         // Pre-derive the block-sized key once (HMAC's own "hash if > block
         // size, else zero-pad" rule) so every append_durable() call doesn't
@@ -430,52 +414,28 @@ private:
                                                                        : RecoveryScanStatus::Corrupt;
     }
 
-    // --- Platform I/O ---
-#if defined(_WIN32)
-    bool acquire_lock() noexcept {
-        // No-sharing CreateFileA is itself an OS-enforced exclusive lock: a
-        // second handle opened anywhere for this path fails with a sharing
-        // violation. Same idiom env_loader.hpp already uses for anti-symlink
-        // opens, reused here for mutual exclusion instead.
-        lock_handle_ = CreateFileA(lock_path_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        return lock_handle_ != INVALID_HANDLE_VALUE;
-    }
-    void release_lock() noexcept {
-        if (lock_handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(lock_handle_);
-            lock_handle_ = INVALID_HANDLE_VALUE;
-        }
-    }
+    // --- Platform I/O: thin delegates to DurableLogStore (docs/SPEC_INVARIANTS.md's
+    // "Phase 1" entry -- extracted this round so this class and
+    // ControlPlaneLogSink share one crash-consistency implementation instead
+    // of maintaining two independently-drifting copies). This is a pure
+    // refactor: every method below has the exact same signature/return
+    // semantics it always did; test_durable_audit_sink.cpp is unmodified and
+    // passing unchanged is the regression evidence. Only the tip-anchor
+    // MAC/key_id encoding stays here (DurableLogStore has no notion of
+    // frame formats, MACs, or keys -- it only moves bytes).
+    bool acquire_lock() noexcept { return log_store_.acquire_lock(); }
+    void release_lock() noexcept { log_store_.release_lock(); }
     bool open_log() noexcept {
-        log_handle_ = CreateFileA(log_path_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        log_open_ = log_handle_ != INVALID_HANDLE_VALUE;
+        log_open_ = log_store_.open_log();
         return log_open_;
     }
     void close_log() noexcept {
-        if (log_handle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(log_handle_);
-            log_handle_ = INVALID_HANDLE_VALUE;
-        }
+        log_store_.close_log();
         log_open_ = false;
     }
-    bool read_entire_log(std::vector<std::byte>& out) noexcept {
-        LARGE_INTEGER size{};
-        if (!GetFileSizeEx(log_handle_, &size)) return false;
-        out.resize(static_cast<std::size_t>(size.QuadPart));
-        if (out.empty()) return true;
-        if (SetFilePointer(log_handle_, 0, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER) return false;
-        DWORD read_bytes = 0;
-        BOOL ok = ReadFile(log_handle_, out.data(), static_cast<DWORD>(out.size()), &read_bytes, nullptr);
-        return ok && static_cast<std::size_t>(read_bytes) == out.size();
-    }
+    bool read_entire_log(std::vector<std::byte>& out) noexcept { return log_store_.read_whole_log(out); }
     bool append_bytes_to_log(const std::byte* data, std::size_t n) noexcept {
-        if (SetFilePointer(log_handle_, 0, nullptr, FILE_END) == INVALID_SET_FILE_POINTER) return false;
-        DWORD written = 0;
-        if (!WriteFile(log_handle_, data, static_cast<DWORD>(n), &written, nullptr)) return false;
-        if (static_cast<std::size_t>(written) != n) return false;
-        return FlushFileBuffers(log_handle_) != 0;
+        return log_store_.append_and_fsync(std::span<const std::byte>(data, n));
     }
     bool write_tip_anchor(std::uint64_t sequence_number, std::array<std::byte, kMacLen> mac) noexcept {
         std::array<std::byte, kTipAnchorSize> buf{};
@@ -484,177 +444,11 @@ private:
         // actually signed the corresponding log frame, and that's hardcoded
         // to 0 until Phase 2 wires this class to a real KeyRing.
         detail::encode_tip_anchor(buf, sequence_number, mac, /*key_id=*/0u, key_span());
+        return log_store_.write_tip_anchor(buf);
+    }
+    bool read_tip_anchor(std::vector<std::byte>& out) noexcept { return log_store_.read_tip_anchor(out); }
 
-        const std::string tmp_path = tip_path_ + ".tmp";
-        HANDLE h = CreateFileA(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        DWORD written = 0;
-        BOOL ok = WriteFile(h, buf.data(), static_cast<DWORD>(buf.size()), &written, nullptr);
-        ok = ok && (static_cast<std::size_t>(written) == buf.size());
-        ok = ok && FlushFileBuffers(h);
-        CloseHandle(h);
-        if (!ok) return false;
-
-        // MOVEFILE_WRITE_THROUGH: NTFS + FlushFileBuffers on the file handle
-        // above is the honest contract here -- this is NOT POSIX directory-
-        // fsync equivalence (no parent-directory metadata flush on Windows in
-        // this implementation). Crash-consistency under this exact procedure
-        // is what's claimed, not power-loss equivalence to the POSIX path.
-        return MoveFileExA(tmp_path.c_str(), tip_path_.c_str(),
-                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-    }
-    bool read_tip_anchor(std::vector<std::byte>& out) noexcept {
-        HANDLE h = CreateFileA(tip_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        LARGE_INTEGER size{};
-        if (!GetFileSizeEx(h, &size)) {
-            CloseHandle(h);
-            return false;
-        }
-        out.resize(static_cast<std::size_t>(size.QuadPart));
-        bool ok = true;
-        if (!out.empty()) {
-            DWORD read_bytes = 0;
-            ok = ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &read_bytes, nullptr) &&
-                 static_cast<std::size_t>(read_bytes) == out.size();
-        }
-        CloseHandle(h);
-        return ok;
-    }
-
-    HANDLE lock_handle_{INVALID_HANDLE_VALUE};
-    HANDLE log_handle_{INVALID_HANDLE_VALUE};
-#else
-    bool acquire_lock() noexcept {
-        lock_fd_ = ::open(lock_path_.c_str(), O_CREAT | O_RDWR, 0600);
-        if (lock_fd_ < 0) return false;
-        if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-            ::close(lock_fd_);
-            lock_fd_ = -1;
-            return false;
-        }
-        return true;
-    }
-    void release_lock() noexcept {
-        if (lock_fd_ >= 0) {
-            ::flock(lock_fd_, LOCK_UN);
-            ::close(lock_fd_);
-            lock_fd_ = -1;
-        }
-    }
-    bool open_log() noexcept {
-        log_fd_ = ::open(log_path_.c_str(), O_CREAT | O_RDWR, 0600);
-        log_open_ = log_fd_ >= 0;
-        return log_open_;
-    }
-    void close_log() noexcept {
-        if (log_fd_ >= 0) {
-            ::close(log_fd_);
-            log_fd_ = -1;
-        }
-        log_open_ = false;
-    }
-    bool read_entire_log(std::vector<std::byte>& out) noexcept {
-        const off_t size = ::lseek(log_fd_, 0, SEEK_END);
-        if (size < 0) return false;
-        out.resize(static_cast<std::size_t>(size));
-        if (out.empty()) return true;
-        if (::lseek(log_fd_, 0, SEEK_SET) < 0) return false;
-        std::size_t total = 0;
-        while (total < out.size()) {
-            const ssize_t n = ::read(log_fd_, out.data() + total, out.size() - total);
-            if (n <= 0) return false;
-            total += static_cast<std::size_t>(n);
-        }
-        return true;
-    }
-    bool append_bytes_to_log(const std::byte* data, std::size_t n) noexcept {
-        if (::lseek(log_fd_, 0, SEEK_END) < 0) return false;
-        std::size_t total = 0;
-        while (total < n) {
-            const ssize_t written = ::write(log_fd_, data + total, n - total);
-            if (written <= 0) return false;
-            total += static_cast<std::size_t>(written);
-        }
-        return ::fsync(log_fd_) == 0;
-    }
-    bool write_tip_anchor(std::uint64_t sequence_number, std::array<std::byte, kMacLen> mac) noexcept {
-        std::array<std::byte, kTipAnchorSize> buf{};
-        // key_id stays 0 here for the same reason append_durable()'s frame
-        // write does -- this tip-anchor's key_id must match whatever key_id
-        // actually signed the corresponding log frame, and that's hardcoded
-        // to 0 until Phase 2 wires this class to a real KeyRing.
-        detail::encode_tip_anchor(buf, sequence_number, mac, /*key_id=*/0u, key_span());
-
-        const std::string tmp_path = tip_path_ + ".tmp";
-        int fd = ::open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0) return false;
-        std::size_t total = 0;
-        bool ok = true;
-        while (ok && total < buf.size()) {
-            const ssize_t written = ::write(fd, buf.data() + total, buf.size() - total);
-            if (written <= 0) {
-                ok = false;
-                break;
-            }
-            total += static_cast<std::size_t>(written);
-        }
-        ok = ok && (::fsync(fd) == 0);
-        ::close(fd);
-        if (!ok) return false;
-
-        if (::rename(tmp_path.c_str(), tip_path_.c_str()) != 0) return false;
-
-        // Directory-entry fsync: the rename itself needs the containing
-        // directory's metadata flushed for crash-durability, not just the
-        // file's own contents (SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md's own
-        // atomic-replace contract, L4 §10.3).
-        const auto slash = tip_path_.find_last_of('/');
-        const std::string dir = (slash == std::string::npos) ? "." : tip_path_.substr(0, slash);
-        int dir_fd = ::open(dir.c_str(), O_RDONLY);
-        if (dir_fd < 0) return false;
-        const bool dir_ok = (::fsync(dir_fd) == 0);
-        ::close(dir_fd);
-        return dir_ok;
-    }
-    bool read_tip_anchor(std::vector<std::byte>& out) noexcept {
-        int fd = ::open(tip_path_.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        const off_t size = ::lseek(fd, 0, SEEK_END);
-        if (size < 0) {
-            ::close(fd);
-            return false;
-        }
-        out.resize(static_cast<std::size_t>(size));
-        bool ok = true;
-        if (!out.empty()) {
-            if (::lseek(fd, 0, SEEK_SET) < 0) {
-                ok = false;
-            } else {
-                std::size_t total = 0;
-                while (ok && total < out.size()) {
-                    const ssize_t n = ::read(fd, out.data() + total, out.size() - total);
-                    if (n <= 0) {
-                        ok = false;
-                        break;
-                    }
-                    total += static_cast<std::size_t>(n);
-                }
-            }
-        }
-        ::close(fd);
-        return ok;
-    }
-
-    int lock_fd_{-1};
-    int log_fd_{-1};
-#endif
-
-    std::string log_path_;
-    std::string lock_path_;
-    std::string tip_path_;
+    DurableLogStore log_store_;
     std::array<std::byte, kKeyBlockSize> key_block_{};
 
     bool log_open_{false};
