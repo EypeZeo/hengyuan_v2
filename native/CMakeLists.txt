@@ -252,6 +252,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_frame_codec)
     gtest_discover_tests(test_durable_frame_codec)
 
+    # Phase 1: control-plane 11 种 payload 的帧编解码 (L1, 纯内存, 无文件 I/O --
+    # 真正的文件落盘在 control_plane_log_sink.hpp，这里只验证帧格式本身，见
+    # control_plane_frame_codec.hpp 头部注释)
+    add_executable(test_control_plane_frame_codec tests/test_control_plane_frame_codec.cpp)
+    target_link_libraries(test_control_plane_frame_codec PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_control_plane_frame_codec)
+    gtest_discover_tests(test_control_plane_frame_codec)
+
     # 轨道 A 第四项: DurableAuditSink 核心 (L2, 真实文件 I/O -- 跨平台锁/fsync/
     # tip anchor 原子替换/recovery_scan()). 真实文件测试见
     # test_durable_audit_sink.cpp；纯内存帧格式测试见上面的 test_durable_frame_codec。
