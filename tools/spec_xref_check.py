@@ -56,6 +56,13 @@ SEARCH_FILES = [
     REPO_ROOT / "native" / "include" / "hengyuan" / "order_tracker.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "durable_frame_codec.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "durable_audit_sink.hpp",
+    # Phase 1 (docs/SPEC_INVARIANTS.md): the platform lock/fsync/tip-anchor
+    # code durable_audit_sink.hpp used to carry directly (including the
+    # flock/CreateFileA identifiers the ledger's own GCC-only finding names)
+    # moved into this shared file when ControlPlaneLogSink started reusing
+    # it -- without adding it here, that finding would silently stop being
+    # checkable the moment the code it describes moved to a new home.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "durable_log_store.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
