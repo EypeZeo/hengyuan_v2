@@ -598,6 +598,90 @@ encode/decode、真实文件发布、MAC 验证、恢复状态机、并发锁）
   `SealJournalIntakeCloseControl` 的拓扑字段必须先由 owner 复制成不可变快照，再进入任何 MAC 输入，
   不能在编码时读取会被其他线程并发修改的 live 控制块。
 
+### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
+及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
+
+`DurableControlPlaneSink` 真实实现 / `orchestrate_submit` 热路径接入 / 密钥轮换 /
+`ExternalAnchorClient` 总路线图（5 个 Phase）的第二个执行单元，紧接上面"Phase 0：共享 durability
+基础设施"小节交付的 KEK/KeyRing/keyed frame v4 底座。这一轮把这套底座接成一个真正能用的
+`DurableControlPlaneSink` 具体实现（新类 ControlPlaneLogSink），并顺带抽取一个 `DurableAuditSink`/
+ControlPlaneLogSink 两者共用的平台 I/O 层。
+
+**范围决定及其演变**：起点是用户拍板"只做持久化机制，业务规则验证留待后续"——11 个 append 方法
+只做真实的 fsync/哈希链帧/tip-anchor/KeyRing 支持的真实 key_id 选择，不实现每个方法自己
+SPEC-METHOD 注释里那些跨帧业务校验规则（`wait_generation` 顺序、`attempt_ordinal` 不允许跳号、
+compaction 会话 baseline 校验等）。第一版计划据此设计了 `recover_control_plane` 的纯
+latest-frame-wins fold，并把文件锁/fsync/tip-anchor 平台代码按 `DurableAuditSink` 现成模式重新
+实现一份（不碰那个文件）。用户随后转发一份外部（GPT）评审，指出两处架构级风险，核实后确认都成立，
+拍板了两处修正：
+
+1. **纯 latest-frame-wins 会把已被 `FreezeClear` 清除的 freeze 重新报告为 active、把过期
+   `WaitSatisfied` 当作当前证据**——完整修复需要跨帧推理，属于业务规则范畴，但这个具体安全隐患
+   足够窄、足够关键，值得在这一轮堵上。**决定**：只加两条窄的安全关键 fold 规则（见下方
+   ControlPlaneLogSink 条目），append 时序校验（`attempt_ordinal` 不跳号等）依然全部延后——
+   这不推翻原有范围决定，只是把"recovery 不能把已撤销的危险状态报告为仍然有效"划进机制范畴，
+   而不是业务范畴。
+2. **文件锁/fsync/tip-anchor 平台代码不应该在新 sink 里重新抄一份**——会形成两套独立维护的崩溃
+   一致性代码，长期语义漂移。**决定**：这一轮抽取共享的 DurableLogStore（`durable_log_store.hpp`，
+   新文件），`DurableAuditSink` 重构为委托调用——**纯重构，不改变对外行为**，验证依据是
+   `test_durable_audit_sink.cpp` 本轮零改动、原样重跑全绿。
+
+**这一轮仍然不做**：11 个 append 方法的跨帧业务校验规则本体（`wait_generation` 顺序、
+`attempt_ordinal` 不允许跳号、`arm_ordinal`/`satisfaction_ordinal` 引用完整性、compaction 会话
+baseline 校验等）——刻意延后，`recover_control_plane` 里 `out_uncleared_epoch_count` 仍是 0/1
+简化、`out_has_wait_arm` 仍是纯 latest-wins。真正的运行时密钥轮换生命周期（Phase 4 的范围）也不做
+——ControlPlaneLogSink 的 active_key_id 构造后不可变，没有运行时切换接口。
+
+- **DurableLogStore（新文件 `durable_log_store.hpp`）**——非多态、非 ABI 冻结的内部实现细节类
+  （不同于 `DurableControlPlaneSink` 这种 spec-pinned 接口），把 `DurableAuditSink` 现有的文件锁
+  （POSIX flock/Windows 无共享 CreateFileA）、open/close、append_and_fsync、tip-anchor 原子替换
+  （`.tmp`写+rename/MoveFileEx+父目录fsync）原样搬迁。新增两个读取原语：read_whole_log（行为
+  与 `DurableAuditSink` 现有 `read_entire_log` 逐字节等价，供其委托调用，是"零行为变化"验证的
+  核心）、read_chunk（有界流式读取，仅供 ControlPlaneLogSink 使用——`DurableAuditSink` 不改
+  行为，继续用整份读入）。
+- **`DurableAuditSink` 的重构（改 `durable_audit_sink.hpp`）**——私有面新增一个 DurableLogStore
+  成员，7 个私有 I/O 方法体替换为对它的薄委托调用。类的公开接口/行为一律不变；本轮**不改**它的
+  `key_id=0u` 硬编码调用点（那是 Phase 2 的范围，与这次重构无关）。
+- **ControlPlaneLogSink（新文件 `control_plane_log_sink.hpp`）**——`DurableControlPlaneSink` 的
+  真实实现，基于 DurableLogStore：
+  - active_key_id 是构造参数，**构造后不可变**（`const` 成员），没有运行时切换接口；每次
+    `append_*` 都做一次实时的 `KeyRing::active_key()` 查找（从不跨调用缓存）。查找失败（未知/
+    已退役 key_id）→ append 返回 `Failed`，**不 fence**（可恢复的配置错误）。
+  - **恢复时 key 解析的处理不同于 append 时**：`peek_frame_key_id()` 读出每帧自己的 key_id，
+    查找失败（未知/已退役/环境不匹配）→ **`Corrupt`（fence）**——已落盘、MAC 链上的帧签名 key
+    在恢复时解析不出来，说明当前进程的 `KeyRing` 环境和写入时不匹配，唯一安全选择是拒绝恢复。
+    前提条件：调用方必须在构造这个 sink 之前，把日志里所有仍被引用的 key_id 都通过
+    `load_wrapped_key()` 加载进 `KeyRing`。
+  - `recover_control_plane`：对多数记录类型是 latest-frame-wins（同 Phase 0 之前的原始设计），
+    但对 `RateLimitFreeze`/`FreezeClear`/`FreezeWaitSatisfied` 三者加两条**安全关键** fold 规则：
+    (a) 扫描到 `freeze_epoch` 匹配（或更晚）的 `FreezeClear` 帧时，`out_has_freeze` 置 false，
+    之后若有更新的 `RateLimitFreeze` 帧再重新置 true；(b) `out_has_wait_satisfied` 只有在折叠出的
+    最新 `WaitSatisfied`/`CompactedFreezeWaitEvidence` 帧的 `wait_generation` 等于折叠出的
+    `out_active_freeze.wait_generation`（且 > 0）时才为 true，跨代残留证据一律视为不满足。这两条
+    是这一轮唯一从"业务规则"里挑出来实现的部分。8 槽 `FreezeProbeAttemptPayload` 环：索引 0 最老，
+    最后一个已填充索引最新。
+  - 恢复扫描是**流式**的（通过 DurableLogStore 的 read_chunk 原语，按帧边界读取，先校验
+    `payload_length` 不超过本轮新引入的 kMaxControlPlaneFrameBytes 常量再分配/读取），不整份读入文件——防止
+    恶意/损坏文件在启动期把内存吃爆；这一点特意不同于 `DurableAuditSink`（后者保留整份读入以维持
+    行为不变）。
+  - `supports_compaction()` 返回 `false`；`append_compacted_freeze_snapshot`/
+    `append_compacted_wait_evidence`/`append_seal_journal_apply` 均返回 `Failed`、不 fence——与
+    这个接口里其余"不支持的记录类型返回 Failed"的既有写法一致，不新增 `AuditAppendResult::Status`
+    第 3 个值。
+- **`control_plane_frame_codec.hpp`（新文件）**——11 种 payload 类型各自的 encode/decode 函数对
+  + 帧封装函数，复用 `durable_frame_codec.hpp` 的 `detail::` 原语，不修改那个文件本身（它的定位
+  仍是 OrderEvent 专用）。`SymbolRegistrySnapshotPayload` 的变长 `SymbolRules` 数组：本地定义
+  一个新常量 kMaxSnapshotSymbols = 64（`durable_control_plane.hpp:531` 注释引用的 `kMaxSymbols`
+  常量未在该文件定义，只在不相关的 `binance_json_parser.hpp`/`input_validator.hpp` 里定义，这是
+  既存小缺口，非本轮引入）。**防溢出纪律**：decode 时先校验 `payload_length` 派生的 entry_count
+  不超过 kMaxSnapshotSymbols，校验通过后才做基于它的乘法/缓冲区定位，不允许先乘后比较——
+  `entry_count` 来自不可信的帧头字段。所有 `pad[3]` 等保留字段 encode 时清零、decode 时校验
+  必须为零。
+
+`spec_enum_diff.py` 本轮**零改动**（零新增枚举）；`spec_xref_check.py --quiet` 需重跑并通过——
+新增文字里非 spec 转写的实现层标识符（DurableLogStore、ControlPlaneLogSink、
+kMaxSnapshotSymbols 等）均未加反引号，避免误报"未在任何搜索文件命中"。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
