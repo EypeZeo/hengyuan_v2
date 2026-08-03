@@ -168,7 +168,6 @@ public:
 
     AuditAppendResult append_snapshot(const SymbolRegistrySnapshotPayload& snap,
                                        std::span<const SymbolRules> entries) noexcept override {
-        AuditAppendResult result{};
         if (fenced_ || !log_store_.is_log_open()) return failed_result();
 
         std::array<std::byte, kKeyBlockSize> key_block{};
@@ -483,7 +482,6 @@ private:
 
             std::size_t frame_size = 0;
             std::array<std::byte, kMacLen> frame_mac{};
-            RecoveryScanStatus dispatch_status = RecoveryScanStatus::Clean;
             bool dispatched_ok = false;
 
             switch (hdr.record_type) {
@@ -663,7 +661,6 @@ private:
             }
 
             if (dispatched_ok) {
-                (void)dispatch_status;
                 running_prev_mac = frame_mac;
                 last_mac = frame_mac;
                 any_frame_seen = true;
