@@ -237,6 +237,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_key_ring)
     gtest_discover_tests(test_key_ring)
 
+    # Phase 1: DurableLogStore 共享平台 I/O 层 (L2, 真实文件 I/O -- 跨平台锁/
+    # fsync/tip-anchor 原子替换/流式 read_chunk。DurableAuditSink 与
+    # ControlPlaneLogSink 共用同一份实现，见 durable_log_store.hpp 头部注释)
+    add_executable(test_durable_log_store tests/test_durable_log_store.cpp)
+    target_link_libraries(test_durable_log_store PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_log_store)
+    gtest_discover_tests(test_durable_log_store)
+
     # 轨道 A 第四项: durable 日志帧编解码 (L1, 纯内存, 无文件 I/O -- 真正的文件
     # 落盘在 durable_audit_sink.hpp，这里只验证帧格式本身)
     add_executable(test_durable_frame_codec tests/test_durable_frame_codec.cpp)
