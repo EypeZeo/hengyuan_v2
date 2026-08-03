@@ -260,6 +260,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_control_plane_frame_codec)
     gtest_discover_tests(test_control_plane_frame_codec)
 
+    # Phase 1: ControlPlaneLogSink -- 首个真实 DurableControlPlaneSink 实现
+    # (L2, 真实文件 I/O，基于共享 DurableLogStore，见 control_plane_log_sink.hpp
+    # 头部注释：机制先行 + 两条安全关键 recovery fold 规则)
+    add_executable(test_control_plane_log_sink tests/test_control_plane_log_sink.cpp)
+    target_link_libraries(test_control_plane_log_sink PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_control_plane_log_sink)
+    gtest_discover_tests(test_control_plane_log_sink)
+
     # 轨道 A 第四项: DurableAuditSink 核心 (L2, 真实文件 I/O -- 跨平台锁/fsync/
     # tip anchor 原子替换/recovery_scan()). 真实文件测试见
     # test_durable_audit_sink.cpp；纯内存帧格式测试见上面的 test_durable_frame_codec。
