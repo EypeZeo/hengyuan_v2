@@ -42,6 +42,7 @@ enum class AuditEventType : std::uint8_t {
     AccountTruthStale = 17,
     ClockSkewDetected = 18,
     RateLimitApproaching = 19,
+    OrderSubmitPrepared = 20,
 };
 
 inline const char* audit_event_name(AuditEventType t) noexcept {
@@ -66,6 +67,7 @@ inline const char* audit_event_name(AuditEventType t) noexcept {
         case AuditEventType::AccountTruthStale: return "ACCOUNT_TRUTH_STALE";
         case AuditEventType::ClockSkewDetected: return "CLOCK_SKEW_DETECTED";
         case AuditEventType::RateLimitApproaching: return "RATE_LIMIT_APPROACHING";
+        case AuditEventType::OrderSubmitPrepared: return "ORDER_SUBMIT_PREPARED";
     }
     return "UNKNOWN";
 }

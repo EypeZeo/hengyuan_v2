@@ -145,7 +145,7 @@ inline void read_bytes(const std::byte*& p, void* dst, std::size_t n) noexcept {
 }
 
 inline bool is_legal_audit_event_type(std::uint8_t v) noexcept {
-    return v <= static_cast<std::uint8_t>(AuditEventType::RateLimitApproaching);
+    return v <= static_cast<std::uint8_t>(AuditEventType::OrderSubmitPrepared);
 }
 
 inline bool is_legal_execution_mode(std::uint8_t v) noexcept {
