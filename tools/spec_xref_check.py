@@ -63,6 +63,14 @@ SEARCH_FILES = [
     # it -- without adding it here, that finding would silently stop being
     # checkable the moment the code it describes moved to a new home.
     REPO_ROOT / "native" / "include" / "hengyuan" / "durable_log_store.hpp",
+    # Phase 4 (docs/SPEC_INVARIANTS.md): these two have existed since Phase 1
+    # but were never added here -- Phase 4 puts genuinely new, load-bearing
+    # symbols in both (KeyRotationPayload's codec family, ControlPlaneLogSink's
+    # rotate_active_key()/finish_append()), the exact same "a symbol can only
+    # drift unnoticed in a file nobody looks at" gap the durable_log_store.hpp
+    # entry above was added to close.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "control_plane_frame_codec.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "control_plane_log_sink.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

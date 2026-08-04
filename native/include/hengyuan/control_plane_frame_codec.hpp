@@ -1544,4 +1544,170 @@ inline FrameDecodeStatus decode_snapshot_frame(std::span<const std::byte> in, st
     return FrameDecodeStatus::Ok;
 }
 
+// ===========================================================================
+// KeyRotatedRecord -- Phase 4 (docs/SPEC_INVARIANTS.md), durable evidence of
+// a live active_key_id_ rotation on DurableAuditSink (own sidecar log) or
+// ControlPlaneLogSink (own main log).
+//
+// Deliberately NOT a DurableRecordType member and deliberately NOT built on
+// write_control_plane_header/read_control_plane_header/ControlPlaneFrameHeader
+// -- DurableRecordType is a closed, spec-transcribed, persisted wire
+// discriminator (docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2511-2561) that
+// tools/spec_enum_diff.py enforces has zero code-only extensions (confirmed
+// the hard way: adding KeyRotated=17 there was flagged as a build-failing
+// NAME_CONFLICT). KeyRotated has no spec basis anywhere, so this frame
+// invents its own small, independent wire format instead -- the honest
+// alternative to either fabricating fake spec provenance or silently
+// breaking that CI gate. The frame is signed under new_key_id (already
+// verified resolvable in KeyRing at the point this is written); old_key_id
+// travels as authenticated payload data -- same convention
+// durable_control_plane.hpp's own GenerationBridgePayload already
+// established for prev_key_id/new_key_id, not a new rule invented here.
+//
+// Layout (marker occupies the same structural position
+// write_control_plane_header's format_version byte does, but is a reserved
+// sentinel -- 0xFE -- chosen to be unambiguously distinct from
+// kFrameFormatVersion (4) and any plausible future growth of that shared
+// envelope's version number, so a mixed-type scan can peek byte 0 and know
+// which decoder to call before ever touching DurableRecordType/
+// is_legal_durable_record_type at all):
+//   [marker: u8 = kKeyRotatedRecordMarker][key_id: u32 LE]
+//   [sequence_number: u64 LE][time_kind: u8][recorded_utc_ms: i64 LE]
+//   [payload: 16 bytes][prev_mac: 32 bytes]
+//   [mac: 32 bytes = HMAC-SHA256(everything above, including prev_mac)]
+// ===========================================================================
+
+inline constexpr std::uint8_t kKeyRotatedRecordMarker = 0xFE;
+inline constexpr std::size_t kKeyRotatedHeaderSize = 1 + 4 + 8 + 1 + 8;  // 22
+
+inline constexpr std::size_t kKeyRotationPayloadWireSize =
+    4 +  // old_key_id
+    4 +  // new_key_id
+    8;   // log_sequence_at_rotation
+static_assert(kKeyRotationPayloadWireSize == 16);
+
+inline constexpr std::size_t kKeyRotatedFrameSize =
+    kKeyRotatedHeaderSize + kKeyRotationPayloadWireSize + kMacLen + kMacLen;  // 102
+static_assert(kKeyRotatedFrameSize == 102);
+
+inline void encode_key_rotated_payload(std::span<std::byte, kKeyRotationPayloadWireSize> out,
+                                        const KeyRotationPayload& v) noexcept {
+    std::byte* p = out.data();
+    detail::write_u32_le(p, v.old_key_id);
+    detail::write_u32_le(p, v.new_key_id);
+    detail::write_u64_le(p, v.log_sequence_at_rotation);
+}
+
+inline bool decode_key_rotated_payload(std::span<const std::byte, kKeyRotationPayloadWireSize> in,
+                                        KeyRotationPayload& out) noexcept {
+    const std::byte* p = in.data();
+    out.old_key_id = detail::read_u32_le(p);
+    out.new_key_id = detail::read_u32_le(p);
+    out.log_sequence_at_rotation = detail::read_u64_le(p);
+    return true;
+}
+
+// Peek ONLY whether this buffer looks like a KeyRotatedRecord (marker byte
+// match) -- lets a mixed-type scan (ControlPlaneLogSink) decide which
+// decoder to call BEFORE assuming it's a normal DurableRecordType-typed
+// frame. False just means "not this format" (too short, or a different
+// marker byte) -- not itself a claim of corruption, same "peek failure is
+// not Corrupt on its own" philosophy peek_frame_key_id() already uses.
+inline bool peek_is_key_rotated_record(std::span<const std::byte> in) noexcept {
+    return !in.empty() && in[0] == static_cast<std::byte>(kKeyRotatedRecordMarker);
+}
+
+// Peek the KeyRotatedRecord's own key_id field (offset 1, 4 bytes LE) -- same
+// "false only means too-short, not corrupt" philosophy as durable_frame_codec.hpp's
+// peek_frame_key_id(). Caller should have already confirmed
+// peek_is_key_rotated_record() before relying on this for anything beyond a
+// best-effort lookup.
+inline bool peek_key_rotated_record_key_id(std::span<const std::byte> in, std::uint32_t& out_key_id) noexcept {
+    constexpr std::size_t kKeyIdOffset = 1;
+    constexpr std::size_t kMinBytes = kKeyIdOffset + 4;
+    if (in.size() < kMinBytes) return false;
+    const std::byte* p = in.data() + kKeyIdOffset;
+    out_key_id = detail::read_u32_le(p);
+    return true;
+}
+
+inline std::size_t encode_key_rotated_frame(std::span<std::byte> out, std::uint32_t key_id,
+                                             std::uint64_t sequence_number, FrameTimeKind time_kind,
+                                             std::int64_t recorded_utc_ms, const KeyRotationPayload& payload,
+                                             std::span<const std::byte, kMacLen> prev_mac,
+                                             std::span<const std::byte> hmac_key) noexcept {
+    if (out.size() < kKeyRotatedFrameSize) return 0;
+    std::byte* p = out.data();
+    const std::byte* const content_start = p;
+    detail::write_u8(p, kKeyRotatedRecordMarker);
+    detail::write_u32_le(p, key_id);
+    detail::write_u64_le(p, sequence_number);
+    detail::write_u8(p, static_cast<std::uint8_t>(time_kind));
+    detail::write_i64_le(p, recorded_utc_ms);
+    encode_key_rotated_payload(std::span<std::byte, kKeyRotationPayloadWireSize>(p, kKeyRotationPayloadWireSize),
+                                payload);
+    p += kKeyRotationPayloadWireSize;
+    detail::write_bytes(p, prev_mac.data(), kMacLen);
+    const std::size_t content_len = static_cast<std::size_t>(p - content_start);
+    const auto mac = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
+    detail::write_bytes(p, mac.bytes.data(), kMacLen);
+    return kKeyRotatedFrameSize;
+}
+
+struct DecodedKeyRotatedFrame {
+    std::uint32_t key_id{0};
+    std::uint64_t sequence_number{0};
+    FrameTimeKind time_kind{FrameTimeKind::ServerCorrectedUtc};
+    std::int64_t recorded_utc_ms{0};
+    KeyRotationPayload payload{};
+    std::array<std::byte, kMacLen> prev_mac{};
+    std::array<std::byte, kMacLen> mac{};
+};
+
+inline FrameDecodeStatus decode_key_rotated_frame(std::span<const std::byte> in, std::span<const std::byte> hmac_key,
+                                                   DecodedKeyRotatedFrame& out, std::size_t& out_frame_size) noexcept {
+    out_frame_size = 0;
+    if (in.size() < kKeyRotatedHeaderSize) return FrameDecodeStatus::Truncated;
+
+    const std::byte* p = in.data();
+    const std::uint8_t marker = detail::read_u8(p);
+    if (marker != kKeyRotatedRecordMarker) return FrameDecodeStatus::UnknownVersion;
+    const std::uint32_t key_id = detail::read_u32_le(p);
+    const std::uint64_t sequence_number = detail::read_u64_le(p);
+    const std::uint8_t time_kind_raw = detail::read_u8(p);
+    if (!detail::is_legal_frame_time_kind(time_kind_raw)) return FrameDecodeStatus::MalformedEnum;
+    const auto time_kind = static_cast<FrameTimeKind>(time_kind_raw);
+    const std::int64_t recorded_utc_ms = detail::read_i64_le(p);
+
+    out_frame_size = kKeyRotatedFrameSize;
+    if (in.size() < kKeyRotatedFrameSize) return FrameDecodeStatus::Truncated;
+
+    const std::byte* const content_start = in.data();
+    KeyRotationPayload payload{};
+    if (!decode_key_rotated_payload(
+            std::span<const std::byte, kKeyRotationPayloadWireSize>(p, kKeyRotationPayloadWireSize), payload)) {
+        return FrameDecodeStatus::MalformedEnum;
+    }
+    p += kKeyRotationPayloadWireSize;
+
+    std::array<std::byte, kMacLen> prev_mac{};
+    detail::read_bytes(p, prev_mac.data(), kMacLen);
+
+    const std::size_t content_len = static_cast<std::size_t>(p - content_start);
+    const auto expected_mac = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
+
+    std::array<std::byte, kMacLen> mac{};
+    detail::read_bytes(p, mac.data(), kMacLen);
+    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+
+    out.key_id = key_id;
+    out.sequence_number = sequence_number;
+    out.time_kind = time_kind;
+    out.recorded_utc_ms = recorded_utc_ms;
+    out.payload = payload;
+    out.prev_mac = prev_mac;
+    out.mac = mac;
+    return FrameDecodeStatus::Ok;
+}
+
 }  // namespace hy
