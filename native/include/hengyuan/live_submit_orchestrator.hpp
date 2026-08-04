@@ -29,6 +29,7 @@
 #include <hengyuan/account_truth.hpp>
 #include <hengyuan/audit_trail.hpp>
 #include <hengyuan/dry_run_evidence.hpp>
+#include <hengyuan/durable_audit_sink.hpp>
 #include <hengyuan/exit_safety.hpp>
 #include <hengyuan/kill_switch.hpp>
 #include <hengyuan/order_lifecycle.hpp>
@@ -121,6 +122,50 @@ struct SubmitPort {
     bool is_valid() const noexcept { return fn != nullptr; }
 };
 
+// --- Durable order-audit port (dependency injection, mirrors SubmitPort) ---
+//
+// Real file I/O, the same class of dependency as SubmitPort's real network I/O --
+// this file's existing "only SubmitPort is mocked, everything else is a real
+// instance" testing philosophy does not apply here: durable_audit is just as slow
+// and just as side-effectful, so it earns the same injectable-fake treatment.
+// make_durable_order_audit_port() below plugs a real DurableAuditSink into this
+// port unchanged, for the small number of tests that need real file persistence.
+struct DurableOrderAuditPort {
+    using AppendFn = AuditAppendResult(*)(void* user_data, const AuditRecord& rec, std::int64_t now_ms);
+    using FencedFn = bool(*)(void* user_data);
+
+    AppendFn append_fn{nullptr};
+    FencedFn fenced_fn{nullptr};
+    void* user_data{nullptr};
+
+    AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) const noexcept {
+        if (!append_fn) {
+            AuditAppendResult r{};
+            r.status = AuditAppendResult::Status::Failed;
+            return r;
+        }
+        return append_fn(user_data, rec, now_ms);
+    }
+
+    // Unwired reads as "already fenced" -- a caller that checks this before ever
+    // calling append_durable() should see the conservative answer, not a
+    // default that looks like "everything is fine".
+    bool fenced() const noexcept { return fenced_fn ? fenced_fn(user_data) : true; }
+
+    bool is_valid() const noexcept { return append_fn != nullptr; }
+};
+
+inline AuditAppendResult durable_audit_sink_append_adapter(void* user_data, const AuditRecord& rec,
+                                                            std::int64_t now_ms) noexcept {
+    return static_cast<DurableAuditSink*>(user_data)->append_durable(rec, now_ms);
+}
+inline bool durable_audit_sink_fenced_adapter(void* user_data) noexcept {
+    return static_cast<DurableAuditSink*>(user_data)->fenced();
+}
+inline DurableOrderAuditPort make_durable_order_audit_port(DurableAuditSink& sink) noexcept {
+    return DurableOrderAuditPort{&durable_audit_sink_append_adapter, &durable_audit_sink_fenced_adapter, &sink};
+}
+
 // --- Operator confirmation bound to an immutable order summary (ADR-019 D3 M3) ---
 //
 // A bare "confirmed=true" flag binds nothing: it cannot prove the operator approved
@@ -191,6 +236,13 @@ enum class OrchestratorGate : std::uint8_t {
     // deliberately left unclaimed rather than "helpfully" renumbered to the
     // next free slot — those three gates are out of scope for this round.
     SubmitStaleRulesVersion = 21,
+    // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §3 (spec line 845): real durable
+    // append to ctx.durable_audit was not Acked. Gate 5/9/13 (Intent/Prepared/
+    // Outcome) all route here rather than getting distinct gate values -- the
+    // spec's own design deliberately treats every durable-write failure the
+    // same way (fail closed, no transition, no release), so a single value is
+    // enough; docs/SPEC_INVARIANTS.md's Phase 3 section has the full reasoning.
+    AuditWriteNotAcked = 22,
 };
 
 struct OrchestratorResult {
@@ -211,6 +263,10 @@ struct OrchestratorContext {
     RequestWeightTracker* rate_tracker{nullptr};
     OrderConfirmation confirmation{};       // F3: bound operator CONFIRM
     InFlightRegistry* in_flight{nullptr};   // F4: idempotency / no-blind-retry guard
+    // Real durable-audit gate (spec §3/§6.2/§6.4). Value type, same injection
+    // style as submit_port; unwired defaults to is_valid()==false, which fails
+    // Gate 5 closed rather than silently skipping the durable-before-send check.
+    DurableOrderAuditPort durable_audit{};
 
     // Reconcile/poll loop wiring (order_tracker.hpp). Both nullable and default
     // to nullptr for backward compatibility with existing callers/tests that
@@ -397,6 +453,13 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
         ctx.audit->append(ar);
+
+        // Gate 10b (spec §3/§6.2): real durable Ack, fail closed, before
+        // CONFIRM/port-validity/in-flight registration.
+        if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+            result.gate = OrchestratorGate::AuditWriteNotAcked;
+            return result;
+        }
     }
 
     // Gate 11: Operator CONFIRM, bound to the immutable order summary (D3 M3).
@@ -478,7 +541,34 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         return result;
     }
 
-    // Transition to Submitting
+    // Gate 12d (spec §3/§6.2): real durable Ack for OrderSubmitPrepared, before
+    // the Submitting transition -- this moved the transition itself off of
+    // in-flight registration and onto this Ack (see AuditWriteNotAcked's doc
+    // comment and docs/SPEC_INVARIANTS.md's Phase 3 section for why: the old
+    // "transition right after in-flight registration" timing is the P0 that
+    // OrderState::AbortedPreSend used to paper over before it was removed).
+    {
+        AuditRecord ar{};
+        ar.timestamp_ms = ctx.now_ms;
+        ar.event_type = AuditEventType::OrderSubmitPrepared;
+        ar.mode = ctx.mode;
+        ar.symbol_id = ctx.symbol_id;
+        ar.price_ticks = ctx.price_ticks;
+        ar.qty_ticks = ctx.qty_ticks;
+        ar.set_client_order_id(coid.view());
+        ar.resulting_state = OrderState::Submitting;  // target state this record authorizes; not applied yet
+
+        if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+            // Never release the in-flight slot here -- a Failed result may still
+            // have genuinely landed on the medium. State stays Intent; the
+            // transition below never runs.
+            result.gate = OrchestratorGate::AuditWriteNotAcked;
+            return result;
+        }
+    }
+
+    // Transition to Submitting -- the one and only transition site, and only
+    // after the Prepared Ack above actually succeeded.
     result.order.transition_to(OrderState::Submitting);
     {
         AuditRecord ar{};
@@ -499,61 +589,88 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         coid.id, ctx.symbol_id, ctx.side, ctx.order_type,
         ctx.price_ticks, ctx.qty_ticks, ctx.pre_trade_rules_snapshot);
 
-    // Gate 13: Result routing
+    // Gate 13: Result routing. Every branch durably Acks BEFORE transitioning
+    // state, releasing the in-flight slot, or pushing to reconcile (spec
+    // §3/§6.4) -- on Ack failure, result.gate is set to AuditWriteNotAcked and
+    // the function returns without touching result.order.state at all, which
+    // leaves it exactly where Gate 12d's transition left it: Submitting. That
+    // is the spec-required "stay in Submitting" outcome, reached by construction
+    // rather than an explicit rollback.
+    //
+    // An outcome-Ack failure here means the order is now silently stuck in
+    // Submitting -- in-flight slot held, NOT pushed to ctx.to_reconcile -- until
+    // this process restarts and DurableAuditSink::run_recovery_scan() reclassifies
+    // it as Ambiguous. This is spec's own deliberate choice (§6.4: "do NOT
+    // transition to Ambiguous in the hope of reconciling in THIS process -- that
+    // path is unreachable under a fenced sink"), not an oversight of this round.
     switch (resp.outcome) {
-        case SubmitOutcome::Accepted:
+        case SubmitOutcome::Accepted: {
+            AuditRecord ar{};
+            ar.timestamp_ms = ctx.now_ms;
+            ar.event_type = AuditEventType::OrderAccepted;
+            ar.mode = ctx.mode;
+            ar.symbol_id = ctx.symbol_id;
+            ar.exchange_order_id = resp.exchange_order_id;
+            ar.set_client_order_id(coid.view());
+            ar.resulting_state = OrderState::Accepted;
+
+            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+                result.gate = OrchestratorGate::AuditWriteNotAcked;
+                return result;
+            }
+
             result.order.exchange_order_id = resp.exchange_order_id;
             result.order.transition_to(OrderState::Accepted);
             result.gate = OrchestratorGate::SubmitAccepted;
-            {
-                AuditRecord ar{};
-                ar.timestamp_ms = ctx.now_ms;
-                ar.event_type = AuditEventType::OrderAccepted;
-                ar.mode = ctx.mode;
-                ar.symbol_id = ctx.symbol_id;
-                ar.exchange_order_id = resp.exchange_order_id;
-                ar.set_client_order_id(coid.view());
-                ar.resulting_state = result.order.state;
-                ctx.audit->append(ar);
-            }
+            ctx.audit->append(ar);
             break;
+        }
 
-        case SubmitOutcome::Rejected:
+        case SubmitOutcome::Rejected: {
+            AuditRecord ar{};
+            ar.timestamp_ms = ctx.now_ms;
+            ar.event_type = AuditEventType::OrderRejected;
+            ar.mode = ctx.mode;
+            ar.symbol_id = ctx.symbol_id;
+            ar.detail_code = resp.error_code;
+            ar.set_client_order_id(coid.view());
+            ar.resulting_state = OrderState::Rejected;
+            ar.set_detail("exchange rejected");
+
+            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+                result.gate = OrchestratorGate::AuditWriteNotAcked;
+                return result;  // in-flight slot NOT released, unlike an Acked reject
+            }
+
             result.order.transition_to(OrderState::Rejected);
             result.gate = OrchestratorGate::SubmitRejected;
             // Rejected is terminal — release the in-flight slot so the id can be
             // retired. Accepted/Ambiguous stay registered (order may exist on the
             // exchange; blind resubmit must remain blocked until reconciled).
             ctx.in_flight->mark_resolved(coid.view());
-            {
-                AuditRecord ar{};
-                ar.timestamp_ms = ctx.now_ms;
-                ar.event_type = AuditEventType::OrderRejected;
-                ar.mode = ctx.mode;
-                ar.symbol_id = ctx.symbol_id;
-                ar.detail_code = resp.error_code;
-                ar.set_client_order_id(coid.view());
-                ar.resulting_state = result.order.state;
-                ar.set_detail("exchange rejected");
-                ctx.audit->append(ar);
-            }
+            ctx.audit->append(ar);
             break;
+        }
 
-        case SubmitOutcome::Timeout:
+        case SubmitOutcome::Timeout: {
             // M6: timeout → Ambiguous, NOT "stop and discard"
+            AuditRecord ar{};
+            ar.timestamp_ms = ctx.now_ms;
+            ar.event_type = AuditEventType::OrderAmbiguous;
+            ar.mode = ctx.mode;
+            ar.symbol_id = ctx.symbol_id;
+            ar.set_client_order_id(coid.view());
+            ar.resulting_state = OrderState::Ambiguous;
+            ar.set_detail("POST timeout - ambiguous, do NOT retry");
+
+            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+                result.gate = OrchestratorGate::AuditWriteNotAcked;
+                return result;
+            }
+
             result.order.transition_to(OrderState::Ambiguous);
             result.gate = OrchestratorGate::SubmitAmbiguous;
-            {
-                AuditRecord ar{};
-                ar.timestamp_ms = ctx.now_ms;
-                ar.event_type = AuditEventType::OrderAmbiguous;
-                ar.mode = ctx.mode;
-                ar.symbol_id = ctx.symbol_id;
-                ar.set_client_order_id(coid.view());
-                ar.resulting_state = result.order.state;
-                ar.set_detail("POST timeout - ambiguous, do NOT retry");
-                ctx.audit->append(ar);
-            }
+            ctx.audit->append(ar);
             if (ctx.to_reconcile) {
                 // Cannot genuinely fail under correct wiring: ToReconcileRing's
                 // capacity equals kMaxInFlight (order_tracker.hpp), and this
@@ -565,27 +682,33 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
             }
             break;
+        }
 
-        case SubmitOutcome::NetworkError:
+        case SubmitOutcome::NetworkError: {
+            AuditRecord ar{};
+            ar.timestamp_ms = ctx.now_ms;
+            ar.event_type = AuditEventType::OrderAmbiguous;
+            ar.mode = ctx.mode;
+            ar.symbol_id = ctx.symbol_id;
+            ar.set_client_order_id(coid.view());
+            ar.resulting_state = OrderState::Ambiguous;
+            ar.set_detail("network error - ambiguous");
+
+            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+                result.gate = OrchestratorGate::AuditWriteNotAcked;
+                return result;
+            }
+
             result.order.transition_to(OrderState::Ambiguous);
             result.gate = OrchestratorGate::SubmitNetworkError;
-            {
-                AuditRecord ar{};
-                ar.timestamp_ms = ctx.now_ms;
-                ar.event_type = AuditEventType::OrderAmbiguous;
-                ar.mode = ctx.mode;
-                ar.symbol_id = ctx.symbol_id;
-                ar.set_client_order_id(coid.view());
-                ar.resulting_state = result.order.state;
-                ar.set_detail("network error - ambiguous");
-                ctx.audit->append(ar);
-            }
+            ctx.audit->append(ar);
             if (ctx.to_reconcile) {
                 (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
             }
             break;
+        }
 
-        case SubmitOutcome::StaleRulesVersion:
+        case SubmitOutcome::StaleRulesVersion: {
             // UNREACHABLE by construction under this file's own gate ordering:
             // the top-of-block check above catches a stale version before
             // SubmitPort::call() is ever invoked (see SubmitOutcome::
@@ -597,23 +720,28 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             // switch rather than silently miscounting it as success -- matching
             // spec §4's "default to Ambiguous unless positively proven otherwise"
             // principle.
+            AuditRecord ar{};
+            ar.timestamp_ms = ctx.now_ms;
+            ar.event_type = AuditEventType::OrderAmbiguous;
+            ar.mode = ctx.mode;
+            ar.symbol_id = ctx.symbol_id;
+            ar.set_client_order_id(coid.view());
+            ar.resulting_state = OrderState::Ambiguous;
+            ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
+
+            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+                result.gate = OrchestratorGate::AuditWriteNotAcked;
+                return result;
+            }
+
             result.order.transition_to(OrderState::Ambiguous);
             result.gate = OrchestratorGate::SubmitAmbiguous;
-            {
-                AuditRecord ar{};
-                ar.timestamp_ms = ctx.now_ms;
-                ar.event_type = AuditEventType::OrderAmbiguous;
-                ar.mode = ctx.mode;
-                ar.symbol_id = ctx.symbol_id;
-                ar.set_client_order_id(coid.view());
-                ar.resulting_state = result.order.state;
-                ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
-                ctx.audit->append(ar);
-            }
+            ctx.audit->append(ar);
             if (ctx.to_reconcile) {
                 (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
             }
             break;
+        }
     }
 
     return result;
