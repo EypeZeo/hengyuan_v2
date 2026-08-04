@@ -3,7 +3,25 @@
 #include <gtest/gtest.h>
 #include <hengyuan/live_submit_orchestrator.hpp>
 
+#include <array>
+#include <cstdio>
 #include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace hy;
 
@@ -31,6 +49,45 @@ static std::uint32_t mock_current_rules_version(void* /*ud*/) {
     return g_mock_current_rules_version;
 }
 
+// --- Fake durable-audit port (Phase 3) ---
+//
+// Real DurableAuditSink is real file I/O -- deliberately not used by most of
+// this file's gate-logic tests (see live_submit_orchestrator.hpp's
+// DurableOrderAuditPort doc comment for why it's injectable like SubmitPort).
+// This fake defaults to "never fails", matching what every test below already
+// assumed about ctx_.audit before this port existed; the three *_should_fail
+// flags let individual tests precisely target the Intent/Prepared/Outcome
+// durable-write gate without touching disk at all.
+struct FakeDurableAudit {
+    bool intent_should_fail{false};
+    bool prepared_should_fail{false};
+    bool outcome_should_fail{false};
+    std::uint64_t next_sequence{0};
+    bool is_fenced{false};
+};
+
+static AuditAppendResult fake_durable_append(void* user_data, const AuditRecord& rec, std::int64_t) noexcept {
+    auto* f = static_cast<FakeDurableAudit*>(user_data);
+    const bool is_intent = rec.event_type == AuditEventType::OrderIntentCreated;
+    const bool is_prepared = rec.event_type == AuditEventType::OrderSubmitPrepared;
+    const bool fail = (is_intent && f->intent_should_fail) ||
+                       (is_prepared && f->prepared_should_fail) ||
+                       (!is_intent && !is_prepared && f->outcome_should_fail);
+    AuditAppendResult r{};
+    if (fail) {
+        f->is_fenced = true;
+        r.status = AuditAppendResult::Status::Failed;
+        return r;
+    }
+    r.status = AuditAppendResult::Status::Acked;
+    r.sequence = f->next_sequence++;
+    return r;
+}
+
+static bool fake_durable_fenced(void* user_data) noexcept {
+    return static_cast<FakeDurableAudit*>(user_data)->is_fenced;
+}
+
 // --- Test fixture ---
 
 class LiveSubmitTest : public ::testing::Test {
@@ -43,6 +100,7 @@ protected:
     SymbolRules rules_{};
     AccountSnapshot account_{};
     OrchestratorContext ctx_{};
+    FakeDurableAudit fake_durable_audit_{};
 
     void SetUp() override {
         // Default: all gates pass
@@ -102,6 +160,12 @@ protected:
 
         g_mock_response = {SubmitOutcome::Accepted, 12345, 0};
         ctx_.submit_port = {mock_submit, nullptr, mock_current_rules_version};
+
+        // Phase 3: fake durable-audit port, defaults to "never fails" -- matches
+        // every test's existing assumption about ctx_.audit before this port
+        // existed. Individual tests opt into a specific failure via
+        // fake_durable_audit_.*_should_fail.
+        ctx_.durable_audit = {&fake_durable_append, &fake_durable_fenced, &fake_durable_audit_};
     }
 
     // Build a confirmation that authorizes the current ctx_ order params.
@@ -457,6 +521,41 @@ TEST_F(LiveSubmitTest, RejectedReleasesInFlight) {
     EXPECT_EQ(in_flight_.count(), 0u);  // terminal → slot released
 }
 
+// --- Phase 3: durable-before-send gates (spec §3/§6.2/§6.4) ---
+
+TEST_F(LiveSubmitTest, AuditWriteNotAckedAtIntentGate) {
+    fake_durable_audit_.intent_should_fail = true;
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
+    EXPECT_EQ(r.order.state, OrderState::Intent);
+}
+
+TEST_F(LiveSubmitTest, SubmittingNotSetIfPreparedAppendFails) {
+    fake_durable_audit_.prepared_should_fail = true;
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
+    // Not Submitting -- the transition site never ran.
+    EXPECT_EQ(r.order.state, OrderState::Intent);
+}
+
+TEST_F(LiveSubmitTest, InFlightNotReleasedIfOutcomeAppendFailsRejected) {
+    g_mock_response = {SubmitOutcome::Rejected, 0, -1013};
+    fake_durable_audit_.outcome_should_fail = true;
+    auto coid = make_client_order_id(ctx_.now_ms, ctx_.sequence, ctx_.symbol_id);
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
+    // Unlike an Acked reject, the slot must stay held -- release only happens
+    // after the outcome Ack succeeds.
+    EXPECT_TRUE(in_flight_.is_in_flight(coid.view()));
+}
+
+TEST_F(LiveSubmitTest, DurableAuditPortNotWiredFailsClosedAtIntentGate) {
+    ctx_.durable_audit = {};  // default-constructed: is_valid() == false
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
+    EXPECT_EQ(r.order.state, OrderState::Intent);
+}
+
 // --- Reconcile/poll loop wiring (order_tracker.hpp) ---
 //
 // ctx_.to_reconcile/ctx_.reconcile_events are left null by SetUp() -- every
@@ -597,4 +696,93 @@ TEST_F(LiveSubmitReconcileTest, DrainRunsEvenWhenThisCallFailsAnEarlyGate) {
 
     EXPECT_FALSE(in_flight_.is_in_flight(r1.order.client_order_id.view()));
     EXPECT_EQ(in_flight_.count(), 0u);
+}
+
+// --- Phase 3: real-file-I/O integration (durable persistence, not just gate
+// logic -- the fake port above covers gate logic; this proves the port
+// adapter wiring and the actual on-disk frame sequence are correct). ---
+
+class LiveSubmitDurableIntegrationTest : public LiveSubmitTest {
+protected:
+    std::string durable_audit_path_;
+    std::unique_ptr<KeyRing> key_ring_;
+    std::unique_ptr<DurableAuditSink> durable_audit_sink_;
+
+    void SetUp() override {
+        LiveSubmitTest::SetUp();
+
+        static int counter = 0;
+        ++counter;
+#ifdef _WIN32
+        char tmp[MAX_PATH];
+        GetTempPathA(MAX_PATH, tmp);
+        durable_audit_path_ = std::string(tmp) + "hy_live_submit_durable_" +
+                               std::to_string(GetCurrentProcessId()) + "_" + std::to_string(counter) + ".log";
+#else
+        durable_audit_path_ = "/tmp/hy_live_submit_durable_" + std::to_string(getpid()) + "_" +
+                               std::to_string(counter) + ".log";
+#endif
+        remove_durable_files();
+
+        std::array<std::byte, kKekSize> kek{};
+        for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x40 + i);
+        key_ring_ = std::make_unique<KeyRing>(kek);
+        WrappedKeyRecord rec{};
+        std::vector<std::byte> key_material{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}, std::byte{0x04}};
+        ASSERT_EQ(key_ring_->add_key(1, key_material, rec), KeyRingAddStatus::Ok);
+
+        durable_audit_sink_ = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+        ASSERT_TRUE(durable_audit_sink_->is_open());
+        ctx_.durable_audit = make_durable_order_audit_port(*durable_audit_sink_);
+    }
+
+    void TearDown() override {
+        durable_audit_sink_.reset();
+        key_ring_.reset();
+        remove_durable_files();
+        LiveSubmitTest::TearDown();
+    }
+
+    void remove_durable_files() {
+        std::remove(durable_audit_path_.c_str());
+        std::remove((durable_audit_path_ + ".lock").c_str());
+        std::remove((durable_audit_path_ + ".tip").c_str());
+        std::remove((durable_audit_path_ + ".tip.tmp").c_str());
+    }
+};
+
+TEST_F(LiveSubmitDurableIntegrationTest, HappyPathDurableAuditSequence) {
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+
+    // Simulate a process restart: destroy this instance, construct a fresh
+    // one over the same path/KeyRing -- recovery runs in the constructor.
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    ASSERT_EQ(restarted->recovery_status(), RecoveryScanStatus::Recovered)
+        << "Accepted is not exchange-final -- the 3 durably-written frames "
+           "(Intent/Prepared/Accepted) must recover as one open checkpoint";
+    auto cps = restarted->recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Accepted);
+    EXPECT_EQ(cps[0].symbol_id, ctx_.symbol_id);
+    EXPECT_EQ(cps[0].intended_price_ticks, ctx_.price_ticks);
+    EXPECT_EQ(cps[0].intended_qty_ticks, ctx_.qty_ticks);
+    EXPECT_EQ(cps[0].exchange_order_id, r.order.exchange_order_id);
+    EXPECT_STREQ(cps[0].client_order_id.id, r.order.client_order_id.id);
+}
+
+TEST_F(LiveSubmitDurableIntegrationTest, RejectedPathReleasesInFlightOnlyAfterRealDurableAck) {
+    g_mock_response = {SubmitOutcome::Rejected, 0, -1013};
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitRejected);
+    EXPECT_EQ(in_flight_.count(), 0u);
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Clean)
+        << "Rejected is exchange-final -- nothing should need recovering";
+    EXPECT_TRUE(restarted->recovered_checkpoints().empty());
 }

@@ -20,8 +20,25 @@
 
 #include <hengyuan/live_submit_orchestrator.hpp>
 
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace hy;
 
@@ -85,8 +102,34 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::DuplicateInFlight: return "DuplicateInFlight";
         case OrchestratorGate::InFlightRegistryUnavailable: return "InFlightRegistryUnavailable";
         case OrchestratorGate::SubmitStaleRulesVersion: return "SubmitStaleRulesVersion";
+        case OrchestratorGate::AuditWriteNotAcked: return "AuditWriteNotAcked";
     }
     return "?";
+}
+
+// Real KeyRing + DurableAuditSink, one temp file per Fixture instance --
+// this is what lets the Submit/Reject/Ambiguous scenarios below actually
+// reach their intended gate instead of failing closed at the new Gate 10b
+// (Intent durable Ack). Mirrors test_durable_audit_sink.cpp's fixture.
+std::string durable_audit_temp_path() {
+    static int counter = 0;
+    ++counter;
+#ifdef _WIN32
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    return std::string(tmp) + "hy_evidence_harness_" + std::to_string(GetCurrentProcessId()) +
+           "_" + std::to_string(counter) + ".log";
+#else
+    return "/tmp/hy_evidence_harness_" + std::to_string(getpid()) + "_" +
+           std::to_string(counter) + ".log";
+#endif
+}
+
+void remove_durable_audit_files(const std::string& base_path) {
+    std::remove(base_path.c_str());
+    std::remove((base_path + ".lock").c_str());
+    std::remove((base_path + ".tip").c_str());
+    std::remove((base_path + ".tip.tmp").c_str());
 }
 
 struct Fixture {
@@ -100,10 +143,24 @@ struct Fixture {
     OrchestratorContext ctx{};
     std::uint32_t seq{0};
 
+    std::string durable_audit_path;
+    std::unique_ptr<KeyRing> key_ring;
+    std::unique_ptr<DurableAuditSink> durable_audit_sink;
+
     Fixture() {
         audit.set_available(true);
         kill_switch.operator_reset();
         rate_tracker.reset(6000, 500);
+
+        durable_audit_path = durable_audit_temp_path();
+        remove_durable_audit_files(durable_audit_path);
+        std::array<std::byte, kKekSize> kek{};
+        for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x20 + i);
+        key_ring = std::make_unique<KeyRing>(kek);
+        WrappedKeyRecord rec{};
+        key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}}, rec);
+        durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
+        ctx.durable_audit = make_durable_order_audit_port(*durable_audit_sink);
 
         std::strncpy(rules.symbol, "BTCUSDT", sizeof(rules.symbol) - 1);
         rules.is_trading = true;
@@ -144,6 +201,12 @@ struct Fixture {
         ctx.mode = ExecutionMode::DryRun;
         ctx.order_weight = 1;
         ctx.submit_port = {mock_submit, nullptr};
+    }
+
+    ~Fixture() {
+        durable_audit_sink.reset();
+        key_ring.reset();
+        remove_durable_audit_files(durable_audit_path);
     }
 
     void bind_confirmation() {
