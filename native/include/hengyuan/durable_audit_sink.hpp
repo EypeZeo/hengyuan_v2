@@ -21,8 +21,13 @@
 //     its remaining lifetime (formal/durable_log_recovery.tla's
 //     FencedWriterMakesNoNewWrites, now given a real code analog).
 //   - Only DurableRecordType::OrderEvent frames. No compaction, no L4-owned
-//     record types, no group-commit batching, no key rotation (key_id fixed
-//     to 0 -- construction takes a pre-derived raw key).
+//     record types, no group-commit batching.
+//   - Real KeyRing-backed key_id selection (Phase 2, docs/SPEC_INVARIANTS.md) --
+//     every append does a live KeyRing::active_key(active_key_id_, ...) lookup
+//     (never cached), and recovery resolves each frame's OWN key_id via
+//     peek_frame_key_id() + a KeyRing lookup. Still NO runtime key rotation:
+//     active_key_id_ is fixed for the instance's lifetime, no
+//     set_active_key_id() -- that's Phase 4's job.
 //
 // THREAD OWNERSHIP: like InFlightRegistry/AuditRingSink, this class is meant
 // for single-writer use from one owner thread. No internal synchronization.
@@ -32,6 +37,7 @@
 #include <hengyuan/durable_control_plane.hpp>
 #include <hengyuan/durable_frame_codec.hpp>
 #include <hengyuan/durable_log_store.hpp>
+#include <hengyuan/key_ring.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 
 #include <array>
@@ -87,6 +93,24 @@ struct DecodedTipAnchor {
     std::uint32_t key_id{0};
 };
 
+// Reads ONLY the key_id field (offset 1+8+kMacLen = 41, 4 bytes LE -- past
+// format_version+sequence_number+mac, before anchor_mac), without verifying
+// anchor_mac or format_version. Same philosophy as durable_frame_codec.hpp's
+// peek_frame_key_id() (Phase 2, docs/SPEC_INVARIANTS.md): callers use this to
+// pick the right KeyRing key BEFORE calling decode_tip_anchor, which is what
+// actually verifies the anchor. Returns false (out_key_id untouched) only
+// because `in` is too short to contain the field -- a tip-anchor is always
+// atomically replaced whole, so there is no legal "partial write survives on
+// disk" case to be lenient about here (unlike a log frame's torn tail).
+inline bool peek_tip_anchor_key_id(std::span<const std::byte> in, std::uint32_t& out_key_id) noexcept {
+    constexpr std::size_t kKeyIdOffset = 1 + 8 + kMacLen;  // format_version, sequence_number, mac
+    constexpr std::size_t kMinBytes = kKeyIdOffset + 4;
+    if (in.size() < kMinBytes) return false;
+    const std::byte* p = in.data() + kKeyIdOffset;
+    out_key_id = read_u32_le(p);
+    return true;
+}
+
 // false = anchor is absent-shaped/malformed/tampered -- caller decides what
 // that means (IoError vs Corrupt depends on whether the log is empty).
 inline bool decode_tip_anchor(std::span<const std::byte> in, std::span<const std::byte> hmac_key,
@@ -114,24 +138,12 @@ class DurableAuditSink {
 public:
     // path: base path for the log (e.g. "state/audit.log"); the lock sidecar
     // and tip-anchor files are derived from it (path+".lock", path+".tip").
-    // hmac_key: pre-derived raw key material, copied and retained for the
-    // lifetime of this instance (no rotation this round -- see class header).
-    DurableAuditSink(const std::string& path, std::span<const std::byte> hmac_key) noexcept
-        : log_store_(path, path + ".lock", path + ".tip") {
-        const std::size_t key_len = hmac_key.size() < kKeyBlockSize ? hmac_key.size() : kKeyBlockSize;
-        // Pre-derive the block-sized key once (HMAC's own "hash if > block
-        // size, else zero-pad" rule) so every append_durable() call doesn't
-        // redo that work for a long key -- HmacSha256's constructor applied
-        // to an already-block-sized key just zero-pads trivially, so passing
-        // key_block_ into hmac_sha256() on every call is equivalent to
-        // passing the raw key every time, just cheaper for a long key.
-        if (hmac_key.size() > crypto::HmacSha256::kBlockSize) {
-            const auto hashed = crypto::sha256(hmac_key);
-            std::memcpy(key_block_.data(), hashed.bytes.data(), hashed.bytes.size());
-        } else {
-            std::memcpy(key_block_.data(), hmac_key.data(), key_len);
-        }
-
+    // key_ring: NOT owned, must outlive this sink. active_key_id: fixed for
+    // this instance's lifetime -- see class header's KeyRing note (Phase 2).
+    DurableAuditSink(const std::string& path, KeyRing& key_ring, std::uint32_t active_key_id) noexcept
+        : log_store_(path, path + ".lock", path + ".tip"),
+          key_ring_(key_ring),
+          active_key_id_(active_key_id) {
         if (!acquire_lock()) {
             recovery_status_ = RecoveryScanStatus::IoError;
             return;
@@ -195,16 +207,20 @@ public:
             return result;
         }
 
+        // Live per-call lookup (never cached) -- Phase 2, docs/SPEC_INVARIANTS.md.
+        // Unknown/retired active_key_id is a correctable configuration
+        // mistake, not corruption: Failed, but do NOT fence.
+        std::array<std::byte, kKeyBlockSize> key_block{};
+        if (!key_ring_.active_key(active_key_id_, key_block)) {
+            result.status = AuditAppendResult::Status::Failed;
+            return result;
+        }
+        std::span<const std::byte> hmac_key(key_block.data(), key_block.size());
+
         std::array<std::byte, kOrderEventFrameSize> buf{};
-        // key_id stays the fixed 0 this class has always used (class header's
-        // own "no key rotation this round" scope note) -- durable_frame_codec.hpp
-        // gained a real key_id field in its v4 bump (Phase 0, 轨道 key-rotation
-        // substrate), but wiring THIS class to a KeyRing for real per-frame
-        // key selection is Phase 2's job, not this one. This literal 0 is a
-        // compile-compatibility placeholder, not a functional change.
-        const auto n = encode_order_event_frame(buf, /*key_id=*/0u, next_sequence_,
+        const auto n = encode_order_event_frame(buf, active_key_id_, next_sequence_,
                                                  FrameTimeKind::ServerCorrectedUtc,
-                                                 now_ms, rec, tip_mac_, key_span());
+                                                 now_ms, rec, tip_mac_, hmac_key);
         if (n != kOrderEventFrameSize) {
             fenced_ = true;
             result.status = AuditAppendResult::Status::Failed;
@@ -220,7 +236,7 @@ public:
         std::array<std::byte, kMacLen> this_mac{};
         std::memcpy(this_mac.data(), buf.data() + kOrderEventFrameSize - kMacLen, kMacLen);
 
-        if (!write_tip_anchor(next_sequence_, this_mac)) {
+        if (!write_tip_anchor(next_sequence_, this_mac, hmac_key)) {
             fenced_ = true;
             result.status = AuditAppendResult::Status::Failed;
             return result;
@@ -240,7 +256,7 @@ public:
             t.generation = 0;
             t.sequence = result.sequence;
             std::memcpy(t.tip_mac.data(), this_mac.data(), t.tip_mac.size());
-            t.key_id = 0;
+            t.key_id = active_key_id_;
             t.enqueued_utc_ms = now_ms;
             t.time_kind = static_cast<std::uint8_t>(FrameTimeKind::ServerCorrectedUtc);
             (void)export_outbox_->try_push(t);
@@ -255,11 +271,7 @@ public:
     void set_export_outbox(ExportOutboxRing* ring) noexcept { export_outbox_ = ring; }
 
 private:
-    static constexpr std::size_t kKeyBlockSize = crypto::HmacSha256::kBlockSize;
-
-    std::span<const std::byte> key_span() const noexcept {
-        return std::span<const std::byte>(key_block_.data(), key_block_.size());
-    }
+    static constexpr std::size_t kKeyBlockSize = hy::kKeyBlockSize;
 
     // --- Per-COID replay state, scan-local only (never persisted as
     // instance state beyond the final checkpoints_ output) ---
@@ -291,9 +303,28 @@ private:
 
         while (offset < content.size()) {
             std::span<const std::byte> remaining(content.data() + offset, content.size() - offset);
+
+            // Resolve THIS frame's own key_id (Phase 2, docs/SPEC_INVARIANTS.md)
+            // -- peek_frame_key_id() failing (fewer than 6 bytes left) does
+            // NOT mean Corrupt; it means "not even enough for the key_id
+            // field", which is a strict subset of decode_order_event_frame's
+            // own 27-byte Truncated threshold. Leave key_block as an all-zero
+            // dummy and let decode_order_event_frame's own length check
+            // classify it as Truncated (the correct torn-tail outcome) --
+            // never short-circuit to Corrupt on a peek failure alone. Only a
+            // SUCCESSFUL peek followed by a failed KeyRing lookup is a real
+            // "signing key unresolvable in this environment" Corrupt.
+            std::uint32_t frame_key_id = 0;
+            std::array<std::byte, kKeyBlockSize> frame_key_block{};
+            if (peek_frame_key_id(remaining, frame_key_id)) {
+                if (!key_ring_.active_key(frame_key_id, frame_key_block)) return RecoveryScanStatus::Corrupt;
+            }
+
             DecodedOrderFrame frame{};
             std::size_t frame_size = 0;
-            const auto status = decode_order_event_frame(remaining, key_span(), frame, frame_size);
+            const auto status = decode_order_event_frame(
+                remaining, std::span<const std::byte>(frame_key_block.data(), frame_key_block.size()), frame,
+                frame_size);
 
             if (status == FrameDecodeStatus::Truncated) {
                 // Only legal at the physical end -- discard just this tail
@@ -397,8 +428,31 @@ private:
             return RecoveryScanStatus::Corrupt;  // anchor claims a tip; log has none
         }
 
+        // Peek the anchor's OWN key_id (Phase 2, docs/SPEC_INVARIANTS.md) --
+        // do not assume it must be active_key_id_. A tip-anchor is always
+        // atomically replaced whole, so a peek failure here is unconditionally
+        // Corrupt (unlike a log frame's torn tail, there is no legal partial-
+        // write state to be lenient about).
+        std::uint32_t anchor_key_id = 0;
+        if (!detail::peek_tip_anchor_key_id(anchor_bytes, anchor_key_id)) return RecoveryScanStatus::Corrupt;
+
+        std::array<std::byte, kKeyBlockSize> anchor_key_block{};
+        if (!key_ring_.active_key(anchor_key_id, anchor_key_block)) return RecoveryScanStatus::Corrupt;
+
         detail::DecodedTipAnchor anchor{};
-        if (!detail::decode_tip_anchor(anchor_bytes, key_span(), anchor)) return RecoveryScanStatus::Corrupt;
+        if (!detail::decode_tip_anchor(
+                anchor_bytes, std::span<const std::byte>(anchor_key_block.data(), anchor_key_block.size()),
+                anchor)) {
+            return RecoveryScanStatus::Corrupt;
+        }
+
+        // Consistency check: the anchor's own (now MAC-verified) key_id must
+        // match what this instance was configured with. A mismatch means the
+        // key actually used to sign the last durable state differs from the
+        // one this restart was told to use -- without a real rotation
+        // protocol (Phase 4), that can only be a configuration mistake or an
+        // unauthorized identity swap, never silently accepted.
+        if (anchor.key_id != active_key_id_) return RecoveryScanStatus::Corrupt;
 
         if (anchor.sequence_number > log_tip_sequence) return RecoveryScanStatus::Corrupt;  // tail deletion
         if (anchor.sequence_number == log_tip_sequence) {
@@ -437,19 +491,20 @@ private:
     bool append_bytes_to_log(const std::byte* data, std::size_t n) noexcept {
         return log_store_.append_and_fsync(std::span<const std::byte>(data, n));
     }
-    bool write_tip_anchor(std::uint64_t sequence_number, std::array<std::byte, kMacLen> mac) noexcept {
+    bool write_tip_anchor(std::uint64_t sequence_number, std::array<std::byte, kMacLen> mac,
+                          std::span<const std::byte> hmac_key) noexcept {
         std::array<std::byte, kTipAnchorSize> buf{};
-        // key_id stays 0 here for the same reason append_durable()'s frame
-        // write does -- this tip-anchor's key_id must match whatever key_id
-        // actually signed the corresponding log frame, and that's hardcoded
-        // to 0 until Phase 2 wires this class to a real KeyRing.
-        detail::encode_tip_anchor(buf, sequence_number, mac, /*key_id=*/0u, key_span());
+        // hmac_key is the already-resolved key for active_key_id_, threaded
+        // through from append_durable() to avoid a second, redundant KeyRing
+        // lookup within the same append call.
+        detail::encode_tip_anchor(buf, sequence_number, mac, active_key_id_, hmac_key);
         return log_store_.write_tip_anchor(buf);
     }
     bool read_tip_anchor(std::vector<std::byte>& out) noexcept { return log_store_.read_tip_anchor(out); }
 
     DurableLogStore log_store_;
-    std::array<std::byte, kKeyBlockSize> key_block_{};
+    KeyRing& key_ring_;
+    const std::uint32_t active_key_id_;
 
     bool log_open_{false};
     bool fenced_{false};
