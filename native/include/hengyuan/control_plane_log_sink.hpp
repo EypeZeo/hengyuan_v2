@@ -41,15 +41,15 @@
 //   out_uncleared_epoch_count simplification, etc.) -- see the method's own
 //   comment for the complete, explicitly disclosed list of what's NOT done.
 //
-// KEY SELECTION: active_key_id is a constructor parameter, IMMUTABLE for the
-// lifetime of this instance -- there is no set_active_key_id() or other
-// runtime-rotation entry point. Real runtime key-rotation lifecycle
-// (prepare -> new key available -> restart-verify -> retire) is Phase 4's
-// job, not this one; exposing a rotation setter here would have been scope
-// creep ahead of that phase actually designing the writer-quiesce protocol
-// rotation safely needs. Every append_* does a LIVE per-call
-// KeyRing::active_key(active_key_id_, ...) lookup (never cached) so this
-// class is "really" KeyRing-backed rather than snapshotting a key at
+// KEY SELECTION: active_key_id is a constructor parameter; rotate_active_key()
+// (Phase 4, docs/SPEC_INVARIANTS.md) is the ONE place it is ever reassigned,
+// always after durably confirming the rotation (see that method's own doc
+// comment for the exact sequencing -- no writer-quiesce protocol was needed
+// in the end: this class already has no internal synchronization and
+// rotate_active_key() simply joins append_*()/recover_control_plane() in
+// requiring the same single owning thread). Every append_* does a LIVE
+// per-call KeyRing::active_key(active_key_id_, ...) lookup (never cached) so
+// this class is "really" KeyRing-backed rather than snapshotting a key at
 // construction -- an unknown/retired active_key_id at append time returns
 // Failed WITHOUT fencing (a correctable configuration mistake); the SAME
 // failure during recovery (a frame's own key_id cannot be resolved) returns
@@ -92,6 +92,7 @@
 #include <hengyuan/durable_control_plane.hpp>
 #include <hengyuan/durable_log_store.hpp>
 #include <hengyuan/key_ring.hpp>
+#include <hengyuan/secure_wipe.hpp>
 
 #include <array>
 #include <cstring>
@@ -145,6 +146,59 @@ public:
     // codebase yet.
     bool supports_compaction() const noexcept { return false; }
 
+    std::uint32_t active_key_id() const noexcept { return active_key_id_; }
+
+    // Phase 4 (docs/SPEC_INVARIANTS.md): safely switches active_key_id_ to
+    // new_key_id without a process restart. Caller must have already loaded
+    // new_key_id into key_ring (the "prepare" step). Must be called from the
+    // same owning thread as every append_*/recover_control_plane() call --
+    // see class header's "KEY SELECTION" note.
+    //
+    // Unlike DurableAuditSink (which needs a separate sidecar log -- its main
+    // log format is hard-limited to OrderEvent frames only), this class
+    // already supports multiple record types in one stream, so the
+    // KeyRotated record is written directly to THIS sink's own main log --
+    // as control_plane_frame_codec.hpp's bespoke, non-DurableRecordType
+    // KeyRotatedRecord frame (see that struct's own header comment for why
+    // it isn't a real DurableRecordType member), not as an 18th enumerator.
+    // The scan below peeks for its marker byte before ever consulting
+    // DurableRecordType/the switch below. Durable-before-flip: the frame
+    // (and its tip anchor) is written and Acked BEFORE active_key_id_ itself
+    // changes; on any failure active_key_id_ is left untouched. This does
+    // NOT go through append_generic() -- that helper resolves its signing
+    // key from the (still old, not yet flipped) active_key_id_ member, but
+    // this frame must be signed under new_key_id specifically (same
+    // reasoning as DurableAuditSink::rotate_active_key(), and the same
+    // reason finish_append() above takes an explicit key_id_for_anchor
+    // parameter instead of reading the member).
+    bool rotate_active_key(std::uint32_t new_key_id, std::int64_t now_ms) noexcept {
+        if (fenced_ || !log_store_.is_log_open()) return false;
+
+        std::array<std::byte, kKeyBlockSize> new_key_block{};
+        if (!key_ring_.active_key(new_key_id, new_key_block)) return false;  // "prepare" not done yet
+        std::span<const std::byte> new_hmac_key(new_key_block.data(), new_key_block.size());
+
+        const std::uint32_t old_key_id = active_key_id_;
+        const std::uint64_t seq_at_rotation = (next_sequence_ == 0) ? kNoPriorTipSequence : next_sequence_ - 1;
+        KeyRotationPayload payload{old_key_id, new_key_id, seq_at_rotation};
+
+        std::array<std::byte, kKeyRotatedFrameSize> buf{};
+        const auto n = encode_key_rotated_frame(buf, new_key_id, next_sequence_, FrameTimeKind::ServerCorrectedUtc,
+                                                 now_ms, payload, tip_mac_, new_hmac_key);
+        if (n != kKeyRotatedFrameSize) {
+            fenced_ = true;  // encode failure at a fixed, always-sufficient buffer size is a real bug, not input shape
+            secure_wipe(new_key_block.data(), new_key_block.size());
+            return false;
+        }
+        auto result = finish_append(std::span<const std::byte>(buf.data(), n), new_key_block,
+                                     /*key_id_for_anchor=*/new_key_id);
+        secure_wipe(new_key_block.data(), new_key_block.size());
+        if (!result.acked()) return false;  // finish_append() already fenced on genuine I/O failure
+
+        active_key_id_ = new_key_id;
+        return true;
+    }
+
     AuditAppendResult append_rate_freeze(const RateLimitFreezePayload& freeze,
                                          FrameTimeKind time_kind) noexcept override {
         const std::int64_t recorded_utc_ms = time_kind == FrameTimeKind::UnknownBootstrap ? 0 : freeze.recorded_utc_ms;
@@ -179,7 +233,7 @@ public:
                                              std::span<const std::byte>(key_block.data(), key_block.size()));
         if (n == 0) return failed_result();  // pre-I/O shape rejection, nothing written -- not fenced
 
-        return finish_append(std::span<const std::byte>(buf.data(), n), key_block);
+        return finish_append(std::span<const std::byte>(buf.data(), n), key_block, active_key_id_);
     }
 
     AuditAppendResult append_weight_config(const EndpointWeightConfig& cfg) noexcept override {
@@ -376,15 +430,21 @@ private:
                                   std::span<const std::byte>(key_block.data(), key_block.size()));
         if (n != frame_size) return failed_result();
 
-        return finish_append(std::span<const std::byte>(buf.data(), n), key_block);
+        return finish_append(std::span<const std::byte>(buf.data(), n), key_block, active_key_id_);
     }
 
     // Common tail shared by every append path (fixed-size and
     // append_snapshot's variable-size path): append+fsync the already-
     // encoded frame, write the tip anchor, and advance sequence/tip_mac_ on
     // success. `frame_bytes` must be the complete, already-MAC'd frame.
+    // key_id_for_anchor is explicit (not read from the active_key_id_ member)
+    // so rotate_active_key() (Phase 4) can write its own KeyRotated frame's
+    // tip anchor under new_key_id BEFORE active_key_id_ itself is flipped --
+    // see that method's own doc comment. Every existing call site passes
+    // active_key_id_ explicitly -- a zero-behavior-change signature extension.
     AuditAppendResult finish_append(std::span<const std::byte> frame_bytes,
-                                     const std::array<std::byte, kKeyBlockSize>& key_block) noexcept {
+                                     const std::array<std::byte, kKeyBlockSize>& key_block,
+                                     std::uint32_t key_id_for_anchor) noexcept {
         if (!log_store_.append_and_fsync(frame_bytes)) {
             fenced_ = true;
             return failed_result();
@@ -394,7 +454,7 @@ private:
         std::memcpy(this_mac.data(), frame_bytes.data() + frame_bytes.size() - kMacLen, kMacLen);
 
         std::array<std::byte, kTipAnchorSize> anchor_buf{};
-        detail::encode_tip_anchor(anchor_buf, next_sequence_, this_mac, active_key_id_,
+        detail::encode_tip_anchor(anchor_buf, next_sequence_, this_mac, key_id_for_anchor,
                                    std::span<const std::byte>(key_block.data(), key_block.size()));
         if (!log_store_.write_tip_anchor(anchor_buf)) {
             fenced_ = true;
@@ -470,6 +530,37 @@ private:
             if (got == 0) break;  // nothing left to read -- treat as end of usable data
 
             std::span<const std::byte> view(chunk.data(), got);
+
+            // Phase 4: KeyRotatedRecord frames are deliberately NOT
+            // DurableRecordType-typed (see that struct's own header comment)
+            // -- peek the marker byte BEFORE assuming this is a normal
+            // control-plane frame, since read_control_plane_header would
+            // otherwise reject it as UnknownVersion.
+            if (peek_is_key_rotated_record(view)) {
+                std::uint32_t rot_key_id = 0;
+                std::array<std::byte, kKeyBlockSize> rot_key_block{};
+                if (peek_key_rotated_record_key_id(view, rot_key_id)) {
+                    if (!key_ring_.active_key(rot_key_id, rot_key_block)) return RecoveryScanStatus::Corrupt;
+                }
+                DecodedKeyRotatedFrame f{};
+                std::size_t rot_frame_size = 0;
+                const auto st = decode_key_rotated_frame(
+                    view, std::span<const std::byte>(rot_key_block.data(), rot_key_block.size()), f, rot_frame_size);
+                if (st == FrameDecodeStatus::Truncated) break;  // torn tail, stop scanning
+                if (st != FrameDecodeStatus::Ok) return RecoveryScanStatus::Corrupt;
+                if (f.sequence_number != expected_seq || f.prev_mac != running_prev_mac) {
+                    return RecoveryScanStatus::Corrupt;
+                }
+                // Not folded into any out-param -- every rotation is a
+                // permanent historical fact, not "unresolved state to
+                // recover" the way the freeze/weights/usage/bridge folds are.
+                running_prev_mac = f.mac;
+                last_mac = f.mac;
+                any_frame_seen = true;
+                ++expected_seq;
+                offset += rot_frame_size;
+                continue;
+            }
 
             detail::ControlPlaneFrameHeader hdr{};
             const auto hdr_status = detail::read_control_plane_header(view, hdr);
@@ -715,7 +806,10 @@ private:
 
     DurableLogStore log_store_;
     KeyRing& key_ring_;
-    const std::uint32_t active_key_id_;
+    // Phase 4: no longer const -- rotate_active_key() is the one and only
+    // place this is ever reassigned, always after durably confirming the
+    // rotation (see that method's doc comment for the exact ordering).
+    std::uint32_t active_key_id_;
 
     bool fenced_{false};
     RecoveryScanStatus recovery_status_{RecoveryScanStatus::IoError};
