@@ -718,8 +718,8 @@ bullet 和"Phase 0"小节开篇行）。这一轮把 `DurableAuditSink` 接上�
    切换。用现有的 `RecoveryScanStatus::Corrupt`，不发明新枚举值。
 
 其余改动：构造函数签名变为 `(const std::string& path, KeyRing& key_ring, std::uint32_t
-active_key_id)`；移除 `key_block_` 成员和手工 HMAC block-derive 逻辑（职责移交 `KeyRing`，Phase 0
-已建立）；`append_durable()` 每次实时 `key_ring_.active_key(active_key_id_, ...)` 查找（实现层
+active_key_id)`；移除原来持有原始 key 的私有成员和手工 HMAC block-derive 逻辑（职责移交
+`KeyRing`，Phase 0 已建立）；`append_durable()` 每次实时 `key_ring_.active_key(active_key_id_, ...)` 查找（实现层
 私有成员命名，不作为登记符号），失败 `Failed` 不 fence（可纠正的配置错误，同 Phase 1
 ControlPlaneLogSink 内部 append_generic 辅助方法的先例，这是本轮**唯一新增**的 Failed-不-fence
 路径——既有的"encode/I/O 失败一律 fence"行为不变，不是这一轮范围）；`ExportTuple.key_id` 从字面量
