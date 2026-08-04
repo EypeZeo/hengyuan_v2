@@ -51,9 +51,28 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
+
+// Platform-native, non-throwing CSPRNG for store-identity generation (see
+// "Store identity" section below) -- deliberately NOT std::random_device,
+// whose constructor may throw inside this file's noexcept methods.
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#elif defined(__linux__)
+#include <cerrno>
+#include <sys/random.h>
+#endif
 
 namespace hy {
 
@@ -142,6 +161,118 @@ inline bool decode_tip_anchor(std::span<const std::byte> in, std::span<const std
 
 }  // namespace detail
 
+// --- Store identity (implementation-internal, NOT spec-pinned) ---
+//
+// Phase 5 (docs/SPEC_INVARIANTS.md): a persistent, randomly-generated 128-bit
+// label for "this specific store instance" -- established once on first
+// construction, signed under key_ring_/active_key_id_ like every other
+// structure in this class (NOT a raw KEK -- this class's constructor has
+// never taken a KekLoader&, and adding one just for this would force a
+// signature change onto an already-stable, three-phases-old constructor).
+// Persisted via a third DurableLogStore sidecar, same pattern as the
+// KeyRotated sidecar.
+//
+// Exists so ExportTuple.store_uuid_lo/hi (previously always 0 -- a real,
+// pre-existing semantic gap this round closes) actually distinguishes one
+// physical store from another to an external anchor. Deliberately
+// independent of `generation` (ExportTuple.generation stays hardcoded 0 --
+// that belongs to the compaction/generation-switch subsystem, a different,
+// still out-of-scope problem).
+//
+//   [format_version: u8][store_uuid_lo: u64 LE][store_uuid_hi: u64 LE]
+//   [key_id: u32 LE][mac: 32 bytes = HMAC(key_ring key for key_id, above)]
+inline constexpr std::uint8_t kStoreIdentityFormatVersion = 1;
+inline constexpr std::size_t kStoreIdentitySize = 1 + 8 + 8 + 4 + kMacLen;  // 53
+
+namespace detail {
+
+inline std::size_t encode_store_identity(std::span<std::byte, kStoreIdentitySize> out,
+                                          std::uint64_t store_uuid_lo, std::uint64_t store_uuid_hi,
+                                          std::uint32_t key_id, std::span<const std::byte> hmac_key) noexcept {
+    std::byte* p = out.data();
+    const std::byte* const content_start = p;
+    write_u8(p, kStoreIdentityFormatVersion);
+    write_u64_le(p, store_uuid_lo);
+    write_u64_le(p, store_uuid_hi);
+    write_u32_le(p, key_id);
+    const std::size_t content_len = static_cast<std::size_t>(p - content_start);
+    const auto mac = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
+    write_bytes(p, mac.bytes.data(), kMacLen);
+    return kStoreIdentitySize;
+}
+
+struct DecodedStoreIdentity {
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint32_t key_id{0};
+};
+
+// Same "peek the key_id before deciding which KeyRing key to verify with"
+// philosophy as peek_tip_anchor_key_id()/peek_frame_key_id() -- a store
+// identity file may have been signed under an earlier active_key_id_ than
+// the one this process currently has active.
+inline bool peek_store_identity_key_id(std::span<const std::byte> in, std::uint32_t& out_key_id) noexcept {
+    constexpr std::size_t kKeyIdOffset = 1 + 8 + 8;  // format_version, store_uuid_lo, store_uuid_hi
+    constexpr std::size_t kMinBytes = kKeyIdOffset + 4;
+    if (in.size() < kMinBytes) return false;
+    const std::byte* p = in.data() + kKeyIdOffset;
+    out_key_id = read_u32_le(p);
+    return true;
+}
+
+inline bool decode_store_identity(std::span<const std::byte> in, std::span<const std::byte> hmac_key,
+                                   DecodedStoreIdentity& out) noexcept {
+    if (in.size() != kStoreIdentitySize) return false;
+    const std::byte* p = in.data();
+    const std::byte* const content_start = p;
+    if (read_u8(p) != kStoreIdentityFormatVersion) return false;
+    DecodedStoreIdentity v{};
+    v.store_uuid_lo = read_u64_le(p);
+    v.store_uuid_hi = read_u64_le(p);
+    v.key_id = read_u32_le(p);
+    const std::size_t content_len = static_cast<std::size_t>(p - content_start);
+    const auto expected_mac = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
+    std::array<std::byte, kMacLen> mac{};
+    read_bytes(p, mac.data(), kMacLen);
+    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return false;
+    out = v;
+    return true;
+}
+
+// Fills `out` with cryptographically-strong random bytes via the platform's
+// native, non-throwing CSPRNG -- deliberately NOT std::random_device, whose
+// constructor may throw std::exception on some platforms while every method
+// in this class (and this free function itself) is noexcept; an exception
+// escaping here would terminate the process. Same "raw platform API, never a
+// throwing C++ standard-library facility" discipline kek_loader.hpp already
+// established for KEK loading. Returns false (out left untouched) on any
+// failure -- callers must treat that as "could not establish an identity"
+// and degrade (see DurableAuditSink's store_identity_degraded_), never fall
+// back to a weak/predictable/zero value.
+inline bool fill_random_bytes(std::span<std::byte> out) noexcept {
+#if defined(_WIN32)
+    const NTSTATUS status = BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(out.data()),
+                                             static_cast<ULONG>(out.size()),
+                                             BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return status == 0;  // STATUS_SUCCESS == 0
+#elif defined(__linux__)
+    std::size_t total = 0;
+    while (total < out.size()) {
+        const ssize_t n = ::getrandom(out.data() + total, out.size() - total, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        total += static_cast<std::size_t>(n);
+    }
+    return true;
+#else
+    return false;  // unsupported platform, fail-closed
+#endif
+}
+
+}  // namespace detail
+
 class DurableAuditSink {
 public:
     // path: base path for the log (e.g. "state/audit.log"); the lock sidecar
@@ -151,6 +282,7 @@ public:
     DurableAuditSink(const std::string& path, KeyRing& key_ring, std::uint32_t active_key_id) noexcept
         : log_store_(path, path + ".lock", path + ".tip"),
           rotation_log_store_(path + ".keyrotations", path + ".keyrotations.lock", path + ".keyrotations.tip"),
+          store_identity_store_(path + ".storeid", path + ".storeid.lock", path + ".storeid.tip"),
           key_ring_(key_ring),
           active_key_id_(active_key_id) {
         if (!acquire_lock()) {
@@ -187,6 +319,12 @@ public:
         if (!run_rotation_recovery_scan()) {
             rotation_fenced_ = true;
         }
+
+        // Phase 5 (docs/SPEC_INVARIANTS.md): store identity, same "own
+        // independent durability domain, never fences the main log" treatment
+        // as the rotation sidecar above -- establish_store_identity() only
+        // ever sets store_identity_degraded_, never fenced_.
+        establish_store_identity(path + ".storeid.tip");
     }
 
     ~DurableAuditSink() {
@@ -271,13 +409,23 @@ public:
         tip_mac_ = this_mac;
         ++next_sequence_;
 
-        if (export_outbox_) {
+        // Phase 5 (docs/SPEC_INVARIANTS.md): store_identity_degraded_ suppresses
+        // this entire block -- when the store's identity could not be
+        // established/verified, pushing a tuple with a zero or unpersisted-
+        // and-therefore-unstable-across-restart store_uuid would be worse
+        // than not exporting at all (a real, previously-shipped self-
+        // contradiction this round's second external review round caught and
+        // fixed: a "degraded" state must behave like "no export_outbox_
+        // wired", never like "export_outbox_ wired but lying about identity").
+        if (export_outbox_ && !store_identity_degraded_) {
             // Best-effort: a full ring (no consumer exists yet this round)
             // must never fail or fence the local append -- local durability
             // is the correctness-critical part; see class header + this
             // round's SPEC_INVARIANTS.md entry.
             ExportTuple t{};
-            t.generation = 0;
+            t.store_uuid_lo = store_uuid_lo_;
+            t.store_uuid_hi = store_uuid_hi_;
+            t.generation = 0;  // compaction/generation-switch subsystem, still out of scope
             t.sequence = result.sequence;
             std::memcpy(t.tip_mac.data(), this_mac.data(), t.tip_mac.size());
             t.key_id = active_key_id_;
@@ -292,6 +440,13 @@ public:
     // Optional: wire an ExportOutboxRing to receive a tip tuple on every
     // successful Acked append (see class header's ExportOutboxRing note).
     // Nullable; unset by default. Not owned.
+    //
+    // Lifetime contract (Phase 5, docs/SPEC_INVARIANTS.md -- implicit since
+    // this method was first written, made explicit here): call this once,
+    // before the export-worker/submit thread starts draining the ring.
+    // Never reset() it or let the pointed-to ExportOutboxRing be destroyed
+    // while a worker may still be reading it -- this class holds a raw,
+    // non-owning pointer and does no lifetime tracking of its own.
     void set_export_outbox(ExportOutboxRing* ring) noexcept { export_outbox_ = ring; }
 
     // Phase 4 (docs/SPEC_INVARIANTS.md): safely switches active_key_id_ to
@@ -380,6 +535,19 @@ public:
     std::uint32_t active_key_id() const noexcept { return active_key_id_; }
     bool rotation_log_open() const noexcept { return rotation_log_open_; }
     bool rotation_fenced() const noexcept { return rotation_fenced_; }
+
+    // Phase 5 (docs/SPEC_INVARIANTS.md): 0/0 whenever store_identity_degraded()
+    // is true -- callers must not treat 0/0 here as a real identity, only as
+    // "not currently established".
+    std::uint64_t store_uuid_lo() const noexcept { return store_uuid_lo_; }
+    std::uint64_t store_uuid_hi() const noexcept { return store_uuid_hi_; }
+    // True iff the store-identity sidecar could not be established/verified
+    // (corrupt file, or a first-time generation whose durable write failed).
+    // Never affects fenced()/append_durable()'s core correctness -- it only
+    // suppresses the export_outbox_ push in append_durable() (see that
+    // method's own comment), so a caller cannot mistake a degraded process
+    // for one that has simply never had export_outbox_ wired up at all.
+    bool store_identity_degraded() const noexcept { return store_identity_degraded_; }
 
 private:
     static constexpr std::size_t kKeyBlockSize = hy::kKeyBlockSize;
@@ -666,6 +834,95 @@ private:
         return true;
     }
 
+    // Phase 5 (docs/SPEC_INVARIANTS.md): establishes (or verifies) this
+    // sink's persistent store_uuid_lo_/hi_. Called once from the
+    // constructor, after the rotation sidecar block. A problem here NEVER
+    // fences the main log or the rotation sidecar -- it only sets
+    // store_identity_degraded_, which append_durable() checks before pushing
+    // to export_outbox_ (see that method's own comment: degraded must behave
+    // like "no export_outbox_ wired", never like "wired but lying").
+    void establish_store_identity(const std::string& tip_path) noexcept {
+        if (!store_identity_store_.acquire_lock()) {
+            store_identity_degraded_ = true;
+            return;
+        }
+
+        std::vector<std::byte> raw;
+        if (store_identity_store_.read_tip_anchor(raw)) {
+            std::uint32_t file_key_id = 0;
+            std::array<std::byte, kKeyBlockSize> file_key_block{};
+            if (!detail::peek_store_identity_key_id(raw, file_key_id) ||
+                !key_ring_.active_key(file_key_id, file_key_block)) {
+                // Too short to even contain a key_id, or the key_id it names
+                // is unknown/retired -- treated the same as a decode failure
+                // below: degrade, never regenerate.
+                store_identity_degraded_ = true;
+                return;
+            }
+            detail::DecodedStoreIdentity decoded{};
+            if (!detail::decode_store_identity(
+                    raw, std::span<const std::byte>(file_key_block.data(), file_key_block.size()), decoded)) {
+                // File exists but does not decode to a self-consistent value
+                // -- corruption or tampering. MUST NOT regenerate a fresh
+                // identity here: that would silently mask the problem behind
+                // a brand-new, equally-plausible-looking UUID. Degrade
+                // instead (store_uuid_lo_/hi_ stay 0).
+                store_identity_degraded_ = true;
+                return;
+            }
+            store_uuid_lo_ = decoded.store_uuid_lo;
+            store_uuid_hi_ = decoded.store_uuid_hi;
+            return;
+        }
+
+        // read_tip_anchor() collapses "file absent" and "I/O error" into one
+        // false -- distinguish them via the non-throwing error_code overload
+        // (the throwing overload could raise inside this noexcept method).
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(tip_path, ec);
+        if (ec || exists) {
+            // Either the probe itself failed, or the file is there but
+            // read_tip_anchor() still failed for a real I/O reason (not
+            // "absent") -- do not attempt first-time generation over what
+            // might be a real, unreadable file.
+            store_identity_degraded_ = true;
+            return;
+        }
+
+        // Genuinely absent: first run. Generate a new identity.
+        std::array<std::byte, 16> random_bytes{};
+        if (!detail::fill_random_bytes(random_bytes)) {
+            store_identity_degraded_ = true;
+            return;
+        }
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+        std::memcpy(&lo, random_bytes.data(), 8);
+        std::memcpy(&hi, random_bytes.data() + 8, 8);
+
+        std::array<std::byte, kKeyBlockSize> key_block{};
+        if (!key_ring_.active_key(active_key_id_, key_block)) {
+            store_identity_degraded_ = true;
+            return;
+        }
+        std::array<std::byte, kStoreIdentitySize> buf{};
+        detail::encode_store_identity(buf, lo, hi, active_key_id_,
+                                       std::span<const std::byte>(key_block.data(), key_block.size()));
+        if (!store_identity_store_.write_tip_anchor(buf)) {
+            // Generated but NOT durable -- using it anyway would give this
+            // process an identity that vanishes on restart (a future
+            // restart would silently generate a DIFFERENT identity for the
+            // same physical store), which is worse than simply not
+            // exporting: it would look stable for this process's lifetime
+            // while silently not being so. Degrade instead of using the
+            // in-memory-only value.
+            store_identity_degraded_ = true;
+            return;
+        }
+        store_uuid_lo_ = lo;
+        store_uuid_hi_ = hi;
+    }
+
     // --- Platform I/O: thin delegates to DurableLogStore (docs/SPEC_INVARIANTS.md's
     // "Phase 1" entry -- extracted this round so this class and
     // ControlPlaneLogSink share one crash-consistency implementation instead
@@ -708,6 +965,11 @@ private:
     // (path+".keyrotations"/.lock/.tip) -- see rotate_active_key()'s doc
     // comment for why this isn't mixed into log_store_ above.
     DurableLogStore rotation_log_store_;
+    // Phase 5: separate DurableLogStore instance for the store-identity
+    // sidecar (path+".storeid"/.lock/.tip) -- same "own independent
+    // durability domain" treatment as rotation_log_store_ above; see
+    // establish_store_identity()'s doc comment.
+    DurableLogStore store_identity_store_;
     KeyRing& key_ring_;
     // Phase 4: no longer const -- rotate_active_key() is the one and only
     // place this is ever reassigned, always after durably confirming the
@@ -737,6 +999,12 @@ private:
     bool rotation_fenced_{false};
     std::uint64_t rotation_next_sequence_{0};
     std::array<std::byte, kMacLen> rotation_tip_mac_{};
+
+    // Phase 5: store identity. Both stay 0 whenever store_identity_degraded_
+    // is true -- see establish_store_identity()'s doc comment.
+    std::uint64_t store_uuid_lo_{0};
+    std::uint64_t store_uuid_hi_{0};
+    bool store_identity_degraded_{false};
 };
 
 // --- Startup recovery integration ---

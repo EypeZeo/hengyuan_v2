@@ -35,6 +35,10 @@ target_include_directories(hengyuan_core INTERFACE include)
 target_compile_features(hengyuan_core INTERFACE cxx_std_20)
 # std::fopen is standard C; silence MSVC's non-standard "use fopen_s" deprecation
 target_compile_definitions(hengyuan_core INTERFACE $<$<CXX_COMPILER_ID:MSVC>:_CRT_SECURE_NO_WARNINGS>)
+# BCryptGenRandom (export_worker.hpp/durable_audit_sink.hpp store-identity
+# generation, Phase 5) lives in bcrypt.lib, not linked by default the way
+# kernel32's CreateFileA/friends already used elsewhere in this codebase are.
+target_link_libraries(hengyuan_core INTERFACE $<$<PLATFORM_ID:Windows>:bcrypt>)
 
 # Static library: parser + orderbook + validator (IO-01 + OB-01)
 add_library(hengyuan_dataplane STATIC
@@ -276,6 +280,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_audit_sink)
     gtest_discover_tests(test_durable_audit_sink)
 
+    # Phase 5 (docs/SPEC_INVARIANTS.md): export-worker best-effort telemetry
+    # consumer for ExportOutboxRing (L2, real file I/O for LastRemoteAckedTip
+    # persistence; ExternalAnchorClient stays mock-only via FakeExternalAnchorClient,
+    # same precedent as SubmitPort).
+    add_executable(test_export_worker tests/test_export_worker.cpp)
+    target_link_libraries(test_export_worker PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_export_worker)
+    gtest_discover_tests(test_export_worker)
+
     # P2-EXEC-LIVE-01 D12-9: live submit orchestrator (L1, mock submit port)
     add_executable(test_live_submit_orchestrator tests/test_live_submit_orchestrator.cpp)
     target_link_libraries(test_live_submit_orchestrator PRIVATE hengyuan_core GTest::gtest_main)
@@ -427,6 +440,15 @@ if(HY_BUILD_TESTS)
         add_executable(tsan_control_relaxed_ring tests/tsan_control_relaxed_ring.cpp)
         target_link_libraries(tsan_control_relaxed_ring PRIVATE hengyuan_core Threads::Threads)
         hengyuan_set_warnings(tsan_control_relaxed_ring)
+
+        # Phase 5: negative control proving ExportOutboxRing's documented
+        # single-consumer contract is a real, TSan-detectable requirement --
+        # see the file's own header comment for why it drives the ring
+        # in-memory directly instead of through run_export_worker_once().
+        add_executable(tsan_control_export_worker_dual_consumer
+            tests/tsan_control_export_worker_dual_consumer.cpp)
+        target_link_libraries(tsan_control_export_worker_dual_consumer PRIVATE hengyuan_core Threads::Threads)
+        hengyuan_set_warnings(tsan_control_export_worker_dual_consumer)
     endif()
 
     # P2-EXEC-LIVE-01: HMAC signer (requires OpenSSL)

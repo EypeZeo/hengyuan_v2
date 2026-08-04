@@ -1013,6 +1013,176 @@ RotateActiveKeyFailsClosedWhenFenced）加 RecoveryScanAcceptsKeyRotatedFrameWit
 比对，因为它压根不是任何枚举的成员）。`key_ring.hpp`/`kek_loader.hpp`/`durable_control_plane.hpp`
 的 `DurableRecordType` 枚举本身，三者均零改动。
 
+### Phase 5：ExportOutboxRing 消费者（best-effort telemetry）—— export-worker 排水循环 +
+### LastRemoteAckedTip 面包屑持久化 + Store 身份
+
+`DurableControlPlaneSink` 真实实现总路线图的第六个、也是当前排期的最后一个执行单元（Phase 0-4 均已
+合并：PR #18/#22/#23/#24/#25）。用户最初要求的措辞是"`ExternalAnchorClient` 真实网络实现"，撞到
+一堵硬墙：两份 spec 都从未规定这个接口该讲什么协议、连接对端是什么、用什么认证方案——`docs/BINANCE_PRIVATE_REST_L4_SPEC.md`
+原文明确说这是"这份 spec 不发明的真实基础设施"，这条判断本身早就记在这份清单更早的位置（见本节
+之前"比照 `SubmitPort`/`QueryPort` 先例，真实网络实现不做"的既有记录）。用户确认后的方向：
+`ExternalAnchorClient` 接口继续保持可注入（同 `SubmitPort` 先例，永久 mock-only），这一轮改做
+它旁边真正缺失、真正可独立验证、不需要发明协议或依赖外部基础设施的东西——`ExportOutboxRing`
+（`durable_control_plane.hpp`，早已完整实现的 256 容量 SPSC 环）至今没有任何消费者，
+`LastRemoteAckedTip`（导出基线面包屑，ABI 早已定义）也从未有代码真正读写过。用户随后把范围收窄到
+只做"export-worker 排水循环 + `LastRemoteAckedTip` 持久化"，明确排除启动时重建程序（§10.2.1）、
+`OperatorOverrideSidecar` 真实实现+准入算法、append 路径的背压式围栏——三者均需要这一轮之外的
+独立基础设施（离线 operator 工具、实时 `/time` 探测、对一个已稳定四轮的核心 `append_durable()`
+的真实行为改动），不是"给已经在跑的 ring 建一个消费者"这件事本身的自然延伸。
+
+**两轮外部 GPT 审查触发的自我纠错，记在这里防止以后重复踩坑**：
+
+第一轮审查核实为真、已采纳的点：`LastRemoteAckedTipStore` 原设计完全没有对新写入值做单调性/身份
+校验，直接违反了研究阶段已经引用过的 spec 原文"under monotonic (generation, sequence) CAS"；
+`read()` 原设计只返回 `bool`，把"从未导出过"和"文件损坏"混成一种失败，跟这个仓库
+`RecoveryScanStatus` 的多值区分传统不一致；`LastRemoteAckedTipStore` 原设计持有活的 `KekLoader&`
+并逐次调用 `is_loaded()`/`get()`，有 TOCTOU 风险，且偏离了 `KeyRing::KeyRing()` 自己"构造时拷贝
+一次 KEK，不持有外部活引用"的既有先例；breadcrumb wire 格式原设计漏掉了这个仓库每一处 wire 格式
+都有的 format-version 字节。同一轮还核实了 `DurableAuditSink::append_durable()` 产出的
+`ExportTuple` 现在 `store_uuid_lo/hi` 永远是 0——这是一个真实存在、早于本轮就有的语义空洞（外部
+锚定服务分不清两个不同的 store），用户单独确认后同意"顺便加上，小而纯增量的 store UUID 机制"
+（`generation` 字段依然保持硬编码为 0——那是压缩/generation 切换子系统 round-12 的范围，是一个
+不同大小的问题，这一轮不碰）。
+
+第二轮审查抓到了第一轮实现里一个真正的自我矛盾，是本轮最严重的一处修正：store-identity"降级"路径
+原设计在身份文件损坏或首次生成后落盘失败时，仍然继续用 `(0,0)` 或未持久化的内存态 UUID 往
+`export_outbox_` 里塞 tuple——这恰好复现了引入这套机制本来要修的那个语义空洞，只是从"永远是 0"
+变成"有条件地是 0 或不稳定"，反而更隐蔽。修正为：`store_identity_degraded_ == true` 时，
+`append_durable()` 整个跳过 `export_outbox_` 的 push，效果等同于压根没接导出通道，绝不发送零身份
+或跨重启会变化的身份。第二轮审查还指出两处会在 `noexcept` 路径下触发 `std::terminate()` 的真实
+风险：`std::filesystem::exists()` 的裸重载和 `std::random_device` 的构造函数都可能抛异常，而
+这两个类的每一个公开方法都声明为 `noexcept`。修正为：`std::filesystem::exists(path, error_code&)`
+的不抛异常重载，以及用 Windows `BCryptGenRandom`/Linux `getrandom()` 的薄封装取代
+`std::random_device`——这直接照抄 `kek_loader.hpp` 自 Phase 0 起就确立的"裸平台 API、不借助任何
+会抛异常的 C++ 标准库设施"纪律，`std::random_device` 是这一版计划里唯一偏离这条纪律的地方。
+
+两轮审查里被判定为"已经是既有范围决定，重复提出但没有新论据"而拒绝的点：完整启动重建程序、
+`OperatorOverrideSidecar`、append 路径背压围栏、真正的生产线程调度器——均为用户在两轮
+AskUserQuestion 里已经明确排除的范围。被判定为"改动面明显超出'小而纯增量'"而拒绝、改为纯披露
+的点：`set_export_outbox(ExportOutboxRing*)` 改成构造期非空引用注入（会改变一个已稳定三轮、被
+大量既有测试依赖的公开 API 默认行为，只做既有注释加固，不改签名）；store_uuid 与主日志创世帧内容
+做密码学绑定（能防"整个目录树被复制导致身份碰撞"，但是比"给 store 一个持久身份"更大的一块独立
+设计，这一轮只做披露不实现）。
+
+**关键设计事实**：
+- `ExportOutboxRing`/`ExportTuple` 早已完整实现（256 容量、two-phase `peek_oldest()`/
+  `pop_after_remote_ack()`、SPSC、零堆分配），只有 `DurableAuditSink` 接了 producer 端
+  （`set_export_outbox()`）；`ControlPlaneLogSink` 这一轮维持"完全没接"的现状不变。
+- `LastRemoteAckedTip` 的 MAC 原本设计在裸 KEK 下计算，不走 `KeyRing` 按 key_id 派生——这是这个
+  仓库里唯一一个信任边界不经过 `KeyRing` 的 durable 结构，是刻意的、独立的设计点。但
+  `DurableAuditSink` 的构造函数签名（`(path, KeyRing&, active_key_id)`）根本没有 `KekLoader&`——
+  给新的 store-identity 机制引入裸 KEK 签名会强迫改这个已稳定四轮的构造函数签名，牵连所有既有
+  调用点，不是"纯增量"。**store-identity 因此改用已经可用的 `key_ring_`/`active_key_id_` 签名，
+  跟 tip-anchor 自己的签名方式完全一致**——`LastRemoteAckedTip` 自己的裸 KEK 签名维持不变（它是
+  `export_worker.hpp` 里独立的 `LastRemoteAckedTipStore` 概念，不依赖 `DurableAuditSink` 的
+  `KeyRing`）。
+- `DurableLogStore::write_tip_anchor()`/`read_tip_anchor()`（Phase 1 共享基础设施）完全通用，
+  这一轮第三次复用它（`LastRemoteAckedTipStore` 一次、`DurableAuditSink` 新增的 store-identity
+  sidecar 一次）——`read_tip_anchor()` 把"文件不存在"和"I/O 失败"合并成同一个 `false`，这个仓库
+  不改这个共享原语（已被两个生产 sink 共用四轮，改动面不成比例），Absent vs IoError 的区分改在
+  调用方这一层用 `std::filesystem::exists(path, error_code&)` 做。
+- `order_tracker.hpp` 的 `poll_once()`/`ReconcilePollPolicy`/`reconcile_backoff_delay_ms()` 是
+  直接仿照的既有先例，包括"至今没有真正的生产线程驱动"这一点——`run_export_worker_once()` 同样是
+  纯 `noexcept` 自由函数，不内建线程/sleep，调用方决定驱动节奏。
+- `export_tip_and_wait_bounded()` 返回 `AuditAppendResult`（不是 `bool`）——真正的"远端拒绝"和
+  "传输层失败"在这一层共用同一个 `Failed`/未 `acked()` 语义，spec 原文没有在这一层进一步区分，
+  这一轮不发明区分。
+- **最小状态链**（本轮实际交付的因果顺序，任一环节失败就停在那一步，不静默推进）：
+  `main-log Ack` → 已持久化且非降级的 store identity → `try_push()`（满则丢弃，
+  既有先例不改）→ `ExternalAnchorClient::export_tip_and_wait_bounded` 远端 Ack → `LastRemoteAckedTip`
+  原子落盘（内建单调性/身份校验）→ `pop_after_remote_ack`（落盘成功后才做，pop 前防御性
+  re-peek 核对 head 未变）。这条链本身就是"best-effort telemetry"的定义——不保证每一条 tuple
+  最终都被导出，只保证凡是被导出/落盘的都真实、完整、单调。
+
+**新增符号**：
+- `export_worker.hpp`（新文件）：`kLastRemoteAckedTipFormatVersion`(1)、
+  `kLastRemoteAckedTipContentSize`(65)、`kLastRemoteAckedTipWireSize`(97)、
+  `encode_last_remote_acked_tip`/`decode_last_remote_acked_tip`（MAC 覆盖全部字段，含
+  format-version 字节，签名 key 是调用方传入的裸 KEK span，不是 `KeyRing` 查找）。
+- `LastRemoteAckedTipReadStatus{Absent, Valid, Corrupt, IoError}`/
+  `LastRemoteAckedTipWriteStatus{Ok, Regressed, Conflicting, IoError}`——全新的、非 spec 治理的
+  本地小枚举，不涉及任何已转写的 spec 枚举，不会重演 Phase 4 那次 `DurableRecordType` 的教训。
+  `Regressed`：新 `(generation, sequence)` 落后于磁盘已有值。`Conflicting`：同一位置（或同一
+  `store_uuid`）但 `tip_mac`/`key_id` 不同——跟 `Corrupt`（读时 MAC/尺寸校验失败）是两个独立的
+  判定层，`Corrupt` 是"文件本身读不出一个自洽的值"，`Conflicting` 是"文件给出的自洽值跟即将写入
+  的新值语义冲突"，概念上不合并。
+- `LastRemoteAckedTipStore`：构造时拷贝一次 KEK（`kek_copy_`，析构 `secure_wipe()`，同
+  `KeyRing::KeyRing()` 先例，不持有 `KekLoader&`）；`open()` 把 `acquire_lock()` 的结果记进
+  `lock_held_`，`write()`/`read()` 内部强制检查 `lock_held_`，不再只信任调用方自己检查过
+  `open()` 的返回值——两个独立实例意外指向同一路径时，没拿到锁的那个会被内部拒绝，不会绕过
+  "单调 CAS" 直接写穿。
+- `ExportWorkerPolicy{base_retry_interval_ms, backoff_multiplier, max_retry_interval_ms}` +
+  `export_worker_backoff_delay_ms()`——无状态公式，`consecutive_failures` 由调用方传入/维护，
+  同 `ReconcilePollPolicy` 先例；真正的生产调度器（GPT 第二轮审查建议的"入队时一次唤醒 + 有界
+  定时器退避"混合等待，避免每笔 append 都做内核唤醒）不在本轮范围内，这个具体形状记在这里作为
+  未来独立回合的参考起点。
+- `ExportRunStatus{Empty, Exported, RemoteRejected, BaselineWriteFailed, BaselineConflict,
+  InternalInconsistency}` + `run_export_worker_once(ExportOutboxRing&, ExternalAnchorClient&,
+  LastRemoteAckedTipStore&) noexcept`——必须只从唯一一个专属 export-worker 线程调用（单消费者
+  契约，tsan_control_export_worker_dual_consumer 提供真实的 TSan 负控制）；pop 前重新
+  `peek_oldest()` 核对 head 未变（`InternalInconsistency` 覆盖这个正常场景下不该发生、出现即
+  说明契约被违反的情形）；`ExternalAnchorClient` 的纯虚方法在既有 ABI 里已经声明 `noexcept`
+  （Round A/B，非本轮新增）——实现若抛出会在自身栈展开时直接 `std::terminate()`，发生在控制权
+  返回本函数之前，worker 侧代码拦截不到也不需要尝试拦截，这跟这仓库其余每一个 `noexcept` 虚接口
+  （例如 `SubmitPort`）的既有契约一致，不是本轮引入的新风险。
+- `durable_audit_sink.hpp` 新增 store-identity 小节（仿照文件里已有的 tip-anchor 本地 wire-format
+  小节写法）：`kStoreIdentityFormatVersion`(1)、`kStoreIdentitySize`(53)。新增私有成员：
+  第三个 `DurableLogStore` sidecar `store_identity_store_`（`<path>.storeid`/`.lock`/`.tip`，
+  同 `rotation_log_store_` 的既有接线模式）、`store_uuid_lo_`/`store_uuid_hi_`（默认 0）、
+  `store_identity_degraded_`（默认 false）。新增只读访问器：`store_uuid_lo()`/`store_uuid_hi()`/
+  `store_identity_degraded()`。**构造函数签名不变**，只在函数体里追加：首次运行用平台原生 CSPRNG
+  （`BCryptGenRandom`/`getrandom()`，不用会抛异常的 `std::random_device`）生成新身份，用当前
+  `active_key_id_` 对应的 `key_ring_` 密钥签名并落盘；已有身份文件则用文件自带的 `key_id`（不是
+  当前 `active_key_id_`）做一次 `key_ring_` 查找校验 MAC，同 tip-anchor 自己"用帧自带 key_id
+  校验"的既有模式一致，允许身份文件是在更早的 key 下签的。**身份 sidecar 出问题（打不开/损坏/
+  首次落盘失败）不 fence 主日志、不影响 `append_durable()` 正常工作**，只设置
+  `store_identity_degraded_ = true`——同 rotation sidecar 自己"绝不能 fence 主 sink"的既有原则
+  一致。**关键修正**：`append_durable()` 里 push 进 `export_outbox_` 的条件从
+  `if (export_outbox_)` 改成 `if (export_outbox_ && !store_identity_degraded_)`——身份不可信
+  （无论是"文件损坏"还是"首次生成后落盘失败，内存里有值但不稳定"）时，整个导出通道跟"没接
+  `export_outbox_`"完全一样地静默跳过，绝不发送零身份或跨重启会变化的身份。
+  `ExportTuple.store_uuid_lo/hi` 从永远是 0 改成填 `store_uuid_lo_/hi_`；`generation` 维持
+  硬编码为 0 不变。
+- `set_export_outbox(ExportOutboxRing*)`（Phase 2 既有 API，可空、默认不设置、不拥有所有权）——
+  这一轮**签名和行为均不改**，只加固既有注释，明确此前隐含但没写清楚的生命周期契约：只应在
+  worker/提交线程开始排水之前完成一次性配置，运行期间不得 `reset` 或让所指向的 `ExportOutboxRing`
+  提前析构。
+
+**明确排除/降级为"记录但不实现"的范围（附理由）**：
+- 不做启动时重建程序（§10.2.1 正常路径+降级路径）+ 不做 append 路径背压式围栏——用户两轮
+  AskUserQuestion 已明确排除。已知后果，本轮如实披露而非新发现：`ExportOutboxRing` 纯内存，
+  进程重启会丢失尚未导出的 tuple，两个具体崩溃窗口——(a) 本地日志已落盘、tuple 还没 push 进 ring
+  之前崩溃；(b) baseline 已落盘、ring 还没真正 pop 之前崩溃。两者都不会腐化本地审计日志本身的
+  正确性，只是那条 tuple 的导出/baseline 记录可能重复或延后。**这个通道的输出不得被未来任何代码
+  当作 rollback 检测或 hard-lag 判定的输入，除非启动重建和背压围栏先被建出来**——这是本轮对
+  "best-effort telemetry, not a safety mechanism"这个定性的直接可执行约束，不是免责声明。
+- 不做 `OperatorOverrideSidecar` 真实实现 + 准入算法——需要离线 operator 工具 + 实时 `/time`
+  探测，这两样都不存在，属于独立基础设施工作。
+- `ExternalAnchorUnavailable` 依然没有任何代码设置/检查它——设置它需要上面
+  第一条排除的启动重建路径存在。
+- `ExternalAnchorClient` 接口零改动，不新增真实网络实现子类，继续可注入（同 `SubmitPort` 先例）；
+  `ControlPlaneLogSink` 零改动。
+- store_uuid 不与主日志内容做密码学绑定——当前设计只保证"同一个 store 目录跨重启身份稳定"，不
+  保证"这个目录树没有被整个复制/克隆到别处"；真正堵上这个洞需要把身份 MAC 纳入主日志创世帧的
+  哈希，是比"给 store 一个持久身份"更大的一块独立设计，这里只做披露。
+
+**测试范围**：`test_export_worker.cpp`（新文件）覆盖 `ExportRunStatus` 每个分支、
+`LastRemoteAckedTipReadStatus`/`LastRemoteAckedTipWriteStatus` 每个分支（含
+WriteWithoutOpenFailsClosed/SecondStoreOnSameLockedPathFailsClosed 两个专门验证锁生命周期强制
+校验真的生效的用例，测试方法名同上方"测试范围"惯例不加反引号）、`export_worker_backoff_delay_ms`
+独立单元测试。tsan_control_export_worker_dual_consumer.cpp（新文件，不进常规 ctest，同
+tsan_control_relaxed_ring 角色，手工 TSan 验证）证明违反单消费者契约会被真实抓到。
+`test_durable_audit_sink.cpp` 新增 store-identity 用例，含
+TamperedStoreIdentityFileDisablesExportWithoutFencingMainLog（核心断言：篡改后新追加的 tuple
+完全不出现在 `export_outbox_` 里，不是出现但带零身份）和
+StoreIdentityWriteFailureDisablesExportEvenWithInMemoryUuid（验证首次落盘失败时即使内存里已经
+生成了随机 UUID，导出仍然被禁用）。
+
+`spec_xref_check.py --quiet`/`tools/spec_enum_diff.py` 均已重跑确认：前者 exit 0，后者
+`0 value conflict(s), 0 name conflict(s)`（本轮三个新枚举都是全新本地小枚举，不涉及任何已转写的
+spec 枚举）。`control_plane_log_sink.hpp`/`durable_control_plane.hpp`/`durable_log_store.hpp`
+三者均零改动。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）

@@ -57,7 +57,7 @@ run_thread() {
         -DHY_SANITIZER=thread \
         -DHY_BUILD_TSAN_CONTROL=ON \
         -DHY_BUILD_DEMO=OFF
-    cmake --build build-linux-tsan -j"$(nproc)" --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring
+    cmake --build build-linux-tsan -j"$(nproc)" --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
     echo "--- concurrency tests (must pass) ---"
     (
@@ -93,6 +93,28 @@ run_thread() {
         fi
         echo "OK: TSan reported the injected race as expected."
         grep -A5 "WARNING: ThreadSanitizer: data race" /tmp/tsan_control.log | head -20
+    )
+
+    echo "--- control: tsan_control_export_worker_dual_consumer (must FAIL with a data race report) ---"
+    (
+        cd build-linux-tsan
+        export TSAN_OPTIONS="history_size=7:halt_on_error=1:exitcode=66"
+        set +e
+        setarch "$(uname -m)" -R ./tsan_control_export_worker_dual_consumer > /tmp/tsan_control_export_worker.log 2>&1
+        rc=$?
+        set -e
+        if [[ $rc -eq 0 ]]; then
+            echo "ERROR: tsan_control_export_worker_dual_consumer exited 0. TSan did NOT detect the injected race on this machine. Every 'no race found' result above is unsubstantiated."
+            tail -50 /tmp/tsan_control_export_worker.log
+            exit 1
+        fi
+        if ! grep -q "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_export_worker.log; then
+            echo "ERROR: tsan_control_export_worker_dual_consumer failed, but NOT with a ThreadSanitizer data-race report. It may be erroring for an unrelated reason."
+            tail -50 /tmp/tsan_control_export_worker.log
+            exit 1
+        fi
+        echo "OK: TSan reported the injected race as expected."
+        grep -A5 "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_export_worker.log | head -20
     )
 }
 

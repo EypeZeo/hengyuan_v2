@@ -105,7 +105,8 @@ jobs:
         working-directory: native
         run: |
           cmake --build build-tsan -j$(nproc) \
-            --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring
+            --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring \
+            tsan_control_export_worker_dual_consumer
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
       # race whose two halves are separated in time gets reported at all — it
@@ -144,6 +145,27 @@ jobs:
             exit 1
           fi
           echo "OK: TSan reported the injected race as expected — the gate is live."
+
+      # Phase 5 (docs/SPEC_INVARIANTS.md): same discipline, for
+      # ExportOutboxRing's documented single-consumer contract -- two threads
+      # deliberately both drive its consumer-side API concurrently.
+      - name: "Control: TSan MUST flag the deliberate dual-consumer ExportOutboxRing misuse"
+        working-directory: native/build-tsan
+        env:
+          TSAN_OPTIONS: "history_size=7:halt_on_error=1:exitcode=66"
+        run: |
+          set -u
+          if ./tsan_control_export_worker_dual_consumer > control_export_worker.log 2>&1; then
+            echo "::error::tsan_control_export_worker_dual_consumer exited 0. TSan did NOT detect the injected dual-consumer race on this runner. Every 'no data races found' result in this job is unsubstantiated — do not trust the TSan gate until this is fixed."
+            tail -50 control_export_worker.log
+            exit 1
+          fi
+          if ! grep -q "WARNING: ThreadSanitizer: data race" control_export_worker.log; then
+            echo "::error::tsan_control_export_worker_dual_consumer failed, but NOT with a ThreadSanitizer data-race report. It is probably failing for an unrelated reason (missing runtime, flag drift, build error), which would silently disable this control."
+            tail -50 control_export_worker.log
+            exit 1
+          fi
+          echo "OK: TSan reported the injected dual-consumer race as expected — the gate is live."
 
   arm64-weak-memory:
     name: "ARM64 Release: hardware weak-memory verdict"

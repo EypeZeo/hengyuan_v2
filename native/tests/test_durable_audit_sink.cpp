@@ -153,6 +153,11 @@ protected:
         std::remove((base_path_ + ".keyrotations.lock").c_str());
         std::remove((base_path_ + ".keyrotations.tip").c_str());
         std::remove((base_path_ + ".keyrotations.tip.tmp").c_str());
+        // Phase 5: store-identity sidecar.
+        std::remove((base_path_ + ".storeid").c_str());
+        std::remove((base_path_ + ".storeid.lock").c_str());
+        std::remove((base_path_ + ".storeid.tip").c_str());
+        std::remove((base_path_ + ".storeid.tip.tmp").c_str());
     }
 
     // Overwrites `n` bytes at `offset` in the log file with garbage, for
@@ -663,4 +668,141 @@ TEST_F(DurableAuditSinkTest, RotateActiveKeyFailsClosedWhenFenced) {
     ASSERT_TRUE(restarted.fenced());
     EXPECT_FALSE(restarted.rotate_active_key(2, 2000));
     EXPECT_EQ(restarted.active_key_id(), 1u);
+}
+
+// --- Phase 5 (docs/SPEC_INVARIANTS.md): store identity ---
+
+TEST_F(DurableAuditSinkTest, StoreIdentityGeneratedOnFirstConstructionAndNonZero) {
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(sink.is_open());
+    EXPECT_FALSE(sink.store_identity_degraded());
+    EXPECT_TRUE(sink.store_uuid_lo() != 0 || sink.store_uuid_hi() != 0);
+}
+
+TEST_F(DurableAuditSinkTest, StoreIdentitySurvivesRestart) {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_FALSE(sink.store_identity_degraded());
+        lo = sink.store_uuid_lo();
+        hi = sink.store_uuid_hi();
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_FALSE(restarted.store_identity_degraded());
+    EXPECT_EQ(restarted.store_uuid_lo(), lo);
+    EXPECT_EQ(restarted.store_uuid_hi(), hi);
+}
+
+TEST_F(DurableAuditSinkTest, AppendDurableExportTuplePopulatesRealStoreUuid) {
+    ExportOutboxRing ring;
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
+    ASSERT_FALSE(sink.store_identity_degraded());
+    sink.set_export_outbox(&ring);
+
+    ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+
+    ExportTuple t{};
+    ASSERT_TRUE(ring.peek_oldest(t));
+    EXPECT_EQ(t.store_uuid_lo, sink.store_uuid_lo());
+    EXPECT_EQ(t.store_uuid_hi, sink.store_uuid_hi());
+    EXPECT_TRUE(t.store_uuid_lo != 0 || t.store_uuid_hi != 0);
+}
+
+TEST_F(DurableAuditSinkTest, TamperedStoreIdentityFileDisablesExportWithoutFencingMainLog) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_FALSE(sink.store_identity_degraded());
+    }
+
+    // Flip a byte inside the store-identity sidecar's tip file -- same
+    // corruption technique corrupt_log_byte() uses for the main log, applied
+    // to the .storeid.tip file instead.
+    {
+        std::fstream f(base_path_ + ".storeid.tip", std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(f.is_open());
+        char b = 0;
+        f.read(&b, 1);
+        b = static_cast<char>(b ^ 0x01);
+        f.seekp(0);
+        f.write(&b, 1);
+    }
+
+    ExportOutboxRing ring;
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_FALSE(restarted.fenced());  // a store-identity problem never fences the main log
+    EXPECT_TRUE(restarted.store_identity_degraded());
+    EXPECT_EQ(restarted.store_uuid_lo(), 0u);
+    EXPECT_EQ(restarted.store_uuid_hi(), 0u);
+
+    restarted.set_export_outbox(&ring);
+    // Core assertion of this round's fix: main append path keeps working...
+    ASSERT_TRUE(restarted.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    // ...but the degraded identity means NOTHING gets pushed to the export
+    // outbox at all -- not a tuple with a zero/placeholder identity.
+    ExportTuple t{};
+    EXPECT_FALSE(ring.peek_oldest(t));
+}
+
+TEST_F(DurableAuditSinkTest, StoreIdentityWriteFailureDisablesExportEvenWithInMemoryUuid) {
+    // Block ONLY the durable write of a first-time-generated identity: create
+    // a directory at the exact path write_tip_anchor() needs for its
+    // temp-file-then-rename step, while leaving the real ".storeid.tip" path
+    // itself genuinely absent -- so establish_store_identity() reaches
+    // "generate a fresh random identity", then fails specifically at the
+    // write, not at the earlier read/exists probe.
+    const std::string blocked_tmp_path = base_path_ + ".storeid.tip.tmp";
+#ifdef _WIN32
+    ASSERT_TRUE(CreateDirectoryA(blocked_tmp_path.c_str(), nullptr));
+#else
+    ASSERT_EQ(::mkdir(blocked_tmp_path.c_str(), 0700), 0);
+#endif
+
+    ExportOutboxRing ring;
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(sink.is_open());
+    EXPECT_FALSE(sink.fenced());  // still never fences the main log
+    EXPECT_TRUE(sink.store_identity_degraded());
+    // Never uses the freshly-generated-but-unpersisted value -- 0, not some
+    // in-memory-only UUID that would silently change again on the next
+    // restart.
+    EXPECT_EQ(sink.store_uuid_lo(), 0u);
+    EXPECT_EQ(sink.store_uuid_hi(), 0u);
+
+    sink.set_export_outbox(&ring);
+    ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    ExportTuple t{};
+    EXPECT_FALSE(ring.peek_oldest(t));
+
+#ifdef _WIN32
+    RemoveDirectoryA(blocked_tmp_path.c_str());
+#else
+    ::rmdir(blocked_tmp_path.c_str());
+#endif
+}
+
+TEST_F(DurableAuditSinkTest, TwoDifferentSinksGetDifferentStoreUuids) {
+    std::string other_path = base_path_ + "_other";
+    auto remove_other = [&] {
+        std::remove(other_path.c_str());
+        std::remove((other_path + ".lock").c_str());
+        std::remove((other_path + ".tip").c_str());
+        std::remove((other_path + ".keyrotations").c_str());
+        std::remove((other_path + ".keyrotations.lock").c_str());
+        std::remove((other_path + ".keyrotations.tip").c_str());
+        std::remove((other_path + ".storeid").c_str());
+        std::remove((other_path + ".storeid.lock").c_str());
+        std::remove((other_path + ".storeid.tip").c_str());
+    };
+    remove_other();
+
+    DurableAuditSink a(base_path_, *key_ring_, 1);
+    DurableAuditSink b(other_path, *key_ring_, 1);
+    ASSERT_FALSE(a.store_identity_degraded());
+    ASSERT_FALSE(b.store_identity_degraded());
+    EXPECT_TRUE(a.store_uuid_lo() != b.store_uuid_lo() || a.store_uuid_hi() != b.store_uuid_hi());
+
+    remove_other();
 }
