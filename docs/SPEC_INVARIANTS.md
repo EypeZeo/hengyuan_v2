@@ -868,6 +868,151 @@ fake `DurableOrderAuditPort` 后端，断言不变；新增 4 个用 fake 精确
 未把 `AuditEventType` 转写成代码块）；`AuditWriteNotAcked` 走既有的仅追加数值模式，零冲突。
 `spec_xref_check.py --quiet` 需重跑并通过。
 
+### Phase 4：真正的运行时密钥轮换生命周期（DurableAuditSink + ControlPlaneLogSink）
+
+`DurableControlPlaneSink` 真实实现总路线图的第五个执行单元（Phase 0-3 均已合并：PR #18/#22/#23/#24）。
+`KeyRing`（Phase 0）本身早就支持持有多个 key_id、按 id 查找、按 id 退役，但 `DurableAuditSink`/
+`ControlPlaneLogSink` 从 Phase 0 起就反复明确把"真正的运行时密钥轮换"排除在范围外：两个类的
+`active_key_id_` 都是构造参数、`const` 成员，构造后不可变，没有 `set_active_key_id()` 或任何运行时
+切换入口——每一轮的 ledger 都写着同一句话"运行时轮换的并发安全设计整体留给 Phase 4"。这一轮把这句
+反复出现的欠账还上，并按用户明确要求，给轮换动作本身落一条专门的、可验证的 durable 记录，而不是
+只靠"后续帧的 key_id 变了"这种间接证据。
+
+**执行过程中的一次真实自我纠错，记在这里避免以后重复踩坑**：最初的设计把这条记录做成
+`DurableRecordType::KeyRotated = 17`，调研当时错误地认为两份 spec 文档从未把 `DurableRecordType`
+转写成真正的代码块（把它和 Phase 3 `AuditEventType` 的情况搞混了）。`tools/spec_enum_diff.py`
+在实现落地后立刻抓到了这个错误——`DurableRecordType` **确实**是一个真正 spec-transcribed 的
+代码块（`docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2511-2561`，止于 `SealJournalApplied=16`），该工具
+对这类"持久化 wire discriminator"零容忍任何 spec 里没有的新枚举值，判定为 `NAME_CONFLICT`，
+build-failing，且没有 delta/白名单机制可以绕过（跟 `OrchestratorGate` 那种 spec 自己标注"...
+existing N values unchanged ..."的 delta 区块性质完全不同）。伪造一段"spec 提案"塞进 spec 文档来
+让检查通过，比问题本身更违反 TRANSCRIBE 纪律。用户确认后的最终方案：**`KeyRotated` 完全不进
+`DurableRecordType`，改成一个独立的、非 spec 治理的全新 wire 记录**（`KeyRotatedRecord`，
+`control_plane_frame_codec.hpp`），用一个专属 marker 字节（`0xFE`，刻意选在 `kFrameFormatVersion`
+(4) 和共享信封版本号任何可预见的未来增长范围之外）取代 `DurableRecordType` 在共享信封里的结构位置，
+扫描时先 peek 这个 marker 字节，是就走独立解码路径，不是才走既有的 `read_control_plane_header`/
+`DurableRecordType` 分发。
+
+**关键设计事实**：
+- `key_ring.hpp` **零改动**——`add_key()`/`load_wrapped_key()`/`active_key()`/`retire()`/
+  `wipe_all()` 早就是完整底座，`kMaxLiveKeys=16` 的注释本身就说明了"key 轮换是罕见的、operator
+  触发的事件，不是热路径容量限制"。
+- **"writer-quiesce 协议"是免费的，不是这一轮要新设计的东西**：直接读过 `kill_switch.hpp`——
+  它是这仓库唯一的另一个"operator 触发、热线程观察"的控制态类，完全没有原子量/跨线程同步原语，
+  隐含约定就是"只从 owning 线程调用"。全仓库没有任何一处跨线程原子控制标志的先例；唯一的跨线程
+  模式是 `ToReconcileRing`/`ReconcileEventRing` 这一对 SPSC 环，且专用于热线程↔对账线程这一个
+  特定边界。`rotate_active_key()` 和 `append_*()`/`run_recovery_scan()` 一样只允许从 owning 线程
+  调用，不需要发明任何新同步原语——没有并发写者需要被 quiesce。
+- **`KeyRotated` 记录签名约定照抄 `durable_control_plane.hpp` 已有的 `GenerationBridgePayload`**
+  （round-12 P0，压缩边界的密钥过渡记录）：帧本身签在 `new_key_id` 下（轮换发生时 `new_key_id`
+  已经在 KeyRing 里验证过可解析），`old_key_id` 作为已认证的 payload 数据带在里面——理由原文是
+  "绝不能允许验证方为了兼容一次轮换就尝试多个 key，那会把'这条消息是被这一个特定 key 签的'弱化成
+  '被我们认识的任意一个 key 签的'"。不是发明新规则，是 TRANSCRIBE 已有先例。
+- **`DurableAuditSink` 与 `ControlPlaneLogSink` 对 `KeyRotatedRecord` 的落盘位置不对称，是刻意的**：
+  `DurableAuditSink` 的主日志格式从 Phase 0 起就明确写死"只写 `DurableRecordType::OrderEvent`"，
+  它的 `run_recovery_scan()` 直接调用 `decode_order_event_frame`，完全没有先 peek 再分发的机制。
+  真要把这条记录混进它的主日志，需要教会它的 recovery scan 支持变长帧/多类型分发——这是对一个已经
+  稳定四轮的核心文件的真实结构改动，外部评审（用户）确认后采用的方案是：`DurableAuditSink` 用一个
+  独立 sidecar 日志（`<path>.keyrotations`/`.keyrotations.lock`/`.keyrotations.tip`，复用 Phase 1
+  的 `DurableLogStore`）专门承载这条记录，主日志格式完全不动。`ControlPlaneLogSink` 天生支持多种
+  记录类型混在同一日志流（recovery scan 本来就已经是"先读通用 header 再分发"的结构），直接在扫描
+  循环最前面加一段 marker 字节 peek 前置分支即可复用同一日志——两个类分别选了"独立 sidecar"和
+  "内联主日志"，各自贴合自己已经建立四轮的架构边界。
+
+**新增符号**：
+- `KeyRotatedRecord`（`control_plane_frame_codec.hpp`，概念名，无对应 struct——它是一组自由函数 +
+  常量）：`kKeyRotatedRecordMarker = 0xFE`（占据共享信封 `format_version` 字节的同一结构位置，
+  但语义上跟 `DurableRecordType` 完全无关）、`kKeyRotatedHeaderSize`(22)、`kKeyRotatedFrameSize`
+  (=22+16+32+32=102)、`encode_key_rotated_frame`/`decode_key_rotated_frame`/
+  `DecodedKeyRotatedFrame`/`peek_is_key_rotated_record`/`peek_key_rotated_record_key_id`——**不复用**
+  `write_control_plane_header`/`read_control_plane_header`/`ControlPlaneFrameHeader`（那三者硬编码
+  `DurableRecordType` 类型），完全独立手写编解码，字段顺序为
+  `[marker u8][key_id u32][sequence_number u64][time_kind u8][recorded_utc_ms i64][payload 16B]
+  [prev_mac 32B][mac 32B]`。**`durable_control_plane.hpp` 的 `DurableRecordType` 枚举本身
+  这一轮零改动**——`is_legal_durable_record_type()` 的上界也维持 `SealJournalApplied` 不变，
+  两者都不需要任何连带修复，因为 `KeyRotated` 压根不经过这条校验路径。
+- `KeyRotationPayload{old_key_id, new_key_id, log_sequence_at_rotation}`（16 字节固定大小，struct
+  定义在 `durable_control_plane.hpp`，跟其余 payload struct 一致；`kNoPriorTipSequence` 同处）——
+  内容不变，只是不再被塞进 `DurableRecordType` 家族的信封。`kNoPriorTipSequence`（`UINT64_MAX`）
+  表示轮换发生在还从未写过任何帧的空日志上，没有 tip 可谈。
+- **`peek_is_key_rotated_record()`/`peek_key_rotated_record_key_id()` 的"先 peek marker 字节再决定
+  怎么解码"是两个消费者（sidecar 扫描、`ControlPlaneLogSink` 混合类型扫描）都必须遵守的前置步骤**——
+  `key_id` 在这个格式里位于偏移 1（`[marker][key_id]...`），跟 `durable_frame_codec.hpp` 既有的
+  `peek_frame_key_id()`（假设 `[format_version][record_type][key_id]...`，偏移 2）**不是同一个
+  偏移量，两者不能混用**——`DurableAuditSink` 的 sidecar 扫描一开始误用了 `peek_frame_key_id()`，
+  被 RotationSidecarSurvivesRestart 测试（测试方法名，同下方"测试范围"一节的说明，不加反引号）
+  直接跑挂，修正为调用
+  `peek_key_rotated_record_key_id()` 后通过；这是实现阶段发现的第二个自我纠错，记在这里防止
+  以后又混用。
+- `DurableAuditSink::rotate_active_key(new_key_id, now_ms) -> bool`：`active_key_id_` 从 `const`
+  改为可变（这是本轮唯一必须打破的既有不变量）；`write_tip_anchor()` 私有方法新增显式 `key_id`
+  参数（原来直接读成员），唯一现有调用点（`append_durable()` 内部）显式传 `active_key_id_`，
+  零行为改变——`rotate_active_key()` 需要在还没翻转 `active_key_id_` 之前就用 `new_key_id` 签名
+  主日志的重新锚定，显式参数是唯一干净的做法（先翻转成员再签名、失败再回滚，违反这仓库反复确立的
+  "先落盘、后翻转，绝不翻转后回滚"纪律）。新增 sidecar 相关私有成员
+  （`rotation_log_store_`/`rotation_log_open_`/`rotation_fenced_`/`rotation_next_sequence_`/
+  `rotation_tip_mac_`）——sidecar 出问题（打不开/损坏）**不 fence 主日志、不影响 `append_durable()`
+  正常工作**，只是让 `rotate_active_key()` 从此失败关闭。sidecar 自己的 recovery 大幅简化（只有
+  `KeyRotated` 一种固定帧类型，不需要分发；不折叠任何跨记录状态，因为每条轮换记录是永久历史事实，
+  不是"未解决、需要恢复"的状态；因此**不维护有界内存历史数组**，跟主日志的 `recovered_checkpoints()`
+  语义不同，离线审计需要直接读原始 sidecar 文件）。新增只读访问器 `active_key_id()`/
+  `rotation_log_open()`/`rotation_fenced()`。
+- **`rotate_active_key()` 的关键正确性设计——重新锚定主日志 tip 关闭"崩溃窗口"**：如果轮换只是
+  简单地翻转内存里的 `active_key_id_`、不重新签名主日志现有的 tip-anchor，那么"翻转成功返回"和
+  "下一次真正 append 之前"之间存在一个崩溃窗口——此时重启若用新 key_id 构造，会发现 tip-anchor
+  还是旧 key 签的，触发 Phase 2 那条"anchor.key_id 必须等于 active_key_id_"一致性检查，被误判成
+  `Corrupt`，即使数据完全没问题。所以 `rotate_active_key()` 必须在真正翻转 `active_key_id_` 之前，
+  先用 `new_key_id` 重新签名主日志现有 tip 的 anchor（`next_sequence_==0` 的空日志例外，此时没有
+  tip 可谈，第一次 `append_durable()` 自然会用新 key 正确写出第一条帧+anchor）。这一步失败按
+  `append_durable()` 同样的自我熔断纪律 fence 主日志（真实 I/O 失败，不是可纠正的配置错误）。
+- **sidecar 落盘与主日志重新锚定之间没有跨文件原子性，是刻意的、如实披露的取舍**：两步之间崩溃，
+  会让 sidecar 显示"一次被记录但未完成的轮换尝试"——这是诚实的取证信息，不是 bug，不需要两阶段
+  提交去消除（这本来就是罕见的、operator 驱动的事件，不是需要跨进程协调的高频路径）。
+- `ControlPlaneLogSink::rotate_active_key(new_key_id, now_ms) -> bool`：`active_key_id_` 同样从
+  `const` 改为可变；`finish_append()` 新增显式 `key_id` 参数（原来直接读成员），两个现有调用点
+  （`append_snapshot()`、`append_generic()`）都显式传 `active_key_id_`，零行为改变。
+  `rotate_active_key()` **不走 `append_generic()`**——它内部按（还没翻转的）`active_key_id_`
+  解析签名 key，这里恰恰需要显式用 `new_key_id` 签，理由同上；直接手写 encode + `finish_append`
+  （显式 `key_id`）。`run_recovery_scan()` 的扫描循环在调用既有的 `read_control_plane_header`/
+  `switch (hdr.record_type)` **之前**，新增一段 `peek_is_key_rotated_record()` 前置分支——命中就
+  走独立的 `decode_key_rotated_frame` 路径（同样校验哈希链、不折叠跨记录状态，理由同 sidecar），
+  未命中才继续走原有的 `DurableRecordType` 分发。`KeyRotated` **不是** `switch` 里的一个
+  `case`（它压根不属于 `DurableRecordType`），所以这里不存在"漏加 case 会不会被 `-Wswitch`
+  捕获"的问题——用不同的机制（marker 字节 peek）从根本上绕开了这个顾虑，不需要像 Phase 3 的
+  `gate_name()` 那样依赖穷举 switch 的编译期强制。
+
+**明确排除的范围（附理由）**：
+- **不做旧 key 的自动退役**：`KeyRing::retire()` 早就存在，但 L4 spec 自己把"销毁 wrapped blob"
+  绑定在压缩/归档密封之后——这个仓库目前没有一条真正在跑的压缩/归档管线。在还不知道旧帧是否已经
+  不需要恢复的情况下自动 `retire()` 旧 key 是危险的。这一轮只提供轮换*机制*，退役依然是 operator
+  的显式手动动作，同 Phase 0 早就写好的"`retire()` 只管退役本身，谁还在用哪个 key_id 是调用方的
+  责任"。
+- **不做跨线程的轮换触发通道**：见上方"writer-quiesce 协议是免费的"——真要支持一个独立的 operator
+  线程/进程触发轮换，需要一个新的命令通道（例如仿照 `ToReconcileRing` 的 SPSC 环模式），是独立的、
+  这一轮没有被要求的功能。
+- **不做重启时从 KeyRotated 历史自动推导/校验 `active_key_id_`**：`active_key_id_` 完全来自外部
+  构造参数（operator 配置）；一次成功的实时轮换之后，operator 必须记得在下一次重启时把外部配置
+  更新成新 key_id，否则重启会被 Phase 2 那条一致性检查判成 `Corrupt`（即使数据完全没问题）。让
+  recovery 转而信任日志自己的 `KeyRotated` 历史来推导"当前应该是哪个 key"，是一个更大的信任模型
+  变化（把权威来源从外部配置移到日志内容本身），需要单独评估，不是这一轮顺带做的事。这一点作为
+  已知的操作纪律显式披露（同 ADR-019 D4"轮换需要有责任人和文档化流程"的既有先例），不是 bug。
+
+**测试范围**（测试方法名是测试文件自己的本地标识符，未登记进 `spec_xref_check.py` 的搜索文件列表，
+同 Phase 3 "Fixture" 一条的先例，不作为跨文件核对符号，这里不加反引号）：`test_durable_audit_sink.cpp`
+新增轮换用例，含关键回归测试 CrashBetweenRotateAndFirstAppendStillRecoversCleanly（append→rotate
+含主日志重新锚定→销毁 sink 模拟崩溃→用新 key_id 重启，验证 `recovery_status()` 不是 `Corrupt`，
+直接验证上面"崩溃窗口"设计的正确性）以及 sidecar 跨重启延续性测试。`test_control_plane_log_sink.cpp`
+新增对称用例（RotateActiveKeyRequiresNewKeyAlreadyLoaded/
+RotateActiveKeySucceedsAndSubsequentAppendUsesNewKey/CrashImmediatelyAfterRotateStillRecoversCleanly/
+RotateActiveKeyFailsClosedWhenFenced）加 RecoveryScanAcceptsKeyRotatedFrameWithoutCorrupting
+证明扫描循环里新增的 marker peek 前置分支真正生效、没有被现有的 `DurableRecordType` 分发路径
+误判/吞掉。
+
+`spec_xref_check.py --quiet`/`tools/spec_enum_diff.py` 均已重跑确认：前者 exit 0，后者
+`0 value conflict(s), 0 name conflict(s)`（`KeyRotatedRecord` 完全不经过它的 spec-vs-code 枚举
+比对，因为它压根不是任何枚举的成员）。`key_ring.hpp`/`kek_loader.hpp`/`durable_control_plane.hpp`
+的 `DurableRecordType` 枚举本身，三者均零改动。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
