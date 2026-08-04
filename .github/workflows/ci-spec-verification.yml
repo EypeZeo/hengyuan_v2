@@ -98,7 +98,7 @@ jobs:
       # so CI fetches the pinned release the same way the local setup does.
       - name: Cache TLA+ tools
         id: cache-tla
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: formal/tools/tla2tools.jar
           key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
@@ -181,7 +181,7 @@ jobs:
 
       - name: Cache TLA+ tools
         id: cache-tla
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: formal/tools/tla2tools.jar
           key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
