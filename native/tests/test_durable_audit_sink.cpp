@@ -42,6 +42,15 @@ std::vector<std::byte> test_key() {
     return k;
 }
 
+// A key distinct from test_key(), for Phase 4 rotation tests that need a
+// genuinely second key loaded into the same KeyRing.
+std::vector<std::byte> distinct_key(std::uint8_t seed) {
+    static const char kKey[] = "durable-audit-sink-test-key";
+    std::vector<std::byte> k(sizeof(kKey) - 1);
+    for (std::size_t i = 0; i < k.size(); ++i) k[i] = static_cast<std::byte>(static_cast<unsigned char>(kKey[i]) ^ seed);
+    return k;
+}
+
 std::array<std::byte, kKeyBlockSize> make_plaintext_key(std::uint8_t fill) {
     std::array<std::byte, kKeyBlockSize> key{};
     for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::byte>(fill + i);
@@ -139,6 +148,11 @@ protected:
         std::remove((base_path_ + ".lock").c_str());
         std::remove((base_path_ + ".tip").c_str());
         std::remove((base_path_ + ".tip.tmp").c_str());
+        // Phase 4: rotate_active_key()'s KeyRotated sidecar.
+        std::remove((base_path_ + ".keyrotations").c_str());
+        std::remove((base_path_ + ".keyrotations.lock").c_str());
+        std::remove((base_path_ + ".keyrotations.tip").c_str());
+        std::remove((base_path_ + ".keyrotations.tip.tmp").c_str());
     }
 
     // Overwrites `n` bytes at `offset` in the log file with garbage, for
@@ -544,4 +558,109 @@ TEST_F(DurableAuditSinkTest, CheckpointToOrderRecordPreservesAllFields) {
     EXPECT_EQ(rec.symbol_id, 1u);
     EXPECT_EQ(rec.intended_price_ticks, 100);
     EXPECT_EQ(rec.intended_qty_ticks, 10);
+}
+
+// --- Phase 4: rotate_active_key() ---
+
+TEST_F(DurableAuditSinkTest, RotateActiveKeyRequiresNewKeyAlreadyLoaded) {
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(sink.is_open());
+    EXPECT_FALSE(sink.rotate_active_key(2, 2000));  // key 2 never loaded into key_ring_
+    EXPECT_EQ(sink.active_key_id(), 1u);
+}
+
+TEST_F(DurableAuditSinkTest, RotateActiveKeySucceedsAndSubsequentAppendUsesNewKey) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+        EXPECT_EQ(sink.active_key_id(), 2u);
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1501).acked());
+    }
+
+    // Restart with active_key_id=2 (what a real operator would configure
+    // after a completed rotation) -- both key 1 (for the old frame) and
+    // key 2 (for the new frame + tip anchor) must still be loaded.
+    DurableAuditSink restarted(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_STREQ(cps[0].client_order_id.id, "HY-A");
+}
+
+TEST_F(DurableAuditSinkTest, RotateActiveKeyOnEmptyLogSkipsMainAnchorReanchor) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(sink.is_open());
+    ASSERT_TRUE(sink.rotate_active_key(2, 1000));
+    EXPECT_EQ(sink.active_key_id(), 2u);
+    // Main log was still empty at rotation time -- the first real append now
+    // correctly uses the rotated key.
+    EXPECT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1001).acked());
+}
+
+TEST_F(DurableAuditSinkTest, CrashBetweenRotateAndFirstAppendStillRecoversCleanly) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+        // Simulate a crash right here -- no further appends after rotation.
+    }
+
+    // Restart configured with the NEW key (matching a real operator who
+    // updated config after the rotation reported success) must NOT see this
+    // as Corrupt, even though the crash landed immediately after rotation.
+    DurableAuditSink restarted(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_NE(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+TEST_F(DurableAuditSinkTest, RotationSidecarSurvivesRestart) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0x55), rec3), KeyRingAddStatus::Ok);
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_FALSE(restarted.rotation_fenced());
+    ASSERT_TRUE(restarted.rotation_log_open());
+    // A second rotation after restart proves the sidecar's own sequence/mac
+    // chain correctly continued from what run_rotation_recovery_scan()
+    // recovered, not from a reset-to-zero state.
+    EXPECT_TRUE(restarted.rotate_active_key(3, 2000));
+    EXPECT_EQ(restarted.active_key_id(), 3u);
+}
+
+TEST_F(DurableAuditSinkTest, RotateActiveKeyFailsClosedWhenFenced) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    corrupt_log_byte(40);
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.fenced());
+    EXPECT_FALSE(restarted.rotate_active_key(2, 2000));
+    EXPECT_EQ(restarted.active_key_id(), 1u);
 }

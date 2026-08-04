@@ -398,3 +398,102 @@ TEST_F(ControlPlaneLogSinkTest, RecoveryWithUnresolvableFrameKeyIsCorrupt) {
     EXPECT_EQ(sink.recovery_status(), RecoveryScanStatus::Corrupt);
     EXPECT_TRUE(sink.fenced());
 }
+
+// --- Phase 4: rotate_active_key() ---
+
+TEST_F(ControlPlaneLogSinkTest, RotateActiveKeyRequiresNewKeyAlreadyLoaded) {
+    ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(sink.is_open());
+    EXPECT_FALSE(sink.rotate_active_key(2, 2000));  // key 2 never loaded into key_ring_
+    EXPECT_EQ(sink.active_key_id(), 1u);
+}
+
+TEST_F(ControlPlaneLogSinkTest, RotateActiveKeySucceedsAndSubsequentAppendUsesNewKey) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, make_plaintext_key(0x20), rec2), KeyRingAddStatus::Ok);
+
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        EndpointWeightConfig cfg{};
+        ASSERT_TRUE(sink.append_weight_config(cfg).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+        EXPECT_EQ(sink.active_key_id(), 2u);
+        RateLimitUsageSnapshotPayload usage{};
+        ASSERT_TRUE(sink.append_usage_snapshot(usage).acked());
+    }
+
+    // Restart with active_key_id=2 (what a real operator would configure
+    // after a completed rotation) -- both key 1 (for the pre-rotation frame)
+    // and key 2 (for the KeyRotated frame, the post-rotation frame, and the
+    // tip anchor) must still be loaded.
+    ControlPlaneLogSink restarted(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_FALSE(restarted.fenced());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+TEST_F(ControlPlaneLogSinkTest, CrashImmediatelyAfterRotateStillRecoversCleanly) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, make_plaintext_key(0x20), rec2), KeyRingAddStatus::Ok);
+
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        EndpointWeightConfig cfg{};
+        ASSERT_TRUE(sink.append_weight_config(cfg).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+        // Simulate a crash right here -- no further appends after rotation.
+        // Unlike DurableAuditSink, this class's rotate_active_key() writes
+        // the KeyRotated frame through the SAME finish_append() path every
+        // other append uses, which already re-anchors the tip on every
+        // single call -- there is no separate "re-anchor" step and therefore
+        // no extra crash window to close here.
+    }
+
+    ControlPlaneLogSink restarted(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_NE(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+TEST_F(ControlPlaneLogSinkTest, RotateActiveKeyFailsClosedWhenFenced) {
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        EndpointWeightConfig cfg{};
+        ASSERT_TRUE(sink.append_weight_config(cfg).acked());
+    }
+    // A fresh KeyRing that never loaded key_id 1 -- same fencing precedent as
+    // RecoveryWithUnresolvableFrameKeyIsCorrupt above.
+    std::array<std::byte, kKekSize> other_kek{};
+    for (std::size_t i = 0; i < other_kek.size(); ++i) other_kek[i] = static_cast<std::byte>(0x99 + i);
+    KeyRing empty_ring(other_kek);
+
+    ControlPlaneLogSink sink(base_path_, empty_ring, 1);
+    ASSERT_TRUE(sink.fenced());
+    EXPECT_FALSE(sink.rotate_active_key(2, 2000));
+    EXPECT_EQ(sink.active_key_id(), 1u);
+}
+
+TEST_F(ControlPlaneLogSinkTest, RecoveryScanAcceptsKeyRotatedFrameWithoutCorrupting) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, make_plaintext_key(0x20), rec2), KeyRingAddStatus::Ok);
+
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        EndpointWeightConfig cfg{};
+        ASSERT_TRUE(sink.append_weight_config(cfg).acked());  // seq 0, key 1
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));          // seq 1, key 2 (KeyRotated)
+        RateLimitUsageSnapshotPayload usage{};
+        ASSERT_TRUE(sink.append_usage_snapshot(usage).acked());  // seq 2, key 2
+        GenerationBridgePayload bridge{};
+        ASSERT_TRUE(sink.append_generation_bridge(bridge).acked());  // seq 3, key 2
+    }
+
+    // If the new `case DurableRecordType::KeyRotated:` were missing, this
+    // frame would fall into the existing `default: return Corrupt` -- this
+    // switch already has a default case, so a missing case here is NOT a
+    // compile-time -Wswitch error, only a runtime Corrupt at restart.
+    ControlPlaneLogSink restarted(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_FALSE(restarted.fenced());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+}
