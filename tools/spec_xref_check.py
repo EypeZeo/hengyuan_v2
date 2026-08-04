@@ -71,6 +71,12 @@ SEARCH_FILES = [
     # entry above was added to close.
     REPO_ROOT / "native" / "include" / "hengyuan" / "control_plane_frame_codec.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "control_plane_log_sink.hpp",
+    # Phase 5 (docs/SPEC_INVARIANTS.md): export_worker.hpp is a new file whose
+    # symbols (LastRemoteAckedTipStore, ExportRunStatus, etc.) would otherwise
+    # be unsearchable the moment they're registered -- same "a symbol can only
+    # drift unnoticed in a file nobody looks at" gap the durable_log_store.hpp/
+    # control_plane_frame_codec.hpp entries above were added to close.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "export_worker.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
