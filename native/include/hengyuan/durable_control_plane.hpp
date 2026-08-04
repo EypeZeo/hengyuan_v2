@@ -88,6 +88,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <type_traits>
 
@@ -194,6 +195,17 @@ enum class DurableRecordType : std::uint8_t {
                                   // apply record. Index key = {candidate_id,
                                   // journal_seq}; entry_mac MUST be
                                   // HY-SEALJRN-v1-recomputed (not opaque-only)
+    // Phase 4 (docs/SPEC_INVARIANTS.md): deliberately NOT extended with a
+    // KeyRotated value here. This enum is a closed, spec-transcribed,
+    // persisted wire discriminator (docs/BINANCE_PRIVATE_REST_L4_SPEC.md:
+    // 2511-2561, ending at SealJournalApplied=16) -- tools/spec_enum_diff.py
+    // treats any code enumerator absent from that transcription as an
+    // unconditional NAME_CONFLICT, with no delta/allowlist mechanism (unlike
+    // e.g. OrchestratorGate's spec block, which the spec itself marks as a
+    // "... existing N values unchanged ..." delta listing new proposed
+    // values). KeyRotated has no spec basis anywhere, so it lives as its own
+    // bespoke, non-DurableRecordType wire record instead -- see
+    // control_plane_frame_codec.hpp's KeyRotatedRecord section.
 };
 
 // --- FrameTimeKind ---
@@ -493,6 +505,35 @@ struct FreezeEpochWatermarkPayload {
 };
 static_assert(std::is_trivially_copyable_v<FreezeEpochWatermarkPayload>);
 static_assert(std::is_standard_layout_v<FreezeEpochWatermarkPayload>);
+
+// --- KeyRotationPayload ---
+// Phase 4 (docs/SPEC_INVARIANTS.md) -- NOT a spec-transcribed struct (neither
+// spec doc defines a runtime key-rotation record; this is the one place this
+// round genuinely invents wire format, done deliberately and disclosed here
+// rather than dressed up as a transcription). Durable evidence of a live
+// active_key_id_ rotation on DurableAuditSink (own sidecar log) or
+// ControlPlaneLogSink (own main log). Carried by control_plane_frame_codec.hpp's
+// bespoke KeyRotatedRecord frame -- deliberately NOT a DurableRecordType
+// member (that enum is closed/spec-transcribed; see KeyRotatedRecord's own
+// header comment for why). The frame carrying this payload is
+// always signed under new_key_id (already verified resolvable in KeyRing at
+// the point this is written); old_key_id travels as authenticated payload
+// data instead -- same convention durable_control_plane.hpp's own
+// GenerationBridgePayload already established for prev_key_id/new_key_id, not
+// a new rule invented for this struct.
+struct KeyRotationPayload {
+    std::uint32_t old_key_id{0};
+    std::uint32_t new_key_id{0};
+    // The rotated log's own next_sequence_-1 at the moment of rotation (the
+    // tip sequence re-anchored under new_key_id). kNoPriorTipSequence
+    // (durable_control_plane.hpp, defined alongside this struct) means the
+    // rotation happened on a log that had never written a frame yet.
+    std::uint64_t log_sequence_at_rotation{0};
+};
+static_assert(std::is_trivially_copyable_v<KeyRotationPayload>);
+static_assert(std::is_standard_layout_v<KeyRotationPayload>);
+
+inline constexpr std::uint64_t kNoPriorTipSequence = std::numeric_limits<std::uint64_t>::max();
 
 // ===========================================================================
 // DurableControlPlaneSink dependency structs (轨道 C) -- the 6 payload types
