@@ -7,12 +7,17 @@
 // A "process restart" is simulated by destroying one DurableAuditSink
 // instance and constructing a fresh one over the same path -- recovery
 // happens automatically in the constructor, exactly like a real restart.
+//
+// Phase 2 (docs/SPEC_INVARIANTS.md): DurableAuditSink now takes a KeyRing&
+// + active_key_id instead of a raw key -- the fixture builds a KeyRing with
+// key_id=1 loaded, mirroring test_control_plane_log_sink.cpp's own fixture.
 #include <gtest/gtest.h>
 #include <hengyuan/durable_audit_sink.hpp>
 
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 
 #ifdef __linux__
@@ -35,6 +40,12 @@ std::vector<std::byte> test_key() {
     std::vector<std::byte> k(sizeof(kKey) - 1);
     std::memcpy(k.data(), kKey, k.size());
     return k;
+}
+
+std::array<std::byte, kKeyBlockSize> make_plaintext_key(std::uint8_t fill) {
+    std::array<std::byte, kKeyBlockSize> key{};
+    for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::byte>(fill + i);
+    return key;
 }
 
 AuditRecord make_intent(const char* coid, std::int64_t price, std::int64_t qty, std::uint32_t symbol_id) {
@@ -97,6 +108,7 @@ constexpr std::array<std::byte, kMacLen> kZeroMac{};
 class DurableAuditSinkTest : public ::testing::Test {
 protected:
     std::string base_path_;
+    std::unique_ptr<KeyRing> key_ring_;
 
     void SetUp() override {
         static int counter = 0;
@@ -111,6 +123,13 @@ protected:
             "/tmp/hy_das_" + std::to_string(getpid()) + "_" + std::to_string(counter) + ".log";
 #endif
         remove_all();
+
+        std::array<std::byte, kKekSize> kek{};
+        for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x20 + i);
+        key_ring_ = std::make_unique<KeyRing>(kek);
+
+        WrappedKeyRecord rec{};
+        ASSERT_EQ(key_ring_->add_key(1, test_key(), rec), KeyRingAddStatus::Ok);
     }
 
     void TearDown() override { remove_all(); }
@@ -155,8 +174,10 @@ protected:
     void append_prefix_of_a_real_frame(const AuditRecord& rec, std::uint64_t sequence_number,
                                         std::array<std::byte, kMacLen> prev_mac, std::size_t prefix_len) {
         std::array<std::byte, kOrderEventFrameSize> full_frame{};
-        auto key = test_key();
-        auto n = encode_order_event_frame(full_frame, /*key_id=*/0u, sequence_number,
+        std::array<std::byte, kKeyBlockSize> key_block{};
+        ASSERT_TRUE(key_ring_->active_key(1, key_block));
+        std::span<const std::byte> key(key_block.data(), key_block.size());
+        auto n = encode_order_event_frame(full_frame, /*key_id=*/1u, sequence_number,
                                            FrameTimeKind::ServerCorrectedUtc,
                                            2000, rec, prev_mac, key);
         ASSERT_EQ(n, kOrderEventFrameSize);
@@ -193,7 +214,7 @@ protected:
 // --- Fresh store / basic lifecycle ---
 
 TEST_F(DurableAuditSinkTest, FreshStoreIsClean) {
-    DurableAuditSink sink(base_path_, test_key());
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
     ASSERT_TRUE(sink.is_open());
     EXPECT_FALSE(sink.fenced());
     EXPECT_EQ(sink.recovery_status(), RecoveryScanStatus::Clean);
@@ -201,7 +222,7 @@ TEST_F(DurableAuditSinkTest, FreshStoreIsClean) {
 }
 
 TEST_F(DurableAuditSinkTest, AppendSucceedsAndAcksIncrementingSequence) {
-    DurableAuditSink sink(base_path_, test_key());
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
     ASSERT_TRUE(sink.is_open());
 
     auto r1 = sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000);
@@ -217,13 +238,13 @@ TEST_F(DurableAuditSinkTest, AppendSucceedsAndAcksIncrementingSequence) {
 
 TEST_F(DurableAuditSinkTest, ExchangeFinalOrderNeedsNoRecoveryAfterRestart) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
         ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
         ASSERT_TRUE(sink.append_durable(make_filled("HY-A", 1, 555, 10, 100), 1003).acked());
     }
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_TRUE(restarted.is_open());
     EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean);
     EXPECT_TRUE(restarted.recovered_checkpoints().empty())
@@ -232,12 +253,12 @@ TEST_F(DurableAuditSinkTest, ExchangeFinalOrderNeedsNoRecoveryAfterRestart) {
 
 TEST_F(DurableAuditSinkTest, DanglingSubmittingRecoversAsAmbiguous) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
         // No outcome ever lands -- simulates a crash right after the POST.
     }
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_TRUE(restarted.is_open());
     ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
     auto cps = restarted.recovered_checkpoints();
@@ -251,12 +272,12 @@ TEST_F(DurableAuditSinkTest, DanglingSubmittingRecoversAsAmbiguous) {
 
 TEST_F(DurableAuditSinkTest, AcceptedButUnresolvedRecoversAsAccepted) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
         ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
     }
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
     auto cps = restarted.recovered_checkpoints();
     ASSERT_EQ(cps.size(), 1u);
@@ -266,7 +287,7 @@ TEST_F(DurableAuditSinkTest, AcceptedButUnresolvedRecoversAsAccepted) {
 
 TEST_F(DurableAuditSinkTest, MultipleOrdersRecoveredIndependently) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
         ASSERT_TRUE(sink.append_durable(make_intent("HY-B", 200, 20, 2), 1002).acked());
@@ -275,7 +296,7 @@ TEST_F(DurableAuditSinkTest, MultipleOrdersRecoveredIndependently) {
         ASSERT_TRUE(sink.append_durable(make_filled("HY-B", 2, 777, 20, 200), 1005).acked());
         // HY-A stays dangling Submitting; HY-B resolves to Filled.
     }
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
     auto cps = restarted.recovered_checkpoints();
     ASSERT_EQ(cps.size(), 1u) << "only HY-A should need recovery; HY-B is exchange-final";
@@ -287,7 +308,7 @@ TEST_F(DurableAuditSinkTest, MultipleOrdersRecoveredIndependently) {
 
 TEST_F(DurableAuditSinkTest, TornTailWriteDiscardsOnlyTheIncompleteRecord) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         // Anchor now correctly points at sequence 0. Simulate a crash mid-way
         // through what would have been the NEXT append (Submitting) -- a
@@ -298,7 +319,7 @@ TEST_F(DurableAuditSinkTest, TornTailWriteDiscardsOnlyTheIncompleteRecord) {
     append_prefix_of_a_real_frame(make_submitted("HY-A", 100, 10, 1), /*sequence_number=*/1, kZeroMac,
                                    /*prefix_len=*/30);
 
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_TRUE(restarted.is_open());
     ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered)
         << "one complete frame (Intent) should remain and recover cleanly";
@@ -308,6 +329,30 @@ TEST_F(DurableAuditSinkTest, TornTailWriteDiscardsOnlyTheIncompleteRecord) {
         << "only the first frame (Intent) is real; the trailing garbage must be discarded as a torn tail";
 }
 
+TEST_F(DurableAuditSinkTest, TornTailUnderSixBytesIsRecoveredNotCorrupt) {
+    // Phase 2 (docs/SPEC_INVARIANTS.md): peek_frame_key_id() needs 6 bytes;
+    // decode_order_event_frame()'s own Truncated threshold is 27 bytes. A
+    // torn tail leaving fewer than 6 bytes must NOT be misclassified as
+    // Corrupt just because the key_id peek itself failed -- it must fall
+    // through to decode_order_event_frame's own length check and come back
+    // Truncated, same as any other torn tail.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    append_prefix_of_a_real_frame(make_submitted("HY-A", 100, 10, 1), /*sequence_number=*/1, kZeroMac,
+                                   /*prefix_len=*/3);
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered)
+        << "a 3-byte torn tail (fewer than peek_frame_key_id's own 6-byte minimum) must still be Recovered, "
+           "never misclassified as Corrupt from the key_id peek alone";
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Intent);
+}
+
 TEST_F(DurableAuditSinkTest, AnchorAheadOfTruncatedLogIsCorruptTailDeletion) {
     // Distinct from the torn-write case above: here BOTH appends genuinely
     // completed (anchor legitimately advanced to sequence 1), and the log's
@@ -315,14 +360,14 @@ TEST_F(DurableAuditSinkTest, AnchorAheadOfTruncatedLogIsCorruptTailDeletion) {
     // a corrupted filesystem) looks like, not a crash -- must be Corrupt,
     // never silently treated as "the second write just didn't happen."
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
     }
     const std::size_t full_size = log_file_size();
     truncate_log_to(full_size - 20);
 
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_TRUE(restarted.is_open());
     EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
     EXPECT_TRUE(restarted.fenced());
@@ -330,7 +375,7 @@ TEST_F(DurableAuditSinkTest, AnchorAheadOfTruncatedLogIsCorruptTailDeletion) {
 
 TEST_F(DurableAuditSinkTest, ChecksumCorruptionMidLogIsCorruptNotSilentlySkipped) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
         ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
@@ -339,7 +384,7 @@ TEST_F(DurableAuditSinkTest, ChecksumCorruptionMidLogIsCorruptNotSilentlySkipped
     // end of the file) -- this must be Corrupt, not treated as a torn tail.
     corrupt_log_byte(40);
 
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_TRUE(restarted.is_open());
     EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
     EXPECT_TRUE(restarted.fenced()) << "a Corrupt scan must fail closed -- no appends allowed";
@@ -347,25 +392,25 @@ TEST_F(DurableAuditSinkTest, ChecksumCorruptionMidLogIsCorruptNotSilentlySkipped
 
 TEST_F(DurableAuditSinkTest, ChecksumCorruptionOnLastFrameIsCorruptNotTruncated) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
     }
     const std::size_t size = log_file_size();
     corrupt_log_byte(size - 1);  // last byte of the (complete) last frame's mac
 
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt)
         << "a complete-but-corrupt frame at the physical end must never be treated like a torn write";
 }
 
 TEST_F(DurableAuditSinkTest, CorruptSinkRefusesAppends) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
     }
     corrupt_log_byte(40);
 
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_TRUE(restarted.fenced());
     auto result = restarted.append_durable(make_intent("HY-B", 1, 1, 1), 2000);
     EXPECT_FALSE(result.acked());
@@ -374,43 +419,103 @@ TEST_F(DurableAuditSinkTest, CorruptSinkRefusesAppends) {
 // --- Single-writer lock ---
 
 TEST_F(DurableAuditSinkTest, SecondSinkOverSamePathFailsToOpen) {
-    DurableAuditSink first(base_path_, test_key());
+    DurableAuditSink first(base_path_, *key_ring_, 1);
     ASSERT_TRUE(first.is_open());
 
-    DurableAuditSink second(base_path_, test_key());
+    DurableAuditSink second(base_path_, *key_ring_, 1);
     EXPECT_FALSE(second.is_open()) << "the lock must be exclusive while `first` is still alive";
 }
 
 TEST_F(DurableAuditSinkTest, LockIsReleasedOnDestruction) {
     {
-        DurableAuditSink first(base_path_, test_key());
+        DurableAuditSink first(base_path_, *key_ring_, 1);
         ASSERT_TRUE(first.is_open());
     }
-    DurableAuditSink second(base_path_, test_key());
+    DurableAuditSink second(base_path_, *key_ring_, 1);
     EXPECT_TRUE(second.is_open()) << "the lock must be released once `first` is destroyed";
 }
 
-// --- Wrong key ---
+// --- Wrong / mismatched key ---
 
 TEST_F(DurableAuditSinkTest, WrongKeyOnRestartIsCorrupt) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
     }
-    std::vector<std::byte> wrong_key(4, std::byte{0xAB});
-    DurableAuditSink restarted(base_path_, wrong_key);
+    // A fresh KeyRing that never loaded key_id 1 -- simulates an environment
+    // mismatch (the key this log was signed under isn't available), same
+    // idiom as ControlPlaneLogSinkTest::RecoveryWithUnresolvableFrameKeyIsCorrupt.
+    std::array<std::byte, kKekSize> other_kek{};
+    for (std::size_t i = 0; i < other_kek.size(); ++i) other_kek[i] = static_cast<std::byte>(0x99 + i);
+    KeyRing empty_ring(other_kek);
+
+    DurableAuditSink restarted(base_path_, empty_ring, 1);
     EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(DurableAuditSinkTest, ActiveKeyIdMismatchWithSignedAnchorIsCorrupt) {
+    // Phase 2 (docs/SPEC_INVARIANTS.md): the anchor's own key_id (1, MAC-
+    // verified successfully) must equal the constructor's active_key_id_.
+    // This is a narrower, more precise scenario than WrongKeyOnRestartIsCorrupt
+    // above -- here the MAC verification itself SUCCEEDS (key 1 is loaded and
+    // correctly resolves the anchor), but the configured identity (key 2)
+    // doesn't match what actually signed the durable state, and must still
+    // be rejected.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, make_plaintext_key(0x55), rec2), KeyRingAddStatus::Ok);
+
+    DurableAuditSink restarted(base_path_, *key_ring_, /*active_key_id=*/2);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(DurableAuditSinkTest, RestartWithGenuinelyFreshKeyRingViaPersistedWrappedRecord) {
+    // Unlike every other test in this file (which reuses the same in-memory
+    // key_ring_ across "before"/"after restart" blocks), this test verifies
+    // the path closest to a REAL process restart: the key is recovered from
+    // a persisted WrappedKeyRecord on a brand-new KeyRing instance, not a
+    // reused in-memory object.
+    std::array<std::byte, kKekSize> kek{};
+    for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x77 + i);
+
+    WrappedKeyRecord persisted{};
+    {
+        KeyRing writer_ring(kek);
+        ASSERT_EQ(writer_ring.add_key(1, test_key(), persisted), KeyRingAddStatus::Ok);
+
+        DurableAuditSink sink(base_path_, writer_ring, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+
+    // Brand-new KeyRing object, same KEK, key loaded ONLY via the persisted
+    // WrappedKeyRecord -- not the same in-memory KeyRing that wrote the log.
+    KeyRing reader_ring(kek);
+    ASSERT_EQ(reader_ring.load_wrapped_key(persisted), KeyRingLoadStatus::Ok);
+
+    DurableAuditSink restarted(base_path_, reader_ring, 1);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_STREQ(cps[0].client_order_id.id, "HY-A");
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
 }
 
 // --- InFlightRegistry rebuild integration ---
 
 TEST_F(DurableAuditSinkTest, RepopulateInFlightRegistryHelperRegistersEveryCheckpoint) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
     }
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
 
     InFlightRegistry registry;
@@ -422,12 +527,12 @@ TEST_F(DurableAuditSinkTest, RepopulateInFlightRegistryHelperRegistersEveryCheck
 
 TEST_F(DurableAuditSinkTest, CheckpointToOrderRecordPreservesAllFields) {
     {
-        DurableAuditSink sink(base_path_, test_key());
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
         ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
         ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
     }
-    DurableAuditSink restarted(base_path_, test_key());
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
     auto cps = restarted.recovered_checkpoints();
     ASSERT_EQ(cps.size(), 1u);

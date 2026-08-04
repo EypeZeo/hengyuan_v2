@@ -218,8 +218,9 @@ spec 字面文本的地方，连同理由——**不是遗漏，是范围裁决*
 - **compaction / generation 切换 / seal journal 不做**，日志无限增长，这是已知缺口，等后续单独排期。
 - **§6.1.1.2 密钥派生/轮换/KEK 包裹存储不做**：`DurableAuditSink` 构造时接收一个预先派生好的原始
   key，`key_id` 固定为 0，不做轮换。**真实上线前这一点必须补上**，不是可以无限期搁置的简化。
-  **[Phase 0 已补上底座]**——见下方"Phase 0：共享 durability 基础设施"小节；`DurableAuditSink`
-  本身接入这套底座是 Phase 2 的范围，这一轮（Phase 0）还没有做。
+  **[Phase 0 已补上底座，Phase 2 已接入]**——见下方"Phase 0：共享 durability 基础设施"/
+  "Phase 2：DurableAuditSink 接入 KeyRing"两个小节；`key_id` 现在是真实值，不再固定为 0，但真正的
+  运行时轮换仍然是 Phase 4 的范围。
 - **只读写帧格式 v3，不做 v1/v2 历史格式解码**：这个代码库从未写过 durable 帧，没有历史格式要兼容；
   版本号不对时，实际代码路径是 `decode_order_event_frame` 返回 `UnknownVersion`，
   `run_recovery_scan()` 把它和其他非 `Ok`/`Truncated` 状态一样映射成 `RecoveryScanStatus::Corrupt`
@@ -267,7 +268,8 @@ POSIX flock/Windows 无共享 CreateFileA、每次 append 同步 fsync、本地 
 **[已实现]** `DurableControlPlaneSink` 真实实现 / `orchestrate_submit` 热路径接入 / 密钥轮换 /
 `ExternalAnchorClient` 总路线图（5 个 Phase）的第一个执行单元。给 `§6.1.1.2` 的密钥轮换建一个真正
 可用的底座，并把这个底座接进现有帧格式——**这一轮不做**`DurableAuditSink` 本身切换到用这套底座
-（Phase 2）、真正的运行时轮换生命周期（Phase 4）、`ControlPlaneSink`（Phase 1）。
+（Phase 2，**已接入**，见下方对应小节）、真正的运行时轮换生命周期（Phase 4）、`ControlPlaneSink`
+（Phase 1，**已实现**）。
 
 - **KEK 权威来源 = 独立的 0600/0400 权限文件**（用户决策），复用 `env_loader.hpp` 已有的权限检查/
   反符号链接/mlock/安全擦除模式，但独立成新类 KekLoader（`kek_loader.hpp`）——载荷是定长 32
@@ -681,6 +683,73 @@ baseline 校验等）——刻意延后，`recover_control_plane` 里 `out_uncle
 `spec_enum_diff.py` 本轮**零改动**（零新增枚举）；`spec_xref_check.py --quiet` 需重跑并通过——
 新增文字里非 spec 转写的实现层标识符（DurableLogStore、ControlPlaneLogSink、
 kMaxSnapshotSymbols 等）均未加反引号，避免误报"未在任何搜索文件命中"。
+
+### Phase 2：DurableAuditSink 接入 KeyRing
+
+`DurableControlPlaneSink` 真实实现 / `orchestrate_submit` 热路径接入 / 密钥轮换 /
+`ExternalAnchorClient` 总路线图的第三个执行单元。Phase 0（PR #18）建了 KEK/KeyRing/keyed-frame-v4
+底座；Phase 1（PR #22）用这套底座建了第一个真实消费者 ControlPlaneLogSink，同时把
+`DurableAuditSink` 的平台 I/O 抽成共享的 DurableLogStore，但没有接 KeyRing——`append_durable()`
+仍然用字面量 `key_id=0u`，tip-anchor 也是同样的硬编码（见上面"durable 审计日志"条目 §6.1.1.2
+bullet 和"Phase 0"小节开篇行）。这一轮把 `DurableAuditSink` 接上真正的 KeyRing，范围完全对齐早就
+写好的预告：先支持按 key_id 正确验证，**不要求这一步就有运行时轮换**——真正的运行时密钥轮换生命
+周期依然是 Phase 4 的范围，`KeyRing` 本身无内部并发保护这一点也已经在 Phase 1 那轮外部评审里定过
+调（运行时轮换的并发安全设计整体留给 Phase 4），这一轮不重复展开。
+
+设计上尽量镜像 ControlPlaneLogSink（Phase 1 建立的先例），但有三处刻意不同，照搬会引入真实回归：
+
+1. **`finalize_scan_with_anchor_check()` 保留 4 参数签名和"迟到 fsync 窗口"容忍分支**——
+   `DurableAuditSink` 版本比 `ControlPlaneLogSink` 的同名方法多一个 `macs_by_sequence` 参数，
+   包含一段 `anchor.sequence_number < log_tip_sequence` 时仍可判 Clean 的容忍逻辑（只要 anchor
+   声称的 mac 匹配日志里对应 sequence 的真实帧 mac）。这一轮只换这个方法内部解析 anchor 签名
+   key 的来源，不向 `ControlPlaneLogSink` 的 3 参数版本看齐。
+2. **`peek_frame_key_id()` 失败不等于 `Corrupt`**——它自己的头注释明确写了"返回 false 不代表
+   Corrupt"，只需要 6 字节；`decode_order_event_frame()` 自己的 Truncated 判断需要 27 字节。
+   如果 peek 失败就直接返回 `Corrupt`，会把真正的断尾崩溃（残留字节 < 6）误判成损坏——round-6-P0
+   torn-write-vs-corruption 区分本身要保护的场景。正确处理：peek 失败时用全零哑元 key 继续调用
+   `decode_order_event_frame`，让它自己的 27 字节长度检查接管，正确分类成 `Truncated`；只有
+   peek **成功**之后 `key_ring_.active_key()` 查找失败，才是真正的"签名 key 在当前环境解析不出
+   来"，返回 `Corrupt`。
+3. **tip-anchor 改为 peek 自身的 `key_id` 字段，而不是直接假设 active_key_id_**——新增
+   `detail::peek_tip_anchor_key_id()`（同 `peek_frame_key_id` 的哲学：只读 key_id 字段，不验证
+   MAC，返回 false 只代表长度不够）。MAC 验证通过之后，还新增一条一致性校验：**非空日志时，
+   anchor 自己的 `key_id` 必须等于构造函数传入的 active_key_id_，不一致即 `Corrupt`**——防止
+   "重启时把 active_key_id 参数悄悄换成别的值，却被静默当成有效接受"这种配置错误/未授权身份
+   切换。用现有的 `RecoveryScanStatus::Corrupt`，不发明新枚举值。
+
+其余改动：构造函数签名变为 `(const std::string& path, KeyRing& key_ring, std::uint32_t
+active_key_id)`；移除原来持有原始 key 的私有成员和手工 HMAC block-derive 逻辑（职责移交
+`KeyRing`，Phase 0 已建立）；`append_durable()` 每次实时 `key_ring_.active_key(active_key_id_, ...)` 查找（实现层
+私有成员命名，不作为登记符号），失败 `Failed` 不 fence（可纠正的配置错误，同 Phase 1
+ControlPlaneLogSink 内部 append_generic 辅助方法的先例，这是本轮**唯一新增**的 Failed-不-fence
+路径——既有的"encode/I/O 失败一律 fence"行为不变，不是这一轮范围）；`ExportTuple.key_id` 从字面量
+`0` 改成 active_key_id_；没有 `set_active_key_id()`（Phase 4 才做）。
+
+**明确排除的范围**（外部评审提过、核实后判定不适用/超出这一轮边界，附理由，避免未来误以为遗漏）：
+
+- **legacy `key_id=0` 数据迁移不做**：`git log` 确认这个仓库从未写过真实 durable 帧（`SubmitPort`
+  仍是 mock-only），零真实部署数据=零迁移成本——同 Phase 0（v3→v4）、Phase 1（DurableLogStore
+  重构）已经用过两次的理由。
+- **不可变 key 快照架构不做**：Phase 1 那轮外部评审已经提过同一个问题，用户当时的拍板是"运行时
+  轮换的并发安全设计整体留给 Phase 4"，这一轮不重新翻案。
+- **`BinanceEnvironment` 环域绑定/独立密码学评审不做**：Phase 0 已经最大限度披露过 HY-KEKWRAP-v1
+  "不是标准 AEAD"的边界；"上线前需要真正的密码学评审"是 `CLAUDE.md` 本身早就声明的、这整个仓库
+  的常态背景，不是这一轮的缺口；环域绑定是超出"接入 KeyRing 做 key 选择"范围的架构改动。
+- **recovery 改流式扫描不做**：和"接入 KeyRing"无关，且正面违反 Phase 1 刚定的"`DurableAuditSink`
+  保持整份读入以维持行为不变"这一决定。
+
+**测试范围**：`test_durable_audit_sink.cpp` 16 个既有用例，15 个只改构造机制（`DurableAuditSink
+sink(base_path_, test_key())` → `DurableAuditSink sink(base_path_, *key_ring_, 1)`），断言不变；
+原有的"错误 key 重启即 Corrupt"用例重新表述为"用一个从未加载过该 key_id 的 KeyRing 做恢复"，镜像
+Phase 1 ControlPlaneLogSink 测试套件里对应的未知帧签名 key 场景（并补上原来漏掉的 `fenced()`
+断言）。新增 3 个测试：MAC 验证成功但 anchor 的 key_id 与 active_key_id_ 不一致依然拒绝（直接
+验证第 3 条设计要点）、断尾 < 6 字节场景（直接验证第 2 条设计要点的 torn-tail 修正）、跨真正独立
+`KeyRing` 实例的持久化重建（用 `add_key()` 拿到的 wrapped-key 记录在一个全新 `KeyRing` 对象上
+`load_wrapped_key()`，而不是像其余测试那样跨"重启前后"复用同一个内存 `KeyRing` 对象——这是外部
+评审指出的一个真实测试质量问题，之前包括 Phase 1 的 ControlPlaneLogSink 测试套件在内都没有真正
+测过这条路径）。
+
+`spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——本轮零新增枚举。
 
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
