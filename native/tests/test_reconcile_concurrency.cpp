@@ -46,10 +46,27 @@
 #include <gtest/gtest.h>
 #include <hengyuan/live_submit_orchestrator.hpp>
 
+#include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace hy;
 
@@ -137,6 +154,36 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     account.can_trade = true;
     account.timestamp_ms = 900;
 
+    // Phase 3: a single shared real DurableAuditSink for the hot thread's
+    // orchestrate_submit() calls -- constructed here, outside the hot loop,
+    // and never touched by the reconcile thread, so the single-writer
+    // constraint DurableAuditSink documents is unaffected by this test's
+    // two-thread design (reconcile thread only calls poll_once(), which never
+    // touches ctx.audit/ctx.durable_audit/ctx.in_flight).
+    std::string durable_audit_path;
+#ifdef _WIN32
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    durable_audit_path = std::string(tmp) + "hy_reconcile_concurrency_" +
+                          std::to_string(GetCurrentProcessId()) + ".log";
+#else
+    durable_audit_path = "/tmp/hy_reconcile_concurrency_" + std::to_string(getpid()) + ".log";
+#endif
+    std::remove(durable_audit_path.c_str());
+    std::remove((durable_audit_path + ".lock").c_str());
+    std::remove((durable_audit_path + ".tip").c_str());
+    std::remove((durable_audit_path + ".tip.tmp").c_str());
+
+    std::array<std::byte, kKekSize> kek{};
+    for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x60 + i);
+    auto key_ring = std::make_unique<KeyRing>(kek);
+    WrappedKeyRecord key_record{};
+    std::vector<std::byte> key_material{std::byte{0x0A}, std::byte{0x0B}, std::byte{0x0C}};
+    ASSERT_EQ(key_ring->add_key(1, key_material, key_record), KeyRingAddStatus::Ok);
+    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
+    ASSERT_TRUE(durable_audit_sink->is_open());
+    DurableOrderAuditPort durable_audit_port = make_durable_order_audit_port(*durable_audit_sink);
+
     std::vector<SubmittedOrder> results;
     results.reserve(kIterations);
     std::atomic<bool> hot_done{false};
@@ -180,6 +227,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
             ctx.order_weight = 1;
             ctx.to_reconcile = &to_reconcile;
             ctx.reconcile_events = &reconcile_events;
+            ctx.durable_audit = durable_audit_port;
 
             ctx.confirmation.confirmed = true;
             ctx.confirmation.symbol_id = ctx.symbol_id;
@@ -288,4 +336,14 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     EXPECT_GT(ambiguous_count, kIterations / 8)
         << "too few orders reached the reconcile path -- test may not be exercising the "
            "cross-thread handoff it exists to verify";
+
+    // Release the exclusive file/lock handles before removing them -- both are
+    // opened with zero sharing (durable_log_store.hpp), so deleting while
+    // still open would silently no-op on Windows.
+    durable_audit_sink.reset();
+    key_ring.reset();
+    std::remove(durable_audit_path.c_str());
+    std::remove((durable_audit_path + ".lock").c_str());
+    std::remove((durable_audit_path + ".tip").c_str());
+    std::remove((durable_audit_path + ".tip.tmp").c_str());
 }
