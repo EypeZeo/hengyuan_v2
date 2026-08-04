@@ -751,6 +751,123 @@ Phase 1 ControlPlaneLogSink 测试套件里对应的未知帧签名 key 场景�
 
 `spec_enum_diff.py`/`spec_xref_check.py` 均**零改动**——本轮零新增枚举。
 
+### Phase 3：orchestrate_submit() 接入热提交路径（durable-before-send）
+
+`DurableControlPlaneSink` 真实实现 / `orchestrate_submit` 热路径接入 / 密钥轮换 /
+`ExternalAnchorClient` 总路线图的第四个执行单元。Phase 0-2（PR #18/#22/#23）建好了
+KeyRing/DurableLogStore/`DurableAuditSink` 底座并接上了真实 key 选择，但 `orchestrate_submit()`
+（`live_submit_orchestrator.hpp`）从未真正调用过 `DurableAuditSink`——热路径至今只写内存态的
+`AuditRingSink`（fire-and-forget，进程崩溃即丢失）。这一轮实现
+`SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` §3/§6.2/§6.4（**权威出处订正**：早期一轮 subagent 调研
+把这部分内容误标成本文件的行号——本文件只有 780 行，不存在那些行号；真正的出处已直接读源码核实，
+是 `SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` 的 §3 行748-869、§6.2-6.4 行1546-1672）规定的
+durable-before-send 纪律：网络发送前必须先拿到 `OrderIntentCreated`（CONFIRM 之前）和
+`OrderSubmitPrepared`（发送前）两个真实落盘 Ack，响应结果本身也必须先落盘 Ack 才能转态/释放
+in-flight 槽位。
+
+**新增符号**：
+- `AuditEventType::OrderSubmitPrepared = 20`——顺序取现有枚举末尾的下一个空位。两份 spec 都从未
+  把 `AuditEventType` 转写成真正的 ` ```cpp ` 代码块（只在 prose 里提及这个记录类型），因此这个
+  新增值**完全不会被 `spec_enum_diff.py` 感知**——它只 diff 从 spec 代码块里提取出的枚举定义；
+  这里不能声称这条变更会被那个工具捕获，正确性靠 `spec_xref_check.py` + 人工审阅。
+- `OrchestratorGate::AuditWriteNotAcked = 22`——spec 钉死的数值
+  （`SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:845`），延续 `SubmitStaleRulesVersion = 21` 已经建立
+  的先例：18-20（`SubmitPartialFill`/`SubmitFilled`/`SubmitRateLimited`）继续刻意留空，不重新编号
+  占用。
+- `DurableOrderAuditPort`（`live_submit_orchestrator.hpp` 新增，函数指针注入结构体，
+  `AppendFn`/`FencedFn`/`user_data`，同文件里 `SubmitPort` 已经建立的风格）+
+  `OrchestratorContext` 新增的 `durable_audit` 字段（值类型，未接线时 `is_valid()==false`，按 fenced
+  处理）——外部评审 + 用户拍板的依赖注入方式：`durable_audit` 是真实文件 I/O，和 `SubmitPort`
+  代表的真实网络 I/O 同一类依赖，这个文件"只有 `SubmitPort` 被注入 fake、其余依赖
+  （`AuditRingSink`/`KillSwitch`/`InFlightRegistry`）直接用真实实例"的既有测试哲学对
+  `durable_audit` 不适用。`make_durable_order_audit_port(DurableAuditSink&)` 提供薄 adapter，
+  给少量真实文件 I/O 集成测试使用；其余既有 gate 逻辑测试改用一个轻量确定性 fake 后端，可以精确
+  构造"仅 Intent 失败"/"仅 Prepared 失败"/"仅 Outcome 失败"，不再需要靠破坏磁盘文件这种粗粒度
+  手法做故障注入。
+
+**连带修复（必须和新枚举值同一提交，否则留下不安全中间态）**：`durable_frame_codec.hpp` 的
+`is_legal_audit_event_type()` 硬编码上界是当前最后一个枚举值（`RateLimitApproaching`）——每次
+`decode_order_event_frame` 都会跑这个范围检查。新增 `OrderSubmitPrepared` 后如果不同步把上界抬高
+到它，`encode` 阶段不会报错，但任何后续 `run_recovery_scan()`（包括真实进程重启，也包括这一轮
+新增的"重启验证 3 帧落盘"集成测试）会把合法的 `OrderSubmitPrepared` 帧误判成 `Corrupt`——这是
+追踪 wire 路径才发现的连带缺口，两份 spec 的 prose 都没有明写。
+
+**第二处连带修复（实现阶段实测发现，不是设计阶段能预见的）**：`live_submit_orchestrator.hpp` 新增
+`#include <hengyuan/durable_audit_sink.hpp>` 后，MSVC 编译立即在 `order_tracker.hpp`/
+`transport_policy.hpp` 里报出一批 `min`/`max` 相关的 C2589/C2059 语法错误——根因是
+`durable_log_store.hpp`（经由 `durable_audit_sink.hpp` 传递 include）在 Windows 下 include
+`<windows.h>` 时从未定义 `NOMINMAX`，而这次新增的 include 顺序恰好把它排到了
+`order_tracker.hpp`/`transport_policy.hpp`（两者都用到 `std::numeric_limits<T>::max()` 一类的
+标识符）前面，导致 windows.h 的 `min`/`max` 宏在同一个编译单元里污染了后续代码。这是一个此前
+一直存在、但从未被两个 include 顺序同时触发过的潜伏缺陷，不是这一轮设计本身引入的新问题——修复
+方式是给 `durable_log_store.hpp`、以及同样有这个隐患的 `kek_loader.hpp`/`env_loader.hpp`（都用
+同一段 `WIN32_LEAN_AND_MEAN` + `#include <windows.h>` 写法）统一补上 `#ifndef NOMINMAX #define
+NOMINMAX #endif`，随核心实现提交一起落地。
+
+**行为改变**：`Submitting` 转态时机从"in-flight 注册成功后立即转"后移到"`OrderSubmitPrepared`
+真正落盘 Ack 之后"——spec 明确指出这是修正一处历史 P0（`OrderState::AbortedPreSend` 当初被引入
+就是为了绕开"转态和 in-flight 注册绑死、Gate 7/8 失败路径没有合法转态可撤销"这个坑，后来该状态
+本身又被移除，见上面事件时间线第 5 条）。响应结果（Gate 13 的 5 分支 switch）同样先落盘 Ack、
+再转态/释放，失败时 `result.order.state` 完全不碰，天然停在进入 switch 时的 `Submitting`，靠
+代码顺序自然达成"失败时留在 Submitting"，不需要显式回滚。
+
+**显眼披露（刻意不修，不是遗漏）**：outcome 阶段落盘失败时，订单静默停在 `Submitting`、
+`InFlightRegistry` 槽位不释放、也不推入 `ctx.to_reconcile`（spec §6.4 原文："do NOT transition
+to Ambiguous in the hope of reconciling in THIS process — that path is unreachable under a
+fenced sink"）——如果进程本身不崩溃、不重启，这个订单会在进程剩余生命周期里一直卡在
+`Submitting`，没有任何主动告警，直到下一次进程重启由 `recovery_scan()` 重新归类成 `Ambiguous`
+才继续 reconciliation。这是 spec 自己的保守设计（fenced sink 下这个进程已经没有安全的方式继续），
+这一轮刻意不修。
+
+**明确排除的范围**（外部评审提过，核实后判定不适用/超出这一轮边界，附理由）：
+
+- **不发明 `fence_and_stop_l5()`/`escalate_via_out_of_band_channel()`**：这两个名字只在 spec
+  prose 里松散重复出现，全仓库 `native/` 从未真正定义过任一签名。`durable_control_plane.hpp`
+  自己的治理原则是"TRANSCRIBE, NEVER INVENT"。"停止 L5"这个效果已经由 Phase 2 建立的
+  `DurableAuditSink` 自我 fence 纪律自动保证——一旦真正 Failed，之后每次 `append_durable()` 都
+  立即返回 `Failed`，下一次 `orchestrate_submit()` 会在最早的 Gate 5（Intent）就重新失败，到不了
+  CONFIRM/in-flight/发送。`DurableOrderAuditPort::fenced()` 已经足够让调用方按需查询、自行决定是否
+  告警。
+- **不把 `AuditAppendResult::Status` 从 2 值扩成 4 值**：这个类型的 2 值定义（`Acked=0`/`Failed=1`）
+  已经在 Phase 1 的 ledger 里明确记录过"不引入第 3 个值"，这一轮不翻案。规格自己对"Failed"的所有
+  子情况都执行同样保守的动作（不转态、不释放、留给 recovery 判定真相），更细的状态区分对正确性
+  没有实际增益。
+- **不新增跨 context/sink 的共享 cacheline 对齐提交栅栏**：这个代码库从 Phase 0 起反复确认的架构
+  前提是单一热线程调用 `orchestrate_submit()`，`DurableAuditSink` 自己的头注释也明写"单写者，
+  无内部同步"——多线程并发提交本来就被架构排除，不是这一轮引入的新风险。
+- **不给 `OrderSubmitPrepared` record 补新固定大小 wire 类型**：这一轮的安全属性只要求"recovery
+  能正确判断订单曾经到达 Prepared 边界"，现有 `AuditRecord` 的 COID/symbol/price/qty/
+  `resulting_state` 已经足够；更完整的取证记录是合理的未来增强，不是这一轮的范围。
+- **`EscalatedToOperator`/`EscalatedLedger`/`OrderOperatorResolved`/§6.5 容量记账生命周期不做**：
+  用户已明确确认这一轮不做，留待后续单独排期——这是 InFlightRegistry 容量耗尽的独立问题，和
+  "接入 durable-before-send 门禁"是两件不同的事。
+- **`is_exchange_final()`/`is_terminal()` 在释放点的用法维持现状不变**：已核实今天 Gate 13 逐分支
+  硬编码"只有 `Rejected` 释放"，恰好和 `is_exchange_final()` 对这 5 个可达结果（`Accepted`/
+  `Rejected`/`Timeout`/`NetworkError`/`StaleRulesVersion`）的判定完全一致；把它泛化成真正的
+  `is_exchange_final()` 驱动释放是 `PartialFill`/`Filled` 那部分的事，这一轮不做。
+
+**已核实为真、但判定为既有限制、这一轮不处理**：`AuditRingSink` 固定 1024 容量
+（`audit_trail.hpp:127`），满了不自动 drain，`can_submit_order()` 报 `Unavailable` 而不是覆盖旧
+记录——这是刻意设计（ADR-019 D10），从这个文件存在第一天起 Gate 1（`AuditUnavailable`）就依赖
+这个容量上限，和 durable audit 的健康状况完全独立。这一轮没有新增任何 `ctx.audit->append()`
+调用点（Prepared 阶段刻意没有内存态副本），不会让这个既有限制变得更差，也不会修它。
+
+**测试范围**：既有 39 个 `orchestrate_submit`/`OrchestratorContext` 测试（`test_live_submit_
+orchestrator.cpp` 32 + `test_reconcile_concurrency.cpp` 相关线程用例）改接一个默认"从不失败"的
+fake `DurableOrderAuditPort` 后端，断言不变；新增 4 个用 fake 精确构造的故障场景用例（Intent 失败
+/Prepared 失败/Outcome 失败/端口完全未接线），直接验证三处"失败时不转态/不释放"的安全关键行为；
+新增至少 2-3 个真实文件 I/O 集成测试（真实 `KeyRing`+`DurableAuditSink`+
+`make_durable_order_audit_port`），验证端口 adapter 接线正确、3 帧按正确顺序真实落盘且可恢复。
+`native/src/live_submit_evidence_harness.cpp` 的 `gate_name()` 穷举 switch（无 `default:`）补
+`AuditWriteNotAcked` 一个 case——`OrchestratorGate` 一旦加进这个值，这是硬编译约束，不是可选项；
+该文件的测试 fixture 同步接上真实 `KeyRing`+`DurableAuditSink`，否则演示场景会全部先在新 Gate 5
+处失败（fixture 是这个 harness 自己的本地结构体名，未登记进 `spec_xref_check.py` 的搜索文件列表，
+不作为跨文件核对符号）。
+
+`spec_enum_diff.py` 对本轮两个新枚举值分别确认：`OrderSubmitPrepared` 不参与 diff（两份 spec 都
+未把 `AuditEventType` 转写成代码块）；`AuditWriteNotAcked` 走既有的仅追加数值模式，零冲突。
+`spec_xref_check.py --quiet` 需重跑并通过。
+
 ## 已知的"自我引入"事件时间线（供交叉核查脚本的验证用例）
 
 1. round 14→15：`AuditAppendResult` 缺 `.sequence` 字段（P0 self-inflicted）
