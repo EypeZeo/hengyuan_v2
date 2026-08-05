@@ -22,10 +22,15 @@
 from __future__ import annotations
 
 import json
+import shutil
+import sys
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 from py_core.backtests.models import BacktestConfig, BacktestMetrics, ValidationReport
 from py_core.backtests.risk_integration import RiskAwareBacktestResult
@@ -66,8 +71,17 @@ def serialize_config(
     stop_distance: Decimal | None = None,
     ohlcv_path: str = "",
     signals_path: str = "",
+    strategy_spec: str | None = None,
+    strategy_params: dict[str, Any] | None = None,
+    ohlcv_fingerprint_info: dict[str, Any] | None = None,
+    strategy_fingerprint_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """序列化运行配置快照。不含 API key 或 secret。"""
+    """序列化运行配置快照。不含 API key 或 secret。
+
+    strategy_spec/strategy_params/ohlcv_fingerprint_info/strategy_fingerprint_info 是
+    P2-STRAT-01 新增的可复现性 provenance 字段——"这次跑的到底是哪份 OHLCV 数据、哪个
+    策略、哪个版本、什么参数"，走 --signals 路径时均为 None。
+    """
     return {
         "run_id": run_id,
         "created_at": datetime.now(UTC).isoformat(),
@@ -76,6 +90,14 @@ def serialize_config(
         "inputs": {
             "ohlcv_path": ohlcv_path,
             "signals_path": signals_path,
+        },
+        "provenance": {
+            "strategy_spec": strategy_spec,
+            "strategy_params": strategy_params,
+            "ohlcv_fingerprint": ohlcv_fingerprint_info,
+            "strategy_fingerprint": strategy_fingerprint_info,
+            "python_version": sys.version,
+            "pandas_version": pd.__version__,
         },
         "backtest_config": {
             "initial_capital": config.initial_capital,
@@ -210,10 +232,17 @@ def export_risk_aware_backtest_artifacts(
     stop_distance: Decimal | None = None,
     ohlcv_path: str = "",
     signals_path: str = "",
+    strategy_spec: str | None = None,
+    strategy_params: dict[str, Any] | None = None,
+    ohlcv_fingerprint_info: dict[str, Any] | None = None,
+    strategy_fingerprint_info: dict[str, Any] | None = None,
 ) -> Path:
     """将 RiskAwareBacktestResult 序列化为完整 artifact 目录。
 
-    在 output_dir/<run_id>/ 下创建所有 artifact 文件。
+    原子发布：先在 output_dir 的同级临时目录下把所有文件写完，全部成功后再整体 rename 到
+    output_dir/<run_id>/ ——中途失败/被杀不会留下"写了一半"的残留。目标 run 目录已存在且
+    非空时拒绝覆盖。
+
     所有文件包含 non_authorizing=true。
 
     Returns:
@@ -221,55 +250,70 @@ def export_risk_aware_backtest_artifacts(
 
     Raises:
         ValueError: result 不符合 non_authorizing 约束（不应发生，仅防御）。
+        FileExistsError: 目标 run 目录已存在且非空。
         OSError: 无法创建输出目录。
     """
     if not result.non_authorizing:
         raise ValueError("result.non_authorizing 必须为 True")
 
     run_dir = output_dir / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if run_dir.exists() and any(run_dir.iterdir()):
+        raise FileExistsError(f"输出目录已存在且非空，拒绝覆盖: {run_dir}")
 
-    # config.json
-    config_dict = serialize_config(
-        run_id=run_id,
-        config=config,
-        risk_config=risk_config,
-        stop_distance=stop_distance,
-        ohlcv_path=ohlcv_path,
-        signals_path=signals_path,
-    )
-    (run_dir / "config.json").write_text(_dumps(config_dict), encoding="utf-8")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = output_dir / f".tmp-{run_id}-{uuid.uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=False)
 
-    # base_metrics.json
-    base_metrics_dict = serialize_metrics(result.base_result.metrics, non_authorizing=True)
-    (run_dir / "base_metrics.json").write_text(_dumps(base_metrics_dict), encoding="utf-8")
+    try:
+        # config.json
+        config_dict = serialize_config(
+            run_id=run_id,
+            config=config,
+            risk_config=risk_config,
+            stop_distance=stop_distance,
+            ohlcv_path=ohlcv_path,
+            signals_path=signals_path,
+            strategy_spec=strategy_spec,
+            strategy_params=strategy_params,
+            ohlcv_fingerprint_info=ohlcv_fingerprint_info,
+            strategy_fingerprint_info=strategy_fingerprint_info,
+        )
+        (tmp_dir / "config.json").write_text(_dumps(config_dict), encoding="utf-8")
 
-    # risk_metrics.json
-    risk_metrics_dict = serialize_metrics(result.risk_metrics, non_authorizing=True)
-    (run_dir / "risk_metrics.json").write_text(_dumps(risk_metrics_dict), encoding="utf-8")
+        # base_metrics.json
+        base_metrics_dict = serialize_metrics(result.base_result.metrics, non_authorizing=True)
+        (tmp_dir / "base_metrics.json").write_text(_dumps(base_metrics_dict), encoding="utf-8")
 
-    # validation_report.json
-    vr_dict = serialize_validation_report(result.base_result.validation_report)
-    (run_dir / "validation_report.json").write_text(_dumps(vr_dict), encoding="utf-8")
+        # risk_metrics.json
+        risk_metrics_dict = serialize_metrics(result.risk_metrics, non_authorizing=True)
+        (tmp_dir / "risk_metrics.json").write_text(_dumps(risk_metrics_dict), encoding="utf-8")
 
-    # risk_equity_curve.jsonl
-    with (run_dir / "risk_equity_curve.jsonl").open("w", encoding="utf-8") as f:
-        for ts, eq in zip(result.timestamps, result.risk_equity_curve, strict=True):
-            f.write(_dumps_line({"timestamp_utc": ts.isoformat(), "equity": eq}) + "\n")
+        # validation_report.json
+        vr_dict = serialize_validation_report(result.base_result.validation_report)
+        (tmp_dir / "validation_report.json").write_text(_dumps(vr_dict), encoding="utf-8")
 
-    # risk_positions.jsonl
-    with (run_dir / "risk_positions.jsonl").open("w", encoding="utf-8") as f:
-        for ts, pos in zip(result.timestamps, result.risk_positions_fraction, strict=True):
-            f.write(_dumps_line({"timestamp_utc": ts.isoformat(), "exposure_fraction": pos}) + "\n")
+        # risk_equity_curve.jsonl
+        with (tmp_dir / "risk_equity_curve.jsonl").open("w", encoding="utf-8") as f:
+            for ts, eq in zip(result.timestamps, result.risk_equity_curve, strict=True):
+                f.write(_dumps_line({"timestamp_utc": ts.isoformat(), "equity": eq}) + "\n")
 
-    # risk_decisions.jsonl
-    with (run_dir / "risk_decisions.jsonl").open("w", encoding="utf-8") as f:
-        for ts, decision in zip(result.timestamps, result.risk_decisions, strict=True):
-            line = serialize_risk_decision_line(decision, ts)
-            f.write(_dumps_line(line) + "\n")
+        # risk_positions.jsonl
+        with (tmp_dir / "risk_positions.jsonl").open("w", encoding="utf-8") as f:
+            for ts, pos in zip(result.timestamps, result.risk_positions_fraction, strict=True):
+                f.write(_dumps_line({"timestamp_utc": ts.isoformat(), "exposure_fraction": pos}) + "\n")
 
-    # summary.json
-    summary_dict = serialize_summary(run_id=run_id, result=result)
-    (run_dir / "summary.json").write_text(_dumps(summary_dict), encoding="utf-8")
+        # risk_decisions.jsonl
+        with (tmp_dir / "risk_decisions.jsonl").open("w", encoding="utf-8") as f:
+            for ts, decision in zip(result.timestamps, result.risk_decisions, strict=True):
+                line = serialize_risk_decision_line(decision, ts)
+                f.write(_dumps_line(line) + "\n")
 
+        # summary.json
+        summary_dict = serialize_summary(run_id=run_id, result=result)
+        (tmp_dir / "summary.json").write_text(_dumps(summary_dict), encoding="utf-8")
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    tmp_dir.rename(run_dir)
     return run_dir.resolve()
