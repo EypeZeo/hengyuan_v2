@@ -29,8 +29,8 @@ from py_core.backtests.models import (
     BacktestResult,
 )
 from py_core.backtests.vectorized_engine import (
+    _run_vectorized_backtest_on_df,
     records_to_dataframe,
-    run_vectorized_backtest,
     validate_inputs,
 )
 from py_core.risk.risk_calculator import RiskCalculator
@@ -165,7 +165,9 @@ def run_risk_aware_backtest(
         raise ValueError(f"输入校验失败：{validation_report.issues}")
 
     # ── 运行基础回测（P2-BT-01，不做修改）────────────────────────────────
-    base_result = run_vectorized_backtest(config, records, signals)
+    # 复用上面已经构建好的 df，不再让 _run_vectorized_backtest_on_df 内部重新调用
+    # records_to_dataframe(records) 构建第二份一样的 DataFrame。
+    base_result = _run_vectorized_backtest_on_df(config, df, signals)
 
     # ── next-bar 仓位（与 P2-BT-01 shift 语义相同）───────────────────────
     positions: pd.Series[Any] = signals_aligned.shift(1).fillna(0.0)
