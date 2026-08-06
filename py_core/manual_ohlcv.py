@@ -29,6 +29,7 @@ class OhlcvInputFormat(StrEnum):
     CSV = "csv"
     JSON = "json"
     CCXT_PUBLIC = "ccxt_public"
+    BINANCE_PUBLIC_REST = "binance_public_rest"
 
 
 class TimestampPosture(StrEnum):
@@ -60,6 +61,7 @@ class OhlcvValidationIssueCode(StrEnum):
     DUPLICATE_EVENT_TIME = "DUPLICATE_EVENT_TIME"
     NON_MONOTONIC_EVENT_TIME = "NON_MONOTONIC_EVENT_TIME"
     INVALID_OHLC_BOUNDS = "INVALID_OHLC_BOUNDS"
+    NON_FINITE_DECIMAL = "NON_FINITE_DECIMAL"
 
 
 _TIMEFRAME_PATTERN = re.compile(r"^[1-9]\d*[mhdw]$", re.IGNORECASE)
@@ -191,7 +193,28 @@ def validate_ohlcv_record(record: NormalizedOhlcvRecord) -> tuple[OhlcvValidatio
         "low": record.low_price,
         "close": record.close_price,
     }
+
+    # NaN/Infinity must be caught BEFORE any ordering comparison below: Python's decimal
+    # module traps InvalidOperation on ordering comparisons involving NaN under the default
+    # context (directly verified: `Decimal('NaN') <= Decimal('0')` raises
+    # decimal.InvalidOperation), so a malformed/corrupted price field would crash this
+    # function instead of producing a clean validation issue. Infinity does not raise on
+    # comparison but is just as meaningless as a price/volume value.
+    non_finite_fields: set[str] = set()
+    for field_name, value in {**prices, "volume": record.volume}.items():
+        if not value.is_finite():
+            non_finite_fields.add(field_name)
+            issues.append(
+                OhlcvValidationIssue(
+                    code=OhlcvValidationIssueCode.NON_FINITE_DECIMAL,
+                    field_name=field_name,
+                    message=f"Field '{field_name}' must be a finite decimal (not NaN/Infinity).",
+                )
+            )
+
     for field_name, value in prices.items():
+        if field_name in non_finite_fields:
+            continue  # already reported; comparing a non-finite value further is unsafe
         if value <= Decimal("0"):
             issues.append(
                 OhlcvValidationIssue(
@@ -201,7 +224,7 @@ def validate_ohlcv_record(record: NormalizedOhlcvRecord) -> tuple[OhlcvValidatio
                 )
             )
 
-    if record.volume < Decimal("0"):
+    if "volume" not in non_finite_fields and record.volume < Decimal("0"):
         issues.append(
             OhlcvValidationIssue(
                 code=OhlcvValidationIssueCode.NEGATIVE_VOLUME,
@@ -210,18 +233,19 @@ def validate_ohlcv_record(record: NormalizedOhlcvRecord) -> tuple[OhlcvValidatio
             )
         )
 
-    max_price = max(record.open_price, record.close_price, record.low_price)
-    min_price = min(record.open_price, record.close_price, record.high_price)
-    if record.high_price < max_price or record.low_price > min_price:
-        issues.append(
-            OhlcvValidationIssue(
-                code=OhlcvValidationIssueCode.INVALID_OHLC_BOUNDS,
-                message=(
-                    "OHLC values are inconsistent: high must be >= open/close/low and "
-                    "low must be <= open/close/high."
-                ),
+    if not non_finite_fields.intersection({"open", "high", "low", "close"}):
+        max_price = max(record.open_price, record.close_price, record.low_price)
+        min_price = min(record.open_price, record.close_price, record.high_price)
+        if record.high_price < max_price or record.low_price > min_price:
+            issues.append(
+                OhlcvValidationIssue(
+                    code=OhlcvValidationIssueCode.INVALID_OHLC_BOUNDS,
+                    message=(
+                        "OHLC values are inconsistent: high must be >= open/close/low and "
+                        "low must be <= open/close/high."
+                    ),
+                )
             )
-        )
 
     return tuple(issues)
 
