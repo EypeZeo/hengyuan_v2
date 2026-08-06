@@ -1,16 +1,21 @@
 """
-向量化 OHLCV 回测 — 本地 CLI 示例入口（P2-BT-01）
+向量化 OHLCV 回测 — 本地 CLI 示例入口（P2-BT-01 / P2-STRAT-01）
 
 独立脚本，不依赖 app/interfaces/cli/main.py。
 所有输出均为回测估算值，不代表财务建议或交易授权。
 
-用法：
+用法（--signals 与 --strategy 二选一）：
     python -m research.backtests.cli run \\
         --ohlcv path/to/ohlcv.csv \\
         --signals path/to/signals.csv \\
         --initial-capital 100000 \\
         --fee-bps 10 \\
         --slippage-bps 5
+
+    python -m research.backtests.cli run \\
+        --ohlcv path/to/ohlcv.csv \\
+        --strategy py_core.strategies.sma_crossover:SmaCrossoverStrategy \\
+        --strategy-params '{"fast_window": 5, "slow_window": 20}'
 
 OHLCV CSV 格式（必须包含以下列，timestamp 为 UTC ISO 8601）：
     timestamp_utc,open,high,low,close,volume
@@ -23,7 +28,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import importlib.util
 import json
+import shutil
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -42,14 +50,90 @@ from py_core.manual_ohlcv import (
 from py_core.backtests.artifact_export import export_risk_aware_backtest_artifacts
 from py_core.backtests.models import BacktestConfig, BacktestResult
 from py_core.backtests.risk_integration import run_risk_aware_backtest
-from py_core.backtests.vectorized_engine import run_vectorized_backtest
+from py_core.backtests.vectorized_engine import _run_vectorized_backtest_on_df, records_to_dataframe
 from py_core.risk.risk_config import RiskConfig
+from py_core.strategies.base import load_strategy
 
 NON_AUTH_NOTICE = (
     "\n[NOTICE] All outputs are BACKTESTING ESTIMATES ONLY.\n"
     "NOT financial advice. NOT trading authorization.\n"
     "NOT dry-run readiness. NOT live readiness.\n"
 )
+
+
+def validate_run_id(run_id: str) -> None:
+    """校验 run_id 可以安全拼进输出文件路径。
+
+    Raises:
+        ValueError: run_id 为空，或包含 "/"、"\\" 或 ".."。
+    """
+    if not run_id:
+        raise ValueError("run_id 不能为空")
+    if "/" in run_id or "\\" in run_id or ".." in run_id:
+        raise ValueError(f"run_id 不能包含路径分隔符或 '..'，收到: {run_id!r}")
+
+
+def _parse_strategy_params(raw: str | None) -> dict[str, Any]:
+    """解析 --strategy-params 传入的 JSON 对象字符串。None/空字符串视为无参数。
+
+    改用单个 JSON 对象而不是重复的 "key=value" 参数——后者对重复 key、空 key、科学计数、
+    布尔值这些情况的类型推断没有明确定义，JSON 把类型解析完全交给 json.loads()，没有歧义。
+
+    Raises:
+        ValueError: 不是合法 JSON，或合法 JSON 但顶层不是对象（dict）。
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--strategy-params 不是合法的 JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"--strategy-params 必须是一个 JSON 对象（dict），收到: {type(parsed).__name__}"
+        )
+    return parsed
+
+
+def ohlcv_fingerprint(ohlcv_path: Path, records: list[NormalizedOhlcvRecord]) -> dict[str, Any]:
+    """OHLCV 数据的可复现性指纹。优先用源文件内容的 SHA-256；文件不存在时（理论上不会发生，
+    调用方在这之前已经检查过路径存在）退化成"记录数 + 首尾时间戳"摘要。"""
+    if ohlcv_path.exists():
+        digest = hashlib.sha256(ohlcv_path.read_bytes()).hexdigest()
+        return {"kind": "file_sha256", "path": str(ohlcv_path), "sha256": digest}
+    first_ts = records[0].event_time_utc.isoformat() if records else None
+    last_ts = records[-1].event_time_utc.isoformat() if records else None
+    return {
+        "kind": "record_summary",
+        "record_count": len(records),
+        "first_timestamp_utc": first_ts,
+        "last_timestamp_utc": last_ts,
+    }
+
+
+def strategy_source_fingerprint(strategy_spec: str | None) -> dict[str, Any] | None:
+    """尝试定位 strategy_spec 对应模块的磁盘文件并算 SHA-256。定位不到时返回一个明确标注
+    "source_available": False 的字典，不是报错——不是每个可 import 的策略模块都保证有对应
+    的 .py 文件路径。strategy_spec 为 None（走 --signals 路径）时直接返回 None。"""
+    if strategy_spec is None:
+        return None
+    module_path = strategy_spec.split(":", 1)[0] if ":" in strategy_spec else strategy_spec
+    try:
+        spec = importlib.util.find_spec(module_path)
+    except (ImportError, ValueError):
+        spec = None
+    if spec is None or spec.origin is None:
+        return {"spec": strategy_spec, "source_available": False}
+    source_path = Path(spec.origin)
+    if not source_path.is_file():
+        return {"spec": strategy_spec, "source_available": False}
+    digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    return {
+        "spec": strategy_spec,
+        "source_available": True,
+        "source_path": str(source_path),
+        "sha256": digest,
+    }
 
 
 def _parse_timestamp_utc(s: str) -> datetime:
@@ -143,70 +227,131 @@ def load_signals_csv(
     return signals
 
 
-def save_results(result: BacktestResult, output_dir: Path) -> None:
-    """将回测结果序列化写入 output_dir。"""
-    output_dir.mkdir(parents=True, exist_ok=True)
+def load_signals_from_strategy(
+    strategy_spec: str,
+    strategy_params: dict[str, Any],
+    df: pd.DataFrame,
+    *,
+    allow_external: bool,
+) -> pd.Series[Any]:
+    """用策略框架在已经构建好的 df 上生成 signal Series。
 
-    # metrics.json
-    metrics_dict: dict[str, Any] = {
-        "output_label": result.output_label,
-        "non_auth_assertion": result.non_auth_assertion,
-        "total_return": result.metrics.total_return,
-        "annualized_return": result.metrics.annualized_return,
-        "annualized_volatility": result.metrics.annualized_volatility,
-        "sharpe_ratio": result.metrics.sharpe_ratio,
-        "max_drawdown": result.metrics.max_drawdown,
-        "calmar_ratio": result.metrics.calmar_ratio,
-        "win_rate": result.metrics.win_rate,
-        "exposure": result.metrics.exposure,
-        "turnover": result.metrics.turnover,
-        "cost_impact_bps": result.metrics.cost_impact_bps,
-        "cost_impact_total": result.metrics.cost_impact_total,
-    }
-    (output_dir / "metrics.json").write_text(json.dumps(metrics_dict, indent=2), encoding="utf-8")
+    df 由调用方构建一次并传入（不在这里再调用 records_to_dataframe()）——避免策略生成和
+    回测执行各自独立构建一次同样的 DataFrame。
+    """
+    strategy = load_strategy(strategy_spec, allow_external=allow_external, **strategy_params)
+    return strategy.generate_signals(df)
 
-    # validation_report.json
-    vr_dict: dict[str, Any] = {
-        "timestamp_monotonic": result.validation_report.timestamp_monotonic,
-        "no_nan_close": result.validation_report.no_nan_close,
-        "no_future_shift_detected": result.validation_report.no_future_shift_detected,
-        "bar_count": result.validation_report.bar_count,
-        "is_valid": result.validation_report.is_valid,
-        "issues": result.validation_report.issues,
-    }
-    (output_dir / "validation_report.json").write_text(
-        json.dumps(vr_dict, indent=2), encoding="utf-8"
-    )
 
-    # equity_curve.jsonl
-    with (output_dir / "equity_curve.jsonl").open("w", encoding="utf-8") as f:
-        for ts, eq in zip(result.timestamps, result.equity_curve, strict=True):
-            f.write(json.dumps({"timestamp_utc": ts.isoformat(), "equity": eq}) + "\n")
+def save_results(
+    result: BacktestResult,
+    output_dir: Path,
+    *,
+    strategy_spec: str | None = None,
+    strategy_params: dict[str, Any] | None = None,
+    signals_path: str | None = None,
+    ohlcv_fingerprint_info: dict[str, Any] | None = None,
+    strategy_fingerprint_info: dict[str, Any] | None = None,
+) -> None:
+    """将回测结果序列化写入 output_dir，原子发布。
 
-    # positions.jsonl
-    with (output_dir / "positions.jsonl").open("w", encoding="utf-8") as f:
-        for ts, pos in zip(result.timestamps, result.positions, strict=True):
-            f.write(json.dumps({"timestamp_utc": ts.isoformat(), "position": pos}) + "\n")
+    先在 output_dir 的同级临时目录下把所有文件写完，全部成功后再整体 rename 到
+    output_dir 本身——中途失败/被杀不会在 output_dir 留下"写了一半"的残留。output_dir
+    已存在且非空时拒绝覆盖（不静默覆盖已有的一次运行结果）。
 
-    # trades.jsonl
-    with (output_dir / "trades.jsonl").open("w", encoding="utf-8") as f:
-        for tr in result.fills_approx:
-            f.write(
-                json.dumps(
-                    {
-                        "bar_index": tr.bar_index,
-                        "timestamp_utc": tr.timestamp_utc.isoformat(),
-                        "direction": tr.direction,
-                        "execution_price": tr.execution_price,
-                        "position_before": tr.position_before,
-                        "position_after": tr.position_after,
-                        "position_change": tr.position_change,
-                        "estimated_cost_rate": tr.estimated_cost_rate,
-                        "note": tr.note,
-                    }
+    Raises:
+        FileExistsError: output_dir 已存在且非空。
+    """
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"输出目录已存在且非空，拒绝覆盖: {output_dir}")
+
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = output_dir.parent / f".tmp-{output_dir.name}-{uuid.uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=False)
+
+    try:
+        # metrics.json
+        metrics_dict: dict[str, Any] = {
+            "output_label": result.output_label,
+            "non_auth_assertion": result.non_auth_assertion,
+            "total_return": result.metrics.total_return,
+            "annualized_return": result.metrics.annualized_return,
+            "annualized_volatility": result.metrics.annualized_volatility,
+            "sharpe_ratio": result.metrics.sharpe_ratio,
+            "max_drawdown": result.metrics.max_drawdown,
+            "calmar_ratio": result.metrics.calmar_ratio,
+            "win_rate": result.metrics.win_rate,
+            "exposure": result.metrics.exposure,
+            "turnover": result.metrics.turnover,
+            "cost_impact_bps": result.metrics.cost_impact_bps,
+            "cost_impact_total": result.metrics.cost_impact_total,
+        }
+        (tmp_dir / "metrics.json").write_text(json.dumps(metrics_dict, indent=2), encoding="utf-8")
+
+        # validation_report.json
+        vr_dict: dict[str, Any] = {
+            "timestamp_monotonic": result.validation_report.timestamp_monotonic,
+            "no_nan_close": result.validation_report.no_nan_close,
+            "no_future_shift_detected": result.validation_report.no_future_shift_detected,
+            "bar_count": result.validation_report.bar_count,
+            "is_valid": result.validation_report.is_valid,
+            "issues": result.validation_report.issues,
+        }
+        (tmp_dir / "validation_report.json").write_text(
+            json.dumps(vr_dict, indent=2), encoding="utf-8"
+        )
+
+        # equity_curve.jsonl
+        with (tmp_dir / "equity_curve.jsonl").open("w", encoding="utf-8") as f:
+            for ts, eq in zip(result.timestamps, result.equity_curve, strict=True):
+                f.write(json.dumps({"timestamp_utc": ts.isoformat(), "equity": eq}) + "\n")
+
+        # positions.jsonl
+        with (tmp_dir / "positions.jsonl").open("w", encoding="utf-8") as f:
+            for ts, pos in zip(result.timestamps, result.positions, strict=True):
+                f.write(json.dumps({"timestamp_utc": ts.isoformat(), "position": pos}) + "\n")
+
+        # trades.jsonl
+        with (tmp_dir / "trades.jsonl").open("w", encoding="utf-8") as f:
+            for tr in result.fills_approx:
+                f.write(
+                    json.dumps(
+                        {
+                            "bar_index": tr.bar_index,
+                            "timestamp_utc": tr.timestamp_utc.isoformat(),
+                            "direction": tr.direction,
+                            "execution_price": tr.execution_price,
+                            "position_before": tr.position_before,
+                            "position_after": tr.position_after,
+                            "position_change": tr.position_change,
+                            "estimated_cost_rate": tr.estimated_cost_rate,
+                            "note": tr.note,
+                        }
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
+
+        # run_manifest.json — provenance for reproducibility/audit (P2-STRAT-01)
+        manifest: dict[str, Any] = {
+            "created_at": datetime.now(UTC).isoformat(),
+            "output_label": result.output_label,
+            "non_auth_assertion": result.non_auth_assertion,
+            "strategy_spec": strategy_spec,
+            "strategy_params": strategy_params,
+            "signals_path": signals_path,
+            "ohlcv_fingerprint": ohlcv_fingerprint_info,
+            "strategy_fingerprint": strategy_fingerprint_info,
+            "python_version": sys.version,
+            "pandas_version": pd.__version__,
+        }
+        (tmp_dir / "run_manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    tmp_dir.rename(output_dir)
 
 
 def cmd_run_risk_aware(args: argparse.Namespace) -> int:
@@ -215,12 +360,12 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
     print("[NOTICE] run-risk-aware — NON-AUTHORIZING RESEARCH USE ONLY\n")
 
     ohlcv_path = Path(args.ohlcv).resolve()
-    signals_path = Path(args.signals).resolve()
     if not ohlcv_path.exists():
         print(f"[ERROR] OHLCV 文件不存在: {ohlcv_path}", file=sys.stderr)
         return 1
-    if not signals_path.exists():
-        print(f"[ERROR] Signals 文件不存在: {signals_path}", file=sys.stderr)
+
+    if bool(args.strategy) == bool(args.signals):
+        print("[ERROR] 必须且只能提供 --strategy 或 --signals 之一", file=sys.stderr)
         return 1
 
     print(f"[INFO] 加载 OHLCV: {ohlcv_path}")
@@ -232,9 +377,24 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
     )
     print(f"[INFO] 已加载 {len(records)} 条 OHLCV 记录")
 
-    print(f"[INFO] 加载 Signals: {signals_path}")
-    signals = load_signals_csv(signals_path, records)
-    print(f"[INFO] 已加载 {len(signals)} 条 Signal")
+    strategy_params: dict[str, Any] = {}
+    signals_path_str: str | None = None
+    if args.strategy:
+        strategy_params = _parse_strategy_params(args.strategy_params)
+        df = records_to_dataframe(records)
+        signals = load_signals_from_strategy(
+            args.strategy, strategy_params, df, allow_external=args.allow_external_strategy
+        )
+        print(f"[INFO] 使用策略生成 Signals: {args.strategy}")
+    else:
+        signals_path = Path(args.signals).resolve()
+        if not signals_path.exists():
+            print(f"[ERROR] Signals 文件不存在: {signals_path}", file=sys.stderr)
+            return 1
+        signals_path_str = str(signals_path)
+        print(f"[INFO] 加载 Signals: {signals_path}")
+        signals = load_signals_csv(signals_path, records)
+        print(f"[INFO] 已加载 {len(signals)} 条 Signal")
 
     config = BacktestConfig(
         initial_capital=args.initial_capital,
@@ -292,6 +452,7 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
 
     # 导出 artifacts
     run_id = getattr(args, "run_id", None) or uuid.uuid4().hex[:8]
+    validate_run_id(run_id)
     output_root = Path(getattr(args, "output", ".var/risk-aware-backtests"))
     run_dir = export_risk_aware_backtest_artifacts(
         run_id=run_id,
@@ -301,7 +462,11 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
         output_dir=output_root,
         stop_distance=stop_distance,
         ohlcv_path=str(ohlcv_path),
-        signals_path=str(signals_path),
+        signals_path=signals_path_str or "",
+        strategy_spec=args.strategy,
+        strategy_params=strategy_params if args.strategy else None,
+        ohlcv_fingerprint_info=ohlcv_fingerprint(ohlcv_path, records),
+        strategy_fingerprint_info=strategy_source_fingerprint(args.strategy),
     )
     print(f"\n[INFO] Artifacts 已保存至: {run_dir}")
     print(NON_AUTH_NOTICE)
@@ -313,12 +478,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(NON_AUTH_NOTICE)
 
     ohlcv_path = Path(args.ohlcv).resolve()
-    signals_path = Path(args.signals).resolve()
     if not ohlcv_path.exists():
         print(f"[ERROR] OHLCV 文件不存在: {ohlcv_path}", file=sys.stderr)
         return 1
-    if not signals_path.exists():
-        print(f"[ERROR] Signals 文件不存在: {signals_path}", file=sys.stderr)
+
+    if bool(args.strategy) == bool(args.signals):
+        print("[ERROR] 必须且只能提供 --strategy 或 --signals 之一", file=sys.stderr)
         return 1
 
     print(f"[INFO] 加载 OHLCV: {ohlcv_path}")
@@ -330,9 +495,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     print(f"[INFO] 已加载 {len(records)} 条 OHLCV 记录")
 
-    print(f"[INFO] 加载 Signals: {signals_path}")
-    signals = load_signals_csv(signals_path, records)
-    print(f"[INFO] 已加载 {len(signals)} 条 Signal")
+    # 只构建一次 df——策略生成信号和回测执行都用这同一份，不重复调用
+    # records_to_dataframe()。
+    df = records_to_dataframe(records)
+
+    strategy_params: dict[str, Any] = {}
+    signals_path_str: str | None = None
+    if args.strategy:
+        strategy_params = _parse_strategy_params(args.strategy_params)
+        signals = load_signals_from_strategy(
+            args.strategy, strategy_params, df, allow_external=args.allow_external_strategy
+        )
+        print(f"[INFO] 使用策略生成 Signals: {args.strategy}")
+    else:
+        signals_path = Path(args.signals).resolve()
+        if not signals_path.exists():
+            print(f"[ERROR] Signals 文件不存在: {signals_path}", file=sys.stderr)
+            return 1
+        signals_path_str = str(signals_path)
+        print(f"[INFO] 加载 Signals: {signals_path}")
+        signals = load_signals_csv(signals_path, records)
+        print(f"[INFO] 已加载 {len(signals)} 条 Signal")
 
     config = BacktestConfig(
         initial_capital=args.initial_capital,
@@ -343,7 +526,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
 
     print("[INFO] 运行回测...")
-    result = run_vectorized_backtest(config, records, signals)
+    result = _run_vectorized_backtest_on_df(config, df, signals)
 
     # 输出绩效摘要
     m = result.metrics
@@ -366,8 +549,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # 保存结果
     run_id = getattr(args, "run_id", None) or uuid.uuid4().hex[:8]
+    validate_run_id(run_id)
     output_dir = Path(".var") / "backtests" / run_id
-    save_results(result, output_dir)
+    save_results(
+        result,
+        output_dir,
+        strategy_spec=args.strategy,
+        strategy_params=strategy_params if args.strategy else None,
+        signals_path=signals_path_str,
+        ohlcv_fingerprint_info=ohlcv_fingerprint(ohlcv_path, records),
+        strategy_fingerprint_info=strategy_source_fingerprint(args.strategy),
+    )
     print(f"\n[INFO] 结果已保存至: {output_dir.resolve()}")
     print(NON_AUTH_NOTICE)
     return 0
@@ -382,7 +574,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="运行回测")
     run_parser.add_argument("--ohlcv", required=True, help="OHLCV CSV 文件路径")
-    run_parser.add_argument("--signals", required=True, help="Signals CSV 文件路径")
+    run_parser.add_argument(
+        "--signals", default=None, help="Signals CSV 文件路径（与 --strategy 二选一）"
+    )
+    run_parser.add_argument(
+        "--strategy",
+        default=None,
+        help='策略 spec，形如 "py_core.strategies.sma_crossover:SmaCrossoverStrategy"'
+        "（与 --signals 二选一）",
+    )
+    run_parser.add_argument(
+        "--strategy-params",
+        default=None,
+        help='策略构造参数，JSON 对象字符串，例如 \'{"fast_window": 5, "slow_window": 20}\'',
+    )
+    run_parser.add_argument(
+        "--allow-external-strategy",
+        action="store_true",
+        help="允许加载 py_core.strategies 命名空间之外的策略模块（默认不允许）",
+    )
     run_parser.add_argument(
         "--initial-capital", type=float, default=100000.0, help="初始资本（默认 100000）"
     )
@@ -402,7 +612,25 @@ def build_parser() -> argparse.ArgumentParser:
     # ── run-risk-aware subcommand ────────────────────────────────────────────
     rra_parser = subparsers.add_parser("run-risk-aware", help="运行风险感知回测（P2-RM-03）")
     rra_parser.add_argument("--ohlcv", required=True, help="OHLCV CSV 文件路径")
-    rra_parser.add_argument("--signals", required=True, help="Signals CSV 文件路径")
+    rra_parser.add_argument(
+        "--signals", default=None, help="Signals CSV 文件路径（与 --strategy 二选一）"
+    )
+    rra_parser.add_argument(
+        "--strategy",
+        default=None,
+        help='策略 spec，形如 "py_core.strategies.sma_crossover:SmaCrossoverStrategy"'
+        "（与 --signals 二选一）",
+    )
+    rra_parser.add_argument(
+        "--strategy-params",
+        default=None,
+        help='策略构造参数，JSON 对象字符串，例如 \'{"fast_window": 5, "slow_window": 20}\'',
+    )
+    rra_parser.add_argument(
+        "--allow-external-strategy",
+        action="store_true",
+        help="允许加载 py_core.strategies 命名空间之外的策略模块（默认不允许）",
+    )
     rra_parser.add_argument(
         "--initial-capital", type=float, default=100000.0, help="初始资本（默认 100000）"
     )

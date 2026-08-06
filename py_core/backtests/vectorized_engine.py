@@ -55,6 +55,16 @@ def records_to_dataframe(records: list[NormalizedOhlcvRecord]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df = df.set_index("event_time_utc")
     df.index = pd.DatetimeIndex(df.index)
+
+    # 必须在 sort_index() 之前检查——排序会把乱序/重复时间戳悄悄"整理好"，导致
+    # validate_inputs() 的"timestamp 单调递增"检查在实际入口（run_vectorized_backtest()/
+    # run_risk_aware_backtest()，两者都先调用本函数再调用 validate_inputs()）里形同虚设：
+    # 无论原始 records 是否乱序/重复，validate_inputs() 拿到的永远是已排序、永远"合法"的
+    # df。is_monotonic_increasing 本身允许相等的相邻值（非严格递增），所以额外单独检查
+    # has_duplicates 才能真正拒绝重复时间戳，不只是拒绝时间倒退。
+    if not df.index.is_monotonic_increasing or df.index.has_duplicates:
+        raise ValueError("records 的 event_time_utc 必须严格按时间升序排列且不含重复值（发现乱序或重复时间戳）")
+
     df = df.sort_index()
     return df
 
@@ -134,9 +144,26 @@ def run_vectorized_backtest(
     if not records:
         raise ValueError("records 不能为空")
 
-    # --- 构建 OHLCV DataFrame ---
     df = records_to_dataframe(records)
+    return _run_vectorized_backtest_on_df(config, df, signals)
 
+
+def _run_vectorized_backtest_on_df(
+    config: BacktestConfig,
+    df: pd.DataFrame,
+    signals: pd.Series[Any],
+) -> BacktestResult:
+    """run_vectorized_backtest() 的内部实现，接收已经构建好的 OHLCV DataFrame。
+
+    供 risk_integration.py/策略框架的 CLI 路径复用——两者都需要先自己算一遍
+    records_to_dataframe(records)（喂给策略/风险计算），不应该再让这个函数内部重新构建
+    一次同样的 DataFrame。
+
+    Args:
+        df: records_to_dataframe() 的输出形状（DatetimeIndex，按时间升序，
+            columns=[open, high, low, close, volume]）。调用方负责保证这一点，本函数不
+            重新校验 df 本身的形状（那是 records_to_dataframe() 的职责）。
+    """
     # 确保 signals 拥有 DatetimeIndex
     signals_work = signals.copy()
     if not isinstance(signals_work.index, pd.DatetimeIndex):
