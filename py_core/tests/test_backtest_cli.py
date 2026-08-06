@@ -180,6 +180,18 @@ def test_save_results_refuses_to_overwrite_existing_nonempty_run_dir(tmp_path: A
         save_results(result, output_dir)
 
 
+def test_save_results_refuses_to_overwrite_existing_empty_run_dir(tmp_path: Any) -> None:
+    # 回归用例：之前"已存在且非空才拒绝"的写法在 POSIX 上对着一个已存在的空目录会被
+    # rename 静默替换掉——跟 Windows 上 rename 对已存在空目录直接报错不一致，是真实的
+    # 平台相关 TOCTOU，不只是理论风险。现在不管目标目录是否为空，已存在就必须拒绝。
+    result = _make_result()
+    output_dir = tmp_path / "run1"
+    output_dir.mkdir(parents=True)
+    assert list(output_dir.iterdir()) == []
+    with pytest.raises(FileExistsError):
+        save_results(result, output_dir)
+
+
 def test_save_results_leaves_no_partial_output_on_failure(tmp_path: Any) -> None:
     result = _make_result()
     output_dir = tmp_path / "run1"

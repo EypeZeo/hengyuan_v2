@@ -239,9 +239,11 @@ def export_risk_aware_backtest_artifacts(
 ) -> Path:
     """将 RiskAwareBacktestResult 序列化为完整 artifact 目录。
 
-    原子发布：先在 output_dir 的同级临时目录下把所有文件写完，全部成功后再整体 rename 到
-    output_dir/<run_id>/ ——中途失败/被杀不会留下"写了一半"的残留。目标 run 目录已存在且
-    非空时拒绝覆盖。
+    原子发布：先在 output_dir 的同级临时目录下把所有文件写完；全部成功后用
+    run_dir.mkdir(exist_ok=False) 做一次真正原子的排他占位（不管 run_dir 是否已存在、是否为空，
+    两个平台语义一致——之前"检查已存在且非空，再 rename"的写法在 POSIX 上对一个已存在的空目录
+    会被静默替换掉，是一个真实的 check-then-act 竞争窗口，不只是理论上的），再把临时目录里的
+    文件逐个搬进去。中途失败/被杀不会留下"写了一半"的残留；已存在的目标目录也不会被静默覆盖。
 
     所有文件包含 non_authorizing=true。
 
@@ -250,16 +252,13 @@ def export_risk_aware_backtest_artifacts(
 
     Raises:
         ValueError: result 不符合 non_authorizing 约束（不应发生，仅防御）。
-        FileExistsError: 目标 run 目录已存在且非空。
+        FileExistsError: 目标 run 目录已存在（不管是否为空）。
         OSError: 无法创建输出目录。
     """
     if not result.non_authorizing:
         raise ValueError("result.non_authorizing 必须为 True")
 
     run_dir = output_dir / run_id
-    if run_dir.exists() and any(run_dir.iterdir()):
-        raise FileExistsError(f"输出目录已存在且非空，拒绝覆盖: {run_dir}")
-
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir = output_dir / f".tmp-{run_id}-{uuid.uuid4().hex}"
     tmp_dir.mkdir(parents=True, exist_ok=False)
@@ -315,5 +314,13 @@ def export_risk_aware_backtest_artifacts(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
-    tmp_dir.rename(run_dir)
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise FileExistsError(f"输出目录已存在，拒绝覆盖: {run_dir}") from None
+
+    for f in tmp_dir.iterdir():
+        f.rename(run_dir / f.name)
+    tmp_dir.rmdir()
     return run_dir.resolve()
