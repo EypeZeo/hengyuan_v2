@@ -255,16 +255,16 @@ def save_results(
 ) -> None:
     """将回测结果序列化写入 output_dir，原子发布。
 
-    先在 output_dir 的同级临时目录下把所有文件写完，全部成功后再整体 rename 到
-    output_dir 本身——中途失败/被杀不会在 output_dir 留下"写了一半"的残留。output_dir
-    已存在且非空时拒绝覆盖（不静默覆盖已有的一次运行结果）。
+    先在 output_dir 的同级临时目录下把所有文件写完；全部成功后用
+    output_dir.mkdir(exist_ok=False) 做一次真正原子的排他占位（不管 output_dir 是否已存在、
+    是否为空，两个平台语义一致——之前用"检查已存在且非空，再 rename"的写法在 POSIX 上对一个
+    已存在的空目录会被静默替换掉，跟 Windows 上 rename 对已存在空目录直接报错的行为不一致，
+    是一个真实的 check-then-act 竞争窗口，不只是理论上的），再把临时目录里的文件逐个搬进去。
+    中途失败/被杀不会在 output_dir 留下"写了一半"的残留；已存在的目标目录也不会被静默覆盖。
 
     Raises:
-        FileExistsError: output_dir 已存在且非空。
+        FileExistsError: output_dir 已存在（不管是否为空）。
     """
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"输出目录已存在且非空，拒绝覆盖: {output_dir}")
-
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = output_dir.parent / f".tmp-{output_dir.name}-{uuid.uuid4().hex}"
     tmp_dir.mkdir(parents=True, exist_ok=False)
@@ -351,7 +351,15 @@ def save_results(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
 
-    tmp_dir.rename(output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise FileExistsError(f"输出目录已存在，拒绝覆盖: {output_dir}") from None
+
+    for f in tmp_dir.iterdir():
+        f.rename(output_dir / f.name)
+    tmp_dir.rmdir()
 
 
 def cmd_run_risk_aware(args: argparse.Namespace) -> int:

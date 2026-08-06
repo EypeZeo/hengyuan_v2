@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pandas as pd
 import pytest
@@ -550,6 +551,70 @@ def test_export_idempotent_different_run_ids(tmp_path: Path) -> None:
     )
     assert (tmp_path / "run1").is_dir()
     assert (tmp_path / "run2").is_dir()
+
+
+def test_export_refuses_to_overwrite_existing_nonempty_run_dir(tmp_path: Path) -> None:
+    result, config, risk_config = _make_raa_result()
+    export_risk_aware_backtest_artifacts(
+        run_id="dup",
+        result=result,
+        config=config,
+        risk_config=risk_config,
+        output_dir=tmp_path,
+    )
+    with pytest.raises(FileExistsError):
+        export_risk_aware_backtest_artifacts(
+            run_id="dup",
+            result=result,
+            config=config,
+            risk_config=risk_config,
+            output_dir=tmp_path,
+        )
+
+
+def test_export_refuses_to_overwrite_existing_empty_run_dir(tmp_path: Path) -> None:
+    # 回归用例：之前"已存在且非空才拒绝"的写法在 POSIX 上对着一个已存在的空目录会被
+    # rename 静默替换掉——跟 Windows 上 rename 对已存在空目录直接报错不一致，是真实的
+    # 平台相关 TOCTOU，不只是理论风险。现在不管目标目录是否为空，已存在就必须拒绝。
+    result, config, risk_config = _make_raa_result()
+    run_dir = tmp_path / "dup"
+    run_dir.mkdir(parents=True)
+    assert list(run_dir.iterdir()) == []
+    with pytest.raises(FileExistsError):
+        export_risk_aware_backtest_artifacts(
+            run_id="dup",
+            result=result,
+            config=config,
+            risk_config=risk_config,
+            output_dir=tmp_path,
+        )
+
+
+def test_export_leaves_no_partial_output_on_failure(tmp_path: Path) -> None:
+    result, config, risk_config = _make_raa_result()
+    run_id = "flaky"
+
+    real_dumps = json.dumps
+    call_count = {"n": 0}
+
+    def flaky_dumps(*args: Any, **kwargs: Any) -> str:
+        call_count["n"] += 1
+        if call_count["n"] == 3:
+            raise RuntimeError("boom")
+        return real_dumps(*args, **kwargs)
+
+    with mock.patch("py_core.backtests.artifact_export.json.dumps", side_effect=flaky_dumps):
+        with pytest.raises(RuntimeError):
+            export_risk_aware_backtest_artifacts(
+                run_id=run_id,
+                result=result,
+                config=config,
+                risk_config=risk_config,
+                output_dir=tmp_path,
+            )
+
+    assert not (tmp_path / run_id).exists()
+    assert list(tmp_path.glob(".tmp-*")) == []
 
 
 def test_export_rejects_non_authorizing_false(tmp_path: Path) -> None:
