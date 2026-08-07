@@ -117,7 +117,12 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     // the cap with margin, while still forcing many full churn cycles through
     // InFlightRegistry's 64-slot capacity -- the actual condition under test.
     constexpr int kIterations = 200;
-    constexpr int kAcceptedPrefix = 5;  // first N orders: never resolved, stay in-flight
+    // First N orders come back Accepted rather than Timeout. Before audit
+    // EXEC-INFLIGHT-003 these were "never resolved, stay in-flight forever" -- which
+    // was the defect, not a property worth preserving. They now flow through the same
+    // reconcile handoff as the Ambiguous ones and reach a terminal state, so this
+    // prefix exercises the Accepted->reconcile path across the thread boundary.
+    constexpr int kAcceptedPrefix = 5;
 
     AuditRingSink audit;
     KillSwitch kill_switch;
@@ -300,8 +305,13 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
         const auto& r = results[static_cast<std::size_t>(i)];
         if (r.gate == OrchestratorGate::SubmitAccepted) {
             ++accepted_count;
-            EXPECT_TRUE(in_flight.is_in_flight(r.coid.view()))
-                << "Accepted order (never reconciled in this test) must still hold its slot, i=" << i;
+            // AUDIT EXEC-INFLIGHT-003: this used to assert the slot was STILL HELD,
+            // because nothing could ever release it. An Accepted order now reaches the
+            // reconcile loop, gets polled, and (mock_query returns Filled) resolves to
+            // a terminal state, so its slot must be released exactly like an
+            // Ambiguous one's.
+            EXPECT_FALSE(in_flight.is_in_flight(r.coid.view()))
+                << "Accepted order must reach a terminal state and release its slot, i=" << i;
         } else if (r.gate == OrchestratorGate::SubmitAmbiguous) {
             ++ambiguous_count;
             EXPECT_FALSE(in_flight.is_in_flight(r.coid.view()))
@@ -319,8 +329,13 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     }
 
     EXPECT_EQ(accepted_count, kAcceptedPrefix);
-    EXPECT_EQ(in_flight.count(), static_cast<std::size_t>(accepted_count))
-        << "only the never-reconciled Accepted orders should still occupy a slot";
+    // The invariant the whole gate chain rests on (protocol §31: an accepted request
+    // must eventually reach a terminal state): once both threads have joined and the
+    // final drain has run, NOTHING is still holding a slot. Before audit
+    // EXEC-INFLIGHT-003 this could only ever have been `accepted_count`, because
+    // Accepted orders had no route to a terminal state at all.
+    EXPECT_EQ(in_flight.count(), 0u)
+        << "every submitted order must have reached a terminal state and released its slot";
 
     RecordProperty("ambiguous_resolved", ambiguous_count);
     RecordProperty("duplicate_or_capacity_exhausted", other_count);
