@@ -85,6 +85,18 @@ std::optional<std::int64_t> BinanceJsonParser::parse_decimal_to_fixed(
         }
     }
 
+    // The two guards above only prove each CONTRIBUTION fits on its own; their SUM
+    // still can't. `max / multiplier` truncates, so integer_part is allowed right up
+    // to floor(max/multiplier) -- leaving max % multiplier of headroom, while
+    // frac_contrib ranges up to multiplier-1. For multiplier=1e8 (this parser's
+    // default price/qty multiplier) that headroom is 54,775,807 against a
+    // frac_contrib ceiling of 99,999,999, so "92233720368.99999999" overflows.
+    // Both operands are non-negative here (integer_part and multiplier are both
+    // positive, and frac_contrib is only assigned inside a frac_value > 0 branch),
+    // so a single subtraction-form check is sufficient and cannot itself overflow.
+    if (frac_contrib > std::numeric_limits<std::int64_t>::max() - int_contrib) {
+        return std::nullopt;
+    }
     std::int64_t result = int_contrib + frac_contrib;
     if (negative) result = -result;
     return result;

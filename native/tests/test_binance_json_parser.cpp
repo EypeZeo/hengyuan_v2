@@ -2,6 +2,9 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_json_parser.hpp>
 
+#include <cstdint>
+#include <limits>
+
 using hy::BinanceJsonParser;
 using hy::BinanceMarketEvent;
 using hy::EventType;
@@ -269,4 +272,50 @@ TEST(DecimalToFixed, Int64MaxBoundary) {
 TEST(DecimalToFixed, NegativeWithManyFractionalDigitsStillGuarded) {
     auto r = BinanceJsonParser::parse_decimal_to_fixed("-0.1234567890123456789012345", 100'000'000);
     EXPECT_FALSE(r.has_value());
+}
+
+// --- Combined-contribution overflow (audit MD-NUM-001) ---
+//
+// Each of the three pre-existing guards proves ONE step doesn't overflow: the
+// integer-digit loop, the fractional-digit loop, and integer_part*multiplier.
+// None of them constrains their SUM. `max/multiplier` truncates, so integer_part
+// is admitted right up to floor(max/multiplier), leaving only `max % multiplier`
+// of headroom -- 54,775,807 for the default 1e8 multiplier -- while frac_contrib
+// reaches multiplier-1 = 99,999,999. UBSan reports
+// "signed integer overflow: 99999999 + 9223372036800000000" on these inputs
+// without the final guard. Reachable straight from an untrusted WS "p"/"q" string
+// and from binance_depth_snapshot_codec.hpp's REST path.
+TEST(DecimalToFixed, CombinedContributionOverflowRejected) {
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("92233720368.99999999", 100'000'000);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(DecimalToFixed, CombinedContributionOverflowRejectedNegative) {
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("-92233720368.99999999", 100'000'000);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(DecimalToFixed, CombinedContributionJustUnderMaxAccepted) {
+    // The largest value that genuinely fits: floor(max/1e8) whole units plus the
+    // exact remaining headroom (max % 1e8 = 54,775,807). Proves the new guard
+    // rejects only what actually overflows, rather than clipping the top of the
+    // representable range.
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("92233720368.54775807", 100'000'000);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, std::numeric_limits<std::int64_t>::max());
+}
+
+TEST(DecimalToFixed, CombinedContributionOneTickOverMaxRejected) {
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("92233720368.54775808", 100'000'000);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(DecimalToFixed, CombinedContributionOverflowOtherMultiplier) {
+    // Same class of input at a 3-decimal multiplier, so the fix isn't tied to 1e8.
+    // max/1000 = 9223372036854775, remaining headroom = 807.
+    auto over = BinanceJsonParser::parse_decimal_to_fixed("9223372036854775.808", 1000);
+    EXPECT_FALSE(over.has_value());
+    auto ok = BinanceJsonParser::parse_decimal_to_fixed("9223372036854775.807", 1000);
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(*ok, std::numeric_limits<std::int64_t>::max());
 }
