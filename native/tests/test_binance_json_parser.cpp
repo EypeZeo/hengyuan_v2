@@ -2,8 +2,10 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_json_parser.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 using hy::BinanceJsonParser;
 using hy::BinanceMarketEvent;
@@ -272,6 +274,122 @@ TEST(DecimalToFixed, Int64MaxBoundary) {
 TEST(DecimalToFixed, NegativeWithManyFractionalDigitsStillGuarded) {
     auto r = BinanceJsonParser::parse_decimal_to_fixed("-0.1234567890123456789012345", 100'000'000);
     EXPECT_FALSE(r.has_value());
+}
+
+// --- depthUpdate truncation emits a resync marker (audit MD-TRUNC-015) ---
+//
+// This used to `break` out of the level loop and return Ok with whatever fit,
+// silently diverging the local book from the exchange. Because the bids loop runs
+// first, a large enough message could consume every slot and leave the asks side
+// completely unrepresented -- still reported as a clean parse.
+
+TEST(DepthTruncation, OverlongDepthUpdateYieldsSingleResyncMarker) {
+    BinanceJsonParser p;
+    p.register_symbol("BTCUSDT", 0);
+
+    // 8 bid levels into a 4-slot batch.
+    std::string json = R"({"e":"depthUpdate","E":123,"s":"BTCUSDT","U":10,"u":15,"b":[)";
+    for (int i = 0; i < 8; ++i) {
+        if (i) json += ",";
+        json += "[\"" + std::to_string(50000 - i) + ".0\",\"1.0\"]";
+    }
+    json += R"(],"a":[["50010.0","1.0"]]})";
+
+    BinanceMarketEvent evs[4]{};
+    std::size_t count = 0;
+    auto r = p.parse(json, 999, evs, 4, count);
+
+    EXPECT_EQ(r, ParseResult::TruncatedResync);
+    ASSERT_EQ(count, 1u) << "the partial delta must be discarded, not handed back";
+    EXPECT_EQ(evs[0].type, EventType::DepthDelta);
+    EXPECT_EQ(evs[0].symbol_id, 0u);
+    EXPECT_EQ(evs[0].event_id, 15u);
+    EXPECT_EQ(evs[0].aux_id, 10u);
+    EXPECT_NE(evs[0].flags & hy::event_flag::kResyncRequired, 0)
+        << "the marker must be what drives DepthManager back to Buffering";
+    EXPECT_EQ(p.counters().truncated_resync, 1u);
+    EXPECT_EQ(p.counters().parsed_ok, 0u) << "truncation must not be counted as a clean parse";
+}
+
+TEST(DepthTruncation, ExactlyFittingDepthUpdateIsNotTruncated) {
+    // Boundary: as many levels as slots must still be an ordinary Ok.
+    BinanceJsonParser p;
+    p.register_symbol("BTCUSDT", 0);
+    std::string json =
+        R"({"e":"depthUpdate","E":123,"s":"BTCUSDT","U":10,"u":15,)"
+        R"("b":[["50000.0","1.0"],["49999.0","2.0"]],"a":[["50010.0","1.0"],["50011.0","2.0"]]})";
+
+    BinanceMarketEvent evs[4]{};
+    std::size_t count = 0;
+    auto r = p.parse(json, 999, evs, 4, count);
+
+    EXPECT_EQ(r, ParseResult::Ok);
+    EXPECT_EQ(count, 4u);
+    EXPECT_EQ(p.counters().truncated_resync, 0u);
+}
+
+TEST(DepthTruncation, TruncationInTheAsksLoopIsAlsoCaught) {
+    // Bids fit exactly; the asks side is what overflows. Under the old code this was
+    // the worst case -- the book would apply bid-only updates forever.
+    BinanceJsonParser p;
+    p.register_symbol("BTCUSDT", 0);
+    std::string json =
+        R"({"e":"depthUpdate","E":123,"s":"BTCUSDT","U":10,"u":15,)"
+        R"("b":[["50000.0","1.0"],["49999.0","2.0"]],)"
+        R"("a":[["50010.0","1.0"],["50011.0","2.0"],["50012.0","3.0"]]})";
+
+    BinanceMarketEvent evs[4]{};
+    std::size_t count = 0;
+    auto r = p.parse(json, 999, evs, 4, count);
+
+    EXPECT_EQ(r, ParseResult::TruncatedResync);
+    ASSERT_EQ(count, 1u);
+    EXPECT_NE(evs[0].flags & hy::event_flag::kResyncRequired, 0);
+}
+
+// --- Reusable padded buffer (audit PERF-ALLOC-012) ---
+
+TEST(ParserPaddedBuffer, RepeatedParsesOfVaryingSizesStayCorrect) {
+    // The buffer is reused and only grows, so a short message parsed after a long
+    // one must not see stale bytes from the previous document.
+    BinanceJsonParser p;
+    p.register_symbol("BTCUSDT", 0);
+
+    std::string big = R"({"e":"depthUpdate","E":1,"s":"BTCUSDT","U":1,"u":2,"b":[)";
+    for (int i = 0; i < 200; ++i) {
+        if (i) big += ",";
+        big += "[\"" + std::to_string(50000 - i) + ".0\",\"1.0\"]";
+    }
+    big += R"(],"a":[["60000.0","1.0"]]})";
+
+    const std::string small =
+        R"({"e":"trade","E":7,"s":"BTCUSDT","t":42,"p":"100.5","q":"2.25","m":false})";
+
+    BinanceMarketEvent evs[512]{};
+    std::size_t count = 0;
+
+    ASSERT_EQ(p.parse(big, 1, evs, 512, count), ParseResult::Ok);
+    ASSERT_EQ(count, 201u);
+
+    ASSERT_EQ(p.parse(small, 2, evs, 512, count), ParseResult::Ok);
+    ASSERT_EQ(count, 1u);
+    EXPECT_EQ(evs[0].type, EventType::Trade);
+    EXPECT_EQ(evs[0].event_id, 42u);
+    EXPECT_EQ(evs[0].price_ticks, 10050000000LL);
+    EXPECT_EQ(evs[0].qty_lots, 225000000LL);
+
+    // ...and back up again, to exercise growth after shrink.
+    ASSERT_EQ(p.parse(big, 3, evs, 512, count), ParseResult::Ok);
+    EXPECT_EQ(count, 201u);
+}
+
+TEST(ParserPaddedBuffer, EmptyInputIsRejectedNotUndefined) {
+    BinanceJsonParser p;
+    p.register_symbol("BTCUSDT", 0);
+    BinanceMarketEvent evs[4]{};
+    std::size_t count = 0;
+    EXPECT_EQ(p.parse("", 1, evs, 4, count), ParseResult::MalformedJson);
+    EXPECT_EQ(count, 0u);
 }
 
 // --- Combined-contribution overflow (audit MD-NUM-001) ---

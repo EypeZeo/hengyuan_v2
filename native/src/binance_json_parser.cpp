@@ -110,7 +110,20 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
     out_count = 0;
     if (max_events == 0) return ParseResult::MalformedJson;
 
-    auto padded = simdjson::padded_string(json_bytes);
+    // Reusable padded buffer, not a fresh simdjson::padded_string per message --
+    // see padded_buf_'s declaration for why (audit PERF-ALLOC-012). resize() only
+    // allocates when the high-water mark grows, so the steady state is memcpy +
+    // memset into storage this object already owns.
+    const std::size_t doc_len = json_bytes.size();
+    if (padded_buf_.size() < doc_len + simdjson::SIMDJSON_PADDING) {
+        padded_buf_.resize(doc_len + simdjson::SIMDJSON_PADDING);
+    }
+    if (doc_len > 0) {
+        std::memcpy(padded_buf_.data(), json_bytes.data(), doc_len);
+    }
+    std::memset(padded_buf_.data() + doc_len, 0, simdjson::SIMDJSON_PADDING);
+    const simdjson::padded_string_view padded(padded_buf_.data(), doc_len, padded_buf_.size());
+
     simdjson::ondemand::document doc;
     auto err = parser_.iterate(padded).get(doc);
     if (err) {
@@ -221,12 +234,16 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
         [[maybe_unused]] auto e6b = doc["u"].get_uint64().get(final_update_id);
 
         std::size_t n = 0;
+        bool truncated = false;
 
         // Parse bids ("b" array): each element is ["price", "qty"]
         simdjson::ondemand::array bids_arr;
         if (doc["b"].get_array().get(bids_arr) == simdjson::SUCCESS) {
             for (auto level_result : bids_arr) {
-                if (n >= max_events) break;
+                if (n >= max_events) {
+                    truncated = true;
+                    break;
+                }
                 simdjson::ondemand::array pair;
                 if (level_result.get_array().get(pair) != simdjson::SUCCESS) continue;
                 auto it = pair.begin();
@@ -261,7 +278,10 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
         simdjson::ondemand::array asks_arr;
         if (doc["a"].get_array().get(asks_arr) == simdjson::SUCCESS) {
             for (auto level_result : asks_arr) {
-                if (n >= max_events) break;
+                if (n >= max_events) {
+                    truncated = true;
+                    break;
+                }
                 simdjson::ondemand::array pair;
                 if (level_result.get_array().get(pair) != simdjson::SUCCESS) continue;
                 auto it = pair.begin();
@@ -290,6 +310,33 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
                 ev.side = Side::Sell;  // ask side
                 ++n;
             }
+        }
+
+        // AUDIT MD-TRUNC-015: a depth delta is explicitly NOT conflatable
+        // (binance_market_event.hpp). Handing back the levels that happened to fit
+        // and returning Ok diverged the local book from the exchange permanently,
+        // with no counter, no flag and no way for the caller to notice -- and the
+        // bids loop runs first, so a large enough message could consume every slot
+        // and leave the asks side entirely unrepresented.
+        //
+        // Discard the partial delta and emit a single synthetic resync marker
+        // instead. event_flag::kResyncRequired is what InputValidator turns into
+        // ValidationResult::ResyncRequired, which drives DepthManager back to
+        // Buffering and a fresh snapshot -- the correct fail-closed response to
+        // "this update could not be represented in full".
+        if (truncated) {
+            ++counters_.truncated_resync;
+            auto& ev = out_events[0];
+            std::memset(&ev, 0, sizeof(ev));
+            ev.event_id = final_update_id;
+            ev.aux_id = first_update_id;
+            ev.ts_event_ms = event_time;
+            ev.ts_recv_ns = recv_ns;
+            ev.symbol_id = sym_cfg->symbol_id;
+            ev.type = EventType::DepthDelta;
+            ev.flags = event_flag::kResyncRequired;
+            out_count = 1;
+            return ParseResult::TruncatedResync;
         }
 
         out_count = n;

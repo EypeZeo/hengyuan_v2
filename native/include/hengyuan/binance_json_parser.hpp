@@ -17,8 +17,10 @@
 #endif
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace hy {
@@ -37,6 +39,15 @@ enum class ParseResult : std::uint8_t {
     UnknownEventType = 4,
     PriceOverflow = 5,
     QtyOverflow = 6,
+    // A depthUpdate carried more price levels than out_events could hold. Depth
+    // deltas are explicitly NOT conflatable (binance_market_event.hpp), so the
+    // partial levels are discarded and out_events[0] is a single synthetic event
+    // carrying event_flag::kResyncRequired instead. The caller MUST push that event
+    // exactly as it pushes an Ok result -- it is what drives DepthManager back to
+    // Buffering. Distinct from Ok so the outcome is countable rather than silent
+    // (audit MD-TRUNC-015: this used to `break` and return Ok, which diverged the
+    // book from the exchange with no signal anywhere).
+    TruncatedResync = 7,
 };
 
 struct ParseCounters {
@@ -47,6 +58,7 @@ struct ParseCounters {
     std::uint64_t unknown_event{0};
     std::uint64_t price_overflow{0};
     std::uint64_t qty_overflow{0};
+    std::uint64_t truncated_resync{0};  // audit MD-TRUNC-015
 };
 
 class BinanceJsonParser {
@@ -83,6 +95,21 @@ private:
 
     simdjson::ondemand::parser parser_;
     ParseCounters counters_{};
+
+    // AUDIT PERF-ALLOC-012: parse() used to build a fresh
+    // simdjson::padded_string(json_bytes) per message -- a heap allocation plus a
+    // full copy of every WS frame, on the hot path, directly against CLAUDE.md's
+    // zero-heap-allocation mandate.
+    //
+    // simdjson needs SIMDJSON_PADDING readable bytes past the document, which an
+    // arbitrary caller-supplied std::string_view cannot promise, so the copy itself
+    // has to stay. What does not have to stay is the ALLOCATION: this buffer is
+    // reused across calls and only ever grows, so after the first few messages the
+    // steady state is a memcpy into already-owned storage and zero mallocs. Sized at
+    // construction to cover realistic Binance frames (depth@100ms with 20+20 levels
+    // is a few KB) so warm-up is immediate rather than gradual.
+    static constexpr std::size_t kInitialPaddedCapacity = 64 * 1024;
+    std::string padded_buf_ = std::string(kInitialPaddedCapacity, '\0');
 
     const SymbolConfig* find_symbol(std::string_view name) const noexcept;
 };

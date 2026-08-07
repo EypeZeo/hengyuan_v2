@@ -120,6 +120,7 @@ struct WsSessionStats {
     std::uint64_t bytes_received{0};
     std::uint64_t parse_ok{0};
     std::uint64_t parse_failed{0};
+    std::uint64_t parse_truncated_resync{0};  // audit MD-TRUNC-015
     std::uint64_t push_ok{0};
     std::uint64_t push_dropped{0};
     std::uint64_t errors{0};
@@ -269,18 +270,27 @@ private:
         std::size_t count = 0;
         auto pr = parser_.parse(sv, recv_ns, events, kMaxEventsPerMessage, count);
 
+        // TruncatedResync is neither a success nor a parse failure: the message was
+        // understood, but it carried more depth levels than one batch can hold, so
+        // out_events[0] is a resync marker rather than the delta (audit
+        // MD-TRUNC-015). It MUST still be pushed -- that marker is what drives
+        // DepthManager back to Buffering -- and it is counted separately so the
+        // condition is visible instead of hiding inside parse_ok.
+        const bool has_events = (pr == ParseResult::Ok || pr == ParseResult::TruncatedResync);
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             ++stats_.messages_received;
             stats_.bytes_received += bytes_transferred;
             if (pr == ParseResult::Ok) {
                 ++stats_.parse_ok;
+            } else if (pr == ParseResult::TruncatedResync) {
+                ++stats_.parse_truncated_resync;
             } else if (pr != ParseResult::EventIgnored) {
                 ++stats_.parse_failed;
             }
         }
 
-        if (pr == ParseResult::Ok) {
+        if (has_events) {
             std::uint64_t local_push_ok = 0;
             std::uint64_t local_push_dropped = 0;
             for (std::size_t i = 0; i < count; ++i) {
