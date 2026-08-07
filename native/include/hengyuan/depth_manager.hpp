@@ -42,6 +42,8 @@ struct DepthManagerStats {
     std::uint64_t snapshots{0};
     std::uint64_t resyncs{0};         // gap detected → back to Buffering
     std::uint64_t gap_events{0};      // events that arrived with U gap
+    std::uint64_t buffer_overflow_count{0};  // events dropped because the Buffering-state
+                                              // ring (kMaxBuffered) was already full
 };
 
 class DepthManager {
@@ -59,6 +61,7 @@ public:
     void start_buffering() noexcept {
         state_ = DepthState::Buffering;
         buf_count_ = 0;
+        buf_overflowed_ = false;
         last_applied_u_ = 0;
         book_.clear();
     }
@@ -78,6 +81,15 @@ public:
                 buf_final_u_[buf_count_] = final_update_id;
                 ++buf_count_;
                 ++stats_.events_buffered;
+            } else {
+                // The buffered array holds a contiguous prefix of events since Buffering
+                // started; once full, every subsequent event is silently lost until the next
+                // apply_snapshot() -- previously this was invisible (no counter, no flag).
+                // Recording it lets apply_snapshot() refuse to trust a replay that we know is
+                // missing events, instead of silently transitioning to Tracking on a book that
+                // may already have a real gap right after the buffered prefix ends.
+                buf_overflowed_ = true;
+                ++stats_.buffer_overflow_count;
             }
             return false;
         }
@@ -107,6 +119,16 @@ public:
     // Returns true if sync succeeded (found valid continuation in buffer).
     bool apply_snapshot(const DepthSnapshot& snap) noexcept {
         if (state_ != DepthState::Buffering) return false;
+
+        if (buf_overflowed_) {
+            // The buffered prefix is known-incomplete for this episode -- replaying it and
+            // trusting the result would silently assume sequence continuity across a gap we
+            // know exists. Discard this snapshot attempt and force a fresh resync instead of
+            // quietly entering Tracking on data we can't vouch for.
+            ++stats_.resyncs;
+            start_buffering();
+            return false;
+        }
 
         ++stats_.snapshots;
         state_ = DepthState::Syncing;
@@ -165,6 +187,7 @@ private:
 
     // Circular buffer for events received during Buffering state.
     std::size_t buf_count_{0};
+    bool buf_overflowed_{false};  // true if any event was dropped due to kMaxBuffered this episode
     std::array<BinanceMarketEvent, kMaxBuffered> buf_events_{};
     std::array<std::uint64_t, kMaxBuffered> buf_first_u_{};
     std::array<std::uint64_t, kMaxBuffered> buf_final_u_{};

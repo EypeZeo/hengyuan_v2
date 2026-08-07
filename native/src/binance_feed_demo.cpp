@@ -7,6 +7,7 @@
 //   conversion to Parquet/DuckDB via tools/perf/hyf_to_parquet.py.
 
 #include <hengyuan/binance_json_parser.hpp>
+#include <hengyuan/binance_tls.hpp>
 #include <hengyuan/binance_ws_session.hpp>
 #include <hengyuan/event_recorder.hpp>
 #include <hengyuan/hot_thread.hpp>
@@ -89,8 +90,7 @@ int main(int argc, char* argv[]) {
     // Boost.Asio + SSL
     boost::asio::io_context ioc;
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
-    ssl_ctx.set_default_verify_paths();
-    ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
+    hy::configure_binance_ssl_context(ssl_ctx);
 
     auto session = std::make_shared<hy::BinanceWsSession<kRingSize>>(
         ioc, ssl_ctx, *ring, parser, config);
@@ -113,16 +113,21 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // Shutdown
+    // Shutdown -- deliberately NOT calling ioc.stop() here: session->stop() posts its
+    // cancellation onto the session's own strand, and ioc.stop() could make ioc.run() return
+    // before that posted work ever executes, leaving pending operations un-cancelled. Letting
+    // the cancellation actually cascade through (bounded by the session's own per-stage
+    // timeouts) and having io_thread.join() return naturally once there's no more work is the
+    // correct graceful-shutdown idiom here.
     session->stop();
-    ioc.stop();
     if (io_thread.joinable()) io_thread.join();
 
     // Final drain
     hot.run_once();
 
-    // Print stats
-    const auto& ws = session->stats();
+    // Print stats -- safe to call now that io_thread has been joined (see
+    // binance_ws_session.hpp's shutdown-contract comment).
+    auto ws = session->stats_snapshot();
     const auto& hs = hot.stats();
     const auto& pc = parser.counters();
 

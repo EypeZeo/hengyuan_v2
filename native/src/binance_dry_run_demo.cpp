@@ -17,12 +17,14 @@
 
 #include <hengyuan/binance_json_parser.hpp>
 #include <hengyuan/binance_rest_snapshot.hpp>
+#include <hengyuan/binance_tls.hpp>
 #include <hengyuan/binance_ws_session.hpp>
 #include <hengyuan/depth_manager.hpp>
 #include <hengyuan/event_recorder.hpp>
 #include <hengyuan/hot_thread.hpp>
 #include <hengyuan/preflight_gate.hpp>
 #include <hengyuan/sim_executor.hpp>
+#include <hengyuan/snapshot_refresh_gate.hpp>
 #include <hengyuan/trade_logger.hpp>
 
 #include <chrono>
@@ -199,8 +201,7 @@ int main(int argc, char* argv[]) {
 
     boost::asio::io_context ioc;
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
-    ssl_ctx.set_default_verify_paths();
-    ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
+    hy::configure_binance_ssl_context(ssl_ctx);
 
     auto session = std::make_shared<hy::BinanceWsSession<kRingSize>>(
         ioc, ssl_ctx, *ring, parser, ws_cfg);
@@ -213,26 +214,19 @@ int main(int argc, char* argv[]) {
                 duration_s, interval_s, lots_to_qty(qty_lots), lots_to_qty(max_pos));
     std::printf("SIMULATION ONLY — no real orders, no real money.\n\n");
 
-    // Depth snapshot bootstrap: wait for WS to buffer some depth events,
-    // then fetch REST snapshot and sync DepthManager.
-    std::printf("Fetching BTCUSDT depth snapshot...\n");
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    hot.run_once();  // drain initial WS events into DepthManager's buffer
+    // Depth snapshot acquisition -- both the initial snapshot and every later resync go
+    // through SnapshotRefreshGate, run on a background worker thread. There is no special-cased
+    // synchronous bootstrap path: WS session I/O has already started (session->start() above)
+    // and is producing into the SPSC ring, so a synchronous fetch here would block hot.run_once()
+    // from draining it for the fetch's full timeout budget -- exactly the same problem a
+    // synchronous fetch mid-loop would cause during a resync. depth_mgr starts in Buffering
+    // state, so the first loop iteration's needs_snapshot() is naturally true and drives the
+    // gate to fetch the initial snapshot the same way a later resync does.
+    hy::SnapshotRefreshGate depth_gate;
 
-    auto snap = hy::fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000);
-    if (snap) {
-        bool ok = depth_mgr.apply_snapshot(*snap);
-        std::printf("Snapshot: lastUpdateId=%" PRIu64 "  bids=%zu  asks=%zu  sync=%s\n",
-                    snap->last_update_id, snap->bid_count, snap->ask_count,
-                    ok ? "OK" : "RESYNC_NEEDED");
-        if (!ok) {
-            std::printf("  Gap detected, will re-snapshot on next cycle.\n");
-        }
-    } else {
-        std::printf("WARNING: snapshot fetch failed. Book may be incomplete.\n");
-    }
-
-    // D3-LIVE preflight check (informational — this is dry-run, not live)
+    // D3-LIVE preflight check (informational — this is dry-run, not live). Runs before the book
+    // is synced (depth_mgr starts in Buffering), which honestly reflects "not ready yet at
+    // startup" rather than the old fixed 2s sleep's unguaranteed hope that sync had finished.
     {
 #ifdef __linux__
         auto pf = hy::check_preflight(sim.kill_switch(), max_pos > 0,
@@ -253,14 +247,19 @@ int main(int argc, char* argv[]) {
     while (!g_stop.load()) {
         hot.run_once();
 
-        // Re-snapshot if DepthManager fell back to Buffering (gap detected)
-        if (depth_mgr.needs_snapshot()) {
-            std::printf("  [resync] Gap detected, fetching new snapshot...\n");
-            auto resnap = hy::fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000);
-            if (resnap) {
-                hot.run_once();  // drain any new buffered events
-                depth_mgr.apply_snapshot(*resnap);
+        // Non-blocking: depth_gate.poll() never blocks the hot loop, whether this is the
+        // initial snapshot (depth_mgr starts in Buffering) or a later resync (gap detected or
+        // an overflowed buffer forced a fresh Buffering episode, see depth_manager.hpp).
+        if (auto snap = depth_gate.poll(depth_mgr.needs_snapshot(),
+                                         {"BTCUSDT", 100'000'000, 100'000'000})) {
+            bool ok = depth_mgr.apply_snapshot(*snap);
+            std::printf("Snapshot: lastUpdateId=%" PRIu64 "  bids=%zu  asks=%zu  sync=%s\n",
+                        snap->last_update_id, snap->bid_count, snap->ask_count,
+                        ok ? "OK" : "RESYNC_NEEDED");
+            if (!ok) {
+                std::printf("  Gap or buffer overflow detected; will re-snapshot after cooldown.\n");
             }
+            depth_gate.notify_apply_result(ok);
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -321,14 +320,14 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // Shutdown
+    // Shutdown -- deliberately NOT calling ioc.stop() here; see binance_feed_demo.cpp's
+    // equivalent comment / binance_ws_session.hpp's shutdown-contract header comment.
     session->stop();
-    ioc.stop();
     if (io_thread.joinable()) io_thread.join();
     hot.run_once();
 
-    // Final summary
-    const auto& ws = session->stats();
+    // Final summary -- safe to call now that io_thread has been joined.
+    auto ws = session->stats_snapshot();
     const auto& hs = hot.stats();
     const auto& pc = parser.counters();
     const auto& ss = sim.stats();
