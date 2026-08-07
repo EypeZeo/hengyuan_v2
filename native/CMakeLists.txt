@@ -93,6 +93,21 @@ if(HY_BUILD_DEMO)
     )
     hengyuan_set_warnings(binance_dry_run_demo)
 
+    # P2-MD-02 / Track C: manual "VPS manual verification = L4" connectivity smoke test --
+    # see the file's own header comment. Not registered with ctest; run by hand.
+    add_executable(binance_connectivity_smoke src/binance_connectivity_smoke.cpp)
+    target_link_libraries(binance_connectivity_smoke PRIVATE
+        hengyuan_dataplane
+        Boost::system
+        OpenSSL::SSL OpenSSL::Crypto
+        Threads::Threads
+    )
+    target_include_directories(binance_connectivity_smoke SYSTEM PRIVATE
+        ${Boost_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+    )
+    hengyuan_set_warnings(binance_connectivity_smoke)
+
     add_executable(latency_bench src/latency_bench.cpp)
     target_link_libraries(latency_bench PRIVATE hengyuan_dataplane)
     hengyuan_set_warnings(latency_bench)
@@ -459,5 +474,54 @@ if(HY_BUILD_TESTS)
         target_include_directories(test_binance_signer SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
         hengyuan_set_warnings(test_binance_signer)
         gtest_discover_tests(test_binance_signer)
+
+        # P2-MD-02 / Track C: REST/WS/Gate connectivity tests -- fully offline (local
+        # blackhole/TLS fixtures, see tests/test_helpers/blackhole_acceptor.hpp), but they need
+        # Boost/OpenSSL to build at all, so they're gated the same as test_binance_signer above.
+        # HY_TEST_FIXTURE_DIR points at the checked-in test CA/leaf cert used by the
+        # wrong-SAN/read-timeout fixtures -- passed as a compile definition rather than assumed
+        # relative to ctest's working directory.
+        set(HY_TEST_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+
+        add_executable(test_binance_rest_snapshot tests/test_binance_rest_snapshot.cpp)
+        target_link_libraries(test_binance_rest_snapshot PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads
+            GTest::gtest_main)
+        target_include_directories(test_binance_rest_snapshot SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_rest_snapshot PRIVATE tests)
+        target_compile_definitions(test_binance_rest_snapshot PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_binance_rest_snapshot)
+        gtest_discover_tests(test_binance_rest_snapshot)
+
+        add_executable(test_binance_ws_session tests/test_binance_ws_session.cpp)
+        target_link_libraries(test_binance_ws_session PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads
+            GTest::gtest_main)
+        target_include_directories(test_binance_ws_session SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_ws_session PRIVATE tests)
+        hengyuan_set_warnings(test_binance_ws_session)
+        gtest_discover_tests(test_binance_ws_session)
+
+        add_executable(test_snapshot_refresh_gate tests/test_snapshot_refresh_gate.cpp)
+        target_link_libraries(test_snapshot_refresh_gate PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads
+            GTest::gtest_main)
+        target_include_directories(test_snapshot_refresh_gate SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_snapshot_refresh_gate PRIVATE tests)
+        hengyuan_set_warnings(test_snapshot_refresh_gate)
+        gtest_discover_tests(test_snapshot_refresh_gate)
     endif()
+
+    # P2-MD-02 / Track C: depth snapshot codec -- deliberately does NOT depend on
+    # HY_BUILD_DEMO/Boost/OpenSSL (see binance_depth_snapshot_codec.hpp's own header comment),
+    # so it builds and runs under the default HY_BUILD_TESTS configuration.
+    add_executable(test_binance_depth_snapshot_codec tests/test_binance_depth_snapshot_codec.cpp)
+    target_link_libraries(test_binance_depth_snapshot_codec PRIVATE
+        hengyuan_dataplane GTest::gtest_main)
+    hengyuan_set_warnings(test_binance_depth_snapshot_codec)
+    gtest_discover_tests(test_binance_depth_snapshot_codec)
 endif()

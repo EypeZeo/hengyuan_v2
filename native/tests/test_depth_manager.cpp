@@ -217,3 +217,107 @@ TEST(DepthManager, StartBufferingClearsState) {
     EXPECT_EQ(dm.book().bid_count(), 0u);
     EXPECT_EQ(dm.book().ask_count(), 0u);
 }
+
+// --- P2-MD-02 / Track C: buffer-overflow fail-closed regression tests ---
+
+TEST(DepthManager, BufferOverflowIsCountedNotSilent) {
+    DepthManager dm;
+    // Fill exactly to capacity, then push one more -- that one must be counted as overflow,
+    // not silently dropped with zero observability (the previous behavior).
+    for (std::size_t i = 0; i < DepthManager::kMaxBuffered; ++i) {
+        auto u = static_cast<std::uint64_t>(i + 1);
+        auto ev = make_depth(100, 10, Side::Buy, u);
+        dm.on_depth_event(ev, u, u);
+    }
+    EXPECT_EQ(dm.stats().buffer_overflow_count, 0u);
+
+    auto overflow_u1 = static_cast<std::uint64_t>(DepthManager::kMaxBuffered + 1);
+    auto overflow_ev = make_depth(100, 10, Side::Buy, overflow_u1);
+    dm.on_depth_event(overflow_ev, overflow_u1, overflow_u1);
+    EXPECT_EQ(dm.stats().buffer_overflow_count, 1u);
+
+    // A second overflow event increments further.
+    auto overflow_u2 = static_cast<std::uint64_t>(DepthManager::kMaxBuffered + 2);
+    dm.on_depth_event(overflow_ev, overflow_u2, overflow_u2);
+    EXPECT_EQ(dm.stats().buffer_overflow_count, 2u);
+}
+
+TEST(DepthManager, OverflowedBufferForcesResyncInsteadOfTracking) {
+    DepthManager dm;
+    // Fill to capacity + overflow by one, using U/u chosen so a naive replay against this
+    // snapshot's lastUpdateId would otherwise look "valid" (first buffered event continues
+    // cleanly from lastUpdateId) -- the point of this test is that overflow must still force a
+    // resync regardless of whether the buffered prefix itself looks internally consistent.
+    for (std::size_t i = 0; i < DepthManager::kMaxBuffered; ++i) {
+        auto u = static_cast<std::uint64_t>(i + 1);
+        auto ev = make_depth(100, 10, Side::Buy, u);
+        dm.on_depth_event(ev, u, u);
+    }
+    auto overflow_u = static_cast<std::uint64_t>(DepthManager::kMaxBuffered + 1);
+    auto overflow_ev = make_depth(100, 10, Side::Buy, overflow_u);
+    dm.on_depth_event(overflow_ev, overflow_u, overflow_u);
+    ASSERT_EQ(dm.stats().buffer_overflow_count, 1u);
+
+    DepthSnapshot snap;
+    snap.last_update_id = 0;  // buffered event #1 has U=1, so U <= lastUpdateId+1 holds
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+
+    bool ok = dm.apply_snapshot(snap);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(dm.state(), DepthState::Buffering);  // must not have entered Tracking
+    EXPECT_EQ(dm.stats().snapshots, 0u);  // this attempt was discarded before being counted
+    EXPECT_GE(dm.stats().resyncs, 1u);
+}
+
+TEST(DepthManager, OverflowFlagResetsOnFreshBufferingEpisode) {
+    DepthManager dm;
+    for (std::size_t i = 0; i < DepthManager::kMaxBuffered; ++i) {
+        auto u = static_cast<std::uint64_t>(i + 1);
+        auto ev = make_depth(100, 10, Side::Buy, u);
+        dm.on_depth_event(ev, u, u);
+    }
+    auto overflow_u = static_cast<std::uint64_t>(DepthManager::kMaxBuffered + 1);
+    auto overflow_ev = make_depth(100, 10, Side::Buy, overflow_u);
+    dm.on_depth_event(overflow_ev, overflow_u, overflow_u);
+
+    DepthSnapshot bad_snap;
+    bad_snap.last_update_id = 0;
+    bad_snap.bids[0] = {99, 50};
+    bad_snap.bid_count = 1;
+    bad_snap.asks[0] = {102, 30};
+    bad_snap.ask_count = 1;
+    ASSERT_FALSE(dm.apply_snapshot(bad_snap));  // discarded due to overflow, back to Buffering
+
+    // A fresh, non-overflowing snapshot attempt on the new Buffering episode must succeed --
+    // start_buffering() (called internally by the discard above) must have reset the flag.
+    DepthSnapshot good_snap;
+    good_snap.last_update_id = 100;
+    good_snap.bids[0] = {99, 50};
+    good_snap.bid_count = 1;
+    good_snap.asks[0] = {102, 30};
+    good_snap.ask_count = 1;
+    EXPECT_TRUE(dm.apply_snapshot(good_snap));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+}
+
+TEST(DepthManager, StartBufferingDoesNotUseStaleBookForTrades) {
+    // Regression/documentation test for the existing fail-closed behavior that must not be
+    // broken by this round's changes: start_buffering() clears the book, so any code that
+    // gates simulated trades on top_of_book() being present will correctly see "no book" while
+    // Buffering, rather than trading against a stale pre-resync book.
+    DepthManager dm;
+    DepthSnapshot snap;
+    snap.last_update_id = 100;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+    dm.apply_snapshot(snap);
+    ASSERT_TRUE(dm.book().top_of_book().has_value());
+
+    dm.start_buffering();
+    EXPECT_FALSE(dm.book().top_of_book().has_value());
+}
