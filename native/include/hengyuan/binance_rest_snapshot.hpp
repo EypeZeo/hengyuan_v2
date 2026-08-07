@@ -26,6 +26,7 @@
 #include <hengyuan/binance_depth_snapshot_codec.hpp>
 #include <hengyuan/binance_tls.hpp>
 #include <hengyuan/depth_manager.hpp>
+#include <hengyuan/snapshot_refresh_gate.hpp>  // SnapshotFetcher/SnapshotRequest (VERIF-TSAN-016)
 
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -292,6 +293,21 @@ inline std::optional<DepthSnapshot> fetch_depth_snapshot(
     const RestSnapshotConfig& cfg = {}) {
     FetchError unused_error;
     return fetch_depth_snapshot(symbol, price_multiplier, qty_multiplier, cfg, unused_error);
+}
+
+// Production SnapshotFetcher for SnapshotRefreshGate.
+//
+// AUDIT VERIF-TSAN-016: this adapter used to live in snapshot_refresh_gate.hpp as a
+// constructor default argument, which forced that header -- and therefore every test
+// of the gate's threaded state machine -- to depend on Boost.Asio/Beast and OpenSSL.
+// The TSan CI job builds HY_BUILD_DEMO=OFF, so the one class in this codebase that
+// spawns a std::thread and hands a mailbox across it was never tested under
+// ThreadSanitizer. Moving the adapter next to the function it adapts leaves the gate
+// Boost-free; callers who want the real network fetcher ask for it explicitly.
+inline SnapshotFetcher make_default_snapshot_fetcher() {
+    return [](const SnapshotRequest& req) -> std::optional<DepthSnapshot> {
+        return fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier);
+    };
 }
 
 }  // namespace hy

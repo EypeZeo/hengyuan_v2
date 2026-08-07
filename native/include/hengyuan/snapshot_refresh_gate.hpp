@@ -23,9 +23,21 @@
 // cancellation, deterministic fake-server fault injection, TLA+ modeling) is out of scope for
 // this round -- see the P2-MD-02 plan's "用户决定 v2" notes.
 
+// AUDIT VERIF-TSAN-016: this header used to include binance_rest_snapshot.hpp --
+// solely to name fetch_depth_snapshot_default as a constructor default argument --
+// which dragged in Boost.Asio/Beast and OpenSSL. That put every test of this class
+// behind HY_BUILD_DEMO, and the TSan CI job builds with HY_BUILD_DEMO=OFF and a
+// hand-picked target list. Net effect: SnapshotRefreshGate spawns a real
+// std::thread and hands a mailbox across it, and that code had never once run under
+// ThreadSanitizer.
+//
+// The gate's state machine needs nothing from the REST layer -- the fetcher is
+// injected. The production default now lives with the thing it defaults to
+// (binance_rest_snapshot.hpp's make_default_snapshot_fetcher()), so this header is
+// Boost-free and its tests build under the plain HY_BUILD_TESTS configuration.
+
 #pragma once
 
-#include <hengyuan/binance_rest_snapshot.hpp>
 #include <hengyuan/depth_manager.hpp>
 
 #include <atomic>
@@ -50,19 +62,16 @@ struct SnapshotRequest {
     std::int64_t qty_multiplier{0};
 };
 
-// Production default: adapts the real fetch_depth_snapshot() to SnapshotFetcher's signature.
-// Tests inject a fake instead (see test_snapshot_refresh_gate.cpp) so the gate's own state-
-// machine behavior (single-flight, mailbox reset, cooldown on fetch-failure/apply-rejection)
-// can be exercised deterministically without any real network/TLS.
-inline std::optional<DepthSnapshot> fetch_depth_snapshot_default(const SnapshotRequest& req) {
-    return fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier);
-}
-
 using SnapshotFetcher = std::function<std::optional<DepthSnapshot>(const SnapshotRequest&)>;
 
 class SnapshotRefreshGate {
 public:
-    explicit SnapshotRefreshGate(SnapshotFetcher fetcher = &fetch_depth_snapshot_default)
+    // No default argument any more (audit VERIF-TSAN-016): naming the production
+    // fetcher here is what coupled this header to Boost/OpenSSL. Production callers
+    // pass hy::make_default_snapshot_fetcher() (binance_rest_snapshot.hpp); tests
+    // inject a fake so the state machine -- single-flight, mailbox reset, cooldown on
+    // fetch-failure/apply-rejection -- is exercised deterministically with no network.
+    explicit SnapshotRefreshGate(SnapshotFetcher fetcher)
         : fetcher_(std::move(fetcher)) {}
 
     ~SnapshotRefreshGate() {

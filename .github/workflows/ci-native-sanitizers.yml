@@ -107,11 +107,18 @@ jobs:
       # in-process exercise of the identical protocol is the closest available
       # check, and it earns its place precisely because the previous non-atomic
       # implementation would have been reported by it instantly.
+      # test_snapshot_refresh_gate is the third (audit VERIF-TSAN-016): that class
+      # spawns a real std::thread and publishes a mailbox across it, but its header
+      # used to name the production REST fetcher as a constructor default, dragging
+      # in Boost/OpenSSL and putting the whole binary behind HY_BUILD_DEMO -- which
+      # this job turns OFF. The one genuinely-networked test moved to
+      # test_binance_rest_snapshot.cpp so the state machine could come here.
       - name: Build concurrency targets only
         working-directory: native
         run: |
           cmake --build build-tsan -j$(nproc) \
             --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
+            test_snapshot_refresh_gate \
             tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
       # history_size=7 (the maximum) is the single biggest lever on whether a

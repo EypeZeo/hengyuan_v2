@@ -518,16 +518,28 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_ws_session)
         gtest_discover_tests(test_binance_ws_session)
 
-        add_executable(test_snapshot_refresh_gate tests/test_snapshot_refresh_gate.cpp)
-        target_link_libraries(test_snapshot_refresh_gate PRIVATE
-            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads
-            GTest::gtest_main)
-        target_include_directories(test_snapshot_refresh_gate SYSTEM PRIVATE
-            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
-        target_include_directories(test_snapshot_refresh_gate PRIVATE tests)
-        hengyuan_set_warnings(test_snapshot_refresh_gate)
-        gtest_discover_tests(test_snapshot_refresh_gate)
     endif()
+
+    # AUDIT VERIF-TSAN-016: SnapshotRefreshGate spawns a real std::thread and hands a
+    # mailbox across it, but its tests used to sit behind HY_BUILD_DEMO (the header
+    # named the production fetcher as a constructor default, dragging in Boost/OpenSSL)
+    # -- and the TSan job builds HY_BUILD_DEMO=OFF with a hand-picked target list. The
+    # one class here doing real cross-thread publication had never run under TSan.
+    # snapshot_refresh_gate.hpp is Boost-free now and this binary is labelled
+    # `concurrency`, with the same setarch wrapper the other TSan targets need under
+    # WSL2. The one gate test that genuinely needs a real fetch moved to
+    # test_binance_rest_snapshot.cpp above.
+    add_executable(test_snapshot_refresh_gate tests/test_snapshot_refresh_gate.cpp)
+    target_link_libraries(test_snapshot_refresh_gate PRIVATE
+        hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_snapshot_refresh_gate)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_snapshot_refresh_gate PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_snapshot_refresh_gate PROPERTIES LABELS concurrency)
 
     # P2-MD-02 / Track C: depth snapshot codec -- deliberately does NOT depend on
     # HY_BUILD_DEMO/Boost/OpenSSL (see binance_depth_snapshot_codec.hpp's own header comment),
