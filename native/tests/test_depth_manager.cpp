@@ -2,6 +2,9 @@
 #include <gtest/gtest.h>
 #include <hengyuan/depth_manager.hpp>
 
+#include <cstddef>
+#include <cstdint>
+
 using hy::BinanceMarketEvent;
 using hy::DepthManager;
 using hy::DepthSnapshot;
@@ -320,4 +323,74 @@ TEST(DepthManager, StartBufferingDoesNotUseStaleBookForTrades) {
 
     dm.start_buffering();
     EXPECT_FALSE(dm.book().top_of_book().has_value());
+}
+
+// --- Realistic-scale snapshot + top-N window (audit MD-BOOK-002) ---
+//
+// Every pre-existing test in this file uses bid_count/ask_count of 1 or 2, so the
+// entire "book is already at kMaxLevels after a real bootstrap" regime was never
+// exercised. These cover the full chain the audit repro walked: a default-config
+// REST snapshot (limit=1000, binance_rest_snapshot.hpp) -> DepthManager ->
+// OrderBook's 256-level window -> the next live depth delta.
+
+namespace {
+DepthSnapshot make_full_snapshot(std::uint64_t last_update_id, std::size_t levels) {
+    DepthSnapshot s;
+    s.last_update_id = last_update_id;
+    for (std::size_t i = 0; i < levels; ++i) {
+        s.bids[i] = {static_cast<std::int64_t>(50'000 - static_cast<std::int64_t>(i)), 10};
+        s.asks[i] = {static_cast<std::int64_t>(50'001 + static_cast<std::int64_t>(i)), 10};
+    }
+    s.bid_count = levels;
+    s.ask_count = levels;
+    return s;
+}
+}  // namespace
+
+TEST(DepthManager, ThousandLevelSnapshotKeepsBestWindow) {
+    DepthManager dm;
+    ASSERT_TRUE(dm.apply_snapshot(make_full_snapshot(1000, 1000)));
+    EXPECT_EQ(dm.book().bid_count(), hy::kMaxLevels);
+    EXPECT_EQ(dm.book().ask_count(), hy::kMaxLevels);
+
+    auto tob = dm.book().top_of_book();
+    ASSERT_TRUE(tob.has_value());
+    EXPECT_EQ(tob->first, 50'000) << "the BEST bid must survive truncation";
+    EXPECT_EQ(tob->second, 50'001);
+}
+
+TEST(DepthManager, NewBestBidAfterFullSnapshotReachesTopOfBook) {
+    DepthManager dm;
+    ASSERT_TRUE(dm.apply_snapshot(make_full_snapshot(1000, 1000)));
+
+    BinanceMarketEvent ev{};
+    ev.type = EventType::DepthDelta;
+    ev.side = Side::Buy;
+    ev.price_ticks = 50'001;  // strictly better than the current best bid
+    ev.qty_lots = 42;
+    ASSERT_TRUE(dm.on_depth_event(ev, 1001, 1001));
+
+    auto tob = dm.book().top_of_book();
+    ASSERT_TRUE(tob.has_value());
+    EXPECT_EQ(tob->first, 50'001) << "a full book must not freeze the top of book";
+    EXPECT_EQ(dm.stats().deltas_outside_window, 0u);
+}
+
+TEST(DepthManager, DeepDeltaCountsAsOutsideWindowWithoutResync) {
+    DepthManager dm;
+    ASSERT_TRUE(dm.apply_snapshot(make_full_snapshot(1000, 1000)));
+    const auto resyncs_before = dm.stats().resyncs;
+
+    BinanceMarketEvent ev{};
+    ev.type = EventType::DepthDelta;
+    ev.side = Side::Buy;
+    ev.price_ticks = 1;  // far worse than the 256th best bid
+    ev.qty_lots = 5;
+    ASSERT_TRUE(dm.on_depth_event(ev, 1001, 1001));
+
+    EXPECT_EQ(dm.stats().deltas_outside_window, 1u);
+    EXPECT_EQ(dm.stats().resyncs, resyncs_before)
+        << "a level outside the maintained window is normal, never a resync trigger";
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.book().bid_count(), hy::kMaxLevels);
 }

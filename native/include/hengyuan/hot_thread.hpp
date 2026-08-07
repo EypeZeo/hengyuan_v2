@@ -28,6 +28,12 @@ struct HotThreadStats {
     std::uint64_t trades{0};
     std::uint64_t rejected{0};
     std::uint64_t resync_requests{0};
+    // AUDIT MD-BOOK-002: OrderBook::apply_delta()'s return value was discarded here,
+    // so a delta that never reached the book looked exactly like one that did.
+    // outside_window is expected and benign (deeper than the maintained top-N view);
+    // invalid_deltas is not.
+    std::uint64_t deltas_outside_window{0};
+    std::uint64_t deltas_invalid{0};
 };
 
 static constexpr std::size_t kMaxBookSymbols = 64;
@@ -105,7 +111,13 @@ public:
                 if (depth_mgr_ && ev.symbol_id == depth_mgr_sym_) {
                     depth_mgr_->on_depth_event(ev, ev.aux_id, ev.event_id);
                 } else if (ev.symbol_id < kMaxBookSymbols) {
-                    books_[ev.symbol_id].apply_delta(ev.price_ticks, ev.qty_lots, ev.side);
+                    const auto ar =
+                        books_[ev.symbol_id].apply_delta(ev.price_ticks, ev.qty_lots, ev.side);
+                    if (ar == OrderBook::ApplyResult::OutsideWindow) {
+                        ++stats_.deltas_outside_window;
+                    } else if (ar == OrderBook::ApplyResult::InvalidInput) {
+                        ++stats_.deltas_invalid;
+                    }
                 }
                 ++stats_.depth_updates;
 

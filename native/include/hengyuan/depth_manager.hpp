@@ -27,11 +27,25 @@ enum class DepthState : std::uint8_t {
     Tracking = 2,   // Fully synced, applying events in real-time
 };
 
+// Per-side capacity of a REST depth snapshot. Bounds Binance's largest allowed
+// `limit` value that this codebase accepts (1000, see binance_rest_snapshot.hpp's
+// kAllowedLimits -- 5000 is deliberately excluded precisely because of this bound).
+inline constexpr std::size_t kDepthSnapshotLevels = 1024;
+
+// AUDIT MD-BOOK-002: this relationship used to be implicit, and getting it wrong in
+// the OTHER direction (OrderBook silently truncating a 1000-level snapshot into 256
+// slots and then refusing every subsequent insert) froze top_of_book(). OrderBook is
+// a bounded top-N VIEW of this snapshot, so kMaxLevels <= kDepthSnapshotLevels is the
+// intended direction; pin it so a future capacity change has to think about it.
+static_assert(kMaxLevels <= kDepthSnapshotLevels,
+              "OrderBook is a top-N view of DepthSnapshot; it must not claim more "
+              "levels per side than a snapshot can carry");
+
 struct DepthSnapshot {
     std::uint64_t last_update_id{0};
-    PriceLevel bids[1024];
+    PriceLevel bids[kDepthSnapshotLevels];
     std::size_t bid_count{0};
-    PriceLevel asks[1024];
+    PriceLevel asks[kDepthSnapshotLevels];
     std::size_t ask_count{0};
 };
 
@@ -44,6 +58,14 @@ struct DepthManagerStats {
     std::uint64_t gap_events{0};      // events that arrived with U gap
     std::uint64_t buffer_overflow_count{0};  // events dropped because the Buffering-state
                                               // ring (kMaxBuffered) was already full
+    // AUDIT MD-BOOK-002: OrderBook::apply_delta()'s return value used to be discarded
+    // here and in hot_thread.hpp, so a delta that never reached the book was
+    // indistinguishable from one that did. These two make the outcome observable.
+    // deltas_outside_window is EXPECTED and benign (a level worse than the 256th
+    // best simply isn't in the maintained window); deltas_invalid is not -- it means
+    // a malformed price/qty reached the book layer.
+    std::uint64_t deltas_outside_window{0};
+    std::uint64_t deltas_invalid{0};
 };
 
 class DepthManager {
@@ -70,7 +92,12 @@ public:
     //   Buffering: store in ring buffer
     //   Syncing:   should not be called (caller drains buffer first)
     //   Tracking:  apply to book, check for gaps
-    // Returns true if the event was applied to the book.
+    // Returns true iff the event was consumed in Tracking state without a detected
+    // gap. That is NOT the same as "changed the book": a level outside the
+    // maintained top-N window (OrderBook::ApplyResult::OutsideWindow) is consumed
+    // correctly and still returns true -- see stats().deltas_outside_window for that
+    // distinction, which used to be invisible because apply_delta()'s return value
+    // was discarded here (audit MD-BOOK-002).
     bool on_depth_event(const BinanceMarketEvent& ev,
                         std::uint64_t first_update_id,
                         std::uint64_t final_update_id) noexcept {
@@ -105,7 +132,7 @@ public:
                 return false;
             }
 
-            book_.apply_delta(ev.price_ticks, ev.qty_lots, ev.side);
+            record_apply_result(book_.apply_delta(ev.price_ticks, ev.qty_lots, ev.side));
             last_applied_u_ = final_update_id;
             ++stats_.events_applied;
             return true;
@@ -162,9 +189,9 @@ public:
                 found_first = true;
             }
 
-            book_.apply_delta(buf_events_[i].price_ticks,
-                              buf_events_[i].qty_lots,
-                              buf_events_[i].side);
+            record_apply_result(book_.apply_delta(buf_events_[i].price_ticks,
+                                                   buf_events_[i].qty_lots,
+                                                   buf_events_[i].side));
             last_applied_u_ = u;
             ++stats_.events_applied;
         }
@@ -180,6 +207,19 @@ public:
     }
 
 private:
+    // Folds OrderBook::apply_delta()'s outcome into stats_ instead of discarding it.
+    // Deliberately does NOT change any control flow: OutsideWindow is the normal
+    // outcome for a deep level and must never trigger a resync, and InvalidInput must
+    // still advance the sequence number (refusing to would manufacture a false gap on
+    // the very next event).
+    void record_apply_result(OrderBook::ApplyResult r) noexcept {
+        if (r == OrderBook::ApplyResult::OutsideWindow) {
+            ++stats_.deltas_outside_window;
+        } else if (r == OrderBook::ApplyResult::InvalidInput) {
+            ++stats_.deltas_invalid;
+        }
+    }
+
     DepthState state_{DepthState::Buffering};
     OrderBook book_{};
     DepthManagerStats stats_{};
