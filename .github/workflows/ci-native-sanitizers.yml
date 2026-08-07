@@ -101,12 +101,18 @@ jobs:
       # AuditRingSink owned by one, OrderTracker by the other, synchronized only
       # via SpscRing) -- without it here, that design's actual thread-safety
       # claim would never run under TSan at all.
+      # test_shm_heartbeat carries the same kind of claim for ShmControlBlock's
+      # seqlock (audit PERF-SHM-004). That protocol is genuinely cross-PROCESS, so
+      # TSan can never observe the real writer/watchdog pair; a two-thread
+      # in-process exercise of the identical protocol is the closest available
+      # check, and it earns its place precisely because the previous non-atomic
+      # implementation would have been reported by it instantly.
       - name: Build concurrency targets only
         working-directory: native
         run: |
           cmake --build build-tsan -j$(nproc) \
-            --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring \
-            tsan_control_export_worker_dual_consumer
+            --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
+            tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
       # race whose two halves are separated in time gets reported at all — it

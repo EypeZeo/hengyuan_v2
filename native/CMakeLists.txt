@@ -204,11 +204,24 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_preflight_gate)
     gtest_discover_tests(test_preflight_gate)
 
-    # P2-INFRA-HB-01: SHM heartbeat (portable tests, no shm_open needed)
+    # P2-INFRA-HB-01: SHM heartbeat (portable tests, no shm_open needed).
+    # Threads::Threads + the concurrency label + the setarch wrapper (audit
+    # PERF-SHM-004): ShmControlBlock's seqlock is a CROSS-PROCESS protocol, so the
+    # only way to put it under TSan at all is a two-thread in-process test of the
+    # same protocol. Without the label the TSan job -- which builds a hand-picked
+    # target list, not the whole suite -- would never run it, which is how the
+    # original "documented as relaxed atomics, implemented with none" state
+    # survived.
     add_executable(test_shm_heartbeat tests/test_shm_heartbeat.cpp)
-    target_link_libraries(test_shm_heartbeat PRIVATE hengyuan_core GTest::gtest_main)
+    target_link_libraries(test_shm_heartbeat PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_shm_heartbeat)
-    gtest_discover_tests(test_shm_heartbeat)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_shm_heartbeat PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_shm_heartbeat PROPERTIES LABELS concurrency)
 
     # P2-EXEC-SIM-04: intent channel
     add_executable(test_intent_channel tests/test_intent_channel.cpp)

@@ -80,17 +80,21 @@ int main(int argc, char* argv[]) {
     }
 
     auto* blk = shm.block();
-    if (!hy::shm_verify(*blk)) {
-        std::printf("ERROR: SHM control block invalid (bad magic/checksum).\n");
+    // AUDIT PERF-SHM-004: reads now go through the seqlock (shm_read_snapshot), not
+    // a plain 64-byte memcpy of memory another process is concurrently writing.
+    hy::ShmHeartbeatSnapshot initial{};
+    if (!hy::shm_read_snapshot(*blk, initial) || !hy::shm_snapshot_valid(initial)) {
+        std::printf("ERROR: SHM control block invalid (bad magic/version, or writer stuck "
+                    "mid-update).\n");
         return 1;
     }
 
-    std::uint64_t main_pid = blk->main_pid;
+    std::uint64_t main_pid = initial.main_pid;
     std::printf("Connected. Main PID=%" PRIu64 "\n", main_pid);
 
     // Monitoring state
-    std::uint64_t prev_loop = blk->loop_counter;
-    std::uint64_t prev_incoming = blk->last_incoming_ns;
+    std::uint64_t prev_loop = initial.loop_counter;
+    std::uint64_t prev_incoming = initial.last_incoming_ns;
     auto last_activity = std::chrono::steady_clock::now();
     int stale_checks = 0;
 
@@ -103,16 +107,18 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // Read and verify control block
-        hy::ShmControlBlock snapshot;
-        std::memcpy(&snapshot, blk, sizeof(snapshot));
-
-        if (!hy::shm_verify(snapshot)) {
+        // Read and verify control block. A failed seqlock read means the writer has
+        // been sitting on an odd generation across kShmReadMaxAttempts retries --
+        // i.e. stuck mid-update -- which is a genuine liveness/corruption signal, not
+        // the transient false alarm the old non-atomic CRC produced.
+        hy::ShmHeartbeatSnapshot snapshot{};
+        if (!hy::shm_read_snapshot(*blk, snapshot) || !hy::shm_snapshot_valid(snapshot)) {
             ++stale_checks;
-            std::printf("[watchdog] CHECKSUM MISMATCH (count=%d). Memory corruption?\n", stale_checks);
+            std::printf("[watchdog] UNSTABLE/INVALID CONTROL BLOCK (count=%d). "
+                        "Writer stuck mid-update, or memory corruption?\n", stale_checks);
             if (stale_checks >= 3) {
-                std::printf("[watchdog] CRITICAL: 3 consecutive checksum failures. ARMING KILL.\n");
-                blk->kill_armed = 1;
+                std::printf("[watchdog] CRITICAL: 3 consecutive failures. ARMING KILL.\n");
+                hy::shm_arm_kill(*blk);
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 std::printf("[watchdog] Sending SIGKILL to PID %" PRIu64 "\n", main_pid);
                 kill(static_cast<pid_t>(main_pid), SIGKILL);
@@ -150,7 +156,7 @@ int main(int argc, char* argv[]) {
             }
 
             std::printf("[watchdog] ARMING KILL SWITCH.\n");
-            blk->kill_armed = 1;
+            hy::shm_arm_kill(*blk);
 
             // Grace period: let main process self-terminate cleanly
             std::this_thread::sleep_for(std::chrono::seconds(2));
