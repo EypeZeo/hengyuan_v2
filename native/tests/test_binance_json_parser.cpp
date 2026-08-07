@@ -16,8 +16,8 @@ using hy::Side;
 class BinanceJsonParserTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        parser_.register_symbol("BTCUSDT", 0);
-        parser_.register_symbol("ETHUSDT", 1);
+        ASSERT_TRUE(parser_.register_symbol("BTCUSDT", 0));
+        ASSERT_TRUE(parser_.register_symbol("ETHUSDT", 1));
     }
 
     ParseResult parse_one(const char* json, std::uint64_t recv_ns = 99999) {
@@ -276,6 +276,51 @@ TEST(DecimalToFixed, NegativeWithManyFractionalDigitsStillGuarded) {
     EXPECT_FALSE(r.has_value());
 }
 
+// --- register_symbol() input validation (audit API-SYM-020) ---
+//
+// symbol_id used to be an unchecked uint32. Every downstream consumer indexes a
+// fixed 64-entry table with it and bounds-checks, so there was no out-of-range
+// access -- but HotThread::book() falls back to books_[0] for an out-of-range id,
+// so an event with symbol_id >= 64 fired on_tob_ carrying ITS id and symbol ZERO's
+// prices. This is the only place that can make that unrepresentable.
+
+TEST(RegisterSymbol, RejectsSymbolIdBeyondThePerSymbolTables) {
+    BinanceJsonParser p;
+    EXPECT_TRUE(p.register_symbol("BTCUSDT", BinanceJsonParser::kMaxSymbolId));
+    EXPECT_FALSE(p.register_symbol("ETHUSDT", BinanceJsonParser::kMaxSymbolId + 1));
+    EXPECT_FALSE(p.register_symbol("SOLUSDT", 1000));
+    EXPECT_FALSE(p.register_symbol("ADAUSDT", 0xFFFFFFFFu));
+}
+
+TEST(RegisterSymbol, RejectsEmptyAndOverlongNames) {
+    BinanceJsonParser p;
+    EXPECT_FALSE(p.register_symbol("", 0));
+    // SymbolEntry::name is 24 bytes, so 23 chars is the longest storable name.
+    EXPECT_TRUE(p.register_symbol("ABCDEFGHIJKLMNOPQRSTUVW", 0));
+    EXPECT_FALSE(p.register_symbol("ABCDEFGHIJKLMNOPQRSTUVWX", 1))
+        << "silent truncation would make two distinct symbols collide in find_symbol()";
+}
+
+TEST(RegisterSymbol, RejectsNonPositiveMultipliers) {
+    BinanceJsonParser p;
+    EXPECT_FALSE(p.register_symbol("BTCUSDT", 0, 0, 100'000'000));
+    EXPECT_FALSE(p.register_symbol("BTCUSDT", 0, 100'000'000, -1));
+    EXPECT_TRUE(p.register_symbol("BTCUSDT", 0, 100'000'000, 100'000'000));
+}
+
+TEST(RegisterSymbol, RejectedRegistrationLeavesTheTableUsable) {
+    BinanceJsonParser p;
+    ASSERT_FALSE(p.register_symbol("BTCUSDT", 9999));
+    ASSERT_TRUE(p.register_symbol("BTCUSDT", 0));
+
+    BinanceMarketEvent evs[4]{};
+    std::size_t count = 0;
+    const char* json =
+        R"({"e":"trade","E":1,"s":"BTCUSDT","t":1,"p":"100.0","q":"1.0","m":false})";
+    EXPECT_EQ(p.parse(json, 0, evs, 4, count), ParseResult::Ok);
+    EXPECT_EQ(evs[0].symbol_id, 0u);
+}
+
 // --- depthUpdate truncation emits a resync marker (audit MD-TRUNC-015) ---
 //
 // This used to `break` out of the level loop and return Ok with whatever fit,
@@ -285,7 +330,7 @@ TEST(DecimalToFixed, NegativeWithManyFractionalDigitsStillGuarded) {
 
 TEST(DepthTruncation, OverlongDepthUpdateYieldsSingleResyncMarker) {
     BinanceJsonParser p;
-    p.register_symbol("BTCUSDT", 0);
+    ASSERT_TRUE(p.register_symbol("BTCUSDT", 0));
 
     // 8 bid levels into a 4-slot batch.
     std::string json = R"({"e":"depthUpdate","E":123,"s":"BTCUSDT","U":10,"u":15,"b":[)";
@@ -314,7 +359,7 @@ TEST(DepthTruncation, OverlongDepthUpdateYieldsSingleResyncMarker) {
 TEST(DepthTruncation, ExactlyFittingDepthUpdateIsNotTruncated) {
     // Boundary: as many levels as slots must still be an ordinary Ok.
     BinanceJsonParser p;
-    p.register_symbol("BTCUSDT", 0);
+    ASSERT_TRUE(p.register_symbol("BTCUSDT", 0));
     std::string json =
         R"({"e":"depthUpdate","E":123,"s":"BTCUSDT","U":10,"u":15,)"
         R"("b":[["50000.0","1.0"],["49999.0","2.0"]],"a":[["50010.0","1.0"],["50011.0","2.0"]]})";
@@ -332,7 +377,7 @@ TEST(DepthTruncation, TruncationInTheAsksLoopIsAlsoCaught) {
     // Bids fit exactly; the asks side is what overflows. Under the old code this was
     // the worst case -- the book would apply bid-only updates forever.
     BinanceJsonParser p;
-    p.register_symbol("BTCUSDT", 0);
+    ASSERT_TRUE(p.register_symbol("BTCUSDT", 0));
     std::string json =
         R"({"e":"depthUpdate","E":123,"s":"BTCUSDT","U":10,"u":15,)"
         R"("b":[["50000.0","1.0"],["49999.0","2.0"]],)"
@@ -353,7 +398,7 @@ TEST(ParserPaddedBuffer, RepeatedParsesOfVaryingSizesStayCorrect) {
     // The buffer is reused and only grows, so a short message parsed after a long
     // one must not see stale bytes from the previous document.
     BinanceJsonParser p;
-    p.register_symbol("BTCUSDT", 0);
+    ASSERT_TRUE(p.register_symbol("BTCUSDT", 0));
 
     std::string big = R"({"e":"depthUpdate","E":1,"s":"BTCUSDT","U":1,"u":2,"b":[)";
     for (int i = 0; i < 200; ++i) {
@@ -385,7 +430,7 @@ TEST(ParserPaddedBuffer, RepeatedParsesOfVaryingSizesStayCorrect) {
 
 TEST(ParserPaddedBuffer, EmptyInputIsRejectedNotUndefined) {
     BinanceJsonParser p;
-    p.register_symbol("BTCUSDT", 0);
+    ASSERT_TRUE(p.register_symbol("BTCUSDT", 0));
     BinanceMarketEvent evs[4]{};
     std::size_t count = 0;
     EXPECT_EQ(p.parse("", 1, evs, 4, count), ParseResult::MalformedJson);

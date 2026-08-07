@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <hengyuan/binance_json_parser.hpp>  // BinanceJsonParser::kMaxSymbolId (API-SYM-020 bound check)
 #include <hengyuan/binance_market_event.hpp>
 #include <hengyuan/depth_manager.hpp>
 #include <hengyuan/input_validator.hpp>
@@ -34,9 +35,19 @@ struct HotThreadStats {
     // invalid_deltas is not.
     std::uint64_t deltas_outside_window{0};
     std::uint64_t deltas_invalid{0};
+    // Times run_once() hit kMaxEventsPerRun with the ring still non-empty (audit
+    // HOT-DRAIN-027). Non-zero means the consumer is behind; sustained growth is the
+    // signal to look at, not a single blip after a burst.
+    std::uint64_t drain_limit_hits{0};
 };
 
 static constexpr std::size_t kMaxBookSymbols = 64;
+
+// Audit API-SYM-020: book() clamps an out-of-range symbol_id to books_[0], which
+// would report symbol 0's prices under someone else's id. BinanceJsonParser refuses
+// to register such an id in the first place; this keeps the two bounds from drifting.
+static_assert(BinanceJsonParser::kMaxSymbolId + 1 <= kMaxBookSymbols,
+              "a registrable symbol_id must always have its own OrderBook slot");
 
 using OnTopOfBookCallback = std::function<void(std::uint32_t symbol_id,
                                                 std::int64_t best_bid,
@@ -73,9 +84,26 @@ public:
         on_fill_ = std::move(on_fill);
     }
 
+    // Maximum market-data events consumed by one run_once() call.
+    //
+    // AUDIT HOT-DRAIN-027: this loop used to drain the ring to empty with no bound.
+    // The ring holds RingSize (65536 by default) events, so a burst -- or simply a
+    // slow consumer catching up -- could keep one call running for the whole backlog,
+    // during which the snapshot gate, the intent channel and the watchdog kill check
+    // (all after the loop) do not run at all. That is a tail-latency and
+    // fail-closed-responsiveness problem, not a throughput one: the work still gets
+    // done, just in one unbounded chunk instead of bounded slices.
+    //
+    // 4096 keeps the per-call cost bounded while staying far above any realistic
+    // per-iteration arrival count, so the steady state still drains fully in one pass
+    // and pays nothing for the bound.
+    static constexpr std::size_t kMaxEventsPerRun = 4096;
+
     void run_once() noexcept {
         BinanceMarketEvent ev{};
-        while (ring_.try_pop(ev)) {
+        std::size_t drained = 0;
+        while (drained < kMaxEventsPerRun && ring_.try_pop(ev)) {
+            ++drained;
             auto vr = validator_.validate(ev);
 
             if (vr == ValidationResult::ResyncRequired) {
@@ -130,6 +158,10 @@ public:
             } else if (ev.type == EventType::Trade || ev.type == EventType::AggTrade) {
                 ++stats_.trades;
             }
+        }
+
+        if (drained == kMaxEventsPerRun && !ring_.empty_approx()) {
+            ++stats_.drain_limit_hits;
         }
 
         // Watchdog kill check: if watchdog armed the kill flag, arm our

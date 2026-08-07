@@ -198,9 +198,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DHY_BUILD_DEMO=OFF
 
+      # AUDIT CI-ARM-022: this used to build test_spsc_concurrency alone, so
+      # test_reconcile_concurrency's memory orders -- and now
+      # test_shm_heartbeat's seqlock -- never got a hardware verdict on weak
+      # memory, only TSan's model verdict on x86. The `ctest -L concurrency`
+      # selection below already expected all of them.
       - name: Build concurrency targets only
         working-directory: native
-        run: cmake --build build-arm -j$(nproc) --target test_spsc_concurrency
+        run: |
+          cmake --build build-arm -j$(nproc) \
+            --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the

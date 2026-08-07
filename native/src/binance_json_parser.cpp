@@ -6,18 +6,30 @@
 
 namespace hy {
 
-void BinanceJsonParser::register_symbol(std::string_view binance_symbol,
+bool BinanceJsonParser::register_symbol(std::string_view binance_symbol,
                                          std::uint32_t symbol_id,
                                          std::int64_t price_mult,
                                          std::int64_t qty_mult) noexcept {
-    if (symbol_count_ >= kMaxSymbols) return;
+    if (symbol_count_ >= kMaxSymbols) return false;
+    // Audit API-SYM-020: an id past the per-symbol table bound would silently be
+    // served symbol 0's order book downstream. Reject at the only point that knows.
+    if (symbol_id > kMaxSymbolId) return false;
+    // Silently truncating a name would make two different symbols collide in
+    // find_symbol(); reject instead. Empty names are rejected because find_symbol()
+    // matches on length and every incoming "s" field is non-empty.
+    if (binance_symbol.empty() || binance_symbol.size() > sizeof(SymbolEntry::name) - 1) {
+        return false;
+    }
+    if (price_mult <= 0 || qty_mult <= 0) return false;  // parse_decimal_to_fixed rejects these anyway
+
     auto& entry = symbols_[symbol_count_];
-    std::size_t len = (std::min)(binance_symbol.size(), sizeof(entry.name) - 1);
+    const std::size_t len = binance_symbol.size();
     std::memcpy(entry.name, binance_symbol.data(), len);
     entry.name[len] = '\0';
     entry.name_len = len;
     entry.config = {symbol_id, price_mult, qty_mult};
     ++symbol_count_;
+    return true;
 }
 
 const SymbolConfig* BinanceJsonParser::find_symbol(std::string_view name) const noexcept {

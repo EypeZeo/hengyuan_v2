@@ -63,10 +63,27 @@ struct ParseCounters {
 
 class BinanceJsonParser {
 public:
-    void register_symbol(std::string_view binance_symbol,
-                         std::uint32_t symbol_id,
-                         std::int64_t price_mult = 100'000'000,
-                         std::int64_t qty_mult = 100'000'000) noexcept;
+    // Returns false (and registers nothing) if the table is full, the symbol name is
+    // empty/too long for SymbolEntry::name, or symbol_id is out of range.
+    //
+    // AUDIT API-SYM-020: symbol_id used to be an unchecked std::uint32_t, but every
+    // downstream consumer indexes a fixed 64-entry table with it -- InputValidator's
+    // seq_state_ and HotThread's books_. Both bounds-check, so there was no
+    // out-of-range access, but the failure mode was worse than a crash: HotThread's
+    // book() accessor silently falls back to books_[0], so an event with
+    // symbol_id >= 64 fired the on_tob_ callback carrying ITS symbol id and symbol
+    // ZERO's prices. Rejecting the registration is the only place that can make that
+    // unrepresentable, since the id is caller-supplied here and never validated
+    // again.
+    [[nodiscard]] bool register_symbol(std::string_view binance_symbol,
+                                        std::uint32_t symbol_id,
+                                        std::int64_t price_mult = 100'000'000,
+                                        std::int64_t qty_mult = 100'000'000) noexcept;
+
+    // Upper bound on a registrable symbol_id, pinned to the smallest per-symbol table
+    // any consumer keeps. Kept in sync by static_asserts in hot_thread.hpp and
+    // input_validator.hpp rather than by convention.
+    static constexpr std::uint32_t kMaxSymbolId = 63;
 
     // Parse a single JSON message into one or more events.
     // trade/aggTrade produce 1 event; depthUpdate produces 1 per price level.

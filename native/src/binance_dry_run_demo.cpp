@@ -117,11 +117,21 @@ int main(int argc, char* argv[]) {
 
     // Parser with symbols
     hy::BinanceJsonParser parser;
-    parser.register_symbol("BTCUSDT", 0);
-    parser.register_symbol("ETHUSDT", 1);
-    parser.register_symbol("SOLUSDT", 2);
-    parser.register_symbol("DOGEUSDT", 3);
-    parser.register_symbol("ADAUSDT", 4);
+    // register_symbol() is [[nodiscard]] (audit API-SYM-020): a rejected registration
+    // means every event for that symbol would be silently dropped as UnknownSymbol,
+    // which is exactly the kind of quiet degradation worth a hard stop at startup.
+    {
+        const struct { const char* name; std::uint32_t id; } kSymbols[] = {
+            {"BTCUSDT", 0}, {"ETHUSDT", 1}, {"SOLUSDT", 2}, {"DOGEUSDT", 3}, {"ADAUSDT", 4},
+        };
+        for (const auto& s : kSymbols) {
+            if (!parser.register_symbol(s.name, s.id)) {
+                std::fprintf(stderr, "FATAL: could not register symbol %s (id %u)\n", s.name,
+                             s.id);
+                return 1;
+            }
+        }
+    }
 
     // SPSC ring
     auto ring = std::make_unique<hy::SpscRing<hy::BinanceMarketEvent, kRingSize>>();

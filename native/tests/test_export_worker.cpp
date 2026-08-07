@@ -224,6 +224,58 @@ TEST_F(ExportWorkerTest, RunOnceReturnsBaselineConflictWhenTupleContradictsExist
     EXPECT_EQ(still.sequence, 3u);
 }
 
+// --- A permanent baseline conflict stops burning remote calls (audit EXPORT-HOL-029) ---
+//
+// Regressed/Conflicting are not transient: retrying cannot change a durable baseline
+// that already contradicts the tuple. The head stayed put forever regardless, but
+// every subsequent call first spent a REAL remote round-trip and only then failed,
+// while the bounded ring behind it filled and began silently dropping new tuples.
+
+TEST_F(ExportWorkerTest, PermanentBaselineConflictDoesNotKeepSpendingRemoteCalls) {
+    ExportOutboxRing ring;
+    FakeExternalAnchorClient anchor;
+    LastRemoteAckedTipStore store(base_path_, kek_);
+    ASSERT_TRUE(store.open());
+    ASSERT_EQ(store.write(make_baseline(10)), LastRemoteAckedTipWriteStatus::Ok);
+    ASSERT_FALSE(store.baseline_conflicted());
+
+    ASSERT_TRUE(ring.try_push(make_tuple(3)));
+
+    EXPECT_EQ(run_export_worker_once(ring, anchor, store), ExportRunStatus::BaselineConflict);
+    EXPECT_TRUE(store.baseline_conflicted()) << "the conflict must latch";
+    const int calls_after_first = anchor.call_count;
+    EXPECT_GT(calls_after_first, 0) << "the first attempt legitimately tries the remote";
+
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_EQ(run_export_worker_once(ring, anchor, store), ExportRunStatus::BaselineConflict);
+    }
+    EXPECT_EQ(anchor.call_count, calls_after_first)
+        << "a permanent conflict must not spend a remote round-trip per tick";
+
+    ExportTuple still{};
+    ASSERT_TRUE(ring.peek_oldest(still)) << "the tuple must still be there for an operator to see";
+    EXPECT_EQ(still.sequence, 3u);
+}
+
+TEST_F(ExportWorkerTest, OperatorCanClearABaselineConflict) {
+    ExportOutboxRing ring;
+    FakeExternalAnchorClient anchor;
+    LastRemoteAckedTipStore store(base_path_, kek_);
+    ASSERT_TRUE(store.open());
+    ASSERT_EQ(store.write(make_baseline(10)), LastRemoteAckedTipWriteStatus::Ok);
+    ASSERT_TRUE(ring.try_push(make_tuple(3)));
+    ASSERT_EQ(run_export_worker_once(ring, anchor, store), ExportRunStatus::BaselineConflict);
+    ASSERT_TRUE(store.baseline_conflicted());
+
+    // Nothing clears this on its own -- that is the point.
+    store.clear_baseline_conflict();
+    EXPECT_FALSE(store.baseline_conflicted());
+    // The underlying contradiction is still there, so it latches again rather than
+    // silently succeeding.
+    EXPECT_EQ(run_export_worker_once(ring, anchor, store), ExportRunStatus::BaselineConflict);
+    EXPECT_TRUE(store.baseline_conflicted());
+}
+
 // --- LastRemoteAckedTipStore::read()/write() ---
 
 TEST_F(ExportWorkerTest, BaselineSurvivesRestart) {

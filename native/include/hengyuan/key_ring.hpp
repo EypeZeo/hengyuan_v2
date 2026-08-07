@@ -51,6 +51,7 @@
 #pragma once
 
 #include <hengyuan/kek_loader.hpp>  // kKekSize
+#include <hengyuan/secure_memory_lock.hpp>
 #include <hengyuan/secure_wipe.hpp>
 #include <hengyuan/sha256.hpp>
 
@@ -125,6 +126,15 @@ inline crypto::Sha256Digest hmac_over(std::span<const std::byte> key,
 class KeyRing {
 public:
     explicit KeyRing(std::span<const std::byte, kKekSize> kek) noexcept {
+        // AUDIT SEC-KEKCOPY-019: everything secret this object owns -- the retained
+        // KEK copy, the two derived subkeys, and every unwrapped key in entries_ --
+        // is locked out of swap before anything is written into it. kek_loader.hpp
+        // mlocks the ORIGINAL KEK; without this, copying it in here silently undid
+        // that for the whole process lifetime. Best-effort by necessity: this is a
+        // noexcept constructor with no error channel, so the outcome is recorded
+        // (memory_locked()) rather than made fatal the way kek_loader.hpp can.
+        memory_locked_ = try_lock_memory(this, sizeof(KeyRing));
+
         const auto enc = detail::hmac_over(kek, "HY-KEKWRAP-v1-ENC");
         const auto tag = detail::hmac_over(kek, "HY-KEKWRAP-v1-TAG");
         std::memcpy(enc_subkey_.data(), enc.bytes.data(), enc.bytes.size());
@@ -133,7 +143,16 @@ public:
         std::memcpy(kek_copy_.data(), kek.data(), kek.size());
     }
 
-    ~KeyRing() { wipe_all(); }
+    ~KeyRing() {
+        wipe_all();
+        if (memory_locked_) unlock_memory(this, sizeof(KeyRing));
+    }
+
+    // False means the platform refused to lock this object's pages (RLIMIT_MEMLOCK,
+    // working-set quota, or an unsupported platform). Key material is still wiped on
+    // destruction; it is only the swap guarantee that is absent. Callers that
+    // require it should surface this rather than assume it.
+    bool memory_locked() const noexcept { return memory_locked_; }
 
     KeyRing(const KeyRing&) = delete;
     KeyRing& operator=(const KeyRing&) = delete;
@@ -382,6 +401,7 @@ private:
     std::array<std::byte, 32> tag_subkey_{};
     std::array<std::byte, kKekSize> kek_copy_{};  // retained for salt derivation; wiped on destruction
     std::array<Entry, kMaxLiveKeys> entries_{};
+    bool memory_locked_{false};  // audit SEC-KEKCOPY-019
 };
 
 }  // namespace hy

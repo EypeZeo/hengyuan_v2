@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <hengyuan/secure_wipe.hpp>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -278,12 +280,20 @@ class HmacSha256 {
 public:
     static constexpr std::size_t kBlockSize = 64;  // SHA-256's block size
 
+    // AUDIT SEC-WIPE-018: key_block, ipad and opad_ are all trivially invertible
+    // back to the key material (K0, K0^0x36, K0^0x5c). This repo goes to real
+    // lengths to mlock and secure-wipe the KEK and the .env secret, so leaving the
+    // derived HMAC key schedule sitting in memory -- opad_ for the object's whole
+    // lifetime, ipad and key_block as stack residue after the constructor returns --
+    // was inconsistent with its own stated discipline. All three are wiped now.
     explicit HmacSha256(std::span<const std::byte> key) noexcept {
         std::array<std::uint8_t, kBlockSize> key_block{};  // zero-padded K0
         if (key.size() > kBlockSize) {
             const Sha256Digest hashed = sha256(key);
             std::memcpy(key_block.data(), hashed.bytes.data(), hashed.bytes.size());
-        } else {
+        } else if (!key.empty()) {
+            // memcpy with a null source is UB even for size 0, and an empty span's
+            // data() may legitimately be null (UBSan's nonnull check flags it).
             std::memcpy(key_block.data(), key.data(), key.size());
         }
 
@@ -294,7 +304,16 @@ public:
         }
         inner_.update(std::span<const std::byte>(reinterpret_cast<const std::byte*>(ipad.data()),
                                                    ipad.size()));
+        secure_wipe(ipad.data(), ipad.size());
+        secure_wipe(key_block.data(), key_block.size());
     }
+
+    ~HmacSha256() { secure_wipe(opad_.data(), opad_.size()); }
+
+    HmacSha256(const HmacSha256&) = delete;
+    HmacSha256& operator=(const HmacSha256&) = delete;
+    HmacSha256(HmacSha256&&) = delete;
+    HmacSha256& operator=(HmacSha256&&) = delete;
 
     void update(std::span<const std::byte> data) noexcept { inner_.update(data); }
 

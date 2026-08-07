@@ -52,8 +52,19 @@ private:
 
     ValidationCounters counters_{};
     SeqState seq_state_[kMaxSymbols][kEventTypes]{};
-    std::uint64_t last_ts_event_ms_{0};
-    bool has_seen_any_{false};
+
+    // AUDIT VAL-TS-028: this used to be a single cross-symbol counter, for exactly
+    // the reason seq_state_ above is per-(symbol, type): different symbols carry
+    // independent event-time streams. On a multi-symbol feed a plain interleave
+    // (BTC at t, ETH at t-2000, BTC at t+1, ...) made every other event look like a
+    // >1s backwards clock jump, so counters_.clock_anomalies was pure noise --
+    // useless as a signal precisely when a real clock anomaly would matter most.
+    // Per-symbol, it compares like with like.
+    struct ClockState {
+        std::uint64_t last_ts_event_ms{0};
+        bool seen{false};
+    };
+    ClockState clock_state_[kMaxSymbols]{};
 };
 
 }  // namespace hy

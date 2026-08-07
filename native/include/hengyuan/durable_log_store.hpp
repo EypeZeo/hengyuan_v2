@@ -40,6 +40,7 @@
 #endif
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>  // flock() -- see durable_audit_sink.hpp's header
                         // comment for why <sys/file.h> must be included
@@ -79,6 +80,30 @@ inline bool try_resize(std::vector<std::byte>& v, std::size_t n) noexcept {
         return false;
     }
 }
+
+#if !defined(_WIN32)
+// AUDIT IO-EINTR-021: read/write/fsync/pread can all return -1/EINTR when a signal
+// is delivered without SA_RESTART, and every one of them here treated that as a
+// hard failure. In this codebase a "hard failure" on the append path permanently
+// FENCES the sink (durable_audit_sink.hpp), so a single stray signal could retire a
+// perfectly healthy writer for the rest of the process's life. There is no signal
+// handler in the library today, but watchdog_daemon.cpp installs SIGINT/SIGTERM
+// handlers and any embedder may install more -- this is precisely the class of
+// assumption that holds until it silently does not.
+//
+// Deliberately NOT applied to fsync's own retry semantics beyond EINTR: on Linux a
+// failed fsync may have already dropped the dirty page, so retrying a NON-EINTR
+// fsync failure would be unsound (the PostgreSQL fsyncgate problem). EINTR is the
+// one case where the operation provably did not run.
+template <typename Fn>
+inline auto retry_on_eintr(Fn&& fn) noexcept -> decltype(fn()) {
+    for (;;) {
+        const auto rc = fn();
+        if (rc < 0 && errno == EINTR) continue;
+        return rc;
+    }
+}
+#endif
 
 }  // namespace detail
 
@@ -262,7 +287,8 @@ public:
         if (::lseek(log_fd_, 0, SEEK_SET) < 0) return false;
         std::size_t total = 0;
         while (total < out.size()) {
-            const ssize_t n = ::read(log_fd_, out.data() + total, out.size() - total);
+            const ssize_t n = detail::retry_on_eintr(
+                [&] { return ::read(log_fd_, out.data() + total, out.size() - total); });
             if (n <= 0) return false;
             total += static_cast<std::size_t>(n);
         }
@@ -272,11 +298,12 @@ public:
         if (::lseek(log_fd_, 0, SEEK_END) < 0) return false;
         std::size_t total = 0;
         while (total < bytes.size()) {
-            const ssize_t written = ::write(log_fd_, bytes.data() + total, bytes.size() - total);
+            const ssize_t written = detail::retry_on_eintr(
+                [&] { return ::write(log_fd_, bytes.data() + total, bytes.size() - total); });
             if (written <= 0) return false;
             total += static_cast<std::size_t>(written);
         }
-        return ::fsync(log_fd_) == 0;
+        return detail::retry_on_eintr([&] { return ::fsync(log_fd_); }) == 0;
     }
     std::uint64_t log_size() const noexcept {
         struct stat st{};
@@ -290,8 +317,10 @@ public:
         if (effective_want == 0) return true;
         std::size_t total = 0;
         while (total < effective_want) {
-            const ssize_t n = ::pread(log_fd_, buffer.data() + total, effective_want - total,
-                                       static_cast<off_t>(offset + total));
+            const ssize_t n = detail::retry_on_eintr([&] {
+                return ::pread(log_fd_, buffer.data() + total, effective_want - total,
+                               static_cast<off_t>(offset + total));
+            });
             if (n < 0) return false;
             if (n == 0) break;  // EOF -- short read is legal, caller decides
             total += static_cast<std::size_t>(n);
@@ -306,14 +335,16 @@ public:
         std::size_t total = 0;
         bool ok = true;
         while (ok && total < anchor_bytes.size()) {
-            const ssize_t written = ::write(fd, anchor_bytes.data() + total, anchor_bytes.size() - total);
+            const ssize_t written = detail::retry_on_eintr([&] {
+                return ::write(fd, anchor_bytes.data() + total, anchor_bytes.size() - total);
+            });
             if (written <= 0) {
                 ok = false;
                 break;
             }
             total += static_cast<std::size_t>(written);
         }
-        ok = ok && (::fsync(fd) == 0);
+        ok = ok && (detail::retry_on_eintr([&] { return ::fsync(fd); }) == 0);
         ::close(fd);
         if (!ok) return false;
 
@@ -326,7 +357,7 @@ public:
         const std::string dir = (slash == std::string::npos) ? "." : tip_path_.substr(0, slash);
         int dir_fd = ::open(dir.c_str(), O_RDONLY);
         if (dir_fd < 0) return false;
-        const bool dir_ok = (::fsync(dir_fd) == 0);
+        const bool dir_ok = (detail::retry_on_eintr([&] { return ::fsync(dir_fd); }) == 0);
         ::close(dir_fd);
         return dir_ok;
     }
@@ -350,7 +381,8 @@ public:
             } else {
                 std::size_t total = 0;
                 while (ok && total < out.size()) {
-                    const ssize_t n = ::read(fd, out.data() + total, out.size() - total);
+                    const ssize_t n = detail::retry_on_eintr(
+                        [&] { return ::read(fd, out.data() + total, out.size() - total); });
                     if (n <= 0) {
                         ok = false;
                         break;

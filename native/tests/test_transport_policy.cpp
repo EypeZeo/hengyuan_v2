@@ -303,3 +303,30 @@ TEST(SanitizeError, DigitRunAtExactInt32MaxBoundary) {
     auto se = sanitize_error(400, R"({"code":2147483647,"msg":"x"})");
     EXPECT_EQ(se.binance_code, std::numeric_limits<std::int32_t>::max());
 }
+
+// --- check_clock_skew() overflow safety (audit TIME-SKEW-025) ---
+//
+// `local_ms - server_ms` on two signed int64s is UB for far-apart operands, and
+// server_ms is destined to come from an untrusted serverTime field once the L4 REST
+// client exists. The magnitude is computed in unsigned arithmetic now; UBSan is what
+// actually vets this.
+
+TEST(ClockSkew, ExtremeOperandsDoNotOverflow) {
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+
+    EXPECT_EQ(check_clock_skew(kMax, kMin, 5000), TransportCheck::ClockSkewTooLarge);
+    EXPECT_EQ(check_clock_skew(kMin, kMax, 5000), TransportCheck::ClockSkewTooLarge);
+    EXPECT_EQ(check_clock_skew(1'700'000'000'000LL, kMin, 5000), TransportCheck::ClockSkewTooLarge);
+    EXPECT_EQ(check_clock_skew(kMax, 1'700'000'000'000LL, 5000), TransportCheck::ClockSkewTooLarge);
+}
+
+TEST(ClockSkew, OrdinaryValuesStillBehave) {
+    const std::int64_t now = 1'700'000'000'000LL;
+    EXPECT_EQ(check_clock_skew(now, now, 5000), TransportCheck::Ok);
+    EXPECT_EQ(check_clock_skew(now, now + 4999, 5000), TransportCheck::Ok);
+    EXPECT_EQ(check_clock_skew(now, now - 4999, 5000), TransportCheck::Ok);
+    EXPECT_EQ(check_clock_skew(now, now + 5000, 5000), TransportCheck::Ok) << "boundary is inclusive";
+    EXPECT_EQ(check_clock_skew(now, now + 5001, 5000), TransportCheck::ClockSkewTooLarge);
+    EXPECT_EQ(check_clock_skew(now, now - 5001, 5000), TransportCheck::ClockSkewTooLarge);
+}

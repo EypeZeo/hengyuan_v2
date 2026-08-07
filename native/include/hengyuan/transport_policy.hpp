@@ -246,8 +246,16 @@ inline TransportCheck check_clock_skew(
     std::int64_t server_ms,
     std::uint32_t recv_window_ms) noexcept {
 
-    auto diff = local_ms > server_ms ? (local_ms - server_ms) : (server_ms - local_ms);
-    if (diff > static_cast<std::int64_t>(recv_window_ms)) {
+    // AUDIT TIME-SKEW-025: `local_ms - server_ms` on two signed int64s overflows for
+    // far-apart operands, and server_ms is destined to come from an untrusted
+    // serverTime JSON field once the L4 REST client exists. Compute the magnitude in
+    // unsigned arithmetic, where the subtraction is defined by wraparound, and let
+    // any difference beyond the window fall out as ClockSkewTooLarge -- which is the
+    // fail-closed answer for a nonsense server time anyway.
+    const auto a = static_cast<std::uint64_t>(local_ms);
+    const auto b = static_cast<std::uint64_t>(server_ms);
+    const std::uint64_t diff = (local_ms > server_ms) ? (a - b) : (b - a);
+    if (diff > static_cast<std::uint64_t>(recv_window_ms)) {
         return TransportCheck::ClockSkewTooLarge;
     }
     return TransportCheck::Ok;

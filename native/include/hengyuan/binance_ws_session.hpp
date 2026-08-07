@@ -195,6 +195,7 @@ private:
     }
 
     void on_resolve(beast::error_code ec, tcp::resolver::results_type results) {
+        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
         if (ec || stop_) return fail(ec, "resolve");
         beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(10));
         beast::get_lowest_layer(ws_).async_connect(
@@ -204,6 +205,7 @@ private:
     }
 
     void on_connect(beast::error_code ec, tcp::resolver::results_type::endpoint_type) {
+        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
         if (ec || stop_) return fail(ec, "connect");
         beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(10));
 #if defined(__GNUC__) && !defined(__clang__)
@@ -226,6 +228,7 @@ private:
     }
 
     void on_ssl_handshake(beast::error_code ec) {
+        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
         if (ec || stop_) return fail(ec, "ssl_handshake");
         // The WS-level timeout option (below) takes over -- disarm the tcp_stream-level timer
         // so the two mechanisms don't fight each other.
@@ -246,6 +249,7 @@ private:
     }
 
     void on_handshake(beast::error_code ec) {
+        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
         if (ec || stop_) return fail(ec, "ws_handshake");
         do_read();
     }
@@ -259,6 +263,11 @@ private:
     }
 
     void on_read(beast::error_code ec, std::size_t bytes_transferred) {
+        // AUDIT WS-STAT-026: `if (ec || stop_) fail(ec, ...)` recorded a spurious
+        // errors++ with an empty error_code on every clean stop(), so a normal
+        // shutdown was indistinguishable from a real read failure in
+        // stats_snapshot(). A requested stop is not an error.
+        if (stop_ && !ec) return;
         if (ec || stop_) return fail(ec, "read");
 
         auto data = buffer_.data();

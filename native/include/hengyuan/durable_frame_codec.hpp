@@ -336,11 +336,15 @@ inline bool peek_frame_key_id(std::span<const std::byte> in, std::uint32_t& out_
 // key resolved for this frame's own key_id (via peek_frame_key_id() + a
 // KeyRing lookup) -- this function does not resolve keys itself.
 //
-// out_frame_size is set to kOrderEventFrameSize whenever the frame's own
-// length fields were read successfully (i.e. on Ok and on every failure
-// EXCEPT Truncated, since Truncated means `in` didn't even contain that much
-// to begin with) -- diagnostic value for a caller that wants to know how big
-// the frame it rejected was.
+// out_frame_size is 0 when `in` was too short to even contain the fixed header
+// (the first Truncated return, before any length field has been read), and
+// kOrderEventFrameSize once the header parsed -- which includes the SECOND
+// Truncated return, where the header said how big the frame should have been but
+// `in` did not carry that many bytes. Diagnostic value for a caller that wants to
+// know how big the frame it rejected was.
+//
+// (Audit DOC-023: this used to say out_frame_size is unset "on every failure
+// EXCEPT Truncated", which contradicted the code for that second case.)
 inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
                                                     std::span<const std::byte> hmac_key,
                                                     DecodedOrderFrame& out,
