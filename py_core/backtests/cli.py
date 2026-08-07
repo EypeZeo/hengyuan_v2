@@ -47,7 +47,10 @@ from py_core.manual_ohlcv import (
     OhlcvTimeframe,
 )
 
-from py_core.backtests.artifact_export import export_risk_aware_backtest_artifacts
+from py_core.backtests.artifact_export import (
+    _write_completion_marker,
+    export_risk_aware_backtest_artifacts,
+)
 from py_core.backtests.models import BacktestConfig, BacktestResult
 from py_core.backtests.risk_integration import run_risk_aware_backtest
 from py_core.backtests.vectorized_engine import _run_vectorized_backtest_on_df, records_to_dataframe
@@ -360,6 +363,10 @@ def save_results(
     for f in tmp_dir.iterdir():
         f.rename(output_dir / f.name)
     tmp_dir.rmdir()
+    # Audit PY-PUB-014: same per-file rename loop as artifact_export.py, so the same
+    # partially-published window. The marker is written last and is what
+    # is_complete_run() checks.
+    _write_completion_marker(output_dir)
 
 
 def cmd_run_risk_aware(args: argparse.Namespace) -> int:
@@ -417,12 +424,25 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
         max_risk_per_trade=Decimal(str(args.max_risk_per_trade)),
     )
 
-    stop_distance: Decimal | None = None
-    if args.stop_distance is not None:
-        stop_distance = Decimal(str(args.stop_distance))
+    stop_distance_fraction: Decimal | None = None
+    if args.stop_distance_fraction is not None:
+        stop_distance_fraction = Decimal(str(args.stop_distance_fraction))
+        # Audit PY-RISK-005: the old --stop-distance flag was documented in price
+        # units, so an existing invocation would pass something like 500 here. Reject
+        # it loudly rather than silently sizing the position ~1000x differently --
+        # the whole point of the rename is that the wrong unit can no longer pass
+        # through unnoticed.
+        if not (Decimal("0") < stop_distance_fraction <= Decimal("1")):
+            print(
+                f"[ERROR] --stop-distance-fraction 必须在 (0, 1] 区间内，"
+                f"当前值 {stop_distance_fraction}。它是价格的比例（0.02 = 2%），"
+                f"不是绝对报价金额。",
+                file=sys.stderr,
+            )
+            return 2
 
     print("[INFO] 运行风险感知回测...")
-    result = run_risk_aware_backtest(config, records, signals, risk_config, stop_distance)
+    result = run_risk_aware_backtest(config, records, signals, risk_config, stop_distance_fraction)
 
     # 输出绩效摘要
     bm = result.base_result.metrics
@@ -468,7 +488,7 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
         config=config,
         risk_config=risk_config,
         output_dir=output_root,
-        stop_distance=stop_distance,
+        stop_distance_fraction=stop_distance_fraction,
         ohlcv_path=str(ohlcv_path),
         signals_path=signals_path_str or "",
         strategy_spec=args.strategy,
@@ -669,10 +689,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="每笔最大风险（默认 0.01）",
     )
     rra_parser.add_argument(
-        "--stop-distance",
+        "--stop-distance-fraction",
         type=float,
         default=None,
-        help="止损距离（价格单位，可选）",
+        help="止损距离，表示为价格的比例（0 < x <= 1，例如 0.02 = 2%%；可选）。"
+             "注意：不是绝对报价金额 —— 见 PY-RISK-005。",
     )
     rra_parser.add_argument(
         "--output",
