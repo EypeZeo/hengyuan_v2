@@ -33,14 +33,61 @@ namespace hy::crypto {
 
 // --- SHA-256 ---
 
+// --- Constant-time comparison (audit SEC-MACCMP-010) ---
+//
+// std::memcmp returns at the FIRST differing byte, so its running time reveals
+// the length of the matching prefix. For an authentication tag that is the
+// classic byte-at-a-time forgery oracle: an attacker who can submit candidate
+// tags and observe verification timing recovers a valid tag one byte at a time
+// instead of needing 2^256 guesses.
+//
+// This codebase already knew that -- key_ring.hpp had a correct constant-time
+// comparison and used it for its wrap tag -- but all seventeen MAC verifications
+// in the durable-log codecs used std::memcmp. Living in one place now, so the two
+// cannot drift apart again.
+//
+// The length check short-circuits deliberately: buffer LENGTHS are not secret
+// here (every frame format has a fixed, publicly-known MAC width), only the
+// contents are.
+inline bool constant_time_equal(std::span<const std::byte> a,
+                                 std::span<const std::byte> b) noexcept {
+    if (a.size() != b.size()) return false;
+    std::uint8_t diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        // The XOR of two uint8_t operands promotes to int; the explicit cast back
+        // before |= is required, not decorative -- GCC's -Wconversion flags the
+        // implicit narrowing that MSVC /W4 does not (a real dual-toolchain
+        // divergence this repo hit before, see key_ring.hpp's history).
+        diff = static_cast<std::uint8_t>(
+            diff | (static_cast<std::uint8_t>(a[i]) ^ static_cast<std::uint8_t>(b[i])));
+    }
+    return diff == 0;
+}
+
 struct Sha256Digest {
     std::array<std::uint8_t, 32> bytes{};
 
+    // Byte view of this digest, for constant_time_equal() against wire bytes.
+    std::span<const std::byte> as_bytes() const noexcept {
+        return std::span<const std::byte>(reinterpret_cast<const std::byte*>(bytes.data()),
+                                           bytes.size());
+    }
+
+    // Constant-time, unlike std::array's own operator== (which is a lexicographic
+    // element-wise compare that stops at the first difference). A digest type
+    // should not hand out a timing-leaky equality by default.
     bool operator==(const Sha256Digest& other) const noexcept {
-        return bytes == other.bytes;
+        return constant_time_equal(as_bytes(), other.as_bytes());
     }
     bool operator!=(const Sha256Digest& other) const noexcept { return !(*this == other); }
 };
+
+// Convenience: compare a freshly-computed digest against MAC bytes read off the
+// wire. Both overloads exist because call sites hold the wire side either as a
+// std::array or as a raw span into a decode buffer.
+inline bool constant_time_equal(const Sha256Digest& digest, std::span<const std::byte> wire) noexcept {
+    return constant_time_equal(digest.as_bytes(), wire);
+}
 
 namespace detail {
 

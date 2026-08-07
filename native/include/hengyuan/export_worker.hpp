@@ -117,7 +117,7 @@ inline bool decode_last_remote_acked_tip(std::span<const std::byte> in,
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
 
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return false;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return false;  // audit SEC-MACCMP-010
     out = v;
     return true;
 }

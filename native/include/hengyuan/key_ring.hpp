@@ -196,19 +196,49 @@ public:
         return true;
     }
 
-    // Removes key_id from the active table and secure-wipes its in-memory
-    // copy. The CALLER is responsible for having already confirmed no
-    // retained frame/tip/journal/bridge/migration record still needs this
-    // key_id (docs/SPEC_INVARIANTS.md's Phase 0 entry) -- this method does
-    // not track usage, it only performs the retirement itself once asked.
-    // No-op if key_id is not currently active.
-    void retire(std::uint32_t key_id) noexcept {
+    // Removes key_id from the active table and secure-wipes its in-memory copy.
+    // Returns true iff a key was actually removed.
+    //
+    // The CALLER is responsible for having already confirmed no retained
+    // frame/tip/journal/bridge/migration record still needs this key_id
+    // (docs/SPEC_INVARIANTS.md's Phase 0 entry) -- this method does not track usage,
+    // it only performs the retirement once asked.
+    //
+    // AUDIT KEY-RETIRE-009, read this before calling: that precondition is currently
+    // UNSATISFIABLE for any key that has ever signed a durable-log frame.
+    // DurableAuditSink has no compaction, so its log retains every frame forever and
+    // its recovery scan re-resolves each frame's own key_id from offset 0 on every
+    // start (durable_audit_sink.hpp). Retiring such a key therefore does not free
+    // anything -- it turns the entire log Corrupt on the next restart and fences the
+    // sink permanently. Use DurableAuditSink::observed_key_ids() to check the
+    // precondition before calling this; it exists for exactly that.
+    //
+    // The practical consequence is a ceiling: with kMaxLiveKeys slots and no safe way
+    // to free one, a store supports at most kMaxLiveKeys key rotations over its
+    // lifetime. Lifting that needs compaction (the CompactionCandidateIntent family
+    // is declared in durable_control_plane.hpp but not implemented), not a bigger
+    // array here. This used to return void, so a caller could not even observe
+    // whether a retirement happened.
+    bool retire(std::uint32_t key_id) noexcept {
         const std::size_t slot = find_slot(key_id);
-        if (slot == kNotFound) return;
+        if (slot == kNotFound) return false;
         secure_wipe(entries_[slot].key.data(), entries_[slot].key.size());
         entries_[slot].active = false;
         entries_[slot].key_id = 0;
+        return true;
     }
+
+    // Live key count and the hard ceiling, so a caller can see the kMaxLiveKeys
+    // limit approaching instead of discovering it as a TableFull at rotation time
+    // (audit KEY-RETIRE-009).
+    std::size_t live_key_count() const noexcept {
+        std::size_t n = 0;
+        for (const auto& e : entries_) {
+            if (e.active) ++n;
+        }
+        return n;
+    }
+    static constexpr std::size_t capacity() noexcept { return kMaxLiveKeys; }
 
     void wipe_all() noexcept {
         for (auto& e : entries_) {
@@ -306,19 +336,14 @@ private:
         return out;
     }
 
+    // Was a private copy of this logic. Promoted to crypto::constant_time_equal
+    // (sha256.hpp) in audit SEC-MACCMP-010, when it turned out the durable-log
+    // codecs had seventeen std::memcmp tag comparisons that should have been using
+    // this exact function. One definition, so they cannot drift apart again.
     static bool constant_time_equal(const std::array<std::byte, 32>& a,
                                      const std::array<std::byte, 32>& b) noexcept {
-        std::uint8_t diff = 0;
-        for (std::size_t i = 0; i < 32; ++i) {
-            // The XOR of two uint8_t operands promotes to int (integer
-            // promotion) -- the explicit cast back to uint8_t before |= is
-            // required, not decorative: GCC's -Wconversion flags the
-            // implicit narrowing that MSVC /W4 does not, a real dual-
-            // toolchain divergence caught by WSL2 verification.
-            diff = static_cast<std::uint8_t>(
-                diff | (static_cast<std::uint8_t>(a[i]) ^ static_cast<std::uint8_t>(b[i])));
-        }
-        return diff == 0;
+        return crypto::constant_time_equal(std::span<const std::byte>(a),
+                                            std::span<const std::byte>(b));
     }
 
     WrappedKeyRecord wrap(std::uint32_t key_id,

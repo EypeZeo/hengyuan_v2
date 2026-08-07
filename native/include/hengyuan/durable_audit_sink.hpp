@@ -52,6 +52,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -152,7 +154,11 @@ inline bool decode_tip_anchor(std::span<const std::byte> in, std::span<const std
     const std::uint32_t key_id = read_u32_le(p);
     const std::size_t content_len = static_cast<std::size_t>(p - content_start);
     const auto expected = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
-    if (std::memcmp(expected.bytes.data(), in.data() + content_len, kMacLen) != 0) return false;
+    // Constant-time (audit SEC-MACCMP-010), see crypto::constant_time_equal.
+    if (!crypto::constant_time_equal(expected,
+                                      std::span<const std::byte>(in.data() + content_len, kMacLen))) {
+        return false;
+    }
     out.sequence_number = seq;
     out.mac = mac;
     out.key_id = key_id;
@@ -234,7 +240,7 @@ inline bool decode_store_identity(std::span<const std::byte> in, std::span<const
     const auto expected_mac = crypto::hmac_sha256(hmac_key, std::span<const std::byte>(content_start, content_len));
     std::array<std::byte, kMacLen> mac{};
     read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return false;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return false;  // audit SEC-MACCMP-010
     out = v;
     return true;
 }
@@ -295,6 +301,33 @@ public:
             return;
         }
 
+        // Phase 4 (docs/SPEC_INVARIANTS.md): the KeyRotated sidecar is a
+        // SEPARATE durability domain from the main order-audit log -- a problem
+        // opening/verifying it must never fence or otherwise affect
+        // append_durable()'s ability to do this class's primary job. It only
+        // gates rotate_active_key() (see that method's own doc comment).
+        //
+        // ORDERING (audit KEY-ROTATE-008): this block now runs BEFORE
+        // run_recovery_scan(), not after. rotate_active_key() is a two-step durable
+        // protocol -- sidecar record first, main-log tip re-anchor second -- and a
+        // crash between the two leaves the main tip anchor signed under the OLD key
+        // while the sidecar durably says a rotation to the new one happened. The
+        // main scan's anchor.key_id consistency check has to be able to consult that
+        // sidecar evidence to tell "interrupted rotation, nothing lost" apart from
+        // "unauthorized identity swap", and it can only do that if the sidecar has
+        // already been scanned. Scanning the sidecar first is safe because it does
+        // not depend on the main log in any way.
+        if (rotation_log_store_.acquire_lock()) {
+            if (rotation_log_store_.open_log()) {
+                rotation_log_open_ = true;
+                if (!run_rotation_recovery_scan()) {
+                    rotation_fenced_ = true;
+                }
+            } else {
+                rotation_log_store_.release_lock();
+            }
+        }
+
         recovery_status_ = run_recovery_scan();
         if (recovery_status_ != RecoveryScanStatus::Clean &&
             recovery_status_ != RecoveryScanStatus::Recovered) {
@@ -303,21 +336,6 @@ public:
             // is_open()/recovery_status() can report on them; append_durable()
             // itself checks fenced_.
             fenced_ = true;
-        }
-
-        // Phase 4 (docs/SPEC_INVARIANTS.md): the KeyRotated sidecar is a
-        // SEPARATE durability domain from the main order-audit log above --
-        // a problem opening/verifying it must never fence or otherwise affect
-        // append_durable()'s ability to do this class's primary job. It only
-        // gates rotate_active_key() (see that method's own doc comment).
-        if (!rotation_log_store_.acquire_lock()) return;
-        if (!rotation_log_store_.open_log()) {
-            rotation_log_store_.release_lock();
-            return;
-        }
-        rotation_log_open_ = true;
-        if (!run_rotation_recovery_scan()) {
-            rotation_fenced_ = true;
         }
 
         // Phase 5 (docs/SPEC_INVARIANTS.md): store identity, same "own
@@ -549,6 +567,35 @@ public:
     // for one that has simply never had export_outbox_ wired up at all.
     bool store_identity_degraded() const noexcept { return store_identity_degraded_; }
 
+    // AUDIT KEY-ROTATE-008: the most recent rotation this sink's sidecar records, or
+    // nullopt if it has never rotated. Exists so a caller/operator can tell an
+    // interrupted rotation apart from an unauthorized identity swap -- the sidecar
+    // always held that information, nothing ever read it back out.
+    const std::optional<KeyRotationPayload>& last_rotation() const noexcept { return last_rotation_; }
+
+    // True iff this construction found the main tip anchor still signed under
+    // last_rotation()->old_key_id and completed the interrupted rotation's step 2
+    // itself. Purely informational (the sink is fully usable either way), but worth
+    // surfacing: it means the process previously died inside rotate_active_key().
+    bool completed_interrupted_rotation() const noexcept { return completed_interrupted_rotation_; }
+
+    // AUDIT KEY-RETIRE-009: every distinct key_id that appears in this log, gathered
+    // during recovery.
+    //
+    // KeyRing::retire()'s documented precondition is "the caller has already
+    // confirmed no retained frame still needs this key_id". With no compaction (see
+    // this class's scope note) the log keeps every frame forever and run_recovery_scan()
+    // re-resolves each frame's OWN key_id from offset 0 on every start -- so retiring
+    // a key that ever signed anything turns the whole log Corrupt and fences the sink
+    // permanently. That made the precondition unsatisfiable in principle AND
+    // uncheckable in practice, because nothing exposed which key_ids were in use.
+    // This does. It does not remove the underlying limit (kMaxLiveKeys bounds the
+    // number of rotations this store can ever accumulate until compaction exists);
+    // it makes the limit visible and the precondition testable instead of a trap.
+    std::span<const std::uint32_t> observed_key_ids() const noexcept {
+        return std::span<const std::uint32_t>(observed_key_ids_.data(), observed_key_id_count_);
+    }
+
 private:
     static constexpr std::size_t kKeyBlockSize = hy::kKeyBlockSize;
 
@@ -565,7 +612,22 @@ private:
         std::int64_t exchange_order_id{0};
     };
 
+    // AUDIT REC-NOEXCEPT-006: the scan below allocates in several places (the whole
+    // log buffer, the per-COID map, the per-COID std::string keys, the mac vector),
+    // and it is called from a noexcept constructor. An escaping std::bad_alloc was
+    // therefore std::terminate(), silently bypassing the entire fail-closed design
+    // this class is built around -- IoError/Corrupt/CapacityExceeded all exist so a
+    // problem leaves a diagnosable process behind, and abort() leaves none.
+    // Allocation failure now takes the same fail-closed exit as an I/O failure.
     RecoveryScanStatus run_recovery_scan() noexcept {
+        try {
+            return run_recovery_scan_impl();
+        } catch (...) {
+            return RecoveryScanStatus::IoError;
+        }
+    }
+
+    RecoveryScanStatus run_recovery_scan_impl() {
         std::vector<std::byte> content;
         if (!read_entire_log(content)) return RecoveryScanStatus::IoError;
 
@@ -574,6 +636,15 @@ private:
         }
 
         std::unordered_map<std::string, ReplayState> per_coid;
+        // AUDIT REC-DETERM-007: recovered_checkpoints() is documented as being "in
+        // scan order", and CapacityExceeded's contract says "this array's first
+        // kMaxInFlight entries are populated". Iterating per_coid directly delivered
+        // neither -- std::unordered_map's order is unspecified and varies with hash
+        // seed, insertion history and standard-library version, so two processes
+        // recovering the SAME log could produce different checkpoint orders and, at
+        // capacity, different SUBSETS. Recording first-appearance order alongside the
+        // map makes the documented contract true by construction.
+        std::vector<std::string> coid_scan_order;
         std::vector<std::array<std::byte, kMacLen>> macs_by_sequence;
 
         std::size_t offset = 0;
@@ -597,6 +668,7 @@ private:
             std::array<std::byte, kKeyBlockSize> frame_key_block{};
             if (peek_frame_key_id(remaining, frame_key_id)) {
                 if (!key_ring_.active_key(frame_key_id, frame_key_block)) return RecoveryScanStatus::Corrupt;
+                note_observed_key_id(frame_key_id);
             }
 
             DecodedOrderFrame frame{};
@@ -622,7 +694,9 @@ private:
             }
 
             std::string coid(frame.record.client_order_id);
-            auto& rs = per_coid[coid];
+            auto [it, inserted] = per_coid.try_emplace(coid);
+            if (inserted) coid_scan_order.push_back(coid);
+            auto& rs = it->second;
             if (!rs.established) {
                 if (frame.record.resulting_state != OrderState::Intent) return RecoveryScanStatus::Corrupt;
                 rs.established = true;
@@ -664,7 +738,26 @@ private:
         next_sequence_ = expected_seq;
         tip_mac_ = macs_by_sequence.back();
 
-        for (const auto& [coid, rs] : per_coid) {
+        // AUDIT KEY-ROTATE-008: finish the interrupted rotation's step 2 now that the
+        // true tip is known. Doing it here (rather than lazily on the next append)
+        // means the on-disk anchor is consistent with active_key_id_ before this
+        // constructor returns, so a second crash immediately afterwards recovers
+        // cleanly through the ordinary path instead of hitting this branch again.
+        if (interrupted_rotation_) {
+            std::array<std::byte, kKeyBlockSize> key_block{};
+            if (!key_ring_.active_key(active_key_id_, key_block)) return RecoveryScanStatus::Corrupt;
+            const bool ok = write_tip_anchor(next_sequence_ - 1, tip_mac_, active_key_id_,
+                                              std::span<const std::byte>(key_block.data(), key_block.size()));
+            secure_wipe(key_block.data(), key_block.size());
+            if (!ok) return RecoveryScanStatus::IoError;
+            completed_interrupted_rotation_ = true;
+        }
+
+        // Iterate coid_scan_order, NOT per_coid: first-appearance order in the log,
+        // so this is reproducible across runs, platforms and standard-library
+        // versions (audit REC-DETERM-007).
+        for (const auto& coid : coid_scan_order) {
+            const ReplayState& rs = per_coid.at(coid);
             if (is_exchange_final(rs.state)) continue;  // nothing to recover
             if (checkpoint_count_ >= checkpoints_.size()) return RecoveryScanStatus::CapacityExceeded;
 
@@ -731,7 +824,28 @@ private:
         // one this restart was told to use -- without a real rotation
         // protocol (Phase 4), that can only be a configuration mistake or an
         // unauthorized identity swap, never silently accepted.
-        if (anchor.key_id != active_key_id_) return RecoveryScanStatus::Corrupt;
+        if (anchor.key_id != active_key_id_) {
+            // AUDIT KEY-ROTATE-008: a crash between rotate_active_key()'s step 1
+            // (durable sidecar record) and step 2 (re-anchor the main tip under the
+            // new key) lands exactly here -- the anchor is still signed under the OLD
+            // key while this process was configured with the NEW one. Nothing was
+            // lost, but the check used to call it Corrupt and fence the sink
+            // permanently, with no API anywhere that could tell an operator the
+            // difference between that and a genuine unauthorized identity swap
+            // (run_rotation_recovery_scan() decoded the KeyRotated payload and threw
+            // it away).
+            //
+            // The sidecar is durable evidence, and it is now consulted: accept ONLY
+            // the one transition it actually proves -- old_key_id matches what signed
+            // the anchor, new_key_id matches what we were configured with. Everything
+            // else stays Corrupt. mark_interrupted_rotation() then has step 2
+            // completed by the caller once the true tip is known.
+            if (!last_rotation_ || anchor.key_id != last_rotation_->old_key_id ||
+                active_key_id_ != last_rotation_->new_key_id) {
+                return RecoveryScanStatus::Corrupt;
+            }
+            interrupted_rotation_ = true;
+        }
 
         if (anchor.sequence_number > log_tip_sequence) return RecoveryScanStatus::Corrupt;  // tail deletion
         if (anchor.sequence_number == log_tip_sequence) {
@@ -758,7 +872,18 @@ private:
     // (I/O, corruption, or a dangling anchor with no matching frame) -- the
     // caller (constructor) treats false as rotation_fenced_ = true, which
     // gates ONLY rotate_active_key(), never append_durable().
+    // Same noexcept-allocation treatment as run_recovery_scan() above (audit
+    // REC-NOEXCEPT-006). false here only sets rotation_fenced_, which gates
+    // rotate_active_key() and nothing else -- strictly better than terminate().
     bool run_rotation_recovery_scan() noexcept {
+        try {
+            return run_rotation_recovery_scan_impl();
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool run_rotation_recovery_scan_impl() {
         std::vector<std::byte> content;
         if (!rotation_log_store_.read_whole_log(content)) return false;
 
@@ -801,6 +926,13 @@ private:
             if (frame.sequence_number != expected_seq) return false;
             if (frame.prev_mac != running_prev_mac) return false;
 
+            // AUDIT KEY-ROTATE-008: the payload used to be decoded and dropped on the
+            // floor here, which is why an interrupted rotation was indistinguishable
+            // from corruption. Keeping the LAST one is enough: it describes the most
+            // recent rotation, and that is the only one whose step 2 could still be
+            // outstanding.
+            last_rotation_ = frame.payload;
+
             last_mac = frame.mac;
             running_prev_mac = frame.mac;
             ++expected_seq;
@@ -841,7 +973,19 @@ private:
     // store_identity_degraded_, which append_durable() checks before pushing
     // to export_outbox_ (see that method's own comment: degraded must behave
     // like "no export_outbox_ wired", never like "wired but lying").
+    // Same noexcept-allocation treatment as the two scans above (audit
+    // REC-NOEXCEPT-006): std::vector<std::byte> raw and the std::string path both
+    // allocate, and degrading is always available here, so there is never a reason
+    // to terminate.
     void establish_store_identity(const std::string& tip_path) noexcept {
+        try {
+            establish_store_identity_impl(tip_path);
+        } catch (...) {
+            store_identity_degraded_ = true;
+        }
+    }
+
+    void establish_store_identity_impl(const std::string& tip_path) {
         if (!store_identity_store_.acquire_lock()) {
             store_identity_degraded_ = true;
             return;
@@ -999,6 +1143,27 @@ private:
     bool rotation_fenced_{false};
     std::uint64_t rotation_next_sequence_{0};
     std::array<std::byte, kMacLen> rotation_tip_mac_{};
+    // Audit KEY-ROTATE-008: the sidecar's last KeyRotated payload, retained instead
+    // of discarded, plus the two flags recording what the main scan did with it.
+    std::optional<KeyRotationPayload> last_rotation_{};
+    bool interrupted_rotation_{false};
+    bool completed_interrupted_rotation_{false};
+
+    // Audit KEY-RETIRE-009: distinct key_ids seen while scanning the main log.
+    // Bounded by kMaxLiveKeys because any key_id NOT in the ring already fails the
+    // scan as Corrupt before reaching here, so more than kMaxLiveKeys distinct ones
+    // is unreachable.
+    std::array<std::uint32_t, kMaxLiveKeys> observed_key_ids_{};
+    std::size_t observed_key_id_count_{0};
+
+    void note_observed_key_id(std::uint32_t key_id) noexcept {
+        for (std::size_t i = 0; i < observed_key_id_count_; ++i) {
+            if (observed_key_ids_[i] == key_id) return;
+        }
+        if (observed_key_id_count_ < observed_key_ids_.size()) {
+            observed_key_ids_[observed_key_id_count_++] = key_id;
+        }
+    }
 
     // Phase 5: store identity. Both stay 0 whenever store_identity_degraded_
     // is true -- see establish_store_identity()'s doc comment.

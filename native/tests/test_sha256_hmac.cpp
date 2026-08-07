@@ -9,7 +9,10 @@
 #include <hengyuan/sha256.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -160,4 +163,97 @@ TEST(HmacSha256, DifferentKeysProduceDifferentDigests) {
     std::vector<std::uint8_t> key_b(20, 0xbb);
     EXPECT_NE(to_hex(hmac_sha256(as_bytes(key_a), as_bytes(data))),
               to_hex(hmac_sha256(as_bytes(key_b), as_bytes(data))));
+}
+
+// --- constant_time_equal (audit SEC-MACCMP-010) ---
+//
+// These test CORRECTNESS, not timing. A constant-time comparison that returns the
+// wrong answer is far worse than a leaky one, and timing itself is not something a
+// unit test on a shared CI runner can measure honestly -- the guarantee here comes
+// from the implementation having no data-dependent control flow or early exit,
+// which is a code-review property. What IS worth pinning is that replacing
+// seventeen std::memcmp calls did not change any verdict.
+
+TEST(ConstantTimeEqual, EqualBuffersCompareEqual) {
+    std::array<std::byte, 32> a{};
+    std::array<std::byte, 32> b{};
+    for (std::size_t i = 0; i < 32; ++i) {
+        a[i] = static_cast<std::byte>(i * 7 + 1);
+        b[i] = a[i];
+    }
+    EXPECT_TRUE(hy::crypto::constant_time_equal(a, b));
+}
+
+TEST(ConstantTimeEqual, DiffersInFirstByte) {
+    std::array<std::byte, 32> a{};
+    std::array<std::byte, 32> b{};
+    b[0] = std::byte{1};
+    EXPECT_FALSE(hy::crypto::constant_time_equal(a, b));
+}
+
+TEST(ConstantTimeEqual, DiffersInLastByte) {
+    // The case std::memcmp handles in 32 comparisons and this handles in 32 --
+    // i.e. the one whose timing used to leak.
+    std::array<std::byte, 32> a{};
+    std::array<std::byte, 32> b{};
+    b[31] = std::byte{1};
+    EXPECT_FALSE(hy::crypto::constant_time_equal(a, b));
+}
+
+TEST(ConstantTimeEqual, SingleBitDifferenceIsDetected) {
+    for (std::size_t i = 0; i < 32; ++i) {
+        for (int bit = 0; bit < 8; ++bit) {
+            std::array<std::byte, 32> a{};
+            std::array<std::byte, 32> b{};
+            b[i] = static_cast<std::byte>(1u << bit);
+            ASSERT_FALSE(hy::crypto::constant_time_equal(a, b))
+                << "byte " << i << " bit " << bit << " must be detected";
+        }
+    }
+}
+
+TEST(ConstantTimeEqual, LengthMismatchIsNotEqual) {
+    std::array<std::byte, 32> a{};
+    std::array<std::byte, 16> b{};
+    EXPECT_FALSE(hy::crypto::constant_time_equal(a, b));
+}
+
+TEST(ConstantTimeEqual, EmptyRangesAreEqual) {
+    EXPECT_TRUE(hy::crypto::constant_time_equal(std::span<const std::byte>{},
+                                                 std::span<const std::byte>{}));
+}
+
+TEST(ConstantTimeEqual, AgreesWithMemcmpOnRandomVectors) {
+    // Differential check against the function it replaced, over every
+    // single-byte-difference position plus the all-equal case.
+    std::array<std::byte, 32> base{};
+    for (std::size_t i = 0; i < 32; ++i) base[i] = static_cast<std::byte>(i * 31 + 5);
+
+    for (std::size_t pos = 0; pos <= 32; ++pos) {
+        auto other = base;
+        if (pos < 32) other[pos] = static_cast<std::byte>(~static_cast<unsigned>(base[pos]) & 0xFFu);
+        const bool ct = hy::crypto::constant_time_equal(base, other);
+        const bool mc = std::memcmp(base.data(), other.data(), base.size()) == 0;
+        ASSERT_EQ(ct, mc) << "verdict changed at pos=" << pos;
+    }
+}
+
+TEST(ConstantTimeEqual, DigestOverloadMatchesWireBytes) {
+    const auto digest = hy::crypto::sha256(as_bytes(std::string("abc")));
+    std::array<std::byte, 32> wire{};
+    std::memcpy(wire.data(), digest.bytes.data(), wire.size());
+    EXPECT_TRUE(hy::crypto::constant_time_equal(digest, wire));
+
+    wire[17] = static_cast<std::byte>(static_cast<unsigned>(wire[17]) ^ 0x01u);
+    EXPECT_FALSE(hy::crypto::constant_time_equal(digest, wire));
+}
+
+TEST(Sha256Digest, EqualityIsConstantTimeAndStillCorrect) {
+    const auto a = hy::crypto::sha256(as_bytes(std::string("abc")));
+    const auto b = hy::crypto::sha256(as_bytes(std::string("abc")));
+    const auto c = hy::crypto::sha256(as_bytes(std::string("abd")));
+    EXPECT_TRUE(a == b);
+    EXPECT_FALSE(a != b);
+    EXPECT_TRUE(a != c);
+    EXPECT_FALSE(a == c);
 }

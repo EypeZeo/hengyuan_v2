@@ -393,7 +393,11 @@ inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
 
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) {
+    // Constant-time, not std::memcmp (audit SEC-MACCMP-010): memcmp returns at the
+    // first differing byte, which turns tag verification into a byte-at-a-time
+    // forgery oracle for anyone who can supply candidate frames and time the
+    // recovery scan.
+    if (!crypto::constant_time_equal(expected_mac, mac)) {
         return FrameDecodeStatus::ChecksumMismatch;
     }
 

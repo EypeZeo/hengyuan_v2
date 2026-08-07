@@ -50,6 +50,38 @@
 
 namespace hy {
 
+// Upper bound on a durable log this process is willing to load into memory.
+//
+// AUDIT REC-NOEXCEPT-006: read_whole_log() sizes its buffer straight from
+// lseek/GetFileSizeEx with no bound, and the whole recovery path above it is
+// noexcept -- so a log larger than available memory turned a designed-to-be
+// fail-closed startup into std::terminate() via an escaping std::bad_alloc. Since
+// this class deliberately has no compaction (see durable_audit_sink.hpp's scope
+// note), the log grows without limit in normal operation, which makes that
+// reachable by ordinary use rather than only by corruption.
+//
+// 1 GiB is roughly 4.2 million OrderEvent frames (255 bytes each). It is a
+// diagnostic tripwire, not a design capacity: a log approaching it means
+// compaction is genuinely needed, and failing closed with IoError says so, where
+// terminate() said nothing at all.
+inline constexpr std::uint64_t kMaxDurableLogBytes = 1024ull * 1024ull * 1024ull;
+
+namespace detail {
+
+// std::vector::resize can throw bad_alloc/length_error. Every caller in this file
+// is noexcept and must fail closed rather than let the exception escape into a
+// std::terminate() (audit REC-NOEXCEPT-006).
+inline bool try_resize(std::vector<std::byte>& v, std::size_t n) noexcept {
+    try {
+        v.resize(n);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+}  // namespace detail
+
 class DurableLogStore {
 public:
     // log_path: the durable log file itself. lock_path: OS-level exclusive
@@ -107,7 +139,8 @@ public:
     bool read_whole_log(std::vector<std::byte>& out) noexcept {
         LARGE_INTEGER size{};
         if (!GetFileSizeEx(log_handle_, &size)) return false;
-        out.resize(static_cast<std::size_t>(size.QuadPart));
+        if (static_cast<std::uint64_t>(size.QuadPart) > kMaxDurableLogBytes) return false;
+        if (!detail::try_resize(out, static_cast<std::size_t>(size.QuadPart))) return false;
         if (out.empty()) return true;
         if (SetFilePointer(log_handle_, 0, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER) return false;
         DWORD read_bytes = 0;
@@ -170,7 +203,11 @@ public:
             CloseHandle(h);
             return false;
         }
-        out.resize(static_cast<std::size_t>(size.QuadPart));
+        if (static_cast<std::uint64_t>(size.QuadPart) > kMaxDurableLogBytes ||
+            !detail::try_resize(out, static_cast<std::size_t>(size.QuadPart))) {
+            CloseHandle(h);
+            return false;
+        }
         bool ok = true;
         if (!out.empty()) {
             DWORD read_bytes = 0;
@@ -219,7 +256,8 @@ public:
     bool read_whole_log(std::vector<std::byte>& out) noexcept {
         const off_t size = ::lseek(log_fd_, 0, SEEK_END);
         if (size < 0) return false;
-        out.resize(static_cast<std::size_t>(size));
+        if (static_cast<std::uint64_t>(size) > kMaxDurableLogBytes) return false;
+        if (!detail::try_resize(out, static_cast<std::size_t>(size))) return false;
         if (out.empty()) return true;
         if (::lseek(log_fd_, 0, SEEK_SET) < 0) return false;
         std::size_t total = 0;
@@ -300,7 +338,11 @@ public:
             ::close(fd);
             return false;
         }
-        out.resize(static_cast<std::size_t>(size));
+        if (static_cast<std::uint64_t>(size) > kMaxDurableLogBytes ||
+            !detail::try_resize(out, static_cast<std::size_t>(size))) {
+            ::close(fd);
+            return false;
+        }
         bool ok = true;
         if (!out.empty()) {
             if (::lseek(fd, 0, SEEK_SET) < 0) {
