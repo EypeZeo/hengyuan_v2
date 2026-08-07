@@ -229,3 +229,44 @@ TEST(DecimalToFixed, Overflow) {
     auto r = BinanceJsonParser::parse_decimal_to_fixed("99999999999999999", 100'000'000);
     EXPECT_FALSE(r.has_value());
 }
+
+// --- P2-MD-02 / Track C: signed-overflow UB fix regression tests ---
+// These specifically target the fractional-digit accumulation path, which previously had no
+// overflow guard at all (unlike the integer-part path, which already did).
+
+TEST(DecimalToFixed, ZeroMultiplierRejected) {
+    // multiplier<=0 previously reached an integer division by zero (UB/SIGFPE).
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("1.5", 0);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(DecimalToFixed, NegativeMultiplierRejected) {
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("1.5", -100'000'000);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(DecimalToFixed, ExcessiveFractionalDigitsOverflowRejected) {
+    // 25 fractional digits: frac_value accumulation would overflow int64 (UB) without the
+    // fix's per-digit guard on the fractional path.
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("1.1234567890123456789012345", 100'000'000);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(DecimalToFixed, FractionalDivisorOverflowRejected) {
+    // Enough fractional digits (~19) for frac_divisor *= 10 alone to overflow, even if the
+    // digits happen to be zero (frac_value itself would stay small).
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("1.0000000000000000000000000", 100'000'000);
+    EXPECT_FALSE(r.has_value());
+}
+
+TEST(DecimalToFixed, Int64MaxBoundary) {
+    // integer part exactly at the edge the existing integer-path guard is meant to allow.
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("92233720368", 1);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, 92233720368LL);
+}
+
+TEST(DecimalToFixed, NegativeWithManyFractionalDigitsStillGuarded) {
+    auto r = BinanceJsonParser::parse_decimal_to_fixed("-0.1234567890123456789012345", 100'000'000);
+    EXPECT_FALSE(r.has_value());
+}

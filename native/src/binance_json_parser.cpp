@@ -33,6 +33,7 @@ const SymbolConfig* BinanceJsonParser::find_symbol(std::string_view name) const 
 std::optional<std::int64_t> BinanceJsonParser::parse_decimal_to_fixed(
     std::string_view s, std::int64_t multiplier) noexcept {
     if (s.empty()) return std::nullopt;
+    if (multiplier <= 0) return std::nullopt;  // guards the later max/multiplier division
 
     bool negative = false;
     std::size_t pos = 0;
@@ -57,7 +58,13 @@ std::optional<std::int64_t> BinanceJsonParser::parse_decimal_to_fixed(
         ++pos;
         while (pos < s.size()) {
             if (s[pos] < '0' || s[pos] > '9') return std::nullopt;
-            frac_value = frac_value * 10 + (s[pos] - '0');
+            std::int64_t digit = s[pos] - '0';
+            // Same overflow-guard pattern as the integer part above -- a string with enough
+            // fractional digits (roughly 19+) would otherwise overflow these into signed UB.
+            if (frac_value > (std::numeric_limits<std::int64_t>::max() - digit) / 10)
+                return std::nullopt;
+            if (frac_divisor > std::numeric_limits<std::int64_t>::max() / 10) return std::nullopt;
+            frac_value = frac_value * 10 + digit;
             frac_divisor *= 10;
             ++pos;
         }
