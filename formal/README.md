@@ -6,10 +6,12 @@ crash-safety properties of the durable-log design in
 with TLC (exhaustive model checking) instead of relying on another round of human/LLM
 review to notice a contradiction.
 
-Two independent models live here: `durable_log_recovery.tla` (the OrderEvent/Gate 8-9
-crash-safety boundary) and `freeze_episode_recovery.tla` (the L4 §10 freeze-episode
-probe/Arm/WaitSatisfied/Clear state machine, further down this file). Each has its own
-config table and MUST be run separately.
+Three independent models live here: `durable_log_recovery.tla` (the OrderEvent/Gate 8-9
+crash-safety boundary), `freeze_episode_recovery.tla` (the L4 §10 freeze-episode
+probe/Arm/WaitSatisfied/Clear state machine, further down this file), and
+`inflight_lifecycle.tla` (the InFlightRegistry slot lifecycle, added by the full-repo
+audit — see its own section at the bottom). Each has its own config table and MUST be
+run separately.
 
 ## Setup (one-time)
 
@@ -247,3 +249,86 @@ model's 4 independent budgets multiply combinatorially in a way
 
 - `freeze_episode_recovery.tla` — the model.
 - `freeze_episode_recovery*.cfg` — see the table above.
+
+---
+
+## `inflight_lifecycle.tla` — InFlightRegistry slot lifecycle
+
+Added by the full-repository audit (finding FORMAL-GAP-017). The argument for it is
+empirical rather than aesthetic: that audit found real defects in three subsystems —
+the InFlightRegistry lifecycle, two-step key rotation, and depth-snapshot bootstrap —
+and **all three were on this file's own "deliberately not modeled" list**, while the
+two subsystems that DO have models came through the same review with no findings. The
+shortfall in this repo's formal coverage was breadth, not depth.
+
+This model closes the highest-value of the three.
+
+### What it models
+
+`orchestrate_submit()` → `ToReconcileRing` → `poll_once()` → `ReconcileEventRing` →
+`drain_reconcile_events()` → slot release. Deliberately abstract about everything else:
+no durable log, no crash/recovery, no key material, no wall-clock or backoff. Those
+either have their own model or are outside this property's resolution, and modeling
+them here without that depth would produce something that looks rigorous while encoding
+guesses — the same rule this file's Scope section already states for
+`durable_log_recovery.tla`.
+
+### The defect it discriminates
+
+EXEC-INFLIGHT-003. An order the exchange **Accepted** kept its InFlightRegistry slot —
+correctly, since it is resting on the book and a blind resubmit must stay blocked — but
+was never handed to anything that could later discover it had filled or been cancelled.
+`drain_reconcile_events()` releases a slot only on `is_exchange_final()`, so the slot
+became unreleasable for the life of the process; 64 of them fail-closed every
+subsequent submit. That violates the invariant the whole gate chain rests on: an
+accepted request must eventually reach a terminal state.
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `inflight_lifecycle.cfg` | **No error found** — the current design |
+| `inflight_lifecycle_untracked_bug.cfg` | **`NoLiveOrderIsUntracked` violated** — regression control |
+| `inflight_lifecycle_liveness.cfg` | **No error found** — `EventualSlotRelease` holds |
+| `inflight_lifecycle_saturation.cfg` | **No error found** — bound-saturation check, manual only |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -config inflight_lifecycle.cfg inflight_lifecycle.tla
+```
+
+**Why the control must fail.** `TrackAcceptedOrders = FALSE` reinstates the pre-audit
+behaviour: `SubmitAccepted` takes a slot without pushing to `ToReconcileRing`. Since
+`poll_once()` only ever sees what arrives on that ring, the order is stranded
+immediately. If this config ever stops failing, the model has stopped discriminating
+the defect it was written for and every clean run of the main config is worth
+correspondingly less — same inversion discipline as `durable_log_recovery_buggy.cfg`
+and the TSan negative controls.
+
+### Recorded results (2026-08-08, TLC 2.19, Java 25)
+
+| Config | States (distinct) | Depth | Result |
+|---|---|---|---|
+| main | 286,636 | 19 | no error |
+| untracked_bug | — | 2 | `NoLiveOrderIsUntracked` violated ✓ |
+| liveness | 12,825 | 15 | no error (`EventualSlotRelease` holds) |
+| saturation | 29,110,403 | 28 | no error |
+
+The regression control's counterexample is **two states deep** (Init → `SubmitAccepted`)
+— the defect needed no crash, no concurrency and no unusual ordering to reach, which is
+consistent with the runtime repro that found it.
+
+**Saturation check**: main at `COIDs=3 / MaxSlots=2 / MaxQueryAttempts=2` → 286,636
+states; saturation at `COIDs=4 / MaxQueryAttempts=3` → 29,110,403 states. A 101× growth
+with violations still at zero, so the smaller bound is not masking anything. Note that
+`MaxSlots` is deliberately NOT also raised: `COIDs=4 / MaxSlots=3 / MaxQueryAttempts=3`
+exceeds 50M distinct states and buys no additional discrimination, given the
+counterexample above is 2 states deep. Re-run this pair whenever the model changes.
+
+### Still not modeled
+
+Two-step key rotation (`rotate_active_key()`'s sidecar-then-reanchor protocol, audit
+KEY-ROTATE-008) and the depth-snapshot bootstrap state machine (MD-BOOK-002) remain
+unmodeled. Both defects were found by hand and are fixed with unit-level regression
+tests; a model for the rotation protocol in particular would be worth writing, since its
+crash window is exactly the kind of thing tests reach only by construction.
