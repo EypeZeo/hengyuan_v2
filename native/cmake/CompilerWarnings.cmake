@@ -11,7 +11,7 @@ function(hengyuan_set_warnings target)
             -Wdouble-promotion -Wformat=2
         >
         $<$<CXX_COMPILER_ID:MSVC>:
-            /W4 /WX /permissive- /utf-8
+            /W4 /WX /permissive- /utf-8 /bigobj
             /wd4324
         >
     )
