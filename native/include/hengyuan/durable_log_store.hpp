@@ -40,6 +40,7 @@
 #endif
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>  // flock() -- see durable_audit_sink.hpp's header
                         // comment for why <sys/file.h> must be included
@@ -49,6 +50,62 @@
 #endif
 
 namespace hy {
+
+// Upper bound on a durable log this process is willing to load into memory.
+//
+// AUDIT REC-NOEXCEPT-006: read_whole_log() sizes its buffer straight from
+// lseek/GetFileSizeEx with no bound, and the whole recovery path above it is
+// noexcept -- so a log larger than available memory turned a designed-to-be
+// fail-closed startup into std::terminate() via an escaping std::bad_alloc. Since
+// this class deliberately has no compaction (see durable_audit_sink.hpp's scope
+// note), the log grows without limit in normal operation, which makes that
+// reachable by ordinary use rather than only by corruption.
+//
+// 1 GiB is roughly 4.2 million OrderEvent frames (255 bytes each). It is a
+// diagnostic tripwire, not a design capacity: a log approaching it means
+// compaction is genuinely needed, and failing closed with IoError says so, where
+// terminate() said nothing at all.
+inline constexpr std::uint64_t kMaxDurableLogBytes = 1024ull * 1024ull * 1024ull;
+
+namespace detail {
+
+// std::vector::resize can throw bad_alloc/length_error. Every caller in this file
+// is noexcept and must fail closed rather than let the exception escape into a
+// std::terminate() (audit REC-NOEXCEPT-006).
+inline bool try_resize(std::vector<std::byte>& v, std::size_t n) noexcept {
+    try {
+        v.resize(n);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+#if !defined(_WIN32)
+// AUDIT IO-EINTR-021: read/write/fsync/pread can all return -1/EINTR when a signal
+// is delivered without SA_RESTART, and every one of them here treated that as a
+// hard failure. In this codebase a "hard failure" on the append path permanently
+// FENCES the sink (durable_audit_sink.hpp), so a single stray signal could retire a
+// perfectly healthy writer for the rest of the process's life. There is no signal
+// handler in the library today, but watchdog_daemon.cpp installs SIGINT/SIGTERM
+// handlers and any embedder may install more -- this is precisely the class of
+// assumption that holds until it silently does not.
+//
+// Deliberately NOT applied to fsync's own retry semantics beyond EINTR: on Linux a
+// failed fsync may have already dropped the dirty page, so retrying a NON-EINTR
+// fsync failure would be unsound (the PostgreSQL fsyncgate problem). EINTR is the
+// one case where the operation provably did not run.
+template <typename Fn>
+inline auto retry_on_eintr(Fn&& fn) noexcept -> decltype(fn()) {
+    for (;;) {
+        const auto rc = fn();
+        if (rc < 0 && errno == EINTR) continue;
+        return rc;
+    }
+}
+#endif
+
+}  // namespace detail
 
 class DurableLogStore {
 public:
@@ -107,7 +164,8 @@ public:
     bool read_whole_log(std::vector<std::byte>& out) noexcept {
         LARGE_INTEGER size{};
         if (!GetFileSizeEx(log_handle_, &size)) return false;
-        out.resize(static_cast<std::size_t>(size.QuadPart));
+        if (static_cast<std::uint64_t>(size.QuadPart) > kMaxDurableLogBytes) return false;
+        if (!detail::try_resize(out, static_cast<std::size_t>(size.QuadPart))) return false;
         if (out.empty()) return true;
         if (SetFilePointer(log_handle_, 0, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER) return false;
         DWORD read_bytes = 0;
@@ -170,7 +228,11 @@ public:
             CloseHandle(h);
             return false;
         }
-        out.resize(static_cast<std::size_t>(size.QuadPart));
+        if (static_cast<std::uint64_t>(size.QuadPart) > kMaxDurableLogBytes ||
+            !detail::try_resize(out, static_cast<std::size_t>(size.QuadPart))) {
+            CloseHandle(h);
+            return false;
+        }
         bool ok = true;
         if (!out.empty()) {
             DWORD read_bytes = 0;
@@ -219,12 +281,14 @@ public:
     bool read_whole_log(std::vector<std::byte>& out) noexcept {
         const off_t size = ::lseek(log_fd_, 0, SEEK_END);
         if (size < 0) return false;
-        out.resize(static_cast<std::size_t>(size));
+        if (static_cast<std::uint64_t>(size) > kMaxDurableLogBytes) return false;
+        if (!detail::try_resize(out, static_cast<std::size_t>(size))) return false;
         if (out.empty()) return true;
         if (::lseek(log_fd_, 0, SEEK_SET) < 0) return false;
         std::size_t total = 0;
         while (total < out.size()) {
-            const ssize_t n = ::read(log_fd_, out.data() + total, out.size() - total);
+            const ssize_t n = detail::retry_on_eintr(
+                [&] { return ::read(log_fd_, out.data() + total, out.size() - total); });
             if (n <= 0) return false;
             total += static_cast<std::size_t>(n);
         }
@@ -234,11 +298,12 @@ public:
         if (::lseek(log_fd_, 0, SEEK_END) < 0) return false;
         std::size_t total = 0;
         while (total < bytes.size()) {
-            const ssize_t written = ::write(log_fd_, bytes.data() + total, bytes.size() - total);
+            const ssize_t written = detail::retry_on_eintr(
+                [&] { return ::write(log_fd_, bytes.data() + total, bytes.size() - total); });
             if (written <= 0) return false;
             total += static_cast<std::size_t>(written);
         }
-        return ::fsync(log_fd_) == 0;
+        return detail::retry_on_eintr([&] { return ::fsync(log_fd_); }) == 0;
     }
     std::uint64_t log_size() const noexcept {
         struct stat st{};
@@ -252,8 +317,10 @@ public:
         if (effective_want == 0) return true;
         std::size_t total = 0;
         while (total < effective_want) {
-            const ssize_t n = ::pread(log_fd_, buffer.data() + total, effective_want - total,
-                                       static_cast<off_t>(offset + total));
+            const ssize_t n = detail::retry_on_eintr([&] {
+                return ::pread(log_fd_, buffer.data() + total, effective_want - total,
+                               static_cast<off_t>(offset + total));
+            });
             if (n < 0) return false;
             if (n == 0) break;  // EOF -- short read is legal, caller decides
             total += static_cast<std::size_t>(n);
@@ -268,14 +335,16 @@ public:
         std::size_t total = 0;
         bool ok = true;
         while (ok && total < anchor_bytes.size()) {
-            const ssize_t written = ::write(fd, anchor_bytes.data() + total, anchor_bytes.size() - total);
+            const ssize_t written = detail::retry_on_eintr([&] {
+                return ::write(fd, anchor_bytes.data() + total, anchor_bytes.size() - total);
+            });
             if (written <= 0) {
                 ok = false;
                 break;
             }
             total += static_cast<std::size_t>(written);
         }
-        ok = ok && (::fsync(fd) == 0);
+        ok = ok && (detail::retry_on_eintr([&] { return ::fsync(fd); }) == 0);
         ::close(fd);
         if (!ok) return false;
 
@@ -288,7 +357,7 @@ public:
         const std::string dir = (slash == std::string::npos) ? "." : tip_path_.substr(0, slash);
         int dir_fd = ::open(dir.c_str(), O_RDONLY);
         if (dir_fd < 0) return false;
-        const bool dir_ok = (::fsync(dir_fd) == 0);
+        const bool dir_ok = (detail::retry_on_eintr([&] { return ::fsync(dir_fd); }) == 0);
         ::close(dir_fd);
         return dir_ok;
     }
@@ -300,7 +369,11 @@ public:
             ::close(fd);
             return false;
         }
-        out.resize(static_cast<std::size_t>(size));
+        if (static_cast<std::uint64_t>(size) > kMaxDurableLogBytes ||
+            !detail::try_resize(out, static_cast<std::size_t>(size))) {
+            ::close(fd);
+            return false;
+        }
         bool ok = true;
         if (!out.empty()) {
             if (::lseek(fd, 0, SEEK_SET) < 0) {
@@ -308,7 +381,8 @@ public:
             } else {
                 std::size_t total = 0;
                 while (ok && total < out.size()) {
-                    const ssize_t n = ::read(fd, out.data() + total, out.size() - total);
+                    const ssize_t n = detail::retry_on_eintr(
+                        [&] { return ::read(fd, out.data() + total, out.size() - total); });
                     if (n <= 0) {
                         ok = false;
                         break;

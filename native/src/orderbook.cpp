@@ -30,16 +30,35 @@ std::size_t OrderBook::find_bid(const std::array<PriceLevel, kMaxLevels>& arr,
     return lo;
 }
 
-void OrderBook::insert_at(std::array<PriceLevel, kMaxLevels>& arr,
+// Bounded top-N insert.
+//
+// AUDIT MD-BOOK-002: this used to `return` unconditionally once count reached
+// kMaxLevels, which made a FULL book reject EVERY new price level -- including one
+// belonging at position 0. Since apply_snapshot() truncates a real 1000-level
+// Binance snapshot to exactly kMaxLevels, the book was full the instant it was
+// bootstrapped, so from then on only quantity updates to already-present prices and
+// deletions could get through. In a market where the best bid/ask moves to a new
+// price level constantly, top_of_book() froze. Verified with a repro against this
+// exact file before the fix.
+//
+// Both sides are kept sorted best-first, so the worst held level is always the last
+// slot. A level that belongs inside the window must displace it; a level worse than
+// all of them (pos == kMaxLevels) is genuinely outside the window and correctly
+// forgotten -- that, and only that, is what false now means.
+bool OrderBook::insert_at(std::array<PriceLevel, kMaxLevels>& arr,
                            std::size_t& count, std::size_t pos,
                            std::int64_t price, std::int64_t qty) noexcept {
-    if (count >= kMaxLevels) return;
+    if (count >= kMaxLevels) {
+        if (pos >= kMaxLevels) return false;  // worse than every level held
+        count = kMaxLevels - 1;               // evict the worst level
+    }
     if (pos < count) {
         std::memmove(&arr[pos + 1], &arr[pos],
                      (count - pos) * sizeof(PriceLevel));
     }
     arr[pos] = {price, qty};
     ++count;
+    return true;
 }
 
 void OrderBook::remove_at(std::array<PriceLevel, kMaxLevels>& arr,
@@ -82,17 +101,15 @@ OrderBook::ApplyResult OrderBook::apply_delta(std::int64_t price_ticks,
         std::size_t pos = find_ask(asks_, ask_count_, price_ticks);
         if (pos < ask_count_ && asks_[pos].price_ticks == price_ticks) {
             asks_[pos].qty_lots = qty_lots;
-        } else {
-            if (ask_count_ >= kMaxLevels) return ApplyResult::LevelsFull;
-            insert_at(asks_, ask_count_, pos, price_ticks, qty_lots);
+        } else if (!insert_at(asks_, ask_count_, pos, price_ticks, qty_lots)) {
+            return ApplyResult::OutsideWindow;
         }
     } else {
         std::size_t pos = find_bid(bids_, bid_count_, price_ticks);
         if (pos < bid_count_ && bids_[pos].price_ticks == price_ticks) {
             bids_[pos].qty_lots = qty_lots;
-        } else {
-            if (bid_count_ >= kMaxLevels) return ApplyResult::LevelsFull;
-            insert_at(bids_, bid_count_, pos, price_ticks, qty_lots);
+        } else if (!insert_at(bids_, bid_count_, pos, price_ticks, qty_lots)) {
+            return ApplyResult::OutsideWindow;
         }
     }
 

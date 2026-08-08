@@ -623,6 +623,20 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             result.order.transition_to(OrderState::Accepted);
             result.gate = OrchestratorGate::SubmitAccepted;
             ctx.audit->append(ar);
+            if (ctx.to_reconcile) {
+                // AUDIT EXEC-INFLIGHT-003: an Accepted order keeps its in-flight slot
+                // (correctly -- it is resting on the exchange and must stay blocked
+                // against a blind resubmit), but nothing used to hand it to anyone who
+                // could ever discover its terminal state. drain_reconcile_events()
+                // releases a slot only on is_exchange_final(), so without this push the
+                // slot was unreleasable for the life of the process and 64 accepted
+                // orders fail-closed every subsequent submit. Same capacity argument as
+                // the Timeout branch below: this push only ever happens for an order
+                // that just consumed one of ctx.in_flight's <= kMaxInFlight slots, and
+                // ToReconcileRing's capacity equals kMaxInFlight, so unconsumed pushes
+                // can never outnumber ring capacity.
+                (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
+            }
             break;
         }
 

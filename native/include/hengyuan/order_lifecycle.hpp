@@ -109,9 +109,24 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
                 return TransitionResult::Ok;
             break;
         case OrderState::Accepted:
+            // Cancelled is reachable WITHOUT a local CancelRequested (audit
+            // STATE-TRANS-011): the operator can cancel from the Binance app during a
+            // manual takeover -- that is the documented procedure in
+            // docs/NATIVE_EXIT_SAFETY_RUNBOOK.md, not a hypothetical -- and the
+            // exchange itself cancels for self-trade prevention. Reconciliation then
+            // discovers CANCELED for an order this process last knew as Accepted.
+            // Without this edge that discovery was an InvalidTransition and the local
+            // state diverged from the exchange permanently. Expired was already
+            // allowed here; the asymmetry with Cancelled was the oversight.
+            //
+            // Rejected is deliberately NOT added: Binance's REJECTED is a
+            // submit-time status, never produced for an order that already reached
+            // NEW. Ambiguous -> Rejected (below) covers "the POST timed out and the
+            // query says it was rejected at submit time", which is the real case.
             if (to == OrderState::PartialFill ||
                 to == OrderState::Filled ||
                 to == OrderState::CancelRequested ||
+                to == OrderState::Cancelled ||
                 to == OrderState::Expired)
                 return TransitionResult::Ok;
             break;
@@ -139,8 +154,12 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
                 return TransitionResult::Ok;
             break;
         case OrderState::PartialFill:
+            // Cancelled without a local CancelRequested, same reasoning as Accepted
+            // above (audit STATE-TRANS-011) -- a partially-filled order is exactly as
+            // cancellable by the operator or the exchange as a resting one.
             if (to == OrderState::Filled ||
                 to == OrderState::CancelRequested ||
+                to == OrderState::Cancelled ||
                 to == OrderState::Expired)
                 return TransitionResult::Ok;
             break;

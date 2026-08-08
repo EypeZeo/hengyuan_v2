@@ -44,15 +44,23 @@ ValidationResult InputValidator::validate(const BinanceMarketEvent& ev) noexcept
         state.seen = true;
     }
 
+    // Clock-anomaly detection is per-symbol (audit VAL-TS-028): a symbol's event
+    // times are only monotonic against ITS OWN previous event, never against another
+    // symbol's. An out-of-range symbol_id cannot reach here with a tracked clock,
+    // and is simply not clock-checked rather than being folded into a shared
+    // counter.
     auto result = ValidationResult::Accept;
-    if (has_seen_any_ && ev.ts_event_ms < last_ts_event_ms_ &&
-        (last_ts_event_ms_ - ev.ts_event_ms) > 1000) {
-        ++counters_.clock_anomalies;
-        result = ValidationResult::AcceptClockAnomaly;
+    if (ev.symbol_id < kMaxSymbols) {
+        auto& clock = clock_state_[ev.symbol_id];
+        if (clock.seen && ev.ts_event_ms < clock.last_ts_event_ms &&
+            (clock.last_ts_event_ms - ev.ts_event_ms) > 1000) {
+            ++counters_.clock_anomalies;
+            result = ValidationResult::AcceptClockAnomaly;
+        }
+        clock.last_ts_event_ms = ev.ts_event_ms;
+        clock.seen = true;
     }
 
-    last_ts_event_ms_ = ev.ts_event_ms;
-    has_seen_any_ = true;
     ++counters_.accepted;
 
     return result;

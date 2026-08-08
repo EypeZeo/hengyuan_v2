@@ -6,18 +6,30 @@
 
 namespace hy {
 
-void BinanceJsonParser::register_symbol(std::string_view binance_symbol,
+bool BinanceJsonParser::register_symbol(std::string_view binance_symbol,
                                          std::uint32_t symbol_id,
                                          std::int64_t price_mult,
                                          std::int64_t qty_mult) noexcept {
-    if (symbol_count_ >= kMaxSymbols) return;
+    if (symbol_count_ >= kMaxSymbols) return false;
+    // Audit API-SYM-020: an id past the per-symbol table bound would silently be
+    // served symbol 0's order book downstream. Reject at the only point that knows.
+    if (symbol_id > kMaxSymbolId) return false;
+    // Silently truncating a name would make two different symbols collide in
+    // find_symbol(); reject instead. Empty names are rejected because find_symbol()
+    // matches on length and every incoming "s" field is non-empty.
+    if (binance_symbol.empty() || binance_symbol.size() > sizeof(SymbolEntry::name) - 1) {
+        return false;
+    }
+    if (price_mult <= 0 || qty_mult <= 0) return false;  // parse_decimal_to_fixed rejects these anyway
+
     auto& entry = symbols_[symbol_count_];
-    std::size_t len = (std::min)(binance_symbol.size(), sizeof(entry.name) - 1);
+    const std::size_t len = binance_symbol.size();
     std::memcpy(entry.name, binance_symbol.data(), len);
     entry.name[len] = '\0';
     entry.name_len = len;
     entry.config = {symbol_id, price_mult, qty_mult};
     ++symbol_count_;
+    return true;
 }
 
 const SymbolConfig* BinanceJsonParser::find_symbol(std::string_view name) const noexcept {
@@ -85,6 +97,18 @@ std::optional<std::int64_t> BinanceJsonParser::parse_decimal_to_fixed(
         }
     }
 
+    // The two guards above only prove each CONTRIBUTION fits on its own; their SUM
+    // still can't. `max / multiplier` truncates, so integer_part is allowed right up
+    // to floor(max/multiplier) -- leaving max % multiplier of headroom, while
+    // frac_contrib ranges up to multiplier-1. For multiplier=1e8 (this parser's
+    // default price/qty multiplier) that headroom is 54,775,807 against a
+    // frac_contrib ceiling of 99,999,999, so "92233720368.99999999" overflows.
+    // Both operands are non-negative here (integer_part and multiplier are both
+    // positive, and frac_contrib is only assigned inside a frac_value > 0 branch),
+    // so a single subtraction-form check is sufficient and cannot itself overflow.
+    if (frac_contrib > std::numeric_limits<std::int64_t>::max() - int_contrib) {
+        return std::nullopt;
+    }
     std::int64_t result = int_contrib + frac_contrib;
     if (negative) result = -result;
     return result;
@@ -98,7 +122,20 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
     out_count = 0;
     if (max_events == 0) return ParseResult::MalformedJson;
 
-    auto padded = simdjson::padded_string(json_bytes);
+    // Reusable padded buffer, not a fresh simdjson::padded_string per message --
+    // see padded_buf_'s declaration for why (audit PERF-ALLOC-012). resize() only
+    // allocates when the high-water mark grows, so the steady state is memcpy +
+    // memset into storage this object already owns.
+    const std::size_t doc_len = json_bytes.size();
+    if (padded_buf_.size() < doc_len + simdjson::SIMDJSON_PADDING) {
+        padded_buf_.resize(doc_len + simdjson::SIMDJSON_PADDING);
+    }
+    if (doc_len > 0) {
+        std::memcpy(padded_buf_.data(), json_bytes.data(), doc_len);
+    }
+    std::memset(padded_buf_.data() + doc_len, 0, simdjson::SIMDJSON_PADDING);
+    const simdjson::padded_string_view padded(padded_buf_.data(), doc_len, padded_buf_.size());
+
     simdjson::ondemand::document doc;
     auto err = parser_.iterate(padded).get(doc);
     if (err) {
@@ -209,12 +246,16 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
         [[maybe_unused]] auto e6b = doc["u"].get_uint64().get(final_update_id);
 
         std::size_t n = 0;
+        bool truncated = false;
 
         // Parse bids ("b" array): each element is ["price", "qty"]
         simdjson::ondemand::array bids_arr;
         if (doc["b"].get_array().get(bids_arr) == simdjson::SUCCESS) {
             for (auto level_result : bids_arr) {
-                if (n >= max_events) break;
+                if (n >= max_events) {
+                    truncated = true;
+                    break;
+                }
                 simdjson::ondemand::array pair;
                 if (level_result.get_array().get(pair) != simdjson::SUCCESS) continue;
                 auto it = pair.begin();
@@ -249,7 +290,10 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
         simdjson::ondemand::array asks_arr;
         if (doc["a"].get_array().get(asks_arr) == simdjson::SUCCESS) {
             for (auto level_result : asks_arr) {
-                if (n >= max_events) break;
+                if (n >= max_events) {
+                    truncated = true;
+                    break;
+                }
                 simdjson::ondemand::array pair;
                 if (level_result.get_array().get(pair) != simdjson::SUCCESS) continue;
                 auto it = pair.begin();
@@ -278,6 +322,33 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
                 ev.side = Side::Sell;  // ask side
                 ++n;
             }
+        }
+
+        // AUDIT MD-TRUNC-015: a depth delta is explicitly NOT conflatable
+        // (binance_market_event.hpp). Handing back the levels that happened to fit
+        // and returning Ok diverged the local book from the exchange permanently,
+        // with no counter, no flag and no way for the caller to notice -- and the
+        // bids loop runs first, so a large enough message could consume every slot
+        // and leave the asks side entirely unrepresented.
+        //
+        // Discard the partial delta and emit a single synthetic resync marker
+        // instead. event_flag::kResyncRequired is what InputValidator turns into
+        // ValidationResult::ResyncRequired, which drives DepthManager back to
+        // Buffering and a fresh snapshot -- the correct fail-closed response to
+        // "this update could not be represented in full".
+        if (truncated) {
+            ++counters_.truncated_resync;
+            auto& ev = out_events[0];
+            std::memset(&ev, 0, sizeof(ev));
+            ev.event_id = final_update_id;
+            ev.aux_id = first_update_id;
+            ev.ts_event_ms = event_time;
+            ev.ts_recv_ns = recv_ns;
+            ev.symbol_id = sym_cfg->symbol_id;
+            ev.type = EventType::DepthDelta;
+            ev.flags = event_flag::kResyncRequired;
+            out_count = 1;
+            return ParseResult::TruncatedResync;
         }
 
         out_count = n;

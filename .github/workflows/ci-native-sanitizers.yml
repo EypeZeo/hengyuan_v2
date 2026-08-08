@@ -101,12 +101,25 @@ jobs:
       # AuditRingSink owned by one, OrderTracker by the other, synchronized only
       # via SpscRing) -- without it here, that design's actual thread-safety
       # claim would never run under TSan at all.
+      # test_shm_heartbeat carries the same kind of claim for ShmControlBlock's
+      # seqlock (audit PERF-SHM-004). That protocol is genuinely cross-PROCESS, so
+      # TSan can never observe the real writer/watchdog pair; a two-thread
+      # in-process exercise of the identical protocol is the closest available
+      # check, and it earns its place precisely because the previous non-atomic
+      # implementation would have been reported by it instantly.
+      # test_snapshot_refresh_gate is the third (audit VERIF-TSAN-016): that class
+      # spawns a real std::thread and publishes a mailbox across it, but its header
+      # used to name the production REST fetcher as a constructor default, dragging
+      # in Boost/OpenSSL and putting the whole binary behind HY_BUILD_DEMO -- which
+      # this job turns OFF. The one genuinely-networked test moved to
+      # test_binance_rest_snapshot.cpp so the state machine could come here.
       - name: Build concurrency targets only
         working-directory: native
         run: |
           cmake --build build-tsan -j$(nproc) \
-            --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring \
-            tsan_control_export_worker_dual_consumer
+            --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
+            test_snapshot_refresh_gate \
+            tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
       # race whose two halves are separated in time gets reported at all — it
@@ -192,9 +205,16 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DHY_BUILD_DEMO=OFF
 
+      # AUDIT CI-ARM-022: this used to build test_spsc_concurrency alone, so
+      # test_reconcile_concurrency's memory orders -- and now
+      # test_shm_heartbeat's seqlock -- never got a hardware verdict on weak
+      # memory, only TSan's model verdict on x86. The `ctest -L concurrency`
+      # selection below already expected all of them.
       - name: Build concurrency targets only
         working-directory: native
-        run: cmake --build build-arm -j$(nproc) --target test_spsc_concurrency
+        run: |
+          cmake --build build-arm -j$(nproc) \
+            --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the

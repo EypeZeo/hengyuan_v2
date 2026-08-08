@@ -71,7 +71,10 @@ int main(int argc, char* argv[]) {
     constexpr std::size_t kRingSize = 4096;
 
     hy::BinanceJsonParser parser;
-    parser.register_symbol(symbol, 0);
+    if (!parser.register_symbol(symbol, 0)) {
+        std::fprintf(stderr, "FATAL: could not register symbol %s\n", symbol.c_str());
+        return 1;
+    }
 
     auto ring = std::make_unique<hy::SpscRing<hy::BinanceMarketEvent, kRingSize>>();
 

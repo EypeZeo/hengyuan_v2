@@ -117,11 +117,21 @@ int main(int argc, char* argv[]) {
 
     // Parser with symbols
     hy::BinanceJsonParser parser;
-    parser.register_symbol("BTCUSDT", 0);
-    parser.register_symbol("ETHUSDT", 1);
-    parser.register_symbol("SOLUSDT", 2);
-    parser.register_symbol("DOGEUSDT", 3);
-    parser.register_symbol("ADAUSDT", 4);
+    // register_symbol() is [[nodiscard]] (audit API-SYM-020): a rejected registration
+    // means every event for that symbol would be silently dropped as UnknownSymbol,
+    // which is exactly the kind of quiet degradation worth a hard stop at startup.
+    {
+        const struct { const char* name; std::uint32_t id; } kSymbols[] = {
+            {"BTCUSDT", 0}, {"ETHUSDT", 1}, {"SOLUSDT", 2}, {"DOGEUSDT", 3}, {"ADAUSDT", 4},
+        };
+        for (const auto& s : kSymbols) {
+            if (!parser.register_symbol(s.name, s.id)) {
+                std::fprintf(stderr, "FATAL: could not register symbol %s (id %u)\n", s.name,
+                             s.id);
+                return 1;
+            }
+        }
+    }
 
     // SPSC ring
     auto ring = std::make_unique<hy::SpscRing<hy::BinanceMarketEvent, kRingSize>>();
@@ -222,7 +232,10 @@ int main(int argc, char* argv[]) {
     // synchronous fetch mid-loop would cause during a resync. depth_mgr starts in Buffering
     // state, so the first loop iteration's needs_snapshot() is naturally true and drives the
     // gate to fetch the initial snapshot the same way a later resync does.
-    hy::SnapshotRefreshGate depth_gate;
+    // The production fetcher is passed explicitly now (audit VERIF-TSAN-016) -- it
+    // used to be a constructor default, which is what coupled the gate's header to
+    // Boost/OpenSSL and kept its threaded state machine out of the TSan job.
+    hy::SnapshotRefreshGate depth_gate(hy::make_default_snapshot_fetcher());
 
     // D3-LIVE preflight check (informational — this is dry-run, not live). Runs before the book
     // is synced (depth_mgr starts in Buffering), which honestly reflects "not ready yet at

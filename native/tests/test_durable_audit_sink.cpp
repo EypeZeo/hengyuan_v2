@@ -14,11 +14,14 @@
 #include <gtest/gtest.h>
 #include <hengyuan/durable_audit_sink.hpp>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifdef __linux__
 #include <sys/stat.h>
@@ -805,4 +808,259 @@ TEST_F(DurableAuditSinkTest, TwoDifferentSinksGetDifferentStoreUuids) {
     EXPECT_TRUE(a.store_uuid_lo() != b.store_uuid_lo() || a.store_uuid_hi() != b.store_uuid_hi());
 
     remove_other();
+}
+
+// --- Deterministic checkpoint order (audit REC-DETERM-007) ---
+//
+// recovered_checkpoints() is documented as "in scan order", and
+// CapacityExceeded's contract promises "this array's FIRST kMaxInFlight entries".
+// Both were false while the loop iterated a std::unordered_map: its order is
+// unspecified and varies with hash seed, insertion history and standard-library
+// version, so two processes recovering the SAME log could disagree on order and,
+// at capacity, on which subset survived.
+
+TEST_F(DurableAuditSinkTest, RecoveredCheckpointsFollowLogScanOrder) {
+    constexpr int kOrders = 12;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        for (int i = 0; i < kOrders; ++i) {
+            char coid[16];
+            std::snprintf(coid, sizeof(coid), "HY-%02d", i);
+            ASSERT_TRUE(sink.append_durable(make_intent(coid, 100 + i, 10, 1), 1000 + i).acked());
+            ASSERT_TRUE(sink.append_durable(make_submitted(coid, 100 + i, 10, 1), 2000 + i).acked());
+        }
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), static_cast<std::size_t>(kOrders));
+    for (int i = 0; i < kOrders; ++i) {
+        char expected[16];
+        std::snprintf(expected, sizeof(expected), "HY-%02d", i);
+        EXPECT_STREQ(cps[static_cast<std::size_t>(i)].client_order_id.id, expected)
+            << "checkpoint " << i << " is out of scan order";
+    }
+}
+
+TEST_F(DurableAuditSinkTest, CheckpointOrderIsStableAcrossRepeatedRecovery) {
+    // Same log, recovered three times in the same process. An unordered_map can
+    // legitimately hand back a different order per container instance; scan order
+    // cannot.
+    constexpr int kOrders = 8;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        for (int i = 0; i < kOrders; ++i) {
+            char coid[16];
+            std::snprintf(coid, sizeof(coid), "HY-%02d", i);
+            ASSERT_TRUE(sink.append_durable(make_intent(coid, 100 + i, 10, 1), 1000 + i).acked());
+            ASSERT_TRUE(sink.append_durable(make_submitted(coid, 100 + i, 10, 1), 2000 + i).acked());
+        }
+    }
+
+    std::vector<std::string> first_order;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        DurableAuditSink restarted(base_path_, *key_ring_, 1);
+        ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+        std::vector<std::string> seen;
+        for (const auto& cp : restarted.recovered_checkpoints()) {
+            seen.emplace_back(cp.client_order_id.id);
+        }
+        ASSERT_EQ(seen.size(), static_cast<std::size_t>(kOrders));
+        if (attempt == 0) {
+            first_order = seen;
+        } else {
+            EXPECT_EQ(seen, first_order) << "recovery order changed between runs (attempt " << attempt << ")";
+        }
+    }
+}
+
+// --- Oversized log fails closed instead of terminating (audit REC-NOEXCEPT-006) ---
+
+TEST_F(DurableAuditSinkTest, LogLargerThanTheReadCapIsIoErrorNotAbort) {
+    // The real trigger is std::bad_alloc escaping a noexcept recovery path, which a
+    // unit test cannot provoke portably. kMaxDurableLogBytes is the tripwire that
+    // makes the same condition reachable deterministically: exceed it and recovery
+    // must report IoError and fence, NOT abort the process and not silently proceed.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    // Sparse file: cheap to create, and read_whole_log() sizes its buffer from the
+    // reported length, which is exactly what is under test.
+    {
+        std::FILE* f = std::fopen(base_path_.c_str(), "r+b");
+        ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fseek(f, static_cast<long>(hy::kMaxDurableLogBytes) + 1024, SEEK_SET), 0);
+        ASSERT_EQ(std::fputc(0, f), 0);
+        std::fclose(f);
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::IoError);
+    EXPECT_TRUE(restarted.fenced()) << "a log we cannot account for must fence, never append";
+
+    AuditRecord rec = make_intent("HY-B", 100, 10, 1);
+    EXPECT_FALSE(restarted.append_durable(rec, 5000).acked());
+}
+
+// --- Interrupted rotation is recoverable (audit KEY-ROTATE-008) ---
+//
+// rotate_active_key() is a two-step durable protocol: (1) append a KeyRotated
+// record to the sidecar under the new key, (2) re-anchor the main log tip under
+// the new key. A crash BETWEEN them leaves the sidecar saying "rotated to N" while
+// the main tip anchor is still signed under the old key. Nothing is lost, but the
+// anchor.key_id == active_key_id_ consistency check used to call that Corrupt and
+// fence the sink permanently -- and run_rotation_recovery_scan() decoded the very
+// payload that could have told the two apart, then dropped it.
+//
+// The crash is simulated by performing a REAL rotation and then restoring the
+// pre-rotation main tip anchor, which is byte-for-byte the state step 2 would have
+// left behind had it never run.
+
+namespace {
+std::vector<char> read_file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<char>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+void write_file_bytes(const std::string& path, const std::vector<char>& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+}  // namespace
+
+TEST_F(DurableAuditSinkTest, InterruptedRotationRecoversAndCompletesStepTwo) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+
+    // Snapshot the tip anchor as it stands under key 1 -- exactly what a crash
+    // before step 2 would leave on disk.
+    const auto tip_under_old_key = read_file_bytes(base_path_ + ".tip");
+    ASSERT_FALSE(tip_under_old_key.empty());
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));  // both steps run...
+    }
+    write_file_bytes(base_path_ + ".tip", tip_under_old_key);  // ...then undo step 2
+
+    // Restart configured with the NEW key, which is what an operator reading the
+    // sidecar would do. This used to be an unrecoverable Corrupt + permanent fence.
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 2);
+        ASSERT_TRUE(restarted.is_open());
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered)
+            << "an interrupted rotation lost nothing and must not be treated as corruption";
+        EXPECT_FALSE(restarted.fenced());
+        EXPECT_TRUE(restarted.completed_interrupted_rotation());
+        ASSERT_TRUE(restarted.last_rotation().has_value());
+        EXPECT_EQ(restarted.last_rotation()->old_key_id, 1u);
+        EXPECT_EQ(restarted.last_rotation()->new_key_id, 2u);
+        EXPECT_TRUE(restarted.append_durable(make_accepted("HY-A", 1, 555), 2000).acked());
+    }
+
+    // Step 2 was completed on disk, so the next restart takes the ordinary path.
+    DurableAuditSink again(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(again.is_open());
+    EXPECT_FALSE(again.fenced());
+    EXPECT_FALSE(again.completed_interrupted_rotation())
+        << "the anchor is consistent now; this must not look like a fresh interruption";
+}
+
+TEST_F(DurableAuditSinkTest, AnchorKeyMismatchNotProvenBySidecarIsStillCorrupt) {
+    // Negative control for the branch above. Without it, "accept a mismatch the
+    // sidecar vouches for" could quietly degrade into "accept any mismatch", which
+    // is exactly the unauthorized-identity-swap case the check exists to catch.
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0xAB), rec3), KeyRingAddStatus::Ok);
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    const auto tip_under_old_key = read_file_bytes(base_path_ + ".tip");
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));  // sidecar proves 1 -> 2 only
+    }
+    write_file_bytes(base_path_ + ".tip", tip_under_old_key);
+
+    // Configured with key 3, which no rotation record vouches for.
+    DurableAuditSink restarted(base_path_, *key_ring_, 3);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(DurableAuditSinkTest, NoRotationMeansAnchorKeyMismatchIsCorrupt) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    // Never rotated: the sidecar is empty, so nothing can vouch for a key change.
+    DurableAuditSink restarted(base_path_, *key_ring_, 2);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_FALSE(restarted.last_rotation().has_value());
+}
+
+// --- Key-retirement precondition is checkable (audit KEY-RETIRE-009) ---
+
+TEST_F(DurableAuditSinkTest, ObservedKeyIdsReportsEveryKeyThatSignedTheLog) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1501).acked());
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 2);
+    ASSERT_TRUE(restarted.is_open());
+    auto ids = restarted.observed_key_ids();
+    ASSERT_EQ(ids.size(), 2u) << "both the pre- and post-rotation signing keys are still needed";
+    EXPECT_EQ(ids[0], 1u) << "scan order: the older frame first";
+    EXPECT_EQ(ids[1], 2u);
+}
+
+TEST_F(DurableAuditSinkTest, RetiringAnObservedKeyIsWhatBreaksRecovery) {
+    // Documents the limit rather than pretending it is gone: retiring a key that
+    // observed_key_ids() reports IS destructive, which is precisely why that
+    // accessor exists. Compaction is what would actually lift this.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    {
+        DurableAuditSink probe(base_path_, *key_ring_, 1);
+        auto ids = probe.observed_key_ids();
+        ASSERT_EQ(ids.size(), 1u);
+        EXPECT_EQ(ids[0], 1u);
+    }
+
+    EXPECT_TRUE(key_ring_->retire(1)) << "retire() must report whether it removed anything";
+    EXPECT_FALSE(key_ring_->retire(1)) << "second retire of the same id removes nothing";
+
+    DurableAuditSink after(base_path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Corrupt)
+        << "retiring a key the log still needs makes the log unrecoverable -- check "
+           "observed_key_ids() first";
+}
+
+TEST_F(DurableAuditSinkTest, KeyRingExposesItsRotationCeiling) {
+    EXPECT_EQ(KeyRing::capacity(), hy::kMaxLiveKeys);
+    EXPECT_EQ(key_ring_->live_key_count(), 1u);
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    EXPECT_EQ(key_ring_->live_key_count(), 2u);
+    EXPECT_TRUE(key_ring_->retire(2));
+    EXPECT_EQ(key_ring_->live_key_count(), 1u);
 }

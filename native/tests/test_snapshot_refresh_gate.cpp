@@ -1,14 +1,18 @@
 // P2-MD-02 / Track C: SnapshotRefreshGate unit tests.
 //
-// All tests here inject a fake SnapshotFetcher -- no real network/TLS. The one exception is the
-// blackhole-based "real fetch_depth_snapshot() failure -> cooldown" test at the bottom, which
-// reuses the same local TCP fixture as test_binance_rest_snapshot.cpp to prove the gate's
-// default production wiring (fetch_depth_snapshot_default) actually works end-to-end.
+// Every test here injects a fake SnapshotFetcher -- no real network, no TLS, and
+// deliberately NO Boost/OpenSSL dependency.
+//
+// AUDIT VERIF-TSAN-016: this file used to include blackhole_acceptor.hpp for one
+// real-network test, which forced the whole binary behind HY_BUILD_DEMO. The TSan CI
+// job builds HY_BUILD_DEMO=OFF with a hand-picked target list, so SnapshotRefreshGate --
+// the one class in this codebase that spawns a std::thread and hands a mailbox across it
+// -- had never run under ThreadSanitizer. That test now lives in
+// test_binance_rest_snapshot.cpp (already Boost-gated, already owns the fixture), and this
+// binary is registered with the `concurrency` label so TSan actually runs it.
 
 #include <gtest/gtest.h>
 #include <hengyuan/snapshot_refresh_gate.hpp>
-
-#include "test_helpers/blackhole_acceptor.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -214,28 +218,4 @@ TEST(SnapshotRefreshGate, ApplyRejectionTriggersCooldownEvenThoughFetchSucceeded
     auto during_cooldown = gate.poll(true, {"BTCUSDT", 1, 1});
     EXPECT_FALSE(during_cooldown.has_value());
     EXPECT_EQ(fetcher.call_count(), 1);  // no new fetch started
-}
-
-TEST(SnapshotRefreshGate, RealFetchWiringIsNonBlocking) {
-    // Light sanity check that the default production wiring (fetch_depth_snapshot_default's
-    // adapter shape) actually plugs a real fetch_depth_snapshot() call into the gate correctly
-    // -- using the local blackhole fixture (no real network). This deliberately does NOT wait
-    // out the full ~5s TLS-handshake-timeout-then-cooldown cycle (that behavior is already
-    // covered by test_binance_rest_snapshot.cpp and the fake-fetcher tests above); it only
-    // checks that starting a real fetch through the gate does not itself block the caller.
-    hy::test_helpers::PlainBlackholeAcceptor blackhole;
-    hy::RestSnapshotConfig cfg;
-    cfg.host = "127.0.0.1";
-    cfg.port = std::to_string(blackhole.port());
-
-    SnapshotRefreshGate gate([&cfg](const SnapshotRequest& req) {
-        return hy::fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier,
-                                         cfg);
-    });
-
-    auto start = std::chrono::steady_clock::now();
-    auto r1 = gate.poll(true, {"BTCUSDT", 100'000'000, 100'000'000});
-    auto elapsed = std::chrono::steady_clock::now() - start;
-    EXPECT_FALSE(r1.has_value());
-    EXPECT_LT(elapsed, std::chrono::milliseconds(500));  // must not block on the real fetch
 }

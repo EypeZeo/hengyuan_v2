@@ -105,6 +105,15 @@ struct ReconcilePollPolicy {
     std::uint32_t backoff_multiplier{4};      // attempt N waits base*multiplier^N
     std::int64_t max_interval_ms{5000};       // saturating cap, see backoff_delay_ms()
     std::uint32_t max_queries_per_tick{16};   // throttle: don't fire all 64 at once
+
+    // Cadence for orders that are LIVE on the exchange (Accepted/PartialFill), as
+    // opposed to Ambiguous ones. Deliberately a flat interval rather than the
+    // exponential backoff above: backoff exists to stop hammering an endpoint over an
+    // *uncertainty* that is expected to resolve quickly, while a resting order is a
+    // normal steady state that may last hours -- backing off toward max_interval_ms
+    // and staying there is the right shape for it, and a flat interval says so
+    // directly instead of arriving there by accident.
+    std::int64_t live_poll_interval_ms{2000};
 };
 
 // base * multiplier^attempt, saturating at max_interval_ms and never
@@ -268,30 +277,84 @@ inline bool is_legal_ambiguous_target(OrderState s) noexcept {
            s == OrderState::Rejected || s == OrderState::Expired;
 }
 
+// True iff a query on an order currently in `from` may legitimately report `to`.
+//
+// Generalizes is_legal_ambiguous_target() to the live states this loop now also
+// polls (audit EXEC-INFLIGHT-003). Two things differ from the Ambiguous case:
+//
+//   * `to == from` is a legal, expected answer for a LIVE order -- "still resting,
+//     nothing changed" is the most common poll result there is, and must be a
+//     no-op rather than a rejected result. It is NOT legal for Ambiguous: a Found
+//     outcome means the query positively identified the order's state, and
+//     "positively identified it as uncertain" is not a thing an exchange reports.
+//   * a live order can only move forward into the fill/cancel/expire set; it can
+//     never become Ambiguous or Rejected (see validate_transition()'s own note on
+//     why Binance's REJECTED is submit-time only).
+inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
+    if (to == from) {
+        return from == OrderState::Accepted || from == OrderState::PartialFill;
+    }
+    switch (from) {
+        case OrderState::Ambiguous:
+            return is_legal_ambiguous_target(to);
+        case OrderState::Accepted:
+            return to == OrderState::PartialFill || to == OrderState::Filled ||
+                   to == OrderState::Cancelled || to == OrderState::Expired;
+        case OrderState::PartialFill:
+            return to == OrderState::Filled || to == OrderState::Cancelled ||
+                   to == OrderState::Expired;
+        default:
+            return false;
+    }
+}
+
 // Never trust an injected QueryFn (mock today, network-backed later) to return
 // internally-consistent data -- same "decode-time range/bounds check" discipline
 // docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md applies throughout to untrusted
-// exchange input.
+// exchange input. Numeric sanity only; state-transition legality is
+// is_legal_query_target()'s job, because it depends on the order's current state.
 inline bool is_valid_query_result(const QueryResult& r, const OrderRecord& rec) noexcept {
-    if (!is_legal_ambiguous_target(r.confirmed_state)) return false;
     if (r.filled_qty_ticks < 0 || r.filled_qty_ticks > rec.intended_qty_ticks) return false;
     if (r.avg_fill_price_ticks < 0) return false;
     if (r.filled_qty_ticks == 0 && r.avg_fill_price_ticks != 0) return false;  // inconsistent
     if (r.exchange_order_id < 0) return false;
+    // A Filled order must actually be fully filled -- an exchange (or a buggy
+    // adapter) reporting FILLED with a short filled_qty would otherwise release the
+    // in-flight slot on an order that still has quantity resting.
+    if (r.confirmed_state == OrderState::Filled && r.filled_qty_ticks != rec.intended_qty_ticks) {
+        return false;
+    }
     return true;
 }
 
 }  // namespace detail
 
-// Runs on the reconcile thread. Drains `inbound` into `tracker`, walks tracked
-// Ambiguous orders applying determine_reconcile_action() (order_lifecycle.hpp,
-// unchanged), and for each resolution/escalation pushes one ReconcileEvent onto
-// `outbound`. NEVER touches InFlightRegistry or AuditRingSink (see file header).
+// Runs on the reconcile thread. Drains `inbound` into `tracker`, walks every
+// tracked non-exchange-final order, and for each state change pushes one
+// ReconcileEvent onto `outbound`. NEVER touches InFlightRegistry or AuditRingSink
+// (see file header).
+//
+// TWO KINDS OF TRACKED ORDER (audit EXEC-INFLIGHT-003):
+//   * Ambiguous -- an unresolved uncertainty. Driven by
+//     determine_reconcile_action() with exponential backoff, and escalated to the
+//     operator after kMaxQueryAttempts. Unchanged from before.
+//   * Accepted / PartialFill -- LIVE and resting on the exchange. Polled at a flat
+//     live_poll_interval_ms cadence and NEVER escalated: a resting order is a
+//     normal steady state, not an anomaly, and its query_attempts must not count
+//     toward the Ambiguous escalation cap.
+//
+// This loop previously handled only the first kind, and untracked an order the
+// moment reconciliation discovered it was actually still live. Because
+// drain_reconcile_events() correctly refuses to release a non-exchange-final
+// InFlightRegistry slot, that left such orders with a held slot and nothing left
+// tracking them -- unreleasable for the life of the process, 64 of them enough to
+// fail-closed every subsequent submit. Giving live orders a polling path is what
+// closes that: every accepted order now has a route to a terminal state.
 //
 // Backpressure: a slot is only untracked AFTER its ReconcileEvent is
-// successfully pushed. If `outbound` is momentarily full, the record stays
-// Ambiguous and tracked -- retried on a later call -- rather than silently
-// dropping a resolution that already cost a real query.
+// successfully pushed. If `outbound` is momentarily full, the record keeps its
+// pre-transition state and stays tracked -- retried on a later call -- rather than
+// silently dropping a resolution that already cost a real query.
 inline void poll_once(OrderTracker& tracker,
                        ToReconcileRing& inbound,
                        ReconcileEventRing& outbound,
@@ -312,39 +375,56 @@ inline void poll_once(OrderTracker& tracker,
     std::uint32_t queries_this_tick = 0;
 
     tracker.for_each_active([&](InFlightHandle handle, OrderRecord& record, std::int64_t last_poll_ms) {
-        if (record.state != OrderState::Ambiguous) return;  // defensive; should not happen
+        // An exchange-final order has nothing left to discover and should already
+        // have been untracked; anything else is either Ambiguous or live.
+        if (is_exchange_final(record.state)) return;
 
-        const ReconcileAction action = determine_reconcile_action(record);
-        if (action == ReconcileAction::NoAction) return;
+        const bool ambiguous = (record.state == OrderState::Ambiguous);
+        const bool live = (record.state == OrderState::Accepted ||
+                            record.state == OrderState::PartialFill);
+        if (!ambiguous && !live) return;  // e.g. EscalatedToOperator: operator owns it now
 
         auto coid = record.client_order_id.view();
 
-        if (action == ReconcileAction::EscalateToOperator) {
-            OrderRecord escalated = record;
-            if (escalated.transition_to(OrderState::EscalatedToOperator) != TransitionResult::Ok) return;
-            ReconcileEvent ev{};
-            ev.handle = handle;
-            ev.coid = escalated.client_order_id;
-            ev.resulting_state = OrderState::EscalatedToOperator;
-            if (outbound.try_push(ev)) {
-                tracker.untrack(coid);
-            }
-            // else: leave tracked, retried next call (see backpressure note above)
-            return;
-        }
+        if (ambiguous) {
+            const ReconcileAction action = determine_reconcile_action(record);
+            if (action == ReconcileAction::NoAction) return;
 
-        // action == QueryOrder
-        if (queries_this_tick >= policy.max_queries_per_tick) return;
-        if (last_poll_ms != OrderTracker::kNeverPolled) {
-            // last_poll_ms != kNeverPolled implies at least one attempt has
-            // already been made, so query_attempts >= 1 here. The delay before
-            // the NEXT attempt is indexed by retries already elapsed
-            // (query_attempts - 1: 0 after the first attempt, 1 after the
-            // second, ...), not by query_attempts itself -- reconcile_backoff_delay_ms's
-            // attempt=0 case is the base interval, meant for the first retry.
-            const std::uint8_t retries_elapsed =
-                static_cast<std::uint8_t>(record.query_attempts - 1);
-            if (now_ms - last_poll_ms < reconcile_backoff_delay_ms(policy, retries_elapsed)) return;
+            if (action == ReconcileAction::EscalateToOperator) {
+                OrderRecord escalated = record;
+                if (escalated.transition_to(OrderState::EscalatedToOperator) != TransitionResult::Ok) return;
+                ReconcileEvent ev{};
+                ev.handle = handle;
+                ev.coid = escalated.client_order_id;
+                ev.resulting_state = OrderState::EscalatedToOperator;
+                if (outbound.try_push(ev)) {
+                    tracker.untrack(coid);
+                }
+                // else: leave tracked, retried next call (see backpressure note above)
+                return;
+            }
+
+            // action == QueryOrder
+            if (queries_this_tick >= policy.max_queries_per_tick) return;
+            if (last_poll_ms != OrderTracker::kNeverPolled) {
+                // last_poll_ms != kNeverPolled implies at least one attempt has
+                // already been made, so query_attempts >= 1 here. The delay before
+                // the NEXT attempt is indexed by retries already elapsed
+                // (query_attempts - 1: 0 after the first attempt, 1 after the
+                // second, ...), not by query_attempts itself -- reconcile_backoff_delay_ms's
+                // attempt=0 case is the base interval, meant for the first retry.
+                const std::uint8_t retries_elapsed =
+                    static_cast<std::uint8_t>(record.query_attempts - 1);
+                if (now_ms - last_poll_ms < reconcile_backoff_delay_ms(policy, retries_elapsed)) return;
+            }
+        } else {
+            // Live on the exchange: flat cadence, no escalation cap. See
+            // ReconcilePollPolicy::live_poll_interval_ms for why not backoff.
+            if (queries_this_tick >= policy.max_queries_per_tick) return;
+            if (last_poll_ms != OrderTracker::kNeverPolled &&
+                now_ms - last_poll_ms < policy.live_poll_interval_ms) {
+                return;
+            }
         }
 
         tracker.note_polled(coid, now_ms);
@@ -358,19 +438,35 @@ inline void poll_once(OrderTracker& tracker,
 
         // query_attempts is incremented on every genuine attempt (Inconclusive
         // included), matching determine_reconcile_action()'s existing contract
-        // (it escalates once query_attempts reaches kMaxQueryAttempts) --
-        // this must happen whether or not the result turns out usable below.
+        // (it escalates once query_attempts reaches kMaxQueryAttempts) -- this must
+        // happen whether or not the result turns out usable below. ONLY for
+        // Ambiguous orders: that counter IS the escalation cap, and a live order
+        // polled every live_poll_interval_ms would otherwise "escalate" itself after
+        // three routine liveness checks.
         OrderRecord attempted = record;
-        ++attempted.query_attempts;
+        if (ambiguous) ++attempted.query_attempts;
 
-        if (result.outcome != QueryOutcome::Found || !detail::is_valid_query_result(result, attempted)) {
-            record = attempted;  // Inconclusive (or rejected as invalid): keep Ambiguous, try again later
+        if (result.outcome != QueryOutcome::Found || !detail::is_valid_query_result(result, attempted) ||
+            !detail::is_legal_query_target(attempted.state, result.confirmed_state)) {
+            record = attempted;  // Inconclusive (or rejected as invalid): keep state, try again later
+            return;
+        }
+
+        // "Still in the state we already knew about" is the ordinary answer for a
+        // live resting order. Refresh the fill figures (a partial fill can grow
+        // without changing the state) and keep tracking -- no transition, no event,
+        // no slot release.
+        if (result.confirmed_state == attempted.state) {
+            attempted.exchange_order_id = result.exchange_order_id;
+            attempted.filled_qty_ticks = result.filled_qty_ticks;
+            attempted.avg_fill_price_ticks = result.avg_fill_price_ticks;
+            record = attempted;
             return;
         }
 
         OrderRecord resolved = attempted;
         if (resolved.transition_to(result.confirmed_state) != TransitionResult::Ok) {
-            record = attempted;  // should be unreachable given is_valid_query_result(); fail safe
+            record = attempted;  // should be unreachable given is_legal_query_target(); fail safe
             return;
         }
         resolved.exchange_order_id = result.exchange_order_id;
@@ -386,9 +482,21 @@ inline void poll_once(OrderTracker& tracker,
         ev.avg_fill_price_ticks = resolved.avg_fill_price_ticks;
 
         if (outbound.try_push(ev)) {
-            tracker.untrack(coid);
+            if (is_exchange_final(resolved.state)) {
+                tracker.untrack(coid);
+            } else {
+                // Still live (Ambiguous -> Accepted/PartialFill, or
+                // Accepted -> PartialFill). Keep tracking so this order still has a
+                // route to a terminal state -- untracking here is precisely what
+                // stranded its InFlightRegistry slot forever (audit
+                // EXEC-INFLIGHT-003). Reset the poll clock so the freshly-adopted
+                // live cadence starts from now rather than inheriting the Ambiguous
+                // backoff position.
+                record = resolved;
+                tracker.note_polled(coid, now_ms);
+            }
         } else {
-            record = attempted;  // publish failed: keep Ambiguous, retry later (backpressure note above)
+            record = attempted;  // publish failed: keep prior state, retry later (backpressure note above)
         }
     });
 }
