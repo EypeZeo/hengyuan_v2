@@ -1,0 +1,79 @@
+name: CI Python
+
+# AUDIT CI-PY-013: py_core had NO workflow at all. None of the five existing
+# workflows' `paths:` filters cover it -- ci-native.yml is scoped to `native/**`
+# and ci-spec-verification.yml to docs/tools/formal plus two specific headers.
+#
+# That interacts badly with main-merge-guard.yml, which treats a null
+# statusCheckRollup ("no workflow matched the changed paths") as a PASS, by design,
+# so that docs-only PRs are not blocked forever. The combination meant a
+# py_core-only PR merged to master with literally zero verification -- and the four
+# most recent py_core commits took exactly that path.
+#
+# Deliberately independent of the other workflows, same reasoning
+# ci-spec-verification.yml gives for staying independent of ci-native.yml: a
+# failure in one must not mask or block another.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'py_core/**'
+      - '.github/workflows/ci-python.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'py_core/**'
+      - '.github/workflows/ci-python.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  pytest:
+    name: "py_core: pytest"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 3.13 matches the interpreter the local .venv was built against
+      # (py_core/pyproject.toml's requires-python is the authority if they diverge).
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: py_core/requirements.txt
+
+      - name: Install dependencies
+        working-directory: py_core
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e . --no-deps
+
+      # -q, not -v: a green run should be one line. Failures print in full either way.
+      - name: Run tests
+        working-directory: py_core
+        run: python -m pytest tests/ -q
+
+      # Non-blocking on purpose for now: this repo has never run a linter over
+      # py_core, so turning ruff into a hard gate in the same change that
+      # introduces the workflow would mean landing an unrelated cleanup pass as
+      # well. Making it visible first, then promoting it to a gate once the
+      # existing findings are triaged, is the honest order -- a lint job whose
+      # failures are routinely ignored is worse than none.
+      - name: Lint (advisory)
+        working-directory: py_core
+        continue-on-error: true
+        run: |
+          pip install ruff
+          ruff check . || echo "::warning::ruff reported findings (advisory, not a gate yet)"

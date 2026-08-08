@@ -105,7 +105,7 @@ def run_risk_aware_backtest(
     records: list[NormalizedOhlcvRecord],
     signals: pd.Series[Any],
     risk_config: RiskConfig,
-    stop_distance: Decimal | None = None,
+    stop_distance_fraction: Decimal | None = None,
 ) -> RiskAwareBacktestResult:
     """运行风险感知回测，将 RiskCalculator 集成到逐 bar 仿真中。
 
@@ -122,7 +122,7 @@ def run_risk_aware_backtest(
               price=open_T,
               signal_target=signal[T-1],
               config=risk_config,
-              stop_distance=stop_distance,
+              stop_distance_fraction=stop_distance_fraction,
           )
     - exposure_fraction = capped_notional / equity_T（上限 1.0，不启用杠杆）；
     - gross_bar_return = exposure_fraction × fwd_open_return[T]；
@@ -136,7 +136,7 @@ def run_risk_aware_backtest(
         signals: 与 records 时间轴对齐的 pd.Series，值 ∈ {0.0, 1.0}（0=空仓，1=多头）。
         risk_config: 风险参数（risk_fraction、max_position_fraction、max_notional、
                      max_risk_per_trade 等）。
-        stop_distance: 可选止损距离（Decimal），传入后激活 max_risk_per_trade 上限。
+        stop_distance_fraction: 可选止损距离（Decimal），传入后激活 max_risk_per_trade 上限。
                        若为 None，该上限不生效。
 
     Returns:
@@ -204,7 +204,7 @@ def run_risk_aware_backtest(
             price=Decimal(str(bar_open)),
             signal_target=signal_target,
             config=risk_config,
-            stop_distance=stop_distance,
+            stop_distance_fraction=stop_distance_fraction,
         )
         risk_decisions.append(decision)
 

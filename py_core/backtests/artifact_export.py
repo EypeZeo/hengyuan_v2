@@ -22,6 +22,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import shutil
 import sys
 import uuid
@@ -50,14 +52,47 @@ def _decimal_to_float(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__!r} is not JSON serializable")
 
 
+def _finite_or_none(obj: Any) -> Any:
+    """Recursively replace non-finite floats with ``None``.
+
+    Audit PY-JSON-024: ``metrics.calmar_ratio`` is ``float("inf")`` whenever a
+    strategy had no drawdown, and ``json.dumps`` serialises that as the bare token
+    ``Infinity`` — which is **not valid JSON** (RFC 8259 has no such literal).  Every
+    artifact from a no-drawdown run was therefore rejected by any strict parser,
+    silently, while looking fine to Python's own ``json.load``.
+
+    ``None``/``null`` is the honest encoding: the ratio is undefined, not enormous.
+    Consumers already have to handle a missing value, and ``null`` says so in a way
+    every JSON parser agrees on.  Kept at the serialisation boundary on purpose —
+    ``inf`` is mathematically meaningful in the in-memory model and stays there.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _finite_or_none(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite_or_none(v) for v in obj]
+    return obj
+
+
 def _dumps(obj: Any) -> str:
-    """带 Decimal 支持的 JSON 序列化，indent=2。"""
-    return json.dumps(obj, indent=2, default=_decimal_to_float, ensure_ascii=False)
+    """带 Decimal 支持的 JSON 序列化，indent=2。
+
+    ``allow_nan=False`` 是安全网而不是主要机制：``_finite_or_none`` 已经把
+    非有限值换成 ``None``，这里让任何漏网的 inf/nan 直接抛错，而不是
+    静默写出非法 JSON（审计 PY-JSON-024）。
+    """
+    return json.dumps(
+        _finite_or_none(obj), indent=2, default=_decimal_to_float, ensure_ascii=False,
+        allow_nan=False,
+    )
 
 
 def _dumps_line(obj: Any) -> str:
     """带 Decimal 支持的单行 JSON 序列化（用于 JSONL）。"""
-    return json.dumps(obj, default=_decimal_to_float, ensure_ascii=False)
+    return json.dumps(
+        _finite_or_none(obj), default=_decimal_to_float, ensure_ascii=False, allow_nan=False,
+    )
 
 
 # ── per-artifact serializers ─────────────────────────────────────────────────
@@ -68,7 +103,7 @@ def serialize_config(
     config: BacktestConfig,
     risk_config: RiskConfig,
     *,
-    stop_distance: Decimal | None = None,
+    stop_distance_fraction: Decimal | None = None,
     ohlcv_path: str = "",
     signals_path: str = "",
     strategy_spec: str | None = None,
@@ -116,8 +151,8 @@ def serialize_config(
                 if risk_config.volatility_estimate is not None
                 else None
             ),
-            "stop_distance": (
-                config_decimal_str(stop_distance) if stop_distance is not None else None
+            "stop_distance_fraction": (
+                config_decimal_str(stop_distance_fraction) if stop_distance_fraction is not None else None
             ),
         },
     }
@@ -229,7 +264,7 @@ def export_risk_aware_backtest_artifacts(
     risk_config: RiskConfig,
     output_dir: Path,
     *,
-    stop_distance: Decimal | None = None,
+    stop_distance_fraction: Decimal | None = None,
     ohlcv_path: str = "",
     signals_path: str = "",
     strategy_spec: str | None = None,
@@ -243,7 +278,12 @@ def export_risk_aware_backtest_artifacts(
     run_dir.mkdir(exist_ok=False) 做一次真正原子的排他占位（不管 run_dir 是否已存在、是否为空，
     两个平台语义一致——之前"检查已存在且非空，再 rename"的写法在 POSIX 上对一个已存在的空目录
     会被静默替换掉，是一个真实的 check-then-act 竞争窗口，不只是理论上的），再把临时目录里的
-    文件逐个搬进去。中途失败/被杀不会留下"写了一半"的残留；已存在的目标目录也不会被静默覆盖。
+    文件逐个搬进去，最后写入 ``.complete`` 标记。已存在的目标目录不会被静默覆盖。
+
+    完整性判定以 ``.complete`` 标记为准（审计 PY-PUB-014）：搬运是逐文件 rename，
+    所以在占位与标记之间被 kill 会留下一个"存在但不完整"的 run_dir。标记最后写入，
+    因此它的存在即证明其余文件都已就位。消费方必须用 :func:`is_complete_run` 判断，
+    不能仅凭目录存在。
 
     所有文件包含 non_authorizing=true。
 
@@ -269,7 +309,7 @@ def export_risk_aware_backtest_artifacts(
             run_id=run_id,
             config=config,
             risk_config=risk_config,
-            stop_distance=stop_distance,
+            stop_distance_fraction=stop_distance_fraction,
             ohlcv_path=ohlcv_path,
             signals_path=signals_path,
             strategy_spec=strategy_spec,
@@ -323,4 +363,55 @@ def export_risk_aware_backtest_artifacts(
     for f in tmp_dir.iterdir():
         f.rename(run_dir / f.name)
     tmp_dir.rmdir()
+
+    # AUDIT PY-PUB-014: everything above is a per-file rename loop, so a crash or
+    # SIGKILL between run_dir.mkdir() and here leaves run_dir EXISTING and holding a
+    # SUBSET of the artifact set -- indistinguishable, to a reader, from a complete
+    # run. The docstring's "中途失败/被杀不会留下写了一半的残留" was true of the tmp
+    # directory but not of the destination.
+    #
+    # A directory rename is not available as a fix: the exclusive
+    # mkdir(exist_ok=False) placeholder above is what closes the check-then-act race
+    # the previous revision had, and os.rename onto an existing empty directory
+    # silently succeeds on POSIX -- which is exactly the bug that placeholder
+    # replaced. The marker is the standard answer: it is written LAST, so its
+    # presence is proof every other file already landed.
+    _write_completion_marker(run_dir)
     return run_dir.resolve()
+
+
+COMPLETION_MARKER = ".complete"
+
+
+def _fsync_dir(path: Path) -> None:
+    """Flush a directory entry to disk; a no-op where the platform forbids it."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return  # Windows cannot open a directory this way; the rename is durable enough there
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_completion_marker(run_dir: Path) -> None:
+    marker = run_dir / COMPLETION_MARKER
+    with marker.open("w", encoding="utf-8") as f:
+        f.write("complete\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_dir(run_dir)
+
+
+def is_complete_run(run_dir: Path) -> bool:
+    """True iff ``run_dir`` holds a fully-published artifact set (audit PY-PUB-014).
+
+    Consumers MUST check this before reading a run directory.  A directory without
+    the marker is a partially-published run left behind by a crash: its files are
+    individually valid but the set is incomplete, and which files are missing is not
+    predictable.
+    """
+    return (run_dir / COMPLETION_MARKER).is_file()

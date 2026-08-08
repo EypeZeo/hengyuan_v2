@@ -276,11 +276,11 @@ class TestMaxPositionFractionCap:
             assert frac <= 0.11  # 允许 1% 浮点误差空间
 
 
-# ────────────────────────────────── stop_distance 测试 ────────────────────────
+# ────────────────────────────────── stop_distance_fraction 测试 ────────────────────────
 
 
 class TestStopDistance:
-    """stop_distance 激活 max_risk_per_trade 上限。"""
+    """stop_distance_fraction 激活 max_risk_per_trade 上限。"""
 
     def test_stop_distance_limits_position(self) -> None:
         records = [
@@ -289,7 +289,15 @@ class TestStopDistance:
             _rec(3, 200.0, close_p=200.0),
         ]
         signals = _make_signals(records, [1.0, 1.0, 1.0])
-        # max_risk_per_trade=50, stop_distance=50 → max_notional_by_risk=1
+        # Audit PY-RISK-005: stop_distance_fraction is a FRACTION of price. This
+        # fixture used to pass 50, which under the corrected semantics is not a
+        # legal fraction at all — and under the old arithmetic produced a cap of
+        # 50/50 = 1 quote unit, i.e. it flattened the strategy to a 0.01% position
+        # while looking like a working risk cap.
+        #
+        # With a 2% stop: max_notional_by_risk = 50 / 0.02 = 2500, against an
+        # uncapped proposal of 0.5 x 10_000 = 5000 — so the cap genuinely binds and
+        # exposure lands at 2500/10_000 = 0.25.
         risk_cfg = _risk_cfg(
             risk_fraction=Decimal("0.5"),
             max_risk_per_trade=Decimal("50"),
@@ -300,11 +308,35 @@ class TestStopDistance:
             records,
             signals,
             risk_cfg,
-            stop_distance=Decimal("50"),
+            stop_distance_fraction=Decimal("0.02"),
         )
-        # max_notional_by_risk = 50/50 = 1；capped_notional=1，exposure=1/10000
         for frac in result.risk_positions_fraction[1:]:
-            assert frac < 0.01
+            assert frac == pytest.approx(0.25, abs=1e-9)
+
+    def test_stop_distance_fraction_out_of_range_is_ignored_not_applied(self) -> None:
+        # An out-of-range value (e.g. someone passing the OLD absolute-distance
+        # number) must not silently produce a cap computed from a nonsense unit.
+        records = [
+            _rec(1, 100.0, close_p=100.0),
+            _rec(2, 200.0, close_p=200.0),
+        ]
+        signals = _make_signals(records, [1.0, 1.0])
+        risk_cfg = _risk_cfg(
+            risk_fraction=Decimal("0.5"),
+            max_risk_per_trade=Decimal("50"),
+            max_notional=Decimal("9999999"),
+        )
+        result = run_risk_aware_backtest(
+            _cfg(initial_capital=10_000.0),
+            records,
+            signals,
+            risk_cfg,
+            stop_distance_fraction=Decimal("50"),  # not a fraction
+        )
+        decision = result.risk_decisions[1]
+        assert any("stop_distance_fraction must be in (0, 1]" in w for w in decision.warnings)
+        # Sizing falls back to the fraction/notional caps only.
+        assert decision.capped_position_size == Decimal("5000.0")
 
 
 # ──────────────────────────────── 无 lookahead 回归测试 ───────────────────────

@@ -24,12 +24,15 @@ from py_core.manual_ohlcv import (
     OhlcvTimeframe,
 )
 from py_core.backtests.artifact_export import (
+    COMPLETION_MARKER,
     _decimal_to_float,
     _dumps,
     _dumps_line,
+    _finite_or_none,
     compute_decision_counts,
     config_decimal_str,
     export_risk_aware_backtest_artifacts,
+    is_complete_run,
     serialize_config,
     serialize_metrics,
     serialize_risk_decision_line,
@@ -206,17 +209,21 @@ def test_serialize_config_run_id() -> None:
 
 
 def test_serialize_config_stop_distance() -> None:
+    # Audit PY-RISK-005: this fixture used Decimal("500") because the parameter was
+    # documented as an absolute quote distance. It is a FRACTION of price.
     cfg: BacktestConfig = _cfg()
     risk_cfg: RiskConfig = _risk_cfg()
-    result: dict[str, Any] = serialize_config("x", cfg, risk_cfg, stop_distance=Decimal("500"))
-    assert result["risk_config"]["stop_distance"] == "500"
+    result: dict[str, Any] = serialize_config(
+        "x", cfg, risk_cfg, stop_distance_fraction=Decimal("0.02")
+    )
+    assert result["risk_config"]["stop_distance_fraction"] == "0.02"
 
 
 def test_serialize_config_stop_distance_none() -> None:
     cfg: BacktestConfig = _cfg()
     risk_cfg: RiskConfig = _risk_cfg()
     result: dict[str, Any] = serialize_config("x", cfg, risk_cfg)
-    assert result["risk_config"]["stop_distance"] is None
+    assert result["risk_config"]["stop_distance_fraction"] is None
 
 
 def test_serialize_config_paths() -> None:
@@ -415,6 +422,7 @@ def test_export_all_files_present(tmp_path: Path) -> None:
         "risk_decisions.jsonl",
         "summary.json",
         "validation_report.json",
+        COMPLETION_MARKER,  # audit PY-PUB-014, written last
     }
     actual_files: set[str] = {f.name for f in run_dir.iterdir() if f.is_file()}
     assert expected_files == actual_files
@@ -633,3 +641,106 @@ def test_export_rejects_non_authorizing_false(tmp_path: Path) -> None:
             risk_config=risk_config,
             output_dir=tmp_path,
         )
+
+
+# ── Completion marker / partial-publish detection (audit PY-PUB-014) ─────────
+#
+# Publishing is a per-file rename loop into an exclusively-claimed directory, so a
+# crash between the claim and the last rename leaves run_dir EXISTING and holding a
+# subset of the artifact set -- indistinguishable, to a reader, from a complete run.
+# The marker is written last, so its presence proves the rest already landed.
+
+
+def test_completed_run_is_marked_complete(tmp_path: Path) -> None:
+    result, config, risk_config = _make_raa_result()
+    run_dir: Path = export_risk_aware_backtest_artifacts(
+        run_id="donerun",
+        result=result,
+        config=config,
+        risk_config=risk_config,
+        output_dir=tmp_path,
+    )
+    assert is_complete_run(run_dir)
+    assert (run_dir / COMPLETION_MARKER).read_text(encoding="utf-8").strip() == "complete"
+
+
+def test_partially_published_run_is_not_complete(tmp_path: Path) -> None:
+    result, config, risk_config = _make_raa_result()
+    run_dir: Path = export_risk_aware_backtest_artifacts(
+        run_id="partialrun",
+        result=result,
+        config=config,
+        risk_config=risk_config,
+        output_dir=tmp_path,
+    )
+    # Simulate the crash window: the marker is what a kill between the directory
+    # claim and the final rename would have left missing.
+    (run_dir / COMPLETION_MARKER).unlink()
+    assert run_dir.is_dir()
+    assert (run_dir / "config.json").is_file()
+    assert not is_complete_run(run_dir), (
+        "a directory that exists and holds some files is NOT evidence of a complete run"
+    )
+
+
+def test_missing_directory_is_not_complete(tmp_path: Path) -> None:
+    assert not is_complete_run(tmp_path / "never-created")
+
+
+# ── Non-finite floats never reach the JSON (audit PY-JSON-024) ──────────────
+#
+# metrics.calmar_ratio is float("inf") for any strategy with no drawdown, and
+# json.dumps writes that as the bare token `Infinity` -- not valid JSON per RFC 8259.
+# Every artifact from a no-drawdown run was silently unparseable by strict readers.
+
+
+def test_infinity_is_serialised_as_null_not_the_infinity_token() -> None:
+    out = _dumps({"calmar_ratio": float("inf")})
+    assert "Infinity" not in out
+    assert json.loads(out)["calmar_ratio"] is None
+
+
+def test_negative_infinity_and_nan_are_also_null() -> None:
+    out = json.loads(_dumps({"a": float("-inf"), "b": float("nan")}))
+    assert out["a"] is None
+    assert out["b"] is None
+
+
+def test_finite_floats_are_untouched() -> None:
+    out = json.loads(_dumps({"a": 1.5, "b": 0.0, "c": -2.25}))
+    assert out == {"a": 1.5, "b": 0.0, "c": -2.25}
+
+
+def test_finite_or_none_recurses_into_nested_containers() -> None:
+    src = {"m": {"calmar": float("inf")}, "rows": [1.0, float("nan"), {"x": float("-inf")}]}
+    assert _finite_or_none(src) == {"m": {"calmar": None}, "rows": [1.0, None, {"x": None}]}
+
+
+def test_jsonl_lines_are_also_sanitised() -> None:
+    out = _dumps_line({"equity": float("inf")})
+    assert "Infinity" not in out
+    assert json.loads(out)["equity"] is None
+
+
+def test_no_drawdown_run_produces_strictly_valid_json(tmp_path: Path) -> None:
+    # End-to-end: whatever calmar_ratio comes out as, the artifact must parse under a
+    # strict reader. json.loads accepts Infinity by default, so parse_constant is
+    # what makes this test actually assert RFC-8259 validity.
+    result, config, risk_config = _make_raa_result()
+    run_dir: Path = export_risk_aware_backtest_artifacts(
+        run_id="strictjson",
+        result=result,
+        config=config,
+        risk_config=risk_config,
+        output_dir=tmp_path,
+    )
+
+    def _reject(token: str) -> None:
+        raise AssertionError(f"non-RFC-8259 token in artifact: {token}")
+
+    for path in run_dir.glob("*.json"):
+        json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject)
+    for path in run_dir.glob("*.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                json.loads(line, parse_constant=_reject)

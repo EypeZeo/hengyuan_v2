@@ -25,6 +25,7 @@ from py_core.risk.risk_decision_artifact import (
 )
 
 _ZERO = Decimal("0")
+_ONE = Decimal("1")
 _SUPPORTED_SIGNALS = frozenset({"long", "none", "short"})
 
 
@@ -37,7 +38,7 @@ class RiskCalculator:
     Caps are applied in this order:
     1. ``max_position_fraction``
     2. ``max_notional``
-    3. ``max_risk_per_trade`` (only when ``stop_distance > 0``)
+    3. ``max_risk_per_trade`` (only when a valid ``stop_distance_fraction`` is given)
 
     If multiple caps trigger, ``cap_reason`` reflects the last (tightest)
     constraint applied; the full cap path is recorded in ``warnings``.
@@ -52,7 +53,7 @@ class RiskCalculator:
         price: Decimal,
         signal_target: str,
         config: RiskConfig,
-        stop_distance: Decimal | None = None,
+        stop_distance_fraction: Decimal | None = None,
     ) -> RiskDecisionArtifact:
         """Evaluate position sizing for the given inputs.
 
@@ -63,9 +64,24 @@ class RiskCalculator:
             signal_target: Direction intent — ``"long"`` / ``"none"`` /
                            ``"short"`` (``"short"`` is rejected in V1).
             config: Immutable :class:`RiskConfig` parameters.
-            stop_distance: Optional notional stop distance.  When provided
-                           and positive, activates the ``max_risk_per_trade``
-                           cap and is used to compute ``risk_used``.
+            stop_distance_fraction: Optional stop distance expressed as a
+                           **fraction of price** — ``Decimal("0.02")`` means a
+                           2% stop, NOT 2 quote-currency units.  Must be in
+                           ``(0, 1]``.  When provided, activates the
+                           ``max_risk_per_trade`` cap and is used to compute
+                           ``risk_used``.
+
+                           Audit PY-RISK-005: this parameter was named
+                           ``stop_distance`` and documented as a "notional stop
+                           distance" (an absolute quote amount), and the test
+                           fixtures passed ``Decimal("500")`` accordingly — but
+                           Rules 9 and 13 below are only dimensionally coherent
+                           if it is a fraction, and ``risk_integration.py``
+                           divides ``capped_position_size`` by equity, which
+                           pins that output to quote currency.  Measured, the
+                           two readings differed by 1000x in resulting position
+                           size for the same inputs.  The name now carries the
+                           unit so the ambiguity is unrepresentable.
 
         Returns:
             A :class:`RiskDecisionArtifact` with ``non_authorizing=True``.
@@ -82,7 +98,7 @@ class RiskCalculator:
             "max_notional": str(config.max_notional),
             "max_risk_per_trade": str(config.max_risk_per_trade),
             "volatility_estimate": str(config.volatility_estimate),
-            "stop_distance": str(stop_distance),
+            "stop_distance_fraction": str(stop_distance_fraction),
         }
 
         # ── Rule 1: equity must be positive ──────────────────────────────
@@ -181,12 +197,23 @@ class RiskCalculator:
             cap_reason = CAP_REASON_MAX_NOTIONAL
             capped = True
 
-        # ── Rule 9: max_risk_per_trade cap (requires stop_distance) ───────
-        if stop_distance is not None:
-            if stop_distance <= _ZERO:
-                warnings.append("stop_distance must be positive; " "max_risk_per_trade cap ignored")
+        # ── Rule 9: max_risk_per_trade cap (requires stop_distance_fraction) ──
+        #
+        # Dimensions (audit PY-RISK-005): current_notional is quote currency and
+        # stop_distance_fraction is dimensionless, so
+        #   risk_at_stop = notional x fraction        -> quote
+        #   max notional = max_risk_per_trade / fraction -> quote
+        # Both sides of the comparison below are quote amounts. Under the previous
+        # "absolute quote distance" reading, max_notional_by_risk was dimensionless
+        # and being compared against a quote amount.
+        if stop_distance_fraction is not None:
+            if stop_distance_fraction <= _ZERO or stop_distance_fraction > _ONE:
+                warnings.append(
+                    "stop_distance_fraction must be in (0, 1] — it is a fraction of "
+                    "price, not an absolute quote amount; max_risk_per_trade cap ignored"
+                )
             else:
-                max_notional_by_risk = config.max_risk_per_trade / stop_distance
+                max_notional_by_risk = config.max_risk_per_trade / stop_distance_fraction
                 if current_notional > max_notional_by_risk:
                     warnings.append(
                         f"capped by MAX_RISK_PER_TRADE: "
@@ -210,8 +237,14 @@ class RiskCalculator:
             )
 
         # ── Rule 13: risk_used ────────────────────────────────────────────
-        if stop_distance is not None and stop_distance > _ZERO:
-            risk_used = current_notional * stop_distance
+        #
+        # Both branches are quote currency (audit PY-RISK-005): with a stop, the
+        # amount at risk is notional x fraction; without one, the whole position is
+        # notionally at risk. Under the previous reading the first branch was
+        # quote-squared, so the same field carried two different units depending on
+        # whether an optional argument was supplied.
+        if stop_distance_fraction is not None and _ZERO < stop_distance_fraction <= _ONE:
+            risk_used = current_notional * stop_distance_fraction
         else:
             risk_used = current_notional
 

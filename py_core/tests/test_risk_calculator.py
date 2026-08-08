@@ -70,7 +70,7 @@ def test_happy_path_accepted() -> None:
 
 
 def test_accepted_risk_used_without_stop_distance() -> None:
-    """When no stop_distance provided, risk_used == capped_position_size."""
+    """When no stop_distance_fraction provided, risk_used == capped_position_size."""
     config = _default_config()
     result = _calc().calculate(
         equity=D("10000"),
@@ -130,7 +130,7 @@ def test_capped_by_max_notional() -> None:
 
 
 def test_capped_by_max_risk_per_trade_with_stop_distance() -> None:
-    """With stop_distance, max_risk_per_trade cap engages."""
+    """With stop_distance_fraction, max_risk_per_trade cap engages."""
     config = _default_config(
         risk_fraction="0.01",
         max_position_fraction="0.10",
@@ -145,7 +145,7 @@ def test_capped_by_max_risk_per_trade_with_stop_distance() -> None:
         price=D("100"),
         signal_target="long",
         config=config,
-        stop_distance=D("1"),  # max_by_risk = 50 / 1 = 50 < 100
+        stop_distance_fraction=D("1"),  # max_by_risk = 50 / 1 = 50 < 100
     )
     assert result.status == RiskDecisionStatus.CAPPED
     assert result.cap_reason == CAP_REASON_MAX_RISK_PER_TRADE
@@ -154,7 +154,7 @@ def test_capped_by_max_risk_per_trade_with_stop_distance() -> None:
 
 
 def test_risk_used_with_stop_distance() -> None:
-    """risk_used = capped_position_size * stop_distance when stop_distance > 0."""
+    """risk_used = capped_position_size * stop_distance_fraction when stop_distance_fraction > 0."""
     config = _default_config(
         risk_fraction="0.01",
         max_position_fraction="0.10",
@@ -167,7 +167,7 @@ def test_risk_used_with_stop_distance() -> None:
         price=D("100"),
         signal_target="long",
         config=config,
-        stop_distance=stop,
+        stop_distance_fraction=stop,
     )
     assert result.risk_used == result.capped_position_size * stop
 
@@ -285,7 +285,7 @@ def test_rejected_unsupported_signal(signal: str) -> None:
     assert result.non_authorizing is True
 
 
-# ── Test 12: stop_distance <= 0 → warning, cap ignored ───────────────────────
+# ── Test 12: stop_distance_fraction <= 0 → warning, cap ignored ───────────────────────
 
 
 def test_stop_distance_zero_adds_warning_no_cap() -> None:
@@ -295,10 +295,10 @@ def test_stop_distance_zero_adds_warning_no_cap() -> None:
         price=D("100"),
         signal_target="long",
         config=config,
-        stop_distance=D("0"),
+        stop_distance_fraction=D("0"),
     )
-    # stop_distance=0 → cap ignored; result should not be driven by max_risk_per_trade
-    assert any("stop_distance" in w for w in result.warnings)
+    # stop_distance_fraction=0 → cap ignored; result should not be driven by max_risk_per_trade
+    assert any("stop_distance_fraction" in w for w in result.warnings)
     assert result.cap_reason != CAP_REASON_MAX_RISK_PER_TRADE
 
 
@@ -309,9 +309,9 @@ def test_stop_distance_negative_adds_warning_no_cap() -> None:
         price=D("100"),
         signal_target="long",
         config=config,
-        stop_distance=D("-0.5"),
+        stop_distance_fraction=D("-0.5"),
     )
-    assert any("stop_distance" in w for w in result.warnings)
+    assert any("stop_distance_fraction" in w for w in result.warnings)
     assert result.cap_reason != CAP_REASON_MAX_RISK_PER_TRADE
 
 
