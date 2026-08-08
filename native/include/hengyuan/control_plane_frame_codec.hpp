@@ -230,7 +230,7 @@ inline FrameDecodeStatus decode_rate_limit_freeze_frame(std::span<const std::byt
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -344,7 +344,7 @@ inline FrameDecodeStatus decode_freeze_probe_attempt_frame(std::span<const std::
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -533,7 +533,7 @@ inline FrameDecodeStatus decode_freeze_clear_frame(std::span<const std::byte> in
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -638,7 +638,7 @@ inline FrameDecodeStatus decode_freeze_wait_arm_frame(std::span<const std::byte>
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -756,7 +756,7 @@ inline FrameDecodeStatus decode_freeze_wait_satisfied_frame(std::span<const std:
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -855,7 +855,7 @@ inline FrameDecodeStatus decode_freeze_epoch_watermark_frame(std::span<const std
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -961,7 +961,7 @@ inline FrameDecodeStatus decode_endpoint_weight_config_frame(std::span<const std
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -1088,7 +1088,7 @@ inline FrameDecodeStatus decode_rate_limit_usage_snapshot_frame(std::span<const 
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -1232,7 +1232,7 @@ inline FrameDecodeStatus decode_operator_override_frame(std::span<const std::byt
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -1351,7 +1351,7 @@ inline FrameDecodeStatus decode_generation_bridge_frame(std::span<const std::byt
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -1531,7 +1531,7 @@ inline FrameDecodeStatus decode_snapshot_frame(std::span<const std::byte> in, st
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = hdr.key_id;
     out.sequence_number = hdr.sequence_number;
@@ -1698,7 +1698,7 @@ inline FrameDecodeStatus decode_key_rotated_frame(std::span<const std::byte> in,
 
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return FrameDecodeStatus::ChecksumMismatch;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return FrameDecodeStatus::ChecksumMismatch;
 
     out.key_id = key_id;
     out.sequence_number = sequence_number;

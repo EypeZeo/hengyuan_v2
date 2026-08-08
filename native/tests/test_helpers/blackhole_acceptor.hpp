@@ -26,6 +26,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <thread>
@@ -54,6 +55,9 @@ public:
     PlainBlackholeAcceptor& operator=(const PlainBlackholeAcceptor&) = delete;
 
     unsigned short port() const { return acceptor_.local_endpoint().port(); }
+    std::uint32_t accepted_connections() const noexcept {
+        return accepted_connections_.load(std::memory_order_acquire);
+    }
 
 private:
     void accept_loop() {
@@ -62,6 +66,7 @@ private:
         acceptor_.async_accept(*socket_ptr, [this, socket](boost::system::error_code ec) {
             if (!ec) {
                 held_sockets_.push_back(socket);  // keep alive; never read/write/close
+                accepted_connections_.fetch_add(1, std::memory_order_release);
             }
             if (!ioc_.stopped()) accept_loop();
         });
@@ -71,6 +76,7 @@ private:
     tcp::acceptor acceptor_;
     std::thread thread_;
     std::vector<std::shared_ptr<tcp::socket>> held_sockets_;
+    std::atomic<std::uint32_t> accepted_connections_{0};
 };
 
 class TlsBlackholeAcceptor {

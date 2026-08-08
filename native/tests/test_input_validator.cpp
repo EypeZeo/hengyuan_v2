@@ -2,6 +2,8 @@
 #include <gtest/gtest.h>
 #include <hengyuan/input_validator.hpp>
 
+#include <cstdint>
+
 using hy::BinanceMarketEvent;
 using hy::EventType;
 using hy::InputValidator;
@@ -185,4 +187,56 @@ TEST(InputValidator, MonotonicSequence) {
         EXPECT_EQ(v.validate(ev), ValidationResult::Accept);
     }
     EXPECT_EQ(v.counters().accepted, 100u);
+}
+
+// --- Clock-anomaly detection is per-symbol (audit VAL-TS-028) ---
+//
+// last_ts_event_ms_ used to be a single cross-symbol counter, for exactly the reason
+// seq_state_ is already per-(symbol, type): different symbols carry independent
+// event-time streams. On a multi-symbol feed a plain interleave made every other
+// event look like a >1s backwards clock jump.
+
+TEST(InputValidatorClock, InterleavedSymbolsDoNotFakeClockAnomalies) {
+    hy::InputValidator v;
+    // Two symbols whose event clocks are legitimately 5s apart -- perfectly normal
+    // when two streams are multiplexed onto one connection.
+    for (int i = 0; i < 50; ++i) {
+        hy::BinanceMarketEvent a{};
+        a.type = hy::EventType::Trade;
+        a.symbol_id = 0;
+        a.event_id = static_cast<std::uint64_t>(i) + 1;
+        a.ts_event_ms = std::uint64_t{1'700'000'000'000} + static_cast<std::uint64_t>(i);
+        a.price_ticks = 100;
+        a.qty_lots = 1;
+        EXPECT_EQ(v.validate(a), hy::ValidationResult::Accept);
+
+        hy::BinanceMarketEvent b{};
+        b.type = hy::EventType::Trade;
+        b.symbol_id = 1;
+        b.event_id = static_cast<std::uint64_t>(i) + 1;
+        b.ts_event_ms = std::uint64_t{1'699'999'995'000} + static_cast<std::uint64_t>(i);
+        b.price_ticks = 100;
+        b.qty_lots = 1;
+        EXPECT_EQ(v.validate(b), hy::ValidationResult::Accept);
+    }
+    EXPECT_EQ(v.counters().clock_anomalies, 0u)
+        << "a second symbol running 5s behind is not a clock anomaly";
+}
+
+TEST(InputValidatorClock, RealBackwardsJumpOnOneSymbolIsStillDetected) {
+    hy::InputValidator v;
+    hy::BinanceMarketEvent e{};
+    e.type = hy::EventType::Trade;
+    e.symbol_id = 0;
+    e.price_ticks = 100;
+    e.qty_lots = 1;
+
+    e.event_id = 1;
+    e.ts_event_ms = std::uint64_t{1'700'000'000'000};
+    EXPECT_EQ(v.validate(e), hy::ValidationResult::Accept);
+
+    e.event_id = 2;
+    e.ts_event_ms = std::uint64_t{1'700'000'000'000} - 5000;  // same symbol, 5s backwards
+    EXPECT_EQ(v.validate(e), hy::ValidationResult::AcceptClockAnomaly);
+    EXPECT_EQ(v.counters().clock_anomalies, 1u);
 }

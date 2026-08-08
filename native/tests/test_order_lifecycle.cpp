@@ -269,7 +269,7 @@ TEST(Reconcile, NonAmbiguousNoAction) {
 // Expected values are derived from order_lifecycle.hpp's own contract:
 //   * is_terminal(from) short-circuits to AlreadyTerminal for all 12 targets,
 //     regardless of `to`. Six terminal states x 12 = 72 pairs.
-//   * The 22 Ok transitions are listed explicitly in kValidTransitions below.
+//   * The 24 Ok transitions are listed explicitly in kValidTransitions below.
 //   * Everything else is InvalidTransition.
 namespace {
 
@@ -303,6 +303,11 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::Accepted,        OrderState::PartialFill},
     {OrderState::Accepted,        OrderState::Filled},
     {OrderState::Accepted,        OrderState::CancelRequested},
+    // Cancelled WITHOUT a local CancelRequested (audit STATE-TRANS-011): operator
+    // cancel from the Binance app during a manual takeover
+    // (docs/NATIVE_EXIT_SAFETY_RUNBOOK.md), or exchange-side self-trade prevention.
+    // Expired was always here; the missing Cancelled was the asymmetry.
+    {OrderState::Accepted,        OrderState::Cancelled},
     {OrderState::Accepted,        OrderState::Expired},
     // Ambiguous: reconciliation resolves to whichever state the query discovered
     // (exchange-final, or still-live Accepted/PartialFill per spec line 961), or
@@ -318,6 +323,7 @@ constexpr Transition kValidTransitions[] = {
     // PartialFill: still open.
     {OrderState::PartialFill,     OrderState::Filled},
     {OrderState::PartialFill,     OrderState::CancelRequested},
+    {OrderState::PartialFill,     OrderState::Cancelled},  // audit STATE-TRANS-011, as above
     {OrderState::PartialFill,     OrderState::Expired},
     // CancelRequested: cancel may lose the race to a fill or an expiry.
     {OrderState::CancelRequested, OrderState::Cancelled},
@@ -325,7 +331,9 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::CancelRequested, OrderState::Expired},
 };
 constexpr std::size_t kValidCount = sizeof(kValidTransitions) / sizeof(kValidTransitions[0]);
-static_assert(kValidCount == 22, "the Ok set changed size — update deliberately");
+// 22 -> 24, deliberately: Accepted->Cancelled and PartialFill->Cancelled
+// (audit STATE-TRANS-011 -- operator/exchange cancel with no local CancelRequested).
+static_assert(kValidCount == 24, "the Ok set changed size — update deliberately");
 
 bool is_listed_valid(OrderState from, OrderState to) {
     for (std::size_t i = 0; i < kValidCount; ++i) {
@@ -360,9 +368,10 @@ TEST(TransitionRelation, EveryOneOf144PairsMatchesTheTable) {
     // Guards against the table silently going vacuous (e.g. a future edit that
     // empties kAllStates would otherwise "pass" with zero comparisons).
     EXPECT_EQ(ok_count + invalid_count + terminal_count, 144);
-    EXPECT_EQ(ok_count, 22);
+    // 22 -> 24: Accepted->Cancelled and PartialFill->Cancelled (audit STATE-TRANS-011).
+    EXPECT_EQ(ok_count, 24);
     EXPECT_EQ(terminal_count, 72) << "6 terminal states x 12 targets";
-    EXPECT_EQ(invalid_count, 50);
+    EXPECT_EQ(invalid_count, 48);
 }
 
 // Called out separately because these four were the specific blind spot: no test

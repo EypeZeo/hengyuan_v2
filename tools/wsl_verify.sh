@@ -66,7 +66,10 @@ run_thread() {
         -DHY_SANITIZER=thread \
         -DHY_BUILD_TSAN_CONTROL=ON \
         -DHY_BUILD_DEMO=OFF
-    cmake --build build-linux-tsan -j"${BUILD_JOBS}" --target test_spsc_concurrency test_reconcile_concurrency tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
+    cmake --build build-linux-tsan -j"${BUILD_JOBS}" --target \
+        test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
+        test_snapshot_refresh_gate tsan_control_relaxed_ring \
+        tsan_control_export_worker_dual_consumer
 
     echo "--- concurrency tests (must pass) ---"
     (

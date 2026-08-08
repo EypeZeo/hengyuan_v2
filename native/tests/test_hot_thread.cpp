@@ -2,6 +2,10 @@
 #include <gtest/gtest.h>
 #include <hengyuan/hot_thread.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
 using hy::BinanceMarketEvent;
 using hy::EventType;
 using hy::HotThread;
@@ -208,4 +212,58 @@ TEST(HotThread, TobCallbackIncludesSymbolId) {
     ht.run_once();
 
     EXPECT_EQ(last_sym, 3u);
+}
+
+// --- Bounded drain per run_once() (audit HOT-DRAIN-027) ---
+//
+// run_once() used to drain the ring to empty with no bound, so a burst could keep
+// one call running for the whole 65536-slot backlog -- during which the snapshot
+// gate, the intent channel and the watchdog kill check (all after the loop) do not
+// run at all. That is a tail-latency and fail-closed-responsiveness problem.
+
+TEST(HotThreadDrain, OneCallConsumesAtMostTheDrainLimit) {
+    using Ring = hy::SpscRing<hy::BinanceMarketEvent, 65536>;
+    auto ring = std::make_unique<Ring>();
+    hy::HotThread<65536> hot(*ring);
+
+    constexpr std::size_t kOverfill = hy::HotThread<65536>::kMaxEventsPerRun + 500;
+    for (std::size_t i = 0; i < kOverfill; ++i) {
+        hy::BinanceMarketEvent ev{};
+        ev.type = hy::EventType::Trade;
+        ev.symbol_id = 0;
+        ev.event_id = i + 1;
+        ev.price_ticks = 100;
+        ev.qty_lots = 1;
+        ASSERT_TRUE(ring->try_push(ev));
+    }
+
+    hot.run_once();
+    EXPECT_EQ(hot.stats().events_processed, hy::HotThread<65536>::kMaxEventsPerRun)
+        << "one call must not run away with the whole backlog";
+    EXPECT_EQ(hot.stats().drain_limit_hits, 1u) << "hitting the bound must be observable";
+
+    // The remainder is not lost -- it is simply picked up by the next call.
+    hot.run_once();
+    EXPECT_EQ(hot.stats().events_processed, kOverfill);
+    EXPECT_EQ(hot.stats().drain_limit_hits, 1u);
+}
+
+TEST(HotThreadDrain, OrdinaryLoadDrainsFullyAndCountsNoLimitHit) {
+    using Ring = hy::SpscRing<hy::BinanceMarketEvent, 65536>;
+    auto ring = std::make_unique<Ring>();
+    hy::HotThread<65536> hot(*ring);
+
+    for (std::size_t i = 0; i < 64; ++i) {
+        hy::BinanceMarketEvent ev{};
+        ev.type = hy::EventType::Trade;
+        ev.symbol_id = 0;
+        ev.event_id = i + 1;
+        ev.price_ticks = 100;
+        ev.qty_lots = 1;
+        ASSERT_TRUE(ring->try_push(ev));
+    }
+    hot.run_once();
+    EXPECT_EQ(hot.stats().events_processed, 64u);
+    EXPECT_EQ(hot.stats().drain_limit_hits, 0u)
+        << "the bound must cost nothing in the steady state";
 }

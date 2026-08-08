@@ -609,17 +609,28 @@ TEST_F(LiveSubmitReconcileTest, StaleRulesVersionGateDoesNotPushBeforeSubmit) {
     EXPECT_FALSE(to_reconcile_.try_pop(in));
 }
 
-TEST_F(LiveSubmitReconcileTest, AcceptedAndRejectedDoNotPushToReconcileRing) {
+TEST_F(LiveSubmitReconcileTest, AcceptedPushesToReconcileRingAndRejectedDoesNot) {
+    // AUDIT EXEC-INFLIGHT-003: this test used to assert that Accepted ALSO stayed off
+    // the reconcile ring. That was the defect. An Accepted order keeps its in-flight
+    // slot (correctly -- it is resting on the exchange), and drain_reconcile_events()
+    // releases a slot only on is_exchange_final(), so if nothing ever tracks it the
+    // slot is unreleasable for the life of the process. Accepted must be handed to
+    // the reconcile loop; Rejected genuinely must not, because it is already terminal
+    // and orchestrate_submit() released its slot synchronously.
     auto r1 = orchestrate_submit(ctx_);
     ASSERT_EQ(r1.gate, OrchestratorGate::SubmitAccepted);
     ReconcileIngress in{};
-    EXPECT_FALSE(to_reconcile_.try_pop(in));
+    ASSERT_TRUE(to_reconcile_.try_pop(in))
+        << "an accepted order must reach the reconcile loop, or its slot can never be released";
+    EXPECT_EQ(in.record.state, OrderState::Accepted);
+    EXPECT_EQ(in.record.client_order_id.view(), r1.order.client_order_id.view());
+    EXPECT_TRUE(in.handle.valid());
 
     ctx_.sequence = 2;
     g_mock_response = {SubmitOutcome::Rejected, 0, -1013};
     auto r2 = orchestrate_submit(ctx_);
     ASSERT_EQ(r2.gate, OrchestratorGate::SubmitRejected);
-    EXPECT_FALSE(to_reconcile_.try_pop(in));
+    EXPECT_FALSE(to_reconcile_.try_pop(in)) << "Rejected is terminal; nothing left to reconcile";
 }
 
 TEST_F(LiveSubmitReconcileTest, PushedHandleReleasesTheSameSlotItRegistered) {

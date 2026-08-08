@@ -40,6 +40,7 @@
 #include <hengyuan/durable_frame_codec.hpp>
 #include <hengyuan/durable_log_store.hpp>
 #include <hengyuan/kek_loader.hpp>
+#include <hengyuan/secure_memory_lock.hpp>
 #include <hengyuan/secure_wipe.hpp>
 #include <hengyuan/sha256.hpp>
 
@@ -117,7 +118,7 @@ inline bool decode_last_remote_acked_tip(std::span<const std::byte> in,
     std::array<std::byte, kMacLen> mac{};
     detail::read_bytes(p, mac.data(), kMacLen);
 
-    if (std::memcmp(expected_mac.bytes.data(), mac.data(), kMacLen) != 0) return false;
+    if (!crypto::constant_time_equal(expected_mac, mac)) return false;  // audit SEC-MACCMP-010
     out = v;
     return true;
 }
@@ -167,10 +168,21 @@ public:
     // avoids for the exact same reason.
     LastRemoteAckedTipStore(const std::string& path, std::span<const std::byte, kKekSize> kek) noexcept
         : log_store_(path + ".unused_log", path + ".lock", path + ".tip"), tip_path_(path + ".tip") {
+        // AUDIT SEC-KEKCOPY-019: same reasoning as KeyRing's constructor -- this is
+        // the second unlocked copy of an mlocked KEK, and it lives as long as the
+        // store does. Locking only the kek_copy_ range (not the whole object) since
+        // the rest of this class holds no secret; mlock is page-granular anyway.
+        memory_locked_ = try_lock_memory(kek_copy_.data(), kek_copy_.size());
         std::memcpy(kek_copy_.data(), kek.data(), kek.size());
     }
 
-    ~LastRemoteAckedTipStore() { secure_wipe(kek_copy_.data(), kek_copy_.size()); }
+    ~LastRemoteAckedTipStore() {
+        secure_wipe(kek_copy_.data(), kek_copy_.size());
+        if (memory_locked_) unlock_memory(kek_copy_.data(), kek_copy_.size());
+    }
+
+    // See KeyRing::memory_locked() -- best effort, and the wipe happens regardless.
+    bool memory_locked() const noexcept { return memory_locked_; }
 
     LastRemoteAckedTipStore(const LastRemoteAckedTipStore&) = delete;
     LastRemoteAckedTipStore& operator=(const LastRemoteAckedTipStore&) = delete;
@@ -219,18 +231,21 @@ public:
         const auto read_status = read(existing);
         if (read_status == LastRemoteAckedTipReadStatus::Valid) {
             if (existing.store_uuid_lo != tip.store_uuid_lo || existing.store_uuid_hi != tip.store_uuid_hi) {
+                baseline_conflicted_ = true;
                 return LastRemoteAckedTipWriteStatus::Conflicting;
             }
             const bool same_position =
                 existing.generation == tip.generation && existing.sequence == tip.sequence;
             if (same_position) {
                 if (existing.key_id != tip.key_id || existing.tip_mac != tip.tip_mac) {
+                    baseline_conflicted_ = true;
                     return LastRemoteAckedTipWriteStatus::Conflicting;
                 }
                 // Identical replay of what's already on disk -- fall through
                 // and write anyway (harmless, idempotent).
             } else if (tip.generation < existing.generation ||
                        (tip.generation == existing.generation && tip.sequence < existing.sequence)) {
+                baseline_conflicted_ = true;
                 return LastRemoteAckedTipWriteStatus::Regressed;
             }
         } else if (read_status != LastRemoteAckedTipReadStatus::Absent) {
@@ -245,12 +260,27 @@ public:
                                                  : LastRemoteAckedTipWriteStatus::IoError;
     }
 
+    // AUDIT EXPORT-HOL-029: latches once a write is refused as Regressed or
+    // Conflicting. Both mean the durable baseline logically contradicts what is
+    // being exported, which no amount of retrying can resolve -- unlike IoError,
+    // which genuinely can be transient. Sticky by design: run_export_worker_once()
+    // consults it before spending a remote round-trip, so a permanent condition
+    // stops costing one call per tick and stops head-of-line-blocking a bounded ring
+    // into silently dropping new tuples.
+    bool baseline_conflicted() const noexcept { return baseline_conflicted_; }
+
+    // Operator escape hatch, after the contradiction has actually been investigated.
+    // Deliberately explicit: nothing clears this on its own.
+    void clear_baseline_conflict() noexcept { baseline_conflicted_ = false; }
+
 private:
     DurableLogStore log_store_;  // only acquire_lock/release_lock/write_tip_anchor/read_tip_anchor used
     std::string tip_path_;       // duplicated from log_store_'s own (private) tip path, only to drive
                                   // the Absent-vs-IoError std::filesystem::exists() probe above
     std::array<std::byte, kKekSize> kek_copy_{};
     bool lock_held_{false};
+    bool memory_locked_{false};       // audit SEC-KEKCOPY-019 (swap lock, unrelated to lock_held_)
+    bool baseline_conflicted_{false};  // audit EXPORT-HOL-029 (sticky, operator-cleared)
 };
 
 // --- ExportWorkerPolicy + backoff formula ---
@@ -335,6 +365,17 @@ inline ExportRunStatus run_export_worker_once(ExportOutboxRing& outbox, External
                                                LastRemoteAckedTipStore& baseline_store) noexcept {
     ExportTuple t{};
     if (!outbox.peek_oldest(t)) return ExportRunStatus::Empty;
+
+    // AUDIT EXPORT-HOL-029: BaselineConflict (Regressed/Conflicting) is NOT a
+    // transient failure -- retrying cannot change a durable baseline that already
+    // contradicts this tuple. Left as-is, the head stayed put forever and every
+    // subsequent call burned a real remote round-trip before failing again, while
+    // the bounded ring behind it filled and started silently dropping new tuples.
+    // A permanent condition is checked BEFORE the remote leg, not after it, and is
+    // reported without spending a call. Clearing it is an operator action (inspect
+    // the baseline, decide whether the store identity or the generation is wrong);
+    // this loop's job is to stop making it worse and stay diagnosable.
+    if (baseline_store.baseline_conflicted()) return ExportRunStatus::BaselineConflict;
 
     const auto result = anchor.export_tip_and_wait_bounded(
         t.store_uuid_lo, t.store_uuid_hi, t.generation, t.sequence,

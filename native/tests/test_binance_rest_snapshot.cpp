@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 #include <hengyuan/binance_rest_snapshot.hpp>
+#include <hengyuan/snapshot_refresh_gate.hpp>
 
 #include "test_helpers/blackhole_acceptor.hpp"
 
@@ -198,4 +199,43 @@ TEST(BinanceRestSnapshotTlsHostnameVerification, MatchingHostWithTrustedCaSuccee
     // passed a legitimately matching certificate instead of rejecting it too.
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(err, FetchError::Read);
+}
+
+// Moved here from test_snapshot_refresh_gate.cpp (audit VERIF-TSAN-016): it is the
+// only gate test that needs a real fetch_depth_snapshot(), and keeping it there kept the
+// gate's threaded state machine out of the TSan job. This binary is already Boost-gated
+// and already owns the blackhole fixture.
+TEST(SnapshotRefreshGateRealFetch, RealFetchWiringIsNonBlocking) {
+    // Light sanity check that the production wiring actually plugs a real
+    // fetch_depth_snapshot() call into the gate correctly -- using the local blackhole
+    // fixture (no real network). This deliberately does NOT wait out the full ~5s
+    // TLS-handshake-timeout-then-cooldown cycle (covered by the tests above and by the
+    // fake-fetcher tests in test_snapshot_refresh_gate.cpp); it only checks that
+    // starting a real fetch through the gate does not itself block the caller.
+    hy::test_helpers::PlainBlackholeAcceptor blackhole;
+    hy::RestSnapshotConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = std::to_string(blackhole.port());
+
+    hy::SnapshotRefreshGate gate([&cfg](const hy::SnapshotRequest& req) {
+        return hy::fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier,
+                                         cfg);
+    });
+
+    auto start = std::chrono::steady_clock::now();
+    auto r1 = gate.poll(true, {"BTCUSDT", 100'000'000, 100'000'000});
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_FALSE(r1.has_value());
+    EXPECT_LT(elapsed, std::chrono::milliseconds(500));  // must not block on the real fetch
+}
+
+TEST(SnapshotRefreshGateRealFetch, DefaultFetcherFactoryIsWired) {
+    // make_default_snapshot_fetcher() is what binance_dry_run_demo.cpp now passes
+    // explicitly (audit VERIF-TSAN-016 removed the constructor default). Prove the
+    // factory produces a usable SnapshotFetcher rather than only compiling.
+    auto fetcher = hy::make_default_snapshot_fetcher();
+    ASSERT_TRUE(static_cast<bool>(fetcher));
+    // An invalid symbol is rejected by validate_rest_config() before any network I/O,
+    // so this exercises the adapter shape without leaving the machine.
+    EXPECT_FALSE(fetcher(hy::SnapshotRequest{"not a symbol", 100'000'000, 100'000'000}).has_value());
 }

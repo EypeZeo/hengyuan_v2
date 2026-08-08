@@ -62,7 +62,7 @@ static void print_result(const BenchResult& r) {
 
 static BenchResult bench_parser(int iters) {
     hy::BinanceJsonParser parser;
-    parser.register_symbol("BTCUSDT", 0);
+    (void)parser.register_symbol("BTCUSDT", 0);  // fixed literal, cannot fail
 
     const std::string json = R"({
         "e": "trade", "E": 1700000000000, "s": "BTCUSDT", "t": 123456,
@@ -90,7 +90,7 @@ static BenchResult bench_parser(int iters) {
 
 static BenchResult bench_parser_depth(int iters) {
     hy::BinanceJsonParser parser;
-    parser.register_symbol("BTCUSDT", 0);
+    (void)parser.register_symbol("BTCUSDT", 0);  // fixed literal, cannot fail
 
     const std::string json = R"({
         "e": "depthUpdate", "E": 1700000002000, "s": "BTCUSDT",

@@ -6,6 +6,9 @@
 #include <gtest/gtest.h>
 #include <hengyuan/order_tracker.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 using namespace hy;
@@ -24,8 +27,8 @@ namespace {
 
 OrderRecord make_ambiguous_record(const char* coid, std::int64_t intended_qty_ticks = 100) {
     OrderRecord rec{};
-    rec.client_order_id.id[0] = '\0';
-    std::strncpy(rec.client_order_id.id, coid, kClientOrderIdLen);
+    // See make_live_record() below for why snprintf rather than strncpy.
+    std::snprintf(rec.client_order_id.id, sizeof(rec.client_order_id.id), "%s", coid);
     rec.symbol_id = 1;
     rec.intended_price_ticks = 5000;
     rec.intended_qty_ticks = intended_qty_ticks;
@@ -131,11 +134,235 @@ TEST_F(OrderTrackerTest, FoundResolvesToStillLiveStates) {
         ReconcileEvent ev{};
         ASSERT_TRUE(outbound.try_pop(ev));
         EXPECT_EQ(ev.resulting_state, target);
-        // Still-live: leaves the tracker (poll_once's job here is done -- open-
-        // order polling until fill/cancel is a separate, not-yet-built mechanism,
-        // see order_tracker.hpp's file header and docs/SPEC_INVARIANTS.md).
-        EXPECT_EQ(tracker.count(), 0u);
+        // AUDIT EXEC-INFLIGHT-003: this used to assert count()==0 -- reconciliation
+        // discovered the order was still live and then dropped it. Since
+        // drain_reconcile_events() correctly refuses to release a non-exchange-final
+        // in-flight slot, that combination stranded the slot forever. A still-live
+        // order must STAY tracked so it still has a route to a terminal state.
+        EXPECT_EQ(tracker.count(), 1u)
+            << "a still-live order must remain tracked until it reaches a terminal state";
     }
+}
+
+// --- Live-order polling: the terminal path for Accepted/PartialFill ---
+
+namespace {
+OrderRecord make_live_record(const char* coid, OrderState state,
+                             std::int64_t intended_qty_ticks = 100) {
+    OrderRecord rec{};
+    // snprintf, not strncpy: strncpy(dst, src, kClientOrderIdLen) writes no
+    // terminator when src is exactly kClientOrderIdLen chars, which GCC flags under
+    // -Werror=stringop-truncation once the source is a runtime buffer it cannot
+    // bound. Value-initialization happens to leave id[kClientOrderIdLen] zero, but
+    // relying on that is exactly the kind of implicit invariant this repo avoids.
+    std::snprintf(rec.client_order_id.id, sizeof(rec.client_order_id.id), "%s", coid);
+    rec.symbol_id = 1;
+    rec.intended_price_ticks = 5000;
+    rec.intended_qty_ticks = intended_qty_ticks;
+    rec.exchange_order_id = 555;
+    rec.state = OrderState::Submitting;
+    rec.transition_to(OrderState::Accepted);
+    if (state == OrderState::PartialFill) rec.transition_to(OrderState::PartialFill);
+    return rec;
+}
+}  // namespace
+
+TEST_F(OrderTrackerTest, AcceptedOrderReachesFilledAndLeavesTracker) {
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{3, 9}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.resulting_state, OrderState::Filled);
+    EXPECT_EQ(ev.filled_qty_ticks, 100);
+    EXPECT_EQ(ev.handle.slot_index, 3u);
+    EXPECT_EQ(tracker_.count(), 0u);
+}
+
+TEST_F(OrderTrackerTest, AcceptedOrderReachesOperatorCancelledAndLeavesTracker) {
+    // The docs/NATIVE_EXIT_SAFETY_RUNBOOK.md case: the operator cancels from the
+    // Binance app, so the order goes Accepted -> Cancelled with no local
+    // CancelRequested. validate_transition() used to reject that edge outright
+    // (audit STATE-TRANS-011).
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 0, 0};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.resulting_state, OrderState::Cancelled);
+    EXPECT_EQ(tracker_.count(), 0u);
+}
+
+TEST_F(OrderTrackerTest, PartialFillOrderReachesCancelled) {
+    auto rec = make_live_record("HY-LIVE", OrderState::PartialFill);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 40, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.resulting_state, OrderState::Cancelled);
+    EXPECT_EQ(ev.filled_qty_ticks, 40);
+    EXPECT_EQ(tracker_.count(), 0u);
+}
+
+TEST_F(OrderTrackerTest, StillRestingLiveOrderEmitsNoEventAndStaysTracked) {
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    EXPECT_FALSE(outbound_.try_pop(ev)) << "no state change means no event";
+    EXPECT_EQ(tracker_.count(), 1u);
+    EXPECT_EQ(g_mock_query_call_count, 1);
+}
+
+TEST_F(OrderTrackerTest, LiveOrderIsNeverEscalated) {
+    // A resting order polled many times must NOT trip the Ambiguous escalation cap
+    // (kMaxQueryAttempts): a live order is a normal steady state, not an anomaly.
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
+
+    std::int64_t now = 1000;
+    for (int i = 0; i < 20; ++i) {
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, now);
+        now += policy_.live_poll_interval_ms;
+    }
+
+    ReconcileEvent ev{};
+    EXPECT_FALSE(outbound_.try_pop(ev)) << "a resting order must never escalate itself";
+    EXPECT_EQ(tracker_.count(), 1u);
+    EXPECT_GE(g_mock_query_call_count, 20);
+}
+
+TEST_F(OrderTrackerTest, LiveOrderRespectsFlatPollInterval) {
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
+
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    ASSERT_EQ(g_mock_query_call_count, 1);
+
+    // Too soon: no second query.
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
+              1000 + policy_.live_poll_interval_ms - 1);
+    EXPECT_EQ(g_mock_query_call_count, 1);
+
+    // Interval elapsed: query again.
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
+              1000 + policy_.live_poll_interval_ms);
+    EXPECT_EQ(g_mock_query_call_count, 2);
+}
+
+TEST_F(OrderTrackerTest, LivePartialFillGrowthUpdatesRecordWithoutEvent) {
+    auto rec = make_live_record("HY-LIVE", OrderState::PartialFill);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::PartialFill, 555, 60, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    EXPECT_FALSE(outbound_.try_pop(ev));
+    EXPECT_EQ(tracker_.count(), 1u);
+
+    // ...and it still reaches a terminal state afterwards.
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
+              1000 + policy_.live_poll_interval_ms);
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.resulting_state, OrderState::Filled);
+    EXPECT_EQ(tracker_.count(), 0u);
+}
+
+TEST_F(OrderTrackerTest, FilledWithShortQuantityIsRejected) {
+    // An exchange (or a buggy adapter) claiming FILLED while filled_qty is short of
+    // intended must not release the in-flight slot on an order that still has
+    // quantity resting.
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 99, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    EXPECT_FALSE(outbound_.try_pop(ev));
+    EXPECT_EQ(tracker_.count(), 1u) << "must stay tracked, not silently resolved";
+}
+
+TEST_F(OrderTrackerTest, LiveOrderCannotRegressToAmbiguous) {
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Ambiguous, 555, 0, 0};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    EXPECT_FALSE(outbound_.try_pop(ev));
+    EXPECT_EQ(tracker_.count(), 1u);
+}
+
+// The full audit chain: Ambiguous -> reconciled to still-live -> polled ->
+// terminal -> in-flight slot released. This is the loop that did not close.
+TEST_F(OrderTrackerTest, AmbiguousToLiveToTerminalReleasesInFlightSlot) {
+    InFlightRegistry in_flight;
+    AuditRingSink audit;
+
+    auto rec = make_ambiguous_record("HY-CHAIN", 100);
+    auto handle = in_flight.register_submit_handle(rec.client_order_id.view());
+    ASSERT_TRUE(handle.valid());
+    ASSERT_TRUE(inbound_.try_push(ReconcileIngress{handle, rec}));
+
+    // 1) reconcile discovers the order is actually still live
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    drain_reconcile_events(in_flight, &audit, outbound_, 1000);
+    EXPECT_TRUE(in_flight.is_in_flight("HY-CHAIN")) << "still live: slot correctly retained";
+    EXPECT_EQ(tracker_.count(), 1u) << "still live: still tracked";
+
+    // 2) later it fills
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
+              1000 + policy_.live_poll_interval_ms);
+    drain_reconcile_events(in_flight, &audit, outbound_, 2000);
+
+    EXPECT_FALSE(in_flight.is_in_flight("HY-CHAIN")) << "terminal: slot must be released";
+    EXPECT_EQ(in_flight.count(), 0u);
+    EXPECT_EQ(tracker_.count(), 0u);
+}
+
+// The exhaustion scenario the audit reproduced, now driven all the way through.
+TEST_F(OrderTrackerTest, SustainedAcceptedOrdersDoNotExhaustInFlightRegistry) {
+    InFlightRegistry in_flight;
+    AuditRingSink audit;
+
+    for (std::size_t i = 0; i < kMaxInFlight * 2; ++i) {
+        char coid[kClientOrderIdLen + 1];
+        std::snprintf(coid, sizeof(coid), "HY-%zu", i);
+
+        auto h = in_flight.register_submit_handle(coid);
+        ASSERT_TRUE(h.valid()) << "submit #" << i << " was refused a slot";
+
+        auto rec = make_live_record(coid, OrderState::Accepted);
+        ASSERT_TRUE(inbound_.try_push(ReconcileIngress{h, rec}));
+
+        const std::int64_t now = 1000 + static_cast<std::int64_t>(i) * policy_.live_poll_interval_ms;
+        g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, now);
+        drain_reconcile_events(in_flight, &audit, outbound_, now);
+    }
+
+    EXPECT_EQ(in_flight.count(), 0u) << "every filled order must have released its slot";
+    EXPECT_EQ(tracker_.count(), 0u);
 }
 
 // --- poll_once: Inconclusive path ---
