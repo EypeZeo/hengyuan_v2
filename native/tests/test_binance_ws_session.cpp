@@ -127,6 +127,52 @@ TEST(BinanceWsSessionConnectivity, TlsHandshakeStageTimeout) {
     EXPECT_LT(elapsed, std::chrono::seconds(20));
 }
 
+TEST(BinanceWsSessionLifecycle, RequestedStopCancelsPendingHandshakeWithoutErrorOrLeak) {
+    hy::test_helpers::PlainBlackholeAcceptor blackhole;
+    SessionFixture fx;
+
+    WsSessionConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = std::to_string(blackhole.port());
+    cfg.subscribe_streams = {"btcusdt@trade"};
+
+    auto session = std::make_shared<BinanceWsSession<1024>>(fx.ioc, fx.ssl_ctx, fx.ring,
+                                                              fx.parser, cfg);
+    std::weak_ptr<BinanceWsSession<1024>> weak_session = session;
+    session->start();
+    std::thread io_thread([&fx] { fx.ioc.run(); });
+
+    // Wait until TCP is accepted: the client is then in its intentionally stalled TLS
+    // handshake, so stop() must exercise an operation_aborted completion rather than merely
+    // stopping before any work began.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (blackhole.accepted_connections() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (blackhole.accepted_connections() == 0) {
+        // Do not ASSERT while io_thread is joinable: its destructor would terminate the test
+        // process and leave the session's operation alive. Always use the production shutdown
+        // protocol first, then report the fixture failure.
+        session->stop();
+        io_thread.join();
+        FAIL() << "blackhole did not accept the client connection before the test deadline";
+        return;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    session->stop();
+    io_thread.join();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    auto stats = session->stats_snapshot();
+    EXPECT_TRUE(session->stopped());
+    EXPECT_EQ(stats.errors, 0u);
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+
+    session.reset();
+    EXPECT_TRUE(weak_session.expired());
+}
+
 TEST(BinanceWsSessionLifecycle, ExactlyOnceStartGuard) {
     hy::test_helpers::PlainBlackholeAcceptor blackhole;
     SessionFixture fx;

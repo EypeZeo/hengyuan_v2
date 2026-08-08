@@ -161,6 +161,10 @@ public:
     // Posts cancellation onto this session's strand and returns immediately -- see this file's
     // header comment for the required stop()+join() shutdown contract.
     void stop() {
+        // Publish the caller's intent before queuing do_stop(). A completion can be dispatched
+        // between these two operations; it must still recognise a requested stop as clean rather
+        // than accounting operation_aborted as a network fault.
+        stop_requested_.store(true, std::memory_order_release);
         net::post(strand_, [self = this->shared_from_this()] { self->do_stop(); });
     }
 
@@ -176,6 +180,20 @@ public:
     }
 
 private:
+    bool is_expected_stop(beast::error_code ec) const noexcept {
+        // Once stop() has published the caller's intent, every later completion belongs to that
+        // cancellation episode. Depending on the Boost/OpenSSL combination, force-closing a
+        // pending TLS handshake may report operation_aborted, stream_truncated, eof, or a
+        // platform socket-close error; none represents a new session fault after the caller has
+        // already chosen the terminal stop transition. A real error that reaches a handler
+        // before stop() publishes its release-store still takes the normal fail-stop path.
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            (void)ec;
+            return true;
+        }
+        return stop_.load(std::memory_order_relaxed) && !ec;
+    }
+
     static net::awaitable<void> resolve_coro(std::shared_ptr<BinanceWsSession> self) {
         using namespace boost::asio::experimental::awaitable_operators;
         self->resolve_timer_.expires_after(std::chrono::seconds(10));
@@ -195,7 +213,7 @@ private:
     }
 
     void on_resolve(beast::error_code ec, tcp::resolver::results_type results) {
-        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
+        if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "resolve");
         beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(10));
         beast::get_lowest_layer(ws_).async_connect(
@@ -205,7 +223,7 @@ private:
     }
 
     void on_connect(beast::error_code ec, tcp::resolver::results_type::endpoint_type) {
-        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
+        if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "connect");
         beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(10));
 #if defined(__GNUC__) && !defined(__clang__)
@@ -228,7 +246,7 @@ private:
     }
 
     void on_ssl_handshake(beast::error_code ec) {
-        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
+        if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "ssl_handshake");
         // The WS-level timeout option (below) takes over -- disarm the tcp_stream-level timer
         // so the two mechanisms don't fight each other.
@@ -249,7 +267,7 @@ private:
     }
 
     void on_handshake(beast::error_code ec) {
-        if (stop_ && !ec) return;  // clean stop, not a failure (audit WS-STAT-026)
+        if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "ws_handshake");
         do_read();
     }
@@ -267,7 +285,7 @@ private:
         // errors++ with an empty error_code on every clean stop(), so a normal
         // shutdown was indistinguishable from a real read failure in
         // stats_snapshot(). A requested stop is not an error.
-        if (stop_ && !ec) return;
+        if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "read");
 
         auto data = buffer_.data();
@@ -338,7 +356,15 @@ private:
         stop_.store(true, std::memory_order_relaxed);
         resolver_.cancel();
         resolve_timer_.cancel();
-        beast::get_lowest_layer(ws_).cancel();
+        auto& socket = beast::get_lowest_layer(ws_).socket();
+        beast::error_code ignored;
+        socket.cancel(ignored);
+        // tcp_stream::cancel() alone does not reliably interrupt an in-progress OpenSSL
+        // handshake on every supported Boost/OpenSSL combination. Closing the transport is the
+        // bounded shutdown backstop: it completes the SSL/WebSocket operation with
+        // operation_aborted instead of leaving join() to wait for the stage deadline.
+        socket.shutdown(tcp::socket::shutdown_both, ignored);
+        socket.close(ignored);
     }
 
     StrandType strand_;
@@ -352,6 +378,7 @@ private:
     mutable std::mutex stats_mutex_;
     WsSessionStats stats_{};
     std::atomic<bool> stop_{false};
+    std::atomic<bool> stop_requested_{false};
     std::atomic<bool> started_{false};
 };
 
