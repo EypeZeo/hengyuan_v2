@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
+
+# CMake 3.30+ defaults CMP0167 to NEW, which removes FindBoost.  Boost 1.91
+# is supplied as a source tree on Windows, so retain the compatible module
+# lookup across the complete configure, including vcpkg's find-package wrapper.
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 OLD)
+endif()
+
 project(hengyuan_native LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -62,7 +70,18 @@ hengyuan_set_warnings(live_submit_evidence_harness)
 option(HY_BUILD_DEMO "Build binance_feed_demo (requires Boost + OpenSSL)" OFF)
 
 if(HY_BUILD_DEMO)
-    find_package(Boost REQUIRED COMPONENTS system)
+    # Boost.System is header-only as of Boost 1.69.  CMake's legacy
+    # FindBoost module still treats `COMPONENTS system` as a request for a
+    # prebuilt boost_system library, which makes a valid 1.91 source/install
+    # tree appear incomplete.  Keep a project-local target named Boost::system
+    # so all consumers retain one stable link dependency without requiring a
+    # dummy archive or a version-specific code path.
+    find_package(Boost REQUIRED)
+    if(NOT TARGET Boost::system)
+        add_library(hengyuan_boost_system INTERFACE)
+        target_link_libraries(hengyuan_boost_system INTERFACE Boost::headers)
+        add_library(Boost::system ALIAS hengyuan_boost_system)
+    endif()
     find_package(OpenSSL REQUIRED)
     # Threads is found unconditionally at the top of this file (the concurrency
     # tests need it whether or not demos are built).

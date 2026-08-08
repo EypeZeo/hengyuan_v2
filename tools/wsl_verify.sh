@@ -23,13 +23,22 @@ if [[ -z "${MODE}" ]]; then
     exit 2
 fi
 
+# CI keeps the default (all available cores).  A constrained WSL VM can pass a
+# smaller positive value, e.g. HY_BUILD_JOBS=4, without changing the validated
+# CMake/test matrix or weakening any sanitizer/control assertion.
+BUILD_JOBS="${HY_BUILD_JOBS:-$(nproc)}"
+if ! [[ "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "HY_BUILD_JOBS must be a positive integer (got: ${BUILD_JOBS})" >&2
+    exit 2
+fi
+
 run_none() {
     echo "=== none: mirrors ci-native.yml ==="
     cmake -B build-linux-none \
         -DCMAKE_CXX_COMPILER=g++-14 \
         -DCMAKE_BUILD_TYPE=Release \
         -DHY_BUILD_DEMO=ON
-    cmake --build build-linux-none -j"$(nproc)"
+    cmake --build build-linux-none -j"${BUILD_JOBS}"
     (cd build-linux-none && ctest --output-on-failure)
 }
 
@@ -40,7 +49,7 @@ run_address() {
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DHY_SANITIZER=address \
         -DHY_BUILD_DEMO=ON
-    cmake --build build-linux-asan -j"$(nproc)"
+    cmake --build build-linux-asan -j"${BUILD_JOBS}"
     (
         cd build-linux-asan
         export ASAN_OPTIONS="detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1:abort_on_error=1"
@@ -57,7 +66,7 @@ run_thread() {
         -DHY_SANITIZER=thread \
         -DHY_BUILD_TSAN_CONTROL=ON \
         -DHY_BUILD_DEMO=OFF
-    cmake --build build-linux-tsan -j"$(nproc)" --target \
+    cmake --build build-linux-tsan -j"${BUILD_JOBS}" --target \
         test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
         test_snapshot_refresh_gate tsan_control_relaxed_ring \
         tsan_control_export_worker_dual_consumer
