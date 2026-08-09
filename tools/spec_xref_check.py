@@ -77,6 +77,21 @@ SEARCH_FILES = [
     # drift unnoticed in a file nobody looks at" gap the durable_log_store.hpp/
     # control_plane_frame_codec.hpp entries above were added to close.
     REPO_ROOT / "native" / "include" / "hengyuan" / "export_worker.hpp",
+    # Round D (docs/SPEC_INVARIANTS.md): the three Compaction*Wire types were
+    # promoted from mac[32]-only markers to real named fields, and four brand
+    # new headers carry their codec/I/O implementation -- the same "a symbol
+    # can only drift unnoticed in a file nobody looks at" gap every entry
+    # above was added to close.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "compaction_intent_codec.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "compaction_breadcrumb_io.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "windows_native_io.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "compaction_lease.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "compaction_intent_store.hpp",
+    # key_ring.hpp has existed since Phase 0 but was never added here either --
+    # Round D adds genuinely new, load-bearing symbols to it (RetireStatus,
+    # PinnedKeyHandle, pin_key()), so this is the same pre-existing gap as
+    # above, closed now that it's actually load-bearing.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "key_ring.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
