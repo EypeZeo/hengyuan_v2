@@ -337,6 +337,19 @@ if(HY_BUILD_TESTS)
 
     gtest_discover_tests(test_compaction_lease PROPERTIES LABELS concurrency)
 
+    # Round D: IntentStore -- genesis-only write/read/match/inspect via the
+    # CandidateLease friend relationship (L2, 真实文件 I/O).
+    add_executable(test_compaction_intent_store tests/test_compaction_intent_store.cpp)
+    target_link_libraries(test_compaction_intent_store PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_compaction_intent_store)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_compaction_intent_store PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_compaction_intent_store)
+
     # Phase 1: control-plane 11 种 payload 的帧编解码 (L1, 纯内存, 无文件 I/O --
     # 真正的文件落盘在 control_plane_log_sink.hpp，这里只验证帧格式本身，见
     # control_plane_frame_codec.hpp 头部注释)

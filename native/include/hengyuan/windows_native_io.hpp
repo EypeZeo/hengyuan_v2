@@ -266,8 +266,18 @@ inline DirOpenResult open_directory(const std::wstring& path, RawHandle& out,
         // FILE_READ_ATTRIBUTES is required for the FileBasicInformation query
         // below (found by testing against a real directory: without it,
         // NtQueryInformationFile returns STATUS_ACCESS_DENIED, 0xC0000022).
+        // FILE_WRITE_DATA ("add file" for a directory object) is required for
+        // FlushFileBuffers() on this handle to succeed at all -- also found
+        // empirically, not from documentation: without it,
+        // write_validated_no_replace_win()'s FlushFileBuffers(dir.get()) call
+        // (compaction_lease.hpp) unconditionally failed with
+        // ERROR_ACCESS_DENIED, meaning every genesis write reported
+        // PublishedNamespaceUncertain instead of DurablyPublished on every
+        // single call -- not a legitimate "sometimes uncertain" outcome, a
+        // access-mask bug that made the durable case unreachable on Windows.
         &h,
-        static_cast<ACCESS_MASK>(FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE),
+        static_cast<ACCESS_MASK>(FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | FILE_WRITE_DATA |
+                                  SYNCHRONIZE),
         &attrs, &iosb,
         nullptr, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
         kFileOpen,
