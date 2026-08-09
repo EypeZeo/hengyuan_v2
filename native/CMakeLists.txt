@@ -303,6 +303,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_frame_codec)
     gtest_discover_tests(test_durable_frame_codec)
 
+    # Round D (docs/SPEC_INVARIANTS.md "Seal-journal Round D"): CompactionIntent
+    # codec (L1, pure in-memory, no file I/O -- real file I/O is
+    # compaction_lease.hpp, see test_compaction_lease.cpp).
+    add_executable(test_compaction_intent_codec tests/test_compaction_intent_codec.cpp)
+    target_link_libraries(test_compaction_intent_codec PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_compaction_intent_codec)
+    gtest_discover_tests(test_compaction_intent_codec)
+
     # Phase 1: control-plane 11 种 payload 的帧编解码 (L1, 纯内存, 无文件 I/O --
     # 真正的文件落盘在 control_plane_log_sink.hpp，这里只验证帧格式本身，见
     # control_plane_frame_codec.hpp 头部注释)
