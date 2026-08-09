@@ -26,6 +26,7 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -84,6 +85,20 @@ struct ReadFixedResult {
 
 inline constexpr std::size_t kMaxArtifactNameLen = 63;
 
+// Fixed-width 16-hex-digit lowercase formatting, null-terminated (out[16] =
+// '\0') -- never snprintf with a width specifier (which can silently
+// truncate on some libc implementations for values wider than expected).
+// The output alphabet is exactly [0-9a-f], so it is structurally incapable
+// of producing a path separator or "..".
+inline void format_hex16(std::uint64_t v, std::array<char, 17>& out) noexcept {
+    static constexpr char kDigits[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; --i) {
+        out[static_cast<std::size_t>(i)] = kDigits[v & 0xFu];
+        v >>= 4;
+    }
+    out[16] = '\0';
+}
+
 // Rejects: empty, ".", "..", any '/' or '\\', embedded NUL, non-ASCII,
 // overlong (> kMaxArtifactNameLen), and a leading '-' (so a name can never
 // be misread as a command-line flag by some naive tool that later greps
@@ -129,26 +144,51 @@ public:
         return ValidatedArtifactName(std::string_view("compaction-candidate-intent"));
     }
 
-    // Round E/F (not called by anything in Round D -- documented here so
-    // the naming convention and hex-formatting discipline are decided once,
-    // not reinvented per round):
-    //   for_x1(build_nonce, seq) -> "compaction-intent-x-<nonce_hex16>-<seq_hex16>.x1"
-    //   for_xgc(build_nonce)     -> "compaction-intent-gc-<nonce_hex16>.xgc"
-    // Both format u64/u32 values as fixed-width lowercase hex via a
-    // dedicated formatter (never snprintf with a width specifier that could
-    // silently truncate) -- physically incapable of producing '/', '\\', or
-    // ".." since hex digits are drawn from a fixed 16-character alphabet.
+    // Read-only factory Round D DOES need: IntentStore::inspect_x1_chain()
+    // (a read-only diagnostic, never a write in Round D -- see
+    // compaction_lease.hpp's SCOPE comment) has to be able to name a `.x1`
+    // file that might already exist on disk (e.g. left over from a future
+    // Round E/F write, or placed there for a test fixture). Formats
+    // build_nonce/seq as fixed-width lowercase hex via format_hex16()
+    // below -- never snprintf with a width specifier that could silently
+    // truncate -- so the result is physically incapable of containing '/',
+    // '\\', or ".." (hex digits are drawn from a fixed 16-character
+    // alphabet). transition_seq is spec-constrained to {1,2,3}
+    // (durable_control_plane.hpp's CompactionIntentTransitionWire comment);
+    // IntentStore validates that before calling this, not this factory --
+    // keeping this factory's only job "format safely," not "know the
+    // business rule."
+    static ValidatedArtifactName for_x1(std::uint64_t build_nonce, std::uint32_t transition_seq) noexcept {
+        std::array<char, 17> nonce_hex{};
+        std::array<char, 17> seq_hex{};
+        format_hex16(build_nonce, nonce_hex);
+        format_hex16(static_cast<std::uint64_t>(transition_seq), seq_hex);
+        std::string name = "compaction-intent-x-";
+        name += nonce_hex.data();
+        name += "-";
+        name += seq_hex.data();
+        name += ".x1";
+        return ValidatedArtifactName(name);
+    }
+
+    // Round E/F (not called by anything in Round D -- Round D never reads
+    // OR writes a `.xgc`, see compaction_lease.hpp's SCOPE comment):
+    //   for_xgc(build_nonce) -> "compaction-intent-gc-<nonce_hex16>.xgc"
 
     std::string_view relative_name() const noexcept { return std::string_view(buf_.data(), len_); }
 
 private:
     explicit ValidatedArtifactName(std::string_view name) noexcept {
-        // Every call site of this private constructor is a literal inside
-        // this class -- is_traversal_safe_name() is not re-checked here at
-        // runtime (it would always be a compile-time-knowable `true` for a
-        // literal), but the invariant is documented so a future edit that
-        // adds a new factory with non-literal input is expected to validate
-        // BEFORE calling this constructor, not rely on it to reject.
+        // for_compaction_candidate_intent()'s call site is a literal;
+        // for_x1()'s is runtime-formatted (from format_hex16(), which is
+        // structurally incapable of producing an unsafe character, but
+        // "structurally incapable" is exactly the kind of claim worth a
+        // debug-build assertion rather than trusting it silently forever).
+        // Release builds do not re-pay this cost per call -- the format_hex16
+        // alphabet guarantee is the actual safety property, this assert is a
+        // regression tripwire for it, not the safety mechanism itself.
+        assert(name.size() < kMaxArtifactNameLen);
+        assert(is_traversal_safe_name(name));
         len_ = static_cast<std::uint8_t>(name.size() < kMaxArtifactNameLen ? name.size() : kMaxArtifactNameLen);
         std::memcpy(buf_.data(), name.data(), len_);
     }

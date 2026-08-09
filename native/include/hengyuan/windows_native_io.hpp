@@ -352,6 +352,54 @@ inline RelativeCreateResult create_new_relative(const RawHandle& dir, const std:
     return RelativeCreateResult::Created;
 }
 
+enum class ExclusiveLockResult : std::uint8_t {
+    Acquired,
+    HeldElsewhere,  // STATUS_SHARING_VIOLATION -- another handle (this process
+                     // or another) already has it open without FILE_SHARE_*
+    Unsupported,
+    Failed,
+};
+
+// Opens (creating if absent) `relative_name` inside `dir` with ShareAccess=0
+// -- no other handle, in this process or any other, can have this file open
+// at the same time. This is Windows' equivalent of POSIX flock(LOCK_EX|
+// LOCK_NB): there is no separate "advisory lock" primitive on Windows the
+// way POSIX has flock(); exclusive share-mode IS the lock. Used by
+// compaction_lease.hpp for the candidate-directory lock file.
+inline ExclusiveLockResult open_or_create_exclusive_relative(const RawHandle& dir,
+                                                                const std::wstring& relative_name,
+                                                                RawHandle& out) noexcept {
+    if (!native_api_available()) return ExclusiveLockResult::Unsupported;
+    auto& t = detail::proc_table();
+
+    UNICODE_STRING name{};
+    name.Length = static_cast<USHORT>(relative_name.size() * sizeof(WCHAR));
+    name.MaximumLength = name.Length;
+    name.Buffer = const_cast<PWSTR>(relative_name.c_str());
+
+    OBJECT_ATTRIBUTES attrs{};
+    InitializeObjectAttributes(&attrs, &name, 0, dir.get(), nullptr);
+
+    IO_STATUS_BLOCK iosb{};
+    HANDLE h = INVALID_HANDLE_VALUE;
+    // CreateDisposition = kFileOpen would fail if absent; here we want
+    // "open if present, create if absent" -- that is CreateDisposition
+    // value 3 (FILE_OPEN_IF in the stable NT4-era constant set), which
+    // this file has not otherwise needed to name.
+    constexpr ULONG kFileOpenIf = 3;
+    const NTSTATUS status = t.nt_create_file(
+        &h, static_cast<ACCESS_MASK>(GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE), &attrs, &iosb, nullptr,
+        FILE_ATTRIBUTE_NORMAL, 0 /* ShareAccess=0: exclusive, this IS the lock */, kFileOpenIf,
+        kFileNonDirectoryFile | kFileSynchronousIoNonalert, nullptr, 0);
+    if (!nt_success(status)) {
+        constexpr NTSTATUS kStatusSharingViolation = static_cast<NTSTATUS>(0xC0000043L);
+        if (status == kStatusSharingViolation) return ExclusiveLockResult::HeldElsewhere;
+        return ExclusiveLockResult::Failed;
+    }
+    out = RawHandle(h);
+    return ExclusiveLockResult::Acquired;
+}
+
 enum class RelativeOpenResult : std::uint8_t {
     Opened,
     NotFound,
@@ -440,6 +488,25 @@ inline RelativeRenameResult rename_no_replace(const RawHandle& file, const RawHa
         return RelativeRenameResult::Failed;
     }
     return RelativeRenameResult::Renamed;
+}
+
+// File/directory identity for TOCTOU re-verification (compaction_lease.hpp's
+// sticky-fence check): VolumeSerialNumber + FileIndex uniquely identify a
+// filesystem object on Windows, the same role st_dev/st_ino play on POSIX.
+// Standard Win32 (GetFileInformationByHandle), not NT-native -- works on any
+// already-open handle regardless of how it was obtained (NtCreateFile-opened
+// handles are ordinary Win32 handles for every purpose except open/rename).
+struct FileIdentity {
+    std::uint64_t volume_serial{0};
+    std::uint64_t file_index{0};
+};
+
+inline bool query_file_identity(const RawHandle& h, FileIdentity& out) noexcept {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!::GetFileInformationByHandle(h.get(), &info)) return false;
+    out.volume_serial = info.dwVolumeSerialNumber;
+    out.file_index = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    return true;
 }
 
 }  // namespace hy::win_native

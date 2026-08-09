@@ -321,6 +321,22 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_compaction_breadcrumb_io_detail)
     gtest_discover_tests(test_compaction_breadcrumb_io_detail)
 
+    # Round D: CandidateLease's own lifecycle surface (acquire/release/held/
+    # fenced/move) against a real temp directory -- L2, real file I/O.
+    # Genesis write/read coverage (via IntentStore, the only friend) lives in
+    # test_compaction_intent_store.cpp. Threading test (NonOwnerRelease...)
+    # needs Threads -- same pattern as other concurrency-relevant targets.
+    add_executable(test_compaction_lease tests/test_compaction_lease.cpp)
+    target_link_libraries(test_compaction_lease PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_compaction_lease)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_compaction_lease PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_compaction_lease PROPERTIES LABELS concurrency)
+
     # Phase 1: control-plane 11 种 payload 的帧编解码 (L1, 纯内存, 无文件 I/O --
     # 真正的文件落盘在 control_plane_log_sink.hpp，这里只验证帧格式本身，见
     # control_plane_frame_codec.hpp 头部注释)
