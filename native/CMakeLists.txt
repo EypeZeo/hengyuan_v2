@@ -311,6 +311,59 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_compaction_intent_codec)
     gtest_discover_tests(test_compaction_intent_codec)
 
+    # Round D: deterministic runner over the checked-in fuzz seed corpus
+    # (fuzz/corpus/compaction_intent/) -- GCC/MSVC-buildable, no libFuzzer/
+    # Clang dependency, part of the default ctest run. The real extended
+    # fuzzing loop (fuzz_compaction_intent_codec, Clang-only, HY_BUILD_FUZZ)
+    # is registered separately below under LABELS "fuzz". Both drivers call
+    # the exact same target function (fuzz/compaction_intent_codec_fuzz_
+    # target.hpp) so they cannot drift into testing different things.
+    # HY_COMPACTION_INTENT_CORPUS_DIR: same compile-definition pattern as
+    # HY_TEST_FIXTURE_DIR elsewhere in this file.
+    set(HY_COMPACTION_INTENT_CORPUS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/compaction_intent")
+    add_executable(test_compaction_intent_codec_corpus_runner
+        tests/test_compaction_intent_codec_corpus_runner.cpp)
+    target_link_libraries(test_compaction_intent_codec_corpus_runner PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_compaction_intent_codec_corpus_runner PRIVATE
+        HY_COMPACTION_INTENT_CORPUS_DIR="${HY_COMPACTION_INTENT_CORPUS_DIR}")
+    hengyuan_set_warnings(test_compaction_intent_codec_corpus_runner)
+    gtest_discover_tests(test_compaction_intent_codec_corpus_runner)
+
+    # Round D: real libFuzzer harness -- Clang-only (needs -fsanitize=fuzzer,
+    # which GCC/MSVC don't implement), off by default, same
+    # "option-gated, not ctest-label-gated" shape as HY_BUILD_TSAN_CONTROL
+    # above: a normal MSVC/GCC-14 build never configures this target at all,
+    # so plain `ctest` on those toolchains is structurally unaffected by it
+    # regardless of any label filter. Unlike tsan_control_relaxed_ring, this
+    # IS ctest-registered (under LABELS "fuzz") -- `ctest -L fuzz` is the
+    # explicit, separate invocation a Clang-specific CI job uses to run it;
+    # a plain `ctest` inside that same job would still pick it up too, which
+    # is intended there (see native/README or ci-native.yml for the actual
+    # job wiring once one exists).
+    option(HY_BUILD_FUZZ "Build the libFuzzer harness for compaction_intent_codec (Clang-only)" OFF)
+    if(HY_BUILD_FUZZ)
+        if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+            message(FATAL_ERROR "HY_BUILD_FUZZ requires Clang (libFuzzer/-fsanitize=fuzzer); "
+                                 "compiler is ${CMAKE_CXX_COMPILER_ID}")
+        endif()
+        add_executable(fuzz_compaction_intent_codec fuzz/fuzz_compaction_intent_codec.cpp)
+        target_link_libraries(fuzz_compaction_intent_codec PRIVATE hengyuan_core)
+        target_compile_options(fuzz_compaction_intent_codec PRIVATE -fsanitize=fuzzer)
+        target_link_options(fuzz_compaction_intent_codec PRIVATE -fsanitize=fuzzer)
+        hengyuan_set_warnings(fuzz_compaction_intent_codec)
+
+        # Explicit resource ceiling -- the structural fix this round's review
+        # required (see docs/SPEC_INVARIANTS.md's Round D entry): an unbounded
+        # fuzz invocation must never be the only option. Values are
+        # deliberately modest for a "smoke" run; a real extended fuzzing
+        # campaign uses this binary directly with its own -runs/-max_total_time.
+        add_test(NAME fuzz_compaction_intent_codec_smoke
+                 COMMAND fuzz_compaction_intent_codec
+                         "${HY_COMPACTION_INTENT_CORPUS_DIR}"
+                         -runs=100000 -timeout=60 -rss_limit_mb=2048 -seed=1)
+        set_tests_properties(fuzz_compaction_intent_codec_smoke PROPERTIES LABELS "fuzz")
+    endif()
+
     # Round D: compaction_breadcrumb_io.hpp's platform-independent surface
     # (ValidatedArtifactName / is_traversal_safe_name) -- the POSIX openat/
     # linkat/renameat2 half and the Windows NT-native half

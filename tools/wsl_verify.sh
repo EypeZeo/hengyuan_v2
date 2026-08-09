@@ -11,6 +11,21 @@
 #   bash tools/wsl_verify.sh address   # mirrors ci-native-sanitizers.yml's asan-ubsan-full job
 #   bash tools/wsl_verify.sh thread    # mirrors ci-native-sanitizers.yml's tsan-concurrency job
 #   bash tools/wsl_verify.sh all       # all three in sequence
+#
+# Round D's real libFuzzer harness (fuzz_compaction_intent_codec, Clang-only,
+# -DHY_BUILD_FUZZ=ON) is NOT covered by any mode above -- this toolchain is
+# GCC-14, and the fuzz target's CMake registration itself hard-errors if the
+# active compiler isn't Clang (see native/CMakeLists.txt). The
+# GCC/MSVC-buildable corpus runner (test_compaction_intent_codec_corpus_
+# runner) that exercises the same checked-in seeds through the same target
+# function IS part of the default `ctest` run in every mode above -- that is
+# this script's actual coverage of that codec's fuzz corpus. A real Clang
+# fuzzing run is `cmake -DCMAKE_CXX_COMPILER=clang++ -DHY_BUILD_FUZZ=ON ...`
+# followed by `ctest -L fuzz` (selects only the bounded smoke test) or running
+# the fuzz_compaction_intent_codec binary directly for an extended campaign --
+# neither belongs in this script's default/no-flag `ctest` invocations, to
+# keep this script's own tail latency unaffected by a workload it can't even
+# build with the toolchain it targets.
 
 set -euo pipefail
 
