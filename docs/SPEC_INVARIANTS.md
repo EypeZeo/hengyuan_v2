@@ -687,9 +687,10 @@ TLA+ 模型继续排除 compaction 的完整 fault-injection 矩阵（`formal/RE
 - Round D（本轮）：真实 codec + Intent genesis-only + 只读诊断 + candidate-scoped 租约 + keyed
   key pin。不推进 Intent phase，不写 `.x1`，不写 `.xgc`。
 - Round E（未来）：真实 C/A codec；`SealIdWatermark`/`SealExportStarted` 等真实 durable 前置
-  事实的 codec/验证；只有这些都存在之后，phase 推进能力才能被安全地暴露为 production API（且
-  必须要求调用方持有由这些真实 codec 产出的不可伪造 receipt，manager 重新验证 receipt+Intent+
-  当前文件状态，不接受裸的 to_phase/ID 参数）。
+  事实的 codec/验证（Slice 1 已启动，见下面"Seal-journal Round E Slice 1"小节）；只有这些都存在
+  之后，phase 推进能力才能被安全地暴露为 production API（且必须要求调用方持有由这些真实 codec
+  产出的不可伪造 receipt，manager 重新验证 receipt+Intent+当前文件状态，不接受裸的 to_phase/ID
+  参数）。
 - Round F（未来，依赖 D+E）：真实 `.xgc` CREATE/reconstruction；`TipExportProducerResume`；
   `.x1`/Intent/`.xgc` 物理 GC 尾段；主日志真实 compaction/retention；`KeyRing::retire()` 真正
   可用（前提条件解除）。**本轮完成不等于日志无限增长或 `KeyRing::retire()` 可用性问题已解决——
@@ -730,6 +731,80 @@ TLA+ 模型继续排除 compaction 的完整 fault-injection 矩阵（`formal/RE
 - Clang-only fuzz target 本身未在本地环境验证——两个本地验证环境（Windows/WSL2 Ubuntu-24.04）
   都没有 Clang 工具链；GCC/MSVC 均可跑的确定性语料库 runner 已验证，8 个种子文件（含两个针对
   fuzz target 固定 key 的真实 MAC 有效编码）跑通。
+
+### Seal-journal Round E Slice 1（SealIdWatermark/SealExportStartedWire durable-precondition codec）[计划中]
+
+Round D 自己的"Round D/E/F 边界"（上面）声明 Round E 需要"`SealIdWatermark`/`SealExportStarted` 等
+真实 durable 前置事实的 codec/验证"。这是 Round E 的第一个切片——只做这两个类型的 codec，不做真实 C/A
+（`.clr`/`.abd`）codec，不做 receipt 概念，不做 `raise_intent_phase()` 或任何 phase 推进 API，不接入
+`IntentStore`/`CandidateLease`/任何 manager，不写任何文件。方案本身经过一轮外部（GPT）Architect
+审查——第一版被 REJECT（把 `SealExportStartedWire` 的拓扑校验错误降级成可选项，会放行 MAC 正确但拓扑
+伪造的输入；`SealIdWatermark` 没有 allocator 安全语义），本节是修订后的范围声明。
+
+**`SealIdWatermark`**（`durable_control_plane.hpp:726-736`，字段已经真实、只缺 codec）：
+- Wire 顺序：`store_uuid_lo`(u64)/`store_uuid_hi`(u64)/`next_candidate_id`(u64)/`next_request_id`(u64)/
+  `mac`(u8[32])，共 64 字节，新增 `kSealIdWatermarkWireBytes = 64`。
+- MAC 域：`HMAC(KEK, "HY-SEALIDWM-v1" || store_uuid_lo || store_uuid_hi || next_candidate_id ||
+  next_request_id)`（照抄结构体自己的注释）。没有 `format_version`/`total_bytes`/`kek_key_id` 字段，
+  也没有 peek-kek-key-id 函数。
+- **allocator 安全语义**：decode 拒绝 `next_candidate_id==0` 或 `next_request_id==0`（0 从来不是
+  合法的 candidate_id/request_id，一个持久化的 `next_*==0` watermark 本身就是矛盾/已损坏状态）。
+  `UINT64_MAX` **不**在 decode 阶段拒绝——一个完整 MAC 校验通过的 `UINT64_MAX` 允许被读出（用于
+  recovery 诊断）；真正的上界 fence 是**未来**"reservation API"（推进 watermark 的写路径）递增前的
+  职责，Slice 1 没有任何写路径/reservation API，所以这条约束在这一轮没有代码要写。
+- **明确不做**：跨文件单调性（同一个 store 连续两次读到的 watermark，后一次的 `next_*` 必须
+  >= 前一次）不是单文件 decode 能证明的性质，属于以后 breadcrumb store/recovery 那一层。
+
+**`SealExportStartedWire`**（`durable_control_plane.hpp:910-967`，别名 `SealExportStarted`，本轮从
+`mac[32]`-only 升格为真实字段）：
+- Wire 顺序照抄 `:917-936` 的偏移注释：`format_version`(u32)/`total_bytes`(u32)/`store_uuid_lo`(u64)/
+  `store_uuid_hi`(u64)/`candidate_id`(u64)/`source_generation`(u32)/`baseline_tip_seq`(u64)/
+  `baseline_tip_mac`(u8[32])/`baseline_key_id`(u32)/`new_generation`(u32)/`new_final_seq`(u64)/
+  `new_final_tip_mac`(u8[32])/`new_key_id`(u32)/`request_id`(u64)/`content_root`(u8[32])/
+  `kek_key_id`(u32)/`registered_producer_mask`(u8)/`producer_count`(u8)/`ring_id`(u32[8])/`mac`(u8[32])，
+  共 238 字节（`kSealExportStartedWireBytes`，已存在）。MAC 域：`"HY-SEALSTART-v2"`（照抄 `:952-957`）。
+  `peek_seal_export_started_kek_key_id` 偏移 168。
+- **host struct 不是 wire layout**：238 字节里 u32 后接 u64 会有 C++ 对齐 padding，host `sizeof`
+  几乎肯定不等于 238。禁止 `#pragma pack`/`reinterpret_cast` 序列化/`memcpy(sizeof)`/
+  `offsetof==disk offset`/`static_assert(sizeof==238)`；唯一的 wire 权威是 encoder/decoder 里
+  显式的逐字段 LE 读写（跟 `CompactionCandidateIntentWire` 一个套路）。ABI 测试删掉
+  `sizeof==32u` 之后只断言 `is_trivially_copyable_v`/`is_standard_layout_v` + wire-byte-constant，
+  不对 host `sizeof`/`offsetof` 下注。
+- **拓扑语义校验（`validate_seal_export_started_shape()`，MAC 比较之前运行，fail-fast，跟
+  `compaction_intent_codec.hpp` 已有的 `MalformedField` 检查顺序一致）**：
+  1. `registered_producer_mask` 只含 `[0, kMaxSealHandoffProducers)` 范围内的 bit 且非零；
+  2. `producer_count == popcount(mask)` 且落在 `[1, kMaxSealHandoffProducers]`；
+  3. mask 置位的每个 `ring_id[i]` 非零，未置位的每个 `ring_id[i]` 必须为零；
+  4. 所有置位槽的 `ring_id` 两两不同；
+  5. `candidate_id != 0`、`request_id != 0`、`new_generation == source_generation + 1`（防
+     `source_generation==UINT32_MAX` 溢出）；
+  6. `kek_key_id`/`baseline_key_id`/`new_key_id` 的 0 值——**不做**非零校验：grep 过
+     `key_ring.hpp` 全文，没有找到任何"key_id==0 是保留值/非法值"的既有契约（`Entry.key_id{0}`
+     只是内部空槽位哨兵，不是 wire 层面的禁止值；`CompactionCandidateIntentWire.kek_key_id` 本身
+     也从未拒绝 0）。既然没有既有契约，就不发明一条没有依据的规则——这是显式记录的开放问题，不是
+     遗漏，留给以后如果出现真实契约时再收紧。
+  失败一律返回 `MalformedField`（这个 codec 文件自己定义 `SealJournalPreconditionDecodeStatus`，
+  不复用 `CompactionWireDecodeStatus`——两个类型族没有实际耦合，复用会造成误导）。
+- **decoder 输入长度契约**：跟 `decode_compaction_candidate_intent_wire` 一致，只要求
+  `in.size() >= kSealExportStartedWireBytes`（不够 `Truncated`），只读取/认证前 N 字节，不关心
+  span 后面是否有多余字节——这不是安全漏洞（MAC 只覆盖前 N 字节内容，附加垃圾字节不改变认证结果），
+  "必须恰好 N 字节"这条更严格的契约属于**未来**的 I/O 读取层（照 `read_validated_exact` 的模式），
+  这一轮没有 I/O 层代码。
+
+**落地位置**：新建 `native/include/hengyuan/seal_journal_precondition_codec.hpp`，一个文件同时装
+两个类型的 codec（spec 自己的"Round D/E/F 边界"原文就是把这两个类型并列成一组"durable 前置事实"）。
+Governance: L1（纯内存计算，无文件 I/O）。`VerifiedSealIdWatermark`/`VerifiedSealExportStarted`
+私有构造、按值持有（不保存输入/MAC/key span 的引用），跟 `VerifiedCompactionCandidateIntent` 一个
+套路；所有函数 `noexcept`；`decode_*` 的失败路径先 `out.reset()`，不允许部分填充。
+
+**本轮明确不做**：真实 C/A（`.clr`/`.abd`）codec；receipt 概念；`raise_intent_phase()`；接入
+`IntentStore`/`CandidateLease`/任何 manager；任何文件 I/O；`SealJournalCommitWatermark`/
+`SealJournalTombstoneWire`/`SealExportStartedMigrationWire`/`SealStartedCleanupTombstoneWire`/
+`SealStartedAbandonWire` 的升格（全部保持现状不动）；`SealIdWatermark` 的跨文件单调性证明；
+`SealExportStartedWire` 的 kek_key_id/baseline_key_id/new_key_id 非零校验（开放问题，见上）。
+
+`tools/spec_xref_check.py` 需要把新头文件加入 `SEARCH_FILES`。`spec_enum_diff.py` 这轮不新增
+`enum class`，预期零新发现。
 
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
