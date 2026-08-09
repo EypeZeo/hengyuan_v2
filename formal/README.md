@@ -11,7 +11,10 @@ crash-safety boundary), `freeze_episode_recovery.tla` (the L4 §10 freeze-episod
 probe/Arm/WaitSatisfied/Clear state machine, further down this file), and
 `inflight_lifecycle.tla` (the InFlightRegistry slot lifecycle, added by the full-repo
 audit — see its own section at the bottom). Each has its own config table and MUST be
-run separately.
+run separately. Two further models closed the audit's remaining named gaps:
+`key_rotation.tla` (the two-step key rotation crash protocol, KEY-ROTATE-008) and
+`depth_snapshot_bootstrap.tla` (the Binance depth snapshot bootstrap state machine,
+MD-BOOK-002) — see their sections below.
 
 ## Setup (one-time)
 
@@ -327,11 +330,223 @@ counterexample above is 2 states deep. Re-run this pair whenever the model chang
 
 ### Still not modeled
 
-Two-step key rotation (`rotate_active_key()`'s sidecar-then-reanchor protocol, audit
-KEY-ROTATE-008) and the depth-snapshot bootstrap state machine (MD-BOOK-002) remain
-unmodeled. Both defects were found by hand and are fixed with unit-level regression
-tests; a model for the rotation protocol in particular would be worth writing, since its
-crash window is exactly the kind of thing tests reach only by construction.
+The full-repository audit's three findings (EXEC-INFLIGHT-003, KEY-ROTATE-008,
+MD-BOOK-002) are now all closed: `inflight_lifecycle.tla` above covers the first,
+`key_rotation.tla` and `depth_snapshot_bootstrap.tla` below cover the other two. Each
+was fixed in production code with unit-level regression tests first; the models exist
+to exhaustively check the crash/interleaving windows those tests reach only by
+construction.
+
+---
+
+## `key_rotation.tla` — two-step key rotation, crash safety (audit KEY-ROTATE-008)
+
+The first of the two models that close this file's former "Still not modeled" list.
+`rotate_active_key()` is a two-step DURABLE protocol
+(`native/include/hengyuan/durable_audit_sink.hpp:502-551`): (1) append a `KeyRotated`
+frame to the SIDECAR log plus the sidecar's own tip anchor — two separate fsyncs, each
+independently crash-able; (2) re-anchor the MAIN log's tip under the new key — legally
+skipped when the main log is empty. Only after both steps are durable does
+`active_key_id_` flip. A crash between the two steps leaves the sidecar saying
+"rotated to N" while the main tip anchor is still signed under the old key.
+
+Recovery (`finalize_scan_with_anchor_check()`, lines 790-862) accepts that mismatch and
+completes step 2 ONLY when all three of these hold — and only then:
+
+- (a) the restart is configured with the NEW key,
+- (b) the sidecar's last record proves old→new (note: the sidecar FRAME scan is what
+  establishes `last_rotation_`, line 934; a torn sidecar anchor only sets
+  `rotation_fenced_`, which gates future rotations, not the repair),
+- (c) the main anchor is still signed by the OLD key.
+
+Any other mismatch is Corrupt: the sink fences permanently and nothing is auto-repaired
+(lines 843-845). The review checklist's parenthetical (that a torn sidecar anchor must
+also force Corrupt) does NOT match the shipped code: the frame alone establishes the
+proof the repair consults, so the model follows the code — a torn sidecar anchor plus
+the (a)(b)(c) triple still repairs. The model's regression control is calibrated to the
+code's actual rule.
+
+`key_ring.hpp`'s retention lifecycle (audit KEY-RETIRE-009) is modeled as a separate
+boot-level fact (`ring_keys`): a key that ever signed retained content must still be
+loadable at recovery, or the scan fails closed — "the active key flipped" is not "the
+old key is retired".
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `key_rotation.cfg` | **No error found** — the current design |
+| `key_rotation_onestep_bug.cfg` | **`RepairOnlyOnProvenMismatch` violated** — regression control |
+| `key_rotation_liveness.cfg` | **No error found** — `EventualConsistencyOrFenced` holds |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -config key_rotation.cfg key_rotation.tla
+```
+
+**Why the control must fail.** `RepairOnlyWhenProven = FALSE` reinstates the simpler
+(but wrong) protocol the review explicitly warned against: recovery decides whether to
+re-anchor from the main anchor's key_id alone — mismatch vs the configured key ⇒
+rewrite — ignoring the sidecar proof entirely. That turns an operator
+misconfiguration (restart configured with the new key while no rotation ever happened,
+or a stale config after a completed one) into a silently "repaired" log instead of the
+required fail-closed Corrupt + fence — exactly the unauthorized-identity-swap class of
+confusion the sidecar consultation exists to prevent. If it ever stops failing, the
+model has stopped discriminating the protection KEY-ROTATE-008 added, and every clean
+run of the main config is worth correspondingly less — same inversion discipline as
+`durable_log_recovery_buggy.cfg` and the TSan negative controls.
+
+**Crash cuts explored.** The `Crash` action fires from every Running state, so TLC
+reaches every cut exhaustively, including: before step 1 (nothing durable); between the
+sidecar frame and the sidecar anchor (torn sidecar); between step 1 and step 2 (the
+canonical interrupted rotation, repaired); inside step 2's anchor write (torn main
+anchor, `"none"` → fail closed); after step 2 (rotation complete); and around an
+empty-log rotation (step 2 legally skipped — recovery is Clean, never a repair).
+Combined with the boot's nondeterministic choice of configured key and ring contents,
+every (config, durable-state) mismatch combo is reached.
+
+**Invariant-to-code map.**
+
+| Invariant | Real code it pins |
+|---|---|
+| `RepairOnlyOnProvenMismatch` | the (a)(b)(c) gate at `durable_audit_sink.hpp:843-847`; negative controls `AnchorKeyMismatchNotProvenBySidecarIsStillCorrupt` / `NoRotationMeansAnchorKeyMismatchIsCorrupt` |
+| `NoDataUnverifiableAfterRotation` | KEY-RETIRE-009's fail-closed lookups at lines 670/748/812 (`key_ring.hpp` `retire()`/`active_key()`); tests `ObservedKeyIdsReportsEveryKeyThatSignedTheLog` / `RetiringAnObservedKeyIsWhatBreaksRecovery` |
+| `IoFailureFencesRotationOrSink` | the self-fencing failure branches at lines 519-523 / 528-532 / 541-545 |
+| `FlipOnlyAfterStepsDurable` | the durable-before-flip ordering documented at lines 480-496 |
+| `AnchorImpliesNonEmptyLog` | structural: the anchor is only ever written behind a frame |
+| `EventualConsistencyOrFenced` (liveness) | recovery always lands in repair-consistent or fail-closed-fenced (lines 796-862) |
+
+**The liveness fairness assumption, and why it is honest.** "A crash between the two
+steps eventually restores a consistent state" is only checkable under (1) a bounded
+crash budget (`MaxCrashes`, an action guard — never a `CONSTRAINT`: a pruned successor
+set makes TLC's liveness checker treat stuttering as a legal infinite behavior, the
+exact trap `durable_log_recovery_liveness.cfg`'s comment documents) and (2)
+`WF_vars(RecoveryScan)`. That fairness corresponds to a real operating fact: a crashed
+process is restarted by the supervisor, and `DurableAuditSink`'s constructor
+unconditionally runs both recovery scans (`durable_audit_sink.hpp:320-331`), completing
+an interrupted rotation's step 2 inside that same constructor (lines 746-754). The
+model assumes the re-anchor I/O eventually succeeds; a transient failure returns
+IoError and fences, and the next restart's scan re-attempts it — the same supervisor
+loop.
+
+### Recorded results (2026-08-09, TLC 2.19, Java 25)
+
+| Config | States (distinct) | Depth | Exit | Result |
+|---|---|---|---|---|
+| main | 346 | 10 | 0 | no error |
+| onestep_bug | 318 | — | 12 | `RepairOnlyOnProvenMismatch` violated ✓ |
+| liveness | 346 | 10 | 0 | no error (`EventualConsistencyOrFenced` holds) |
+
+The regression control's counterexample is `RecoveryScan(boot old) → AppendFirst →
+Crash → RecoveryScan(boot new, unproven repair)` — the operator-misconfig path needs no
+torn writes or exotic cuts to reach.
+
+### Files
+
+- `key_rotation.tla` — the model.
+- `key_rotation*.cfg` — see the table above.
+
+---
+
+## `depth_snapshot_bootstrap.tla` — Binance depth snapshot bootstrap (audit MD-BOOK-002)
+
+The second model closing this file's former "Still not modeled" list. `DepthManager`
+(`native/include/hengyuan/depth_manager.hpp`) is a single-owner, synchronous,
+in-memory state machine: Buffering → (REST snapshot) → Syncing → (replay) → Tracking,
+with `start_buffering()` resync back to Buffering. This is NOT a crash-safety model —
+there is no persistence and no concurrency here, and none is invented: the
+`SnapshotRefreshGate` worker/mailbox (`snapshot_refresh_gate.hpp`) is a separate
+subsystem whose own header defers TLA+ modeling of it to a future round, so the whole
+fetch+apply cycle is abstracted to one atomic action.
+
+The model is built on the real `U`/`u` window semantics of Binance depthUpdate events:
+each event carries `[U, u]` (first/last update id covered), and the replay's continuity
+rules (`apply_snapshot()`, lines 147-202) are modeled branch-for-branch: per-event
+stale drop (`u <= lastUpdateId`), first-kept bridge check (`U <= lastUpdateId+1`), the
+Tracking gap check (`U > last_applied_u + 1` ⇒ re-buffer the gap event itself), and
+`OrderBook::apply_delta()`'s outcome never changing the control flow
+(`record_apply_result()`, lines 210-221 — the sequence is consumed even on
+OutsideWindow/InvalidInput).
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `depth_snapshot_bootstrap.cfg` | **No error found** — the current design |
+| `depth_snapshot_bootstrap_drop_before_snapshot_bug.cfg` | **`TrackingImpliesBookConsistent` violated** — regression control #1 |
+| `depth_snapshot_bootstrap_overflow_still_track_bug.cfg` | **`NoOverflowThenTracking` violated** — regression control #2 |
+| `depth_snapshot_bootstrap_first_bridge_disabled_bug.cfg` | **`FirstBridgeConstraint` violated** — regression control #3 |
+| `depth_snapshot_bootstrap_liveness.cfg` | **No error found** — `EventualBootstrap` holds |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -config depth_snapshot_bootstrap.cfg depth_snapshot_bootstrap.tla
+```
+
+### Why three configs must fail
+
+- **`_drop_before_snapshot_bug`** (`BufferEventsInBuffering = FALSE`) reinstates the
+  drop-before-snapshot behavior: events arriving while Buffering are discarded instead
+  of buffered for replay. The real replay has NO mid-buffer continuity check after the
+  first kept event (lines 172-197), so the hole is invisible to the machine itself:
+  it enters Tracking on a book that diverges from a never-drop reference. The violated
+  invariant is the bootstrap-complete consistency check (`TrackingImpliesBookConsistent`
+  ≈ `book_consistent`); the protection mechanism disabled is the Buffering branch of
+  `on_depth_event()` (lines 104-122, tests `BuffersEventsBeforeSnapshot` /
+  `OverflowedBufferForcesResyncInsteadOfTracking`).
+- **`_overflow_still_track_bug`** (`RejectSnapshotOnOverflow = FALSE`) reinstates
+  applying a snapshot over a known-incomplete buffered prefix: the fail-closed overflow
+  gate at lines 150-158 is disabled, so the machine enters Tracking with
+  `buf_overflowed_` still set — a silent hole it will never notice. Violates
+  `NoOverflowThenTracking` (test `OverflowedBufferForcesResyncInsteadOfTracking`).
+- **`_first_bridge_disabled_bug`** (`CheckFirstBridge = FALSE`) reinstates entering
+  Tracking without verifying `U <= lastUpdateId+1` on the first kept event — a book
+  built across the snapshot/stream boundary gap. Violates `FirstBridgeConstraint`
+  (lines 181-189, test `ResyncOnGapInBufferedEvents`).
+
+If any of the three ever stops failing, the model has stopped discriminating that
+protection, and every clean run of the main config is worth correspondingly less.
+
+**Invariant-to-code map.**
+
+| Invariant | Real code it pins |
+|---|---|
+| `NoOverflowThenTracking` | `apply_snapshot()`'s overflow rejection, `depth_manager.hpp:150-158` |
+| `StaleIncrementsDropped` | the replay's per-event drop, lines 176-179 |
+| `FirstBridgeConstraint` | the first-kept bridge check, lines 181-189 |
+| `TrackingGapForcesRebuffer` | the Tracking gap branch incl. the re-buffered event itself, lines 124-133 |
+| `SequenceAlwaysConsumedOnRejection` | `record_apply_result()` + the unconditional `last_applied_u_ = u`, lines 135-138, 210-221 |
+| `TrackingImpliesBookConsistent` | the never-drop reference comparison (`book_consistent`, modeled as `~episode_dropped`) |
+| `EventualBootstrap` (liveness) | the resync/fetch loop eventually lands in Tracking |
+
+**The liveness fairness assumption, and why it is honest.** `EventualBootstrap` is
+checked with `WF_vars(ApplySnapshot(S))` per snapshot value and a bounded delivery
+budget (`MaxDeliveries`, an action guard — the same no-`CONSTRAINT` discipline as every
+liveness config in this directory). The fairness corresponds to a real operating fact:
+the hot thread polls `needs_snapshot()` every iteration and `SnapshotRefreshGate`
+fetches asynchronously, retrying after each failure's finite `kCooldown`
+(`snapshot_refresh_gate.hpp`) — so the fetch+apply cycle is eventually taken and
+eventually succeeds, and every fetch-reject / bridge-resync cycle consumes the delivery
+budget, so after finitely many cycles a fetch lands in Tracking.
+
+### Recorded results (2026-08-09, TLC 2.19, Java 25)
+
+| Config | States (distinct) | Depth | Exit | Result |
+|---|---|---|---|---|
+| main | 198,202 | 11 | 0 | no error |
+| drop_before_snapshot_bug | 48 | — | 12 | `TrackingImpliesBookConsistent` violated ✓ |
+| overflow_still_track_bug | 1,208 | — | 12 | `NoOverflowThenTracking` violated ✓ |
+| first_bridge_disabled_bug | 1,160 | — | 12 | `FirstBridgeConstraint` violated ✓ |
+| liveness | 198,202 | 11 | 0 | no error (`EventualBootstrap` holds) |
+
+The drop-before-snapshot counterexample is four states deep (Init → two dropped
+deliveries → snapshot applied over the incomplete prefix), matching how directly the
+defect reaches a diverged book.
+
+### Files
+
+- `depth_snapshot_bootstrap.tla` — the model.
+- `depth_snapshot_bootstrap*.cfg` — see the table above.
 
 ---
 
