@@ -9,21 +9,28 @@
 // §10.1/10.2/10.3 procedural prose, which contain zero named types and stay
 // permanently excluded).
 //
-// SCOPE, read this before trusting anything below: every test in this file
-// is a MARKER-DECLARATION test (compile-time shape + numeric constant
-// checks), NOT a wire-serialization test. These three types have no encode/
-// decode anywhere in this codebase -- CompactionIntentGcAuthorizedWire's
-// cleanup_auth_flags/terminal_disposition/phase fields exist only in a
-// comment describing the packed on-disk layout, not as real, readable C++
-// struct members (same mac[32]-only pattern as every other Wire type in this
-// file). That means there is no way to test "does disposition X require flag
-// combination Y" here -- there's no field to read a disposition or a flags
-// value FROM. Those combination-validity tests, along with fault-injection
-// crash-matrix tests, candidate-ownership/concurrency tests, and Windows/
-// POSIX no-replace-publish tests, all require a real codec to exist first;
-// see docs/SPEC_INVARIANTS.md's "Seal-journal Round C" entry, "为未来
-// codec/recovery 轮记录的设计输入" subsection, for what that future round
-// needs to implement and verify.
+// SCOPE (updated for Round D, docs/SPEC_INVARIANTS.md's "Seal-journal Round
+// D" entry): as of Round C these three types were mac[32]-only markers and
+// every test below was purely a compile-time shape/constant check. Round D
+// promotes them to real, readable fields and adds a real codec
+// (compaction_intent_codec.hpp) -- see test_compaction_intent_codec.cpp for
+// the round-trip/tamper/semantic-validation coverage that file now owns.
+// This file keeps only what it originally covered well: is_trivially_
+// copyable/is_standard_layout, and the free constexpr constants (format
+// versions, phase/disposition/flag values) that were never struct members
+// to begin with. The `sizeof(...)==32u` assertions are gone -- they only
+// ever measured the marker-only shape (a lone trailing mac[32]), and now
+// that these structs carry real fields, sizeof is no longer pinned to wire
+// byte count (this file's own established rule for every other Wire type:
+// in-memory layout is never asserted equal to on-disk wire size -- the wire
+// byte count is proven by the codec's encode() return value and round-trip
+// tests, not by sizeof(struct)).
+//
+// Combination-validity tests (e.g. "does disposition X require flag
+// combination Y"), fault-injection crash-matrix tests, candidate-ownership/
+// concurrency tests, and Windows/POSIX no-replace-publish tests all live in
+// test_compaction_intent_codec.cpp / test_compaction_lease.cpp /
+// test_compaction_intent_store.cpp, not here.
 //
 // See test_durable_control_plane_abi.cpp's own header comment for the full
 // caution about what these tests can and cannot prove -- short version: only
@@ -63,11 +70,10 @@ using hy::CompactionCandidateIntentWire;
 using hy::CompactionIntentGcAuthorizedWire;
 using hy::CompactionIntentTransitionWire;
 
-// All three types below are "Wire" structs with only a trailing mac[32]
-// member (the full packed on-disk layout is documented in a comment, not
-// materialized as fields) -- same treatment as every other Wire type in this
-// family. sizeof is meaningful here for the same reason it was for
-// SealJournalTombstoneWire / the Round B Started quintet.
+// All three types below now carry real fields (Round D) -- the shape/layout
+// checks here are is_trivially_copyable/is_standard_layout plus the free
+// constexpr constants; see this file's header comment for why sizeof is not
+// asserted against wire byte count.
 
 // --- CompactionCandidateIntentWire (spec L4 §10 / BINANCE:3375) ---
 
@@ -77,8 +83,7 @@ TEST(CompactionCandidateIntentWire, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
-TEST(CompactionCandidateIntentWire, MarkerDeclarationShapeIsJustTheTrailerMac) {
-    EXPECT_EQ(sizeof(CompactionCandidateIntentWire), 32u);
+TEST(CompactionCandidateIntentWire, FormatVersionAndWireByteConstantsMatchSpec) {
     EXPECT_EQ(kCompactionCandidateIntentFormatVersion, 1u);
     EXPECT_EQ(kCompactionCandidateIntentWireBytes, 140u);
 }
@@ -102,8 +107,7 @@ TEST(CompactionIntentTransitionWire, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
-TEST(CompactionIntentTransitionWire, MarkerDeclarationShapeIsJustTheTrailerMac) {
-    EXPECT_EQ(sizeof(CompactionIntentTransitionWire), 32u);
+TEST(CompactionIntentTransitionWire, FormatVersionAndWireByteConstantsMatchSpec) {
     EXPECT_EQ(kCompactionIntentTransitionFormatVersion, 1u);
     EXPECT_EQ(kCompactionIntentTransitionWireBytes, 176u);
 }
@@ -116,8 +120,7 @@ TEST(CompactionIntentGcAuthorizedWire, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
-TEST(CompactionIntentGcAuthorizedWire, MarkerDeclarationShapeIsJustTheTrailerMac) {
-    EXPECT_EQ(sizeof(CompactionIntentGcAuthorizedWire), 32u);
+TEST(CompactionIntentGcAuthorizedWire, FormatVersionAndWireByteConstantsMatchSpec) {
     EXPECT_EQ(kCompactionIntentGcAuthorizedFormatVersion, 2u);
     EXPECT_EQ(kCompactionIntentGcAuthorizedWireBytes, 316u);
     // Legacy v1/204B is fail-closed only, never an active write format --

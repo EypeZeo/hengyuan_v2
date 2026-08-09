@@ -1128,22 +1128,28 @@ static_assert(std::is_standard_layout_v<SealStartedAbandonWire>);
 // the spec's own words: "the single densest individual type in the whole
 // section").
 //
-// DECLARATION-ONLY, same governance as every Wire type in this file since
-// round 1 -- see this file's top-of-file SCOPE paragraph ("not an
-// implementation of the durable log... no wire (de)serialization"). After
-// this round, every type L4 §10 names is transcribed; the only thing left
+// DECLARATION-ONLY as of Round C -- same governance as every Wire type in
+// this file since round 1 -- see this file's top-of-file SCOPE paragraph
+// ("not an implementation of the durable log... no wire (de)serialization").
+// After Round C, every type L4 §10 names is transcribed; the only thing left
 // out of this file is the crash-window table and §10.1/10.2/10.3 procedural
 // prose (BINANCE_PRIVATE_REST_L4_SPEC.md:5080-5327), which contain zero named
 // types and stay permanently excluded (same treatment as
-// DurableControlPlaneSink's un-implemented method bodies). That means this
-// round can claim "L4 §10's named types are all declared" -- it CANNOT claim
-// ".x1/.xgc persistence, GC, or recovery are implemented," because (same as
-// every other type here) these three structs are mac[32]-only: no encode/
-// decode, no filesystem publish, no MAC verification, no recovery state
-// machine, no concurrency/ownership protocol exists for them anywhere in this
-// codebase. See docs/SPEC_INVARIANTS.md's "Seal-journal Round C" entry for
-// the design input recorded for a future codec/recovery round that would
-// actually implement this.
+// DurableControlPlaneSink's un-implemented method bodies).
+//
+// UPDATE (Round D, docs/SPEC_INVARIANTS.md's "Seal-journal Round D" entry):
+// these three structs are promoted from mac[32]-only markers to real fields,
+// and compaction_intent_codec.hpp gives them real encode/decode + MAC
+// verification. That still does NOT mean ".x1/.xgc persistence, GC, or
+// recovery are implemented" in the full L4 §10 sense -- Round D's only
+// production write path is Intent genesis (CREATE_NEW, phase=Building); no
+// production code path writes a `.x1` transition receipt, raises Intent
+// phase, or creates a `.xgc` GC-authorization file (that requires real C/A
+// codec + an authenticated capture receipt this codebase doesn't have yet --
+// see Round D's ledger entry for why six design revisions converged on this
+// boundary). `SealStartedCleanupTombstoneWire`/`SealStartedAbandonWire` and
+// the rest of this file's Wire types are untouched by Round D and remain
+// mac[32]-only declaration-layer, same as before.
 // ===========================================================================
 
 // --- CompactionCandidateIntentWire ---
@@ -1254,6 +1260,29 @@ struct CompactionCandidateIntentWire {
     // terminal path and those names are already gone / finishable);
     // Forbidden: clear Intent without prior durable matching `.xgc`;
     // Forbidden: unlink any matching `.x1` without prior durable `.xgc`.
+    //
+    // Round D promotes this struct from mac[32]-only marker to real fields
+    // (docs/SPEC_INVARIANTS.md's "Seal-journal Round D" entry) -- encode/decode
+    // is field-by-field in compaction_intent_codec.hpp, never memcpy of this
+    // struct as the disk format, so in-memory padding here is irrelevant to
+    // wire correctness (same rule this file states at the top for every
+    // other Wire type).
+    std::uint32_t format_version{kCompactionCandidateIntentFormatVersion};
+    std::uint32_t total_bytes{kCompactionCandidateIntentWireBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint32_t kek_key_id{0};
+    std::uint8_t phase{kCompactionCandidateIntentPhaseBuilding};
+    std::uint8_t reserved0{0};
+    std::uint16_t reserved1{0};
+    std::uint32_t source_generation{0};
+    std::uint32_t target_generation{0};
+    std::uint64_t baseline_tip_seq{0};
+    std::uint8_t baseline_tip_mac[32]{};
+    std::uint32_t baseline_key_id{0};
+    std::uint64_t build_nonce{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t request_id{0};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<CompactionCandidateIntentWire>);
@@ -1328,6 +1357,28 @@ struct CompactionIntentTransitionWire {
     // foreign build_nonce / wrong baseline while Intent exists -> Corrupt.
     // Hot-path: preallocated fixed 176B buffer; no heap; no std::string.
     // Control-plane I/O only.
+    //
+    // Round D promotes this struct from mac[32]-only marker to real fields;
+    // see the note on CompactionCandidateIntentWire above (field-by-field
+    // codec, never memcpy of this struct as the disk format).
+    std::uint32_t format_version{kCompactionIntentTransitionFormatVersion};
+    std::uint32_t total_bytes{kCompactionIntentTransitionWireBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint32_t kek_key_id{0};
+    std::uint8_t from_phase{0};
+    std::uint8_t to_phase{0};
+    std::uint16_t reserved0{0};
+    std::uint32_t transition_seq{0};
+    std::uint32_t source_generation{0};
+    std::uint32_t target_generation{0};
+    std::uint64_t baseline_tip_seq{0};
+    std::uint8_t baseline_tip_mac[32]{};
+    std::uint32_t baseline_key_id{0};
+    std::uint64_t build_nonce{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t request_id{0};
+    std::uint8_t prev_transition_mac[32]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<CompactionIntentTransitionWire>);
@@ -1509,6 +1560,40 @@ struct CompactionIntentGcAuthorizedWire {
     // legacy v1 204B admitted as Mode B.
     // Hot-path: preallocated fixed 316B buffer; no heap; no std::string.
     // Control-plane I/O only.
+    //
+    // Round D's codec can decode/verify this type (for fail-closed recognition
+    // of a `.xgc` that might already exist on disk) but no Round D production
+    // code path ever constructs/publishes one -- see docs/SPEC_INVARIANTS.md's
+    // "Seal-journal Round D" entry for why (CREATE requires DurableCleanupAuth
+    // Evidence this round has no way to authenticate). Field-by-field codec,
+    // never memcpy of this struct as the disk format.
+    std::uint32_t format_version{kCompactionIntentGcAuthorizedFormatVersion};
+    std::uint32_t total_bytes{kCompactionIntentGcAuthorizedWireBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint32_t kek_key_id{0};
+    std::uint8_t terminal_disposition{0};
+    std::uint8_t intent_phase_at_auth{0};
+    std::uint16_t reserved0{0};
+    std::uint32_t source_generation{0};
+    std::uint32_t target_generation{0};
+    std::uint64_t baseline_tip_seq{0};
+    std::uint8_t baseline_tip_mac[32]{};
+    std::uint32_t baseline_key_id{0};
+    std::uint64_t build_nonce{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t request_id{0};
+    std::uint8_t intent_mac[32]{};
+    std::uint8_t terminal_transition_mac[32]{};
+    std::uint8_t cleanup_auth_flags{0};
+    std::uint8_t started_kind{0};
+    std::uint8_t present_mask_at_auth{0};
+    std::uint8_t reserved1{0};
+    std::uint64_t proof_new_final_seq{0};
+    std::uint8_t proof_new_final_tip_mac[32]{};
+    std::uint32_t proof_new_key_id{0};
+    std::uint8_t proof_content_root[32]{};
+    std::uint8_t gate_trailer_mac[32]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<CompactionIntentGcAuthorizedWire>);

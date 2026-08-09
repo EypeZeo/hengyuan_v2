@@ -600,6 +600,137 @@ encode/decode、真实文件发布、MAC 验证、恢复状态机、并发锁）
   `SealJournalIntakeCloseControl` 的拓扑字段必须先由 owner 复制成不可变快照，再进入任何 MAC 输入，
   不能在编码时读取会被其他线程并发修改的 live 控制块。
 
+### Seal-journal Round D（CompactionCandidateIntent codec/genesis 落地，六版方案演进记录）[已实现]
+
+上面记录的 codec/recovery 设计输入的第一个真实实现轮，已落地并通过 MSVC + WSL2/GCC-14 双工具链
+验证（见本节末尾"实测证据"）。方案在提交实现代码之前经过六轮外部（GPT）Architect 审查，前五版
+均被 REJECT——逐条记录被拒理由，避免以后重新踩同样的坑：
+
+- **第一版**：设想中的 CompactionIntentManager 的 `.xgc` CREATE 依赖调用方传入未经验证的
+  GateCaptureEvidence（这两个名字从未落地实现，仅存在于第一版方案文字里）——HMAC 只证明"持
+  key 的写入者"，不证明"gate 事实为真"；真实 C/A
+  （`.clr`/`.abd`）codec 在这个仓库里完全不存在，任何调用方都能构造一个"看起来合法"的证据签发
+  永久性的 GC 授权。
+- **第二版**：收回了 `.xgc`-from-evidence，但 `authorize_preseal_building_clear()`（Building
+  现状不能证明"没有遗留 Started/journal/C/A/generation 文件"）和通用 `raise_intent_phase()`
+  （Intent/`.x1` 自洽不能证明 watermark/started/C-A-bridge-tip-journal 这些本轮不存在的 durable
+  事实真的发生过）是同一个问题换皮；另外发现 ID 生命周期规则自相矛盾（Building 要求 id=0、
+  Reserved+ 要求 id≠0、immutable 比较又要求 REPLACE 前后逐字节相等，连
+  `Building→Reserved` 第一次合法转移都构造不出来），以及 `KeyRing::pin_active_key()` 无参数——
+  `KeyRing` 本身允许多个 live key，无参数版本在 rotation 后会选错 key。
+- **第三版**：收窄到"codec + genesis-only"（这个方向本身被审查认可，此后未再被推翻），但
+  `CandidateLease` 按路径检查身份之后仍按路径打开 artifact——检查和打开之间存在 TOCTOU 窗口，
+  candidate 目录可以被 rename/recreate（不需要 symlink），锁保护的是旧 handle，写入却落到新目录。
+- **第四版**：修了 directory-handle TOCTOU（POSIX `openat`/`linkat`/`renameat2`，Windows NT
+  handle-relative），但 `CandidateLease::dir_handle()` 公开返回 `const CandidateDirHandle&`——
+  `const` 只限制 C++ 成员访问，不限制底层文件系统副作用，调用方能保存引用跨线程用、在
+  release/move 之后继续用，绕过"同一 candidate 单写者"约束；`PinnedKeyHandle` 只在 **debug
+  build** 断言 `KeyRing` 析构时 pin 计数为零，**Release 下是真实的 use-after-free**。
+- **第五版**：收回了公开 handle、`KeyRing` 全 build type fail-closed 析构，这两个 P0 被认可
+  关闭。但 `CandidateLease` 仍公开接受任意 `std::string_view` 文件名的
+  `publish_no_replace`/publish_replace/read_exact/unlink_file（后三个同样从未落地，仅存在于
+  第五版方案文字里）——目录 handle 只固定了
+  pathname resolution 的起点，**不会自动挡住 `..`**，任何拿到 `CandidateLease` 的代码理论上都能
+  用 `../sibling` 之类的名字逃出目录写/删任意 sibling 文件，让"Round D 只有 genesis 一个写操作"
+  这句范围声明变成假的；另外 `release()` 是一个没有 owner-thread 检查的 `void` 方法，可以被非
+  owner 线程在 owner 正在发起 I/O 时并发调用，关掉一个还在用的 handle。
+- **第六版（本轮采用）**：`CandidateLease` 公开面收窄到只剩生命周期状态查询
+  （`acquire`/`release`/`held`/`fenced`/`last_identity_diagnostic`），不导出任何 handle 类型；
+  真正的读写是唯一 friend `IntentStore` 才能调用的私有 typed 方法
+  （`create_intent_genesis_no_replace`/`read_intent_genesis`/`read_x1_frame`），文件名不是
+  参数——编译期固定字面量或受限 hex 格式化，物理上没有字符串输入面可以被用来路径穿越；
+  `owner_thread_hash_`/`held_`/`fenced_` 全部改成 `std::atomic`，`release()` 返回
+  `ReleaseStatus{Released,WrongOwner,NotHeld}`，非 owner 调用在触碰任何 handle 之前就已经
+  返回；identity 不匹配变成 sticky fence，附带固定大小、不含堆分配字符串的
+  `CandidateIdentityDiagnostic`。
+
+**本轮最终范围**：
+1. 三个类型（`CompactionCandidateIntentWire`/`CompactionIntentTransitionWire`/
+   `CompactionIntentGcAuthorizedWire`）从 `mac[32]`-only 升格为真实具名字段，加 offset/size
+   `static_assert`；真实 encode/decode（固定 `std::array` 缓冲，MAC 域字符串复用既有注释里的
+   `HY-COMPINTENT-v1`/`HY-COMPINTENT-X-v1`/`HY-COMPINTENT-GC-v2`，`constant_time_equal` 比较）；
+   `.xgc` 204B legacy fail-closed；decode 成功返回不可绕过的
+   `VerifiedCompactionCandidateIntent`/`VerifiedTransition` 类型，MAC 已验证是类型层面的前置
+   条件而不是运行时的希望。
+2. 完整语义校验规则（ID 生命周期两层拆分——永久不可变字段 vs. `Building→Reserved` 唯一一次
+   `0/0→nonzero/nonzero`；完整 `.x1` 链校验；`validate_intent_transition()` 纯函数）——为
+   Round E/F 固化规则，**本轮生产代码不调用它来产生真实转移**，只在 codec/property 测试里覆盖。
+3. `IntentStore`：唯一写操作是 `create_building_intent()`（Intent genesis，phase=Building，
+   candidate_id/request_id 均为 0，CREATE_NEW/no-replace）；两个只读诊断
+   （`load_and_validate_intent`/`inspect_x1_chain`）+ `load_and_match_building_genesis()`（复用
+   codec 的永久不可变字段比较，不重写比较逻辑）。**没有 `raise_intent_phase()`，没有任何 `.x1`
+   写入方法，没有任何 `.xgc` 写入方法**——这是本轮反复被审查纠正之后收敛出的边界：genesis
+   不依赖任何本轮无法验证的 durable 事实（不需要 watermark/started/gate 证据），是唯一被证明
+   安全的写操作。
+4. `CandidateLease`：candidate-directory-scoped，文件身份绑定（POSIX `openat`/`linkat`/
+   `renameat2`，Windows NT handle-relative，`windows_native_io.hpp` 承载），owner-thread
+   confined（atomic 字段，无 mutex），identity mismatch 触发 sticky fence。
+5. `KeyRing::pin_key(key_id)`（按 wire 里解出来的 `kek_key_id` 键控，不是无参数版本）+
+   `retire()` 迁移到 `RetireStatus`；`~KeyRing()` 全 build type fail-closed（活跃 pin 非零直接
+   `std::terminate()`）。
+6. `RoundDActual.tla`（只建模本轮真实公开的 API，三个 model switch 对应六轮审查里三个有真实
+   反例的安全性发现——HandleRelativeIo=v3 TOCTOU、HandleEncapsulated=v4 handle 逃逸、
+   OwnerThreadCheckedOnRelease=v5 release() 无 owner 检查——每个切到 FALSE 都必须让对应
+   invariant 违反，否则说明模型已经不再能区分它本该证明的那个历史发现）+ `RoundEFDesign.tla`
+   （未来完整设计的独立模型，不接入 Round D 的 production traceability，没有回归控制——本轮
+   没有真实事故可以拿来回归，防止被误读为"已实现"）。
+7. Clang-only fuzz target（独立 `LABELS fuzz`，带 timeout/seed/RSS 上限，不进默认 CTest）+
+   GCC/MSVC 都能跑的确定性 corpus runner（两者调用同一个 fuzz target 函数，不会各测各的）。
+
+**本轮明确不做**（不是疏漏，是六轮审查反复确认过的范围切割）：真实 C/A（`.clr`/`.abd`）codec；
+`TipExportProducerResume`（本仓库目前不存在这个符号）；任何 `.x1`/`.xgc` 写入/GC/物理清理；
+完整 §10.3 CURRENT-flip 世代切换集成；主 `DurableLogStore` 文件的真实物理 GC/truncate；
+publish_replace/unlink_file（Round D 没有真实调用点，留给 Round E/F 按各自需求重新设计）；
+TLA+ 模型继续排除 compaction 的完整 fault-injection 矩阵（`formal/README.md` 已声明）。
+
+**Round D/E/F 边界**：
+- Round D（本轮）：真实 codec + Intent genesis-only + 只读诊断 + candidate-scoped 租约 + keyed
+  key pin。不推进 Intent phase，不写 `.x1`，不写 `.xgc`。
+- Round E（未来）：真实 C/A codec；`SealIdWatermark`/`SealExportStarted` 等真实 durable 前置
+  事实的 codec/验证；只有这些都存在之后，phase 推进能力才能被安全地暴露为 production API（且
+  必须要求调用方持有由这些真实 codec 产出的不可伪造 receipt，manager 重新验证 receipt+Intent+
+  当前文件状态，不接受裸的 to_phase/ID 参数）。
+- Round F（未来，依赖 D+E）：真实 `.xgc` CREATE/reconstruction；`TipExportProducerResume`；
+  `.x1`/Intent/`.xgc` 物理 GC 尾段；主日志真实 compaction/retention；`KeyRing::retire()` 真正
+  可用（前提条件解除）。**本轮完成不等于日志无限增长或 `KeyRing::retire()` 可用性问题已解决——
+  这两个仍然属于 Round F。**
+
+`spec_enum_diff.py`/`spec_xref_check.py` 需要重跑——三个类型从 `mac[32]`-only 升格为真实字段
+（不是新增枚举），新增头文件（`compaction_intent_codec.hpp`/`compaction_breadcrumb_io.hpp`/
+`windows_native_io.hpp`/`compaction_lease.hpp`/`compaction_intent_store.hpp`）需要加入 xref
+搜索列表。
+
+**实测证据（2026-08-09）**：
+
+- 真实 filesystem bug（不是审查发现，是让代码在真实 NTFS/junction/sharing-violation 上跑起来
+  之后才发现的）：`open_directory()` 打开目录 handle 时缺 `FILE_WRITE_DATA`，导致
+  `FlushFileBuffers(dir_handle)` 在 Windows 上永远失败（`ERROR_ACCESS_DENIED`）——genesis 写入
+  永远只能报告 `PublishedNamespaceUncertain`，从未报告过 `DurablyPublished`，"durable" 这条
+  路径事实上不可达。修复后用真实临时目录端到端验证过。
+- `CandidateLease::release()`/`check_can_operate()` 的检查顺序 bug：owner-thread 检查排在
+  `held_` 检查之前，导致从未 `acquire()` 过的 lease 调用 `release()` 被错误分类成 `WrongOwner`
+  而不是 `NotHeld`——同样是跑真实测试才发现，不是代码审查发现。
+- 一个平台层面的真实发现（不是 bug，是这一版设计的额外收益）：只要 `CandidateLease` 在某个
+  子目录内持有任何缺 share-delete 权限的 handle，Windows 会拒绝重命名/删除该子树内**任何**
+  对象（不只是被持有的那一个，包括所有祖先目录），对任何进程都一样——用一次性探测程序验证过
+  （remove_all/rename 都失败）。这意味着 Round D 设计要防的那个"外部重命名目录"TOCTOU，在
+  Windows 上已经被操作系统自身的 handle 语义结构性挡住了；`RoundDActual.tla` 对应的目录身份
+  fencing 测试因此在 test_compaction_intent_store.cpp 里改成 POSIX-only（POSIX `rename()`
+  从不关心 open fd，这个场景在 POSIX 上真实可达，由 WSL2/GCC-14 那条验证腿实际执行）。
+- MSVC Release 全量 ctest：875/875（compaction intent codec、compaction breadcrumb I/O
+  detail、CandidateLease（含真实跨进程互斥测试，独立子进程 helper）、IntentStore（含目录身份
+  fencing）、windows_native_io（含真实 NTFS junction 创建验证 reparse-point 拒绝）、fuzz 语料库
+  runner 各自的测试套件）。
+- WSL2 GCC-14（镜像 ci-native.yml）：900/900，含两个 POSIX-only 的目录身份 fencing 测试与
+  跨进程互斥测试。
+- `RoundDActual.tla`：主配置 22 states 无违反；三个回归控制（v3bug/v4bug/v5bug）均按预期
+  违反各自对应的 invariant；liveness 配置 22 states 无违反（EventualResolution 成立）。
+  整个状态空间在构造上就是有限的（8 个布尔量 + 有界计数器），不需要 constraint。
+- `RoundEFDesign.tla`：主配置 + liveness 配置各 7 states，均无违反。
+- Clang-only fuzz target 本身未在本地环境验证——两个本地验证环境（Windows/WSL2 Ubuntu-24.04）
+  都没有 Clang 工具链；GCC/MSVC 均可跑的确定性语料库 runner 已验证，8 个种子文件（含两个针对
+  fuzz target 固定 key 的真实 MAC 有效编码）跑通。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 

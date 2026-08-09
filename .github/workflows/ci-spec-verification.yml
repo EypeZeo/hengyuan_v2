@@ -26,6 +26,9 @@ on:
       - 'formal/**'
       - 'native/include/hengyuan/durable_control_plane.hpp'
       - 'native/include/hengyuan/order_lifecycle.hpp'
+      - 'native/include/hengyuan/compaction_lease.hpp'
+      - 'native/include/hengyuan/compaction_intent_store.hpp'
+      - 'native/include/hengyuan/compaction_intent_codec.hpp'
       - '.github/workflows/ci-spec-verification.yml'
   pull_request:
     branches: [master]
@@ -37,6 +40,9 @@ on:
       - 'formal/**'
       - 'native/include/hengyuan/durable_control_plane.hpp'
       - 'native/include/hengyuan/order_lifecycle.hpp'
+      - 'native/include/hengyuan/compaction_lease.hpp'
+      - 'native/include/hengyuan/compaction_intent_store.hpp'
+      - 'native/include/hengyuan/compaction_intent_codec.hpp'
       - '.github/workflows/ci-spec-verification.yml'
   workflow_dispatch:
 
@@ -321,3 +327,136 @@ jobs:
           fi
           echo "  OK: $inv violated as expected"
           echo "::endgroup::"
+
+  tla-model-check-roundd:
+    name: "L3: TLA+ model checking (Round D CandidateLease/IntentStore)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Fourth independent model. Its own job for the same reason every other model
+    # here has one: a failure in one must not mask or block another.
+    #
+    # WHY THIS MODEL EXISTS. Models the REAL, shipped Round D API (compaction_
+    # lease.hpp, compaction_intent_store.hpp -- docs/SPEC_INVARIANTS.md's
+    # "Seal-journal Round D" entry), not a generic file-lease design. Six external
+    # Architect reviews rejected five successive designs before the shipped one;
+    # three of those findings are safety properties with a real counterexample in
+    # an earlier design, which is why this is the first model in this file with
+    # THREE regression controls instead of one.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache TLA+ tools
+        id: cache-tla
+        uses: actions/cache@v6
+        with:
+          path: formal/tools/tla2tools.jar
+          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
+
+      - name: Download TLA+ tools
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p formal/tools
+          curl -sSfL -o formal/tools/tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
+          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
+            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
+
+      - name: "Safety: current (shipped) design must find no violation"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config RoundDActual.cfg RoundDActual.tla
+
+      - name: "Liveness: EventualResolution must hold"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config RoundDActual_liveness.cfg RoundDActual.tla
+
+      # All three MUST fail -- same inversion discipline as every other model's
+      # control(s) in this file. Each reintroduces one design REJECTED by a real
+      # Architect review round (see compaction_lease.hpp's own top-of-file
+      # comment and formal/README.md's RoundDActual.tla section for the full
+      # history each one is tied to).
+      - name: "Controls: the three expected-to-fail configs must still fail"
+        working-directory: formal
+        run: |
+          set -u
+          declare -a controls=(
+            "RoundDActual_v3bug.cfg|NeverWritesIntoWrongObject|review v3: path-based (not handle-relative) I/O -- TOCTOU lets a write land in a renamed-in directory"
+            "RoundDActual_v4bug.cfg|NoCapabilityUseAfterInvalidation|review v4: public handle accessor lets a capability escape the lease's own lifetime"
+            "RoundDActual_v5bug.cfg|NonOwnerReleaseNeverClearsHeld|review v5: release() with no owner-thread check -- any thread could clear held"
+          )
+          for entry in "${controls[@]}"; do
+            IFS='|' read -r cfg inv desc <<< "$entry"
+            echo "::group::$cfg — expecting $inv to be violated"
+            echo "  control: $desc"
+            if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+                 -workers auto -config "$cfg" RoundDActual.tla > "/tmp/$cfg.log" 2>&1; then
+              echo "::error::$cfg PASSED but was expected to violate $inv. The model has stopped discriminating; do not trust the safety run until this is fixed."
+              tail -30 "/tmp/$cfg.log"
+              exit 1
+            fi
+            if ! grep -q "Invariant $inv is violated" "/tmp/$cfg.log"; then
+              echo "::error::$cfg failed, but NOT with the expected '$inv is violated'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+              tail -30 "/tmp/$cfg.log"
+              exit 1
+            fi
+            echo "  OK: $inv violated as expected"
+            echo "::endgroup::"
+          done
+
+  tla-model-check-roundef:
+    name: "L3: TLA+ model checking (Round E/F future .x1/.xgc design)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Fifth independent model, and the only one in this file with NO regression
+    # control -- see RoundEFDesign.tla's own header and formal/README.md's
+    # section for why: it formalizes rules that already exist as real, tested
+    # pure functions in compaction_intent_codec.hpp, but for which no production
+    # write path exists anywhere in this codebase yet. There is no historical
+    # incident to regress against.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache TLA+ tools
+        id: cache-tla
+        uses: actions/cache@v6
+        with:
+          path: formal/tools/tla2tools.jar
+          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
+
+      - name: Download TLA+ tools
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p formal/tools
+          curl -sSfL -o formal/tools/tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
+          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
+            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
+
+      - name: "Safety: no violation expected"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config RoundEFDesign.cfg RoundEFDesign.tla
+
+      - name: "Liveness: EventuallyTerminal must hold"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config RoundEFDesign_liveness.cfg RoundEFDesign.tla

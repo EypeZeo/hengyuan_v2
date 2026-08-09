@@ -332,3 +332,131 @@ KEY-ROTATE-008) and the depth-snapshot bootstrap state machine (MD-BOOK-002) rem
 unmodeled. Both defects were found by hand and are fixed with unit-level regression
 tests; a model for the rotation protocol in particular would be worth writing, since its
 crash window is exactly the kind of thing tests reach only by construction.
+
+---
+
+## `RoundDActual.tla` — CandidateLease / IntentStore's real public API (Round D)
+
+Models the REAL, shipped Round D API (`native/include/hengyuan/compaction_lease.hpp`,
+`compaction_intent_store.hpp`), not a generic file-lease design. Deliberately narrow:
+`CreateGenesis` is the only filesystem write in the state space, and there is no
+generalized "artifact name" anywhere -- matching the real API, whose one write method
+takes no filename parameter at all (it always targets a compile-time-fixed literal).
+
+**Why this one has three regression controls, not one.** Six external Architect
+reviews rejected five successive designs before the shipped one (see
+`compaction_lease.hpp`'s own top-of-file comment for the full history). Three of those
+findings are safety properties with a real, reachable counterexample in an earlier
+design, not style opinions -- exactly what `inflight_lifecycle.tla`'s section above
+argues is worth a control: a MODEL SWITCH that reintroduces the rejected design and
+MUST make the corresponding invariant fail.
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `RoundDActual.cfg` | **No error found** — the current (shipped) design |
+| `RoundDActual_v3bug.cfg` | **`NeverWritesIntoWrongObject` violated** — regression control #1 |
+| `RoundDActual_v4bug.cfg` | **`NoCapabilityUseAfterInvalidation` violated** — regression control #2 |
+| `RoundDActual_v5bug.cfg` | **`NonOwnerReleaseNeverClearsHeld` violated** — regression control #3 |
+| `RoundDActual_liveness.cfg` | **No error found** — `EventualResolution` holds |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -config RoundDActual.cfg RoundDActual.tla
+```
+
+### Why three configs must fail
+
+- **`_v3bug`** (`HandleRelativeIo = FALSE`) reintroduces the design rejected in review
+  v3: check identity by path, then separately open the artifact by path again. An
+  external rename/recreate between the two steps redirects the write into a directory
+  the caller no longer controls -- this is the TOCTOU finding that drove the entire
+  v4+ handle-relative redesign. Counterexample: `Acquire → ExternalIdentityChange →
+  CreateGenesis` (4 states).
+- **`_v4bug`** (`HandleEncapsulated = FALSE`) reintroduces review v4's finding: a
+  public accessor exposing the underlying handle let a caller hold a reference past
+  the lease's own lifetime. Counterexample: `Acquire → BorrowHandle → ReleaseByOwner →
+  UseHandleViaCapability` (5 states) -- the capability gets used after `held` already
+  went false.
+- **`_v5bug`** (`OwnerThreadCheckedOnRelease = FALSE`) reintroduces review v5's
+  finding: `release()` with no owner-thread check, so any thread could clear `held`
+  while the owner is still using it. Counterexample: `Acquire → ReleaseByNonOwner` (3
+  states) -- the shortest of the three, matching how directly reachable the bug was.
+
+### Recorded results (2026-08-09, TLC 2.19, Java 25)
+
+| Config | States (distinct) | Depth | Result |
+|---|---|---|---|
+| main | 22 | 7 | no error |
+| v3bug | 5 | 4 | `NeverWritesIntoWrongObject` violated ✓ |
+| v4bug | 25 | 5 | `NoCapabilityUseAfterInvalidation` violated ✓ |
+| v5bug | 5 | 3 | `NonOwnerReleaseNeverClearsHeld` violated ✓ |
+| liveness | 22 | 7 | no error (`EventualResolution` holds) |
+
+The entire state space is finite by construction (8 booleans + `createAttempts`
+bounded by `MaxCreateAttempts`) -- no `CONSTRAINT` needed anywhere, unlike this file's
+other three models, all of which track an unbounded sequence. No saturation check is
+needed for the same reason: there is no bound to second-guess.
+
+### What is deliberately NOT in this model
+
+KeyRing pin/retire (a separate subsystem with its own real coverage --
+`test_key_ring.cpp`'s `KeyRingDestroyedWithLivePinTerminates` death test already
+exercises that fail-closed property directly, against a real `std::terminate()`, which
+a TLA+ model would only restate); the `.x1`/`.xgc` phase-raise/GC state machine (Round
+D never writes either -- see `RoundEFDesign.tla` below, a genuinely separate model with
+no production traceability of its own); and cross-process mutual exclusion (an
+OS-level guarantee already exercised for real by
+`test_compaction_lease.cpp`'s `CrossProcessMutualExclusion` test against an actual
+second process, which a single-process TLA+ model cannot add confidence to).
+
+### Files
+
+- `RoundDActual.tla` — the model.
+- `RoundDActual*.cfg` — see the table above.
+
+---
+
+## `RoundEFDesign.tla` — future `.x1`/`.xgc` state machine (independent, no production traceability)
+
+A genuinely separate model, not an extension of `RoundDActual.tla`. It formalizes
+rules that already exist as real, unit-tested pure functions in
+`native/include/hengyuan/compaction_intent_codec.hpp` (`walk_x1_chain_raw`,
+`is_legal_candidate_id_transition`, `is_legal_cleanup_auth_flags`) but for which **no
+production write path exists anywhere in this codebase yet** -- Round D deliberately
+never calls any of them (see that file's own SCOPE comment).
+
+This inverts the usual grounding direction: everywhere else in this directory, prose
+spec grounding precedes the model (see the Scope note at the top of this file). Here,
+tested CODE precedes the model, but there is no production BEHAVIOR to check the model
+against yet -- so, unlike every other model in this directory, **it has no regression
+control**. There is no historical incident to regress against. Do not add a "must
+fail" config for it without a real one to point at.
+
+### The config, and what it MUST report
+
+| Config | Expected result |
+|---|---|
+| `RoundEFDesign.cfg` | **No error found** |
+| `RoundEFDesign_liveness.cfg` | **No error found** — `EventuallyTerminal` holds |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -config RoundEFDesign.cfg RoundEFDesign.tla
+```
+
+### Recorded results (2026-08-09, TLC 2.19, Java 25)
+
+| Config | States (distinct) | Depth | Result |
+|---|---|---|---|
+| main | 7 | 5 | no error |
+| liveness | 7 | 5 | no error (`EventuallyTerminal` holds) |
+
+A tiny, fully-enumerable state space (5 phases × 4 seq values × 2 idsBound × 2
+gcAuthorized, most of it unreachable) -- no `CONSTRAINT` needed here either.
+
+### Files
+
+- `RoundEFDesign.tla` — the model.
+- `RoundEFDesign*.cfg` — see the table above.
