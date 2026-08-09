@@ -460,3 +460,172 @@ jobs:
         run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config RoundEFDesign_liveness.cfg RoundEFDesign.tla
+
+  tla-model-check-keyrotation:
+    name: "L3: TLA+ model checking (two-step key rotation, KEY-ROTATE-008)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Sixth independent model. Its own job for the same reason every other model
+    # here has one: a failure in one must not mask or block another.
+    #
+    # WHY THIS MODEL EXISTS. Closes the second gap from the full-repo audit's
+    # findings (the first being inflight_lifecycle.tla, the third being
+    # depth_snapshot_bootstrap.tla below): rotate_active_key() is a two-step
+    # DURABLE protocol (sidecar KeyRotated record + main-tip re-anchor), and a
+    # crash between the two steps leaves on-disk state that recovery must tell
+    # apart from an unauthorized identity swap -- the (a)(b)(c) sidecar-proof
+    # gate at durable_audit_sink.hpp:843-847. The regression control
+    # reinstates the simpler wrong protocol (re-anchor on any anchor-key
+    # mismatch, ignore the sidecar) and MUST violate RepairOnlyOnProvenMismatch.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache TLA+ tools
+        id: cache-tla
+        uses: actions/cache@v6
+        with:
+          path: formal/tools/tla2tools.jar
+          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
+
+      - name: Download TLA+ tools
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p formal/tools
+          curl -sSfL -o formal/tools/tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
+          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
+            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
+
+      - name: "Safety: current design must find no violation"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config key_rotation.cfg key_rotation.tla
+
+      # Progress property. Note this config intentionally has no CONSTRAINT
+      # (see formal/README.md) -- do not "fix" it by adding one.
+      - name: "Liveness: EventualConsistencyOrFenced must hold"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config key_rotation_liveness.cfg key_rotation.tla
+
+      # MUST fail. Same inversion discipline as every other model's control(s)
+      # in this file: without it, "no violation" above would be unsubstantiated.
+      - name: "Control: the expected-to-fail config must still fail"
+        working-directory: formal
+        run: |
+          set -u
+          cfg=key_rotation_onestep_bug.cfg
+          inv=RepairOnlyOnProvenMismatch
+          echo "::group::$cfg — expecting $inv to be violated"
+          echo "  control: one-step protocol (re-anchor on any anchor-key mismatch, ignoring the sidecar proof)"
+          if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+               -workers auto -config "$cfg" key_rotation.tla > "/tmp/$cfg.log" 2>&1; then
+            echo "::error::$cfg PASSED but was expected to violate $inv. The model has stopped discriminating; do not trust the safety run until this is fixed."
+            tail -30 "/tmp/$cfg.log"
+            exit 1
+          fi
+          if ! grep -q "Invariant $inv is violated" "/tmp/$cfg.log"; then
+            echo "::error::$cfg failed, but NOT with the expected '$inv is violated'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+            tail -30 "/tmp/$cfg.log"
+            exit 1
+          fi
+          echo "  OK: $inv violated as expected"
+          echo "::endgroup::"
+
+  tla-model-check-depthsnapshot:
+    name: "L3: TLA+ model checking (depth snapshot bootstrap, MD-BOOK-002)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Seventh independent model. Its own job for the same reason every other
+    # model here has one: a failure in one must not mask or block another.
+    #
+    # WHY THIS MODEL EXISTS. Closes the third gap from the full-repo audit's
+    # findings: the DepthManager bootstrap state machine (depth_manager.hpp) --
+    # snapshot lastUpdateId vs the U/u windows of WS depthUpdate events,
+    # buffered replay, overflow fail-closed, bridge check, Tracking gap
+    # detection. THREE regression controls, one per real protection mechanism
+    # disabled: drop-before-snapshot, overflow-still-tracks, bridge-check
+    # disabled -- each MUST violate its designated invariant.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache TLA+ tools
+        id: cache-tla
+        uses: actions/cache@v6
+        with:
+          path: formal/tools/tla2tools.jar
+          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
+
+      - name: Download TLA+ tools
+        if: steps.cache-tla.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p formal/tools
+          curl -sSfL -o formal/tools/tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
+          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
+            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
+
+      - name: "Safety: current design must find no violation"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config depth_snapshot_bootstrap.cfg depth_snapshot_bootstrap.tla
+
+      # Progress property. Note this config intentionally has no CONSTRAINT
+      # (see formal/README.md) -- do not "fix" it by adding one.
+      - name: "Liveness: EventualBootstrap must hold"
+        working-directory: formal
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config depth_snapshot_bootstrap_liveness.cfg depth_snapshot_bootstrap.tla
+
+      # All three MUST fail -- same inversion discipline as every other model's
+      # control(s) in this file. Each reintroduces one real protection
+      # mechanism of depth_manager.hpp being disabled; if any stops failing,
+      # the model has stopped discriminating it and the safety runs above are
+      # worth correspondingly less.
+      - name: "Controls: the three expected-to-fail configs must still fail"
+        working-directory: formal
+        run: |
+          set -u
+          fail=0
+          for pair in \
+            "depth_snapshot_bootstrap_drop_before_snapshot_bug.cfg|TrackingImpliesBookConsistent|drop-before-snapshot (Buffering discards events instead of buffering them for replay)" \
+            "depth_snapshot_bootstrap_overflow_still_track_bug.cfg|NoOverflowThenTracking|overflow-still-tracks (apply_snapshot proceeds over a known-incomplete prefix)" \
+            "depth_snapshot_bootstrap_first_bridge_disabled_bug.cfg|FirstBridgeConstraint|bridge-check disabled (Tracking entered without U <= lastUpdateId+1 on the first kept event)"
+          do
+            cfg="${pair%%|*}"; rest="${pair#*|}"
+            inv="${rest%%|*}"; desc="${rest#*|}"
+            echo "::group::$cfg — expecting $inv to be violated"
+            echo "  control: $desc"
+            if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+                 -workers auto -config "$cfg" depth_snapshot_bootstrap.tla > "/tmp/$cfg.log" 2>&1; then
+              echo "::error::$cfg PASSED but was expected to violate $inv. The model has stopped discriminating; do not trust the safety runs until this is fixed."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            elif grep -q "Invariant $inv is violated" "/tmp/$cfg.log"; then
+              echo "  OK: $inv violated as expected"
+            else
+              echo "::error::$cfg failed, but NOT with the expected '$inv is violated'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
