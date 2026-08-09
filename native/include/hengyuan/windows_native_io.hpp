@@ -312,6 +312,41 @@ inline DirOpenResult open_directory(const std::wstring& path, RawHandle& out,
     return DirOpenResult::Opened;
 }
 
+// Second line of defense (the first is compaction_breadcrumb_io.hpp's
+// ValidatedArtifactName / is_traversal_safe_name, which every caller of the
+// three open-relative functions below already routes through) against a
+// relative name that could escape the intended directory (path separators,
+// "..") or resolve to a Windows-reserved device object (CON/PRN/AUX/NUL/
+// COM1-9/LPT1-9, reserved even with an extension -- "NUL.txt" still opens
+// the NUL device). Round D itself never passes anything but compile-time-
+// fixed literals or hex-formatted names here (see this file's callers in
+// compaction_lease.hpp), so this cannot currently be exercised by a real
+// attack through this codebase -- it exists purely so Round E/F's future
+// parameterized names inherit this check for free, at negligible cost, per
+// the design note in compaction_lease.hpp's own top-of-file comment.
+inline bool is_relative_name_traversal_safe(const std::wstring& name) noexcept {
+    if (name.empty()) return false;
+    if (name == L"." || name == L"..") return false;
+    for (const wchar_t c : name) {
+        if (c == L'/' || c == L'\\' || c == L'\0') return false;
+    }
+    std::wstring base = name;
+    const auto dot = base.find(L'.');
+    if (dot != std::wstring::npos) base = base.substr(0, dot);
+    for (wchar_t& c : base) {
+        if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
+    }
+    static constexpr const wchar_t* kReservedDeviceNames[] = {
+        L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4", L"COM5",
+        L"COM6", L"COM7", L"COM8", L"COM9", L"LPT1", L"LPT2", L"LPT3", L"LPT4",
+        L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9",
+    };
+    for (const wchar_t* reserved : kReservedDeviceNames) {
+        if (base == reserved) return false;
+    }
+    return true;
+}
+
 enum class RelativeCreateResult : std::uint8_t {
     Created,
     AlreadyExists,  // STATUS_OBJECT_NAME_COLLISION -- caller decides what to do
@@ -329,6 +364,7 @@ enum class RelativeCreateResult : std::uint8_t {
 inline RelativeCreateResult create_new_relative(const RawHandle& dir, const std::wstring& relative_name,
                                                   RawHandle& out) noexcept {
     if (!native_api_available()) return RelativeCreateResult::Unsupported;
+    if (!is_relative_name_traversal_safe(relative_name)) return RelativeCreateResult::Failed;
     auto& t = detail::proc_table();
 
     UNICODE_STRING name{};
@@ -380,6 +416,7 @@ inline ExclusiveLockResult open_or_create_exclusive_relative(const RawHandle& di
                                                                 const std::wstring& relative_name,
                                                                 RawHandle& out) noexcept {
     if (!native_api_available()) return ExclusiveLockResult::Unsupported;
+    if (!is_relative_name_traversal_safe(relative_name)) return ExclusiveLockResult::Failed;
     auto& t = detail::proc_table();
 
     UNICODE_STRING name{};
@@ -424,6 +461,7 @@ enum class RelativeOpenResult : std::uint8_t {
 inline RelativeOpenResult open_existing_relative(const RawHandle& dir, const std::wstring& relative_name,
                                                    RawHandle& out, NTSTATUS* out_status = nullptr) noexcept {
     if (!native_api_available()) return RelativeOpenResult::Unsupported;
+    if (!is_relative_name_traversal_safe(relative_name)) return RelativeOpenResult::Failed;
     auto& t = detail::proc_table();
 
     UNICODE_STRING name{};

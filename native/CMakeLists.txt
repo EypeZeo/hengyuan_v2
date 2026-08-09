@@ -363,6 +363,16 @@ if(HY_BUILD_TESTS)
 
     gtest_discover_tests(test_compaction_intent_store PROPERTIES LABELS concurrency)
 
+    # Round D: windows_native_io.hpp is #ifdef _WIN32-only (no POSIX
+    # equivalent, see its own file header) -- this coverage only makes sense
+    # on Windows, and is gated the same way the header itself is.
+    if(WIN32)
+        add_executable(test_windows_native_io tests/test_windows_native_io.cpp)
+        target_link_libraries(test_windows_native_io PRIVATE hengyuan_core GTest::gtest_main)
+        hengyuan_set_warnings(test_windows_native_io)
+        gtest_discover_tests(test_windows_native_io)
+    endif()
+
     # Phase 1: control-plane 11 种 payload 的帧编解码 (L1, 纯内存, 无文件 I/O --
     # 真正的文件落盘在 control_plane_log_sink.hpp，这里只验证帧格式本身，见
     # control_plane_frame_codec.hpp 头部注释)
