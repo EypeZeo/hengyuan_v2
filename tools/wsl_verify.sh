@@ -69,7 +69,8 @@ run_thread() {
     cmake --build build-linux-tsan -j"${BUILD_JOBS}" --target \
         test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
         test_snapshot_refresh_gate tsan_control_relaxed_ring \
-        tsan_control_export_worker_dual_consumer
+        tsan_control_export_worker_dual_consumer \
+        compaction_lease_holder test_compaction_lease test_compaction_intent_store
 
     echo "--- concurrency tests (must pass) ---"
     (

@@ -95,6 +95,16 @@ public:
     ReleaseStatus release_lease() noexcept { return lease_.release(); }
     bool holds_lease() const noexcept { return lease_.held(); }
 
+    // Passthroughs to CandidateLease's own public diagnostic surface --
+    // both already public on CandidateLease (not friend-gated), exposed
+    // here so a real caller integrating IntentStore can see WHY writes are
+    // being refused (DirectoryIdentityChanged/CandidateFenced) without
+    // reaching into the lease directly.
+    bool lease_fenced() const noexcept { return lease_.fenced(); }
+    std::optional<CandidateIdentityDiagnostic> lease_identity_diagnostic() const noexcept {
+        return lease_.last_identity_diagnostic();
+    }
+
     // Round D's ONLY write operation. Requires the lease to be held.
     // Refuses (AlreadyExists) if a genesis already exists on disk, in any
     // phase -- this is genesis, it never overwrites, never "upgrades," and

@@ -275,3 +275,126 @@ TEST(IntentStore, InspectX1ChainEmptyWhenNoIntentGenesisAtAll) {
     ASSERT_EQ(store.release_lease(), ReleaseStatus::Released);
     std::filesystem::remove_all(dir);
 }
+
+// ===========================================================================
+// Directory identity fencing (Round D review v3/v4's original TOCTOU
+// finding): CandidateLease's private I/O methods -- the only way to reach
+// check_can_operate() -- are friend-only to IntentStore, so this coverage
+// necessarily lives here, not in test_compaction_lease.cpp (see that file's
+// own trailing comment on this exact boundary).
+//
+// POSIX-only, and that is a real platform finding, not a test-portability
+// shortcut. Confirmed empirically (a throwaway probe program, before writing
+// this down) that on Windows, as long as CandidateLease holds ANY handle
+// without FILE_SHARE_DELETE anywhere inside a directory subtree, the OS
+// refuses to rename OR delete anything in that subtree -- not just the
+// exact held object, but every ancestor up to and including the top-level
+// parent -- from ANY process, this one included. Both
+// std::filesystem::remove_all(leaf) and std::filesystem::rename(parent)
+// failed outright (ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED) while a
+// lease was held. That means the exact attack this fencing exists for --
+// an external actor renaming/recreating the directory out from under an
+// acquire()'d lease -- is already structurally unreachable on Windows
+// given CandidateLease's current (deliberately share-delete-less) open
+// flags; there is no same-process way to test it there without granting
+// FILE_SHARE_DELETE, which would be a real regression in the exact
+// property this test exists to prove, not a test-only relaxation. POSIX
+// rename()/unlink() never care about open file descriptors either way, so
+// the scenario is genuinely reachable there, and IS exercised for real by
+// this repo's WSL2/GCC-14 verification leg (tools/wsl_verify.sh).
+#ifndef _WIN32
+
+TEST(IntentStoreDirectoryFencing, RenameAwayThenRestoreProvesStickyFence) {
+    auto parent = make_temp_candidate_dir("fence_rename_parent");
+    auto dir = parent / "candidate";
+    std::filesystem::create_directories(dir);
+    const auto kek = make_kek(0x0D);
+    KeyRing ring(kek);
+    WrappedKeyRecord rec{};
+    ASSERT_EQ(ring.add_key(7, kek, rec), KeyRingAddStatus::Ok);
+
+    IntentStore store(dir, ring);
+    ASSERT_EQ(store.acquire_lease(), LeaseAcquireStatus::Acquired);
+
+    // Rename the PARENT out from under the still-open leaf handle -- the
+    // original `dir` path now resolves to nothing.
+    auto renamed_parent = parent;
+    renamed_parent += "_renamed_away";
+    std::filesystem::rename(parent, renamed_parent);
+
+    const auto req = make_request();
+    const auto first = store.create_building_intent(req);
+    EXPECT_EQ(first, GenesisStatus::DirectoryIdentityChanged);
+    EXPECT_TRUE(store.lease_fenced());
+    const auto diag = store.lease_identity_diagnostic();
+    ASSERT_TRUE(diag.has_value());
+    EXPECT_TRUE(diag->observed_path_missing);
+
+    // Restore the SAME parent object back to the original path -- if the
+    // fence were re-evaluated per call, identity would now match again and
+    // this second call would succeed. A sticky fence must refuse anyway,
+    // without re-touching the filesystem to find out.
+    std::filesystem::rename(renamed_parent, parent);
+    const auto second = store.create_building_intent(req);
+    EXPECT_EQ(second, GenesisStatus::CandidateFenced);
+
+    ASSERT_EQ(store.release_lease(), ReleaseStatus::Released);
+
+    // Neither call should have written anything, anywhere.
+    IntentStore verifier(dir, ring);
+    ASSERT_EQ(verifier.acquire_lease(), LeaseAcquireStatus::Acquired);
+    CompactionCandidateIntentWire loaded{};
+    EXPECT_EQ(verifier.load_and_validate_intent(loaded), LoadStatus::NotFound);
+    ASSERT_EQ(verifier.release_lease(), ReleaseStatus::Released);
+
+    std::filesystem::remove_all(parent);
+}
+
+TEST(IntentStoreDirectoryFencing, RecreatedDirectoryWithDifferentIdentityIsDetected) {
+    auto parent = make_temp_candidate_dir("fence_recreate_parent");
+    auto dir = parent / "candidate";
+    std::filesystem::create_directories(dir);
+    const auto kek = make_kek(0x0E);
+    KeyRing ring(kek);
+    WrappedKeyRecord rec{};
+    ASSERT_EQ(ring.add_key(7, kek, rec), KeyRingAddStatus::Ok);
+
+    IntentStore store(dir, ring);
+    ASSERT_EQ(store.acquire_lease(), LeaseAcquireStatus::Acquired);
+
+    // Move the original parent aside, then create a BRAND NEW parent (with
+    // its own new "candidate" subdirectory) at the exact same parent path
+    // -- same leaf path string, genuinely different underlying filesystem
+    // object (different dev/inode or volume-serial/file-index).
+    auto orphaned_parent = parent;
+    orphaned_parent += "_orphaned";
+    std::filesystem::rename(parent, orphaned_parent);
+    std::filesystem::create_directories(dir);
+
+    const auto req = make_request();
+    const auto status = store.create_building_intent(req);
+    EXPECT_EQ(status, GenesisStatus::DirectoryIdentityChanged);
+    EXPECT_TRUE(store.lease_fenced());
+    const auto diag = store.lease_identity_diagnostic();
+    ASSERT_TRUE(diag.has_value());
+    EXPECT_FALSE(diag->observed_path_missing);
+    EXPECT_TRUE(diag->expected_dev_or_volume_serial != diag->observed_dev_or_volume_serial ||
+                diag->expected_inode_or_file_index != diag->observed_inode_or_file_index);
+
+    ASSERT_EQ(store.release_lease(), ReleaseStatus::Released);
+
+    // The new leaf directory must be untouched (empty); the orphaned
+    // original must also carry no genesis -- this call refused before any
+    // I/O, on either object.
+    EXPECT_TRUE(std::filesystem::is_empty(dir));
+    IntentStore orphan_verifier(orphaned_parent / "candidate", ring);
+    ASSERT_EQ(orphan_verifier.acquire_lease(), LeaseAcquireStatus::Acquired);
+    CompactionCandidateIntentWire loaded{};
+    EXPECT_EQ(orphan_verifier.load_and_validate_intent(loaded), LoadStatus::NotFound);
+    ASSERT_EQ(orphan_verifier.release_lease(), ReleaseStatus::Released);
+
+    std::filesystem::remove_all(parent);
+    std::filesystem::remove_all(orphaned_parent);
+}
+
+#endif  // !_WIN32

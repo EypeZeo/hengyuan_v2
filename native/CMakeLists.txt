@@ -321,13 +321,26 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_compaction_breadcrumb_io_detail)
     gtest_discover_tests(test_compaction_breadcrumb_io_detail)
 
+    # Round D: standalone subprocess for test_compaction_lease's
+    # CrossProcessMutualExclusion test -- NOT a GTest binary, argv-driven,
+    # spawned as a child process. Deliberately not linked against GTest.
+    add_executable(compaction_lease_holder tests/helpers/compaction_lease_holder.cpp)
+    target_link_libraries(compaction_lease_holder PRIVATE hengyuan_core)
+    hengyuan_set_warnings(compaction_lease_holder)
+
     # Round D: CandidateLease's own lifecycle surface (acquire/release/held/
     # fenced/move) against a real temp directory -- L2, real file I/O.
     # Genesis write/read coverage (via IntentStore, the only friend) lives in
     # test_compaction_intent_store.cpp. Threading test (NonOwnerRelease...)
     # needs Threads -- same pattern as other concurrency-relevant targets.
+    # HY_COMPACTION_LEASE_HOLDER_EXE is the built path of the helper above,
+    # for the CrossProcessMutualExclusion test's real subprocess spawn --
+    # same "compile-definition, not an assumed relative path" pattern as
+    # HY_TEST_FIXTURE_DIR elsewhere in this file.
     add_executable(test_compaction_lease tests/test_compaction_lease.cpp)
     target_link_libraries(test_compaction_lease PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    target_compile_definitions(test_compaction_lease PRIVATE
+        HY_COMPACTION_LEASE_HOLDER_EXE="$<TARGET_FILE:compaction_lease_holder>")
     hengyuan_set_warnings(test_compaction_lease)
 
     if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
@@ -348,7 +361,7 @@ if(HY_BUILD_TESTS)
             CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
     endif()
 
-    gtest_discover_tests(test_compaction_intent_store)
+    gtest_discover_tests(test_compaction_intent_store PROPERTIES LABELS concurrency)
 
     # Phase 1: control-plane 11 种 payload 的帧编解码 (L1, 纯内存, 无文件 I/O --
     # 真正的文件落盘在 control_plane_log_sink.hpp，这里只验证帧格式本身，见
