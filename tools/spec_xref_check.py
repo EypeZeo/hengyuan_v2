@@ -92,6 +92,9 @@ SEARCH_FILES = [
     # PinnedKeyHandle, pin_key()), so this is the same pre-existing gap as
     # above, closed now that it's actually load-bearing.
     REPO_ROOT / "native" / "include" / "hengyuan" / "key_ring.hpp",
+    # Round E Slice 1 (docs/SPEC_INVARIANTS.md "Seal-journal Round E Slice 1"):
+    # SealIdWatermark/SealExportStartedWire codec, same gap as Round D above.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_precondition_codec.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

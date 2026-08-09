@@ -732,7 +732,7 @@ TLA+ 模型继续排除 compaction 的完整 fault-injection 矩阵（`formal/RE
   都没有 Clang 工具链；GCC/MSVC 均可跑的确定性语料库 runner 已验证，8 个种子文件（含两个针对
   fuzz target 固定 key 的真实 MAC 有效编码）跑通。
 
-### Seal-journal Round E Slice 1（SealIdWatermark/SealExportStartedWire durable-precondition codec）[计划中]
+### Seal-journal Round E Slice 1（SealIdWatermark/SealExportStartedWire durable-precondition codec）[已实现]
 
 Round D 自己的"Round D/E/F 边界"（上面）声明 Round E 需要"`SealIdWatermark`/`SealExportStarted` 等
 真实 durable 前置事实的 codec/验证"。这是 Round E 的第一个切片——只做这两个类型的 codec，不做真实 C/A
@@ -766,10 +766,10 @@ Round D 自己的"Round D/E/F 边界"（上面）声明 Round E 需要"`SealIdWa
   `peek_seal_export_started_kek_key_id` 偏移 168。
 - **host struct 不是 wire layout**：238 字节里 u32 后接 u64 会有 C++ 对齐 padding，host `sizeof`
   几乎肯定不等于 238。禁止 `#pragma pack`/`reinterpret_cast` 序列化/`memcpy(sizeof)`/
-  `offsetof==disk offset`/`static_assert(sizeof==238)`；唯一的 wire 权威是 encoder/decoder 里
+  offsetof==disk offset/`static_assert(sizeof==238)`；唯一的 wire 权威是 encoder/decoder 里
   显式的逐字段 LE 读写（跟 `CompactionCandidateIntentWire` 一个套路）。ABI 测试删掉
   `sizeof==32u` 之后只断言 `is_trivially_copyable_v`/`is_standard_layout_v` + wire-byte-constant，
-  不对 host `sizeof`/`offsetof` 下注。
+  不对 host sizeof/offsetof 下注。
 - **拓扑语义校验（`validate_seal_export_started_shape()`，MAC 比较之前运行，fail-fast，跟
   `compaction_intent_codec.hpp` 已有的 `MalformedField` 检查顺序一致）**：
   1. `registered_producer_mask` 只含 `[0, kMaxSealHandoffProducers)` 范围内的 bit 且非零；
@@ -803,8 +803,33 @@ Governance: L1（纯内存计算，无文件 I/O）。`VerifiedSealIdWatermark`/
 `SealStartedAbandonWire` 的升格（全部保持现状不动）；`SealIdWatermark` 的跨文件单调性证明；
 `SealExportStartedWire` 的 kek_key_id/baseline_key_id/new_key_id 非零校验（开放问题，见上）。
 
-`tools/spec_xref_check.py` 需要把新头文件加入 `SEARCH_FILES`。`spec_enum_diff.py` 这轮不新增
+`tools/spec_xref_check.py` 需要把新头文件加入其 SEARCH_FILES 列表。`spec_enum_diff.py` 这轮不新增
 `enum class`，预期零新发现。
+
+**实测证据（2026-08-09）**：
+
+- `test_seal_journal_precondition_codec.cpp`（新建，28 个测试）：`SealIdWatermarkCodec` 7 个
+  （round-trip、单字节 MAC 篡改检测、错 key、截断、`next_candidate_id`/`next_request_id` 为 0
+  拒绝各 1 个、`UINT64_MAX` 且 MAC 正确必须解码成功）；`SealExportStartedCodec` 18 个（round-trip
+  含 `ring_id[8]` 逐元素比较、未知 format_version、错误 total_bytes、MAC 篡改、错 key、截断、
+  legacy-192B/draft-234B 均按 `Truncated` 拒绝、以及 P0-1 要求的 10 条"MAC 正确但字段非法"语义
+  拒绝测试——空 mask、mask 满容量下正确接受、`producer_count`/`popcount` 不匹配、置位槽 `ring_id`
+  为零、未置位槽 `ring_id` 非零、重复 `ring_id`、`candidate_id`/`request_id` 为零各 1 个、
+  `new_generation` 不等于 `source_generation+1`、`source_generation==UINT32_MAX` 溢出防护）；
+  `PeekSealExportStartedKekKeyId` 2 个（MAC 篡改后仍可 peek、缓冲区过短拒绝）；一个 2000 次迭代的
+  属性测试确认两个 decode 函数对任意随机字节都不崩溃。
+- MSVC Release 全量 `ctest`：904/904。
+- WSL2 GCC-14 Release（镜像 `ci-native.yml`）：931/931。
+- WSL2 ASan+UBSan（镜像 `ci-native-sanitizers.yml` 的 asan-ubsan-full job，含 `HY_BUILD_DEMO=ON`
+  的全部二进制）：931/931，无 ASan/UBSan 报告。
+- WSL2 TSan 并发测试套件：47/47；两个负控 `tsan_control_relaxed_ring`/
+  `tsan_control_export_worker_dual_consumer` 均按预期以非零退出码报出
+  `WARNING: ThreadSanitizer: data race`（这两个控制跟本轮改动无关——Round E Slice 1 是纯内存
+  codec，不碰任何并发/线程代码——之所以仍然重跑，是因为 `tools/wsl_verify.sh all` 的 `thread`
+  模式本身就会跑这两个控制，用来证明 TSan 在本机确实还能检测到注入的数据竞争，不是这条验证腿本身
+  失效了）。
+- `spec_xref_check.py --quiet`：398 个符号、33045 个匹配点，全部可定位。
+- `spec_enum_diff.py`：0 个新发现（本轮无新增 `enum class`，符合预期）。
 
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
