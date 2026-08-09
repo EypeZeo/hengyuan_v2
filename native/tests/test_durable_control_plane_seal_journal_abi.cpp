@@ -34,6 +34,7 @@
 using hy::DurableRecordType;
 using hy::is_seal_journal_embeddable_type;
 using hy::kMaxSealHandoffProducers;
+using hy::kSealIdWatermarkWireBytes;
 using hy::kSealJournalFixedMetaBytes;
 using hy::kSealJournalFormatVersion;
 using hy::kSealJournalIntakeCloseDeadlineMs;
@@ -64,6 +65,12 @@ TEST(SealIdWatermark, DefaultNextIdsAreOneNotZero) {
     SealIdWatermark w{};
     EXPECT_EQ(w.next_candidate_id, 1u);
     EXPECT_EQ(w.next_request_id, 1u);
+}
+
+// Round E Slice 1: the wire byte count seal_journal_precondition_codec.hpp's
+// encode/decode pin against -- NOT a claim about sizeof(SealIdWatermark).
+TEST(SealIdWatermark, WireByteConstantMatchesSpec) {
+    EXPECT_EQ(kSealIdWatermarkWireBytes, 64u);
 }
 
 // --- SealJournalCommitWatermark (spec L4 §10 / BINANCE:3028) ---

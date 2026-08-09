@@ -735,6 +735,14 @@ struct SealIdWatermark {
 static_assert(std::is_trivially_copyable_v<SealIdWatermark>);
 static_assert(std::is_standard_layout_v<SealIdWatermark>);
 
+// Round E Slice 1 (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 1"
+// entry): real encode/decode lives in seal_journal_precondition_codec.hpp,
+// never memcpy of this struct as the disk format -- this constant is the wire
+// byte count the codec's static_assert pins against, not a claim about
+// sizeof(SealIdWatermark).
+constexpr std::size_t kSealIdWatermarkWireBytes = 64;
+static_assert(8 + 8 + 8 + 8 + 32 == kSealIdWatermarkWireBytes);
+
 // --- SealJournalCommitWatermark ---
 // SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3028
 //
@@ -947,18 +955,48 @@ static_assert(4 + 4 + 8 + 8 + 8 + 4 + 8 + 32 + 4 + 4 + 8 + 32 + 4 + 8 + 32 + 4 +
                   + (4 * kMaxSealHandoffProducers) + 32
               == kSealExportStartedWireBytes);
 
+// Round E Slice 1 promotes this struct from mac[32]-only marker to real
+// named fields (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 1"
+// entry) -- real encode/decode is field-by-field in
+// seal_journal_precondition_codec.hpp, never memcpy of this struct as the
+// disk format. u32-then-u64 field ordering means normal C++ alignment
+// inserts padding here; sizeof(SealExportStartedWire) is NOT 238 and must
+// never be asserted as such -- kSealExportStartedWireBytes (below, already
+// existed before this promotion) is the wire byte count, pinned by the
+// codec's own encode/decode, not by this struct's layout.
 struct SealExportStartedWire {
-    // Conceptual; on-disk packed as above. MAC domain (LE, no padding):
+    // MAC domain (LE, no padding):
     // HMAC(KEK[kek_key_id], "HY-SEALSTART-v2" || format_version || total_bytes ||
     //   store_uuid_lo || store_uuid_hi || candidate_id || source_generation ||
     //   baseline_tip_seq || baseline_tip_mac || baseline_key_id ||
     //   new_generation || new_final_seq || new_final_tip_mac || new_key_id ||
     //   request_id || content_root || kek_key_id || registered_producer_mask ||
     //   producer_count || ring_id[0] || ... || ring_id[kMax-1])
-    // Topology MUST match frozen SealJournalIntakeCloseControl (round-54/55).
+    // Topology MUST match frozen SealJournalIntakeCloseControl (round-54/55) --
+    // enforced by seal_journal_precondition_codec.hpp's
+    // validate_seal_export_started_shape(), not by this struct.
     // Forbidden: write format_version!=2; Forbidden: total_bytes!=238;
     // Forbidden: invent mask=0 / empty topology; Forbidden: try-all / current-key
     // fallback when kek_key_id wrapper missing (L5 §6.1.1.2).
+    std::uint32_t format_version{kSealExportStartedFormatVersion};
+    std::uint32_t total_bytes{kSealExportStartedWireBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint64_t candidate_id{0};
+    std::uint32_t source_generation{0};
+    std::uint64_t baseline_tip_seq{0};
+    std::uint8_t baseline_tip_mac[32]{};
+    std::uint32_t baseline_key_id{0};
+    std::uint32_t new_generation{0};
+    std::uint64_t new_final_seq{0};
+    std::uint8_t new_final_tip_mac[32]{};
+    std::uint32_t new_key_id{0};
+    std::uint64_t request_id{0};
+    std::uint8_t content_root[32]{};
+    std::uint32_t kek_key_id{0};
+    std::uint8_t registered_producer_mask{0};
+    std::uint8_t producer_count{0};
+    SealHandoffRingId ring_id[kMaxSealHandoffProducers]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<SealExportStartedWire>);

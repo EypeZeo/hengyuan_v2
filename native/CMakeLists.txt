@@ -541,6 +541,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_control_plane_seal_journal_started_abi)
     gtest_discover_tests(test_durable_control_plane_seal_journal_started_abi)
 
+    # Round E Slice 1 (docs\SPEC_INVARIANTS.md "Seal-journal Round E Slice 1"):
+    # SealIdWatermark/SealExportStartedWire codec (L1, pure in-memory, no file
+    # I/O -- this codec has no I/O layer at all yet).
+    add_executable(test_seal_journal_precondition_codec tests/test_seal_journal_precondition_codec.cpp)
+    target_link_libraries(test_seal_journal_precondition_codec PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_seal_journal_precondition_codec)
+    gtest_discover_tests(test_seal_journal_precondition_codec)
+
     # 轨道 C: L4 §10 seal-journal Round C（CompactionCandidateIntent GC 家族，最后
     # 一轮，ABI-only、声明层——不是 .x1/.xgc 的持久化/GC/恢复实现，见
     # durable_control_plane.hpp 顶部注释与 SPEC_INVARIANTS.md）
