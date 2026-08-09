@@ -1046,8 +1046,9 @@ TEST_F(DurableAuditSinkTest, RetiringAnObservedKeyIsWhatBreaksRecovery) {
         EXPECT_EQ(ids[0], 1u);
     }
 
-    EXPECT_TRUE(key_ring_->retire(1)) << "retire() must report whether it removed anything";
-    EXPECT_FALSE(key_ring_->retire(1)) << "second retire of the same id removes nothing";
+    EXPECT_EQ(key_ring_->retire(1), RetireStatus::Retired)
+        << "retire() must report whether it removed anything";
+    EXPECT_EQ(key_ring_->retire(1), RetireStatus::NotFound) << "second retire of the same id removes nothing";
 
     DurableAuditSink after(base_path_, *key_ring_, 1);
     EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Corrupt)
@@ -1061,6 +1062,6 @@ TEST_F(DurableAuditSinkTest, KeyRingExposesItsRotationCeiling) {
     WrappedKeyRecord rec2{};
     ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
     EXPECT_EQ(key_ring_->live_key_count(), 2u);
-    EXPECT_TRUE(key_ring_->retire(2));
+    EXPECT_EQ(key_ring_->retire(2), RetireStatus::Retired);
     EXPECT_EQ(key_ring_->live_key_count(), 1u);
 }

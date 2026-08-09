@@ -15,12 +15,20 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <utility>
 
 using hy::kKeyBlockSize;
 using hy::kKekSize;
 using hy::KeyRing;
 using hy::KeyRingAddStatus;
 using hy::KeyRingLoadStatus;
+using hy::PinnedKeyHandle;
+using hy::PinResult;
+using hy::PinStatus;
+using hy::RetireStatus;
 using hy::WrappedKeyRecord;
 
 namespace {
@@ -189,15 +197,14 @@ TEST(KeyRing, RetireThenLookupFails) {
     std::array<std::byte, kKeyBlockSize> out{};
     ASSERT_TRUE(ring.active_key(11, out));
 
-    ring.retire(11);
+    EXPECT_EQ(ring.retire(11), RetireStatus::Retired);
     EXPECT_FALSE(ring.active_key(11, out));
 }
 
-TEST(KeyRing, RetireIsNoOpForUnknownKeyId) {
+TEST(KeyRing, RetireIsNotFoundForUnknownKeyId) {
     const auto kek = make_kek(0x0c);
     KeyRing ring(kek);
-    ring.retire(12345);  // must not crash / must be a harmless no-op
-    SUCCEED();
+    EXPECT_EQ(ring.retire(12345), RetireStatus::NotFound);  // must not crash
 }
 
 TEST(KeyRing, RetiredSlotCanBeReusedByNewKeyId) {
@@ -206,8 +213,133 @@ TEST(KeyRing, RetiredSlotCanBeReusedByNewKeyId) {
 
     WrappedKeyRecord record{};
     ASSERT_EQ(ring.add_key(1, make_plaintext_key(0xb0), record), KeyRingAddStatus::Ok);
-    ring.retire(1);
+    ASSERT_EQ(ring.retire(1), RetireStatus::Retired);
     EXPECT_EQ(ring.add_key(1, make_plaintext_key(0xb1), record), KeyRingAddStatus::Ok);
+}
+
+TEST(KeyRing, RetireSecondTimeIsNotFoundNotRetired) {
+    const auto kek = make_kek(0x0f);
+    KeyRing ring(kek);
+    WrappedKeyRecord record{};
+    ASSERT_EQ(ring.add_key(1, make_plaintext_key(0xb0), record), KeyRingAddStatus::Ok);
+    ASSERT_EQ(ring.retire(1), RetireStatus::Retired);
+    EXPECT_EQ(ring.retire(1), RetireStatus::NotFound);  // already gone, not a second Retired
+}
+
+// --- pin_key / retire interaction (Round D review P0-4) ---
+
+TEST(KeyRingPin, PinKeyReturnsKeyBytesMatchingActiveKey) {
+    const auto kek = make_kek(0x10);
+    KeyRing ring(kek);
+    WrappedKeyRecord record{};
+    ASSERT_EQ(ring.add_key(7, make_plaintext_key(0xc0), record), KeyRingAddStatus::Ok);
+
+    std::array<std::byte, kKeyBlockSize> expected{};
+    ASSERT_TRUE(ring.active_key(7, expected));
+
+    const PinResult pin = ring.pin_key(7);
+    ASSERT_EQ(pin.status, PinStatus::Pinned);
+    ASSERT_TRUE(pin.handle.has_value());
+    EXPECT_EQ(pin.handle->key_id(), 7u);
+    ASSERT_EQ(pin.handle->key_bytes().size(), expected.size());
+    EXPECT_EQ(0, std::memcmp(pin.handle->key_bytes().data(), expected.data(), expected.size()));
+}
+
+TEST(KeyRingPin, PinKeyNotFoundForUnknownKeyId) {
+    const auto kek = make_kek(0x11);
+    KeyRing ring(kek);
+    const PinResult pin = ring.pin_key(999);
+    EXPECT_EQ(pin.status, PinStatus::NotFound);
+    EXPECT_FALSE(pin.handle.has_value());
+}
+
+TEST(KeyRingPin, RetireRefusedWhilePinHeld) {
+    const auto kek = make_kek(0x12);
+    KeyRing ring(kek);
+    WrappedKeyRecord record{};
+    ASSERT_EQ(ring.add_key(3, make_plaintext_key(0xd0), record), KeyRingAddStatus::Ok);
+
+    PinResult pin = ring.pin_key(3);
+    ASSERT_EQ(pin.status, PinStatus::Pinned);
+
+    EXPECT_EQ(ring.retire(3), RetireStatus::KeyPinned);
+
+    std::array<std::byte, kKeyBlockSize> out{};
+    EXPECT_TRUE(ring.active_key(3, out)) << "still active -- retire must have been refused, not silently applied";
+}
+
+TEST(KeyRingPin, RetireSucceedsAfterHandleReleased) {
+    const auto kek = make_kek(0x13);
+    KeyRing ring(kek);
+    WrappedKeyRecord record{};
+    ASSERT_EQ(ring.add_key(4, make_plaintext_key(0xe0), record), KeyRingAddStatus::Ok);
+
+    {
+        PinResult pin = ring.pin_key(4);
+        ASSERT_EQ(pin.status, PinStatus::Pinned);
+        // handle destructs at end of this scope, releasing the pin
+    }
+
+    EXPECT_EQ(ring.retire(4), RetireStatus::Retired);
+}
+
+TEST(KeyRingPin, MoveTransfersPinOwnershipWithoutDoubleRelease) {
+    const auto kek = make_kek(0x14);
+    KeyRing ring(kek);
+    WrappedKeyRecord record{};
+    ASSERT_EQ(ring.add_key(5, make_plaintext_key(0xf0), record), KeyRingAddStatus::Ok);
+
+    PinResult pin = ring.pin_key(5);
+    ASSERT_EQ(pin.status, PinStatus::Pinned);
+    PinnedKeyHandle moved(std::move(*pin.handle));
+    EXPECT_EQ(moved.key_id(), 5u);
+
+    // pin.handle's contained object is now moved-from (ring_==nullptr, so
+    // its destructor at scope exit is a safe no-op); `moved` is what
+    // actually still holds the pin. If move had double-released instead of
+    // transferring ownership, this retire() would wrongly succeed while
+    // `moved` is still alive.
+    EXPECT_EQ(ring.retire(5), RetireStatus::KeyPinned);
+}
+
+TEST(KeyRingPin, SelfMoveAssignmentDoesNotCorruptOrDoubleRelease) {
+    const auto kek = make_kek(0x15);
+    KeyRing ring(kek);
+    WrappedKeyRecord record{};
+    ASSERT_EQ(ring.add_key(6, make_plaintext_key(0x20), record), KeyRingAddStatus::Ok);
+
+    PinResult pin = ring.pin_key(6);
+    ASSERT_EQ(pin.status, PinStatus::Pinned);
+    PinnedKeyHandle& handle = *pin.handle;
+    // Indirect through a pointer so the compiler can't statically detect
+    // (and warn on) an obviously-self move -- this still exercises the
+    // real self-move-assignment code path at runtime.
+    PinnedKeyHandle* self_ptr = &handle;
+    handle = std::move(*self_ptr);
+    EXPECT_EQ(handle.key_id(), 6u);
+    EXPECT_EQ(ring.retire(6), RetireStatus::KeyPinned) << "self-move must not have silently released the pin";
+}
+
+// Round D review P0-2: ~KeyRing() must fail-closed in ALL build types (not
+// a debug-only assert) when a PinnedKeyHandle is still alive at destruction
+// time -- verifying this actually happens, not just documenting the
+// contract. Local scoping alone would destroy `pin` before `ring` (reverse
+// declaration order), which would NOT exercise the violation -- std::
+// unique_ptr<KeyRing>::reset() forces `ring` to be destroyed first, while
+// `pin`'s PinnedKeyHandle is still alive, which is the actual misuse this
+// destructor must catch.
+TEST(KeyRingDeathTest, DestroyedWithLivePinTerminates) {
+    const auto kek = make_kek(0x16);
+    EXPECT_DEATH(
+        {
+            auto ring = std::make_unique<KeyRing>(kek);
+            WrappedKeyRecord record{};
+            if (ring->add_key(1, make_plaintext_key(0x30), record) != KeyRingAddStatus::Ok) std::abort();
+            PinResult pin = ring->pin_key(1);
+            if (pin.status != PinStatus::Pinned) std::abort();
+            ring.reset();  // destroys KeyRing while pin.handle is still alive -- must terminate()
+        },
+        "");
 }
 
 TEST(KeyRing, TableFullIsRefusedNotSilentlyOverwritten) {
