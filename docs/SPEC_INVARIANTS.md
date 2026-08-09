@@ -808,22 +808,22 @@ Governance: L1（纯内存计算，无文件 I/O）。`VerifiedSealIdWatermark`/
 
 **实测证据（2026-08-09）**：
 
-- `test_seal_journal_precondition_codec.cpp`（新建，28 个测试）：`SealIdWatermarkCodec` 7 个
+- `test_seal_journal_precondition_codec.cpp`（新建，28 个测试）：SealIdWatermarkCodec 测试套件 7 个
   （round-trip、单字节 MAC 篡改检测、错 key、截断、`next_candidate_id`/`next_request_id` 为 0
-  拒绝各 1 个、`UINT64_MAX` 且 MAC 正确必须解码成功）；`SealExportStartedCodec` 18 个（round-trip
+  拒绝各 1 个、`UINT64_MAX` 且 MAC 正确必须解码成功）；SealExportStartedCodec 测试套件 18 个（round-trip
   含 `ring_id[8]` 逐元素比较、未知 format_version、错误 total_bytes、MAC 篡改、错 key、截断、
   legacy-192B/draft-234B 均按 `Truncated` 拒绝、以及 P0-1 要求的 10 条"MAC 正确但字段非法"语义
   拒绝测试——空 mask、mask 满容量下正确接受、`producer_count`/`popcount` 不匹配、置位槽 `ring_id`
   为零、未置位槽 `ring_id` 非零、重复 `ring_id`、`candidate_id`/`request_id` 为零各 1 个、
   `new_generation` 不等于 `source_generation+1`、`source_generation==UINT32_MAX` 溢出防护）；
-  `PeekSealExportStartedKekKeyId` 2 个（MAC 篡改后仍可 peek、缓冲区过短拒绝）；一个 2000 次迭代的
-  属性测试确认两个 decode 函数对任意随机字节都不崩溃。
-- MSVC Release 全量 `ctest`：904/904。
-- WSL2 GCC-14 Release（镜像 `ci-native.yml`）：931/931。
-- WSL2 ASan+UBSan（镜像 `ci-native-sanitizers.yml` 的 asan-ubsan-full job，含 `HY_BUILD_DEMO=ON`
+  `peek_seal_export_started_kek_key_id` 测试 2 个（MAC 篡改后仍可 peek、缓冲区过短拒绝）；一个 2000
+  次迭代的属性测试确认两个 decode 函数对任意随机字节都不崩溃。
+- MSVC Release 全量 ctest：904/904。
+- WSL2 GCC-14 Release（镜像 ci-native.yml）：931/931。
+- WSL2 ASan+UBSan（镜像 ci-native-sanitizers.yml 的 asan-ubsan-full job，含 `HY_BUILD_DEMO=ON`
   的全部二进制）：931/931，无 ASan/UBSan 报告。
-- WSL2 TSan 并发测试套件：47/47；两个负控 `tsan_control_relaxed_ring`/
-  `tsan_control_export_worker_dual_consumer` 均按预期以非零退出码报出
+- WSL2 TSan 并发测试套件：47/47；两个负控 tsan_control_relaxed_ring/
+  tsan_control_export_worker_dual_consumer 均按预期以非零退出码报出
   `WARNING: ThreadSanitizer: data race`（这两个控制跟本轮改动无关——Round E Slice 1 是纯内存
   codec，不碰任何并发/线程代码——之所以仍然重跑，是因为 `tools/wsl_verify.sh all` 的 `thread`
   模式本身就会跑这两个控制，用来证明 TSan 在本机确实还能检测到注入的数据竞争，不是这条验证腿本身
