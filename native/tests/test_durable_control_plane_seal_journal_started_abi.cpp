@@ -9,6 +9,13 @@
 // CompactionIntentTransitionWire, CompactionIntentGcAuthorizedWire (confirmed
 // by research to not subdivide further).
 //
+// Round E Slice 1 (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 1"
+// entry) promotes ONLY SealExportStartedWire out of this file's four types
+// from mac[32]-only marker to real named fields + a real codec
+// (seal_journal_precondition_codec.hpp) -- SealExportStartedMigrationWire/
+// SealStartedCleanupTombstoneWire/SealStartedAbandonWire are untouched and
+// still mac[32]-only markers.
+//
 // See test_durable_control_plane_abi.cpp's own header comment for the full
 // caution about what these tests can and cannot prove -- short version: only
 // tools/spec_enum_diff.py proves a type was transcribed from the spec, not
@@ -60,11 +67,22 @@ using hy::SealExportStartedWire;
 using hy::SealStartedAbandonWire;
 using hy::SealStartedCleanupTombstoneWire;
 
-// All four types below are "Wire" structs with only a trailing mac[32] member
-// (the full packed on-disk layout is documented in a comment, not
-// materialized as fields) -- same treatment as every other Wire type in this
-// family (SealJournalTombstoneWire, etc.). sizeof is meaningful here for the
-// same reason it was for SealJournalTombstoneWire.
+// SealExportStartedMigrationWire / SealStartedCleanupTombstoneWire /
+// SealStartedAbandonWire below are still "Wire" structs with only a trailing
+// mac[32] member (the full packed on-disk layout is documented in a comment,
+// not materialized as fields) -- sizeof is meaningful for those three, same
+// treatment as every other Wire type in this family (SealJournalTombstoneWire,
+// etc.).
+//
+// SealExportStartedWire is DIFFERENT as of Round E Slice 1 (docs/
+// SPEC_INVARIANTS.md's "Seal-journal Round E Slice 1" entry): it was promoted
+// from mac[32]-only to real named fields, with encode/decode living in
+// seal_journal_precondition_codec.hpp. Its host-struct sizeof is NOT 238 (u32-
+// then-u64 field ordering means normal C++ alignment inserts padding) and
+// must never be asserted as such -- only is_trivially_copyable_v/
+// is_standard_layout_v (still true, just with more members now) and the
+// kSealExportStartedWireBytes==238u constant (the wire byte count the codec
+// itself pins against) are checked below.
 
 // --- SealExportStartedWire (spec L4 §10 / BINANCE:3185) ---
 
@@ -75,7 +93,6 @@ TEST(SealExportStartedWire, IsTriviallyCopyableStandardLayout) {
 }
 
 TEST(SealExportStartedWire, ShapeIsJustTheTrailerMac) {
-    EXPECT_EQ(sizeof(SealExportStartedWire), 32u);
     EXPECT_EQ(kSealExportStartedFormatVersion, 2u);
     EXPECT_EQ(kSealExportStartedWireBytes, 238u);
     EXPECT_EQ(kSealExportStartedLegacyV1Bytes, 192u);
