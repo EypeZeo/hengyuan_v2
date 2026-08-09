@@ -311,6 +311,16 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_compaction_intent_codec)
     gtest_discover_tests(test_compaction_intent_codec)
 
+    # Round D: compaction_breadcrumb_io.hpp's platform-independent surface
+    # (ValidatedArtifactName / is_traversal_safe_name) -- the POSIX openat/
+    # linkat/renameat2 half and the Windows NT-native half
+    # (windows_native_io.hpp) are exercised for real by test_compaction_lease
+    # (needs an actual directory), not here.
+    add_executable(test_compaction_breadcrumb_io_detail tests/test_compaction_breadcrumb_io_detail.cpp)
+    target_link_libraries(test_compaction_breadcrumb_io_detail PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_compaction_breadcrumb_io_detail)
+    gtest_discover_tests(test_compaction_breadcrumb_io_detail)
+
     # Phase 1: control-plane 11 种 payload 的帧编解码 (L1, 纯内存, 无文件 I/O --
     # 真正的文件落盘在 control_plane_log_sink.hpp，这里只验证帧格式本身，见
     # control_plane_frame_codec.hpp 头部注释)
