@@ -10,11 +10,15 @@
 // by research to not subdivide further).
 //
 // Round E Slice 1 (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 1"
-// entry) promotes ONLY SealExportStartedWire out of this file's four types
-// from mac[32]-only marker to real named fields + a real codec
-// (seal_journal_precondition_codec.hpp) -- SealExportStartedMigrationWire/
-// SealStartedCleanupTombstoneWire/SealStartedAbandonWire are untouched and
-// still mac[32]-only markers.
+// entry) promotes SealExportStartedWire from mac[32]-only marker to real
+// named fields + a real codec (seal_journal_precondition_codec.hpp). Round E
+// Slice 2b (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2b" entry)
+// does the same for the remaining three types in this file --
+// SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/
+// SealStartedAbandonWire -- with encode/decode living in
+// seal_export_migration_cleanup_abandon_codec.hpp. All four types in this
+// file are therefore real named fields as of Slice 2b, none are mac[32]-only
+// markers anymore.
 //
 // See test_durable_control_plane_abi.cpp's own header comment for the full
 // caution about what these tests can and cannot prove -- short version: only
@@ -67,22 +71,13 @@ using hy::SealExportStartedWire;
 using hy::SealStartedAbandonWire;
 using hy::SealStartedCleanupTombstoneWire;
 
-// SealExportStartedMigrationWire / SealStartedCleanupTombstoneWire /
-// SealStartedAbandonWire below are still "Wire" structs with only a trailing
-// mac[32] member (the full packed on-disk layout is documented in a comment,
-// not materialized as fields) -- sizeof is meaningful for those three, same
-// treatment as every other Wire type in this family (SealJournalTombstoneWire,
-// etc.).
-//
-// SealExportStartedWire is DIFFERENT as of Round E Slice 1 (docs/
-// SPEC_INVARIANTS.md's "Seal-journal Round E Slice 1" entry): it was promoted
-// from mac[32]-only to real named fields, with encode/decode living in
-// seal_journal_precondition_codec.hpp. Its host-struct sizeof is NOT 238 (u32-
-// then-u64 field ordering means normal C++ alignment inserts padding) and
-// must never be asserted as such -- only is_trivially_copyable_v/
-// is_standard_layout_v (still true, just with more members now) and the
-// kSealExportStartedWireBytes==238u constant (the wire byte count the codec
-// itself pins against) are checked below.
+// All four types in this file are real named fields as of Round E Slice 2b
+// (SealExportStartedWire since Slice 1). Host-struct sizeof is NOT the wire
+// byte count for any of them (u32-then-u64 field ordering means normal C++
+// alignment inserts padding) and must never be asserted as such -- only
+// is_trivially_copyable_v/is_standard_layout_v and each type's own
+// kXxxWireBytes constant (the wire byte count the respective codec pins
+// against) are checked below.
 
 // --- SealExportStartedWire (spec L4 §10 / BINANCE:3185) ---
 
@@ -114,8 +109,7 @@ TEST(SealExportStartedMigrationWire, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
-TEST(SealExportStartedMigrationWire, ShapeIsJustTheTrailerMac) {
-    EXPECT_EQ(sizeof(SealExportStartedMigrationWire), 32u);
+TEST(SealExportStartedMigrationWire, WireByteConstantMatchesSpec) {
     EXPECT_EQ(kSealExportStartedMigrationFormatVersion, 2u);
     EXPECT_EQ(kSealExportStartedMigrationWireBytes, 208u);
     EXPECT_EQ(kSealExportStartedMigrationDraft136Bytes, 136u);
@@ -129,8 +123,7 @@ TEST(SealStartedCleanupTombstoneWire, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
-TEST(SealStartedCleanupTombstoneWire, ShapeIsJustTheTrailerMac) {
-    EXPECT_EQ(sizeof(SealStartedCleanupTombstoneWire), 32u);
+TEST(SealStartedCleanupTombstoneWire, WireByteConstantMatchesSpec) {
     EXPECT_EQ(kSealStartedCleanupFormatVersion, 2u);
     EXPECT_EQ(kSealStartedCleanupWireBytes, 304u);
     EXPECT_EQ(kSealStartedCleanupDraft176Bytes, 176u);
@@ -154,8 +147,7 @@ TEST(SealStartedAbandonWire, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
-TEST(SealStartedAbandonWire, ShapeIsJustTheTrailerMac) {
-    EXPECT_EQ(sizeof(SealStartedAbandonWire), 32u);
+TEST(SealStartedAbandonWire, WireByteConstantMatchesSpec) {
     EXPECT_EQ(kSealStartedAbandonFormatVersion, 1u);
     EXPECT_EQ(kSealStartedAbandonWireBytes, 192u);
     EXPECT_EQ(kSealStartedAbandonReasonNotFound, 1u);
