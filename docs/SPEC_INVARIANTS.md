@@ -831,6 +831,114 @@ Governance: L1（纯内存计算，无文件 I/O）。`VerifiedSealIdWatermark`/
 - `spec_xref_check.py --quiet`：398 个符号、33045 个匹配点，全部可定位。
 - `spec_enum_diff.py`：0 个新发现（本轮无新增 `enum class`，符合预期）。
 
+### Seal-journal Round E Slice 2a（SealJournalCommitWatermark/SealJournalTombstoneWire commit/tombstone codec）[计划中]
+
+Round E Slice 1（上面）做了 `SealIdWatermark`/`SealExportStartedWire` 两个 durable-precondition 类型的
+codec，并明确把 `SealJournalCommitWatermark`/`SealJournalTombstoneWire` 排除在那一轮之外。这是 Round E
+的第二个切片——只做这两个类型的 codec（编码/解码/MAC 验证 + 字段语义校验），`SealJournalTombstoneWire`
+从 `mac[32]`-only 升格为真实具名字段；不写任何文件 I/O，不接入 `IntentStore`/`CandidateLease`/任何
+manager，不做 receipt 概念，不做 `raise_intent_phase()`，不碰真实 C/A（`.clr`/`.abd`——那是并行轨道
+Slice 2b 的范围）。方案本身经过一轮外部 Architect 审查，发现两个真实的规则遗漏并已修订进本条目：
+P0-3（两条非零校验规则，见下）与 P1-2（`UINT64_MAX` 上界 fence 的 reader/writer 职责边界，见下）；
+另确认一个并行安全要求（独立 worktree 开发，不共享 checkout）。
+
+**`SealJournalCommitWatermark`**（`durable_control_plane.hpp:754-764`，字段已经真实、只缺 codec）：
+- Wire 顺序照抄字段声明顺序：`store_uuid_lo`(u64)/`store_uuid_hi`(u64)/`candidate_id`(u64)/
+  `highest_committed_journal_seq`(u64)/`kek_key_id`(u32)/`mac`(u8[32])，共 68 字节，新增
+  `kSealJournalCommitWatermarkWireBytes = 68` + `static_assert(8+8+8+8+4+32 == ...)`。没有
+  `format_version`/`total_bytes` 字段（不要照抄 Compaction 模板硬凑这两个字段，`SealIdWatermark`
+  已是先例）。
+- MAC 域（LE，无 padding）：`HMAC(KEK[kek_key_id], "HY-SEALJRNHW-v1" || store_uuid_lo ||
+  store_uuid_hi || candidate_id || highest_committed_journal_seq || kek_key_id)`（照抄结构体自己的注释）。
+- `peek_seal_journal_commit_watermark_kek_key_id`：偏移 `8+8+8+8=32`（有 `kek_key_id` 字段，decode
+  前需要先按 key_id 解析 KEK）。
+- **语义校验（P0-3 修订）**：decode 拒绝 `candidate_id == 0`——这个 id 由 `SealIdWatermark` 分配
+  （`next_candidate_id` 起始于 1），0 从来不是合法的已保留 id。`highest_committed_journal_seq` **允许**
+  为 0——结构体注释明确写"0 = none yet"，这是合法的初始状态（"这个 candidate 还没有任何 commit 过的
+  journal entry"），**不要**对它加非零校验。
+- **`UINT64_MAX` 边界（P1-2 修订，这版提示词新加）**：`highest_committed_journal_seq == UINT64_MAX`
+  时 decode **必须允许**读出（不要拒绝）——与 `SealIdWatermark` 的 `next_candidate_id`/`next_request_id`
+  对 `UINT64_MAX` 的处理方式同一个先例：一个 MAC 校验完全通过的 `UINT64_MAX` 状态代表这个 counter
+  已经用尽，运维需要能诊断出这个状态（比如判断"这个 candidate 的 journal 已经不能再往前推进了"），
+  不能因为数值很大就当成损坏拒绝。但这**不代表**未来允许有代码直接对一个 `UINT64_MAX` 的值做未检查的
+  `+1`——那会无符号回绕到 0，是真正的 bug 来源。这轮的 codec 不实现任何写路径（没有
+  reservation/推进 watermark 的函数），所以这条 fence 规则本身没有代码可写，边界如下：
+  1. **reader（本 codec 文件）**：允许读出 `UINT64_MAX`，不允许在 decode 阶段以"数值太大"为由拒绝；
+  2. **writer（未来某个负责推进 `highest_committed_journal_seq` 的函数）**：必须在 `+1` 之前
+     fail-closed（推进前检查 `== UINT64_MAX` 即拒绝，不许回绕到 0）。
+  这条规则在 codec 文件头部注释里明确写清楚，并列为**未来任何实现 journal watermark 推进逻辑的
+  Slice 必须验收的一项**，不能被默认忽略。
+
+**`SealJournalTombstoneWire`**（`durable_control_plane.hpp:858-879`，本轮从 `mac[32]`-only 升格为
+真实字段）：
+- Wire 顺序照抄偏移注释：`format_version`(u32，=1)/`total_bytes`(u32，=108)/`store_uuid_lo`(u64)/
+  `store_uuid_hi`(u64)/`kek_key_id`(u32)/`candidate_id`(u64)/`journal_seq`(u64)/`entry_mac`(u8[32])/
+  `mac`(u8[32])，共 108 字节（`kSealJournalTombstoneFormatVersion`/`kSealJournalTombstoneBytes` 已存在，
+  不重新定义）。MAC 域：`HMAC(KEK[kek_key_id], "HY-SEALJRNTS-v1" || format_version || total_bytes ||
+  store_uuid_lo || store_uuid_hi || kek_key_id || candidate_id || journal_seq || entry_mac)`
+  （照抄 `:868-870`）。`peek_seal_journal_tombstone_kek_key_id`：偏移 `4+4+8+8=24`。
+- **语义校验（P0-3 修订）**：decode 拒绝 `candidate_id == 0` 或 `journal_seq == 0`——`journal_seq`
+  从 1 开始严格递增分配（`docs/BINANCE_PRIVATE_REST_L4_SPEC.md:5059`），0 不可能是任何真实 entry 的
+  编号。注意与 `SealJournalCommitWatermark.highest_committed_journal_seq` 的规则**不同**——watermark
+  的 0 是合法初始值，tombstone 的 0 永远非法，两者含义不同，不要类比错。
+- **host struct 不是 wire layout**：108 字节里 u32 后接 u64 会有 C++ 对齐 padding，host `sizeof`
+  几乎肯定不等于 108。禁止 `#pragma pack`/`reinterpret_cast` 序列化/`memcpy(sizeof)`/
+  offsetof==disk offset/`static_assert(sizeof==108)`；唯一的 wire 权威是 encoder/decoder 里显式的
+  逐字段 LE 读写（跟 `SealExportStartedWire` 升格一个套路）。ABI 测试删掉 `sizeof==32u` 那一行之后
+  只断言 `is_trivially_copyable_v`/`is_standard_layout_v` + wire-byte-constant，不对 host sizeof
+  /offsetof 下注。
+- **`entry_mac` 的"明确不做"**：字段注释写"MUST equal the Applied / journal entry_mac"——这是
+  **跨文件**一致性要求（要跟另一份 journal entry 记录的 mac 比对），单文件 decode 函数证明不了这件事，
+  本 codec 只把它当作一个普通的 32 字节字段编解码，**不**在 decode 里验证这条规则。
+
+**两个类型共同的 codec 规则**（都实现于新文件 `native/include/hengyuan/seal_journal_commit_tombstone_codec.hpp`，
+一个文件装两个类型的 codec。Governance: L1，纯内存计算，无文件 I/O；结构参考
+`seal_journal_precondition_codec.hpp`，同一套 `hy::detail::write_u32_le`/`read_u32_le`/
+`write_u64_le`/`read_u64_le`/`write_u8`/`read_u8`/`write_bytes`/`read_bytes` 原语来自
+`durable_frame_codec.hpp`，`crypto::HmacSha256`/`crypto::constant_time_equal` 来自 `sha256.hpp`）：
+- 自己定义 `SealJournalCommitTombstoneDecodeStatus` 枚举（`Ok`/`Truncated`/`UnknownVersion`/
+  `TotalBytesInvalid`/`MalformedField`/`ChecksumMismatch`，不复用其它 codec 文件的枚举——这两个类型族
+  没有实际耦合）。`SealJournalCommitWatermark` 没有 `format_version`/`total_bytes` 字段，其 decode
+  只会用到 `Ok`/`Truncated`/`MalformedField`/`ChecksumMismatch`。
+- `VerifiedSealJournalCommitWatermark`/`VerifiedSealJournalTombstoneWire`：私有构造函数，成员按值持有
+  完整 struct（不保存输入/MAC/key span 的引用），所有函数 `noexcept`；decode 函数的
+  `std::optional<VerifiedX>&` out 参数在任何失败路径都先 `out.reset()`，不允许部分填充。
+- **MAC 比较之前先做语义校验**（`candidate_id`/`journal_seq` 非零检查），跟
+  `compaction_intent_codec.hpp`/`seal_journal_precondition_codec.hpp` 已有的检查顺序一致——fail-fast
+  的字段形状检查先于 MAC，MAC 检查是最后、唯一决定"是否可信"的门。
+- **decoder 输入长度契约**：接受 `std::span<const std::byte>`，只要求 `in.size() >= kXxxWireBytes`
+  （不够就 `Truncated`），只读取/认证前 N 字节，不关心调用者传入的 span 后面是否还有多余字节——这
+  不是安全漏洞（MAC 只覆盖前 N 字节内容，附加垃圾字节不改变认证结果），"必须恰好 N 字节"这条更严格
+  的契约属于未来 I/O 读取层。
+- **写侧 shape gate（这版提示词新加的一条）**：两个 `encode_*` 函数**必须**在写入任何字节之前先调用
+  对应的 `validate_*_shape()`（watermark 检查 `candidate_id != 0`；tombstone 检查 `candidate_id != 0
+  && journal_seq != 0`）——语义非法直接返回 `0`（不写任何输出字节，不计算 MAC），成功才继续正常的
+  逐字段 LE 写入 + HMAC。这是防止未来某个写路径不小心把语义非法的值签成"MAC 正确"的 durable record。
+
+**明确不做**：真实 C/A（`.clr`/`.abd`）codec；receipt 概念；`raise_intent_phase()`；接入
+`IntentStore`/`CandidateLease`/任何 manager；任何文件 I/O；`SealJournalOriginKey` 的 codec（该类型
+是纯内存去重索引 key，两个字段没有 `mac[32]`，没有 wire 格式，不需要 codec）；`entry_mac` 的跨文件
+一致性验证（见上）；`docs/SPEC_INVARIANTS.md` 的 ledger 状态翻 `[已实现]`（留给协调者合并两边工作
+之后统一处理）；`tools/spec_xref_check.py` 的改动（同样是协调者统一处理的部分）。
+
+**验收要求（未来 Slice 必须遵守，不能被默认忽略）**：任何实现 journal watermark 推进逻辑（对
+`highest_committed_journal_seq` 做 `+1`）的 Slice，必须在 `+1` 之前对 `UINT64_MAX` fail-closed
+（见上 P1-2 的 writer 边界），并以测试验收。
+
+**实测证据（待验证，本轮 commit 时状态为 `[计划中]`，验证结果由协调者合并后统一补入）**：
+- `test_seal_journal_commit_tombstone_codec.cpp`（新建）：SealJournalCommitWatermarkCodec / 
+  SealJournalTombstoneWireCodec / Peek 两个 / RefusesToEncodeSemanticallyInvalidInput 两个 / 合并
+  属性测试（固定种子 2000 次迭代、长度 `trial % 200`、两个 decode 都跑、断言不崩溃 + 状态闭合 +
+  失败时 out 为空 + 成功时重复调用结果一致）——负测试（MAC 正确但 candidate_id/journal_seq 为 0）
+  用测试文件内部的 raw signer 辅助函数构造（生产 `encode_*` 现在会拒绝语义非法的输入）。
+- `test_durable_control_plane_seal_journal_abi.cpp`：新增 `SealJournalCommitWatermark.WireByteConstant
+  MatchesSpec`（`kSealJournalCommitWatermarkWireBytes == 68`）；`ShapeIsJustTheTrailerMac` 删掉
+  `sizeof==32u` 断言、保留常量断言；两个类型的 `IsTriviallyCopyableStandardLayout` 原样保留。
+- `native/CMakeLists.txt` 注册新的 `test_seal_journal_commit_tombstone_codec` 目标（照
+  `test_seal_journal_precondition_codec` 的四件套形状）。
+- 预期验证腿：MSVC Release 全量 ctest + WSL2 GCC-14（`tools/wsl_verify.sh`，worktree 手动同步）
+  ——协调者合并后统一补实测数字。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 
