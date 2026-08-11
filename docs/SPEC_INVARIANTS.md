@@ -831,7 +831,7 @@ Governance: L1（纯内存计算，无文件 I/O）。`VerifiedSealIdWatermark`/
 - `spec_xref_check.py --quiet`：398 个符号、33045 个匹配点，全部可定位。
 - `spec_enum_diff.py`：0 个新发现（本轮无新增 `enum class`，符合预期）。
 
-### Seal-journal Round E Slice 2a（SealJournalCommitWatermark/SealJournalTombstoneWire commit/tombstone codec）[计划中]
+### Seal-journal Round E Slice 2a（SealJournalCommitWatermark/SealJournalTombstoneWire commit/tombstone codec）[已实现]
 
 Round E Slice 1（上面）做了 `SealIdWatermark`/`SealExportStartedWire` 两个 durable-precondition 类型的
 codec，并明确把 `SealJournalCommitWatermark`/`SealJournalTombstoneWire` 排除在那一轮之外。这是 Round E
@@ -893,7 +893,7 @@ P0-3（两条非零校验规则，见下）与 P1-2（`UINT64_MAX` 上界 fence 
 
 **两个类型共同的 codec 规则**（都实现于新文件 `native/include/hengyuan/seal_journal_commit_tombstone_codec.hpp`，
 一个文件装两个类型的 codec。Governance: L1，纯内存计算，无文件 I/O；结构参考
-`seal_journal_precondition_codec.hpp`，同一套 `hy::detail::write_u32_le`/`read_u32_le`/
+`seal_journal_precondition_codec.hpp`，同一套 `detail::write_u32_le`/`read_u32_le`/
 `write_u64_le`/`read_u64_le`/`write_u8`/`read_u8`/`write_bytes`/`read_bytes` 原语来自
 `durable_frame_codec.hpp`，`crypto::HmacSha256`/`crypto::constant_time_equal` 来自 `sha256.hpp`）：
 - 自己定义 `SealJournalCommitTombstoneDecodeStatus` 枚举（`Ok`/`Truncated`/`UnknownVersion`/
@@ -925,21 +925,33 @@ P0-3（两条非零校验规则，见下）与 P1-2（`UINT64_MAX` 上界 fence 
 `highest_committed_journal_seq` 做 `+1`）的 Slice，必须在 `+1` 之前对 `UINT64_MAX` fail-closed
 （见上 P1-2 的 writer 边界），并以测试验收。
 
-**实测证据（待验证，本轮 commit 时状态为 `[计划中]`，验证结果由协调者合并后统一补入）**：
-- `test_seal_journal_commit_tombstone_codec.cpp`（新建）：SealJournalCommitWatermarkCodec / 
+**实测证据（2026-08-11，协调者合并 Slice 2a+2b 后统一补入）**：
+- test_seal_journal_commit_tombstone_codec.cpp（新建，28 个测试）：SealJournalCommitWatermarkCodec / 
   SealJournalTombstoneWireCodec / Peek 两个 / RefusesToEncodeSemanticallyInvalidInput 两个 / 合并
   属性测试（固定种子 2000 次迭代、长度 `trial % 200`、两个 decode 都跑、断言不崩溃 + 状态闭合 +
   失败时 out 为空 + 成功时重复调用结果一致）——负测试（MAC 正确但 candidate_id/journal_seq 为 0）
   用测试文件内部的 raw signer 辅助函数构造（生产 `encode_*` 现在会拒绝语义非法的输入）。
 - `test_durable_control_plane_seal_journal_abi.cpp`：新增 `SealJournalCommitWatermark.WireByteConstant
-  MatchesSpec`（`kSealJournalCommitWatermarkWireBytes == 68`）；`ShapeIsJustTheTrailerMac` 删掉
-  `sizeof==32u` 断言、保留常量断言；两个类型的 `IsTriviallyCopyableStandardLayout` 原样保留。
-- `native/CMakeLists.txt` 注册新的 `test_seal_journal_commit_tombstone_codec` 目标（照
-  `test_seal_journal_precondition_codec` 的四件套形状）。
-- 预期验证腿：MSVC Release 全量 ctest + WSL2 GCC-14（`tools/wsl_verify.sh`，worktree 手动同步）
-  ——协调者合并后统一补实测数字。
+  MatchesSpec`（`kSealJournalCommitWatermarkWireBytes == 68`）；原计划的 ShapeIsJustTheTrailerMac
+  测试因 sizeof==32u 断言不再成立而改名为 WireByteConstantsMatchSpec（删掉 sizeof 断言、保留常量
+  断言）；两个类型的 IsTriviallyCopyableStandardLayout 测试原样保留。
+- native/CMakeLists.txt 注册新的 test_seal_journal_commit_tombstone_codec 目标（照
+  test_seal_journal_precondition_codec 的四件套形状）。
+- MSVC Release 全量 ctest（Slice 2a+2b 合并后的集成分支）：983/983。
+- WSL2 GCC-14 Release（镜像 `ci-native.yml`，含 `HY_BUILD_DEMO=ON` 的全部二进制）：1010/1010。
+- WSL2 ASan+UBSan（定向构建本轮四个相关 test 目标：
+  test_seal_journal_commit_tombstone_codec/test_seal_export_migration_cleanup_abandon_codec/
+  test_durable_control_plane_seal_journal_abi/test_durable_control_plane_seal_journal_started_abi，
+  避开 WSL VM 全量 `HY_BUILD_DEMO=ON` ASan 构建已知的 OOM 问题）：102/102，无 ASan/UBSan 报告。
+- TSan：本轮未重跑——两个切片都是纯内存 codec，不碰任何并发/线程代码，Slice 1 的先例（上面）已经
+  确认本机 TSan 负控仍能检测注入的数据竞争，不为跟并发无关的改动重复这条验证腿。
+- `spec_xref_check.py --quiet`：440 个符号、36088 个匹配点，全部可定位（新增两个 codec 头文件的
+  SEARCH_FILES 注册；ledger 正文里若干处误用反引号包裹的非符号 prose——测试名 prose 引用、worktree
+  目录名、记忆条目名——改成纯文本，不是真实的 spec/code drift）。
+- `spec_enum_diff.py`：0 个新发现（`SealJournalCommitTombstoneDecodeStatus`/`SealStartedWireDecodeStatus`
+  均已在代码中定义，跟 spec 无冲突）。
 
-### Seal-journal Round E Slice 2b（SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/SealStartedAbandonWire durable-precondition codec）[计划中]
+### Seal-journal Round E Slice 2b（SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/SealStartedAbandonWire durable-precondition codec）[已实现]
 
 Round E Slice 1（上面）给"Round A"/"Round B"两个 Wire 类型集群里的 2 个类型
 （`SealIdWatermark`/`SealExportStartedWire`）做了真实 codec。"Round B" 集群（`durable_control_
@@ -951,10 +963,10 @@ encode/decode/MAC 验证 codec，跟 Slice 1 一样的governance（L1，纯内�
 `IntentStore`/`CandidateLease`/任何 manager，不做 receipt，不做 `raise_intent_phase()`）。
 
 **并行开发说明**：这一轮跟另一个"Round A"集群（`SealJournalCommitWatermark`/
-`SealJournalTombstoneWire`，Slice 2a）并行开发，各自在独立的 `git worktree`
-（`hengyuan_v2_slice2b`/`hengyuan_v2_slice2a`）里进行，避免共享 checkout 导致互相打断工作目录
+`SealJournalTombstoneWire`，Slice 2a）并行开发，各自在独立的 git worktree
+（hengyuan_v2_slice2b/hengyuan_v2_slice2a）里进行，避免共享 checkout 导致互相打断工作目录
 （上一轮 Round E Slice 1 + 形式化建模那次并行工作真实发生过两次分支切换互相干扰，详见记忆
-`project_shared_workdir_branch_collision`）。`tools/spec_xref_check.py` 的注册和这个 ledger
+project_shared_workdir_branch_collision）。`tools/spec_xref_check.py` 的注册和这个 ledger
 条目从 `[计划中]` 翻成 `[已实现]`，都统一放到两边合并之后由协调者做，不在各自轨道自己的 commit
 里做。
 
@@ -1058,8 +1070,12 @@ encoder 也补上同款 gate。
 `mac[32]`，不需要）；`SealJournalIntakeCloseControl`/`SealJournalIntakeCloseProducerSlot` 的
 codec（RAM-only atomic 控制块，非 durable）；Fuzz 基础设施（2000 次随机字节属性测试保留，但
 不替代真正的 fuzz——这轮的 parser 处理固定、可信的本地 sidecar 格式，fuzz 标记
-`NEEDS_EVIDENCE`，不是这轮发布阻断项）；TLA+（纯 encode/decode，没有新的并发状态机或持久化
+NEEDS_EVIDENCE，不是这轮发布阻断项）；TLA+（纯 encode/decode，没有新的并发状态机或持久化
 写路径，不为了"覆盖率"造模型）。
+
+**实测证据**：Slice 2a 与 Slice 2b 由协调者在同一次合并（`codex/round-e-slice2-integration`）后
+统一验证，实测数字记在上面"Seal-journal Round E Slice 2a"条目的"实测证据"小节——两边共用同一套
+MSVC/WSL2/ASan+UBSan 验证腿，不重复记录。
 
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
