@@ -765,6 +765,15 @@ struct SealJournalCommitWatermark {
 static_assert(std::is_trivially_copyable_v<SealJournalCommitWatermark>);
 static_assert(std::is_standard_layout_v<SealJournalCommitWatermark>);
 
+// Round E Slice 2a (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2a"
+// entry): real encode/decode lives in seal_journal_commit_tombstone_codec.hpp,
+// never memcpy of this struct as the disk format -- this constant is the wire
+// byte count the codec's static_assert pins against, not a claim about
+// sizeof(SealJournalCommitWatermark). No format_version/total_bytes fields
+// (same precedent as kSealIdWatermarkWireBytes -- nothing to pin them to).
+constexpr std::size_t kSealJournalCommitWatermarkWireBytes = 68;
+static_assert(8 + 8 + 8 + 8 + 4 + 32 == kSealJournalCommitWatermarkWireBytes);
+
 // --- Seal-journal intake-close constants/alias ---
 // SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3050
 //
@@ -860,7 +869,7 @@ struct SealJournalIntakeCloseControl {
 //
 // Per-seq clear receipt after Applied Ack (breadcrumb directory). File:
 // seal-journal/<store_uuid...>/<candidate_id_hex16>-<journal_seq_hex16>.jts
-// Conceptual; on-disk is packed LE, 108 bytes, no padding:
+// On-disk is packed LE, 108 bytes, no padding:
 //   +0 u32 format_version(=1) / +4 u32 total_bytes(=108) / +8 u64 store_uuid_lo
 //   / +16 u64 store_uuid_hi / +24 u32 kek_key_id / +28 u64 candidate_id /
 //   +36 u64 journal_seq / +44 u8 entry_mac[32] (MUST equal the Applied /
@@ -872,7 +881,27 @@ struct SealJournalIntakeCloseControl {
 constexpr std::uint32_t kSealJournalTombstoneFormatVersion = 1;
 constexpr std::size_t kSealJournalTombstoneBytes = 108;
 
+// Round E Slice 2a promotes this struct from mac[32]-only marker to real
+// named fields (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2a"
+// entry) -- real encode/decode is field-by-field in
+// seal_journal_commit_tombstone_codec.hpp, never memcpy of this struct as the
+// disk format. u32-then-u64 field ordering means normal C++ alignment
+// inserts padding here; sizeof(SealJournalTombstoneWire) is NOT 108 and must
+// never be asserted as such -- kSealJournalTombstoneBytes (above, already
+// existed before this promotion) is the wire byte count, pinned by the
+// codec's own encode/decode, not by this struct's layout.
 struct SealJournalTombstoneWire {
+    std::uint32_t format_version{kSealJournalTombstoneFormatVersion};
+    std::uint32_t total_bytes{kSealJournalTombstoneBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint32_t kek_key_id{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t journal_seq{0};
+    // MUST equal the Applied / journal entry_mac -- a CROSS-FILE consistency
+    // requirement this codec deliberately does not verify (single-file decode
+    // cannot prove it); treated as an ordinary 32-byte field here.
+    std::uint8_t entry_mac[32]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<SealJournalTombstoneWire>);
