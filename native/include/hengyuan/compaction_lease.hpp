@@ -1,8 +1,19 @@
 // SPDX-License-Identifier: proprietary
 // compaction_lease.hpp — CandidateLease: the ONLY public surface for
-// touching a compaction candidate directory's files (Round D, docs/
+// touching the breadcrumb directory's files (Round D, docs/
 // SPEC_INVARIANTS.md's "Seal-journal Round D" entry, sixth and final design
-// revision).
+// revision). Despite the class/file name (kept for minimal diff against the
+// already-shipped, already-six-times-reviewed Round D code -- see the Round
+// E breadcrumb L2 loaders ledger entry for why this was extended in place
+// rather than renamed or duplicated into a second lease class), this
+// directory is NOT compaction-specific: BINANCE_PRIVATE_REST_L4_SPEC.md:
+// 3152-3163 lists compaction-candidate-intent/.x1/.xgc (Round D) and
+// seal-export-started/.v2/.mig/.clr/.abd (Round E) as siblings in the SAME
+// breadcrumb directory. A second, independent lease class opening the same
+// physical directory would mean two uncoordinated locks over one directory
+// -- exactly the kind of cross-class coordination gap Round D's six review
+// rounds exist to prevent one level down; extending this class instead
+// keeps a single lock/handle/atomic-state owner for the whole directory.
 //
 // Governance: L2 (real file I/O). Six external Architect reviews converged
 // on this shape -- read this comment before changing anything, it exists
@@ -23,8 +34,13 @@
 //    ValidatedArtifactName::for_compaction_candidate_intent()
 //    (compaction_breadcrumb_io.hpp), a compile-time-fixed literal.
 //
-// 2. IntentStore (compaction_intent_store.hpp) is the ONLY friend. Nothing
-//    else in this codebase can call the private I/O methods.
+// 2. Originally IntentStore (compaction_intent_store.hpp) was the ONLY
+//    friend. Round E breadcrumb L2 loaders added five more friends (each a
+//    single-type, read-only loader class -- SealIdWatermarkLoader/
+//    SealExportStartedLoader/SealExportStartedMigrationLoader/
+//    SealStartedCleanupTombstoneLoader/SealStartedAbandonLoader), same
+//    "one friend per typed consumer, no generic accessor" discipline --
+//    nothing else in this codebase can call the private I/O methods.
 //
 // 3. Thread-confined by atomics, not a mutex (Round D review's own stated
 //    preference for this "small first slice"): owner_thread_hash_/held_/
@@ -54,6 +70,7 @@
 #pragma once
 
 #include <hengyuan/compaction_breadcrumb_io.hpp>
+#include <hengyuan/durable_control_plane.hpp>  // kSealIdWatermarkWireBytes and friends
 
 #ifdef _WIN32
 #include <hengyuan/windows_native_io.hpp>
@@ -140,6 +157,33 @@ inline std::size_t hash_this_thread() noexcept {
 
 class IntentStore;  // forward-declared friend
 
+// Round E breadcrumb L2 loaders (docs/SPEC_INVARIANTS.md's "Seal-journal
+// Round E breadcrumb L2 loaders" entry) -- forward-declared friends for the
+// five read-only loader classes added this round, same "one friend per
+// consumer, no generic accessor" discipline IntentStore already established
+// above.
+class SealIdWatermarkLoader;
+class SealExportStartedLoader;
+// These two are class TEMPLATES (parameterized on the lease type) so their
+// unit tests can drive them against a duck-typed mock -- the production
+// instantiation is exactly one: SealExportStartedMigrationLoader<CandidateLease>.
+// CandidateLease's `friend class hy::SealExportStartedMigrationLoader;`
+// declarations name the primary template and therefore admit every
+// specialization, so the friendship contract is unchanged.
+template <typename LeaseT>
+class SealExportStartedMigrationLoader;
+template <typename LeaseT>
+class SealStartedCleanupTombstoneLoader;
+class SealStartedAbandonLoader;
+
+namespace test_only {
+// Pre-integration test accessor -- see the friend declaration inside
+// CandidateLease below. Deliberately NOT in namespace hy::compaction_detail
+// or anywhere a production include could reach it by accident; only
+// test_compaction_lease.cpp defines/uses this type.
+class CandidateLeaseSealBreadcrumbTestAccess;
+}  // namespace test_only
+
 class CandidateLease {
 public:
     // Path is used only inside acquire() to open the directory/lock handles
@@ -222,6 +266,41 @@ private:
     // diagnostic) needs to read one if it happens to exist.
     LeaseReadResult read_x1_frame(std::uint64_t build_nonce, std::uint32_t seq,
                                    std::span<std::byte, 176> out) noexcept;
+
+    // Round E breadcrumb L2 loaders (docs/SPEC_INVARIANTS.md's "Seal-journal
+    // Round E breadcrumb L2 loaders" entry) -- six read-only methods for the
+    // seal-journal precondition/tombstone/migration/cleanup/abandon files
+    // confirmed to share this candidate directory with compaction-candidate-
+    // intent/.x1/.xgc above. Same discipline as read_intent_genesis/
+    // read_x1_frame: filename is never a parameter, always a fixed
+    // ValidatedArtifactName literal; friend-only, one loader class per
+    // method (no generic "read anything" accessor).
+    friend class hy::SealIdWatermarkLoader;
+    friend class hy::SealExportStartedLoader;
+    template <typename LeaseT>
+    friend class hy::SealExportStartedMigrationLoader;
+    template <typename LeaseT>
+    friend class hy::SealStartedCleanupTombstoneLoader;
+    friend class hy::SealStartedAbandonLoader;
+    // Coordinator's own pre-integration test accessor -- Modules 1-4's real
+    // loader classes above don't exist yet at the point this lease extension
+    // lands, so this round's own tests (test_compaction_lease.cpp) need a
+    // friend to drive the six new methods through. Harmless to keep
+    // permanently once the real loaders land (same "one friend per narrow
+    // typed consumer" discipline, just an additional one for tests).
+    friend class hy::test_only::CandidateLeaseSealBreadcrumbTestAccess;
+
+    LeaseReadResult read_seal_id_watermark(std::span<std::byte, kSealIdWatermarkWireBytes> out) noexcept;
+    // legacy_or_greenfield selects the filename only (see
+    // ValidatedArtifactName::for_seal_export_started()) -- both files hold
+    // the same SealExportStartedWire wire shape.
+    LeaseReadResult read_seal_export_started(bool legacy_or_greenfield,
+                                              std::span<std::byte, kSealExportStartedWireBytes> out) noexcept;
+    LeaseReadResult read_seal_export_started_migration(
+        std::span<std::byte, kSealExportStartedMigrationWireBytes> out) noexcept;
+    LeaseReadResult read_seal_started_cleanup_tombstone(
+        std::span<std::byte, kSealStartedCleanupWireBytes> out) noexcept;
+    LeaseReadResult read_seal_started_abandon(std::span<std::byte, kSealStartedAbandonWireBytes> out) noexcept;
 
     LeaseIoOutcome check_can_operate() noexcept;
     bool identity_still_matches_path() noexcept;
@@ -627,6 +706,81 @@ inline LeaseReadResult CandidateLease::read_x1_frame(std::uint64_t build_nonce, 
     if (result.outcome != LeaseIoOutcome::Ok) return result;
 
     const auto name = compaction_detail::ValidatedArtifactName::for_x1(build_nonce, seq);
+#ifdef _WIN32
+    result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
+#else
+    result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseReadResult CandidateLease::read_seal_id_watermark(
+    std::span<std::byte, kSealIdWatermarkWireBytes> out) noexcept {
+    LeaseReadResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_id_watermark();
+#ifdef _WIN32
+    result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
+#else
+    result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseReadResult CandidateLease::read_seal_export_started(
+    bool legacy_or_greenfield, std::span<std::byte, kSealExportStartedWireBytes> out) noexcept {
+    LeaseReadResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_export_started(legacy_or_greenfield);
+#ifdef _WIN32
+    result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
+#else
+    result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseReadResult CandidateLease::read_seal_export_started_migration(
+    std::span<std::byte, kSealExportStartedMigrationWireBytes> out) noexcept {
+    LeaseReadResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_export_started_migration();
+#ifdef _WIN32
+    result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
+#else
+    result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseReadResult CandidateLease::read_seal_started_cleanup_tombstone(
+    std::span<std::byte, kSealStartedCleanupWireBytes> out) noexcept {
+    LeaseReadResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_started_cleanup_tombstone();
+#ifdef _WIN32
+    result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
+#else
+    result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseReadResult CandidateLease::read_seal_started_abandon(
+    std::span<std::byte, kSealStartedAbandonWireBytes> out) noexcept {
+    LeaseReadResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_started_abandon();
 #ifdef _WIN32
     result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
 #else
