@@ -175,6 +175,38 @@ public:
     // OR writes a `.xgc`, see compaction_lease.hpp's SCOPE comment):
     //   for_xgc(build_nonce) -> "compaction-intent-gc-<nonce_hex16>.xgc"
 
+    // Round E breadcrumb L2 loaders (docs/SPEC_INVARIANTS.md's "Seal-journal
+    // Round E breadcrumb L2 loaders" entry) -- six fixed literals for the
+    // seal-journal precondition/tombstone/migration/cleanup/abandon files
+    // confirmed to live in this SAME breadcrumb directory as
+    // compaction-candidate-intent/.x1/.xgc above (BINANCE_PRIVATE_REST_L4_
+    // SPEC.md:3152-3163 lists them side by side). "seal-id-watermark" is a
+    // NEW naming decision this round mints (SealIdWatermark has never had a
+    // literal on-disk filename anywhere in this repo or the spec, unlike the
+    // other five, which are transcribed verbatim from that filename list) --
+    // recorded as a deliberate decision in the ledger entry, not a discovery.
+    static ValidatedArtifactName for_seal_id_watermark() noexcept {
+        return ValidatedArtifactName(std::string_view("seal-id-watermark"));
+    }
+    // legacy_or_greenfield=true -> "seal-export-started" (L, greenfield v2 OR
+    // legacy 192B final); false -> "seal-export-started.v2" (V, migration
+    // companion). Same SealExportStartedWire wire shape written to either
+    // file name -- this factory only picks WHICH literal, never derives one
+    // from caller input.
+    static ValidatedArtifactName for_seal_export_started(bool legacy_or_greenfield) noexcept {
+        return ValidatedArtifactName(legacy_or_greenfield ? std::string_view("seal-export-started")
+                                                            : std::string_view("seal-export-started.v2"));
+    }
+    static ValidatedArtifactName for_seal_export_started_migration() noexcept {
+        return ValidatedArtifactName(std::string_view("seal-export-started.mig"));
+    }
+    static ValidatedArtifactName for_seal_started_cleanup_tombstone() noexcept {
+        return ValidatedArtifactName(std::string_view("seal-export-started.clr"));
+    }
+    static ValidatedArtifactName for_seal_started_abandon() noexcept {
+        return ValidatedArtifactName(std::string_view("seal-export-started.abd"));
+    }
+
     std::string_view relative_name() const noexcept { return std::string_view(buf_.data(), len_); }
 
 private:

@@ -57,8 +57,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -226,35 +228,27 @@ enum class DirOpenResult : std::uint8_t {
     Failed,
 };
 
-// Opens `path` as a directory handle suitable for use as OBJECT_ATTRIBUTES::
-// RootDirectory in later handle-relative calls. Rejects reparse points
-// (symlink/junction) rather than silently following them -- see
-// compaction_lease.hpp's identity-verification requirements.
-inline DirOpenResult open_directory(const std::wstring& path, RawHandle& out,
-                                     NTSTATUS* out_query_status = nullptr) noexcept {
+// Opens an already NT-prefixed path as a directory handle suitable for use
+// as OBJECT_ATTRIBUTES::RootDirectory in later handle-relative calls.
+// Rejects reparse points rather than silently following them. This lower-
+// level form performs no allocation; latency-sensitive leases cache the
+// prefixed path at construction and call this on every identity re-check.
+inline DirOpenResult open_directory_nt_path(std::wstring_view nt_path, RawHandle& out,
+                                             NTSTATUS* out_query_status = nullptr) noexcept {
     if (!native_api_available()) return DirOpenResult::Unsupported;
+    constexpr std::wstring_view kNtDosPathPrefix = L"\\??\\";
+    constexpr std::size_t kMaxUnicodeChars =
+        static_cast<std::size_t>(std::numeric_limits<USHORT>::max()) / sizeof(WCHAR);
+    if (!nt_path.starts_with(kNtDosPathPrefix) ||
+        nt_path.size() > kMaxUnicodeChars) {
+        return DirOpenResult::Failed;
+    }
     auto& t = detail::proc_table();
 
-    UNICODE_STRING name{};
-    name.Length = static_cast<USHORT>(path.size() * sizeof(WCHAR));
-    name.MaximumLength = name.Length;
-    name.Buffer = const_cast<PWSTR>(path.c_str());
-
-    // NT native paths need the "\??\" DOS-device prefix to be interpreted
-    // as a Win32-style path (drive letter or \\?\ form) rather than as an
-    // object-manager-namespace path. RtlDosPathNameToNtPathName_U is the
-    // documented way to do this conversion, but it allocates via
-    // RtlFreeHeap semantics that are awkward to wrap safely here; the
-    // simpler, equally-documented alternative is prefixing "\??\" by hand,
-    // which works for any path already in extended-length (\\?\...) or
-    // drive-absolute (C:\...) form -- both of which std::filesystem::path
-    // produces when given an absolute path, which is what
-    // compaction_lease.hpp always passes.
-    std::wstring nt_path = L"\\??\\" + path;
     UNICODE_STRING nt_name{};
     nt_name.Length = static_cast<USHORT>(nt_path.size() * sizeof(WCHAR));
     nt_name.MaximumLength = nt_name.Length;
-    nt_name.Buffer = const_cast<PWSTR>(nt_path.c_str());
+    nt_name.Buffer = const_cast<PWSTR>(nt_path.data());
 
     OBJECT_ATTRIBUTES attrs{};
     InitializeObjectAttributes(&attrs, &nt_name, 0 /* no OBJ_CASE_INSENSITIVE by default */, nullptr,
@@ -312,6 +306,16 @@ inline DirOpenResult open_directory(const std::wstring& path, RawHandle& out,
     return DirOpenResult::Opened;
 }
 
+// General convenience form. NT native paths need the "\??\" DOS-device
+// prefix to interpret drive-absolute input as a Win32 path. General callers
+// pay this allocation once per call; latency-sensitive callers cache the
+// prefixed form and use open_directory_nt_path() above.
+inline DirOpenResult open_directory(const std::wstring& path, RawHandle& out,
+                                     NTSTATUS* out_query_status = nullptr) noexcept {
+    std::wstring nt_path = L"\\??\\" + path;
+    return open_directory_nt_path(nt_path, out, out_query_status);
+}
+
 // Second line of defense (the first is compaction_breadcrumb_io.hpp's
 // ValidatedArtifactName / is_traversal_safe_name, which every caller of the
 // three open-relative functions below already routes through) against a
@@ -324,25 +328,33 @@ inline DirOpenResult open_directory(const std::wstring& path, RawHandle& out,
 // attack through this codebase -- it exists purely so Round E/F's future
 // parameterized names inherit this check for free, at negligible cost, per
 // the design note in compaction_lease.hpp's own top-of-file comment.
-inline bool is_relative_name_traversal_safe(const std::wstring& name) noexcept {
+inline wchar_t ascii_upper(wchar_t c) noexcept {
+    return (c >= L'a' && c <= L'z') ? static_cast<wchar_t>(c - L'a' + L'A') : c;
+}
+
+inline bool ascii_case_equal(std::wstring_view lhs, std::wstring_view rhs) noexcept {
+    if (lhs.size() != rhs.size()) return false;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (ascii_upper(lhs[i]) != ascii_upper(rhs[i])) return false;
+    }
+    return true;
+}
+
+inline bool is_relative_name_traversal_safe(std::wstring_view name) noexcept {
     if (name.empty()) return false;
     if (name == L"." || name == L"..") return false;
     for (const wchar_t c : name) {
         if (c == L'/' || c == L'\\' || c == L'\0') return false;
     }
-    std::wstring base = name;
-    const auto dot = base.find(L'.');
-    if (dot != std::wstring::npos) base = base.substr(0, dot);
-    for (wchar_t& c : base) {
-        if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
-    }
-    static constexpr const wchar_t* kReservedDeviceNames[] = {
+    const auto dot = name.find(L'.');
+    const std::wstring_view base = name.substr(0, dot);
+    static constexpr std::array<std::wstring_view, 22> kReservedDeviceNames = {
         L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4", L"COM5",
         L"COM6", L"COM7", L"COM8", L"COM9", L"LPT1", L"LPT2", L"LPT3", L"LPT4",
         L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9",
     };
-    for (const wchar_t* reserved : kReservedDeviceNames) {
-        if (base == reserved) return false;
+    for (const std::wstring_view reserved : kReservedDeviceNames) {
+        if (ascii_case_equal(base, reserved)) return false;
     }
     return true;
 }
@@ -458,16 +470,19 @@ enum class RelativeOpenResult : std::uint8_t {
 // Opens an EXISTING file named `relative_name` inside `dir` for reading,
 // rejecting reparse points. Handle-relative, same TOCTOU-closing property
 // as create_new_relative.
-inline RelativeOpenResult open_existing_relative(const RawHandle& dir, const std::wstring& relative_name,
+inline RelativeOpenResult open_existing_relative(const RawHandle& dir, std::wstring_view relative_name,
                                                    RawHandle& out, NTSTATUS* out_status = nullptr) noexcept {
     if (!native_api_available()) return RelativeOpenResult::Unsupported;
     if (!is_relative_name_traversal_safe(relative_name)) return RelativeOpenResult::Failed;
+    constexpr std::size_t kMaxUnicodeChars =
+        static_cast<std::size_t>(std::numeric_limits<USHORT>::max()) / sizeof(WCHAR);
+    if (relative_name.size() > kMaxUnicodeChars) return RelativeOpenResult::Failed;
     auto& t = detail::proc_table();
 
     UNICODE_STRING name{};
     name.Length = static_cast<USHORT>(relative_name.size() * sizeof(WCHAR));
     name.MaximumLength = name.Length;
-    name.Buffer = const_cast<PWSTR>(relative_name.c_str());
+    name.Buffer = const_cast<PWSTR>(relative_name.data());
 
     OBJECT_ATTRIBUTES attrs{};
     InitializeObjectAttributes(&attrs, &name, 0, dir.get(), nullptr);

@@ -403,6 +403,22 @@ if(HY_BUILD_TESTS)
 
     gtest_discover_tests(test_compaction_lease PROPERTIES LABELS concurrency)
 
+    # Round E breadcrumb L2 loaders (docs/SPEC_INVARIANTS.md's "Seal-journal
+    # Round E breadcrumb L2 loaders" entry): SealJournalStoreLease's own
+    # lifecycle surface + the two friend-only read methods, against a real
+    # temp directory -- L2, real file I/O. Threading tests need Threads,
+    # same pattern as test_compaction_lease above.
+    add_executable(test_seal_journal_store_lease tests/test_seal_journal_store_lease.cpp)
+    target_link_libraries(test_seal_journal_store_lease PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_seal_journal_store_lease)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_seal_journal_store_lease PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_seal_journal_store_lease PROPERTIES LABELS concurrency)
+
     # Round D: IntentStore -- genesis-only write/read/match/inspect via the
     # CandidateLease friend relationship (L2, 真实文件 I/O).
     add_executable(test_compaction_intent_store tests/test_compaction_intent_store.cpp)
@@ -549,6 +565,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_seal_journal_precondition_codec)
     gtest_discover_tests(test_seal_journal_precondition_codec)
 
+    # Round E breadcrumb L2: fixed-name, read-only CandidateLease loaders for
+    # SealIdWatermark and legacy/V2 SealExportStarted records.
+    add_executable(test_seal_id_watermark_export_started_loader
+        tests/test_seal_id_watermark_export_started_loader.cpp)
+    target_link_libraries(test_seal_id_watermark_export_started_loader PRIVATE
+        hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_seal_id_watermark_export_started_loader)
+    gtest_discover_tests(test_seal_id_watermark_export_started_loader)
+
     # Round E Slice 2a (docs\SPEC_INVARIANTS.md "Seal-journal Round E Slice 2a"):
     # SealJournalCommitWatermark/SealJournalTombstoneWire codec (L1, pure
     # in-memory, no file I/O -- this codec has no I/O layer at all yet).
@@ -557,12 +582,51 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_seal_journal_commit_tombstone_codec)
     gtest_discover_tests(test_seal_journal_commit_tombstone_codec)
 
+    # Round E breadcrumb L2: per-store, read-only commit-watermark and
+    # tombstone loaders, including sparse 1..watermark enumeration.
+    add_executable(test_seal_journal_commit_tombstone_loader
+        tests/test_seal_journal_commit_tombstone_loader.cpp)
+    target_link_libraries(test_seal_journal_commit_tombstone_loader PRIVATE
+        hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_seal_journal_commit_tombstone_loader)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_seal_journal_commit_tombstone_loader PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_seal_journal_commit_tombstone_loader)
+
     # Round E Slice 2b: SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/
     # SealStartedAbandonWire codec (seal_export_migration_cleanup_abandon_codec.hpp).
     add_executable(test_seal_export_migration_cleanup_abandon_codec tests/test_seal_export_migration_cleanup_abandon_codec.cpp)
     target_link_libraries(test_seal_export_migration_cleanup_abandon_codec PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_seal_export_migration_cleanup_abandon_codec)
     gtest_discover_tests(test_seal_export_migration_cleanup_abandon_codec)
+
+    # Round E breadcrumb L2 loaders (seal_started_migration_cleanup_loader.hpp):
+    # read-only loaders for seal-export-started.mig / seal-export-started.clr,
+    # unit-tested against a duck-typed lease mock (no real file I/O needed --
+    # the real CandidateLease read methods are friend-only, coordinator-side).
+    add_executable(test_seal_started_migration_cleanup_loader tests/test_seal_started_migration_cleanup_loader.cpp)
+    target_link_libraries(test_seal_started_migration_cleanup_loader PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_seal_started_migration_cleanup_loader)
+    gtest_discover_tests(test_seal_started_migration_cleanup_loader)
+
+    # Round E breadcrumb L2: SealStartedAbandonLoader (read-only .abd loader).
+    add_executable(test_seal_started_abandon_loader tests/test_seal_started_abandon_loader.cpp)
+    target_link_libraries(test_seal_started_abandon_loader PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_seal_started_abandon_loader)
+    gtest_discover_tests(test_seal_started_abandon_loader)
+
+    # Round E breadcrumb L2 loaders: coordinator-only composition of Modules
+    # 1/3/4's loaders into one call (load_all_breadcrumb_preconditions()) --
+    # written after all three landed, see the header's own SCOPE comment.
+    add_executable(test_seal_journal_breadcrumb_precondition_aggregate
+        tests/test_seal_journal_breadcrumb_precondition_aggregate.cpp)
+    target_link_libraries(test_seal_journal_breadcrumb_precondition_aggregate PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_seal_journal_breadcrumb_precondition_aggregate)
+    gtest_discover_tests(test_seal_journal_breadcrumb_precondition_aggregate)
 
     # 轨道 C: L4 §10 seal-journal Round C（CompactionCandidateIntent GC 家族，最后
     # 一轮，ABI-only、声明层——不是 .x1/.xgc 的持久化/GC/恢复实现，见
