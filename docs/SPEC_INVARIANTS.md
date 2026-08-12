@@ -1077,6 +1077,133 @@ NEEDS_EVIDENCE，不是这轮发布阻断项）；TLA+（纯 encode/decode，没
 统一验证，实测数字记在上面"Seal-journal Round E Slice 2a"条目的"实测证据"小节——两边共用同一套
 MSVC/WSL2/ASan+UBSan 验证腿，不重复记录。
 
+### Seal-journal Round E breadcrumb L2 loaders（7 个 durable-precondition 类型的真实只读文件
+I/O）[已实现]
+
+Slice 1/2a/2b（上面）给 `SealIdWatermark`/`SealExportStartedWire`/`SealJournalCommitWatermark`/
+`SealJournalTombstoneWire`/`SealExportStartedMigrationWire`/`SealStartedCleanupTombstoneWire`/
+`SealStartedAbandonWire` 七个类型都做了真实 L1（纯内存，MAC 验证）codec。Round D 的"边界"小节
+（本文档"Seal-journal Round D"条目）早就写明：receipt 概念 / `raise_intent_phase()` 生产 API /
+manager 接入，必须等这些真实 codec **都**存在**之后**才能安全开放——现在满足了这个前提，但下一步
+不是直接跳去做 phase-advancement API。
+
+**为什么不直接做 receipt/raise_intent_phase()/manager**：`CandidateLease`/`IntentStore`
+（Round D，唯一已经落地的 L2 写路径）自己的 ledger 记录了 6 轮外部 Architect 审查、前 5 版全部被
+拒的真实历史（本文档"Seal-journal Round D"条目"第一版"到"第六版"）。拒绝理由包括：可伪造的
+evidence 对象、`raise_intent_phase()` 本身就是同一个问题换皮、ID 生命周期规则自相矛盾、TOCTOU、
+handle 通过 public accessor 泄漏导致 UAF、写方法接受任意字符串文件名导致路径穿越、`release()`
+没有 owner-thread 检查。这些全部是 phase-advancement/manager 级别的设计问题，需要单一权威反复
+审查才收敛，不适合分给互不通气的多方并行做。
+
+**这一轮做什么**：receipt/manager 逻辑要用的"读取一份已经在磁盘上的 durable precondition 记录"
+这个能力本身还不存在（之前全是 L1 codec，没有真正的文件 I/O）。这一轮只做**只读** L2 I/O——不涉及
+Round D 那 5 次被拒设计里任何一个写路径特有的问题（可伪造 evidence / ID 生命周期 / 路径穿越写 /
+release 无 owner 检查全部是写语义）。仍然**明确不做**：receipt 概念、`raise_intent_phase()`、
+`IntentStore`/`CandidateLease`/任何 manager 的 phase-advancement 接入、任何写方法。
+
+**关键架构发现（阻塞性，已解决）**：起初设想给 `SealIdWatermark`/`SealExportStartedWire`/M/C/A
+五个类型新建一个独立的 SealBreadcrumbLease 类（这个类从未落地，只是被否决的设计方案名字）。
+这是错的——
+`docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3152-3163` 的文件名列表（"Filenames (breadcrumb dir) —
+round-56/57/64"）把 `seal-export-started`/`.v2`/`.mig`/`.clr`/`.abd` 和
+`compaction-candidate-intent`/`.x1`/`.xgc`（Round D 已经在管的三个文件）列在**同一个目录**里，
+逐字面确认无疑。如果新建一个独立的 lease 类去开同一个物理目录，会在 Round D 已有的锁文件
+（`compaction-candidate.lock`）之外产生一套完全不协调的第二把锁——两个类各自的 owner-thread/
+fenced 状态互相看不见对方，等于在类间层面重新制造 Round D 六轮审查专门要消灭的那类协调漏洞。
+**决定**：不新建 breadcrumb 类，直接扩展 `CandidateLease`（`compaction_lease.hpp`）本体，复用它
+已经审查过、已经在生产可用的 handle/锁/atomic 机制，新增 6 个 friend-only 定长只读方法（类/文件
+名不改，保留六轮审查历史的最小 diff）。`SealJournalCommitWatermark`/`SealJournalTombstoneWire`
+所在的 `seal-journal/<store_uuid_lo_hex16><store_uuid_hi_hex16>/`
+（`durable_control_plane.hpp:750`/`871`、`BINANCE_PRIVATE_REST_L4_SPEC.md:4392`）是另一个、
+名字明确不同的目录，这个确实需要一个新的独立类：`SealJournalStoreLease`（新文件
+`seal_journal_store_lease.hpp` + `seal_journal_store_io.hpp`，只读子集，不
+`#include compaction_breadcrumb_io.hpp`——那个文件头注释明确写死"DO NOT include this file from
+anywhere except compaction_lease.hpp"，这个边界不动，`seal_journal_store_io.hpp`是独立、只读的
+重复实现，不是耦合）。
+
+**`SealIdWatermark` 文件名（新增决定，不是 transcribe）**：跟 L/V/M/C/A 五个类型不同，
+`SealIdWatermark` 在整个仓库/spec 里之前**没有任何字面量文件名**。这一轮把它定为
+`seal-id-watermark`（`ValidatedArtifactName::for_seal_id_watermark()`），跟其余 kebab-case
+命名一致，作为这一轮的设计决定明确记录，不是从既有契约里抄出来的。
+
+**`kek_key_id` 契约**：`SealIdWatermark` 的 wire 里没有 `kek_key_id` 字段、没有 peek 函数
+（跟本仓库其它六个类型都不同）——调用方必须显式传入 `kek_key_id`，绝不能加"当前 active key"
+兜底（那正是 Round D 第二版被拒的漏洞在 `KeyRing` 层面的翻版；`KeyRing::pin_active_key()` 已经
+因为这个确切原因被移除）。Module 1（下面）的 `SealIdWatermarkLoader::load()` 必须把 `kek_key_id`
+作为显式参数。
+
+**5 模块划分（协调者 + 4 个独立外包，完整拆解见协调者本地计划文档，未入库）**：
+- **模块 0（协调者，本条目状态为 [进行中] 期间已落地的部分）**：`CandidateLease` 新增 6 个
+  friend-only 方法（`read_seal_id_watermark`/`read_seal_export_started`（L/V 用
+  `legacy_or_greenfield` 布尔选择文件名，同一个方法，不是两个）/`read_seal_export_started_migration`/
+  `read_seal_started_cleanup_tombstone`/`read_seal_started_abandon`）；`ValidatedArtifactName`
+  新增 5 个对应 factory；新建 `SealJournalStoreLease`（`read_seal_journal_commit_watermark`/
+  `read_seal_journal_tombstone` 两个 friend-only 方法）。Friend 类名冻结（其余模块必须原样使用，
+  不得自行更名）：`SealIdWatermarkLoader`/`SealExportStartedLoader`/
+  `SealExportStartedMigrationLoader`/`SealStartedCleanupTombstoneLoader`/
+  `SealStartedAbandonLoader`（`CandidateLease` 的友元）、`SealJournalCommitWatermarkLoader`/
+  `SealJournalTombstoneLoader`（`SealJournalStoreLease` 的友元）。测试通过
+  `hy::test_only::CandidateLeaseSealBreadcrumbTestAccess`/
+  `hy::test_only::SealJournalStoreLeaseTestAccess` 两个协调者自用的 test-only friend 驱动
+  （生产代码不 include，只有对应测试文件用）——因为下面 4 个模块的真实 loader 类在这一步落地时
+  还不存在。
+- **模块 1-4（外包，尚未落地，本条目 [进行中] 状态直到全部并入才翻 [已实现]）**：模块 1 =
+  `SealIdWatermarkLoader` + `SealExportStartedLoader`；模块 2 = `SealJournalCommitWatermarkLoader`
+  + `SealJournalTombstoneLoader`（后者依赖前者读出的 `highest_committed_journal_seq` 才知道该
+  扫哪些 `journal_seq`，不是互相独立）；模块 3 = `SealExportStartedMigrationLoader` +
+  `SealStartedCleanupTombstoneLoader`；模块 4 = `SealStartedAbandonLoader`。四个模块互相之间
+  零依赖，只依赖模块 0 已经冻结的方法签名 + 已经合并的 L1 `decode_*` 函数；聚合函数
+  `load_all_breadcrumb_preconditions()` 由协调者在四个模块都落地后自己写（需要同时知道 1/3/4
+  三个模块各自的返回类型，故意不下放，避免破坏"互相零上下文"）。
+
+**验证（模块 0-4 + 协调者聚合函数全部并入后的最终实测，2026-08-12）**：
+- `test_compaction_lease.cpp` 新增 SealBreadcrumbLoaders/SealBreadcrumbLoadersDirectoryFencing
+  测试套件（round-trip、NotFound、WrongSize、NotHeld、WrongOwner，以及证明"扩展 CandidateLease
+  而非新建"这个决定本身成立的关键测试——目录 rename/recreate 触发的 sticky fence 对新方法和
+  Round D 原有方法一视同仁，POSIX-only，Windows 上该场景结构性不可达的理由跟
+  `test_compaction_intent_store.cpp` 的 IntentStoreDirectoryFencing 测试套件完全一致）；新建
+  `test_seal_journal_store_lease.cpp`，同款生命周期 + fencing 覆盖，外加多 candidate/多 seq
+  共享同一目录的场景（证明"per-store not per-candidate"这个容易被误读的性质）。
+- Modules 1-4（`test_seal_id_watermark_export_started_loader.cpp`/
+  `test_seal_journal_commit_tombstone_loader.cpp`/`test_seal_started_migration_cleanup_loader.cpp`/
+  `test_seal_started_abandon_loader.cpp`）各自独立交付，复核后发现两处需要修的问题：
+  (1) Module 2 的 `SealJournalCommitWatermarkLoader`/`SealJournalTombstoneLoader` 头文件
+  在 `hy` 命名空间里定义了自己的 `enum class LoadStatus`，跟 Module 1/3/4 复用的
+  `hy::LoadStatus`（来自 `compaction_intent_store.hpp`）同名——两者字段集合确实不同
+  （`StoreDirFenced` vs `CandidateFenced`，语义上不该合并），但同名会在任何同时
+  `#include` 两边的翻译单元里造成重定义编译错误（协调者聚合函数正是这样的翻译单元）。
+  修复：重命名为 `SealJournalStoreLoadStatus`，不复用 `hy::LoadStatus`。
+  (2) Module 1 的 `SealExportStartedLoader` round-trip 测试对 `std::uint8_t[32]` 字段
+  （`baseline_tip_mac`/`new_final_tip_mac`/`content_root`）用 EXPECT_EQ 直接比较——C
+  数组退化成指针比较地址而非内容，测试恒定失败（无论产品代码是否正确）。修复：改用
+  `std::memcmp`，跟本仓库其它 mac[32] 字段的既有测试写法一致。
+- 协调者新建 `seal_journal_breadcrumb_precondition_aggregate.hpp`
+  （`load_all_breadcrumb_preconditions()`），只组合 Modules 1/3/4（breadcrumb 目录，同一个
+  `CandidateLease`），不含 Module 2（`seal-journal/<store_uuid>/` 是不同目录，用
+  `SealJournalStoreLease`，混进同一个函数会模糊这轮 ledger 条目特意保留的目录边界区分）；
+  新建 `test_seal_journal_breadcrumb_precondition_aggregate.cpp` 验证组合本身（每个字段的
+  状态互相独立、没有提前 return）。
+- MSVC Release 全量 ctest：1084/1084（`SealIdWatermarkLoader.DirectoryIdentityChangeThen
+  StickyFenceAreDistinct` 之外的两个 fencing 测试都标了 `#ifndef _WIN32`，1 个 skip 是
+  预期行为，理由跟 IntentStoreDirectoryFencing 的既有 POSIX-only 说明完全一致）。
+- WSL2 GCC-14 Release（镜像 `ci-native.yml`，含 `HY_BUILD_DEMO=ON` 全部二进制，两个
+  POSIX-only fencing 测试这里真的会跑）：1111/1111。
+- WSL2 ASan+UBSan（定向构建本轮全部相关 test 目标：test_compaction_lease/
+  test_compaction_intent_store/test_seal_journal_store_lease/
+  test_seal_id_watermark_export_started_loader/test_seal_journal_commit_tombstone_loader/
+  test_seal_started_migration_cleanup_loader/test_seal_started_abandon_loader/
+  test_seal_journal_breadcrumb_precondition_aggregate，避开 WSL VM 全量
+  `HY_BUILD_DEMO=ON` ASan 构建已知的 OOM 问题）：123/123，无 ASan/UBSan 报告。
+- WSL2 TSan：`CandidateLease` 本体被改了，负控 tsan_control_relaxed_ring 重新确认仍然以
+  非零退出码报出 `WARNING: ThreadSanitizer: data race`（本机 TSan 检测能力未失效）；
+  test_compaction_lease（含新的 SealBreadcrumbLoaders/跨进程互斥测试）在 TSan 下全部
+  通过，未发现新的数据竞争。
+- `spec_xref_check.py --quiet`：460 个符号、38155 个匹配点，全部可定位（新注册
+  `seal_journal_store_lease.hpp`/`seal_journal_store_io.hpp`/四个模块的 loader 头文件/
+  聚合头文件；ledger 正文修了几处误用反引号包裹非符号 prose 的地方，同 Slice 2a/2b 的
+  同类修复）。
+- `spec_enum_diff.py`：0 个新发现。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 

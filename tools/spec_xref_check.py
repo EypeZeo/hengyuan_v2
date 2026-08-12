@@ -102,6 +102,21 @@ SEARCH_FILES = [
     # SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/SealStartedAbandonWire
     # codec, same gap as above.
     REPO_ROOT / "native" / "include" / "hengyuan" / "seal_export_migration_cleanup_abandon_codec.hpp",
+    # Round E breadcrumb L2 loaders (docs/SPEC_INVARIANTS.md "Seal-journal Round E
+    # breadcrumb L2 loaders"): CandidateLease's six new friend-only read methods live
+    # in the already-registered compaction_lease.hpp/compaction_breadcrumb_io.hpp above,
+    # but the two new files below (SealJournalStoreLease) are the same "a symbol can
+    # only drift unnoticed in a file nobody looks at" gap every entry above closes.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_store_lease.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_store_io.hpp",
+    # Round E breadcrumb L2 loaders, Modules 1-4 (docs/SPEC_INVARIANTS.md "Seal-journal
+    # Round E breadcrumb L2 loaders"): the four independently-authored loader headers,
+    # same "a symbol can only drift unnoticed in a file nobody looks at" gap.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_id_watermark_export_started_loader.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_commit_tombstone_loader.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_started_migration_cleanup_loader.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_started_abandon_loader.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_breadcrumb_precondition_aggregate.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
