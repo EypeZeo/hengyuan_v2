@@ -765,6 +765,15 @@ struct SealJournalCommitWatermark {
 static_assert(std::is_trivially_copyable_v<SealJournalCommitWatermark>);
 static_assert(std::is_standard_layout_v<SealJournalCommitWatermark>);
 
+// Round E Slice 2a (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2a"
+// entry): real encode/decode lives in seal_journal_commit_tombstone_codec.hpp,
+// never memcpy of this struct as the disk format -- this constant is the wire
+// byte count the codec's static_assert pins against, not a claim about
+// sizeof(SealJournalCommitWatermark). No format_version/total_bytes fields
+// (same precedent as kSealIdWatermarkWireBytes -- nothing to pin them to).
+constexpr std::size_t kSealJournalCommitWatermarkWireBytes = 68;
+static_assert(8 + 8 + 8 + 8 + 4 + 32 == kSealJournalCommitWatermarkWireBytes);
+
 // --- Seal-journal intake-close constants/alias ---
 // SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3050
 //
@@ -860,7 +869,7 @@ struct SealJournalIntakeCloseControl {
 //
 // Per-seq clear receipt after Applied Ack (breadcrumb directory). File:
 // seal-journal/<store_uuid...>/<candidate_id_hex16>-<journal_seq_hex16>.jts
-// Conceptual; on-disk is packed LE, 108 bytes, no padding:
+// On-disk is packed LE, 108 bytes, no padding:
 //   +0 u32 format_version(=1) / +4 u32 total_bytes(=108) / +8 u64 store_uuid_lo
 //   / +16 u64 store_uuid_hi / +24 u32 kek_key_id / +28 u64 candidate_id /
 //   +36 u64 journal_seq / +44 u8 entry_mac[32] (MUST equal the Applied /
@@ -872,7 +881,27 @@ struct SealJournalIntakeCloseControl {
 constexpr std::uint32_t kSealJournalTombstoneFormatVersion = 1;
 constexpr std::size_t kSealJournalTombstoneBytes = 108;
 
+// Round E Slice 2a promotes this struct from mac[32]-only marker to real
+// named fields (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2a"
+// entry) -- real encode/decode is field-by-field in
+// seal_journal_commit_tombstone_codec.hpp, never memcpy of this struct as the
+// disk format. u32-then-u64 field ordering means normal C++ alignment
+// inserts padding here; sizeof(SealJournalTombstoneWire) is NOT 108 and must
+// never be asserted as such -- kSealJournalTombstoneBytes (above, already
+// existed before this promotion) is the wire byte count, pinned by the
+// codec's own encode/decode, not by this struct's layout.
 struct SealJournalTombstoneWire {
+    std::uint32_t format_version{kSealJournalTombstoneFormatVersion};
+    std::uint32_t total_bytes{kSealJournalTombstoneBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint32_t kek_key_id{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t journal_seq{0};
+    // MUST equal the Applied / journal entry_mac -- a CROSS-FILE consistency
+    // requirement this codec deliberately does not verify (single-file decode
+    // cannot prove it); treated as an ordinary 32-byte field here.
+    std::uint8_t entry_mac[32]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<SealJournalTombstoneWire>);
@@ -1031,11 +1060,32 @@ constexpr std::size_t kSealExportStartedMigrationDraft136Bytes = 136;
 static_assert(4 + 4 + 8 + 8 + 8 + 8 + 4 + 4 + 32 + 32 + 32 + 32 + 32
               == kSealExportStartedMigrationWireBytes);
 
+// Round E Slice 2b (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2b"
+// entry) promotes this struct from mac[32]-only to real named fields -- real
+// encode/decode is field-by-field in
+// seal_export_migration_cleanup_abandon_codec.hpp, never memcpy of this
+// struct as the disk format. u32-then-u64 field ordering means normal C++
+// alignment inserts padding here; sizeof(SealExportStartedMigrationWire) is
+// NOT 208 and must never be asserted as such --
+// kSealExportStartedMigrationWireBytes (above) is the wire byte count,
+// pinned by the codec's own encode/decode, not by this struct's layout.
 struct SealExportStartedMigrationWire {
     // HMAC(KEK[v2_kek_key_id], "HY-SEALSTARTMIG-v2" || format_version ||
     //   total_bytes || store_uuid_lo || store_uuid_hi || candidate_id ||
     //   request_id || legacy_kek_key_id || v2_kek_key_id ||
     //   legacy_file_digest || v2_file_digest || legacy_mac || v2_mac)
+    std::uint32_t format_version{kSealExportStartedMigrationFormatVersion};
+    std::uint32_t total_bytes{kSealExportStartedMigrationWireBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t request_id{0};
+    std::uint32_t legacy_kek_key_id{0};
+    std::uint32_t v2_kek_key_id{0};
+    std::uint8_t legacy_file_digest[32]{};
+    std::uint8_t v2_file_digest[32]{};
+    std::uint8_t legacy_mac[32]{};
+    std::uint8_t v2_mac[32]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<SealExportStartedMigrationWire>);
@@ -1091,6 +1141,13 @@ static_assert(4 + 4 + 8 + 8 + 8 + 8 + 4 + 1 + 1 + 1 + 1
                   + 32 + 32 + 32 + 32
               == kSealStartedCleanupWireBytes);
 
+// Round E Slice 2b (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2b"
+// entry) promotes this struct from mac[32]-only to real named fields -- real
+// encode/decode is field-by-field in
+// seal_export_migration_cleanup_abandon_codec.hpp, never memcpy of this
+// struct as the disk format. sizeof(SealStartedCleanupTombstoneWire) is NOT
+// 304 and must never be asserted as such -- kSealStartedCleanupWireBytes
+// (above) is the wire byte count, pinned by the codec's own encode/decode.
 struct SealStartedCleanupTombstoneWire {
     // HMAC(KEK[kek_key_id], "HY-SEALSTARTCLR-v2" || format_version ||
     //   total_bytes || store_uuid_lo || store_uuid_hi || candidate_id ||
@@ -1100,7 +1157,32 @@ struct SealStartedCleanupTombstoneWire {
     //   new_final_seq || new_final_tip_mac || new_key_id || content_root ||
     //   digest_L || digest_V || digest_M)
     // phase advances are monotonic; REPLACE of .clr allowed only to raise phase
-    // (proof fields immutable after Authorized CREATE_NEW).
+    // (proof fields immutable after Authorized CREATE_NEW). Enforced by
+    // seal_export_migration_cleanup_abandon_codec.hpp's
+    // validate_seal_started_cleanup_shape(), not by this struct.
+    std::uint32_t format_version{kSealStartedCleanupFormatVersion};
+    std::uint32_t total_bytes{kSealStartedCleanupWireBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t request_id{0};
+    std::uint32_t kek_key_id{0};
+    std::uint8_t started_kind{0};
+    std::uint8_t present_mask{0};
+    std::uint8_t phase{0};
+    std::uint8_t reserved0{0};
+    std::uint32_t source_generation{0};
+    std::uint64_t baseline_tip_seq{0};
+    std::uint8_t baseline_tip_mac[32]{};
+    std::uint32_t baseline_key_id{0};
+    std::uint32_t new_generation{0};
+    std::uint64_t new_final_seq{0};
+    std::uint8_t new_final_tip_mac[32]{};
+    std::uint32_t new_key_id{0};
+    std::uint8_t content_root[32]{};
+    std::uint8_t digest_L[32]{};
+    std::uint8_t digest_V[32]{};
+    std::uint8_t digest_M[32]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<SealStartedCleanupTombstoneWire>);
@@ -1145,6 +1227,13 @@ static_assert(4 + 4 + 8 + 8 + 8 + 8 + 4 + 1 + 1 + 1 + 1
                   + 4 + 8 + 32 + 4 + 32 + 32 + 32
               == kSealStartedAbandonWireBytes);
 
+// Round E Slice 2b (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Slice 2b"
+// entry) promotes this struct from mac[32]-only to real named fields -- real
+// encode/decode is field-by-field in
+// seal_export_migration_cleanup_abandon_codec.hpp, never memcpy of this
+// struct as the disk format. sizeof(SealStartedAbandonWire) is NOT 192 and
+// must never be asserted as such -- kSealStartedAbandonWireBytes (above) is
+// the wire byte count, pinned by the codec's own encode/decode.
 struct SealStartedAbandonWire {
     // HMAC(KEK[kek_key_id], "HY-SEALSTARTABD-v1" || format_version ||
     //   total_bytes || store_uuid_lo || store_uuid_hi || candidate_id ||
@@ -1152,7 +1241,26 @@ struct SealStartedAbandonWire {
     //   present_mask || phase || source_generation || baseline_tip_seq ||
     //   baseline_tip_mac || baseline_key_id || content_root || digest_C)
     // phase advances monotonic; REPLACE .abd only to raise phase
-    // (all other fields immutable after Authorized CREATE_NEW).
+    // (all other fields immutable after Authorized CREATE_NEW). Enforced by
+    // seal_export_migration_cleanup_abandon_codec.hpp's
+    // validate_seal_started_abandon_shape(), not by this struct.
+    std::uint32_t format_version{kSealStartedAbandonFormatVersion};
+    std::uint32_t total_bytes{kSealStartedAbandonWireBytes};
+    std::uint64_t store_uuid_lo{0};
+    std::uint64_t store_uuid_hi{0};
+    std::uint64_t candidate_id{0};
+    std::uint64_t request_id{0};
+    std::uint32_t kek_key_id{0};
+    std::uint8_t started_kind{0};
+    std::uint8_t abandon_reason{0};
+    std::uint8_t present_mask{0};
+    std::uint8_t phase{0};
+    std::uint32_t source_generation{0};
+    std::uint64_t baseline_tip_seq{0};
+    std::uint8_t baseline_tip_mac[32]{};
+    std::uint32_t baseline_key_id{0};
+    std::uint8_t content_root[32]{};
+    std::uint8_t digest_C[32]{};
     std::uint8_t mac[32]{};
 };
 static_assert(std::is_trivially_copyable_v<SealStartedAbandonWire>);

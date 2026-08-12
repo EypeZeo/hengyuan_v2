@@ -95,6 +95,13 @@ SEARCH_FILES = [
     # Round E Slice 1 (docs/SPEC_INVARIANTS.md "Seal-journal Round E Slice 1"):
     # SealIdWatermark/SealExportStartedWire codec, same gap as Round D above.
     REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_precondition_codec.hpp",
+    # Round E Slice 2a (docs/SPEC_INVARIANTS.md "Seal-journal Round E Slice 2a"):
+    # SealJournalCommitWatermark/SealJournalTombstoneWire codec, same gap as above.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_commit_tombstone_codec.hpp",
+    # Round E Slice 2b (docs/SPEC_INVARIANTS.md "Seal-journal Round E Slice 2b"):
+    # SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/SealStartedAbandonWire
+    # codec, same gap as above.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "seal_export_migration_cleanup_abandon_codec.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

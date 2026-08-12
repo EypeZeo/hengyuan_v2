@@ -35,6 +35,7 @@ using hy::DurableRecordType;
 using hy::is_seal_journal_embeddable_type;
 using hy::kMaxSealHandoffProducers;
 using hy::kSealIdWatermarkWireBytes;
+using hy::kSealJournalCommitWatermarkWireBytes;
 using hy::kSealJournalFixedMetaBytes;
 using hy::kSealJournalFormatVersion;
 using hy::kSealJournalIntakeCloseDeadlineMs;
@@ -84,6 +85,14 @@ TEST(SealJournalCommitWatermark, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
+// Round E Slice 2a: the wire byte count seal_journal_commit_tombstone_codec
+// .hpp's encode/decode pin against -- NOT a claim about
+// sizeof(SealJournalCommitWatermark). This type has no format_version/
+// total_bytes fields (same precedent as kSealIdWatermarkWireBytes).
+TEST(SealJournalCommitWatermark, WireByteConstantMatchesSpec) {
+    EXPECT_EQ(kSealJournalCommitWatermarkWireBytes, 68u);
+}
+
 // --- SealJournalTombstoneWire (spec L4 §10 / BINANCE:3116) ---
 
 TEST(SealJournalTombstoneWire, IsTriviallyCopyableStandardLayout) {
@@ -92,11 +101,15 @@ TEST(SealJournalTombstoneWire, IsTriviallyCopyableStandardLayout) {
     SUCCEED();
 }
 
-TEST(SealJournalTombstoneWire, ShapeIsJustTheTrailerMac) {
-    // Unlike a full wire-layout struct, this type's only C++ member is the
-    // trailing MAC (the packed 108-byte on-disk layout is documented in a
-    // comment, not materialized as fields) -- sizeof is meaningful here.
-    EXPECT_EQ(sizeof(SealJournalTombstoneWire), 32u);
+TEST(SealJournalTombstoneWire, WireByteConstantsMatchSpec) {
+    // Round E Slice 2a promoted this type from mac[32]-only marker to real
+    // named fields -- the 108-byte packed wire layout is now materialized as
+    // struct members (u32-then-u64 ordering), and the C++ host struct's own
+    // sizeof is NOT the wire size (alignment padding). The only wire
+    // authorities are the encode/decode functions in
+    // seal_journal_commit_tombstone_codec.hpp and these two constants; no
+    // host sizeof/offsetof assertions are made (see the struct's own
+    // promotion comment in durable_control_plane.hpp).
     EXPECT_EQ(kSealJournalTombstoneFormatVersion, 1u);
     EXPECT_EQ(kSealJournalTombstoneBytes, 108u);
 }
