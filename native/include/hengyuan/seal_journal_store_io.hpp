@@ -12,10 +12,13 @@
 // second, small, read-only copy (same reasoning durable_log_store.hpp's
 // posix_retry_on_eintr duplication already established in this codebase).
 //
-// Read-only subset only: this round's SealJournalStoreLease has no write
-// method (see seal_journal_store_lease.hpp's own SCOPE comment), so unlike
-// compaction_breadcrumb_io.hpp this file carries NO publish/write-side
-// primitives at all -- nothing here can create, replace, or delete a file.
+// Originally read-only (Round E breadcrumb L2 loaders). The "Seal-journal
+// Round E SealJournalCommitWatermark CREATE_NEW + two-lock coordination"
+// entry adds the first write-side primitive here: a no-replace publish,
+// duplicated (not shared) from compaction_breadcrumb_io.hpp's
+// write_validated_no_replace() for the same trust-boundary reason stated
+// above -- this file still carries no REPLACE/delete primitive of any kind,
+// only CREATE_NEW.
 //
 // This file has two parts:
 //
@@ -36,13 +39,17 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace hy::seal_journal_store_detail {
 
@@ -60,6 +67,27 @@ enum class ReadFixedStatus : std::uint8_t {
 
 struct ReadFixedResult {
     ReadFixedStatus status{ReadFixedStatus::IoError};
+    std::error_code ec{};
+};
+
+// Identical vocabulary to compaction_breadcrumb_io.hpp's PublishCommitState/
+// PublishProvenance/PublishResult, duplicated rather than shared for the
+// same trust-boundary reason stated at the top of this file.
+enum class PublishCommitState : std::uint8_t {
+    DurablyPublished,
+    PublishedNamespaceUncertain,
+    NotPublished,
+};
+
+enum class PublishProvenance : std::uint8_t {
+    CreatedThisCallDurable,
+    CreatedThisCallUncertain,
+    FoundPreExisting,
+};
+
+struct PublishResult {
+    PublishCommitState state{PublishCommitState::NotPublished};
+    PublishProvenance provenance{PublishProvenance::FoundPreExisting};
     std::error_code ec{};
 };
 
@@ -167,6 +195,8 @@ private:
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 namespace hy::seal_journal_store_detail {
@@ -243,6 +273,144 @@ inline ReadFixedResult read_validated_exact(int dir_fd, const SealJournalArtifac
         return result;
     }
     result.status = ReadFixedStatus::Ok;
+    return result;
+}
+
+// Byte-identical logic to compaction_breadcrumb_io.hpp's
+// make_unique_tmp_name(); duplicated for the trust-boundary reason stated
+// at the top of this file.
+inline std::string make_unique_tmp_name(std::string_view final_name) noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
+    char suffix[64];
+    std::snprintf(suffix, sizeof(suffix), ".tmp-%d-%llu-%llu", static_cast<int>(::getpid()),
+                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(::time(nullptr)));
+    std::string out(final_name);
+    out += suffix;
+    return out;
+}
+
+// Handle-relative (dirfd-relative) no-replace publish: unique-named
+// O_CREAT|O_EXCL tmp -> write -> fsync(file) -> no-replace publish (try
+// renameat2(RENAME_NOREPLACE) first; if the running kernel doesn't support
+// it -- ENOSYS -- fall back to linkat+unlinkat, which has the identical
+// no-replace guarantee on POSIX) -> fsync(dir_fd) for parent-directory
+// durability. If the final name already exists: read it back and compare
+// bytes -- identical content is idempotent (DurablyPublished,
+// FoundPreExisting); any difference is NotPublished (a real conflict, never
+// silently overwritten). Byte-identical logic to
+// compaction_breadcrumb_io.hpp's write_validated_no_replace(); duplicated
+// for the trust-boundary reason stated at the top of this file.
+inline PublishResult write_validated_no_replace(int dir_fd, const SealJournalArtifactName& name,
+                                                  std::span<const std::byte> bytes) noexcept {
+    PublishResult result{};
+    const std::string_view final_name = name.relative_name();
+    const std::string tmp_name = make_unique_tmp_name(final_name);
+
+    const int tmp_fd = ::openat(dir_fd, tmp_name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (tmp_fd < 0) {
+        result.state = PublishCommitState::NotPublished;
+        result.ec = std::error_code(errno, std::generic_category());
+        return result;
+    }
+
+    bool write_ok = true;
+    std::size_t total = 0;
+    while (write_ok && total < bytes.size()) {
+        const ssize_t written = posix_retry_on_eintr(
+            [&] { return ::write(tmp_fd, bytes.data() + total, bytes.size() - total); });
+        if (written <= 0) {
+            write_ok = false;
+            break;
+        }
+        total += static_cast<std::size_t>(written);
+    }
+    write_ok = write_ok && (posix_retry_on_eintr([&] { return ::fsync(tmp_fd); }) == 0);
+    const int fsync_errno = errno;
+    ::close(tmp_fd);
+    if (!write_ok) {
+        ::unlinkat(dir_fd, tmp_name.c_str(), 0);  // best-effort cleanup of our own tmp
+        result.state = PublishCommitState::NotPublished;
+        result.ec = std::error_code(fsync_errno, std::generic_category());
+        return result;
+    }
+
+    std::string final_name_str(final_name);
+#ifdef SYS_renameat2
+    long rc = ::syscall(SYS_renameat2, dir_fd, tmp_name.c_str(), dir_fd, final_name_str.c_str(),
+                         static_cast<unsigned int>(1u /* RENAME_NOREPLACE */));
+    bool renamed = (rc == 0);
+    bool collision = !renamed && (errno == EEXIST);
+    bool syscall_unsupported = !renamed && (errno == ENOSYS || errno == EINVAL);
+#else
+    bool renamed = false;
+    bool collision = false;
+    bool syscall_unsupported = true;
+#endif
+    if (syscall_unsupported) {
+        // Fallback: linkat (fails EEXIST if target exists, same no-replace
+        // guarantee) + unlink the tmp name.
+        const int link_rc = ::linkat(dir_fd, tmp_name.c_str(), dir_fd, final_name_str.c_str(), 0);
+        renamed = (link_rc == 0);
+        collision = !renamed && (errno == EEXIST);
+        if (renamed) ::unlinkat(dir_fd, tmp_name.c_str(), 0);
+    }
+
+    if (!renamed) {
+        ::unlinkat(dir_fd, tmp_name.c_str(), 0);  // best-effort cleanup regardless of outcome
+        if (!collision) {
+            result.state = PublishCommitState::NotPublished;
+            result.ec = std::error_code(errno, std::generic_category());
+            return result;
+        }
+        // Target already exists -- read it back and compare bytes.
+        const int existing_fd = ::openat(dir_fd, final_name_str.c_str(), O_RDONLY);
+        if (existing_fd < 0) {
+            result.state = PublishCommitState::NotPublished;
+            result.ec = std::error_code(errno, std::generic_category());
+            return result;
+        }
+        std::vector<std::byte> existing(bytes.size() + 1);  // +1 to detect "longer than expected"
+        std::size_t read_total = 0;
+        bool read_ok = true;
+        while (read_ok && read_total < existing.size()) {
+            const ssize_t n = posix_retry_on_eintr(
+                [&] { return ::read(existing_fd, existing.data() + read_total, existing.size() - read_total); });
+            if (n < 0) {
+                read_ok = false;
+                break;
+            }
+            if (n == 0) break;
+            read_total += static_cast<std::size_t>(n);
+        }
+        ::close(existing_fd);
+        if (!read_ok) {
+            result.state = PublishCommitState::NotPublished;
+            result.ec = std::error_code(errno, std::generic_category());
+            return result;
+        }
+        const bool byte_equal =
+            read_total == bytes.size() && std::memcmp(existing.data(), bytes.data(), bytes.size()) == 0;
+        if (byte_equal) {
+            result.state = PublishCommitState::DurablyPublished;
+            result.provenance = PublishProvenance::FoundPreExisting;
+            return result;
+        }
+        result.state = PublishCommitState::NotPublished;  // real conflict -- never overwritten
+        return result;
+    }
+
+    // Parent-directory fsync -- this is what makes the rename's directory-
+    // entry change crash-durable, not just the file content.
+    const bool dir_ok = (posix_retry_on_eintr([&] { return ::fsync(dir_fd); }) == 0);
+    if (!dir_ok) {
+        result.state = PublishCommitState::NotPublished;
+        result.ec = std::error_code(errno, std::generic_category());
+        return result;
+    }
+
+    result.state = PublishCommitState::DurablyPublished;
+    result.provenance = PublishProvenance::CreatedThisCallDurable;
     return result;
 }
 
