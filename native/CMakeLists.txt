@@ -66,6 +66,16 @@ add_executable(live_submit_evidence_harness src/live_submit_evidence_harness.cpp
 target_link_libraries(live_submit_evidence_harness PRIVATE hengyuan_core)
 hengyuan_set_warnings(live_submit_evidence_harness)
 
+# --- Read-only cross-file MUST-equal audit tool (diagnostic; deliberately NOT
+# a production code path -- never acquires a lease, never writes breadcrumbs).
+# Scans a constructed fixture breadcrumb directory and reports which
+# MUST-equal cross-file rules are violated; feeds the IntentPhaseAdvancer
+# step-2 field mapping table. Self-check mode runs the full per-rule injection
+# matrix (registered as a ctest entry inside the HY_BUILD_TESTS block below).
+add_executable(seal_journal_cross_file_audit src/seal_journal_cross_file_audit.cpp)
+target_link_libraries(seal_journal_cross_file_audit PRIVATE hengyuan_core)
+hengyuan_set_warnings(seal_journal_cross_file_audit)
+
 # --- Binance feed demo (optional, requires Boost + OpenSSL) ---
 option(HY_BUILD_DEMO "Build binance_feed_demo (requires Boost + OpenSSL)" OFF)
 
@@ -160,6 +170,12 @@ if(HY_BUILD_TESTS)
     # runtime, and the failure surfaces as a confusing BUILD error rather than a
     # test failure. 120s is generous headroom for instrumented startup.
     set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_TIMEOUT 120)
+
+    # Read-only cross-file MUST-equal audit tool -- self-check exercises the
+    # full per-rule injection matrix (clean fixtures + one tampered fixture per
+    # rule, asserting the violated-rule set matches expectation exactly).
+    add_test(NAME seal_journal_cross_file_audit_selfcheck
+             COMMAND seal_journal_cross_file_audit --self-check)
 
     add_executable(test_market_event_layout tests/test_market_event_layout.cpp)
     target_link_libraries(test_market_event_layout PRIVATE hengyuan_core GTest::gtest_main)
@@ -431,6 +447,22 @@ if(HY_BUILD_TESTS)
     endif()
 
     gtest_discover_tests(test_compaction_intent_store PROPERTIES LABELS concurrency)
+
+    # Round E receipt + raise_intent_phase() (Building->Reserved) (docs/
+    # SPEC_INVARIANTS.md's "Seal-journal Round E receipt + raise_intent_phase()
+    # (Building->Reserved)" entry): IntentPhaseAdvancer, a second
+    # CandidateLease-friend write path alongside IntentStore -- test-only
+    # scope this round, see intent_phase_advancer.hpp's own header comment.
+    add_executable(test_intent_phase_advancer tests/test_intent_phase_advancer.cpp)
+    target_link_libraries(test_intent_phase_advancer PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_intent_phase_advancer)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_intent_phase_advancer PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_intent_phase_advancer PROPERTIES LABELS concurrency)
 
     # Round D: windows_native_io.hpp is #ifdef _WIN32-only (no POSIX
     # equivalent, see its own file header) -- this coverage only makes sense

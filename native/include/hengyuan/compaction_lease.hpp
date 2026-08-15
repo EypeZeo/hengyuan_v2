@@ -176,6 +176,14 @@ template <typename LeaseT>
 class SealStartedCleanupTombstoneLoader;
 class SealStartedAbandonLoader;
 
+// Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's "Seal-journal
+// Round E receipt + raise_intent_phase() (Building->Reserved)" entry) --
+// forward-declared friend for the phase-advance write path. See that class's
+// own file (intent_phase_advancer.hpp) for the full design rationale (three
+// rounds of adversarial review) and its SCOPE comment for why this is
+// test-only this round, not wired into any production call path.
+class IntentPhaseAdvancer;
+
 namespace test_only {
 // Pre-integration test accessor -- see the friend declaration inside
 // CandidateLease below. Deliberately NOT in namespace hy::compaction_detail
@@ -289,6 +297,31 @@ private:
     // permanently once the real loaders land (same "one friend per narrow
     // typed consumer" discipline, just an additional one for tests).
     friend class hy::test_only::CandidateLeaseSealBreadcrumbTestAccess;
+
+    // Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's
+    // "Seal-journal Round E receipt + raise_intent_phase() (Building->
+    // Reserved)" entry) -- the second and third write methods this class has
+    // ever had (the first is create_intent_genesis_no_replace above). Same
+    // discipline: filename is never a parameter (always
+    // ValidatedArtifactName::for_x1()/for_compaction_candidate_intent()),
+    // friend-only, single narrow consumer. NOTE (see that class's own
+    // comment): C++ friendship is class-scoped, not method-scoped --
+    // IntentPhaseAdvancer being a friend also grants it compiler-level
+    // access to every other private member of CandidateLease, including
+    // create_intent_genesis_no_replace and all six read methods above. That
+    // is a property of this codebase's friend-based capability model, not
+    // something this comment or IntentPhaseAdvancer's own design closes;
+    // isolation between "what IntentStore does" and "what IntentPhaseAdvancer
+    // does" is a code-review-discipline boundary, not a compiler-enforced one.
+    friend class hy::IntentPhaseAdvancer;
+
+    LeaseWriteResult write_x1_frame_no_replace(std::uint64_t build_nonce, std::uint32_t seq,
+                                                std::span<const std::byte, 176> encoded_transition) noexcept;
+    // REPLACE, not CREATE_NEW -- an Intent already exists (this is a phase
+    // raise on an existing genesis, never a second genesis). Encoded bytes
+    // are the caller's responsibility to have already validated via
+    // validate_intent_transition() before calling this.
+    LeaseWriteResult replace_intent_phase(std::span<const std::byte, 140> encoded_intent) noexcept;
 
     LeaseReadResult read_seal_id_watermark(std::span<std::byte, kSealIdWatermarkWireBytes> out) noexcept;
     // legacy_or_greenfield selects the filename only (see
@@ -421,6 +454,58 @@ inline PublishResult write_validated_no_replace_win(const win_native::RawHandle&
     // universally guaranteed. Failure here is classified Uncertain, not
     // Failed, because the file itself IS confirmed durable with correct
     // content at this point.
+    if (::FlushFileBuffers(dir.get())) {
+        result.state = PublishCommitState::DurablyPublished;
+        result.provenance = PublishProvenance::CreatedThisCallDurable;
+    } else {
+        result.state = PublishCommitState::PublishedNamespaceUncertain;
+        result.provenance = PublishProvenance::CreatedThisCallUncertain;
+    }
+    return result;
+}
+
+// Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's
+// "Seal-journal Round E receipt + raise_intent_phase() (Building->Reserved)"
+// entry): the Windows-native combination helper for write_validated_replace
+// (compaction_breadcrumb_io.hpp's POSIX side) -- same tmp-write-fsync-
+// then-atomic-rename shape as write_validated_no_replace_win above, but
+// using rename_with_replace() (ReplaceIfExists=TRUE) instead of
+// rename_no_replace(), and therefore with NO byte-compare-on-collision
+// branch: a REPLACE has no AlreadyExists outcome to react to, unlike a
+// no-replace publish.
+inline PublishResult write_validated_replace_win(const win_native::RawHandle& dir, const ValidatedArtifactName& name,
+                                                    std::span<const std::byte> bytes) noexcept {
+    PublishResult result{};
+    const std::wstring final_name = ascii_to_wide(name.relative_name());
+    const std::wstring tmp_name = make_unique_tmp_name_win(name.relative_name());
+
+    win_native::RawHandle tmp;
+    if (win_native::create_new_relative(dir, tmp_name, tmp) != win_native::RelativeCreateResult::Created) {
+        result.state = PublishCommitState::NotPublished;
+        return result;
+    }
+
+    DWORD written = 0;
+    BOOL ok = ::WriteFile(tmp.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    ok = ok && written == static_cast<DWORD>(bytes.size());
+    ok = ok && ::FlushFileBuffers(tmp.get());
+    if (!ok) {
+        result.state = PublishCommitState::NotPublished;
+        return result;  // tmp's RawHandle destructor closes it; the leftover
+                         // uniquely-named tmp file is harmless uncollected
+                         // garbage, same reasoning as the POSIX side
+    }
+
+    NTSTATUS rename_status = 0;
+    const auto rename_result = win_native::rename_with_replace(tmp, dir, final_name, &rename_status);
+    if (rename_result != win_native::RelativeRenameResult::Renamed) {
+        result.state = PublishCommitState::NotPublished;
+        return result;
+    }
+    tmp.reset();  // rename doesn't invalidate the handle, but we're done with it
+
+    // Same Windows parent-directory-durability-is-undecidable reasoning as
+    // write_validated_no_replace_win above.
     if (::FlushFileBuffers(dir.get())) {
         result.state = PublishCommitState::DurablyPublished;
         result.provenance = PublishProvenance::CreatedThisCallDurable;
@@ -710,6 +795,47 @@ inline LeaseReadResult CandidateLease::read_x1_frame(std::uint64_t build_nonce, 
     result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
 #else
     result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+// Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's "Seal-
+// journal Round E receipt + raise_intent_phase() (Building->Reserved)"
+// entry). Mirrors create_intent_genesis_no_replace()'s exact shape:
+// check_can_operate() first, then a fixed ValidatedArtifactName, then the
+// appropriate publish primitive for the platform. build_nonce/seq select the
+// filename only (ValidatedArtifactName::for_x1()); the caller
+// (IntentPhaseAdvancer) is responsible for having already validated
+// encoded_transition via validate_intent_transition() before calling this --
+// this method performs no semantic validation of the payload itself, same
+// division of responsibility as create_intent_genesis_no_replace above.
+inline LeaseWriteResult CandidateLease::write_x1_frame_no_replace(
+    std::uint64_t build_nonce, std::uint32_t seq, std::span<const std::byte, 176> encoded_transition) noexcept {
+    LeaseWriteResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_x1(build_nonce, seq);
+#ifdef _WIN32
+    result.publish = compaction_detail::write_validated_no_replace_win(dir_handle_, name, encoded_transition);
+#else
+    result.publish = compaction_detail::write_validated_no_replace(dir_fd_, name, encoded_transition);
+#endif
+    return result;
+}
+
+// REPLACE, not CREATE_NEW -- see the private declaration's comment for why
+// (an Intent already exists; this is a phase raise on an existing genesis).
+inline LeaseWriteResult CandidateLease::replace_intent_phase(std::span<const std::byte, 140> encoded_intent) noexcept {
+    LeaseWriteResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_compaction_candidate_intent();
+#ifdef _WIN32
+    result.publish = compaction_detail::write_validated_replace_win(dir_handle_, name, encoded_intent);
+#else
+    result.publish = compaction_detail::write_validated_replace(dir_fd_, name, encoded_intent);
 #endif
     return result;
 }
