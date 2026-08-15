@@ -1334,6 +1334,87 @@ DeepSeek 的审计工具）合并进同一个集成分支，仅 `native/CMakeLis
 `add_executable(test_intent_phase_advancer ...)` 来自协调者自己），应用后 `grep -c
 add_executable` 确认无重复/无遗漏行。
 
+### Seal-journal Round E SealIdWatermark advance（`raise_intent_phase()` 折进 watermark 推进）[已实现]
+
+上一轮（"Seal-journal Round E receipt + raise_intent_phase()"，见上）明确划定"SealIdWatermark
+本身的写入"在范围外，假设有某个外部 actor 已经先把 watermark 推进到 durable 状态——但复核发现
+这个假设从未被本仓库任何代码路径满足过（"明确不做"清单里那句"本仓库目前没有任何代码路径写
+SealIdWatermark"本身就已经暗示了这一点），而 L4 spec 把"durable watermark advance → `.x1` →
+Intent REPLACE"写成同一个 id-reserve 步骤，不是一个解耦的前置条件。这一轮把 watermark advance
+折进 `raise_intent_phase()` 本身，修正这个从未真正成立的假设。
+
+**两轮对抗性审查**（协调者本地 scratchpad，未入库，`receipt_raise_intent_phase_design_
+{v4,v5}.md`）：
+- v4（提议同时折入 `SealIdWatermark` advance + `SealJournalCommitWatermark` CREATE_NEW）第一轮
+  审查给出 4 项发现。协调者独立核实后推翻其中头号发现——审查 agent 认为每个 candidate 各自一份
+  独立目录、store 内多个 candidate 会各自 bootstrap 出冲突的 `next_candidate_id=1`；但
+  `compaction_intent_store.hpp:109`（"Refuses AlreadyExists if a genesis already exists on
+  disk"）+ L4 spec"refuse if a prior Intent still exists"只有在同一个目录被多个连续 candidate
+  复用时才成立（如果每个 candidate 各自新目录，物理上不可能"已存在"）——`CandidateLease` 管的
+  目录是 store 级别、跨多个 candidate 生命周期复用的单一目录，`seal-id-watermark` 放在这里没有
+  跨 candidate 冲突。另外三项发现确认成立：`next_candidate_id` 方向需要从"减一"改成直接用
+  `next_*` 本身（旧假设下"减一"是对的，但既然 advance 本身现在就在这次调用里发生，"减一"会
+  重复消耗）；`CandidateLease`/`SealJournalStoreLease` 两把锁协调是真实开放问题、本仓库没有
+  先例；同进程重试在 advance 成功但下游（`.x1`/Intent REPLACE）失败后，如果不加防护会每次重试
+  多烧一个 id。
+- v5 收窄范围：只折入 `SealIdWatermark` advance，`SealJournalCommitWatermark` CREATE_NEW 整体
+  推迟到专门设计两把锁协调方案的下一轮（不在这轮内尝试）；修正 id 派生方向；新增
+  `WatermarkAdvanceProvenanceMemory` 同进程幂等重试防护（跟 `X1WriteProvenanceMemory` 形状不同：
+  X1 只在"不确定"结果时才需要记忆，但 watermark advance 一旦 `DurablyPublished` 就已经消耗
+  完毕，不管下游成功与否，所以要在 `DurablyPublished` 观测到的当下就记，不是只在"不确定"分支
+  记）。第二轮审查发现一项"新"问题（watermark advance 排在 `validate_intent_transition()`
+  的 before-state 检查之前，一个注定失败的 transition 也会先烧掉一个 id）——协调者核实后确认
+  不成立：`intent_permanently_immutable_fields_match(before, after)` 因为 `after` 是从
+  `before` 拷贝构造、只改 phase/candidate_id/request_id，按构造方式恒真；
+  `is_legal_candidate_ids_for_phase(before.phase, ...)` 已经在 `raise_intent_phase()` 现有
+  Step 0（`before.phase != Building` 检查，watermark 读取之前）覆盖，不会走到 advance 之后才
+  发现失败。其余核实项（目录复用读法、`X1WriteProvenanceMemory` 类比是否连贯、bootstrap 遇到
+  `PublishedNamespaceUncertain` 的处理、fence 检查顺序、跟 `genesis_provenance_memory_` 的类比
+  是否准确）全部确认成立，v5 无需 v6。
+
+**这一轮做的事**：
+- `compaction_lease.hpp`：新增 `create_seal_id_watermark_no_replace()`/
+  `replace_seal_id_watermark()` 两个 friend-only 写方法（`CandidateLease` 有史以来第 4/5 个写
+  方法），复用已有的 `write_validated_no_replace`/`write_validated_replace`（及各自 `_win`
+  变体）原语，不新增底层 I/O 原语。
+- `intent_phase_advancer.hpp`：`raise_intent_phase()` 的 Step 1 从"只读 watermark、`next_* - 1`
+  派生 id"改成"读取或（NotFound 时）bootstrap watermark → `candidate_id = next_candidate_id`/
+  `request_id = next_request_id`（不再减一）→ UINT64_MAX fence 检查 → CREATE_NEW（bootstrap）
+  或 REPLACE（advance）写回 `next_*+1`"，全部在同一次调用内完成，advance 成功后才继续走
+  `.x1`/Intent REPLACE（未改动）。新增 `WatermarkAdvanceProvenanceMemory`（同进程记忆
+  `(build_nonce, bound_candidate_id, bound_request_id, advanced)`，`DurablyPublished` 一出现
+  就记录，同 build_nonce 的后续调用直接复用绑定的 id，不重新派生）。新增
+  `PhaseAdvanceStatus::WatermarkExhausted`（`next_candidate_id`/`next_request_id` 已经是
+  UINT64_MAX）、`WatermarkAdvanceFailed`（watermark CREATE_NEW/REPLACE 返回 `NotPublished`，
+  含"bootstrap 时跟另一个进程的真实 watermark 写入撞车"这个窄场景——调用方直接重试整个
+  `raise_intent_phase()` 调用即可，重试的新鲜读取会看到真实已存在的 watermark，走正常
+  非-bootstrap 路径）。原有的 `WatermarkNotFound` 状态因为 NotFound 现在触发 bootstrap 而不再
+  可达，从枚举里移除。
+- `test_intent_phase_advancer.cpp`：`plant_watermark_reserving()` 测试 helper 修正方向（不再
+  `+1`，直接存 `candidate_id`/`request_id` 本身）；原 RefusesWithoutWatermark 测试改名
+  BootstrapsWatermarkWhenAbsentAndBindsOneOne，断言 bootstrap 成功绑定 1/1 且 watermark 文件
+  推进到 `next_*=2`；新增 RefusesWhenWatermarkAtUint64Max（fence 检查）；新增
+  RetryAfterX1FailureReusesSameWatermarkBoundIdsInsteadOfBurningAnother（预置一个字节不同的
+  `.x1` seq=1 占位文件制造下游写入失败，验证 watermark 已经推进但同一个 advancer 实例重试时
+  绑定同一对 id，不是新的一对）。
+
+**明确不做（跟 v4/v5 一致）**：`SealJournalCommitWatermark` CREATE_NEW（推迟到下一轮，届时设计
+`CandidateLease`/`SealJournalStoreLease` 两把锁的协调方案）；`.xgc`/GC 授权；journal
+drain-completeness 前置检查；Reserved→StartedPublished 及之后任何边。运营范围延续上一轮"只做到
+类存在、测试证明逻辑对，不接入生产路径"（未变，未重新征求用户确认，因为范围本身没有扩大）。
+
+**验证（2026-08-15）**：
+- MSVC Release 全量构建：0 warning。全量 ctest：1096/1096（1 个既有 POSIX-only skip）。
+- WSL2 GCC-14 Release（`HY_BUILD_DEMO=ON`）：1125/1125（1123 基线 + 本轮新增 2 个测试）。
+- WSL2 ASan+UBSan（同前几轮的 OOM 规避：只构建本轮相关的 9 个测试目标 + compaction_lease_holder
+  跨进程测试辅助可执行文件——第一次目标列表遗漏了这个辅助程序，导致
+  `CandidateLease.CrossProcessMutualExclusion` 因"找不到可执行文件"而非真实 bug 失败，补上目标
+  后确认是构建范围问题不是代码问题）：94/94，无 ASan/UBSan 报告。
+- WSL2 TSan：`ctest -L concurrency`：58/58。两个负控均正确报出 `WARNING: ThreadSanitizer: data
+  race`。
+- `tools/spec_xref_check.py --quiet`、`tools/spec_enum_diff.py`：均 clean（跟之前几轮相同的
+  既有、无关警告）。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 
