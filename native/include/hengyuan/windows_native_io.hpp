@@ -553,6 +553,39 @@ inline RelativeRenameResult rename_no_replace(const RawHandle& file, const RawHa
     return RelativeRenameResult::Renamed;
 }
 
+// Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's
+// "Seal-journal Round E receipt + raise_intent_phase() (Building->Reserved)"
+// entry): the NT-native analogue of MoveFileExW(...,
+// MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) -- the exact recipe
+// docs/BINANCE_PRIVATE_REST_L4_SPEC.md's "File replace (... / Intent
+// phase-only)" line already names. Identical to rename_no_replace() above
+// except ReplaceIfExists=TRUE; unlike that function, there is no
+// AlreadyExists outcome to report, because replacing IS the point -- an
+// existing target is silently overwritten, not treated as a collision.
+inline RelativeRenameResult rename_with_replace(const RawHandle& file, const RawHandle& dir,
+                                                   const std::wstring& new_relative_name,
+                                                   NTSTATUS* out_status = nullptr) noexcept {
+    if (!native_api_available()) return RelativeRenameResult::Unsupported;
+    auto& t = detail::proc_table();
+
+    const std::size_t name_bytes = new_relative_name.size() * sizeof(WCHAR);
+    const std::size_t total_bytes = sizeof(FileRenameInformationNt) + name_bytes;
+    std::vector<std::byte> buf(total_bytes);
+    auto* info = reinterpret_cast<FileRenameInformationNt*>(buf.data());
+    info->ReplaceIfExists = TRUE;
+    info->RootDirectory = dir.get();
+    info->FileNameLength = static_cast<ULONG>(name_bytes);
+    std::memcpy(info->FileName, new_relative_name.c_str(), name_bytes);
+
+    IO_STATUS_BLOCK iosb{};
+    const NTSTATUS status = t.nt_set_information_file(
+        file.get(), &iosb, info, static_cast<ULONG>(total_bytes),
+        static_cast<FILE_INFORMATION_CLASS>(kFileRenameInformationClass));
+    if (out_status != nullptr) *out_status = status;
+    if (!nt_success(status)) return RelativeRenameResult::Failed;
+    return RelativeRenameResult::Renamed;
+}
+
 // File/directory identity for TOCTOU re-verification (compaction_lease.hpp's
 // sticky-fence check): VolumeSerialNumber + FileIndex uniquely identify a
 // filesystem object on Windows, the same role st_dev/st_ino play on POSIX.

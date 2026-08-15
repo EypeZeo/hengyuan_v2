@@ -117,6 +117,10 @@ SEARCH_FILES = [
     REPO_ROOT / "native" / "include" / "hengyuan" / "seal_started_migration_cleanup_loader.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "seal_started_abandon_loader.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "seal_journal_breadcrumb_precondition_aggregate.hpp",
+    # Round E receipt + raise_intent_phase() (docs/SPEC_INVARIANTS.md "Seal-journal
+    # Round E receipt + raise_intent_phase() (Building->Reserved)"): IntentPhaseAdvancer
+    # and its receipt/status types are new load-bearing symbols, same gap as above.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "intent_phase_advancer.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

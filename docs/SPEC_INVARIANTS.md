@@ -1204,6 +1204,136 @@ anywhere except compaction_lease.hpp"，这个边界不动，`seal_journal_store
   同类修复）。
 - `spec_enum_diff.py`：0 个新发现。
 
+### Seal-journal Round E receipt + raise_intent_phase()（Building->Reserved）[已实现]
+
+Round E breadcrumb L2 loaders（上面）落地后，receipt 概念 / `raise_intent_phase()` 的前提（7 个
+durable-precondition 类型都有真实 L1 codec + L2 只读 I/O）第一次全部满足。这一轮做 Round D 六轮
+审查刻意排除的那类写路径——Intent phase 推进——但只做 Building→Reserved 一条边，其余三条边
+（Reserved→StartedPublished / StartedPublished→{PostSealFinalizing,AbandonFinalizing}）推迟到
+这一条边真正落地、复核通过之后再逐条设计，不比照 Round D 五版被拒历史里"一次性设计全部写路径"
+那类失败模式。
+
+**三轮对抗性审查收敛出的设计（协调者本地 scratchpad，未入库，`receipt_raise_intent_phase_design_
+{v1,v2,v3}.md`）**：
+- v1（四条边全设计）被查出三处真实 bug：`StartedPublished→PostSealFinalizing`/`AbandonFinalizing`
+  两条边的字段映射表比对了 `CompactionCandidateIntentWire` 根本没有的字段、`phase >=
+  kSealStartedCleanupPhaseAuthorized`（== 0）恒真死代码、`AbandonFinalizing` 边接受 `GenGone`
+  过宽（`GenGone` 不代表 tip 已重新核对，只有 `ResumeAuthorized` 代表）。
+- v2 收窄到只做 Building→Reserved，修正上述三处（推迟另外三条边，不是修复后仍然一次性做完）；
+  同时诚实记录 `friend class hy::IntentPhaseAdvancer` 授予的是对 `CandidateLease` **整个类**
+  私有面的编译期访问权（C++ friend 是类粒度不是方法粒度），不是这版设计能消除的风险。
+- v3 修 v2 唯一未过关的一项：`.x1` 写入的幂等重试直接复用 `write_validated_no_replace`/`_win`
+  本身的语义，但没配上 `IntentStore::genesis_provenance_memory_*` 那套同进程 provenance-memory
+  防护——Windows 上首次写入可能返回 `PublishedNamespaceUncertain`，崩溃重试会看到"文件已存在且
+  字节相同"就误判 `DurablyPublished`，违反 L4 spec"Forbidden: Intent REPLACE without prior
+  durable matching `.x1`"。修复：`IntentPhaseAdvancer` 新增跟 `genesis_provenance_memory_*`
+  同款的 `X1WriteProvenanceMemory`（键为 build_nonce+transition_seq+encoded bytes，而非
+  GenesisRequest）。v3 同时钉死两个开放问题：`raise_intent_phase(build_nonce)` 只接受
+  `build_nonce`（不接受裸 `to_phase`，不接受 candidate_id/request_id 参数——两个 id 完全由这次
+  调用内部从新鲜读取的 `SealIdWatermark`（`next_candidate_id - 1`/`next_request_id - 1`）派生，
+  见下面"实现层面对 watermark 严格 == 判断的落地方式"）；`SealIdWatermarkLoader::load()` 的
+  `kek_key_id` 从当前 Intent 自己的 `kek_key_id` 字段读，不另外传参。
+
+**实现层面对 watermark 严格 `==` 判断的落地方式（v3 之后、写代码时才发现需要明确记录的一点）**：
+设计文档的字段映射表写的是"`next_candidate_id == candidate_id + 1`"，隐含 candidate_id 是一个
+独立获得、可能过期的值。但 v3 把 `raise_intent_phase()` 的参数收窄到只有 `build_nonce` 之后，
+candidate_id/request_id 不再是调用方传入的独立值——`IntentPhaseAdvancer` 直接把这次读到的
+watermark 的 `next_candidate_id - 1`/`next_request_id - 1` 当成要绑定的 id。这让"严格 ==
+判断"在实现里体现为"永远用最新一次读取派生"，不是"比较两个独立获得的值"——原设计文档里
+"严格 == 不是 >"这条分析结论仍然成立（排除了"watermark 已经继续往前推了好几个"这种场景被放行
+的风险），只是承载它的机制从"一次显式比较"变成了"派生方式本身"。诚实记录这个差异，不假装
+按字面实现了一次独立比较。
+
+**明确不做（跟 v1/v2/v3 一致）**：`.xgc`/GC 授权（Round F）；journal drain-completeness 前置
+检查；Reserved→StartedPublished 及之后任何边；`SealIdWatermark` 本身的**写入**（`raise_intent_
+phase()` 只读取、绑定已经 durable 的 watermark 状态，不负责让它变成 durable——本仓库目前没有任何
+代码路径写 `SealIdWatermark`，这是这一轮明确划定在范围外的前置依赖，真实部署前必须先有）。
+
+**运营范围（用户已确认，2026-08-15）**：这一轮**只做到"类存在、测试证明逻辑对"**，不接入任何
+真实会被调用的生产代码路径——`Reserved→StartedPublished`/PreSeal-abandon 清理路径都还不存在，
+一旦真实调用会永久卡住 candidate 目录和已分配的 id（跟 spec 自己写明的"crash 后 id 永久消耗"
+同一类不可逆），要清理只能靠仓外人工手段。
+
+**交付物**：
+- `compaction_lease.hpp`：新增 `write_x1_frame_no_replace()`/`replace_intent_phase()` 两个
+  friend-only 写方法（`CandidateLease` 有史以来第 2/3 个写方法，第 1 个是 Round D 的
+  `create_intent_genesis_no_replace()`），新增 `friend class hy::IntentPhaseAdvancer`
+  （第 8 个 friend）。`replace_intent_phase()` 需要 REPLACE 语义（Round D 的 genesis 写入
+  一直是 CREATE_NEW-only，这个仓库历史上第一次需要"覆盖已存在文件"这个原语）：新增
+  `windows_native_io.hpp::rename_with_replace()`（`ReplaceIfExists=TRUE` 版
+  `rename_no_replace()`）、`compaction_breadcrumb_io.hpp::write_validated_replace()`（POSIX，
+  普通 `renameat()` 本身已经是原子 replace，不需要 no-replace 那套 renameat2/linkat 回退，
+  也没有 byte-compare-on-collision 分支——REPLACE 没有"already exists"这个失败态可以区分）、
+  `compaction_lease.hpp` 内 `write_validated_replace_win()`（组合 helper，镜像
+  `write_validated_no_replace_win()` 结构）。
+- 新文件 `intent_phase_advancer.hpp`：`PhaseAdvanceStatus` 枚举、`SealIdWatermarkAdvanceReceipt`
+  （私有构造 + `IntentPhaseAdvancer` 唯一 friend，不作为跨调用对象暴露——receipt 生产+消费在
+  同一次 `raise_intent_phase()` 调用内完成，关闭 TOCTOU 窗口）、`IntentPhaseAdvancer` 本体
+  （构造接收 `CandidateLease&`/`KeyRing&`，复用同一把已审查过的锁，不新开）。`raise_intent_
+  phase(build_nonce)`：读取现有 Intent（必须 Building 且 build_nonce 匹配；已经 Reserved 及以后
+  且 build_nonce 匹配则返回 `AlreadyAtOrPastTargetPhase`，幂等安全）→ 读取+MAC 验证
+  `SealIdWatermark` receipt → 派生 candidate_id/request_id → 复用既有
+  `validate_intent_transition()` 做语义校验（不重新实现 ID 生命周期/immutable 字段/chain 规则）
+  → `write_x1_frame_no_replace()`（带 `X1WriteProvenanceMemory` 幂等重试防护）→ 确认 durable
+  后才 `replace_intent_phase()`。
+- 新测试 `test_intent_phase_advancer.cpp`：成功路径（watermark 派生 id 正确绑定）、`.x1` 先于
+  Intent REPLACE durable 的顺序验证、同实例重试返回 `AlreadyAtOrPastTargetPhase`、
+  ForeignBuildNonce/IntentNotFound/WatermarkNotFound/WatermarkCorrupt（含 watermark 全零场景，
+  见下面"验证"小节的说明）/WatermarkForeignStore/LeaseNotHeld 各类拒绝路径。`SealIdWatermark`
+  无生产写入路径，测试用裸文件 I/O 直接种一份 watermark（不经过 lease，因为只读方法才是
+  friend-gated，写字节本身不需要）。
+
+**验证（2026-08-15）**：
+- MSVC Release 全量构建：0 warning（`/W4`）。全量 ctest：1093/1093（1 个既有 POSIX-only fencing
+  skip，跟既有说明一致）。过程中发现并修了两处自己的 bug：测试 fixture 把 watermark 写到了
+  错误文件名（`compaction-id-watermark`，应为 `ValidatedArtifactName::for_seal_id_watermark()`
+  实际返回的 `seal-id-watermark`）；`IntentPhaseAdvancer` 里一段
+  `next_candidate_id/next_request_id == 0` 检查是死代码——`decode_seal_id_watermark_wire()`
+  自己已经在解码阶段拒绝零值（Round E Slice 1 的 allocator-safety 检查），这一步永远不可达，
+  删除并把 watermark store_uuid 不匹配的状态从原先设想的"WatermarkNotYetAdvanced"改名为更准确的
+  `WatermarkForeignStore`（不再跟一个已经不可能出现的场景共用同一个名字）。
+- WSL2 GCC-14 Release（镜像 `ci-native.yml`，`HY_BUILD_DEMO=ON`）：1122/1122。
+- WSL2 ASan+UBSan：全量 `HY_BUILD_DEMO=ON` ASan 构建在这台 WSL VM 上有已知 OOM 问题（跟
+  breadcrumb loaders 那轮完全一致的限制），改用同一个规避方式——只构建本轮相关的 9 个测试目标
+  （test_compaction_lease/test_compaction_intent_store/test_intent_phase_advancer/
+  test_seal_journal_store_lease/四个 loader 测试/test_seal_journal_breadcrumb_precondition_
+  aggregate），`-DHY_BUILD_DEMO=OFF`：92/92，无 ASan/UBSan 报告。
+- WSL2 TSan：`ctest -L concurrency`：58/58。两个负控
+  （tsan_control_relaxed_ring/tsan_control_export_worker_dual_consumer）均以非零退出码正确
+  报出 `WARNING: ThreadSanitizer: data race`（本机 TSan 检测能力未失效）。验证过程中一次因
+  WSL VM 瞬时中断导致的构建被杀掉，留下一个 0 字节的 tsan_control_export_worker_dual_consumer
+  可执行文件（增量构建系统没能感知到这是被杀掉的半成品，误判"已经是最新"）——删除后强制重新
+  link 即恢复正常；记录下来是因为这跟真正的代码 bug表现相似（负控没报错），必须先排除环境因素
+  再下结论，不能直接假设"负控没触发 = 代码有问题"或反过来"退出码 0 = 一切正常"（这次 WSL
+  外层脚本本身的退出码在这次环境中断后也不可靠，靠读实际 ctest/日志内容而非退出码本身确认结果，
+  跟本轮更早发现的"exit code 经过 `| tail` 管道会被掩盖"是同一类教训）。
+
+**同轮并行派发的两份独立产出（跟上面的 `IntentPhaseAdvancer` 实现互相零文件交集，按"下一轮
+2-模型并行派发协议"隔离 worktree 完成，协调者复核后一并整合进本条目，不单开 ledger 条目）**：
+- **Grok 4.6**：新增 `formal/RoundEFDesignReceiptVerified.tla`（+ .cfg / _liveness.cfg 两个模型
+  检查配置）——`RoundEFDesign.tla`（未来设计参考模型，跟生产代码无可追溯关系）的独立姊妹模型，
+  不修改原文件。新增 receiptVerified BOOLEAN 变量，按"消费型"（不是单调）建模：VerifyReceipt
+  置真，`Transition` 要求为真后立即消费回假——跟 `IntentPhaseAdvancer` 真实实现里"receipt 只在
+  `raise_intent_phase()` 一次调用内生产+消费，不跨调用持久化"这条设计决定同构。协调者用 TLC
+  独立重跑全部结果，与 Grok 报告完全一致；并额外做了一次这个仓库一贯的"控制必须失败"验证
+  （去掉 receiptVerified 守卫，确认 TLC 报出预期的不变量违反）——未发现问题，无需修复。
+- **DeepSeek V4 Flash**：新增 `native/src/seal_journal_cross_file_audit.cpp`（只读诊断工具，
+  非生产代码路径，从不获取 lease，只用 plain std::ifstream）——扫描一个构造出的 fixture breadcrumb
+  目录，报告 92 条跨文件 MUST-equal 规则（entry_mac 等字段必须在多个文件间一致）的
+  Verified/Violated/N/A 状态，喂给未来字段映射表的实证基础；`--self-check` 模式跑满 97 个
+  单点注入 + 4 个 clean 场景的完整矩阵。协调者复核了 key material 处理、7 个 `decode_*`
+  wrapper 的 peek→pin→decode 模式、`InjectionSpec.field` 的生命周期修复（`std::string` 而非
+  悬空 `string_view`）、3 处 `KeyRing` 构造点的双 key 修复，并独立在 MSVC + WSL2 GCC-14 双工具链
+  各跑一次完整构建 + 全量 ctest（MSVC 1085/1085，1 个既有 skip；WSL2 1114/1114），外加直接运行
+  `--self-check` 本身确认 97+4 项全部符合预期——未发现问题，无需修复。
+
+**最终整合**：三份互相零文件交集的产出（`IntentPhaseAdvancer` 本体、Grok 的 TLA+ 模型、
+DeepSeek 的审计工具）合并进同一个集成分支，仅 `native/CMakeLists.txt` 有两处独立、不重叠的插入点
+需要协调者手工按顺序应用（`add_executable(seal_journal_cross_file_audit ...)` +
+`add_test(seal_journal_cross_file_audit_selfcheck)` 来自 DeepSeek，
+`add_executable(test_intent_phase_advancer ...)` 来自协调者自己），应用后 `grep -c
+add_executable` 确认无重复/无遗漏行。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 

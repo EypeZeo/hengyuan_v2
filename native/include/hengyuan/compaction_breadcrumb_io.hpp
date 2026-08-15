@@ -406,6 +406,90 @@ inline PublishResult write_validated_no_replace(int dir_fd, const ValidatedArtif
     return result;
 }
 
+// Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's "Seal-journal
+// Round E receipt + raise_intent_phase() (Building->Reserved)" entry): the
+// first REPLACE (not no-replace) publish primitive this codebase has ever
+// needed -- Round D's genesis write is CREATE_NEW-only. Handle-relative
+// unique-named tmp -> write -> fsync(file) -> unconditional replace-rename
+// (plain renameat(), which is already an atomic replace on POSIX -- no
+// RENAME_NOREPLACE flag, no linkat fallback needed, since there is no
+// "already exists" failure mode to distinguish) -> fsync(dir_fd) for
+// parent-directory durability. Unlike write_validated_no_replace, there is
+// no byte-compare-on-collision branch: a REPLACE is defined to always
+// succeed in replacing whatever was there (or create it fresh if nothing
+// was), so "the target already existed" is not a distinguishable outcome
+// here the way EEXIST is for a no-replace publish.
+//
+// This does NOT itself enforce "the target must have already existed" --
+// that is a protocol invariant IntentPhaseAdvancer's caller-side logic
+// enforces (only call this after confirming, via a fresh read, that an
+// Intent genesis already exists), not something this filesystem-level
+// primitive can distinguish (a REPLACE onto an absent target and a REPLACE
+// onto a present target are the identical underlying syscall).
+inline PublishResult write_validated_replace(int dir_fd, const ValidatedArtifactName& name,
+                                              std::span<const std::byte> bytes) noexcept {
+    PublishResult result{};
+    const std::string_view final_name = name.relative_name();
+    const std::string tmp_name = make_unique_tmp_name(final_name);
+
+    const int tmp_fd = ::openat(dir_fd, tmp_name.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (tmp_fd < 0) {
+        result.state = PublishCommitState::NotPublished;
+        result.ec = std::error_code(errno, std::generic_category());
+        return result;
+    }
+
+    bool write_ok = true;
+    std::size_t total = 0;
+    while (write_ok && total < bytes.size()) {
+        const ssize_t written = posix_retry_on_eintr(
+            [&] { return ::write(tmp_fd, bytes.data() + total, bytes.size() - total); });
+        if (written <= 0) {
+            write_ok = false;
+            break;
+        }
+        total += static_cast<std::size_t>(written);
+    }
+    write_ok = write_ok && (posix_retry_on_eintr([&] { return ::fsync(tmp_fd); }) == 0);
+    const int fsync_errno = errno;
+    ::close(tmp_fd);
+    if (!write_ok) {
+        ::unlinkat(dir_fd, tmp_name.c_str(), 0);  // best-effort cleanup of our own tmp
+        result.state = PublishCommitState::NotPublished;
+        result.ec = std::error_code(fsync_errno, std::generic_category());
+        return result;
+    }
+
+    const std::string final_name_str(final_name);
+    // Plain renameat (no NOREPLACE flag) is already an atomic replace on
+    // POSIX -- unlike the no-replace path above, this never needs the
+    // renameat2/linkat fallback dance, because there is no kernel-version-
+    // dependent flag involved at all.
+    const int rc = ::renameat(dir_fd, tmp_name.c_str(), dir_fd, final_name_str.c_str());
+    if (rc != 0) {
+        const int rename_errno = errno;
+        ::unlinkat(dir_fd, tmp_name.c_str(), 0);  // best-effort cleanup of our own tmp
+        result.state = PublishCommitState::NotPublished;
+        result.ec = std::error_code(rename_errno, std::generic_category());
+        return result;
+    }
+
+    // Parent-directory fsync -- this is what makes the rename's directory-
+    // entry change crash-durable, not just the file content. Same
+    // POSIX-fsync-failure-is-definite-failure reasoning as the no-replace
+    // path above.
+    const bool dir_ok = (posix_retry_on_eintr([&] { return ::fsync(dir_fd); }) == 0);
+    if (!dir_ok) {
+        result.state = PublishCommitState::NotPublished;
+        result.ec = std::error_code(errno, std::generic_category());
+        return result;
+    }
+
+    result.state = PublishCommitState::DurablyPublished;
+    result.provenance = PublishProvenance::CreatedThisCallDurable;
+    return result;
+}
+
 // Handle-relative exact-size read: rejects short/long reads, symlinks, and
 // non-regular files. Never resizes a buffer based on an attacker-influenced
 // file size -- `out` is caller-sized and fixed.
