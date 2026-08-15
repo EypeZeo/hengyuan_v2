@@ -61,19 +61,28 @@
 // 5. Where candidate_id/request_id come from (Building->Reserved's whole
 //    reason for existing): the L4 spec (quoted on CompactionCandidateIntentWire
 //    in durable_control_plane.hpp) forbids raising Reserved "without durable
-//    SealIdWatermark advance binding the same candidate_id/request_id."
-//    SealIdWatermark's wire fields are `next_candidate_id`/`next_request_id`
-//    -- "the next value to allocate," not "the value just allocated" -- so
-//    this class treats "next - 1" as the id most recently, durably reserved
-//    by whatever external actor advanced the watermark (that advance itself
-//    is out of this round's scope -- see compaction_breadcrumb_io.hpp/
-//    seal_journal_precondition_codec.hpp's read-only loaders; nothing in
-//    this repo writes a SealIdWatermark yet). A production caller MUST have
-//    already durably advanced the watermark for this exact candidate before
-//    calling raise_intent_phase() -- this class only reads and binds, it
-//    never performs that advance itself (matches the design docs' "明确不做"
-//    boundary: `raise_intent_phase()` consumes already-durable watermark
-//    state, it does not make that state durable).
+//    SealIdWatermark advance binding the same candidate_id/request_id," and
+//    separately states the durable watermark advance is the SAME id-reserve
+//    step as the `.x1`/Intent REPLACE that follows it (L4 spec: "Reserved:
+//    after durable SealIdWatermark advance ... publish `.x1` seq=1 ... THEN
+//    REPLACE Intent"), not a decoupled precondition satisfied by some other
+//    actor beforehand. The first three landed rounds of this class (v1-v3,
+//    docs/SPEC_INVARIANTS.md's "Seal-journal Round E receipt +
+//    raise_intent_phase()" entry) assumed the opposite -- that watermark
+//    advance was already-durable, external, out of scope -- and read
+//    `next_candidate_id - 1` accordingly. That assumption was wrong (no code
+//    path in this repo ever performed the advance, so the assumption was
+//    never actually satisfiable) and is corrected here (docs/SPEC_INVARIANTS.md's
+//    "Seal-journal Round E SealIdWatermark advance" entry): this class now
+//    performs the watermark read-modify-write itself, as part of this same
+//    call, and binds `candidate_id = next_candidate_id` / `request_id =
+//    next_request_id` (the value AT the point of advance, not "minus one" --
+//    the "-1" reading was only correct under the old, never-true
+//    already-advanced assumption). `SealJournalCommitWatermark` CREATE_NEW
+//    (the L4 spec's other Reserved-moment write, in a directory guarded by a
+//    completely different lock class, SealJournalStoreLease) is deliberately
+//    still out of scope this round -- folding it in requires a two-lock
+//    coordination design this round does not attempt; see the ledger entry.
 
 #pragma once
 
@@ -86,6 +95,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 
@@ -122,6 +132,16 @@ enum class PhaseAdvanceStatus : std::uint8_t {
     WatermarkForeignStore,       // the watermark decoded and MAC-verified fine, but its store_uuid
                                   // doesn't match this Intent's -- there is no id this call can
                                   // legally bind against a watermark for a different store.
+    WatermarkExhausted,          // next_candidate_id or next_request_id is already UINT64_MAX --
+                                  // advancing would overflow to 0, which is never a legal
+                                  // next-allocatable id (L4 spec: "At UINT64_MAX -> fence").
+    WatermarkAdvanceFailed,      // the watermark CREATE_NEW/REPLACE returned NotPublished. Includes
+                                  // the narrow bootstrap-race case (this call saw NotFound, but a
+                                  // different process's watermark write raced in with DIFFERENT
+                                  // content before this call's CREATE_NEW landed) -- the caller can
+                                  // simply retry the whole raise_intent_phase() call; the retry's
+                                  // fresh read will see the real, now-existing watermark and take
+                                  // the normal (non-bootstrap) path.
     IllegalTransition,           // validate_intent_transition() rejected the constructed
                                   // before/after/`.x1` triple.
     X1WriteFailed,
@@ -177,9 +197,31 @@ private:
         bool uncertain{false};
     };
 
+    // Different shape from X1WriteProvenanceMemory on purpose (design v5, see
+    // docs/SPEC_INVARIANTS.md's "Seal-journal Round E SealIdWatermark
+    // advance" entry for the full reasoning): X1's memory only needs to
+    // trigger on the *uncertain* outcome, because a definite success or
+    // definite failure of that write is each individually safe to re-derive
+    // fresh on retry. The watermark advance is not symmetric that way -- the
+    // moment the CREATE_NEW/REPLACE returns DurablyPublished, the id is
+    // spent (L4 spec: never reclaimed), full stop, regardless of what
+    // happens to `.x1`/Intent REPLACE afterward. So this memory must be set
+    // as soon as DurablyPublished is observed (not gated on "uncertain"),
+    // and a same-process retry for the same build_nonce must reuse the
+    // bound ids rather than re-deriving from a fresh watermark read --
+    // otherwise every retry after a downstream (`.x1`/Intent) failure would
+    // burn one more id pair for the same build_nonce, forever.
+    struct WatermarkAdvanceProvenanceMemory {
+        std::uint64_t build_nonce{0};
+        std::uint64_t bound_candidate_id{0};
+        std::uint64_t bound_request_id{0};
+        bool advanced{false};
+    };
+
     CandidateLease& lease_;
     KeyRing& key_ring_;
     std::optional<X1WriteProvenanceMemory> x1_provenance_memory_{};
+    std::optional<WatermarkAdvanceProvenanceMemory> watermark_provenance_memory_{};
 };
 
 inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_intent_phase(std::uint64_t build_nonce) noexcept {
@@ -244,46 +286,114 @@ inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_intent_phase(std::uint64_t 
         return PhaseAdvanceStatus::IllegalTransition;
     }
 
-    // Step 1: the receipt -- fresh read + full MAC verification of
-    // SealIdWatermark via the real loader/codec (SealIdWatermarkLoader,
-    // Round E breadcrumb L2 loaders). kek_key_id is sourced from the
-    // Intent's own field (intent_permanently_immutable_fields_match()
-    // already keeps this field pinned for the Intent's whole lifetime, so
-    // reusing it here is inherently consistent -- no separate parameter,
-    // no caller has to know which key the watermark uses).
-    SealIdWatermark watermark{};
-    {
-        SealIdWatermarkLoader loader(lease_);
-        const LoadStatus wm_status = loader.load(before.kek_key_id, key_ring_, watermark);
-        switch (wm_status) {
-            case LoadStatus::LeaseNotHeld:
+    // Step 1: the SealIdWatermark advance itself (design v5 -- see the
+    // header comment's SCOPE section 5). Reserved's normative moment is
+    // "durable watermark advance, THEN `.x1`, THEN Intent REPLACE" as one
+    // bound sequence, not "assume some other actor already advanced it."
+    std::uint64_t candidate_id = 0;
+    std::uint64_t request_id = 0;
+    if (watermark_provenance_memory_.has_value() && watermark_provenance_memory_->advanced &&
+        watermark_provenance_memory_->build_nonce == build_nonce) {
+        // Same-process retry for this exact build_nonce, after a prior call
+        // already durably advanced the watermark -- reuse those bound ids.
+        // See WatermarkAdvanceProvenanceMemory's comment for why re-deriving
+        // from a fresh read here (instead) would burn a second id pair.
+        candidate_id = watermark_provenance_memory_->bound_candidate_id;
+        request_id = watermark_provenance_memory_->bound_request_id;
+    } else {
+        SealIdWatermark watermark{};
+        bool bootstrapping = false;
+        {
+            SealIdWatermarkLoader loader(lease_);
+            const LoadStatus wm_status = loader.load(before.kek_key_id, key_ring_, watermark);
+            switch (wm_status) {
+                case LoadStatus::LeaseNotHeld:
+                    return PhaseAdvanceStatus::LeaseNotHeld;
+                case LoadStatus::CandidateFenced:
+                    return PhaseAdvanceStatus::CandidateFenced;
+                case LoadStatus::DirectoryIdentityChanged:
+                    return PhaseAdvanceStatus::DirectoryIdentityChanged;
+                case LoadStatus::NotFound:
+                    // This store's first-ever candidate: no seal-id-watermark on disk
+                    // yet. Bootstrap with the spec's documented defaults
+                    // (SealIdWatermark's next_candidate_id/next_request_id both
+                    // default-initialize to 1) and CREATE_NEW it below, in the same
+                    // call that consumes the first id pair.
+                    bootstrapping = true;
+                    watermark = SealIdWatermark{};
+                    watermark.store_uuid_lo = before.store_uuid_lo;
+                    watermark.store_uuid_hi = before.store_uuid_hi;
+                    watermark.next_candidate_id = 1;
+                    watermark.next_request_id = 1;
+                    break;
+                case LoadStatus::Corrupt:
+                case LoadStatus::IoError:
+                    return PhaseAdvanceStatus::WatermarkCorrupt;
+                case LoadStatus::KeyNotFound:
+                    return PhaseAdvanceStatus::WatermarkKeyNotFound;
+                case LoadStatus::Ok:
+                    break;
+            }
+        }
+        if (!bootstrapping &&
+            (watermark.store_uuid_lo != before.store_uuid_lo || watermark.store_uuid_hi != before.store_uuid_hi)) {
+            return PhaseAdvanceStatus::WatermarkForeignStore;
+        }
+        // No next_candidate_id/next_request_id == 0 check on the loaded (non-bootstrap) path:
+        // SealIdWatermarkLoader::load() (via decode_seal_id_watermark_wire()) already refuses to
+        // produce an Ok watermark with either field 0 -- that case surfaced as WatermarkCorrupt
+        // above already. The bootstrap path constructs next_*=1 directly, never 0.
+
+        const SealIdWatermarkAdvanceReceipt receipt(watermark);
+        candidate_id = receipt.value().next_candidate_id;
+        request_id = receipt.value().next_request_id;
+        if (candidate_id == std::numeric_limits<std::uint64_t>::max() ||
+            request_id == std::numeric_limits<std::uint64_t>::max()) {
+            return PhaseAdvanceStatus::WatermarkExhausted;
+        }
+
+        SealIdWatermark advanced = watermark;
+        advanced.next_candidate_id = candidate_id + 1;
+        advanced.next_request_id = request_id + 1;
+
+        const PinResult watermark_pin = key_ring_.pin_key(before.kek_key_id);
+        if (watermark_pin.status != PinStatus::Pinned) return PhaseAdvanceStatus::IntentKeyNotFound;
+
+        std::array<std::byte, kSealIdWatermarkWireBytes> encoded_watermark{};
+        encode_seal_id_watermark_wire(encoded_watermark, advanced, watermark_pin.handle->key_bytes());
+
+        const LeaseWriteResult watermark_write =
+            bootstrapping ? lease_.create_seal_id_watermark_no_replace(encoded_watermark)
+                          : lease_.replace_seal_id_watermark(encoded_watermark);
+        switch (watermark_write.outcome) {
+            case LeaseIoOutcome::WrongOwner:
+            case LeaseIoOutcome::NotHeld:
                 return PhaseAdvanceStatus::LeaseNotHeld;
-            case LoadStatus::CandidateFenced:
+            case LeaseIoOutcome::CandidateFenced:
                 return PhaseAdvanceStatus::CandidateFenced;
-            case LoadStatus::DirectoryIdentityChanged:
+            case LeaseIoOutcome::DirectoryIdentityChanged:
                 return PhaseAdvanceStatus::DirectoryIdentityChanged;
-            case LoadStatus::NotFound:
-                return PhaseAdvanceStatus::WatermarkNotFound;
-            case LoadStatus::Corrupt:
-            case LoadStatus::IoError:
-                return PhaseAdvanceStatus::WatermarkCorrupt;
-            case LoadStatus::KeyNotFound:
-                return PhaseAdvanceStatus::WatermarkKeyNotFound;
-            case LoadStatus::Ok:
+            case LeaseIoOutcome::Ok:
                 break;
         }
+        switch (watermark_write.publish.state) {
+            case compaction_detail::PublishCommitState::DurablyPublished:
+                // Spent, regardless of what happens next this call -- record it before
+                // doing anything else (see WatermarkAdvanceProvenanceMemory's comment).
+                watermark_provenance_memory_ =
+                    WatermarkAdvanceProvenanceMemory{build_nonce, candidate_id, request_id, true};
+                break;
+            case compaction_detail::PublishCommitState::PublishedNamespaceUncertain:
+                // Not recorded as advanced -- unconfirmed durability carries no proof the
+                // id was actually spent; a retry re-attempts this same step fresh, same
+                // "platform-honest recovery boundary" as every other uncertain outcome in
+                // this class.
+                return PhaseAdvanceStatus::PhaseRaiseUncertain;
+            case compaction_detail::PublishCommitState::NotPublished:
+            default:
+                return PhaseAdvanceStatus::WatermarkAdvanceFailed;
+        }
     }
-    if (watermark.store_uuid_lo != before.store_uuid_lo || watermark.store_uuid_hi != before.store_uuid_hi) {
-        return PhaseAdvanceStatus::WatermarkForeignStore;
-    }
-    // No next_candidate_id/next_request_id == 0 check here: SealIdWatermarkLoader::load() (via
-    // decode_seal_id_watermark_wire()) already refuses to produce an Ok watermark with either
-    // field 0 -- that case surfaced as WatermarkCorrupt above already, this point is unreachable
-    // with a zero id.
-
-    const SealIdWatermarkAdvanceReceipt receipt(watermark);
-    const std::uint64_t candidate_id = receipt.value().next_candidate_id - 1;
-    const std::uint64_t request_id = receipt.value().next_request_id - 1;
 
     // Step 2: construct the proposed after-state + the `.x1` seq=1 evidence
     // that must be durable before the Intent REPLACE is allowed to happen.

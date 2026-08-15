@@ -4,15 +4,18 @@
 // (real file I/O). Test-only scope (see intent_phase_advancer.hpp's own
 // header comment) -- this class is not called from any production path.
 //
-// SealIdWatermark has no production writer anywhere in this codebase yet
-// (this round's explicit boundary -- see intent_phase_advancer.hpp point 5),
-// so these tests plant a watermark file directly via plain file I/O (no
-// CandidateLease/friend access needed for a bare write -- only reads are
-// friend-gated), standing in for whatever external actor would durably
-// advance it in a real deployment.
+// raise_intent_phase() now performs the SealIdWatermark advance itself
+// (design v5 -- see intent_phase_advancer.hpp's SCOPE section 5), including
+// bootstrapping the file when absent. Some tests below still plant a
+// watermark file directly via plain file I/O (no CandidateLease/friend
+// access needed for a bare write -- only reads are friend-gated), to set up
+// a specific pre-existing state (a non-default starting point, a foreign
+// store_uuid, a corrupt/zero watermark, an exhausted watermark) rather than
+// relying on this store's first-ever bootstrap.
 #include <gtest/gtest.h>
 #include <hengyuan/compaction_intent_store.hpp>
 #include <hengyuan/intent_phase_advancer.hpp>
+#include <hengyuan/seal_id_watermark_export_started_loader.hpp>
 #include <hengyuan/seal_journal_precondition_codec.hpp>
 
 #include <array>
@@ -21,8 +24,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace hy;
 
@@ -57,11 +62,9 @@ GenesisRequest make_request(std::uint32_t kek_key_id, std::uint64_t build_nonce)
 }
 
 // Plants a durable SealIdWatermark file directly (bypassing CandidateLease --
-// no production writer for this file exists yet, see this file's header
-// comment). next_candidate_id/next_request_id are "the next value to
-// allocate," so a watermark that has "reserved" candidate_id/request_id N
-// stores N+1 in these fields (matches intent_phase_advancer.hpp's "next - 1"
-// derivation).
+// used to set up a specific pre-existing state; raise_intent_phase() itself
+// is the only production-shaped writer of this file, see this file's header
+// comment).
 void plant_watermark(const std::filesystem::path& candidate_dir, std::uint64_t store_uuid_lo,
                        std::uint64_t store_uuid_hi, std::uint64_t next_candidate_id, std::uint64_t next_request_id,
                        const std::array<std::byte, kKekSize>& kek) {
@@ -103,8 +106,12 @@ struct Fixture {
         ASSERT_EQ(store.release_lease(), ReleaseStatus::Released);
     }
 
+    // Plants a watermark such that the NEXT raise_intent_phase() call derives
+    // exactly (candidate_id, request_id) -- since raise_intent_phase() now
+    // binds candidate_id = next_candidate_id directly (design v5; no longer
+    // "next - 1"), that means storing (candidate_id, request_id) as-is.
     void plant_watermark_reserving(std::uint64_t candidate_id, std::uint64_t request_id) {
-        plant_watermark(dir, 0x1111111111111111ULL, 0x2222222222222222ULL, candidate_id + 1, request_id + 1, kek);
+        plant_watermark(dir, 0x1111111111111111ULL, 0x2222222222222222ULL, candidate_id, request_id, kek);
     }
 };
 
@@ -193,16 +200,100 @@ TEST(IntentPhaseAdvancer, RefusesWithoutIntentGenesis) {
     ASSERT_EQ(lease.release(), ReleaseStatus::Released);
 }
 
-TEST(IntentPhaseAdvancer, RefusesWithoutWatermark) {
+TEST(IntentPhaseAdvancer, BootstrapsWatermarkWhenAbsentAndBindsOneOne) {
     Fixture fx("no_watermark");
-    fx.create_building_genesis(0xABCULL);
-    // Deliberately never plants a watermark.
+    constexpr std::uint64_t kBuildNonce = 0xABCULL;
+    fx.create_building_genesis(kBuildNonce);
+    // Deliberately never plants a watermark -- this store's first-ever
+    // candidate. raise_intent_phase() must bootstrap it (design v5) rather
+    // than refuse.
 
     CandidateLease lease(fx.dir);
     ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
     IntentPhaseAdvancer advancer(lease, fx.ring);
-    EXPECT_EQ(advancer.raise_intent_phase(0xABCULL), PhaseAdvanceStatus::WatermarkNotFound);
+    EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
     ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+
+    IntentStore verify_store(fx.dir, fx.ring);
+    ASSERT_EQ(verify_store.acquire_lease(), LeaseAcquireStatus::Acquired);
+    CompactionCandidateIntentWire loaded{};
+    ASSERT_EQ(verify_store.load_and_validate_intent(loaded), LoadStatus::Ok);
+    EXPECT_EQ(loaded.candidate_id, 1u);
+    EXPECT_EQ(loaded.request_id, 1u);
+    ASSERT_EQ(verify_store.release_lease(), ReleaseStatus::Released);
+
+    // The watermark itself must now read next_*=2 -- bootstrap consumed 1,1.
+    CandidateLease verify_lease(fx.dir);
+    ASSERT_EQ(verify_lease.acquire(), LeaseAcquireStatus::Acquired);
+    SealIdWatermark wm{};
+    SealIdWatermarkLoader loader(verify_lease);
+    ASSERT_EQ(loader.load(fx.kek_key_id, fx.ring, wm), LoadStatus::Ok);
+    EXPECT_EQ(wm.next_candidate_id, 2u);
+    EXPECT_EQ(wm.next_request_id, 2u);
+    ASSERT_EQ(verify_lease.release(), ReleaseStatus::Released);
+}
+
+TEST(IntentPhaseAdvancer, RefusesWhenWatermarkAtUint64Max) {
+    Fixture fx("watermark_exhausted");
+    fx.create_building_genesis(0xABCULL);
+    plant_watermark(fx.dir, 0x1111111111111111ULL, 0x2222222222222222ULL,
+                     std::numeric_limits<std::uint64_t>::max(), 5, fx.kek);
+
+    CandidateLease lease(fx.dir);
+    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
+    IntentPhaseAdvancer advancer(lease, fx.ring);
+    EXPECT_EQ(advancer.raise_intent_phase(0xABCULL), PhaseAdvanceStatus::WatermarkExhausted);
+    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+}
+
+TEST(IntentPhaseAdvancer, RetryAfterX1FailureReusesSameWatermarkBoundIdsInsteadOfBurningAnother) {
+    Fixture fx("retry_x1_failure");
+    constexpr std::uint64_t kBuildNonce = 0x55ULL;
+    fx.create_building_genesis(kBuildNonce);
+    // No watermark planted -- bootstraps to 1,1 on the first call.
+
+    // Pre-create a colliding, WRONG-content `.x1` seq=1 file so the first
+    // call's `.x1` write hits a byte-mismatch collision (real conflict,
+    // never overwritten -- see compaction_breadcrumb_io.hpp's
+    // write_validated_no_replace) and the call fails downstream of the
+    // watermark advance.
+    const auto x1_name = compaction_detail::ValidatedArtifactName::for_x1(kBuildNonce, /*seq=*/1);
+    {
+        std::vector<char> wrong_bytes(kCompactionIntentTransitionWireBytes, 'X');
+        std::ofstream bogus(fx.dir / x1_name.relative_name(), std::ios::binary | std::ios::trunc);
+        bogus.write(wrong_bytes.data(), static_cast<std::streamsize>(wrong_bytes.size()));
+    }
+
+    CandidateLease lease(fx.dir);
+    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
+    IntentPhaseAdvancer advancer(lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::X1WriteFailed);
+
+    // The watermark must already show the advance (spent, per
+    // WatermarkAdvanceProvenanceMemory's contract) even though the overall
+    // call failed downstream.
+    {
+        SealIdWatermarkLoader loader(lease);
+        SealIdWatermark wm{};
+        ASSERT_EQ(loader.load(fx.kek_key_id, fx.ring, wm), LoadStatus::Ok);
+        EXPECT_EQ(wm.next_candidate_id, 2u);
+        EXPECT_EQ(wm.next_request_id, 2u);
+    }
+
+    // Remove the colliding stub and retry with the SAME advancer instance --
+    // must bind the SAME ids (1,1) the first attempt already spent, not
+    // derive a new pair from the now-advanced watermark.
+    std::filesystem::remove(fx.dir / x1_name.relative_name());
+    EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+
+    IntentStore verify_store(fx.dir, fx.ring);
+    ASSERT_EQ(verify_store.acquire_lease(), LeaseAcquireStatus::Acquired);
+    CompactionCandidateIntentWire loaded{};
+    ASSERT_EQ(verify_store.load_and_validate_intent(loaded), LoadStatus::Ok);
+    EXPECT_EQ(loaded.candidate_id, 1u);
+    EXPECT_EQ(loaded.request_id, 1u);
+    ASSERT_EQ(verify_store.release_lease(), ReleaseStatus::Released);
 }
 
 TEST(IntentPhaseAdvancer, RefusesZeroWatermarkAsCorrupt) {

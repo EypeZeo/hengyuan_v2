@@ -300,11 +300,15 @@ private:
 
     // Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's
     // "Seal-journal Round E receipt + raise_intent_phase() (Building->
-    // Reserved)" entry) -- the second and third write methods this class has
-    // ever had (the first is create_intent_genesis_no_replace above). Same
-    // discipline: filename is never a parameter (always
-    // ValidatedArtifactName::for_x1()/for_compaction_candidate_intent()),
-    // friend-only, single narrow consumer. NOTE (see that class's own
+    // Reserved)" entry) -- the 2nd through 5th write methods this class has
+    // ever had (the first is create_intent_genesis_no_replace above): `.x1`,
+    // Intent REPLACE, and (added when raise_intent_phase() was revised to
+    // fold in the watermark advance itself, per the "Seal-journal Round E
+    // SealIdWatermark advance" entry) the watermark's CREATE_NEW/REPLACE
+    // pair. Same discipline: filename is never a parameter (always
+    // ValidatedArtifactName::for_x1()/for_compaction_candidate_intent()/
+    // for_seal_id_watermark()), friend-only, single narrow consumer. NOTE
+    // (see that class's own
     // comment): C++ friendship is class-scoped, not method-scoped --
     // IntentPhaseAdvancer being a friend also grants it compiler-level
     // access to every other private member of CandidateLease, including
@@ -322,6 +326,17 @@ private:
     // are the caller's responsibility to have already validated via
     // validate_intent_transition() before calling this.
     LeaseWriteResult replace_intent_phase(std::span<const std::byte, 140> encoded_intent) noexcept;
+
+    // Round E watermark-advance (docs/SPEC_INVARIANTS.md's "Seal-journal Round
+    // E SealIdWatermark advance" entry): the fourth and fifth write methods
+    // this class has ever had. CREATE_NEW is the bootstrap path (this store's
+    // very first candidate, no seal-id-watermark on disk yet); REPLACE is
+    // every advance after that. Both are friend-only, same discipline as
+    // every other write method here -- filename is never a parameter.
+    LeaseWriteResult create_seal_id_watermark_no_replace(
+        std::span<const std::byte, kSealIdWatermarkWireBytes> encoded_watermark) noexcept;
+    LeaseWriteResult replace_seal_id_watermark(
+        std::span<const std::byte, kSealIdWatermarkWireBytes> encoded_watermark) noexcept;
 
     LeaseReadResult read_seal_id_watermark(std::span<std::byte, kSealIdWatermarkWireBytes> out) noexcept;
     // legacy_or_greenfield selects the filename only (see
@@ -836,6 +851,44 @@ inline LeaseWriteResult CandidateLease::replace_intent_phase(std::span<const std
     result.publish = compaction_detail::write_validated_replace_win(dir_handle_, name, encoded_intent);
 #else
     result.publish = compaction_detail::write_validated_replace(dir_fd_, name, encoded_intent);
+#endif
+    return result;
+}
+
+// CREATE_NEW -- bootstrap path, this store's first-ever candidate. Refuses
+// (AlreadyExists) if a watermark already exists, same as
+// create_intent_genesis_no_replace's genesis discipline.
+inline LeaseWriteResult CandidateLease::create_seal_id_watermark_no_replace(
+    std::span<const std::byte, kSealIdWatermarkWireBytes> encoded_watermark) noexcept {
+    LeaseWriteResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_id_watermark();
+#ifdef _WIN32
+    result.publish = compaction_detail::write_validated_no_replace_win(dir_handle_, name, encoded_watermark);
+#else
+    result.publish = compaction_detail::write_validated_no_replace(dir_fd_, name, encoded_watermark);
+#endif
+    return result;
+}
+
+// REPLACE -- every advance after the bootstrap CREATE_NEW. See
+// IntentPhaseAdvancer's WatermarkAdvanceProvenanceMemory for why a bare
+// REPLACE (no byte-compare-on-collision, unlike the no-replace primitive)
+// requires that caller-side idempotent-retry guard rather than relying on
+// anything this method itself detects.
+inline LeaseWriteResult CandidateLease::replace_seal_id_watermark(
+    std::span<const std::byte, kSealIdWatermarkWireBytes> encoded_watermark) noexcept {
+    LeaseWriteResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_id_watermark();
+#ifdef _WIN32
+    result.publish = compaction_detail::write_validated_replace_win(dir_handle_, name, encoded_watermark);
+#else
+    result.publish = compaction_detail::write_validated_replace(dir_fd_, name, encoded_watermark);
 #endif
     return result;
 }
