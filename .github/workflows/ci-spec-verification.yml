@@ -421,6 +421,37 @@ jobs:
           echo "  OK: $inv violated as expected"
           echo "::endgroup::"
 
+      - name: "Model: RoundERetryIdempotency (raise_intent_phase() retry idempotency)"
+        id: m_retryidempotency
+        continue-on-error: true
+        working-directory: formal
+        # Single-process retry-idempotency state machine, not a two-caller
+        # model -- see RoundERetryIdempotency.tla's own header. Finite by
+        # construction (booleans + a 2-element id space), no liveness
+        # property to check.
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config RoundERetryIdempotency.cfg RoundERetryIdempotency.tla
+
+          set -u
+          cfg=RoundERetryIdempotency_bug.cfg
+          inv=NeverRebindsCandidateId
+          echo "::group::$cfg — expecting $inv to be violated"
+          echo "  control: ReuseBoundIdsOnRetry=FALSE (the ~watermarkAdvanced guard dropped from AdvanceWatermark, allowing a same-process retry to rebind a different candidate_id)"
+          if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+               -workers auto -config "$cfg" RoundERetryIdempotency.tla > "/tmp/$cfg.log" 2>&1; then
+            echo "::error::$cfg PASSED but was expected to violate $inv. The model has stopped discriminating; do not trust the safety run until this is fixed."
+            tail -30 "/tmp/$cfg.log"
+            exit 1
+          fi
+          if ! grep -q "Invariant $inv is violated" "/tmp/$cfg.log"; then
+            echo "::error::$cfg failed, but NOT with the expected '$inv is violated'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+            tail -30 "/tmp/$cfg.log"
+            exit 1
+          fi
+          echo "  OK: $inv violated as expected"
+          echo "::endgroup::"
+
       # Aggregate: turns any individual model's failure into an overall job
       # failure. `if: always()` so this runs even though every model step
       # above is `continue-on-error: true`. Each model's own pass/fail is
@@ -438,5 +469,6 @@ jobs:
           [ "${{ steps.m_roundef.outcome }}" = "failure" ] && { echo "::error::RoundEFDesign failed"; fail=1; }
           [ "${{ steps.m_keyrotation.outcome }}" = "failure" ] && { echo "::error::key_rotation failed"; fail=1; }
           [ "${{ steps.m_lockorder.outcome }}" = "failure" ] && { echo "::error::RoundELockOrder failed"; fail=1; }
+          [ "${{ steps.m_retryidempotency.outcome }}" = "failure" ] && { echo "::error::RoundERetryIdempotency failed"; fail=1; }
           [ "${{ steps.m_depthsnapshot.outcome }}" = "failure" ] && { echo "::error::depth_snapshot_bootstrap failed"; fail=1; }
           exit $fail

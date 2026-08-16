@@ -1567,6 +1567,76 @@ drain-completeness 前置检查；`highest_committed_journal_seq` 的 REPLACE-wi
 - `formal/RoundELockOrder.tla`：协调者独立用 TLC 重跑正确配置 + 负控配置，结果与 Grok 报告完全
   一致（见上）。
 
+### Round G：raise_intent_phase() 幂等重试 TLA+ 模型 + store 级别 `.jhw`/`.jts` 诊断工具[已实现]
+
+延续 Round F 的 2-模型并行派发协议，这一轮的两块候选（同样零文件交集、只读/纯新增）分别补上：
+`raise_intent_phase()` 内部三个 provenance-memory 结构（`WatermarkAdvanceProvenanceMemory`/
+`JhwWriteProvenanceMemory`/`X1WriteProvenanceMemory`）各自不同的 armed 规则从未被形式化验证过；
+`seal_journal_cross_file_audit.cpp` 只审计一个 Intent 选中的那一份 `.jhw`，没有任何工具能一次性
+列出一个 store 目录里全部 candidate 各自的 `.jhw`/`.jts`。**Reserved→StartedPublished 这条真正
+的下一个实现边继续留给协调者自己做，不外包，这一轮两块产出都不触碰它。**
+
+**Grok 4.6：`formal/RoundERetryIdempotency.tla`（+ .cfg 正确配置 + _bug.cfg 负控）**——单进程
+状态机（同 RoundELockOrder.tla 先例）：变量 watermarkAdvanced/boundCandidateId/
+firstBoundCandidateId（history/ghost，记住第一次绑定的 id，状态不变式需要"看见上一态"时必须
+靠它，因为 CI 抓的是 INVARIANT 行不是 temporal property）/jhwWritten/x1Written。正确 Next 的
+AdvanceWatermark(id) 要求 `~watermarkAdvanced`（对应真实代码 `watermark_provenance_memory_.
+has_value() && advanced` 就直接复用绑定值、不重新推导）；`.jhw`/`.x1` 两步（选项 (a)，未
+建模各自的 provenance-memory/Uncertain 状态，只要求它们必须晚于 watermarkAdvanced）。安全
+不变式 `NeverRebindsCandidateId == watermarkAdvanced => boundCandidateId = firstBoundCandidateId`。
+_bug.cfg 用常量 ReuseBoundIdsOnRetry=FALSE 去掉 `~watermarkAdvanced` guard，TLC 必须报出
+`Invariant NeverRebindsCandidateId is violated`。设计偏离（均已在报告里说明理由，核实后认为
+合理，不需要改）：id 空间不含单独的 request_id 变量（`(candidate_id, request_id)` 是同一次
+advance 一起 spend 的一对，拆开只会放大状态空间，不改变负控本身）；MaxCandidateId 钉死为 2
+（负控必须能选到一个不同的 id，否则两次 Advance 仍可能巧合绑同一个值，负控会空转）；没有单独
+建模"重试"动作（重试第 1 步本身就是再次调用 AdvanceWatermark，正确版本已经被 guard 挡住）。
+协调者独立用 TLC 重跑：正确配置 11 states generated / 9 distinct / depth 4，无违反；负控配置
+`Error: Invariant NeverRebindsCandidateId is violated`，反例状态序列（Init → 第一次
+AdvanceWatermark 绑定一个 id → 第二次 AdvanceWatermark 在 watermarkAdvanced 已经为真时
+绑定另一个 id）跟设计预期完全一致——具体 states generated/distinct 数字（6/5 vs Grok 报告的
+5/4）因 TLC 多 worker 并行搜索在找到第一个反例后提前退出、探索顺序不确定而有微小出入，属于
+TLC 已知的良性非确定性，不是真实差异（错误字符串、反例结构完全一致）。未发现问题，无需修复。
+
+**DeepSeek V4 Flash：新文件 `native/src/seal_journal_store_dump.cpp`**——纯只读诊断工具（不
+获取任何 lease，跟 `seal_journal_cross_file_audit.cpp` 同一套纪律）：`seal_journal_store_dump
+--dir <store 目录> [--kek-hex <64hex>]`，枚举目录、按文件名模式识别 `.jhw`（`<16hex>.jhw`）/
+`.jts`（`<16hex>-<16hex>.jts`），复用已有的 `encode/decode_seal_journal_commit_watermark_wire`/
+`decode_seal_journal_tombstone_wire`，MAC/解码结果三态分类（valid/invalid/decode failed）,
+按 candidate_id 分组展示、`.jts` 按 journal_seq 排序，文件名跟解码字段矛盾（candidate_id 或
+journal_seq 不一致）单独报 warning 不中断，无法识别的文件名/非常规文件（目录等）同样只警告
+跳过。没有 `--self-check`/`--gen` 模式（那是审计工具的自证方式，这个是纯展示型诊断工具），
+不需要 ctest 注册。协调者复核：读完整文件（470 行）、独立在 MSVC 上构建 0 警告 + 用
+`seal_journal_cross_file_audit --gen --seal-journal-dir` 生成的真实 fixture 加上手工构造的
+损坏/不完整 `.jts`（复制 `.jhw` 字节冒充 `.jts`，触发"decode failed: truncated"）、未知文件、
+非常规目录条目做端到端冒烟测试，输出完全符合预期（正确分组、正确报告字段、正确警告、不中断、
+exit 0）——在 MSVC 和 WSL2 GCC-14 上各自独立复现同一测试，结果一致；未发现问题，无需修复。
+
+**CI 集成**：RoundERetryIdempotency.tla/.cfg/_bug.cfg 接入 `ci-spec-verification.yml`
+`tla-model-check-all` 合并 job，作为第 9 个 model step（m_retryidempotency）；
+seal_journal_store_dump 新增 CMakeLists.txt 注册（add_executable/
+target_link_libraries/hengyuan_set_warnings，紧跟在 seal_journal_cross_file_audit 后面），
+无 ctest 条目。
+
+**这一轮之后仍然明确不做**：Reserved→StartedPublished 及之后任何边；`.xgc`/GC 授权；journal
+drain-completeness 前置检查；Intent REPLACE 本身的幂等重试建模（这次只建模前三步）；
+`.jhw`/`.x1` 的 `PublishedNamespaceUncertain` 误判场景的形式化验证（Grok 报告里明确点出这是
+另一条性质，这次选项 (a) 没做）。
+
+**验证（2026-08-16）**：
+- MSVC Release 全量构建：0 warning。全量 ctest：1097/1097（跟上一轮相同——这一轮没有新增
+  ctest 条目，1 个既有 POSIX-only skip）。
+- WSL2 GCC-14 Release（`HY_BUILD_DEMO=ON`）：1126/1126（跟上一轮相同）。
+- WSL2 ASan+UBSan（同前几轮的 OOM 规避，目标列表含 compaction_lease_holder +
+  seal_journal_cross_file_audit + seal_journal_store_dump）：95/95，无 ASan/UBSan 报告；
+  audit 工具 `--self-check` 同样 102+3+1 全过；store_dump 端到端冒烟测试在 ASan/UBSan 下同样
+  干净。
+- WSL2 TSan：`ctest -L concurrency`：58/58。两个负控均正确报出 `WARNING: ThreadSanitizer: data
+  race`。
+- `tools/spec_xref_check.py --quiet`、`tools/spec_enum_diff.py`：均 clean（跟之前几轮相同的
+  既有、无关警告）。
+- `formal/RoundERetryIdempotency.tla`：协调者独立用 TLC 重跑正确配置 + 负控配置，结果与 Grok
+  报告一致（见上，状态计数的微小出入已说明原因）。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 
