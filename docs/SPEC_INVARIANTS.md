@@ -1637,6 +1637,101 @@ drain-completeness 前置检查；Intent REPLACE 本身的幂等重试建模（�
 - `formal/RoundERetryIdempotency.tla`：协调者独立用 TLC 重跑正确配置 + 负控配置，结果与 Grok
   报告一致（见上，状态计数的微小出入已说明原因）。
 
+### Seal-journal Round E Reserved->StartedPublished（NativeV2Started）[已实现]
+
+Round G 之后，用户在"继续外包派发 2 个任务"和"开始设计真正的下一条实现边"之间选择了后者——这一轮
+不再外包，协调者自己设计并实现 `raise_started_published()`：`IntentPhaseAdvancer`（
+`native/include/hengyuan/intent_phase_advancer.hpp`）新增的第二个写方法，Reserved->
+StartedPublished 边（`.x1` seq=2），仅覆盖 NativeV2Started（greenfield）路径。同一个类现在实现
+两条边；MigratedV2Started（V+M legacy-companion 写路径）与 StartedPublished->{PostSealFinalizing,
+AbandonFinalizing} 两条终边不在这一轮范围内。**跟 raise_intent_phase() 一样，这一整轮是
+test-only**——本仓库没有任何生产调用路径会走到这个函数，也没有任何 PostSeal 恢复实现能正确处理
+它写出的 L 文件（见下面"操作性风险"）。
+
+**设计经过 3 轮对抗性审查才定稿（v1→v2→v3），过程中两轮各自发现真实问题，均已独立核实并修正**：
+
+- **Finding 0（第一轮发现，最终定性为设计纪律而非需要修复的 bug）**：`walk_x1_chain_raw()`
+  （`compaction_intent_codec.hpp`）的 `TerminalBranchConflict` 检查（校验 `after.phase` 等于
+  链条终点的 `to_phase`）只在传入的链条恰好是 3 帧时才生效——对 1 帧（Building->Reserved）和
+  2 帧（Reserved->StartedPublished）链条都会被静默跳过。v1 曾提议删掉这个 `size()==3` 门槛来
+  堵住这个校验缺口，但这会破坏 `IntentStore::inspect_x1_chain()`（`compaction_intent_store.hpp`）
+  在文档化的崩溃恢复窗口期（`.x1` seq=1 已落盘但 Intent REPLACE 还没到达，磁盘上的
+  `Intent.phase` 因此合法地落后于链条）对这种宽松行为的合法依赖——协调者独立读
+  `inspect_x1_chain()` 源码核实后确认 v1 的修复方案本身是错的，改为 v2 的正确做法：
+  `raise_intent_phase()`（既有）与 `raise_started_published()`（新增）各自在调用未改动的
+  `walk_x1_chain_raw` 之后，自己额外加一条 `after.phase == 本边目标 phase` 的显式检查——编译器
+  不强制，但对整个状态机是闭合的（合法链条拓扑只有 1/2/3 帧三种，两条尚未实现的 3 帧终边落地时
+  会自动被共享函数自身的 `size()==3` 检查覆盖）。
+- **字段绑定表遗漏（第一轮发现）**：v1/v2 的 Step 2 绑定字段列表漏了
+  `started.new_generation == before.target_generation`——通过 L4 spec 的
+  `CURRENT.generation == C.new_generation`（约 3882 行）和 `CURRENT == I.target_generation`
+  （约 4257-4258 行）传递约束同一个 `CURRENT`，v2 已补上。
+- **引用错误（第二轮发现）**：v2 的说明文字里有一处引用张冠李戴（"recovery one-step lag"那句话
+  误标为出自 `intent_phase_advancer.hpp`，实际出自 L4 spec 文档）和一处不精确的先例引用
+  （`create_seal_journal_commit_watermark_no_replace` 被引作 `CandidateLease` 同类先例，实际
+  定义在 `SealJournalStoreLease` 上）——v3 已修正，协调者独立复核（`sed`/`grep` 核对原文）确认
+  修正无误。
+- 第三轮审查结论："design is ready for implementation... No v4 needed."
+
+**跟 raise_intent_phase() 一个根本不同的信任模型**：`SealIdWatermark`/`SealJournalCommitWatermark`
+的内容完全由 `raise_intent_phase()` 内部从已有的 Intent 状态推导出来，调用方没有任何东西需要提供。
+`SealExportStartedWire` 描述的是真实的、已经完成的 seal 输出（`new_generation`/`new_final_seq`/
+`new_final_tip_mac`/`content_root`），本仓库没有真实的 compaction 执行引擎能算出这些字段——
+`raise_started_published()` 无法自己推导，因此 `started` 是调用方提供的参数，在 Step 2 里做校验
+（不是信任）：先逐字段核对跟这个 Intent 自己的 store_uuid/candidate_id/request_id/
+source_generation/target_generation/baseline 四元组/kek_key_id 是否绑定一致（不一致返回
+`StartedForeignBinding`），再调用既有的 `validate_seal_export_started_shape()` 校验拓扑自洽性
+（不通过返回 `StartedShapeInvalid`）。
+
+**操作性风险，比 raise_intent_phase() 更尖锐**：`SealExportStartedWire` 自己的文档注释
+（`durable_control_plane.hpp:951-952`）写着"Presence forces PostSeal recovery even when no local
+seal Ack was observed"——未来一个真实的 PostSeal 恢复实现（本仓库目前不存在）一旦看到这个
+test-only 调用写出的 L 文件，会被强制当成"真的发生过一次 seal 尝试"的证据，即便实际上什么都没
+发生。在 StartedPublished->{PostSealFinalizing, AbandonFinalizing} 及至少 PreSeal-abandon 清理
+的雏形落地之前，不能把这两个函数接进任何真实的 compaction 触发流程。
+
+**实现内容**：
+- `CandidateLease::create_seal_export_started_no_replace()`（`compaction_lease.hpp`）——第 6 个
+  写方法，CREATE_NEW-only（这个 L 文件只在 StartedPublished 写一次；PostSeal/Abandon 清理会
+  最终 unlink 它，不在这一轮范围内），跟 `create_seal_id_watermark_no_replace` 完全同一套
+  CREATE_NEW 模式。
+- `IntentPhaseAdvancer::raise_started_published(build_nonce, started)`——Step 0 读 Intent（要求
+  phase==Reserved，past 且 ids 合法返回 `AlreadyAtOrPastTargetPhase` 幂等重试）；Step 1 用既有
+  的 `CandidateLease::read_x1_frame()` 读回 durable 的 seq=1 `.x1` 帧（缺失/损坏分别返回
+  `SeqOneX1NotFound`/`SeqOneX1Corrupt`）；Step 2 校验 `started`（见上）；Step 3 构造 `after`
+  （ids 不变）+ seq=2 `CompactionIntentTransitionWire`；Step 4 直接调用
+  `compaction_codec_detail::walk_x1_chain_raw`（不经过 `validate_intent_transition()`——那个
+  函数硬编码 `before.phase == Building`，是 Building->Reserved 专用，这条边不能复用）+ 显式的
+  `after.phase == StartedPublished` 检查（Finding 0 的纪律）；Step 5 CREATE_NEW L 文件，配
+  `StartedWriteProvenanceMemory`（跟 `JhwWriteProvenanceMemory` 同一个形状——只在 `Uncertain`
+  时需要同进程记忆，因为内容一旦 `started` 参数确定就是确定性的，Definite 成功/失败都可以在
+  重试时安全地重新推导）；Step 6 复用既有的 `write_x1_frame_no_replace`/
+  `X1WriteProvenanceMemory`（本来就按 `transition_seq` 泛化，不需要改动）写 `.x1` seq=2；
+  Step 7 复用既有的 `replace_intent_phase` REPLACE Intent 到 StartedPublished。
+- 新增 5 个 `PhaseAdvanceStatus` 枚举值：`SeqOneX1NotFound`/`SeqOneX1Corrupt`/
+  `StartedForeignBinding`/`StartedShapeInvalid`/`StartedWriteFailed`。
+- `test_intent_phase_advancer.cpp` 新增 8 个测试：成功路径（验证 Intent.phase、L 文件内容、`.x1`
+  seq=2 落盘）、幂等重试、仍在 Building 时拒绝、外部绑定不一致拒绝、拓扑不自洽拒绝、外部
+  build_nonce 拒绝、seq=1 `.x1` 缺失拒绝、seq=1 `.x1` 损坏拒绝。
+
+**验证（2026-08-16）**：
+- MSVC Release 全量构建：0 warning。全量 ctest：1105/1105（含新增 8 个测试；1 个既有
+  POSIX-only skip）。
+- WSL2 GCC-14 Release（`HY_BUILD_DEMO=ON`）：1134/1134。
+- WSL2 ASan+UBSan（同前几轮的 OOM 规避手法，`HY_BUILD_DEMO=OFF` 目标构建：
+  test_intent_phase_advancer + compaction_lease_holder + seal_journal_cross_file_audit）：
+  IntentPhaseAdvancer 测试 20/20（含新增 8 个），audit 工具 `--self-check` 1/1，均无 ASan/UBSan
+  报告。
+- WSL2 TSan：`ctest -L concurrency`：58/58（含 `CandidateLease` 系列，覆盖新增写方法所在的类）。
+  两个负控均正确报出 `WARNING: ThreadSanitizer: data race`。
+- `tools/spec_xref_check.py --quiet`：500 个符号、31 个文件、43037 个引用点，OK。
+  `tools/spec_enum_diff.py`：OK（跟之前几轮相同的既有、无关警告——`SubmitOutcome::RateLimited`
+  尚未在代码中实现，跟本轮无关）。
+
+**这一轮之后仍然明确不做**：MigratedV2Started 写路径；StartedPublished->{PostSealFinalizing,
+AbandonFinalizing} 两条终边；`.xgc`/GC 授权；任何真实网络 seal 调用；把这两个函数接进任何真实的
+compaction 触发流程（见上"操作性风险"）。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 

@@ -300,15 +300,17 @@ private:
 
     // Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's
     // "Seal-journal Round E receipt + raise_intent_phase() (Building->
-    // Reserved)" entry) -- the 2nd through 5th write methods this class has
+    // Reserved)" entry) -- the 2nd through 6th write methods this class has
     // ever had (the first is create_intent_genesis_no_replace above): `.x1`,
-    // Intent REPLACE, and (added when raise_intent_phase() was revised to
+    // Intent REPLACE, (added when raise_intent_phase() was revised to
     // fold in the watermark advance itself, per the "Seal-journal Round E
     // SealIdWatermark advance" entry) the watermark's CREATE_NEW/REPLACE
-    // pair. Same discipline: filename is never a parameter (always
+    // pair, and (added by the "Seal-journal Round E Reserved->
+    // StartedPublished (NativeV2Started)" entry) the seal-export-started
+    // CREATE_NEW. Same discipline: filename is never a parameter (always
     // ValidatedArtifactName::for_x1()/for_compaction_candidate_intent()/
-    // for_seal_id_watermark()), friend-only, single narrow consumer. NOTE
-    // (see that class's own
+    // for_seal_id_watermark()/for_seal_export_started()), friend-only,
+    // single narrow consumer. NOTE (see that class's own
     // comment): C++ friendship is class-scoped, not method-scoped --
     // IntentPhaseAdvancer being a friend also grants it compiler-level
     // access to every other private member of CandidateLease, including
@@ -344,6 +346,17 @@ private:
     // the same SealExportStartedWire wire shape.
     LeaseReadResult read_seal_export_started(bool legacy_or_greenfield,
                                               std::span<std::byte, kSealExportStartedWireBytes> out) noexcept;
+    // Round E Reserved->StartedPublished (docs/SPEC_INVARIANTS.md's
+    // "Seal-journal Round E Reserved->StartedPublished (NativeV2Started)"
+    // entry): CREATE_NEW only, same discipline as every other write method
+    // here -- no REPLACE variant exists for this file (L is written exactly
+    // once, at StartedPublished; PostSeal/Abandon cleanup, which would
+    // eventually unlink it, is out of scope for this round and this repo).
+    // legacy_or_greenfield selects the filename only, same parameter as the
+    // read method above -- this round always passes true (greenfield;
+    // MigratedV2Started's legacy-companion write path is deferred).
+    LeaseWriteResult create_seal_export_started_no_replace(
+        bool legacy_or_greenfield, std::span<const std::byte, kSealExportStartedWireBytes> encoded_started) noexcept;
     LeaseReadResult read_seal_export_started_migration(
         std::span<std::byte, kSealExportStartedMigrationWireBytes> out) noexcept;
     LeaseReadResult read_seal_started_cleanup_tombstone(
@@ -919,6 +932,21 @@ inline LeaseReadResult CandidateLease::read_seal_export_started(
     result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
 #else
     result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseWriteResult CandidateLease::create_seal_export_started_no_replace(
+    bool legacy_or_greenfield, std::span<const std::byte, kSealExportStartedWireBytes> encoded_started) noexcept {
+    LeaseWriteResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_export_started(legacy_or_greenfield);
+#ifdef _WIN32
+    result.publish = compaction_detail::write_validated_no_replace_win(dir_handle_, name, encoded_started);
+#else
+    result.publish = compaction_detail::write_validated_no_replace(dir_fd_, name, encoded_started);
 #endif
     return result;
 }
