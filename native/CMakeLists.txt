@@ -76,6 +76,15 @@ add_executable(seal_journal_cross_file_audit src/seal_journal_cross_file_audit.c
 target_link_libraries(seal_journal_cross_file_audit PRIVATE hengyuan_core)
 hengyuan_set_warnings(seal_journal_cross_file_audit)
 
+# --- Per-store .jhw/.jts overview tool (diagnostic; deliberately NOT a
+# production code path -- no lease acquisition, plain directory_iterator +
+# ifstream). Lists every candidate's commit watermark + tombstones in one
+# seal-journal/<store_uuid>/ directory. No --self-check mode, so no ctest
+# registration.
+add_executable(seal_journal_store_dump src/seal_journal_store_dump.cpp)
+target_link_libraries(seal_journal_store_dump PRIVATE hengyuan_core)
+hengyuan_set_warnings(seal_journal_store_dump)
+
 # --- Binance feed demo (optional, requires Boost + OpenSSL) ---
 option(HY_BUILD_DEMO "Build binance_feed_demo (requires Boost + OpenSSL)" OFF)
 
