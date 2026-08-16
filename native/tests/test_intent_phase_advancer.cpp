@@ -69,6 +69,35 @@ GenesisRequest make_request(std::uint32_t kek_key_id, std::uint64_t build_nonce)
     return req;
 }
 
+// A SealExportStartedWire whose bound fields match make_request()'s fixed
+// constants (store_uuid/source_generation=3/target_generation=4/
+// baseline_tip_seq=999/baseline_tip_mac=0xAB fill/baseline_key_id=kek_key_id)
+// -- the caller-supplied fields raise_started_published() checks (not
+// derives) at its Step 2. candidate_id/request_id are the caller's, since
+// those are the ids raise_intent_phase() already bound at Reserved.
+SealExportStartedWire make_started(std::uint32_t kek_key_id, std::uint64_t candidate_id, std::uint64_t request_id) {
+    SealExportStartedWire v{};
+    v.store_uuid_lo = 0x1111111111111111ULL;
+    v.store_uuid_hi = 0x2222222222222222ULL;
+    v.candidate_id = candidate_id;
+    v.source_generation = 3;
+    v.baseline_tip_seq = 999;
+    for (auto& b : v.baseline_tip_mac) b = std::uint8_t{0xAB};
+    v.baseline_key_id = kek_key_id;
+    v.new_generation = 4;  // == make_request()'s target_generation
+    v.new_final_seq = 555;
+    for (auto& b : v.new_final_tip_mac) b = std::uint8_t{0xCD};
+    v.new_key_id = kek_key_id;
+    v.request_id = request_id;
+    for (auto& b : v.content_root) b = std::uint8_t{0xEF};
+    v.kek_key_id = kek_key_id;
+    v.registered_producer_mask = 0b00000011;
+    v.producer_count = 2;
+    v.ring_id[0] = 101;
+    v.ring_id[1] = 102;
+    return v;
+}
+
 // Plants a durable SealIdWatermark file directly (bypassing CandidateLease --
 // used to set up a specific pre-existing state; raise_intent_phase() itself
 // is the only production-shaped writer of this file, see this file's header
@@ -403,4 +432,170 @@ TEST(IntentPhaseAdvancer, RefusesWithoutSealJournalStoreLease) {
     IntentPhaseAdvancer advancer(lease, seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::SealJournalStoreLeaseNotHeld);
     ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+}
+
+// ---------------------------------------------------------------------------
+// raise_started_published(): Reserved->StartedPublished (NativeV2Started).
+// ---------------------------------------------------------------------------
+
+TEST(IntentPhaseAdvancer, RaisesReservedToStartedPublishedWithValidStarted) {
+    Fixture fx("started_ok");
+    constexpr std::uint64_t kBuildNonce = 0x424242ULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(/*candidate_id=*/3, /*request_id=*/6);
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+
+    const SealExportStartedWire started = make_started(fx.kek_key_id, /*candidate_id=*/3, /*request_id=*/6);
+    EXPECT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::PhaseRaised);
+
+    const auto x1_seq2_name = compaction_detail::ValidatedArtifactName::for_x1(kBuildNonce, /*transition_seq=*/2);
+    EXPECT_TRUE(std::filesystem::exists(fx.dir / x1_seq2_name.relative_name()))
+        << "the `.x1` seq=2 evidence must be durable once raise_started_published() reports success";
+
+    SealExportStartedLoader started_loader(leases.candidate_lease);
+    SealExportStartedWire loaded_started{};
+    ASSERT_EQ(started_loader.load(/*legacy_or_greenfield=*/true, fx.ring, loaded_started), LoadStatus::Ok);
+    EXPECT_EQ(loaded_started.candidate_id, 3u);
+    EXPECT_EQ(loaded_started.request_id, 6u);
+    EXPECT_EQ(loaded_started.new_generation, 4u);
+
+    leases.release();
+
+    IntentStore verify_store(fx.dir, fx.ring);
+    ASSERT_EQ(verify_store.acquire_lease(), LeaseAcquireStatus::Acquired);
+    CompactionCandidateIntentWire loaded{};
+    ASSERT_EQ(verify_store.load_and_validate_intent(loaded), LoadStatus::Ok);
+    EXPECT_EQ(loaded.phase, kCompactionCandidateIntentPhaseStartedPublished);
+    EXPECT_EQ(loaded.candidate_id, 3u);
+    EXPECT_EQ(loaded.request_id, 6u);
+    ASSERT_EQ(verify_store.release_lease(), ReleaseStatus::Released);
+}
+
+TEST(IntentPhaseAdvancer, RetryAfterStartedPublishedSuccessReturnsAlreadyAtOrPastTargetPhase) {
+    Fixture fx("started_retry_already_past");
+    constexpr std::uint64_t kBuildNonce = 0x5151ULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(1, 1);
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+
+    const SealExportStartedWire started = make_started(fx.kek_key_id, 1, 1);
+    ASSERT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::PhaseRaised);
+    // Second call, same instance -- must not attempt a second `.x1` seq=2
+    // write (that would collide) and must not error.
+    EXPECT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::AlreadyAtOrPastTargetPhase);
+    leases.release();
+}
+
+TEST(IntentPhaseAdvancer, RefusesStartedPublishedWhileStillBuilding) {
+    Fixture fx("started_still_building");
+    constexpr std::uint64_t kBuildNonce = 0x62ULL;
+    fx.create_building_genesis(kBuildNonce);
+    // Deliberately never calls raise_intent_phase() -- Intent is still Building.
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    const SealExportStartedWire started = make_started(fx.kek_key_id, /*candidate_id=*/1, /*request_id=*/1);
+    EXPECT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::IllegalTransition);
+    leases.release();
+}
+
+TEST(IntentPhaseAdvancer, RefusesStartedForeignBinding) {
+    Fixture fx("started_foreign_binding");
+    constexpr std::uint64_t kBuildNonce = 0x73ULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(/*candidate_id=*/9, /*request_id=*/10);
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+
+    // candidate_id doesn't match the Intent's own bound candidate_id (9).
+    SealExportStartedWire started = make_started(fx.kek_key_id, /*candidate_id=*/999, /*request_id=*/10);
+    EXPECT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::StartedForeignBinding);
+    leases.release();
+}
+
+TEST(IntentPhaseAdvancer, RefusesStartedShapeInvalid) {
+    Fixture fx("started_shape_invalid");
+    constexpr std::uint64_t kBuildNonce = 0x84ULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(/*candidate_id=*/2, /*request_id=*/4);
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+
+    SealExportStartedWire started = make_started(fx.kek_key_id, /*candidate_id=*/2, /*request_id=*/4);
+    started.registered_producer_mask = 0;  // topology self-consistency violation.
+    started.producer_count = 0;
+    started.ring_id[0] = 0;
+    started.ring_id[1] = 0;
+    EXPECT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::StartedShapeInvalid);
+    leases.release();
+}
+
+TEST(IntentPhaseAdvancer, RefusesStartedPublishedForeignBuildNonce) {
+    Fixture fx("started_foreign_nonce");
+    constexpr std::uint64_t kBuildNonce = 0x95ULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(1, 1);
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+
+    const SealExportStartedWire started = make_started(fx.kek_key_id, 1, 1);
+    EXPECT_EQ(advancer.raise_started_published(/*build_nonce=*/0x9999ULL, started), PhaseAdvanceStatus::ForeignBuildNonce);
+    leases.release();
+}
+
+TEST(IntentPhaseAdvancer, RefusesStartedPublishedWhenSeqOneX1Missing) {
+    Fixture fx("started_seq1_missing");
+    constexpr std::uint64_t kBuildNonce = 0xA6ULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(1, 1);
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+
+    // Out-of-band tampering: seq=1 `.x1` removed even though the Intent is
+    // durably Reserved -- SeqOneX1NotFound, not a silent skip.
+    const auto x1_seq1_name = compaction_detail::ValidatedArtifactName::for_x1(kBuildNonce, /*transition_seq=*/1);
+    std::filesystem::remove(fx.dir / x1_seq1_name.relative_name());
+
+    const SealExportStartedWire started = make_started(fx.kek_key_id, 1, 1);
+    EXPECT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::SeqOneX1NotFound);
+    leases.release();
+}
+
+TEST(IntentPhaseAdvancer, RefusesStartedPublishedWhenSeqOneX1Corrupt) {
+    Fixture fx("started_seq1_corrupt");
+    constexpr std::uint64_t kBuildNonce = 0xB7ULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(1, 1);
+
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
+    ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
+
+    // Out-of-band tampering: overwrite the durable seq=1 `.x1` frame with
+    // bytes that fail decode (wrong format_version) -- MAC/decode failure,
+    // not a WrongSize/NotFound case.
+    const auto x1_seq1_name = compaction_detail::ValidatedArtifactName::for_x1(kBuildNonce, /*transition_seq=*/1);
+    {
+        std::vector<char> corrupt_bytes(kCompactionIntentTransitionWireBytes, 'Z');
+        std::ofstream corrupt(fx.dir / x1_seq1_name.relative_name(), std::ios::binary | std::ios::trunc);
+        corrupt.write(corrupt_bytes.data(), static_cast<std::streamsize>(corrupt_bytes.size()));
+    }
+
+    const SealExportStartedWire started = make_started(fx.kek_key_id, 1, 1);
+    EXPECT_EQ(advancer.raise_started_published(kBuildNonce, started), PhaseAdvanceStatus::SeqOneX1Corrupt);
+    leases.release();
 }
