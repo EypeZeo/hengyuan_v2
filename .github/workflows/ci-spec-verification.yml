@@ -276,8 +276,10 @@ jobs:
         continue-on-error: true
         working-directory: formal
         run: |
+          # DELIBERATE SABOTAGE for the continue-on-error verification test --
+          # must be reverted before this branch is merged.
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
-            -workers auto -config RoundDActual.cfg RoundDActual.tla
+            -workers auto -config RoundDActual_DOES_NOT_EXIST.cfg RoundDActual.tla
 
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config RoundDActual_liveness.cfg RoundDActual.tla
