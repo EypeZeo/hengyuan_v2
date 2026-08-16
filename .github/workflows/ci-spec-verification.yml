@@ -11,6 +11,30 @@ name: CI Spec Verification
 #
 # Deliberately does NOT touch ci-native.yml — the two are independent and a
 # failure in one must not mask or block the other.
+#
+# Minutes optimization (2026-08-15): the 7 independent TLA+ models used to each
+# run in their own job (7 separate ubuntu-24.04 runners), each paying its own
+# checkout + setup-java + tla2tools.jar cache-restore overhead before running
+# what's often just a few seconds of real TLC work. GitHub Actions bills a
+# private repo's jobs in whole-minute increments rounded UP, so 7 jobs each
+# under a minute of real work still billed 7 separate ~1-minute floors on every
+# single triggering push/PR, against this repo's 2000-min/month budget. All 7
+# models share the identical toolchain (JDK 21 + the same tla2tools.jar) and
+# have zero runtime interaction with each other (each reads/writes only its own
+# uniquely-named .tla/.cfg/log files) — the only real requirement was never
+# "technical isolation," just "a failure in one model must not mask or block
+# another" at the REPORTING level. That's exactly what this file's own
+# "Controls" steps already do within a single model (loop over every config,
+# `fail=0` accumulator, never short-circuit on the first failing config) — this
+# consolidation applies the identical pattern one level up, across models
+# instead of across configs within one model. spec-invariant-xref stays its own
+# job: different toolchain (Python, not JDK), already cheap, folding it in
+# would only entangle two unrelated toolchains for zero billing benefit.
+#
+# Tradeoff, stated honestly: wall-clock latency per PR goes UP (7 models now
+# run sequentially within one job instead of in parallel across 7 runners,
+# worst case sums each model's timeout instead of taking the max) while billed
+# minutes go DOWN, which is the actual constraint being optimized against here.
 
 permissions:
   contents: read
@@ -86,10 +110,14 @@ jobs:
       - name: Diff spec enum definitions against the real headers
         run: python tools/spec_enum_diff.py
 
-  tla-model-check:
-    name: "L3: TLA+ model checking"
+  tla-model-check-all:
+    name: "L3: TLA+ model checking (all models)"
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Sum-ceiling across 7 sequential models, was 7 x independent 20-min caps
+    # possible in parallel before this consolidation -- see this file's header
+    # comment for why billed minutes (not wall-clock) is the thing being
+    # optimized here.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -102,6 +130,7 @@ jobs:
 
       # tla2tools.jar is gitignored (a 2MB binary does not belong in the tree),
       # so CI fetches the pinned release the same way the local setup does.
+      # ONE fetch for all 7 models below, not 7.
       - name: Cache TLA+ tools
         id: cache-tla
         uses: actions/cache@v6
@@ -118,28 +147,35 @@ jobs:
           file formal/tools/tla2tools.jar | grep -q 'Java archive' \
             || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
 
-      # The current design must verify clean.
-      - name: "Safety: current design must find no violation"
+      # Each model below is `continue-on-error: true` so one model's failure
+      # does not skip the remaining models (identical intent to this file's
+      # own "Controls" steps: run everything, aggregate at the end). Each
+      # model's OWN internal safety->liveness->controls sequence still
+      # short-circuits on first failure within its own step (bash's default
+      # `set -e` for `run:` blocks) -- that is unchanged from before this
+      # consolidation, where a model's own Safety-step failure already skipped
+      # its own Liveness/Controls steps in the same job.
+
+      - name: "Model: durable_log_recovery (main design)"
+        id: m_durable_log_recovery
+        continue-on-error: true
         working-directory: formal
         run: |
+          # Safety: current design must find no violation.
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config durable_log_recovery.cfg durable_log_recovery.tla
 
-      # Progress property. Note this config intentionally has no CONSTRAINT
-      # (see formal/README.md) — do not "fix" it by adding one.
-      - name: "Liveness: EventualResolution must hold"
-        working-directory: formal
-        run: |
+          # Liveness: EventualResolution must hold. This config intentionally
+          # has no CONSTRAINT (see formal/README.md) -- do not "fix" it by
+          # adding one.
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config durable_log_recovery_liveness.cfg durable_log_recovery.tla
 
-      # These three MUST fail. TLC exits 12 on an invariant violation, so the
-      # check is inverted: a clean exit here means the model has stopped
-      # discriminating and every "no violation" result above is worth less.
-      # Without this inversion the regression controls would be decorative.
-      - name: "Controls: the three expected-to-fail configs must still fail"
-        working-directory: formal
-        run: |
+          # Controls: these three MUST fail. TLC exits 12 on an invariant
+          # violation, so the check is inverted: a clean exit here means the
+          # model has stopped discriminating and every "no violation" result
+          # above is worth less. Without this inversion the regression
+          # controls would be decorative.
           set -u
           fail=0
           for pair in \
@@ -167,67 +203,23 @@ jobs:
           done
           exit $fail
 
-  tla-model-check-freeze:
-    name: "L3: TLA+ model checking (freeze-episode slice, 轨道 C)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Separate job, not folded into tla-model-check: freeze_episode_recovery.tla
-    # is a second, independent model (see formal/README.md) -- a failure in one
-    # must not mask or block the other, same reasoning this workflow's own
-    # header gives for staying independent of ci-native.yml.
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Cache TLA+ tools
-        id: cache-tla
-        uses: actions/cache@v6
-        with:
-          path: formal/tools/tla2tools.jar
-          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
-
-      - name: Download TLA+ tools
-        if: steps.cache-tla.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p formal/tools
-          curl -sSfL -o formal/tools/tla2tools.jar \
-            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
-          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
-            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
-
-      - name: "Safety: current design must find no violation"
+      - name: "Model: freeze_episode_recovery (freeze-episode slice, 轨道 C)"
+        id: m_freeze
+        continue-on-error: true
         working-directory: formal
         run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config freeze_episode_recovery.cfg freeze_episode_recovery.tla
 
-      # Progress property. Note this config intentionally has no CONSTRAINT
-      # (see formal/README.md) -- do not "fix" it by adding one.
-      - name: "Liveness: EventualFreezeResolution must hold"
-        working-directory: formal
-        run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config freeze_episode_recovery_liveness.cfg freeze_episode_recovery.tla
 
-      # These three MUST fail -- same inversion discipline as tla-model-check's
-      # own controls step, applied to this model's two regression controls
-      # (round 30, round 31/32) plus its reachability probe.
-      - name: "Controls: the three expected-to-fail configs must still fail"
-        working-directory: formal
-        run: |
           set -u
           fail=0
           for pair in \
             "freeze_episode_recovery_wait_ok_bug.cfg|NoPrematureConservativeClear|round-30 forged WaitSatisfied Ack (sink trusts a caller-claimed wait instead of independently verifying)" \
             "freeze_episode_recovery_generation_bug.cfg|WaitSatisfiedOnlyForCurrentGeneration|round-31/32 legacy generation re-match (a stale generation's WaitSatisfied satisfies a newer one)" \
             "freeze_episode_recovery_probe.cfg|AbandonedArmUnreachable|abandoned-Arm-across-restart reachability probe"
-
           do
             cfg="${pair%%|*}"; rest="${pair#*|}"
             inv="${rest%%|*}"; desc="${rest#*|}"
@@ -249,66 +241,17 @@ jobs:
           done
           exit $fail
 
-  tla-model-check-inflight:
-    name: "L3: TLA+ model checking (in-flight slot lifecycle)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Third independent model (audit FORMAL-GAP-017). Its own job for the same
-    # reason the freeze-episode slice has one: a failure in one model must not mask
-    # or block another.
-    #
-    # WHY THIS MODEL EXISTS. formal/README.md's Scope section lists what
-    # durable_log_recovery.tla deliberately does not cover. The full-repo audit
-    # found real defects in three subsystems, and all three were on that list --
-    # while the two subsystems that DO have models came through the same review
-    # clean. This closes the highest-value gap of the three: the InFlightRegistry
-    # slot lifecycle, where an Accepted order had no route to a terminal state and
-    # 64 of them fail-closed every subsequent submit (EXEC-INFLIGHT-003).
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Cache TLA+ tools
-        id: cache-tla
-        uses: actions/cache@v6
-        with:
-          path: formal/tools/tla2tools.jar
-          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
-
-      - name: Download TLA+ tools
-        if: steps.cache-tla.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p formal/tools
-          curl -sSfL -o formal/tools/tla2tools.jar \
-            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
-          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
-            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
-
-      - name: "Safety: current design must find no violation"
+      - name: "Model: inflight_lifecycle (in-flight slot lifecycle, EXEC-INFLIGHT-003)"
+        id: m_inflight
+        continue-on-error: true
         working-directory: formal
         run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config inflight_lifecycle.cfg inflight_lifecycle.tla
 
-      # Progress property. Note this config intentionally has no CONSTRAINT
-      # (see formal/README.md) -- do not "fix" it by adding one.
-      - name: "Liveness: EventualSlotRelease must hold"
-        working-directory: formal
-        run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config inflight_lifecycle_liveness.cfg inflight_lifecycle.tla
 
-      # MUST fail. Same inversion discipline as the other two models' controls:
-      # without it, "no violation" above would be unsubstantiated.
-      - name: "Control: the expected-to-fail config must still fail"
-        working-directory: formal
-        run: |
           set -u
           cfg=inflight_lifecycle_untracked_bug.cfg
           inv=NoLiveOrderIsUntracked
@@ -328,66 +271,17 @@ jobs:
           echo "  OK: $inv violated as expected"
           echo "::endgroup::"
 
-  tla-model-check-roundd:
-    name: "L3: TLA+ model checking (Round D CandidateLease/IntentStore)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Fourth independent model. Its own job for the same reason every other model
-    # here has one: a failure in one must not mask or block another.
-    #
-    # WHY THIS MODEL EXISTS. Models the REAL, shipped Round D API (compaction_
-    # lease.hpp, compaction_intent_store.hpp -- docs/SPEC_INVARIANTS.md's
-    # "Seal-journal Round D" entry), not a generic file-lease design. Six external
-    # Architect reviews rejected five successive designs before the shipped one;
-    # three of those findings are safety properties with a real counterexample in
-    # an earlier design, which is why this is the first model in this file with
-    # THREE regression controls instead of one.
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Cache TLA+ tools
-        id: cache-tla
-        uses: actions/cache@v6
-        with:
-          path: formal/tools/tla2tools.jar
-          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
-
-      - name: Download TLA+ tools
-        if: steps.cache-tla.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p formal/tools
-          curl -sSfL -o formal/tools/tla2tools.jar \
-            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
-          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
-            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
-
-      - name: "Safety: current (shipped) design must find no violation"
+      - name: "Model: RoundDActual (Round D CandidateLease/IntentStore)"
+        id: m_roundd
+        continue-on-error: true
         working-directory: formal
         run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config RoundDActual.cfg RoundDActual.tla
 
-      - name: "Liveness: EventualResolution must hold"
-        working-directory: formal
-        run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config RoundDActual_liveness.cfg RoundDActual.tla
 
-      # All three MUST fail -- same inversion discipline as every other model's
-      # control(s) in this file. Each reintroduces one design REJECTED by a real
-      # Architect review round (see compaction_lease.hpp's own top-of-file
-      # comment and formal/README.md's RoundDActual.tla section for the full
-      # history each one is tied to).
-      - name: "Controls: the three expected-to-fail configs must still fail"
-        working-directory: formal
-        run: |
           set -u
           declare -a controls=(
             "RoundDActual_v3bug.cfg|NeverWritesIntoWrongObject|review v3: path-based (not handle-relative) I/O -- TOCTOU lets a write land in a renamed-in directory"
@@ -413,115 +307,33 @@ jobs:
             echo "::endgroup::"
           done
 
-  tla-model-check-roundef:
-    name: "L3: TLA+ model checking (Round E/F future .x1/.xgc design)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Fifth independent model, and the only one in this file with NO regression
-    # control -- see RoundEFDesign.tla's own header and formal/README.md's
-    # section for why: it formalizes rules that already exist as real, tested
-    # pure functions in compaction_intent_codec.hpp, but for which no production
-    # write path exists anywhere in this codebase yet. There is no historical
-    # incident to regress against.
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Cache TLA+ tools
-        id: cache-tla
-        uses: actions/cache@v6
-        with:
-          path: formal/tools/tla2tools.jar
-          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
-
-      - name: Download TLA+ tools
-        if: steps.cache-tla.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p formal/tools
-          curl -sSfL -o formal/tools/tla2tools.jar \
-            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
-          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
-            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
-
-      - name: "Safety: no violation expected"
+      - name: "Model: RoundEFDesign (Round E/F future .x1/.xgc design)"
+        id: m_roundef
+        continue-on-error: true
         working-directory: formal
+        # No regression control -- see RoundEFDesign.tla's own header and
+        # formal/README.md's section for why: it formalizes rules that already
+        # exist as real, tested pure functions in compaction_intent_codec.hpp,
+        # but for which no production write path exists anywhere in this
+        # codebase yet. There is no historical incident to regress against.
         run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config RoundEFDesign.cfg RoundEFDesign.tla
 
-      - name: "Liveness: EventuallyTerminal must hold"
-        working-directory: formal
-        run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config RoundEFDesign_liveness.cfg RoundEFDesign.tla
 
-  tla-model-check-keyrotation:
-    name: "L3: TLA+ model checking (two-step key rotation, KEY-ROTATE-008)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Sixth independent model. Its own job for the same reason every other model
-    # here has one: a failure in one must not mask or block another.
-    #
-    # WHY THIS MODEL EXISTS. Closes the second gap from the full-repo audit's
-    # findings (the first being inflight_lifecycle.tla, the third being
-    # depth_snapshot_bootstrap.tla below): rotate_active_key() is a two-step
-    # DURABLE protocol (sidecar KeyRotated record + main-tip re-anchor), and a
-    # crash between the two steps leaves on-disk state that recovery must tell
-    # apart from an unauthorized identity swap -- the (a)(b)(c) sidecar-proof
-    # gate at durable_audit_sink.hpp:843-847. The regression control
-    # reinstates the simpler wrong protocol (re-anchor on any anchor-key
-    # mismatch, ignore the sidecar) and MUST violate RepairOnlyOnProvenMismatch.
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Cache TLA+ tools
-        id: cache-tla
-        uses: actions/cache@v6
-        with:
-          path: formal/tools/tla2tools.jar
-          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
-
-      - name: Download TLA+ tools
-        if: steps.cache-tla.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p formal/tools
-          curl -sSfL -o formal/tools/tla2tools.jar \
-            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
-          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
-            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
-
-      - name: "Safety: current design must find no violation"
+      - name: "Model: key_rotation (two-step key rotation, KEY-ROTATE-008)"
+        id: m_keyrotation
+        continue-on-error: true
         working-directory: formal
         run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config key_rotation.cfg key_rotation.tla
 
-      # Progress property. Note this config intentionally has no CONSTRAINT
-      # (see formal/README.md) -- do not "fix" it by adding one.
-      - name: "Liveness: EventualConsistencyOrFenced must hold"
-        working-directory: formal
-        run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config key_rotation_liveness.cfg key_rotation.tla
 
-      # MUST fail. Same inversion discipline as every other model's control(s)
-      # in this file: without it, "no violation" above would be unsubstantiated.
-      - name: "Control: the expected-to-fail config must still fail"
-        working-directory: formal
-        run: |
           set -u
           cfg=key_rotation_onestep_bug.cfg
           inv=RepairOnlyOnProvenMismatch
@@ -541,68 +353,17 @@ jobs:
           echo "  OK: $inv violated as expected"
           echo "::endgroup::"
 
-  tla-model-check-depthsnapshot:
-    name: "L3: TLA+ model checking (depth snapshot bootstrap, MD-BOOK-002)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # Seventh independent model. Its own job for the same reason every other
-    # model here has one: a failure in one must not mask or block another.
-    #
-    # WHY THIS MODEL EXISTS. Closes the third gap from the full-repo audit's
-    # findings: the DepthManager bootstrap state machine (depth_manager.hpp) --
-    # snapshot lastUpdateId vs the U/u windows of WS depthUpdate events,
-    # buffered replay, overflow fail-closed, bridge check, Tracking gap
-    # detection. THREE regression controls, one per real protection mechanism
-    # disabled: drop-before-snapshot, overflow-still-tracks, bridge-check
-    # disabled -- each MUST violate its designated invariant.
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up JDK
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Cache TLA+ tools
-        id: cache-tla
-        uses: actions/cache@v6
-        with:
-          path: formal/tools/tla2tools.jar
-          key: tla2tools-${{ env.TLA_TOOLS_VERSION }}
-
-      - name: Download TLA+ tools
-        if: steps.cache-tla.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p formal/tools
-          curl -sSfL -o formal/tools/tla2tools.jar \
-            "https://github.com/tlaplus/tlaplus/releases/download/${TLA_TOOLS_VERSION}/tla2tools.jar"
-          file formal/tools/tla2tools.jar | grep -q 'Java archive' \
-            || { echo "::error::downloaded file is not a JAR (release asset moved or network interception?)"; exit 1; }
-
-      - name: "Safety: current design must find no violation"
+      - name: "Model: depth_snapshot_bootstrap (MD-BOOK-002)"
+        id: m_depthsnapshot
+        continue-on-error: true
         working-directory: formal
         run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config depth_snapshot_bootstrap.cfg depth_snapshot_bootstrap.tla
 
-      # Progress property. Note this config intentionally has no CONSTRAINT
-      # (see formal/README.md) -- do not "fix" it by adding one.
-      - name: "Liveness: EventualBootstrap must hold"
-        working-directory: formal
-        run: |
           java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
             -workers auto -config depth_snapshot_bootstrap_liveness.cfg depth_snapshot_bootstrap.tla
 
-      # All three MUST fail -- same inversion discipline as every other model's
-      # control(s) in this file. Each reintroduces one real protection
-      # mechanism of depth_manager.hpp being disabled; if any stops failing,
-      # the model has stopped discriminating it and the safety runs above are
-      # worth correspondingly less.
-      - name: "Controls: the three expected-to-fail configs must still fail"
-        working-directory: formal
-        run: |
           set -u
           fail=0
           for pair in \
@@ -628,4 +389,23 @@ jobs:
             fi
             echo "::endgroup::"
           done
+          exit $fail
+
+      # Aggregate: turns any individual model's failure into an overall job
+      # failure. `if: always()` so this runs even though every model step
+      # above is `continue-on-error: true`. Each model's own pass/fail is
+      # still independently visible as its own named step in the GitHub UI
+      # (a red X on that specific step) -- this step only decides the job's
+      # own final status, it does not hide which model(s) failed.
+      - name: "Aggregate: fail the job iff any model failed"
+        if: always()
+        run: |
+          fail=0
+          [ "${{ steps.m_durable_log_recovery.outcome }}" = "failure" ] && { echo "::error::durable_log_recovery failed"; fail=1; }
+          [ "${{ steps.m_freeze.outcome }}" = "failure" ] && { echo "::error::freeze_episode_recovery failed"; fail=1; }
+          [ "${{ steps.m_inflight.outcome }}" = "failure" ] && { echo "::error::inflight_lifecycle failed"; fail=1; }
+          [ "${{ steps.m_roundd.outcome }}" = "failure" ] && { echo "::error::RoundDActual failed"; fail=1; }
+          [ "${{ steps.m_roundef.outcome }}" = "failure" ] && { echo "::error::RoundEFDesign failed"; fail=1; }
+          [ "${{ steps.m_keyrotation.outcome }}" = "failure" ] && { echo "::error::key_rotation failed"; fail=1; }
+          [ "${{ steps.m_depthsnapshot.outcome }}" = "failure" ] && { echo "::error::depth_snapshot_bootstrap failed"; fail=1; }
           exit $fail
