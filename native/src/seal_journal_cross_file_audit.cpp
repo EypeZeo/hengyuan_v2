@@ -25,11 +25,13 @@
 //   seal-export-started (L), seal-export-started.v2 (V),
 //   seal-export-started.mig (M), seal-export-started.clr (C),
 //   seal-export-started.abd (A)
-// The seal-journal/<store>/ commit-watermark/tombstone family (a different
-// directory scope and lease) and the GenerationSeal/bridge artifact (not
-// implemented in this repo) are out of scope; rules whose source annotation
-// references bridge.prev_* are enforced only as equality between the two
-// carriers that must both equal it (Intent and Started).
+// plus the eighth artifact, the SealJournalCommitWatermark
+// (<candidate_id_hex16>.jhw), which lives in a DIFFERENT directory scope
+// (seal-journal/<store_uuid>/ — see scan_seal_journal_store() and the CLI's
+// --seal-journal-dir). The GenerationSeal/bridge artifact (not implemented
+// in this repo) is out of scope; rules whose source annotation references
+// bridge.prev_* are enforced only as equality between the two carriers that
+// must both equal it (Intent and Started).
 //
 // CRYPTOGRAPHY CAVEAT: fixtures are MAC'd under this tool's OWN deterministic
 // test key (HY-AUDIT-FIXTURE-KEK-1), never under production key material.
@@ -42,8 +44,15 @@
 //   seal_journal_cross_file_audit [--self-check]              (default)
 //   seal_journal_cross_file_audit --gen <dir> [--scenario success|abandon|native]
 //                                [--inject <rule-id>] [--kek-hex <64hex>]
+//                                [--seal-journal-dir <dir>]
 //   seal_journal_cross_file_audit --audit <dir> [--kek-hex <64hex>]
+//                                [--seal-journal-dir <dir>]
 //   seal_journal_cross_file_audit --list-rules
+//
+// --seal-journal-dir points at the seal-journal/<store_uuid>/ directory
+// holding <candidate_id_hex16>.jhw; defaults to <dir>/seal-journal (the
+// layout --gen writes). Without a scannable .jhw every JHW.* rule reports
+// N/A.
 //
 // --self-check: for every rule, builds a fixture directory in the temp
 // directory with exactly that rule's field tampered (all files still
@@ -58,6 +67,7 @@
 #include <hengyuan/durable_control_plane.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/seal_export_migration_cleanup_abandon_codec.hpp>
+#include <hengyuan/seal_journal_commit_tombstone_codec.hpp>
 #include <hengyuan/seal_journal_precondition_codec.hpp>
 #include <hengyuan/sha256.hpp>
 
@@ -122,6 +132,11 @@ constexpr std::string_view kVName = "seal-export-started.v2";     // V
 constexpr std::string_view kMName = "seal-export-started.mig";    // M
 constexpr std::string_view kCName = "seal-export-started.clr";    // C
 constexpr std::string_view kAName = "seal-export-started.abd";    // A
+// The .jhw commit watermark lives under seal-journal/<store_uuid>/, NOT the
+// breadcrumb directory -- fixtures keep one store per breadcrumb dir, so the
+// store_uuid path component is collapsed (it adds no discriminating power to
+// the rule table).
+constexpr std::string_view kSealJournalDirName = "seal-journal";
 
 // Mirrors compaction_breadcrumb_io.hpp's format_hex16() (the tool duplicates
 // the 6-line formatter rather than pulling in the Windows-native I/O header).
@@ -140,6 +155,15 @@ std::string x1_file_name(std::uint64_t build_nonce, std::uint32_t seq) {
     format_hex16(build_nonce, nonce_hex);
     format_hex16(static_cast<std::uint64_t>(seq), seq_hex);
     return std::string("compaction-intent-x-") + nonce_hex.data() + "-" + seq_hex.data() + ".x1";
+}
+
+// <candidate_id_hex16>.jhw -- the SealJournalCommitWatermark file name is the
+// candidate_id it binds (durable_control_plane.hpp's SealJournalCommitWatermark
+// comment: seal-journal/<store_uuid...>/<candidate_id_hex16>.jhw).
+std::string jhw_file_name(std::uint64_t candidate_id) {
+    std::array<char, 17> id_hex{};
+    format_hex16(candidate_id, id_hex);
+    return std::string(id_hex.data()) + ".jhw";
 }
 
 void fill_arr(std::uint8_t (&arr)[32], std::uint8_t seed) {
@@ -223,6 +247,9 @@ struct BreadcrumbSet {
     SealStartedCleanupTombstoneWire c_wire{};
     FileRef a{};
     SealStartedAbandonWire a_wire{};
+    FileRef jhw{};
+    SealJournalCommitWatermark jhw_wire{};
+    std::string jhw_file_name{};  // resolved <candidate_id_hex16>.jhw, or empty
 };
 
 // Decode wrappers: return "" on success, else a short reason. The watermark
@@ -313,6 +340,19 @@ const char* decode_abandon(const std::array<std::byte, kSealStartedAbandonWireBy
     std::optional<VerifiedSealStartedAbandon> verified;
     const auto st = decode_seal_started_abandon_wire(raw, pin.handle->key_bytes(), verified);
     if (st != SealStartedWireDecodeStatus::Ok) return "decode failed";
+    out = verified->value();
+    return "";
+}
+
+const char* decode_jhw(const std::array<std::byte, kSealJournalCommitWatermarkWireBytes>& raw, KeyRing& ring,
+                       SealJournalCommitWatermark& out) noexcept {
+    std::uint32_t key_id = 0;
+    if (!peek_seal_journal_commit_watermark_kek_key_id(raw, key_id)) return "peek failed";
+    const PinResult pin = ring.pin_key(key_id);
+    if (pin.status != PinStatus::Pinned) return "key not in ring";
+    std::optional<VerifiedSealJournalCommitWatermark> verified;
+    const auto st = decode_seal_journal_commit_watermark_wire(raw, pin.handle->key_bytes(), verified);
+    if (st != SealJournalCommitTombstoneDecodeStatus::Ok) return "decode failed";
     out = verified->value();
     return "";
 }
@@ -423,6 +463,55 @@ BreadcrumbSet scan_directory(const std::filesystem::path& dir, KeyRing& ring) {
     return s;
 }
 
+// Scans the seal-journal/<store_uuid>/ directory (a DIFFERENT directory scope
+// than the breadcrumb dir scan_directory() walks -- SealJournalStoreLease, not
+// CandidateLease) for the single <candidate_id_hex16>.jhw commit watermark.
+struct SealJournalScanResult {
+    FileRef jhw{};
+    SealJournalCommitWatermark jhw_wire{};
+    std::string jhw_file_name{};  // resolved <candidate_id_hex16>.jhw, or empty
+};
+
+// candidate_id selects WHICH .jhw to read (the file name IS the candidate_id
+// it binds, durable_control_plane.hpp); 0 = no selection available (Intent
+// undecodable) and the .jhw is reported as absent. A store holding several
+// .jhw files is legal (one per candidate); this tool audits the one for the
+// candidate the breadcrumb directory's Intent names.
+SealJournalScanResult scan_seal_journal_store(const std::filesystem::path& dir, std::uint64_t candidate_id,
+                                              KeyRing& ring) {
+    SealJournalScanResult out{};
+    if (candidate_id == 0) {
+        out.jhw.note = "no Intent candidate_id to select a .jhw file";
+        return out;
+    }
+    out.jhw_file_name = jhw_file_name(candidate_id);
+
+    std::array<std::byte, kSealJournalCommitWatermarkWireBytes> jhw_raw{};
+    const auto jhw_read = read_file_exact(dir, out.jhw_file_name, jhw_raw);
+    if (jhw_read == FileReadStatus::Ok) {
+        fill_file_ref(out.jhw, jhw_raw);
+        const char* why = decode_jhw(jhw_raw, ring, out.jhw_wire);
+        out.jhw.decoded = (why[0] == '\0');
+        out.jhw.note = out.jhw.decoded ? "ok" : why;
+    } else {
+        out.jhw.note = (jhw_read == FileReadStatus::NotFound) ? "absent" : "unreadable";
+    }
+    return out;
+}
+
+// Breadcrumb dir scan + separate seal-journal store scan merged into one set
+// (the .jhw rules live in the same single rule table as everything else).
+BreadcrumbSet scan_with_seal_journal(const std::filesystem::path& breadcrumb_dir,
+                                     const std::filesystem::path& seal_journal_dir, KeyRing& ring) {
+    BreadcrumbSet s = scan_directory(breadcrumb_dir, ring);
+    const std::uint64_t hint = (s.intent.present && s.intent.decoded) ? s.intent_wire.candidate_id : 0;
+    const SealJournalScanResult jhw_scan = scan_seal_journal_store(seal_journal_dir, hint, ring);
+    s.jhw = jhw_scan.jhw;
+    s.jhw_wire = jhw_scan.jhw_wire;
+    s.jhw_file_name = jhw_scan.jhw_file_name;
+    return s;
+}
+
 // ===========================================================================
 // Rule table — every MUST-equal cross-file rule, with its source annotation
 // ===========================================================================
@@ -493,7 +582,7 @@ RuleResult check_field_vs_file_sha(const FileRef& wire_file, std::string_view wi
     return rule_violated("digest differs from file bytes");
 }
 
-// Builds the full rule list (92 rules). Per-frame x1 rules are appended for
+// Builds the full rule list (97 rules). Per-frame x1 rules are appended for
 // each frame index 0..2; their evals N/A themselves when that frame is absent.
 std::vector<Rule> build_rules() {
     std::vector<Rule> rules;
@@ -937,6 +1026,62 @@ std::vector<Rule> build_rules() {
                          return rule_violated("terminal branch conflicts with Intent.phase");
                      }});
 
+    // ---- .jhw (SealJournalCommitWatermark) bindings ----
+    // Source: intent_phase_advancer.hpp Step 1b (the real write code) --
+    // jhw.store_uuid_lo/hi = before.store_uuid_lo/hi (the Intent's),
+    // jhw.candidate_id = candidate_id (the id just bound to the Intent by the
+    // watermark advance), jhw.highest_committed_journal_seq = 0,
+    // jhw.kek_key_id = before.kek_key_id (the INTENT's own key -- the L
+    // record does not exist yet at this advance step, so no L-side rule).
+    // Source annotations for the struct fields: durable_control_plane.hpp
+    // SealJournalCommitWatermark.
+    rules.push_back({"JHW.store_uuid_lo==Intent.store_uuid_lo", "jhw must be for the Intent's store (lo)", 0,
+                     [](const BreadcrumbSet& s, std::size_t) noexcept {
+                         return check_pair(s.jhw, "JHW", s.jhw_wire.store_uuid_lo, s.intent, "Intent",
+                                           s.intent_wire.store_uuid_lo);
+                     }});
+    rules.push_back({"JHW.store_uuid_hi==Intent.store_uuid_hi", "jhw must be for the Intent's store (hi)", 0,
+                     [](const BreadcrumbSet& s, std::size_t) noexcept {
+                         return check_pair(s.jhw, "JHW", s.jhw_wire.store_uuid_hi, s.intent, "Intent",
+                                           s.intent_wire.store_uuid_hi);
+                     }});
+    rules.push_back({"JHW.candidate_id==Intent.candidate_id", "jhw must bind the Intent's candidate_id", 0,
+                     [](const BreadcrumbSet& s, std::size_t) noexcept {
+                         if (!s.intent.present) return rule_unverifiable("Intent absent");
+                         if (!s.jhw.present) return rule_unverifiable("JHW absent");
+                         if (!s.intent.decoded) return rule_unverifiable("Intent not decodable");
+                         if (!s.jhw.decoded) return rule_unverifiable("JHW not decodable");
+                         if (s.intent_wire.phase < kCompactionCandidateIntentPhaseReserved) {
+                             return rule_unverifiable("Intent.phase < Reserved: ids not yet bound");
+                         }
+                         if (s.intent_wire.candidate_id == s.jhw_wire.candidate_id) return rule_verified();
+                         return rule_violated("candidate_id differs");
+                     }});
+    rules.push_back({"JHW.kek_key_id==Intent.kek_key_id", "jhw must be MAC'd under the Intent's own KEK", 0,
+                     [](const BreadcrumbSet& s, std::size_t) noexcept {
+                         return check_pair(s.jhw, "JHW", s.jhw_wire.kek_key_id, s.intent, "Intent",
+                                           s.intent_wire.kek_key_id);
+                     }});
+    // STRICT equality, deliberately NOT the `<` interval inequality the
+    // existing L/Intent-vs-WM rules use: .jhw's candidate_id binds the exact
+    // next_candidate_id value the watermark advance consumed for this Intent,
+    // so after the advance it must be exactly WM.next_candidate_id - 1.
+    rules.push_back({"JHW.candidate_id+1==WM.next_candidate_id",
+                     "jhw binds the exact id the watermark advance consumed", 0,
+                     [](const BreadcrumbSet& s, std::size_t) noexcept {
+                         if (!s.jhw.present) return rule_unverifiable("JHW absent");
+                         if (!s.wm.present) return rule_unverifiable("WM absent");
+                         if (!s.jhw.decoded) return rule_unverifiable("JHW not decodable");
+                         if (!s.wm.decoded) return rule_unverifiable("WM not decodable");
+                         if (s.jhw_wire.candidate_id + 1 == s.wm_wire.next_candidate_id) return rule_verified();
+                         return rule_violated("JHW.candidate_id+1 != WM.next_candidate_id");
+                     }});
+    // NOTE: highest_committed_journal_seq==0 is deliberately NOT a rule --
+    // it is a decode-time/shape property of a freshly created watermark
+    // ("none yet" is the legal initial state, validate_seal_journal_commit_
+    // watermark_shape() fenced it out of the codec by design), not a
+    // cross-file MUST-equal relation.
+
     return rules;
 }
 
@@ -976,6 +1121,7 @@ struct Wires {
     SealExportStartedMigrationWire m{};
     SealStartedCleanupTombstoneWire c{};
     SealStartedAbandonWire a{};
+    SealJournalCommitWatermark jhw{};
 };
 
 // A pin cache: one PinnedKeyHandle per key id, alive for the whole build.
@@ -1127,6 +1273,16 @@ Wires make_wires(const FixtureParams& p) {
     fill_arr(w.a.baseline_tip_mac, 0x10);
     w.a.baseline_key_id = p.baseline_key_id;
     fill_arr(w.a.content_root, 0x30);
+
+    // .jhw mirrors intent_phase_advancer.hpp Step 1b's real write code:
+    // store_uuid from the Intent, candidate_id = the id bound by the
+    // watermark advance, kek_key_id = the Intent's own key, and
+    // highest_committed_journal_seq = 0 ("none yet").
+    w.jhw.store_uuid_lo = p.store_uuid_lo;
+    w.jhw.store_uuid_hi = p.store_uuid_hi;
+    w.jhw.candidate_id = p.candidate_id;
+    w.jhw.highest_committed_journal_seq = 0;
+    w.jhw.kek_key_id = p.kek_key_id;
 
     return w;
 }
@@ -1372,12 +1528,33 @@ std::map<std::string, InjectionSpec> build_injections() {
     reg("X1[3].to_phase==Intent.phase", S::PostSealSuccessMigrated,
         [](Wires& w, std::size_t, std::string_view) noexcept { w.x1[2].to_phase = kCompactionCandidateIntentPhaseAbandonFinalizing; });
 
+    // --- .jhw bindings ---
+    reg("JHW.store_uuid_lo==Intent.store_uuid_lo", S::PostSealSuccessMigrated,
+        [](Wires& w, std::size_t, std::string_view) noexcept { w.jhw.store_uuid_lo ^= 0x8000ull; });
+    reg("JHW.store_uuid_hi==Intent.store_uuid_hi", S::PostSealSuccessMigrated,
+        [](Wires& w, std::size_t, std::string_view) noexcept { w.jhw.store_uuid_hi ^= 0x8000ull; });
+    reg("JHW.candidate_id==Intent.candidate_id", S::PostSealSuccessMigrated,
+        [](Wires& w, std::size_t, std::string_view) noexcept {
+            w.jhw.candidate_id += 100ull;  // stays nonzero (shape), file name still follows Intent
+        });
+    reg("JHW.kek_key_id==Intent.kek_key_id", S::PostSealSuccessMigrated,
+        [](Wires& w, std::size_t, std::string_view) noexcept {
+            w.jhw.kek_key_id = kAuditSecondaryKeyId;  // re-keys the file; ring holds key 8
+        });
+    // The strict +1 rule: shift next_candidate_id by one -- the `<` range
+    // rules still pass (Intent/L ids remain within the allocated range), so
+    // this violation is detected by the strict rule and no other.
+    reg("JHW.candidate_id+1==WM.next_candidate_id", S::PostSealSuccessMigrated,
+        [](Wires& w, std::size_t, std::string_view) noexcept { w.wm.next_candidate_id += 1ull; });
+
     return inj;
 }
 
 // Builds the fixture directory. `injection_id` empty = clean consistent set.
-bool build_fixture(const std::filesystem::path& dir, const FixtureParams& p, std::string_view injection_id,
-                   KeyRing& ring) {
+// Breadcrumb files go to `dir`; the .jhw commit watermark goes to
+// `seal_journal_dir` (the separate directory scope, see header).
+bool build_fixture(const std::filesystem::path& dir, const std::filesystem::path& seal_journal_dir,
+                   const FixtureParams& p, std::string_view injection_id, KeyRing& ring) {
     Wires w = make_wires(p);
 
     static const std::map<std::string, InjectionSpec> injections = build_injections();
@@ -1394,6 +1571,9 @@ bool build_fixture(const std::filesystem::path& dir, const FixtureParams& p, std
 
     std::array<std::byte, kCompactionCandidateIntentWireBytes> intent_b{};
     encode_compaction_candidate_intent_wire(intent_b, w.intent, kh.get(w.intent.kek_key_id));
+
+    std::array<std::byte, kSealJournalCommitWatermarkWireBytes> jhw_b{};
+    encode_seal_journal_commit_watermark_wire(jhw_b, w.jhw, kh.get(w.jhw.kek_key_id));
 
     std::array<std::array<std::byte, kCompactionIntentTransitionWireBytes>, 3> x1_b{};
     encode_compaction_intent_transition_wire(x1_b[0], w.x1[0], kh.get(w.x1[0].kek_key_id));
@@ -1459,6 +1639,7 @@ bool build_fixture(const std::filesystem::path& dir, const FixtureParams& p, std
     // surface as a failed build, never as an uncaught exception in a tool.
     try {
         std::filesystem::create_directories(dir);
+        std::filesystem::create_directories(seal_journal_dir);
     } catch (const std::filesystem::filesystem_error&) {
         return false;
     }
@@ -1475,6 +1656,9 @@ bool build_fixture(const std::filesystem::path& dir, const FixtureParams& p, std
     }
     if (with_cleanup) ok = ok && write_file(dir, kCName, c_b);
     if (with_abandon) ok = ok && write_file(dir, kAName, a_b);
+    // File name follows the INTENT's candidate_id (not w.jhw.candidate_id) so
+    // the candidate_id injection still lands in the file the scanner selects.
+    ok = ok && write_file(seal_journal_dir, jhw_file_name(w.intent.candidate_id), jhw_b);
     return ok;
 }
 
@@ -1509,9 +1693,10 @@ AuditOutcome run_rules(const BreadcrumbSet& set, const std::vector<Rule>& rules)
     return out;
 }
 
-void print_audit(const std::filesystem::path& dir, const BreadcrumbSet& s, const std::vector<Rule>& rules,
-                 bool verbose) {
+void print_audit(const std::filesystem::path& dir, const std::filesystem::path& seal_journal_dir,
+                 const BreadcrumbSet& s, const std::vector<Rule>& rules, bool verbose) {
     std::printf("== breadcrumb directory audit: %s ==\n", dir.string().c_str());
+    std::printf("   (seal-journal dir: %s)\n", seal_journal_dir.string().c_str());
     std::printf("files:\n");
     const auto print_file = [](std::string_view name, const FileRef& f) {
         if (!f.present) {
@@ -1534,6 +1719,12 @@ void print_audit(const std::filesystem::path& dir, const BreadcrumbSet& s, const
     print_file(kMName, s.m);
     print_file(kCName, s.c);
     print_file(kAName, s.a);
+    if (s.jhw_file_name.empty()) {
+        std::printf("  %-42s : absent (no Intent candidate_id to select)\n",
+                    "<candidate_id_hex16>.jhw");
+    } else {
+        print_file(s.jhw_file_name, s.jhw);
+    }
 
     if (s.intent.decoded) {
         std::array<CompactionIntentTransitionWire, 3> frames{};
@@ -1596,11 +1787,12 @@ bool check_clean_scenario(const std::filesystem::path& base, Scenario sc, const 
     FixtureParams p;
     p.scenario = sc;
     const auto dir = base / sanitize_dir_component(label);
-    if (!build_fixture(dir, p, "", ring)) {
+    const auto sj = dir / kSealJournalDirName;
+    if (!build_fixture(dir, sj, p, "", ring)) {
         std::printf("[FAIL] %s: fixture build failed\n", label);
         return false;
     }
-    const BreadcrumbSet s = scan_directory(dir, ring);
+    const BreadcrumbSet s = scan_with_seal_journal(dir, sj, ring);
     const AuditOutcome out = run_rules(s, rules);
     const bool ok = (out.violated == 0);
     std::printf("[%s] %s clean fixture: %d verified, %d violated, %d N/A\n", ok ? "PASS" : "FAIL", label,
@@ -1624,11 +1816,12 @@ bool check_injection(const std::filesystem::path& base, const std::vector<Rule>&
     FixtureParams p;
     p.scenario = inj_it->second.scenario;
     const auto dir = base / sanitize_dir_component(rule_id);
-    if (!build_fixture(dir, p, rule_id, ring)) {
+    const auto sj = dir / kSealJournalDirName;
+    if (!build_fixture(dir, sj, p, rule_id, ring)) {
         std::printf("[FAIL] %s: fixture build failed\n", rule_id.c_str());
         return false;
     }
-    const BreadcrumbSet s = scan_directory(dir, ring);
+    const BreadcrumbSet s = scan_with_seal_journal(dir, sj, ring);
     const AuditOutcome out = run_rules(s, rules);
 
     std::vector<std::string> got = out.violated_ids;
@@ -1674,7 +1867,7 @@ int self_check() {
     {
         const auto dir = base / "empty";
         std::filesystem::create_directories(dir);
-        const BreadcrumbSet s = scan_directory(dir, ring);
+        const BreadcrumbSet s = scan_with_seal_journal(dir, dir / kSealJournalDirName, ring);
         const AuditOutcome out = run_rules(s, rules);
         const bool ok = (out.violated == 0);
         all_ok &= ok;
@@ -1701,11 +1894,13 @@ int self_check() {
     exp("L.store_uuid_lo==A.store_uuid_lo", {"L.store_uuid_lo==A.store_uuid_lo"});
     exp("L.store_uuid_hi==A.store_uuid_hi", {"L.store_uuid_hi==A.store_uuid_hi"});
     exp("L.store_uuid_lo==Intent.store_uuid_lo",
-        {"L.store_uuid_lo==Intent.store_uuid_lo", "X1[1].store_uuid_lo==Intent.store_uuid_lo",
-         "X1[2].store_uuid_lo==Intent.store_uuid_lo", "X1[3].store_uuid_lo==Intent.store_uuid_lo"});
+        {"JHW.store_uuid_lo==Intent.store_uuid_lo", "L.store_uuid_lo==Intent.store_uuid_lo",
+         "X1[1].store_uuid_lo==Intent.store_uuid_lo", "X1[2].store_uuid_lo==Intent.store_uuid_lo",
+         "X1[3].store_uuid_lo==Intent.store_uuid_lo"});
     exp("L.store_uuid_hi==Intent.store_uuid_hi",
-        {"L.store_uuid_hi==Intent.store_uuid_hi", "X1[1].store_uuid_hi==Intent.store_uuid_hi",
-         "X1[2].store_uuid_hi==Intent.store_uuid_hi", "X1[3].store_uuid_hi==Intent.store_uuid_hi"});
+        {"JHW.store_uuid_hi==Intent.store_uuid_hi", "L.store_uuid_hi==Intent.store_uuid_hi",
+         "X1[1].store_uuid_hi==Intent.store_uuid_hi", "X1[2].store_uuid_hi==Intent.store_uuid_hi",
+         "X1[3].store_uuid_hi==Intent.store_uuid_hi"});
     exp("L.store_uuid_lo==WM.store_uuid_lo", {"L.store_uuid_lo==WM.store_uuid_lo"});
     exp("L.store_uuid_hi==WM.store_uuid_hi", {"L.store_uuid_hi==WM.store_uuid_hi"});
 
@@ -1750,16 +1945,19 @@ int self_check() {
     exp("A.digest_C==SHA256(C)", {"A.digest_C==SHA256(C)"});
 
     exp("Intent.candidate_id<WM.next_candidate_id",
-        {"Intent.candidate_id<WM.next_candidate_id", "L.candidate_id<WM.next_candidate_id"});
+        {"Intent.candidate_id<WM.next_candidate_id", "L.candidate_id<WM.next_candidate_id",
+         "JHW.candidate_id+1==WM.next_candidate_id"});
     exp("Intent.request_id<WM.next_request_id",
         {"Intent.request_id<WM.next_request_id", "L.request_id<WM.next_request_id"});
     exp("L.candidate_id<WM.next_candidate_id",
-        {"Intent.candidate_id<WM.next_candidate_id", "L.candidate_id<WM.next_candidate_id"});
+        {"Intent.candidate_id<WM.next_candidate_id", "L.candidate_id<WM.next_candidate_id",
+         "JHW.candidate_id+1==WM.next_candidate_id"});
     exp("L.request_id<WM.next_request_id",
         {"Intent.request_id<WM.next_request_id", "L.request_id<WM.next_request_id"});
 
     exp("Intent.candidate_id==L.candidate_id",
         {"Intent.candidate_id<WM.next_candidate_id", "Intent.candidate_id==L.candidate_id",
+         "JHW.candidate_id==Intent.candidate_id",
          "X1[1].candidate_id==Intent.candidate_id", "X1[2].candidate_id==Intent.candidate_id",
          "X1[3].candidate_id==Intent.candidate_id"});
     exp("Intent.request_id==L.request_id",
@@ -1823,6 +2021,13 @@ int self_check() {
     exp("X1[3].prev_transition_mac==X1[2].mac", {"X1[3].prev_transition_mac==X1[2].mac"});
     exp("X1[3].to_phase==Intent.phase", {"X1[3].to_phase==Intent.phase"});
 
+    exp("JHW.store_uuid_lo==Intent.store_uuid_lo", {"JHW.store_uuid_lo==Intent.store_uuid_lo"});
+    exp("JHW.store_uuid_hi==Intent.store_uuid_hi", {"JHW.store_uuid_hi==Intent.store_uuid_hi"});
+    exp("JHW.candidate_id==Intent.candidate_id",
+        {"JHW.candidate_id==Intent.candidate_id", "JHW.candidate_id+1==WM.next_candidate_id"});
+    exp("JHW.kek_key_id==Intent.kek_key_id", {"JHW.kek_key_id==Intent.kek_key_id"});
+    exp("JHW.candidate_id+1==WM.next_candidate_id", {"JHW.candidate_id+1==WM.next_candidate_id"});
+
     std::size_t checked = 0;
     for (const auto& [rule_id, spec] : injections) {
         all_ok &= check_injection(base, rules, injections, expected, ring, rule_id);
@@ -1862,9 +2067,13 @@ void print_usage() {
         "  seal_journal_cross_file_audit [--self-check]\n"
         "  seal_journal_cross_file_audit --gen <dir> [--scenario success|abandon|native]\n"
         "                                 [--inject <rule-id>] [--kek-hex <64hex>]\n"
+        "                                 [--seal-journal-dir <dir>]\n"
         "  seal_journal_cross_file_audit --audit <dir> [--kek-hex <64hex>]\n"
+        "                                 [--seal-journal-dir <dir>]\n"
         "  seal_journal_cross_file_audit --list-rules\n"
-        "  seal_journal_cross_file_audit --usage\n");
+        "  seal_journal_cross_file_audit --usage\n"
+        "--seal-journal-dir defaults to <dir>/seal-journal (the layout --gen writes);\n"
+        "without a scannable .jhw there, every JHW.* rule reports N/A.\n");
 }
 
 }  // namespace
@@ -1876,6 +2085,7 @@ int main(int argc, char** argv) {
     std::string mode = "self-check";
     std::string gen_dir;
     std::string audit_dir;
+    std::string seal_journal_dir;
     std::string scenario_arg;
     std::string inject_arg;
     std::array<std::byte, kKekSize> kek = kAuditKek;
@@ -1890,6 +2100,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--audit") {
             mode = "audit";
             if (i + 1 < argc) audit_dir = argv[++i];
+        } else if (arg == "--seal-journal-dir") {
+            if (i + 1 < argc) seal_journal_dir = argv[++i];
         } else if (arg == "--scenario") {
             if (i + 1 < argc) scenario_arg = argv[++i];
         } else if (arg == "--inject") {
@@ -1943,13 +2155,16 @@ int main(int argc, char** argv) {
         WrappedKeyRecord rec{};
         ring.add_key(kAuditPrimaryKeyId, kAuditPlaintextKey7, rec);
         ring.add_key(kAuditSecondaryKeyId, kAuditPlaintextKey8, rec);
-        if (!build_fixture(gen_dir, p, inject_arg, ring)) {
+        const std::filesystem::path sj_dir =
+            seal_journal_dir.empty() ? std::filesystem::path(gen_dir) / kSealJournalDirName
+                                     : std::filesystem::path(seal_journal_dir);
+        if (!build_fixture(gen_dir, sj_dir, p, inject_arg, ring)) {
             std::printf("error: fixture build failed (unknown --inject id?)\n");
             return 2;
         }
-        std::printf("fixture written to %s (scenario %s, injection '%s')\n", gen_dir.c_str(),
-                    scenario_arg.empty() ? "success" : scenario_arg.c_str(),
-                    inject_arg.empty() ? "-" : inject_arg.c_str());
+        std::printf("fixture written to %s (scenario %s, injection '%s', seal-journal %s)\n",
+                    gen_dir.c_str(), scenario_arg.empty() ? "success" : scenario_arg.c_str(),
+                    inject_arg.empty() ? "-" : inject_arg.c_str(), sj_dir.string().c_str());
         return 0;
     }
 
@@ -1963,8 +2178,11 @@ int main(int argc, char** argv) {
         WrappedKeyRecord rec{};
         ring.add_key(kAuditPrimaryKeyId, kAuditPlaintextKey7, rec);
         ring.add_key(kAuditSecondaryKeyId, kAuditPlaintextKey8, rec);
-        const auto s = scan_directory(audit_dir, ring);
-        print_audit(audit_dir, s, rules, /*verbose=*/false);
+        const std::filesystem::path sj_dir =
+            seal_journal_dir.empty() ? std::filesystem::path(audit_dir) / kSealJournalDirName
+                                     : std::filesystem::path(seal_journal_dir);
+        const auto s = scan_with_seal_journal(audit_dir, sj_dir, ring);
+        print_audit(audit_dir, sj_dir, s, rules, /*verbose=*/false);
         const AuditOutcome out = run_rules(s, rules);
         std::printf("summary: %d verified, %d violated, %d N/A\n", out.verified, out.violated, out.unverifiable);
         return out.violated > 0 ? 1 : 0;

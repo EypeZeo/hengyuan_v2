@@ -391,6 +391,36 @@ jobs:
           done
           exit $fail
 
+      - name: "Model: RoundELockOrder (Round E two-lease acquisition order)"
+        id: m_lockorder
+        continue-on-error: true
+        working-directory: formal
+        # Single-process lock-order state machine, not a two-caller deadlock
+        # model -- see RoundELockOrder.tla's own header. Finite by
+        # construction (3 booleans), no liveness property to check.
+        run: |
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+            -workers auto -config RoundELockOrder.cfg RoundELockOrder.tla
+
+          set -u
+          cfg=RoundELockOrder_bug.cfg
+          inv=LockOrderRespected
+          echo "::group::$cfg — expecting $inv to be violated"
+          echo "  control: RequireCandidateHeldForSealJournal=FALSE (the candidateLeaseHeld guard dropped from AcquireSealJournalLease)"
+          if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+               -workers auto -config "$cfg" RoundELockOrder.tla > "/tmp/$cfg.log" 2>&1; then
+            echo "::error::$cfg PASSED but was expected to violate $inv. The model has stopped discriminating; do not trust the safety run until this is fixed."
+            tail -30 "/tmp/$cfg.log"
+            exit 1
+          fi
+          if ! grep -q "Invariant $inv is violated" "/tmp/$cfg.log"; then
+            echo "::error::$cfg failed, but NOT with the expected '$inv is violated'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+            tail -30 "/tmp/$cfg.log"
+            exit 1
+          fi
+          echo "  OK: $inv violated as expected"
+          echo "::endgroup::"
+
       # Aggregate: turns any individual model's failure into an overall job
       # failure. `if: always()` so this runs even though every model step
       # above is `continue-on-error: true`. Each model's own pass/fail is
@@ -407,5 +437,6 @@ jobs:
           [ "${{ steps.m_roundd.outcome }}" = "failure" ] && { echo "::error::RoundDActual failed"; fail=1; }
           [ "${{ steps.m_roundef.outcome }}" = "failure" ] && { echo "::error::RoundEFDesign failed"; fail=1; }
           [ "${{ steps.m_keyrotation.outcome }}" = "failure" ] && { echo "::error::key_rotation failed"; fail=1; }
+          [ "${{ steps.m_lockorder.outcome }}" = "failure" ] && { echo "::error::RoundELockOrder failed"; fail=1; }
           [ "${{ steps.m_depthsnapshot.outcome }}" = "failure" ] && { echo "::error::depth_snapshot_bootstrap failed"; fail=1; }
           exit $fail

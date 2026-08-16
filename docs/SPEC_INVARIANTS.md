@@ -1494,6 +1494,79 @@ CREATE_NEW at durable id-reserve (highest=0)"，`highest_committed_journal_seq` 
 - `tools/spec_xref_check.py --quiet`、`tools/spec_enum_diff.py`：均 clean（跟之前几轮相同的
   既有、无关警告）。
 
+### Round F：两把锁顺序 TLA+ 模型 + `.jhw` 审计工具扩展[已实现]
+
+PR #40 引入的 `CandidateLease`/`SealJournalStoreLease` 两把锁顺序约束（只靠
+`seal_journal_store_lease.hpp` 的文档纪律，编译器不强制）此前没有任何形式化模型或跨文件审计
+工具覆盖。这一轮按已建立的"2-模型并行派发协议"（见本文件历史，PR #38 的 Grok 4.6/DeepSeek V4
+Flash 分工先例）派发两块零文件交集、只读/纯新增的独立准备工作：**真正写 Reserved→
+StartedPublished 这条边（需要真实的 "publish NativeV2Started" 写路径，跟 Round D 五版被拒
+历史同一量级的设计风险）继续由协调者自己做，不外包，这一轮两块产出都不触碰这条边**。
+
+**Grok 4.6：`formal/RoundELockOrder.tla`（+ .cfg 正确配置 + _bug.cfg 负控）**——单进程状态机
+（不是两个并发调用者的死锁模型）：布尔量 candidateLeaseHeld/sealJournalLeaseHeld/
+jhwWritten；AcquireSealJournalLease 的正确 Next 要求 candidateLeaseHeld 已经为真才能
+获取内锁；WriteJhw 要求两把锁都已持有（对应 `raise_intent_phase()` Step 1b）；
+ReleaseCandidateLease 要求内锁已经为假才能放外锁。安全不变式 `LockOrderRespected ==
+sealJournalLeaseHeld => candidateLeaseHeld`（guard-implies-invariant）。_bug.cfg 用常量
+RequireCandidateHeldForSealJournal = FALSE 换掉 AcquireSealJournalLease 的
+candidateLeaseHeld guard，TLC 必须报出 `Invariant LockOrderRespected is violated`——这个
+模型刻意带负控，不沿用 `RoundEFDesignReceiptVerified.tla`（上一轮 Grok 自己的产出）"没有历史
+事故可以回归、所以没有负控"的先例，因为这次的锁顺序是一条真实、当前只靠文档约束的规则。
+协调者独立用 TLC 重跑两个配置：`RoundELockOrder.cfg`（10 states generated / 6 distinct /
+depth 6，无违反）、`RoundELockOrder_bug.cfg`（12 states generated / 8 distinct / depth 7，
+`Error: Invariant LockOrderRespected is violated`，反例状态序列跟设计预期完全一致：
+AcquireSealJournalLease 在 candidateLeaseHeld=FALSE 时直接把 sealJournalLeaseHeld 置真）
+——结果跟 Grok 自己报告的完全一致，未发现问题，无需修复。
+
+**DeepSeek V4 Flash：扩展 `native/src/seal_journal_cross_file_audit.cpp`（对已有文件的 diff，
+不是新文件）**——新增第 8 种 artifact 类型 `SealJournalCommitWatermark`（`.jhw`，
+`<candidate_id_hex16>.jhw`，位于 `seal-journal/<store_uuid>/`，一个跟其余 7 种完全不同的目录
+scope）：新增 `scan_seal_journal_store()`（按 Intent 的 `candidate_id` 选取要审计的那一份
+`.jhw`，跟 breadcrumb 目录扫描分开调用后合并进同一个 BreadcrumbSet）；CLI 新增
+`--seal-journal-dir`（默认 `<dir>/seal-journal`，跟 `--gen` 写出的布局一致）；规则表
+92→97 条，新增 5 条（依据 `intent_phase_advancer.hpp` Step 1b 的真实写入代码）：
+`JHW.store_uuid_lo/hi==Intent.store_uuid_lo/hi`、`JHW.candidate_id==Intent.candidate_id`
+（`Intent.phase < Reserved` 时 Unverifiable）、`JHW.kek_key_id==Intent.kek_key_id`（用的是
+Intent 自己的 key，不是 L 的——这条边 L 还不存在）、`JHW.candidate_id+1==WM.next_candidate_id`
+（**严格相等，不是现有 L/Intent-vs-WM 规则用的 `<` 区间不等式**，因为 `.jhw` 绑定的是
+advance 之前那个精确的 `next_candidate_id` 值）。刻意排除
+`highest_committed_journal_seq==0` 进规则表——那是新建 watermark 的 decode-time/shape 属性
+（`validate_seal_journal_commit_watermark_shape()` 已经在编码层面保证），不是跨文件
+MUST-equal 规则。首轮 `--self-check` 抓到 2 处真实级联（往 `Intent.store_uuid_lo/hi` 注入错误
+值时，除了原有的 L/X1[1-3] 也会连带违反新的 `JHW.store_uuid_lo/hi==Intent.store_uuid_lo/hi`
+规则；往 `Intent.candidate_id`/`WM.next_candidate_id` 注入时同理连带触发
+`JHW.candidate_id+1==WM.next_candidate_id`）——这正是这个工具"control must still fail"纪律
+在起作用，期望违反集已经据此补全。协调者复核：读完整 diff（509 行）、独立在 MSVC 上构建 0
+警告 + 直接运行 `--self-check`（102 injections + 3 clean scenarios + empty dir，全部 PASS，
+跟 DeepSeek 报告的数字完全一致）+ 手工冒烟测试（`--gen`→`--audit` 干净往返 0 violated；单独
+注入 `JHW.kek_key_id==Intent.kek_key_id` 后 `--audit` 精确报出这一条 VIOLATED，其余不受影响）+
+独立在 WSL2 GCC-14 上构建 + 跑 `--self-check`（结果一致）——未发现问题，无需修复。
+
+**这一轮之后仍然明确不做**：Reserved→StartedPublished 及之后任何边；`.xgc`/GC 授权；journal
+drain-completeness 前置检查；`highest_committed_journal_seq` 的 REPLACE-with-monotonic-CAS。
+
+**CI 集成**：RoundELockOrder.tla/.cfg/_bug.cfg 接入 PR #41 刚合并的 `ci-spec-verification.yml`
+`tla-model-check-all` 合并 job，作为第 8 个 model step（m_lockorder），跟其余 7 个模型同样的
+`continue-on-error: true` + Aggregate 汇总模式；`.jhw` 审计工具扩展不需要任何 CMakeLists.txt
+改动（`add_executable(seal_journal_cross_file_audit ...)` 早已注册，`--self-check` 走的还是
+同一个 seal_journal_cross_file_audit_selfcheck ctest）。
+
+**验证（2026-08-16）**：
+- MSVC Release 全量构建：0 warning。全量 ctest：1097/1097（跟上一轮相同——这一轮没有新增 C++
+  测试，audit 工具的自检内容本身在既有的 seal_journal_cross_file_audit_selfcheck 里扩展，
+  1 个既有 POSIX-only skip）。
+- WSL2 GCC-14 Release（`HY_BUILD_DEMO=ON`）：1126/1126（跟上一轮相同）。
+- WSL2 ASan+UBSan（同前几轮的 OOM 规避，目标列表含 compaction_lease_holder +
+  seal_journal_cross_file_audit）：95/95，无 ASan/UBSan 报告；audit 工具 `--self-check` 在
+  ASan/UBSan 下同样 102+3+1 全过。
+- WSL2 TSan：`ctest -L concurrency`：58/58。两个负控均正确报出 `WARNING: ThreadSanitizer: data
+  race`。
+- `tools/spec_xref_check.py --quiet`、`tools/spec_enum_diff.py`：均 clean（跟之前几轮相同的
+  既有、无关警告）。
+- `formal/RoundELockOrder.tla`：协调者独立用 TLC 重跑正确配置 + 负控配置，结果与 Grok 报告完全
+  一致（见上）。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 
