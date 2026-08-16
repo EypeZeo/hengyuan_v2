@@ -4,19 +4,27 @@
 // (real file I/O). Test-only scope (see intent_phase_advancer.hpp's own
 // header comment) -- this class is not called from any production path.
 //
-// raise_intent_phase() now performs the SealIdWatermark advance itself
-// (design v5 -- see intent_phase_advancer.hpp's SCOPE section 5), including
-// bootstrapping the file when absent. Some tests below still plant a
-// watermark file directly via plain file I/O (no CandidateLease/friend
-// access needed for a bare write -- only reads are friend-gated), to set up
-// a specific pre-existing state (a non-default starting point, a foreign
-// store_uuid, a corrupt/zero watermark, an exhausted watermark) rather than
-// relying on this store's first-ever bootstrap.
+// raise_intent_phase() now performs BOTH the SealIdWatermark advance AND
+// the SealJournalCommitWatermark (`.jhw`) CREATE_NEW itself (design v5 +
+// the two-lock-coordination round -- see intent_phase_advancer.hpp's SCOPE
+// section), including bootstrapping the watermark file when absent. Some
+// tests below still plant a watermark file directly via plain file I/O (no
+// CandidateLease/friend access needed for a bare write -- only reads are
+// friend-gated), to set up a specific pre-existing state (a non-default
+// starting point, a foreign store_uuid, a corrupt/zero watermark, an
+// exhausted watermark) rather than relying on this store's first-ever
+// bootstrap. IntentPhaseAdvancer now requires TWO leases -- CandidateLease
+// (fx.dir) and SealJournalStoreLease (fx.seal_journal_dir), a genuinely
+// separate directory -- both acquired by the test before constructing the
+// advancer, released in the order seal_journal_store_lease.hpp's header
+// comment's LOCK ORDER section documents (SealJournalStoreLease first).
 #include <gtest/gtest.h>
 #include <hengyuan/compaction_intent_store.hpp>
 #include <hengyuan/intent_phase_advancer.hpp>
 #include <hengyuan/seal_id_watermark_export_started_loader.hpp>
+#include <hengyuan/seal_journal_commit_tombstone_loader.hpp>
 #include <hengyuan/seal_journal_precondition_codec.hpp>
+#include <hengyuan/seal_journal_store_lease.hpp>
 
 #include <array>
 #include <chrono>
@@ -33,7 +41,7 @@ using namespace hy;
 
 namespace {
 
-std::filesystem::path make_temp_candidate_dir(std::string_view tag) {
+std::filesystem::path make_temp_dir(std::string_view tag) {
     auto dir = std::filesystem::temp_directory_path() /
                ("hy_round_e_phase_advancer_" + std::string(tag) + "_" +
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -83,18 +91,27 @@ void plant_watermark(const std::filesystem::path& candidate_dir, std::uint64_t s
 }
 
 struct Fixture {
-    std::filesystem::path dir;
+    std::filesystem::path dir;               // CandidateLease's breadcrumb directory
+    std::filesystem::path seal_journal_dir;  // SealJournalStoreLease's directory -- genuinely
+                                              // separate, not a subdirectory of `dir`.
     std::array<std::byte, kKekSize> kek;
     KeyRing ring;
     std::uint32_t kek_key_id;
 
     explicit Fixture(std::string_view tag, std::uint8_t kek_fill = 0x01, std::uint32_t key_id = 7)
-        : dir(make_temp_candidate_dir(tag)), kek(make_kek(kek_fill)), ring(kek), kek_key_id(key_id) {
+        : dir(make_temp_dir(tag)),
+          seal_journal_dir(make_temp_dir(std::string(tag) + "_sealjournal")),
+          kek(make_kek(kek_fill)),
+          ring(kek),
+          kek_key_id(key_id) {
         WrappedKeyRecord rec{};
         EXPECT_EQ(ring.add_key(kek_key_id, kek, rec), KeyRingAddStatus::Ok);
     }
 
-    ~Fixture() { std::filesystem::remove_all(dir); }
+    ~Fixture() {
+        std::filesystem::remove_all(dir);
+        std::filesystem::remove_all(seal_journal_dir);
+    }
 
     // Creates a Building genesis via IntentStore (acquire+create+release),
     // exactly the way a real caller would -- IntentPhaseAdvancer never
@@ -115,6 +132,24 @@ struct Fixture {
     }
 };
 
+// RAII pair for the two leases IntentPhaseAdvancer now requires, enforcing
+// this file's own acquire/release order to match seal_journal_store_lease.hpp's
+// LOCK ORDER rule (CandidateLease acquired first, released last).
+struct TwoLeases {
+    CandidateLease candidate_lease;
+    SealJournalStoreLease seal_journal_lease;
+
+    explicit TwoLeases(Fixture& fx) : candidate_lease(fx.dir), seal_journal_lease(fx.seal_journal_dir) {
+        EXPECT_EQ(candidate_lease.acquire(), LeaseAcquireStatus::Acquired);
+        EXPECT_EQ(seal_journal_lease.acquire(), SealJournalLeaseAcquireStatus::Acquired);
+    }
+
+    void release() {
+        EXPECT_EQ(seal_journal_lease.release(), SealJournalLeaseReleaseStatus::Released);
+        EXPECT_EQ(candidate_lease.release(), ReleaseStatus::Released);
+    }
+};
+
 }  // namespace
 
 TEST(IntentPhaseAdvancer, RaisesBuildingToReservedWithWatermarkDerivedIds) {
@@ -123,14 +158,13 @@ TEST(IntentPhaseAdvancer, RaisesBuildingToReservedWithWatermarkDerivedIds) {
     fx.create_building_genesis(kBuildNonce);
     fx.plant_watermark_reserving(/*candidate_id=*/41, /*request_id=*/77);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 
     // Verify via a fresh IntentStore/CandidateLease pair over the same
-    // directory -- must acquire only after `lease` above has released
+    // directory -- must acquire only after `leases` above has released
     // (the directory lock is exclusive).
     IntentStore verify_store(fx.dir, fx.ring);
     ASSERT_EQ(verify_store.acquire_lease(), LeaseAcquireStatus::Acquired);
@@ -142,21 +176,30 @@ TEST(IntentPhaseAdvancer, RaisesBuildingToReservedWithWatermarkDerivedIds) {
     ASSERT_EQ(verify_store.release_lease(), ReleaseStatus::Released);
 }
 
-TEST(IntentPhaseAdvancer, WritesDurableX1BeforeReplacingIntent) {
-    Fixture fx("x1_before_replace");
+TEST(IntentPhaseAdvancer, WritesDurableJhwAndX1BeforeReplacingIntent) {
+    Fixture fx("jhw_x1_before_replace");
     constexpr std::uint64_t kBuildNonce = 0x77ULL;
     fx.create_building_genesis(kBuildNonce);
     fx.plant_watermark_reserving(5, 9);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
 
     const auto x1_name = compaction_detail::ValidatedArtifactName::for_x1(kBuildNonce, /*transition_seq=*/1);
     EXPECT_TRUE(std::filesystem::exists(fx.dir / x1_name.relative_name()))
         << "the `.x1` seq=1 evidence must be durable once raise_intent_phase() reports success";
+
+    // `.jhw` must exist for candidate_id=5, with highest_committed_journal_seq=0.
+    SealJournalCommitWatermarkLoader jhw_loader(leases.seal_journal_lease);
+    SealJournalCommitWatermark jhw{};
+    ASSERT_EQ(jhw_loader.load(/*candidate_id=*/5, fx.ring, jhw), SealJournalStoreLoadStatus::Ok);
+    EXPECT_EQ(jhw.candidate_id, 5u);
+    EXPECT_EQ(jhw.highest_committed_journal_seq, 0u);
+    EXPECT_EQ(jhw.store_uuid_lo, 0x1111111111111111ULL);
+    EXPECT_EQ(jhw.store_uuid_hi, 0x2222222222222222ULL);
+
+    leases.release();
 }
 
 TEST(IntentPhaseAdvancer, RetryAfterSuccessReturnsAlreadyAtOrPastTargetPhase) {
@@ -165,15 +208,14 @@ TEST(IntentPhaseAdvancer, RetryAfterSuccessReturnsAlreadyAtOrPastTargetPhase) {
     fx.create_building_genesis(kBuildNonce);
     fx.plant_watermark_reserving(1, 1);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
     // Second call, same instance -- the Intent is now Reserved; must not
     // attempt a second `.x1` seq=1 write (that would collide) and must not
     // error, since this exact build already durably completed the raise.
     EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::AlreadyAtOrPastTargetPhase);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 }
 
 TEST(IntentPhaseAdvancer, ForeignBuildNonceIsRefused) {
@@ -181,11 +223,10 @@ TEST(IntentPhaseAdvancer, ForeignBuildNonceIsRefused) {
     fx.create_building_genesis(/*build_nonce=*/0x1234ULL);
     fx.plant_watermark_reserving(1, 1);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(/*build_nonce=*/0x9999ULL), PhaseAdvanceStatus::ForeignBuildNonce);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 }
 
 TEST(IntentPhaseAdvancer, RefusesWithoutIntentGenesis) {
@@ -193,11 +234,10 @@ TEST(IntentPhaseAdvancer, RefusesWithoutIntentGenesis) {
     // Deliberately never creates a Building genesis.
     fx.plant_watermark_reserving(1, 1);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(0xABCULL), PhaseAdvanceStatus::IntentNotFound);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 }
 
 TEST(IntentPhaseAdvancer, BootstrapsWatermarkWhenAbsentAndBindsOneOne) {
@@ -208,11 +248,10 @@ TEST(IntentPhaseAdvancer, BootstrapsWatermarkWhenAbsentAndBindsOneOne) {
     // candidate. raise_intent_phase() must bootstrap it (design v5) rather
     // than refuse.
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 
     IntentStore verify_store(fx.dir, fx.ring);
     ASSERT_EQ(verify_store.acquire_lease(), LeaseAcquireStatus::Acquired);
@@ -239,11 +278,10 @@ TEST(IntentPhaseAdvancer, RefusesWhenWatermarkAtUint64Max) {
     plant_watermark(fx.dir, 0x1111111111111111ULL, 0x2222222222222222ULL,
                      std::numeric_limits<std::uint64_t>::max(), 5, fx.kek);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(0xABCULL), PhaseAdvanceStatus::WatermarkExhausted);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 }
 
 TEST(IntentPhaseAdvancer, RetryAfterX1FailureReusesSameWatermarkBoundIdsInsteadOfBurningAnother) {
@@ -255,8 +293,9 @@ TEST(IntentPhaseAdvancer, RetryAfterX1FailureReusesSameWatermarkBoundIdsInsteadO
     // Pre-create a colliding, WRONG-content `.x1` seq=1 file so the first
     // call's `.x1` write hits a byte-mismatch collision (real conflict,
     // never overwritten -- see compaction_breadcrumb_io.hpp's
-    // write_validated_no_replace) and the call fails downstream of the
-    // watermark advance.
+    // write_validated_no_replace) and the call fails downstream of both the
+    // watermark advance AND the `.jhw` CREATE_NEW (which now runs before
+    // `.x1`, so it succeeds on this first, otherwise-doomed call).
     const auto x1_name = compaction_detail::ValidatedArtifactName::for_x1(kBuildNonce, /*seq=*/1);
     {
         std::vector<char> wrong_bytes(kCompactionIntentTransitionWireBytes, 'X');
@@ -264,28 +303,37 @@ TEST(IntentPhaseAdvancer, RetryAfterX1FailureReusesSameWatermarkBoundIdsInsteadO
         bogus.write(wrong_bytes.data(), static_cast<std::streamsize>(wrong_bytes.size()));
     }
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     ASSERT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::X1WriteFailed);
 
     // The watermark must already show the advance (spent, per
     // WatermarkAdvanceProvenanceMemory's contract) even though the overall
     // call failed downstream.
     {
-        SealIdWatermarkLoader loader(lease);
+        SealIdWatermarkLoader loader(leases.candidate_lease);
         SealIdWatermark wm{};
         ASSERT_EQ(loader.load(fx.kek_key_id, fx.ring, wm), LoadStatus::Ok);
         EXPECT_EQ(wm.next_candidate_id, 2u);
         EXPECT_EQ(wm.next_request_id, 2u);
     }
+    // `.jhw` for candidate_id=1 must already be durable too -- it ran before
+    // the `.x1` write that failed.
+    {
+        SealJournalCommitWatermarkLoader jhw_loader(leases.seal_journal_lease);
+        SealJournalCommitWatermark jhw{};
+        ASSERT_EQ(jhw_loader.load(/*candidate_id=*/1, fx.ring, jhw), SealJournalStoreLoadStatus::Ok);
+        EXPECT_EQ(jhw.candidate_id, 1u);
+    }
 
     // Remove the colliding stub and retry with the SAME advancer instance --
     // must bind the SAME ids (1,1) the first attempt already spent, not
-    // derive a new pair from the now-advanced watermark.
+    // derive a new pair from the now-advanced watermark. The `.jhw`
+    // CREATE_NEW retry hits its own byte-equal collision (same deterministic
+    // content) and self-heals safely -- no provenance memory needed for it.
     std::filesystem::remove(fx.dir / x1_name.relative_name());
     EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::PhaseRaised);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 
     IntentStore verify_store(fx.dir, fx.ring);
     ASSERT_EQ(verify_store.acquire_lease(), LeaseAcquireStatus::Acquired);
@@ -307,11 +355,10 @@ TEST(IntentPhaseAdvancer, RefusesZeroWatermarkAsCorrupt) {
     plant_watermark(fx.dir, 0x1111111111111111ULL, 0x2222222222222222ULL, /*next_candidate_id=*/0,
                      /*next_request_id=*/0, fx.kek);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(0xABCULL), PhaseAdvanceStatus::WatermarkCorrupt);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 }
 
 TEST(IntentPhaseAdvancer, RefusesForeignStoreWatermark) {
@@ -321,20 +368,39 @@ TEST(IntentPhaseAdvancer, RefusesForeignStoreWatermark) {
     plant_watermark(fx.dir, /*store_uuid_lo=*/0xDEADBEEFULL, /*store_uuid_hi=*/0xFEEDFACEULL,
                      /*next_candidate_id=*/2, /*next_request_id=*/2, fx.kek);
 
-    CandidateLease lease(fx.dir);
-    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    TwoLeases leases(fx);
+    IntentPhaseAdvancer advancer(leases.candidate_lease, leases.seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(0xABCULL), PhaseAdvanceStatus::WatermarkForeignStore);
-    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
+    leases.release();
 }
 
-TEST(IntentPhaseAdvancer, RefusesWithoutLease) {
-    Fixture fx("no_lease");
+TEST(IntentPhaseAdvancer, RefusesWithoutCandidateLease) {
+    Fixture fx("no_candidate_lease");
     fx.create_building_genesis(0xABCULL);
     fx.plant_watermark_reserving(1, 1);
 
     CandidateLease lease(fx.dir);
     // Deliberately never acquires.
-    IntentPhaseAdvancer advancer(lease, fx.ring);
+    SealJournalStoreLease seal_journal_lease(fx.seal_journal_dir);
+    ASSERT_EQ(seal_journal_lease.acquire(), SealJournalLeaseAcquireStatus::Acquired);
+    IntentPhaseAdvancer advancer(lease, seal_journal_lease, fx.ring);
     EXPECT_EQ(advancer.raise_intent_phase(0xABCULL), PhaseAdvanceStatus::LeaseNotHeld);
+    ASSERT_EQ(seal_journal_lease.release(), SealJournalLeaseReleaseStatus::Released);
+}
+
+TEST(IntentPhaseAdvancer, RefusesWithoutSealJournalStoreLease) {
+    Fixture fx("no_seal_journal_lease");
+    constexpr std::uint64_t kBuildNonce = 0xABCULL;
+    fx.create_building_genesis(kBuildNonce);
+    fx.plant_watermark_reserving(1, 1);
+
+    CandidateLease lease(fx.dir);
+    ASSERT_EQ(lease.acquire(), LeaseAcquireStatus::Acquired);
+    SealJournalStoreLease seal_journal_lease(fx.seal_journal_dir);
+    // Deliberately never acquires -- watermark advance (CandidateLease-guarded)
+    // must still succeed and be memoized before the `.jhw` step discovers the
+    // second lease isn't held.
+    IntentPhaseAdvancer advancer(lease, seal_journal_lease, fx.ring);
+    EXPECT_EQ(advancer.raise_intent_phase(kBuildNonce), PhaseAdvanceStatus::SealJournalStoreLeaseNotHeld);
+    ASSERT_EQ(lease.release(), ReleaseStatus::Released);
 }

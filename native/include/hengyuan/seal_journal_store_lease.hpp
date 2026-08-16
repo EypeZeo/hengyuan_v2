@@ -17,12 +17,14 @@
 // compaction-candidate-intent/seal-export-started's breadcrumb directory in
 // any filename enumeration in this repo's specs.
 //
-// SCOPE: read-only this round. Two friend-only typed read methods
-// (SealJournalCommitWatermark's `.jhw`, SealJournalTombstoneWire's `.jts`),
-// zero write methods -- same "one more round of restraint" every Round E
-// slice before this one already established (receipt concept /
-// raise_intent_phase() / manager wiring are explicitly out of scope; see
-// this round's ledger entry). Unlike CandidateLease, this directory holds
+// SCOPE: was read-only through the breadcrumb-loaders round. The
+// "Seal-journal Round E SealJournalCommitWatermark CREATE_NEW + two-lock
+// coordination" entry adds this class's first write method
+// (create_seal_journal_commit_watermark_no_replace, CREATE_NEW only, no
+// REPLACE/delete of any kind) plus its first friend outside the two
+// loaders/test-accessor: `IntentPhaseAdvancer`. Two friend-only typed read
+// methods (SealJournalCommitWatermark's `.jhw`, SealJournalTombstoneWire's
+// `.jts`) remain unchanged. Unlike CandidateLease, this directory holds
 // MANY candidates' files side by side (`<candidate_id_hex16>.jhw`/
 // `<candidate_id_hex16>-<journal_seq_hex16>.jts`, selected by filename, not
 // one lease instance per candidate) -- do not read the "Store" in the class
@@ -33,6 +35,21 @@
 //
 // See windows_native_io.hpp / seal_journal_store_io.hpp for the
 // platform-specific mechanics this class is built on.
+//
+// LOCK ORDER (first time this codebase has ever needed one -- read this
+// before acquiring both this class and CandidateLease in the same scope):
+// CandidateLease MUST be acquired before SealJournalStoreLease, and
+// released after it (SealJournalStoreLease released first). Intent is the
+// single source of truth CandidateLease guards; SealJournalStoreLease
+// guards satellite state outside it. This order is documentation-enforced
+// only -- there is no compiler mechanism preventing a future caller from
+// acquiring them in the opposite order and deadlocking against a
+// concurrent caller that follows this rule (same class of honest
+// limitation as this codebase's friend-isolation comments elsewhere).
+// IntentPhaseAdvancer (intent_phase_advancer.hpp) is the one caller today;
+// it does not acquire either lease itself, it only uses two already-held
+// references, so this rule binds whoever constructs an IntentPhaseAdvancer,
+// not IntentPhaseAdvancer's own code.
 
 #pragma once
 
@@ -105,6 +122,11 @@ struct SealJournalLeaseReadResult {
     seal_journal_store_detail::ReadFixedResult read{};  // meaningful only when outcome == Ok
 };
 
+struct SealJournalLeaseWriteResult {
+    SealJournalLeaseIoOutcome outcome{SealJournalLeaseIoOutcome::WrongOwner};
+    seal_journal_store_detail::PublishResult publish{};  // meaningful only when outcome == Ok
+};
+
 namespace seal_journal_store_detail_impl {
 
 inline std::size_t hash_this_thread() noexcept {
@@ -117,6 +139,12 @@ inline std::size_t hash_this_thread() noexcept {
 // (seal_journal_commit_tombstone_loader.hpp).
 class SealJournalCommitWatermarkLoader;
 class SealJournalTombstoneLoader;
+
+// Forward-declared friend -- intent_phase_advancer.hpp's write path. See
+// that class's own file for the full design rationale and its SCOPE
+// comment for why this is test-only, not wired into any production call
+// path.
+class IntentPhaseAdvancer;
 
 namespace test_only {
 // Pre-integration test accessor -- see the friend declaration inside
@@ -208,9 +236,26 @@ private:
     // so this round's own tests need a friend to drive the two methods
     // through. Harmless to keep permanently once the real loaders land.
     friend class hy::test_only::SealJournalStoreLeaseTestAccess;
+    // See this file's header comment's LOCK ORDER section and
+    // intent_phase_advancer.hpp's own friend-isolation comment (identical
+    // C++ friendship-is-class-scoped-not-method-scoped limitation applies
+    // here too).
+    friend class hy::IntentPhaseAdvancer;
 
     SealJournalLeaseReadResult read_seal_journal_commit_watermark(
         std::uint64_t candidate_id, std::span<std::byte, kSealJournalCommitWatermarkWireBytes> out) noexcept;
+    // CREATE_NEW only -- this class has no REPLACE/delete primitive.
+    // candidate_id selects the filename (SealJournalArtifactName::
+    // for_commit_watermark), same division of responsibility as
+    // CandidateLease's write methods: this method performs no semantic
+    // validation of encoded_watermark itself, the caller is responsible for
+    // having already encoded a value this candidate_id is legally allowed
+    // to bind (IntentPhaseAdvancer only ever calls this once per
+    // build_nonce, immediately after deriving that exact candidate_id from
+    // the SealIdWatermark advance).
+    SealJournalLeaseWriteResult create_seal_journal_commit_watermark_no_replace(
+        std::uint64_t candidate_id,
+        std::span<const std::byte, kSealJournalCommitWatermarkWireBytes> encoded_watermark) noexcept;
     SealJournalLeaseReadResult read_seal_journal_tombstone(
         std::uint64_t candidate_id, std::uint64_t journal_seq,
         std::span<std::byte, kSealJournalTombstoneBytes> out) noexcept;
@@ -298,6 +343,86 @@ inline seal_journal_store_detail::ReadFixedResult read_validated_exact_win(
         return result;
     }
     result.status = seal_journal_store_detail::ReadFixedStatus::Ok;
+    return result;
+}
+
+inline std::wstring make_unique_tmp_name_win(std::string_view final_name) noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
+    std::array<wchar_t, seal_journal_store_detail::kMaxArtifactNameLen> final_name_storage{};
+    std::wstring out(ascii_to_wide(final_name, final_name_storage));
+    out += L".tmp-" + std::to_wstring(::GetCurrentProcessId()) + L"-" + std::to_wstring(n);
+    return out;
+}
+
+// Direct analogue of compaction_lease.hpp's write_validated_no_replace_win
+// -- duplicated (not reused) for the same trust-boundary reason
+// seal_journal_store_io.hpp states at its top. CREATE_NEW only, same as
+// this file's POSIX write_validated_no_replace().
+inline seal_journal_store_detail::PublishResult write_validated_no_replace_win(
+    const win_native::RawHandle& dir, const seal_journal_store_detail::SealJournalArtifactName& name,
+    std::span<const std::byte> bytes) noexcept {
+    seal_journal_store_detail::PublishResult result{};
+    std::array<wchar_t, seal_journal_store_detail::kMaxArtifactNameLen> final_name_storage{};
+    const std::wstring_view final_name = ascii_to_wide(name.relative_name(), final_name_storage);
+    const std::wstring tmp_name = make_unique_tmp_name_win(name.relative_name());
+
+    win_native::RawHandle tmp;
+    if (win_native::create_new_relative(dir, tmp_name, tmp) != win_native::RelativeCreateResult::Created) {
+        result.state = seal_journal_store_detail::PublishCommitState::NotPublished;
+        return result;
+    }
+
+    DWORD written = 0;
+    BOOL ok = ::WriteFile(tmp.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    ok = ok && written == static_cast<DWORD>(bytes.size());
+    ok = ok && ::FlushFileBuffers(tmp.get());
+    if (!ok) {
+        result.state = seal_journal_store_detail::PublishCommitState::NotPublished;
+        return result;
+    }
+
+    NTSTATUS rename_status = 0;
+    const auto rename_result =
+        win_native::rename_no_replace(tmp, dir, std::wstring(final_name), &rename_status);
+    if (rename_result == win_native::RelativeRenameResult::AlreadyExists) {
+        tmp.reset();
+        win_native::RawHandle existing;
+        if (win_native::open_existing_relative(dir, final_name, existing) !=
+            win_native::RelativeOpenResult::Opened) {
+            result.state = seal_journal_store_detail::PublishCommitState::NotPublished;
+            return result;
+        }
+        std::vector<std::byte> existing_bytes(bytes.size() + 1);
+        DWORD read_n = 0;
+        if (!::ReadFile(existing.get(), existing_bytes.data(), static_cast<DWORD>(existing_bytes.size()),
+                         &read_n, nullptr)) {
+            result.state = seal_journal_store_detail::PublishCommitState::NotPublished;
+            return result;
+        }
+        const bool byte_equal =
+            read_n == bytes.size() && std::memcmp(existing_bytes.data(), bytes.data(), bytes.size()) == 0;
+        if (byte_equal) {
+            result.state = seal_journal_store_detail::PublishCommitState::DurablyPublished;
+            result.provenance = seal_journal_store_detail::PublishProvenance::FoundPreExisting;
+            return result;
+        }
+        result.state = seal_journal_store_detail::PublishCommitState::NotPublished;
+        return result;
+    }
+    if (rename_result != win_native::RelativeRenameResult::Renamed) {
+        result.state = seal_journal_store_detail::PublishCommitState::NotPublished;
+        return result;
+    }
+    tmp.reset();
+
+    if (::FlushFileBuffers(dir.get())) {
+        result.state = seal_journal_store_detail::PublishCommitState::DurablyPublished;
+        result.provenance = seal_journal_store_detail::PublishProvenance::CreatedThisCallDurable;
+    } else {
+        result.state = seal_journal_store_detail::PublishCommitState::PublishedNamespaceUncertain;
+        result.provenance = seal_journal_store_detail::PublishProvenance::CreatedThisCallUncertain;
+    }
     return result;
 }
 
@@ -498,6 +623,23 @@ inline SealJournalLeaseReadResult SealJournalStoreLease::read_seal_journal_commi
     result.read = seal_journal_store_detail_impl::read_validated_exact_win(dir_handle_, name, out);
 #else
     result.read = seal_journal_store_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline SealJournalLeaseWriteResult SealJournalStoreLease::create_seal_journal_commit_watermark_no_replace(
+    std::uint64_t candidate_id,
+    std::span<const std::byte, kSealJournalCommitWatermarkWireBytes> encoded_watermark) noexcept {
+    SealJournalLeaseWriteResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != SealJournalLeaseIoOutcome::Ok) return result;
+
+    const auto name = seal_journal_store_detail::SealJournalArtifactName::for_commit_watermark(candidate_id);
+#ifdef _WIN32
+    result.publish = seal_journal_store_detail_impl::write_validated_no_replace_win(dir_handle_, name,
+                                                                                      encoded_watermark);
+#else
+    result.publish = seal_journal_store_detail::write_validated_no_replace(dir_fd_, name, encoded_watermark);
 #endif
     return result;
 }

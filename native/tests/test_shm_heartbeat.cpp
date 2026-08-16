@@ -216,9 +216,19 @@ TEST(ShmHeartbeatConcurrency, ReaderNeverObservesATornGeneration) {
     writer.init(7);
 
     constexpr std::uint64_t kWrites = 200000;
+    std::atomic<bool> reader_ready{false};
     std::atomic<bool> writer_done{false};
 
     std::thread w([&] {
+        // Same latch shape as test_reconcile_concurrency.cpp: the worker must
+        // not start until the other side is actually executing. Release-build
+        // CI (ubuntu-24.04, -O2) can finish all 200k seqlock sections before
+        // the parent reaches the first load of writer_done -- the test then
+        // fails the vacuous-guard (reads+failed_reads==0) in 0 ms. Observed
+        // as CI Native run 31890070101 attempts 1-3; not a seqlock tear.
+        while (!reader_ready.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
         for (std::uint64_t i = 1; i <= kWrites; ++i) {
             // One seqlock section covering BOTH fields, so the invariant below is
             // the property actually under test.
@@ -232,22 +242,28 @@ TEST(ShmHeartbeatConcurrency, ReaderNeverObservesATornGeneration) {
     std::uint64_t failed_reads = 0;
     std::uint64_t torn = 0;
     std::uint64_t last_counter = 0;
-    while (!writer_done.load(std::memory_order_acquire)) {
+    // Announce only after the first poll has executed, so the vacuous-guard
+    // cannot fire even if the writer later races through the whole batch
+    // during a preemption window. do-while keeps polling through writer_done.
+    do {
         ShmHeartbeatSnapshot s{};
         if (!shm_read_snapshot(blk, s)) {
             ++failed_reads;
-            continue;
+        } else {
+            ++reads;
+            // loop_counter is bumped before last_incoming_ns within the same iteration,
+            // so a consistent generation shows either (n, (n-1)*2) [mid-iteration] or
+            // (n, n*2) [end of iteration]. What must NEVER appear is incoming AHEAD of
+            // the counter, which is what a torn read across generations produces.
+            if (s.last_incoming_ns > s.loop_counter * 2) ++torn;
+            // Monotonicity: a stable generation can never go backwards.
+            if (s.loop_counter < last_counter) ++torn;
+            last_counter = s.loop_counter;
         }
-        ++reads;
-        // loop_counter is bumped before last_incoming_ns within the same iteration,
-        // so a consistent generation shows either (n, (n-1)*2) [mid-iteration] or
-        // (n, n*2) [end of iteration]. What must NEVER appear is incoming AHEAD of
-        // the counter, which is what a torn read across generations produces.
-        if (s.last_incoming_ns > s.loop_counter * 2) ++torn;
-        // Monotonicity: a stable generation can never go backwards.
-        if (s.loop_counter < last_counter) ++torn;
-        last_counter = s.loop_counter;
-    }
+        if (!reader_ready.load(std::memory_order_relaxed)) {
+            reader_ready.store(true, std::memory_order_release);
+        }
+    } while (!writer_done.load(std::memory_order_acquire));
     w.join();
 
     EXPECT_EQ(torn, 0u) << "seqlock must never hand back an inconsistent generation";

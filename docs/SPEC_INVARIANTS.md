@@ -1415,6 +1415,85 @@ drain-completeness 前置检查；Reserved→StartedPublished 及之后任何边
 - `tools/spec_xref_check.py --quiet`、`tools/spec_enum_diff.py`：均 clean（跟之前几轮相同的
   既有、无关警告）。
 
+### Seal-journal Round E SealJournalCommitWatermark CREATE_NEW + 两把锁协调[已实现]
+
+上一轮（"Seal-journal Round E SealIdWatermark advance"，见上）明确把 `SealJournalCommitWatermark`
+CREATE_NEW 推迟到"专门设计两把锁协调方案的下一轮"。L4 spec 原文
+（`docs/BINANCE_PRIVATE_REST_L4_SPEC.md:3839-3843`）："Reserved: after durable SealIdWatermark
+advance + CREATE_NEW SealJournalCommitWatermark for this candidate_id (same id-reserve step as
+§10.1): publish `.x1` seq=1 ... THEN REPLACE Intent."——这一轮做后半句：把 `.jhw`
+（`seal-journal/<store_uuid>/<candidate_id_hex16>.jhw`）的 CREATE_NEW 折进
+`raise_intent_phase()`，插在 watermark advance 产出 candidate_id 之后、构造 `.x1` 之前（`.jhw`
+的 `candidate_id` 字段本身就依赖 watermark advance 的输出，两步顺序不能颠倒）。这是
+`IntentPhaseAdvancer` 第一次需要同时持有两把完全独立的锁（`CandidateLease` +
+`SealJournalStoreLease`，互不共享任何状态）。
+
+**一轮对抗性审查**（协调者本地 scratchpad，未入库，`jhw_create_new_two_lock_design_v1.md`）：
+核实全部 8 条声明，草稿的核心结论（两把锁确实是这个仓库第一次出现、`.jhw` CREATE_NEW 必须晚于
+watermark advance、`.jhw` 需要跟 `X1WriteProvenanceMemory` 同款（不是跟
+`WatermarkAdvanceProvenanceMemory` 同款）的幂等重试防护——因为 `.jhw` 是 no-replace CREATE_NEW,
+跟 `.x1` 是同一类原语，不是 watermark 的 REPLACE-advance）全部确认成立。审查同时指出草稿三处
+可执行层面的缺口（草稿本身没有编译期/运行期可验证性,是写代码时才会暴露的那类问题，不是设计
+思路错误）：
+1. 草稿提议的写方法签名遗漏了 `candidate_id` 参数——`SealJournalArtifactName::
+   for_commit_watermark(candidate_id)` 需要它才能构造文件名，跟已有的读方法
+   `read_seal_journal_commit_watermark(candidate_id, out)` 签名一致，草稿的写方法却只有
+   encoded bytes 一个参数，物理上无法确定要写哪个文件。
+2. 草稿把 Windows 写原语放错了文件——`seal_journal_store_io.hpp` 只有平台无关部分 + POSIX-only
+   部分（`#ifndef _WIN32`），Windows 版本应该跟既有的 `read_validated_exact_win` 一样放在
+   `seal_journal_store_lease.hpp` 自己的 `#ifdef _WIN32` 块里。
+3. 草稿没有设计新的写结果类型——`SealJournalStoreLease` 目前只有 `SealJournalLeaseReadResult`，
+   新写方法需要一个类比 `CandidateLease` 的 `LeaseWriteResult` 的 `SealJournalLeaseWriteResult`。
+审查同时核实草稿"未决问题"里的第 3 条本可以不必悬而未决——L4 spec 3024 行明确写"Lifetime:
+CREATE_NEW at durable id-reserve (highest=0)"，`highest_committed_journal_seq` 在 CREATE_NEW
+时必须是 0，不是草稿以为的"看起来合理但没找到明文依据"。
+
+**这一轮做的事**：
+- `seal_journal_store_io.hpp`：新增 `PublishCommitState`/`PublishProvenance`/`PublishResult`
+  （跟 `compaction_breadcrumb_io.hpp` 同款词汇表，复制不共享，同一条信任边界理由）+ POSIX
+  `write_validated_no_replace()`（CREATE_NEW only，这个文件依然没有 REPLACE/delete 原语）。
+- `seal_journal_store_lease.hpp`：新增 Windows `write_validated_no_replace_win()`（镜像
+  `compaction_lease.hpp` 同名函数），新增 `SealJournalLeaseWriteResult`，新增
+  `create_seal_journal_commit_watermark_no_replace(candidate_id, encoded_watermark)`
+  friend-only 写方法（这个类有史以来第一个写方法），新增
+  `friend class hy::IntentPhaseAdvancer`（第 3 个 friend）。新增
+  **LOCK ORDER 文档**：`CandidateLease` 必须先于 `SealJournalStoreLease` 获取，释放顺序相反——
+  这个仓库第一次需要跨两把锁的调用路径，没有先例可循，这条规则只能靠文档纪律，编译器不强制。
+- `intent_phase_advancer.hpp`：构造函数改成同时接收 `CandidateLease&` +
+  `SealJournalStoreLease&`（调用方负责按 LOCK ORDER 顺序各自 acquire 好、持有整个调用期间，
+  这个类本身不 acquire/release 任何一把锁）。`raise_intent_phase()` 在 watermark advance
+  之后、构造 `.x1` 之前插入 `.jhw` CREATE_NEW，新增 `JhwWriteProvenanceMemory`（跟
+  `X1WriteProvenanceMemory` 同形状，键为 `(build_nonce, candidate_id, encoded .jhw bytes)`,
+  只在 `PublishedNamespaceUncertain` 时才记忆——因为 candidate_id 到这一步已经被
+  `WatermarkAdvanceProvenanceMemory` 钉死，`.jhw` 内容对同一个 build_nonce 永远确定，定成功/
+  定失败都可以安全地在重试时重新推导，不需要跟 watermark advance 那种"一旦 Durable 就已经
+  消耗、必须记忆"的逻辑）。新增 `PhaseAdvanceStatus::SealJournalStoreLeaseNotHeld/
+  SealJournalStoreLeaseFenced/SealJournalStoreLeaseDirectoryIdentityChanged/JhwWriteFailed`。
+- `test_intent_phase_advancer.cpp`：全部改用 TwoLeases 测试 helper（同时 acquire 两把锁，按
+  LOCK ORDER 顺序 release），新增 WritesDurableJhwAndX1BeforeReplacingIntent（验证 `.jhw`
+  真实落盘、字段正确）、RefusesWithoutSealJournalStoreLease（对称于既有的
+  RefusesWithoutCandidateLease，原 RefusesWithoutLease 改名）；既有的
+  RetryAfterX1FailureReusesSameWatermarkBoundIdsInsteadOfBurningAnother 顺带验证了 `.jhw`
+  CREATE_NEW 在重试路径上的 byte-compare-on-collision 自愈行为（不需要额外测试，这个场景
+  天然被这条既有用例的重试步骤覆盖到）。
+
+**明确不做（这一轮之后 Building→Reserved 的两个 id-reserve 写终于都做完了，但仍然不做）**：
+`.xgc`/GC 授权；journal drain-completeness 前置检查；Reserved→StartedPublished 及之后任何边；
+`highest_committed_journal_seq` 后续的 REPLACE-with-monotonic-CAS（`.jhw` 生命周期里 CREATE_NEW
+之后的部分，属于 StartedPublished 及之后，本仓库目前完全没有）。运营范围延续"只做到类存在、
+测试证明逻辑对，不接入生产路径"（未变）。
+
+**验证（2026-08-15）**：
+- MSVC Release 全量构建：0 warning。全量 ctest：1097/1097（1096 基线 + 本轮新增 1 个测试，1 个
+  既有 POSIX-only skip）。
+- WSL2 GCC-14 Release（`HY_BUILD_DEMO=ON`）：1126/1126（1125 基线 + 本轮新增 1 个测试）。
+- WSL2 ASan+UBSan（同前几轮的 OOM 规避，这次目标列表一次性包含了
+  compaction_lease_holder，没有重复上一轮"漏掉辅助程序"那个失误）：95/95，无 ASan/UBSan 报告。
+- WSL2 TSan：`ctest -L concurrency`：58/58。两个负控均正确报出 `WARNING: ThreadSanitizer: data
+  race`。
+- `tools/spec_xref_check.py --quiet`、`tools/spec_enum_diff.py`：均 clean（跟之前几轮相同的
+  既有、无关警告）。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 

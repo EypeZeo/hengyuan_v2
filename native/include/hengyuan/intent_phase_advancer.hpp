@@ -79,10 +79,13 @@
 //    next_request_id` (the value AT the point of advance, not "minus one" --
 //    the "-1" reading was only correct under the old, never-true
 //    already-advanced assumption). `SealJournalCommitWatermark` CREATE_NEW
-//    (the L4 spec's other Reserved-moment write, in a directory guarded by a
-//    completely different lock class, SealJournalStoreLease) is deliberately
-//    still out of scope this round -- folding it in requires a two-lock
-//    coordination design this round does not attempt; see the ledger entry.
+//    (the L4 spec's other Reserved-moment write, in a directory guarded by
+//    the completely separate SealJournalStoreLease) is now folded in too
+//    (docs/SPEC_INVARIANTS.md's "Seal-journal Round E SealJournalCommitWatermark
+//    CREATE_NEW + two-lock coordination" entry) -- this class now requires
+//    the caller to hold BOTH leases for the whole call. See
+//    seal_journal_store_lease.hpp's header comment's LOCK ORDER section for
+//    the acquisition-order rule this binds the caller (not this class) to.
 
 #pragma once
 
@@ -91,6 +94,8 @@
 #include <hengyuan/compaction_lease.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/seal_id_watermark_export_started_loader.hpp>
+#include <hengyuan/seal_journal_commit_tombstone_codec.hpp>
+#include <hengyuan/seal_journal_store_lease.hpp>
 
 #include <array>
 #include <cstdint>
@@ -142,6 +147,13 @@ enum class PhaseAdvanceStatus : std::uint8_t {
                                   // simply retry the whole raise_intent_phase() call; the retry's
                                   // fresh read will see the real, now-existing watermark and take
                                   // the normal (non-bootstrap) path.
+    SealJournalStoreLeaseNotHeld,
+    SealJournalStoreLeaseFenced,
+    SealJournalStoreLeaseDirectoryIdentityChanged,
+    JhwWriteFailed,               // the `.jhw` CREATE_NEW returned NotPublished (a real conflict --
+                                  // see JhwWriteProvenanceMemory's comment for why this should be
+                                  // unreachable given WatermarkAdvanceProvenanceMemory already
+                                  // guarantees a deterministic candidate_id per build_nonce).
     IllegalTransition,           // validate_intent_transition() rejected the constructed
                                   // before/after/`.x1` triple.
     X1WriteFailed,
@@ -170,7 +182,13 @@ private:
 
 class IntentPhaseAdvancer {
 public:
-    IntentPhaseAdvancer(CandidateLease& lease, KeyRing& key_ring) noexcept : lease_(lease), key_ring_(key_ring) {}
+    // Both leases must already be acquire()'d by the caller, held for the
+    // whole call -- this class never acquires/releases either. See
+    // seal_journal_store_lease.hpp's header comment's LOCK ORDER section:
+    // candidate_lease must have been acquired before seal_journal_lease.
+    IntentPhaseAdvancer(CandidateLease& candidate_lease, SealJournalStoreLease& seal_journal_lease,
+                         KeyRing& key_ring) noexcept
+        : lease_(candidate_lease), seal_journal_lease_(seal_journal_lease), key_ring_(key_ring) {}
 
     // The only write operation this class has. See the header comment's
     // SCOPE section for the full boundary (Building->Reserved only, no
@@ -218,10 +236,26 @@ private:
         bool advanced{false};
     };
 
+    // Same shape as X1WriteProvenanceMemory, NOT WatermarkAdvanceProvenanceMemory: `.jhw` is a
+    // no-replace CREATE_NEW (same primitive class as `.x1`), not a REPLACE-advance -- only the
+    // *uncertain* outcome needs same-process memory, because content is fully deterministic per
+    // retry (candidate_id is already pinned via WatermarkAdvanceProvenanceMemory by the time this
+    // write happens, so a definite success or definite failure is each safe to re-derive fresh).
+    // Keyed on (build_nonce, candidate_id, encoded `.jhw` bytes) rather than just build_nonce,
+    // matching X1WriteProvenanceMemory's "compare the exact bytes, not just the identity" caution.
+    struct JhwWriteProvenanceMemory {
+        std::uint64_t build_nonce{0};
+        std::uint64_t candidate_id{0};
+        std::array<std::byte, kSealJournalCommitWatermarkWireBytes> encoded_watermark{};
+        bool uncertain{false};
+    };
+
     CandidateLease& lease_;
+    SealJournalStoreLease& seal_journal_lease_;
     KeyRing& key_ring_;
     std::optional<X1WriteProvenanceMemory> x1_provenance_memory_{};
     std::optional<WatermarkAdvanceProvenanceMemory> watermark_provenance_memory_{};
+    std::optional<JhwWriteProvenanceMemory> jhw_provenance_memory_{};
 };
 
 inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_intent_phase(std::uint64_t build_nonce) noexcept {
@@ -392,6 +426,71 @@ inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_intent_phase(std::uint64_t 
             case compaction_detail::PublishCommitState::NotPublished:
             default:
                 return PhaseAdvanceStatus::WatermarkAdvanceFailed;
+        }
+    }
+
+    // Step 1b: CREATE_NEW SealJournalCommitWatermark (`.jhw`) for this
+    // candidate_id -- same id-reserve step as the watermark advance above
+    // (L4 spec: "Reserved: after durable SealIdWatermark advance + CREATE_NEW
+    // SealJournalCommitWatermark for this candidate_id"), in the completely
+    // separate directory SealJournalStoreLease guards. Runs unconditionally
+    // on every call reaching this point, including the same-process-retry
+    // branch above (candidate_id is pinned by then either way), because a
+    // retry after a downstream (`.jhw`/`.x1`/Intent) failure must still
+    // ensure `.jhw` exists before proceeding -- CREATE_NEW's own
+    // byte-compare-on-collision makes a repeat call for the SAME
+    // candidate_id/content safe on its own (no id is spent twice by this
+    // step; only WatermarkAdvanceProvenanceMemory's step above accounts for
+    // spent ids).
+    {
+        SealJournalCommitWatermark jhw{};
+        jhw.store_uuid_lo = before.store_uuid_lo;
+        jhw.store_uuid_hi = before.store_uuid_hi;
+        jhw.candidate_id = candidate_id;
+        jhw.highest_committed_journal_seq = 0;
+        jhw.kek_key_id = before.kek_key_id;
+
+        const PinResult jhw_pin = key_ring_.pin_key(before.kek_key_id);
+        if (jhw_pin.status != PinStatus::Pinned) return PhaseAdvanceStatus::IntentKeyNotFound;
+
+        std::array<std::byte, kSealJournalCommitWatermarkWireBytes> encoded_jhw{};
+        encode_seal_journal_commit_watermark_wire(encoded_jhw, jhw, jhw_pin.handle->key_bytes());
+
+        if (jhw_provenance_memory_.has_value() && jhw_provenance_memory_->uncertain &&
+            jhw_provenance_memory_->build_nonce == build_nonce &&
+            jhw_provenance_memory_->candidate_id == candidate_id &&
+            std::memcmp(jhw_provenance_memory_->encoded_watermark.data(), encoded_jhw.data(),
+                         encoded_jhw.size()) == 0) {
+            // Same-process retry of an attempt already known to be uncertain -- do not
+            // re-derive/re-judge from a fresh read; a fresh byte-equal read-back would
+            // carry no information about whether the parent-directory flush actually
+            // happened (same reasoning as X1WriteProvenanceMemory).
+            return PhaseAdvanceStatus::PhaseRaiseUncertain;
+        }
+
+        const SealJournalLeaseWriteResult jhw_write =
+            seal_journal_lease_.create_seal_journal_commit_watermark_no_replace(candidate_id, encoded_jhw);
+        switch (jhw_write.outcome) {
+            case SealJournalLeaseIoOutcome::WrongOwner:
+            case SealJournalLeaseIoOutcome::NotHeld:
+                return PhaseAdvanceStatus::SealJournalStoreLeaseNotHeld;
+            case SealJournalLeaseIoOutcome::StoreDirFenced:
+                return PhaseAdvanceStatus::SealJournalStoreLeaseFenced;
+            case SealJournalLeaseIoOutcome::DirectoryIdentityChanged:
+                return PhaseAdvanceStatus::SealJournalStoreLeaseDirectoryIdentityChanged;
+            case SealJournalLeaseIoOutcome::Ok:
+                break;
+        }
+        switch (jhw_write.publish.state) {
+            case seal_journal_store_detail::PublishCommitState::DurablyPublished:
+                jhw_provenance_memory_.reset();
+                break;
+            case seal_journal_store_detail::PublishCommitState::PublishedNamespaceUncertain:
+                jhw_provenance_memory_ = JhwWriteProvenanceMemory{build_nonce, candidate_id, encoded_jhw, true};
+                return PhaseAdvanceStatus::PhaseRaiseUncertain;
+            case seal_journal_store_detail::PublishCommitState::NotPublished:
+            default:
+                return PhaseAdvanceStatus::JhwWriteFailed;
         }
     }
 
