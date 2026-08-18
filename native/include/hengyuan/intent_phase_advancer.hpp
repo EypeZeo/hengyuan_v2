@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: proprietary
 // intent_phase_advancer.hpp -- IntentPhaseAdvancer: the receipt-gated
 // Building->Reserved phase raise (docs/SPEC_INVARIANTS.md's "Seal-journal
-// Round E receipt + raise_intent_phase() (Building->Reserved)" entry), and
-// (docs/SPEC_INVARIANTS.md's "Seal-journal Round E Reserved->StartedPublished
-// (NativeV2Started)" entry) the Reserved->StartedPublished raise,
-// raise_started_published().
+// Round E receipt + raise_intent_phase() (Building->Reserved)" entry), the
+// Reserved->StartedPublished raise (docs/SPEC_INVARIANTS.md's "Seal-journal
+// Round E Reserved->StartedPublished (NativeV2Started)" entry),
+// raise_started_published(), and the two terminal edges
+// StartedPublished->{PostSealFinalizing, AbandonFinalizing}
+// (docs/SPEC_INVARIANTS.md's "Seal-journal Round E StartedPublished->
+// {PostSealFinalizing, AbandonFinalizing}" entry), raise_post_seal_
+// finalizing() / raise_abandon_finalizing().
 //
 // Governance: L2 (real file I/O, via CandidateLease -- same governance class
 // as compaction_intent_store.hpp's IntentStore).
@@ -13,15 +17,18 @@
 // adversarial review converged on this boundary -- see the ledger entry and
 // the design scratch files it references for the full history):
 //
-// 1. This class implements Building->Reserved (`.x1` seq=1) and
+// 1. This class implements Building->Reserved (`.x1` seq=1),
 //    Reserved->StartedPublished (`.x1` seq=2, NativeV2Started/greenfield
-//    path only -- raise_started_published()). MigratedV2Started (the V+M
-//    legacy-companion write path) and StartedPublished->{PostSealFinalizing,
-//    AbandonFinalizing} do not exist here -- the latter two edges' field-
-//    mapping tables were found to have real bugs in round 1 of review (the
-//    Building->Reserved round) and are deferred to a future round that
-//    redesigns them against the real struct definitions, not carried
-//    forward from a rejected draft.
+//    path only -- raise_started_published()), and the two terminal edges
+//    StartedPublished->PostSealFinalizing / StartedPublished->
+//    AbandonFinalizing (`.x1` seq=3, NativeV2 path only --
+//    raise_post_seal_finalizing() / raise_abandon_finalizing()).
+//    MigratedV2Started (the V+M legacy-companion write path) does not exist
+//    here. The two terminal edges' field-mapping tables were found to have
+//    real bugs in round 1 of review (the Building->Reserved round) -- see
+//    point 8 below for the corrected mapping and the three bugs it avoids
+//    repeating; that finding is why this round exists as a dedicated,
+//    re-derived design rather than carrying forward the rejected draft.
 // 2. raise_intent_phase() takes ONLY build_nonce. It does not accept a bare
 //    to_phase (forbidden by docs/SPEC_INVARIANTS.md's Round D/E boundary --
 //    the whole reason `raise_intent_phase()` exists as a receipt-gated API
@@ -54,10 +61,17 @@
 //    future PostSeal-recovery implementation (which does not exist in this
 //    repo yet) encountering an L file this test-only call wrote would be
 //    FORCED to treat it as proof a real seal attempt happened, even though
-//    nothing real did. Do not wire either function into any real
-//    compaction-trigger flow until StartedPublished->{PostSealFinalizing,
-//    AbandonFinalizing} and at least the shape of PreSeal-abandon cleanup
-//    exist.
+//    nothing real did. raise_post_seal_finalizing()/raise_abandon_
+//    finalizing() are SHARPER STILL: a test-only call can now drive
+//    Intent.phase all the way to a TERMINAL value (3 or 4), not just an
+//    intermediate breadcrumb -- a future real PostSeal/Abandon recovery
+//    implementation encountering that terminal phase would be forced to
+//    treat it as proof the ENTIRE real cleanup procedure (ordered M/V/L or
+//    A unlink, `.xgc` authorization, TipExportProducerResume) already ran to
+//    completion, when in this repo nothing real ever did. Do not wire any of
+//    these four functions into any real compaction-trigger flow until real
+//    `.clr`/`.abd` authorization, `.xgc` CREATE/GC, and TipExportProducerResume
+//    all exist.
 // 4. Friend-isolation honesty (same finding as the breadcrumb-loader round,
 //    repeated here because it applies to every new friend added since):
 //    `friend class hy::IntentPhaseAdvancer;` in compaction_lease.hpp grants
@@ -115,31 +129,65 @@
 //    This is why this function's shape is closer to "commit already-
 //    computed evidence" than "advance an internal counter" -- do not read
 //    the two functions as the same pattern with different field names.
+//    raise_post_seal_finalizing()/raise_abandon_finalizing() extend this
+//    same "checked, not trusted, caller-must-already-have-produced-it"
+//    trust model one step further, but with a twist: the evidence
+//    (`SealStartedCleanupTombstoneWire`/`SealStartedAbandonWire`, `.clr`/
+//    `.abd`) is not a call parameter at all -- these two functions read it
+//    back off disk themselves (via the already-landed, read-only
+//    `SealStartedCleanupTombstoneLoader`/`SealStartedAbandonLoader`), the
+//    same way raise_started_published() reads back the seq=1 `.x1` frame a
+//    prior call must have already published. Neither function ever writes
+//    `.clr`/`.abd` -- this repo has no code path that can legitimately
+//    produce a `.clr` already at phase==Authorized or an `.abd` already at
+//    phase==ResumeAuthorized(6), because that requires the real (absent)
+//    authorization procedure; test fixtures plant them directly via a raw
+//    file write (see test_intent_phase_advancer.cpp), bypassing
+//    CandidateLease entirely, same precedent as this file's own
+//    plant_watermark() helper for SealIdWatermark.
 // 7. walk_x1_chain_raw()'s TerminalBranchConflict check (compaction_intent_
 //    codec.hpp) only fires when the supplied chain is exactly 3 frames --
 //    for the 1-frame (Building->Reserved) and 2-frame (Reserved->
-//    StartedPublished) chains both functions in this class construct, it
-//    is silently skipped, so `after.phase` is NEVER cross-checked against
-//    the chain's actual terminal to_phase by that shared function alone.
-//    This is NOT a bug to fix in walk_x1_chain_raw itself -- IntentStore::
-//    inspect_x1_chain() (compaction_intent_store.hpp) legitimately calls it
-//    with the REAL on-disk Intent.phase against whatever `.x1` frames
-//    happen to exist, and that phase can legitimately lag the chain during
-//    the documented crash window between a `.x1` write landing and the
-//    following Intent REPLACE (L4 spec: "recovery one-step lag completes
-//    REPLACE to Reserved") -- forcing the check to run unconditionally
-//    would misclassify that legitimate recovery window as corruption, with
-//    no existing test to catch the regression. Both raise_intent_phase()
-//    and raise_started_published() instead each carry their OWN explicit
-//    `after.phase == <this edge's target>` check, immediately after their
-//    own walk_x1_chain_raw call -- compiler-unenforced discipline, not a
-//    shared-function guarantee, same class of honest limitation as the
-//    LOCK ORDER comment in seal_journal_store_lease.hpp. (This is closed
-//    for the whole state machine, not just these two edges: the only legal
-//    chains are the 1-frame/2-frame/3-frame ones durable_control_plane.hpp
-//    documents, and the two 3-frame terminal edges -- PostSealFinalizing,
-//    AbandonFinalizing, not implemented in this repo -- are automatically
-//    covered by walk_x1_chain_raw's own size()==3 check when they land.)
+//    StartedPublished) chains, it is silently skipped, so `after.phase` is
+//    NEVER cross-checked against the chain's actual terminal to_phase by
+//    that shared function alone. This is NOT a bug to fix in
+//    walk_x1_chain_raw itself -- IntentStore::inspect_x1_chain()
+//    (compaction_intent_store.hpp) legitimately calls it with the REAL
+//    on-disk Intent.phase against whatever `.x1` frames happen to exist,
+//    and that phase can legitimately lag the chain during the documented
+//    crash window between a `.x1` write landing and the following Intent
+//    REPLACE (L4 spec: "recovery one-step lag completes REPLACE to
+//    Reserved") -- forcing the check to run unconditionally would
+//    misclassify that legitimate recovery window as corruption, with no
+//    existing test to catch the regression. Every raise_*() function in
+//    this class instead carries its OWN explicit `after.phase == <this
+//    edge's target>` check, immediately after its own walk_x1_chain_raw
+//    call -- compiler-unenforced discipline, not a shared-function
+//    guarantee, same class of honest limitation as the LOCK ORDER comment
+//    in seal_journal_store_lease.hpp. For the two 3-frame terminal edges
+//    this round adds, walk_x1_chain_raw's own size()==3 TerminalBranchConflict
+//    check DOES also fire (unlike the two shorter chains above), so the
+//    explicit check in raise_post_seal_finalizing()/raise_abandon_
+//    finalizing() is deliberately redundant with it -- kept for symmetry
+//    with the other two functions' discipline, not because it is load-
+//    bearing on its own for this particular edge.
+// 8. walk_x1_chain_raw()'s ForeignBinding check (compaction_intent_codec.hpp)
+//    compares store_uuid/kek_key_id/source_generation/target_generation/
+//    baseline_tip_seq/baseline_tip_mac/baseline_key_id/build_nonce between
+//    each `.x1` frame and the Intent it's validated against -- it NEVER
+//    compares candidate_id/request_id. A `.x1` frame with a fully valid MAC
+//    but a candidate_id/request_id that doesn't match the current Intent's
+//    own (impossible under this class's own write paths, but not something
+//    walk_x1_chain_raw itself rules out for an arbitrary on-disk frame) would
+//    be silently accepted. raise_post_seal_finalizing()/raise_abandon_
+//    finalizing() read back BOTH the seq=1 and seq=2 frames fresh (neither
+//    was read by the call that's raising THIS edge), so this class closes
+//    the gap explicitly for both, immediately after reading each frame back.
+//    raise_started_published() reads back seq=1 the same way and carries the
+//    identical exposure -- it is patched with the same explicit check as
+//    part of this same round (two lines, no behavior change on any already-
+//    passing test), rather than left as a latent gap in already-merged code
+//    while only the new functions get the fix.
 
 #pragma once
 
@@ -151,6 +199,8 @@
 #include <hengyuan/seal_journal_commit_tombstone_codec.hpp>
 #include <hengyuan/seal_journal_precondition_codec.hpp>
 #include <hengyuan/seal_journal_store_lease.hpp>
+#include <hengyuan/seal_started_abandon_loader.hpp>
+#include <hengyuan/seal_started_migration_cleanup_loader.hpp>
 
 #include <array>
 #include <cstdint>
@@ -214,18 +264,62 @@ enum class PhaseAdvanceStatus : std::uint8_t {
     X1WriteFailed,
     IntentReplaceFailed,
 
-    // raise_started_published() only, from here down.
-    SeqOneX1NotFound,            // read_x1_frame(build_nonce, 1, ...) returned NotFound -- Reserved
-                                  // phase should always have a durable seq=1 frame; missing means
-                                  // the state machine was tampered with or corrupted out-of-band,
-                                  // not a scenario this call can silently route around.
-    SeqOneX1Corrupt,              // seq=1 frame exists but failed MAC verification/decode.
+    // raise_started_published()/raise_post_seal_finalizing()/
+    // raise_abandon_finalizing() share these two: Reserved (and everything
+    // past it) should always have a durable seq=1 frame; missing/corrupt
+    // means the state machine was tampered with or corrupted out-of-band,
+    // not a scenario any of these calls can silently route around.
+    SeqOneX1NotFound,             // read_x1_frame(build_nonce, 1, ...) returned NotFound.
+    SeqOneX1Corrupt,              // seq=1 frame exists but failed MAC verification/decode, or its
+                                  // candidate_id/request_id don't match the Intent's own (header
+                                  // comment's point 8).
+
+    // raise_started_published() only.
     StartedForeignBinding,       // `started`'s store_uuid/candidate_id/request_id/source_generation/
                                   // target_generation/baseline_*/kek_key_id don't match the Intent's
                                   // own fields -- see the header comment's point 6 for why these are
                                   // checked (not derived) fields.
     StartedShapeInvalid,         // validate_seal_export_started_shape(started) rejected it (topology).
     StartedWriteFailed,          // the seal-export-started CREATE_NEW returned NotPublished.
+
+    // raise_post_seal_finalizing()/raise_abandon_finalizing() share these
+    // three: both need the seq=2 frame too (a 3-frame chain), and both can
+    // legally see the Intent already at either terminal phase.
+    SeqTwoX1NotFound,             // read_x1_frame(build_nonce, 2, ...) returned NotFound.
+    SeqTwoX1Corrupt,              // seq=2 frame exists but failed MAC verification/decode, or its
+                                  // candidate_id/request_id don't match the Intent's own.
+    AlreadyAtOppositeTerminalPhase,  // the Intent is already at the OTHER terminal phase (this call
+                                  // is raise_post_seal_finalizing() but Intent.phase is already
+                                  // AbandonFinalizing, or vice versa) -- a permanent, non-idempotent
+                                  // refusal, NOT a safe retry outcome: the spec forbids a
+                                  // PostSealFinalizing<->AbandonFinalizing cross unconditionally.
+
+    // raise_post_seal_finalizing() only.
+    ClrNotFound,                  // SealStartedCleanupTombstoneLoader::load() returned NotFound --
+                                  // no `.clr` exists yet for this candidate.
+    ClrCorrupt,                   // the loader returned Corrupt or IoError (MAC/shape/decode failure
+                                  // or a genuine read failure -- both surface as this one status,
+                                  // same "Corrupt is the honest umbrella" choice as IntentCorrupt).
+    ClrKeyNotFound,                // the loader returned KeyNotFound (`.clr`'s kek_key_id isn't pinned).
+    ClrForeignBinding,             // `.clr`'s store_uuid/candidate_id/request_id/kek_key_id/
+                                  // source_generation/baseline_*/new_generation/started_kind don't
+                                  // match this Intent's own fields (or started_kind != NativeV2 --
+                                  // MigratedV2Started is out of scope this round).
+    ClrNotAuthorized,             // `.clr`'s phase != kSealStartedCleanupPhaseAuthorized(0) -- exact
+                                  // equality, not `>=` (round-1 review bug #2: `>=0` is always true).
+
+    // raise_abandon_finalizing() only.
+    AbdNotFound,                   // SealStartedAbandonLoader::load() returned NotFound.
+    AbdCorrupt,                    // the loader returned Corrupt or IoError.
+    AbdKeyNotFound,                 // the loader returned KeyNotFound.
+    AbdForeignBinding,              // `.abd`'s store_uuid/candidate_id/request_id/kek_key_id/
+                                  // source_generation/baseline_*/started_kind don't match this
+                                  // Intent's own fields (`.abd` has no new_generation/new_final_*
+                                  // fields at all -- do not reuse `.clr`'s binding list here).
+    AbdNotResumeAuthorized,        // `.abd`'s phase != kSealStartedAbandonPhaseResumeAuthorized(6) --
+                                  // exact equality, not `>= GenGone(5)` (round-1 review bug #3:
+                                  // GenGone alone does not prove the tip was re-verified against the
+                                  // abandon baseline; only ResumeAuthorized does).
 };
 
 // A decoded-and-MAC-verified SealIdWatermark, obtainable only by
@@ -269,7 +363,40 @@ public:
     PhaseAdvanceStatus raise_started_published(std::uint64_t build_nonce,
                                                 const SealExportStartedWire& started) noexcept;
 
+    // StartedPublished->PostSealFinalizing (`.x1` seq=3), NativeV2 path only.
+    // Requires a durable `.clr` already at phase==Authorized -- read back via
+    // SealStartedCleanupTombstoneLoader, never written by this function (see
+    // the header comment's point 6). Test-only this round, same as above.
+    PhaseAdvanceStatus raise_post_seal_finalizing(std::uint64_t build_nonce) noexcept;
+
+    // StartedPublished->AbandonFinalizing (`.x1` seq=3), NativeV2 path only.
+    // Requires a durable `.abd` already at phase==ResumeAuthorized(6) -- read
+    // back via SealStartedAbandonLoader, never written by this function.
+    // `.abd` itself is never unlinked by this call (spec: "while A is still
+    // on disk"). Test-only this round, same as above.
+    PhaseAdvanceStatus raise_abandon_finalizing(std::uint64_t build_nonce) noexcept;
+
 private:
+    // Shared by raise_post_seal_finalizing()/raise_abandon_finalizing():
+    // reads back the durable seq=1 and seq=2 `.x1` frames a prior
+    // raise_intent_phase()/raise_started_published() call must already have
+    // published, MAC-verifies each, and checks each frame's candidate_id/
+    // request_id against `before`'s own (header comment's point 8 --
+    // walk_x1_chain_raw's ForeignBinding check never compares these two
+    // fields). raise_started_published()'s own single-frame Step 1 is left
+    // as its own inline block (not refactored to call this) to minimize the
+    // diff on already-shipped, already-tested code; it gets the equivalent
+    // two-line fix inline instead. Returns true (out_seq1/out_seq2 valid) on
+    // success; on failure returns false and sets out_failure_status to the
+    // real PhaseAdvanceStatus to propagate -- deliberately NOT expressed as
+    // "return a PhaseAdvanceStatus and use some value as a success sentinel,"
+    // since every enumerator here is a real, reachable terminal status and
+    // reusing one as a sentinel would be a footgun for any future call site.
+    bool read_verified_seq1_and_seq2(std::uint64_t build_nonce, const CompactionCandidateIntentWire& before,
+                                      CompactionIntentTransitionWire& out_seq1,
+                                      CompactionIntentTransitionWire& out_seq2,
+                                      PhaseAdvanceStatus& out_failure_status) noexcept;
+
     // Same reasoning, same shape, as IntentStore::genesis_provenance_memory_*
     // (compaction_intent_store.hpp) -- a same-process retry after
     // PublishedNamespaceUncertain must not "heal" into certainty just
@@ -804,6 +931,13 @@ inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_started_published(
             return PhaseAdvanceStatus::SeqOneX1Corrupt;
         }
         seq1 = verified_seq1->value();
+
+        // walk_x1_chain_raw()'s ForeignBinding check never compares
+        // candidate_id/request_id (header comment's point 8) -- check them
+        // explicitly here rather than trust a MAC-valid-but-foreign-ids frame.
+        if (seq1.candidate_id != before.candidate_id || seq1.request_id != before.request_id) {
+            return PhaseAdvanceStatus::SeqOneX1Corrupt;
+        }
     }
 
     // Step 2: `started` is caller-supplied (header comment's point 6) --
@@ -951,6 +1085,555 @@ inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_started_published(
 
     // Step 7: only now (the `.x1` is confirmed durable) REPLACE the Intent
     // to phase=StartedPublished.
+    std::array<std::byte, kCompactionCandidateIntentWireBytes> encoded_intent{};
+    encode_compaction_candidate_intent_wire(encoded_intent, after, write_pin.handle->key_bytes());
+
+    const LeaseWriteResult intent_write = lease_.replace_intent_phase(encoded_intent);
+    switch (intent_write.outcome) {
+        case LeaseIoOutcome::WrongOwner:
+        case LeaseIoOutcome::NotHeld:
+            return PhaseAdvanceStatus::LeaseNotHeld;
+        case LeaseIoOutcome::CandidateFenced:
+            return PhaseAdvanceStatus::CandidateFenced;
+        case LeaseIoOutcome::DirectoryIdentityChanged:
+            return PhaseAdvanceStatus::DirectoryIdentityChanged;
+        case LeaseIoOutcome::Ok:
+            break;
+    }
+    switch (intent_write.publish.state) {
+        case compaction_detail::PublishCommitState::DurablyPublished:
+            return PhaseAdvanceStatus::PhaseRaised;
+        case compaction_detail::PublishCommitState::PublishedNamespaceUncertain:
+            return PhaseAdvanceStatus::PhaseRaiseUncertain;
+        case compaction_detail::PublishCommitState::NotPublished:
+        default:
+            return PhaseAdvanceStatus::IntentReplaceFailed;
+    }
+}
+
+inline bool IntentPhaseAdvancer::read_verified_seq1_and_seq2(
+    std::uint64_t build_nonce, const CompactionCandidateIntentWire& before,
+    CompactionIntentTransitionWire& out_seq1, CompactionIntentTransitionWire& out_seq2,
+    PhaseAdvanceStatus& out_failure_status) noexcept {
+    {
+        std::array<std::byte, kCompactionIntentTransitionWireBytes> buf{};
+        const LeaseReadResult read_result = lease_.read_x1_frame(build_nonce, 1, buf);
+        switch (read_result.outcome) {
+            case LeaseIoOutcome::WrongOwner:
+            case LeaseIoOutcome::NotHeld:
+                out_failure_status = PhaseAdvanceStatus::LeaseNotHeld;
+                return false;
+            case LeaseIoOutcome::CandidateFenced:
+                out_failure_status = PhaseAdvanceStatus::CandidateFenced;
+                return false;
+            case LeaseIoOutcome::DirectoryIdentityChanged:
+                out_failure_status = PhaseAdvanceStatus::DirectoryIdentityChanged;
+                return false;
+            case LeaseIoOutcome::Ok:
+                break;
+        }
+        switch (read_result.read.status) {
+            case compaction_detail::ReadFixedStatus::NotFound:
+                out_failure_status = PhaseAdvanceStatus::SeqOneX1NotFound;
+                return false;
+            case compaction_detail::ReadFixedStatus::WrongSize:
+            case compaction_detail::ReadFixedStatus::NotRegularFile:
+            case compaction_detail::ReadFixedStatus::IoError:
+                out_failure_status = PhaseAdvanceStatus::SeqOneX1Corrupt;
+                return false;
+            case compaction_detail::ReadFixedStatus::Ok:
+                break;
+        }
+
+        const PinResult pin = key_ring_.pin_key(before.kek_key_id);
+        if (pin.status != PinStatus::Pinned) {
+            out_failure_status = PhaseAdvanceStatus::IntentKeyNotFound;
+            return false;
+        }
+
+        std::optional<VerifiedTransition> verified;
+        if (decode_compaction_intent_transition_wire(buf, pin.handle->key_bytes(), verified) !=
+            CompactionWireDecodeStatus::Ok) {
+            out_failure_status = PhaseAdvanceStatus::SeqOneX1Corrupt;
+            return false;
+        }
+        out_seq1 = verified->value();
+        // header comment's point 8: walk_x1_chain_raw never compares
+        // candidate_id/request_id -- check explicitly here.
+        if (out_seq1.candidate_id != before.candidate_id || out_seq1.request_id != before.request_id) {
+            out_failure_status = PhaseAdvanceStatus::SeqOneX1Corrupt;
+            return false;
+        }
+    }
+    {
+        std::array<std::byte, kCompactionIntentTransitionWireBytes> buf{};
+        const LeaseReadResult read_result = lease_.read_x1_frame(build_nonce, 2, buf);
+        switch (read_result.outcome) {
+            case LeaseIoOutcome::WrongOwner:
+            case LeaseIoOutcome::NotHeld:
+                out_failure_status = PhaseAdvanceStatus::LeaseNotHeld;
+                return false;
+            case LeaseIoOutcome::CandidateFenced:
+                out_failure_status = PhaseAdvanceStatus::CandidateFenced;
+                return false;
+            case LeaseIoOutcome::DirectoryIdentityChanged:
+                out_failure_status = PhaseAdvanceStatus::DirectoryIdentityChanged;
+                return false;
+            case LeaseIoOutcome::Ok:
+                break;
+        }
+        switch (read_result.read.status) {
+            case compaction_detail::ReadFixedStatus::NotFound:
+                out_failure_status = PhaseAdvanceStatus::SeqTwoX1NotFound;
+                return false;
+            case compaction_detail::ReadFixedStatus::WrongSize:
+            case compaction_detail::ReadFixedStatus::NotRegularFile:
+            case compaction_detail::ReadFixedStatus::IoError:
+                out_failure_status = PhaseAdvanceStatus::SeqTwoX1Corrupt;
+                return false;
+            case compaction_detail::ReadFixedStatus::Ok:
+                break;
+        }
+
+        const PinResult pin = key_ring_.pin_key(before.kek_key_id);
+        if (pin.status != PinStatus::Pinned) {
+            out_failure_status = PhaseAdvanceStatus::IntentKeyNotFound;
+            return false;
+        }
+
+        std::optional<VerifiedTransition> verified;
+        if (decode_compaction_intent_transition_wire(buf, pin.handle->key_bytes(), verified) !=
+            CompactionWireDecodeStatus::Ok) {
+            out_failure_status = PhaseAdvanceStatus::SeqTwoX1Corrupt;
+            return false;
+        }
+        out_seq2 = verified->value();
+        if (out_seq2.candidate_id != before.candidate_id || out_seq2.request_id != before.request_id) {
+            out_failure_status = PhaseAdvanceStatus::SeqTwoX1Corrupt;
+            return false;
+        }
+    }
+    return true;
+}
+
+inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_post_seal_finalizing(std::uint64_t build_nonce) noexcept {
+    // Step 0: fresh read + full MAC verification of the current Intent.
+    // Precondition phase is StartedPublished; two possible "already past"
+    // terminal phases must be told apart (this edge's own target vs the
+    // opposite, mutually-exclusive terminal edge -- spec forbids a
+    // PostSealFinalizing<->AbandonFinalizing cross unconditionally).
+    CompactionCandidateIntentWire before{};
+    {
+        std::array<std::byte, kCompactionCandidateIntentWireBytes> buf{};
+        const LeaseReadResult read_result = lease_.read_intent_genesis(buf);
+        switch (read_result.outcome) {
+            case LeaseIoOutcome::WrongOwner:
+            case LeaseIoOutcome::NotHeld:
+                return PhaseAdvanceStatus::LeaseNotHeld;
+            case LeaseIoOutcome::CandidateFenced:
+                return PhaseAdvanceStatus::CandidateFenced;
+            case LeaseIoOutcome::DirectoryIdentityChanged:
+                return PhaseAdvanceStatus::DirectoryIdentityChanged;
+            case LeaseIoOutcome::Ok:
+                break;
+        }
+        switch (read_result.read.status) {
+            case compaction_detail::ReadFixedStatus::NotFound:
+                return PhaseAdvanceStatus::IntentNotFound;
+            case compaction_detail::ReadFixedStatus::WrongSize:
+            case compaction_detail::ReadFixedStatus::NotRegularFile:
+            case compaction_detail::ReadFixedStatus::IoError:
+                return PhaseAdvanceStatus::IntentCorrupt;
+            case compaction_detail::ReadFixedStatus::Ok:
+                break;
+        }
+
+        std::uint32_t kek_key_id_peek = 0;
+        if (!peek_compaction_candidate_intent_kek_key_id(buf, kek_key_id_peek)) {
+            return PhaseAdvanceStatus::IntentCorrupt;
+        }
+        const PinResult read_pin = key_ring_.pin_key(kek_key_id_peek);
+        if (read_pin.status != PinStatus::Pinned) return PhaseAdvanceStatus::IntentKeyNotFound;
+
+        std::optional<VerifiedCompactionCandidateIntent> verified;
+        if (decode_compaction_candidate_intent_wire(buf, read_pin.handle->key_bytes(), verified) !=
+            CompactionWireDecodeStatus::Ok) {
+            return PhaseAdvanceStatus::IntentCorrupt;
+        }
+        before = verified->value();
+    }
+
+    if (before.build_nonce != build_nonce) return PhaseAdvanceStatus::ForeignBuildNonce;
+
+    if (before.phase != kCompactionCandidateIntentPhaseStartedPublished) {
+        if (before.phase == kCompactionCandidateIntentPhasePostSealFinalizing &&
+            is_legal_candidate_ids_for_phase(before.phase, before.candidate_id, before.request_id)) {
+            return PhaseAdvanceStatus::AlreadyAtOrPastTargetPhase;
+        }
+        if (before.phase == kCompactionCandidateIntentPhaseAbandonFinalizing &&
+            is_legal_candidate_ids_for_phase(before.phase, before.candidate_id, before.request_id)) {
+            return PhaseAdvanceStatus::AlreadyAtOppositeTerminalPhase;
+        }
+        return PhaseAdvanceStatus::IllegalTransition;
+    }
+
+    // Step 1: read back the durable seq=1 and seq=2 `.x1` frames.
+    CompactionIntentTransitionWire seq1{};
+    CompactionIntentTransitionWire seq2{};
+    {
+        PhaseAdvanceStatus failure_status{};
+        if (!read_verified_seq1_and_seq2(build_nonce, before, seq1, seq2, failure_status)) {
+            return failure_status;
+        }
+    }
+
+    // Step 2: read `.clr` back (never written by this function -- header
+    // comment's point 6), checked not trusted.
+    SealStartedCleanupTombstoneWire clr{};
+    {
+        SealStartedCleanupTombstoneLoader<CandidateLease> loader(lease_);
+        const LoadStatus load_status = loader.load(key_ring_, clr);
+        switch (load_status) {
+            case LoadStatus::LeaseNotHeld:
+                return PhaseAdvanceStatus::LeaseNotHeld;
+            case LoadStatus::CandidateFenced:
+                return PhaseAdvanceStatus::CandidateFenced;
+            case LoadStatus::DirectoryIdentityChanged:
+                return PhaseAdvanceStatus::DirectoryIdentityChanged;
+            case LoadStatus::NotFound:
+                return PhaseAdvanceStatus::ClrNotFound;
+            case LoadStatus::Corrupt:
+            case LoadStatus::IoError:
+                return PhaseAdvanceStatus::ClrCorrupt;
+            case LoadStatus::KeyNotFound:
+                return PhaseAdvanceStatus::ClrKeyNotFound;
+            case LoadStatus::Ok:
+                break;
+        }
+    }
+    // Note on clr.new_generation == before.target_generation: given
+    // clr.source_generation == before.source_generation is ALSO checked
+    // here, and validate_seal_started_cleanup_shape()'s own internal algebra
+    // already forces clr.new_generation == clr.source_generation + 1 (any
+    // record that doesn't satisfy this fails to decode at all), this
+    // particular equality can never independently fail once the
+    // source_generation check above already passed -- it is real defense-
+    // in-depth against either upstream invariant being loosened later, not
+    // something reachable as its own distinct failure mode today.
+    if (clr.store_uuid_lo != before.store_uuid_lo || clr.store_uuid_hi != before.store_uuid_hi ||
+        clr.candidate_id != before.candidate_id || clr.request_id != before.request_id ||
+        clr.kek_key_id != before.kek_key_id || clr.source_generation != before.source_generation ||
+        clr.baseline_tip_seq != before.baseline_tip_seq ||
+        std::memcmp(clr.baseline_tip_mac, before.baseline_tip_mac, sizeof(before.baseline_tip_mac)) != 0 ||
+        clr.baseline_key_id != before.baseline_key_id || clr.new_generation != before.target_generation ||
+        clr.started_kind != kSealStartedKindNativeV2) {
+        return PhaseAdvanceStatus::ClrForeignBinding;
+    }
+    if (clr.phase != kSealStartedCleanupPhaseAuthorized) {
+        return PhaseAdvanceStatus::ClrNotAuthorized;
+    }
+    // Not re-calling validate_seal_started_cleanup_shape() here -- the
+    // loader's decode path already ran it before the MAC check; a second
+    // call would be dead code (same reasoning as raise_started_published()'s
+    // Step 2 for validate_seal_export_started_shape()).
+
+    // Step 3: construct the proposed after-state (ids stay byte-unchanged) +
+    // the `.x1` seq=3 evidence.
+    CompactionCandidateIntentWire after = before;
+    after.phase = kCompactionCandidateIntentPhasePostSealFinalizing;
+
+    CompactionIntentTransitionWire transition{};
+    transition.format_version = kCompactionIntentTransitionFormatVersion;
+    transition.total_bytes = kCompactionIntentTransitionWireBytes;
+    transition.store_uuid_lo = before.store_uuid_lo;
+    transition.store_uuid_hi = before.store_uuid_hi;
+    transition.kek_key_id = before.kek_key_id;
+    transition.from_phase = kCompactionCandidateIntentPhaseStartedPublished;
+    transition.to_phase = kCompactionCandidateIntentPhasePostSealFinalizing;
+    transition.reserved0 = 0;
+    transition.transition_seq = 3;
+    transition.source_generation = before.source_generation;
+    transition.target_generation = before.target_generation;
+    transition.baseline_tip_seq = before.baseline_tip_seq;
+    std::memcpy(transition.baseline_tip_mac, before.baseline_tip_mac, sizeof(before.baseline_tip_mac));
+    transition.baseline_key_id = before.baseline_key_id;
+    transition.build_nonce = before.build_nonce;
+    transition.candidate_id = before.candidate_id;
+    transition.request_id = before.request_id;
+    std::memcpy(transition.prev_transition_mac, seq2.mac, sizeof(seq2.mac));
+
+    // Step 4: pure-function semantic validation via the shared chain-walker.
+    // walk_x1_chain_raw's own TerminalBranchConflict check DOES fire for
+    // this 3-frame chain (header comment's point 7) -- the explicit check
+    // below is deliberately redundant with it, kept for symmetry with the
+    // other functions in this class.
+    {
+        const std::array<CompactionIntentTransitionWire, 3> chain{seq1, seq2, transition};
+        std::array<std::uint8_t, 32> terminal_mac{};
+        if (compaction_codec_detail::walk_x1_chain_raw(after, chain, terminal_mac) != X1ChainStatus::Valid) {
+            return PhaseAdvanceStatus::IllegalTransition;
+        }
+        if (after.phase != kCompactionCandidateIntentPhasePostSealFinalizing) {
+            return PhaseAdvanceStatus::IllegalTransition;
+        }
+    }
+
+    const PinResult write_pin = key_ring_.pin_key(before.kek_key_id);
+    if (write_pin.status != PinStatus::Pinned) return PhaseAdvanceStatus::IntentKeyNotFound;
+
+    // Step 5: publish `.x1` seq=3 (no-replace), with the idempotent-retry
+    // guard for the PublishedNamespaceUncertain case.
+    std::array<std::byte, kCompactionIntentTransitionWireBytes> encoded_transition{};
+    encode_compaction_intent_transition_wire(encoded_transition, transition, write_pin.handle->key_bytes());
+
+    if (x1_provenance_memory_.has_value() && x1_provenance_memory_->uncertain &&
+        x1_provenance_memory_->build_nonce == build_nonce &&
+        x1_provenance_memory_->transition_seq == transition.transition_seq &&
+        std::memcmp(x1_provenance_memory_->encoded_transition.data(), encoded_transition.data(),
+                     encoded_transition.size()) == 0) {
+        return PhaseAdvanceStatus::PhaseRaiseUncertain;
+    }
+
+    const LeaseWriteResult x1_write =
+        lease_.write_x1_frame_no_replace(build_nonce, transition.transition_seq, encoded_transition);
+    switch (x1_write.outcome) {
+        case LeaseIoOutcome::WrongOwner:
+        case LeaseIoOutcome::NotHeld:
+            return PhaseAdvanceStatus::LeaseNotHeld;
+        case LeaseIoOutcome::CandidateFenced:
+            return PhaseAdvanceStatus::CandidateFenced;
+        case LeaseIoOutcome::DirectoryIdentityChanged:
+            return PhaseAdvanceStatus::DirectoryIdentityChanged;
+        case LeaseIoOutcome::Ok:
+            break;
+    }
+    switch (x1_write.publish.state) {
+        case compaction_detail::PublishCommitState::DurablyPublished:
+            x1_provenance_memory_.reset();
+            break;
+        case compaction_detail::PublishCommitState::PublishedNamespaceUncertain:
+            x1_provenance_memory_ = X1WriteProvenanceMemory{build_nonce, transition.transition_seq,
+                                                              encoded_transition, true};
+            return PhaseAdvanceStatus::PhaseRaiseUncertain;
+        case compaction_detail::PublishCommitState::NotPublished:
+        default:
+            return PhaseAdvanceStatus::X1WriteFailed;
+    }
+
+    // Step 6: only now REPLACE the Intent to phase=PostSealFinalizing.
+    std::array<std::byte, kCompactionCandidateIntentWireBytes> encoded_intent{};
+    encode_compaction_candidate_intent_wire(encoded_intent, after, write_pin.handle->key_bytes());
+
+    const LeaseWriteResult intent_write = lease_.replace_intent_phase(encoded_intent);
+    switch (intent_write.outcome) {
+        case LeaseIoOutcome::WrongOwner:
+        case LeaseIoOutcome::NotHeld:
+            return PhaseAdvanceStatus::LeaseNotHeld;
+        case LeaseIoOutcome::CandidateFenced:
+            return PhaseAdvanceStatus::CandidateFenced;
+        case LeaseIoOutcome::DirectoryIdentityChanged:
+            return PhaseAdvanceStatus::DirectoryIdentityChanged;
+        case LeaseIoOutcome::Ok:
+            break;
+    }
+    switch (intent_write.publish.state) {
+        case compaction_detail::PublishCommitState::DurablyPublished:
+            return PhaseAdvanceStatus::PhaseRaised;
+        case compaction_detail::PublishCommitState::PublishedNamespaceUncertain:
+            return PhaseAdvanceStatus::PhaseRaiseUncertain;
+        case compaction_detail::PublishCommitState::NotPublished:
+        default:
+            return PhaseAdvanceStatus::IntentReplaceFailed;
+    }
+}
+
+inline PhaseAdvanceStatus IntentPhaseAdvancer::raise_abandon_finalizing(std::uint64_t build_nonce) noexcept {
+    // Step 0: same shape as raise_post_seal_finalizing()'s Step 0, with the
+    // two terminal-phase branches swapped.
+    CompactionCandidateIntentWire before{};
+    {
+        std::array<std::byte, kCompactionCandidateIntentWireBytes> buf{};
+        const LeaseReadResult read_result = lease_.read_intent_genesis(buf);
+        switch (read_result.outcome) {
+            case LeaseIoOutcome::WrongOwner:
+            case LeaseIoOutcome::NotHeld:
+                return PhaseAdvanceStatus::LeaseNotHeld;
+            case LeaseIoOutcome::CandidateFenced:
+                return PhaseAdvanceStatus::CandidateFenced;
+            case LeaseIoOutcome::DirectoryIdentityChanged:
+                return PhaseAdvanceStatus::DirectoryIdentityChanged;
+            case LeaseIoOutcome::Ok:
+                break;
+        }
+        switch (read_result.read.status) {
+            case compaction_detail::ReadFixedStatus::NotFound:
+                return PhaseAdvanceStatus::IntentNotFound;
+            case compaction_detail::ReadFixedStatus::WrongSize:
+            case compaction_detail::ReadFixedStatus::NotRegularFile:
+            case compaction_detail::ReadFixedStatus::IoError:
+                return PhaseAdvanceStatus::IntentCorrupt;
+            case compaction_detail::ReadFixedStatus::Ok:
+                break;
+        }
+
+        std::uint32_t kek_key_id_peek = 0;
+        if (!peek_compaction_candidate_intent_kek_key_id(buf, kek_key_id_peek)) {
+            return PhaseAdvanceStatus::IntentCorrupt;
+        }
+        const PinResult read_pin = key_ring_.pin_key(kek_key_id_peek);
+        if (read_pin.status != PinStatus::Pinned) return PhaseAdvanceStatus::IntentKeyNotFound;
+
+        std::optional<VerifiedCompactionCandidateIntent> verified;
+        if (decode_compaction_candidate_intent_wire(buf, read_pin.handle->key_bytes(), verified) !=
+            CompactionWireDecodeStatus::Ok) {
+            return PhaseAdvanceStatus::IntentCorrupt;
+        }
+        before = verified->value();
+    }
+
+    if (before.build_nonce != build_nonce) return PhaseAdvanceStatus::ForeignBuildNonce;
+
+    if (before.phase != kCompactionCandidateIntentPhaseStartedPublished) {
+        if (before.phase == kCompactionCandidateIntentPhaseAbandonFinalizing &&
+            is_legal_candidate_ids_for_phase(before.phase, before.candidate_id, before.request_id)) {
+            return PhaseAdvanceStatus::AlreadyAtOrPastTargetPhase;
+        }
+        if (before.phase == kCompactionCandidateIntentPhasePostSealFinalizing &&
+            is_legal_candidate_ids_for_phase(before.phase, before.candidate_id, before.request_id)) {
+            return PhaseAdvanceStatus::AlreadyAtOppositeTerminalPhase;
+        }
+        return PhaseAdvanceStatus::IllegalTransition;
+    }
+
+    // Step 1: read back the durable seq=1 and seq=2 `.x1` frames.
+    CompactionIntentTransitionWire seq1{};
+    CompactionIntentTransitionWire seq2{};
+    {
+        PhaseAdvanceStatus failure_status{};
+        if (!read_verified_seq1_and_seq2(build_nonce, before, seq1, seq2, failure_status)) {
+            return failure_status;
+        }
+    }
+
+    // Step 2: read `.abd` back (never written by this function -- header
+    // comment's point 6), checked not trusted. `.abd` has no new_generation/
+    // new_final_* fields at all -- this binding list must NOT reuse `.clr`'s.
+    SealStartedAbandonWire abd{};
+    {
+        SealStartedAbandonLoader loader(lease_);
+        const LoadStatus load_status = loader.load(key_ring_, abd);
+        switch (load_status) {
+            case LoadStatus::LeaseNotHeld:
+                return PhaseAdvanceStatus::LeaseNotHeld;
+            case LoadStatus::CandidateFenced:
+                return PhaseAdvanceStatus::CandidateFenced;
+            case LoadStatus::DirectoryIdentityChanged:
+                return PhaseAdvanceStatus::DirectoryIdentityChanged;
+            case LoadStatus::NotFound:
+                return PhaseAdvanceStatus::AbdNotFound;
+            case LoadStatus::Corrupt:
+            case LoadStatus::IoError:
+                return PhaseAdvanceStatus::AbdCorrupt;
+            case LoadStatus::KeyNotFound:
+                return PhaseAdvanceStatus::AbdKeyNotFound;
+            case LoadStatus::Ok:
+                break;
+        }
+    }
+    if (abd.store_uuid_lo != before.store_uuid_lo || abd.store_uuid_hi != before.store_uuid_hi ||
+        abd.candidate_id != before.candidate_id || abd.request_id != before.request_id ||
+        abd.kek_key_id != before.kek_key_id || abd.source_generation != before.source_generation ||
+        abd.baseline_tip_seq != before.baseline_tip_seq ||
+        std::memcmp(abd.baseline_tip_mac, before.baseline_tip_mac, sizeof(before.baseline_tip_mac)) != 0 ||
+        abd.baseline_key_id != before.baseline_key_id || abd.started_kind != kSealStartedKindNativeV2) {
+        return PhaseAdvanceStatus::AbdForeignBinding;
+    }
+    if (abd.phase != kSealStartedAbandonPhaseResumeAuthorized) {
+        return PhaseAdvanceStatus::AbdNotResumeAuthorized;
+    }
+    // Not re-calling validate_seal_started_abandon_shape() here -- same
+    // dead-code reasoning as raise_post_seal_finalizing()'s Step 2.
+
+    // Step 3: construct the proposed after-state (ids stay byte-unchanged) +
+    // the `.x1` seq=3 evidence.
+    CompactionCandidateIntentWire after = before;
+    after.phase = kCompactionCandidateIntentPhaseAbandonFinalizing;
+
+    CompactionIntentTransitionWire transition{};
+    transition.format_version = kCompactionIntentTransitionFormatVersion;
+    transition.total_bytes = kCompactionIntentTransitionWireBytes;
+    transition.store_uuid_lo = before.store_uuid_lo;
+    transition.store_uuid_hi = before.store_uuid_hi;
+    transition.kek_key_id = before.kek_key_id;
+    transition.from_phase = kCompactionCandidateIntentPhaseStartedPublished;
+    transition.to_phase = kCompactionCandidateIntentPhaseAbandonFinalizing;
+    transition.reserved0 = 0;
+    transition.transition_seq = 3;
+    transition.source_generation = before.source_generation;
+    transition.target_generation = before.target_generation;
+    transition.baseline_tip_seq = before.baseline_tip_seq;
+    std::memcpy(transition.baseline_tip_mac, before.baseline_tip_mac, sizeof(before.baseline_tip_mac));
+    transition.baseline_key_id = before.baseline_key_id;
+    transition.build_nonce = before.build_nonce;
+    transition.candidate_id = before.candidate_id;
+    transition.request_id = before.request_id;
+    std::memcpy(transition.prev_transition_mac, seq2.mac, sizeof(seq2.mac));
+
+    // Step 4: same discipline as raise_post_seal_finalizing()'s Step 4.
+    {
+        const std::array<CompactionIntentTransitionWire, 3> chain{seq1, seq2, transition};
+        std::array<std::uint8_t, 32> terminal_mac{};
+        if (compaction_codec_detail::walk_x1_chain_raw(after, chain, terminal_mac) != X1ChainStatus::Valid) {
+            return PhaseAdvanceStatus::IllegalTransition;
+        }
+        if (after.phase != kCompactionCandidateIntentPhaseAbandonFinalizing) {
+            return PhaseAdvanceStatus::IllegalTransition;
+        }
+    }
+
+    const PinResult write_pin = key_ring_.pin_key(before.kek_key_id);
+    if (write_pin.status != PinStatus::Pinned) return PhaseAdvanceStatus::IntentKeyNotFound;
+
+    // Step 5: publish `.x1` seq=3 (no-replace).
+    std::array<std::byte, kCompactionIntentTransitionWireBytes> encoded_transition{};
+    encode_compaction_intent_transition_wire(encoded_transition, transition, write_pin.handle->key_bytes());
+
+    if (x1_provenance_memory_.has_value() && x1_provenance_memory_->uncertain &&
+        x1_provenance_memory_->build_nonce == build_nonce &&
+        x1_provenance_memory_->transition_seq == transition.transition_seq &&
+        std::memcmp(x1_provenance_memory_->encoded_transition.data(), encoded_transition.data(),
+                     encoded_transition.size()) == 0) {
+        return PhaseAdvanceStatus::PhaseRaiseUncertain;
+    }
+
+    const LeaseWriteResult x1_write =
+        lease_.write_x1_frame_no_replace(build_nonce, transition.transition_seq, encoded_transition);
+    switch (x1_write.outcome) {
+        case LeaseIoOutcome::WrongOwner:
+        case LeaseIoOutcome::NotHeld:
+            return PhaseAdvanceStatus::LeaseNotHeld;
+        case LeaseIoOutcome::CandidateFenced:
+            return PhaseAdvanceStatus::CandidateFenced;
+        case LeaseIoOutcome::DirectoryIdentityChanged:
+            return PhaseAdvanceStatus::DirectoryIdentityChanged;
+        case LeaseIoOutcome::Ok:
+            break;
+    }
+    switch (x1_write.publish.state) {
+        case compaction_detail::PublishCommitState::DurablyPublished:
+            x1_provenance_memory_.reset();
+            break;
+        case compaction_detail::PublishCommitState::PublishedNamespaceUncertain:
+            x1_provenance_memory_ = X1WriteProvenanceMemory{build_nonce, transition.transition_seq,
+                                                              encoded_transition, true};
+            return PhaseAdvanceStatus::PhaseRaiseUncertain;
+        case compaction_detail::PublishCommitState::NotPublished:
+        default:
+            return PhaseAdvanceStatus::X1WriteFailed;
+    }
+
+    // Step 6: only now REPLACE the Intent to phase=AbandonFinalizing. `.abd`
+    // itself is never unlinked here (spec: "while A is still on disk").
     std::array<std::byte, kCompactionCandidateIntentWireBytes> encoded_intent{};
     encode_compaction_candidate_intent_wire(encoded_intent, after, write_pin.handle->key_bytes());
 
