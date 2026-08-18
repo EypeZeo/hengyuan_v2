@@ -1732,6 +1732,111 @@ test-only 调用写出的 L 文件，会被强制当成"真的发生过一次 se
 AbandonFinalizing} 两条终边；`.xgc`/GC 授权；任何真实网络 seal 调用；把这两个函数接进任何真实的
 compaction 触发流程（见上"操作性风险"）。
 
+### Seal-journal Round E StartedPublished->{PostSealFinalizing, AbandonFinalizing}[已实现]
+
+PR #44 合并后，用户明确要求继续做 `IntentPhaseAdvancer` 剩下的两条边——`StartedPublished->
+PostSealFinalizing` 和 `StartedPublished->AbandonFinalizing`（`.x1` seq=3，二选一，互斥）。这两条
+边正是上一轮头注释里点名"字段映射表在早期草稿（v1）里被查出真实 bug、推迟到未来一轮"的那两条：
+
+1. 字段映射表比对了 `CompactionCandidateIntentWire` 根本没有的字段（写死在一个想象中的/过时的
+   struct 形状上）。
+2. 死代码前置检查 `phase >= kSealStartedCleanupPhaseAuthorized`，而
+   `kSealStartedCleanupPhaseAuthorized == 0`——恒真，等于没检查。
+3. `AbandonFinalizing` 边把 `GenGone`（phase 5）当作足够的授权证据，但 `GenGone` 只证明 gen-N+1
+   目录已经改名挪走，不证明 tip 已经针对 abandon baseline 重新核对过——只有 `ResumeAuthorized`
+   （phase 6）才证明这个。
+
+本仓库没有任何代码路径能真正走完 `.clr`/`.abd` 的真实授权流程（完整状态机、
+`TipExportProducerResume`、journal drain-completeness 检查、`.xgc` 全都不存在）。用户确认采用
+方案 (b)：`raise_post_seal_finalizing()`/`raise_abandon_finalizing()` 本身对 `.clr`/`.abd`
+**只读**（复用已经落地、在 `seal_journal_breadcrumb_precondition_aggregate.hpp` 里已经使用的
+`SealStartedCleanupTombstoneLoader`/`SealStartedAbandonLoader`），从不写入——测试直接用
+std::ofstream 种文件（跟本文件已有的 `plant_watermark()`/`test_compaction_lease.cpp` 的
+`write_raw_file()` 同一先例），不需要给 `CandidateLease` 新增任何写方法或 friend。两条边合并成
+一轮/一个 PR：结构上近乎镜像对称（都是"读一份已 durable 的终态证据 + 3-帧 `.x1` 链校验 + Intent
+REPLACE"），且 `AlreadyAtOppositeTerminalPhase` 这类跨分支保护（PostSeal 看到 Intent 已经在
+AbandonFinalizing，反之亦然）只有两条边都实现了才能被真实测试到。
+
+**设计经过 1 轮 Explore 双 agent 研究 + 1 轮 Plan agent 设计 + 1 轮 DeepSeek 对抗性审查，9 条发现
+逐条对照实际代码验证后确认为真实问题，全部采纳**：
+
+1. **最大简化**：原计划打算新增一个 test-only planter 类 + `CandidateLease` 两个新 CREATE_NEW
+   写方法 + 新 friend，理由是"这样两个新函数只读的属性能在 diff 里被肉眼核实"——审查指出这个属性
+   不依赖 planter 存在，函数体是否调用 lease 写方法是函数体自己的事，且本仓库已有
+   `plant_watermark()`/`write_raw_file()` 直接 ofstream 种文件的先例。采纳后这一轮完全不改
+   `compaction_lease.hpp`。
+2. **Step 0 三分支不对称**：跨分支判定（`AlreadyAtOppositeTerminalPhase`）漏了 ids 合法性核对，
+   一条 `candidate_id==0` 的损坏记录会被误判成"对面已完成"而不是 `IllegalTransition`——已用
+   `is_legal_candidate_ids_for_phase()` 的真实签名核实并修正，三个分支（本函数目标终态/对面
+   终态/其余）现在统一核对 ids 合法性。
+3. **`walk_x1_chain_raw()` 不校验帧的 candidate_id/request_id**（`compaction_intent_codec.hpp`
+   的 ForeignBinding 检查只比对 store_uuid/kek_key_id/generations/baseline/build_nonce）——两个
+   新函数读回 seq=1/seq=2 帧后补一条显式 ids 核对；**这个防御性缺口在已合并的
+   `raise_started_published()` 里同样存在**，这一轮顺手给它的 Step 1 也补上同样两行（新增回归
+   测试 RefusesStartedPublishedWhenSeqOneX1IdsMismatch）。
+4. `LoadStatus::IoError` 必须显式映射到 `ClrCorrupt`/`AbdCorrupt`（已用
+   `seal_started_abandon_loader.hpp` 的真实分支核实是可达分支，不是理论上的）。
+5/6. "明确不做"清单本来遗漏了两条真实省略——`.clr` 跟已落盘的 L 文件之间的跨文件字段核对完全不做
+   （`seal_export_migration_cleanup_abandon_codec.hpp` 自己的注释已经写明"explicitly out of
+   scope"）；Abandon 边 spec 的 Forbidden 从句是"`ResumeAuthorized` 且 A 仍在磁盘"的合取，这一轮
+   只落地 phase 精确相等这一半（`.abd` 文件不存在时 loader 已经返回 `NotFound`，隐式满足但不是
+   独立显式检查）——均已补进头注释 SCOPE 段落。
+7. 事实性用词修正：`SealStartedCleanupTombstoneLoader`/`SealStartedAbandonLoader` 不是"落地未
+   使用"，已经在 `seal_journal_breadcrumb_precondition_aggregate.hpp` 里被使用。
+8. Planter 改直接种文件后新增的提醒：`encode_seal_started_cleanup_tombstone_wire`/
+   `encode_seal_started_abandon_wire` 在形状不合法时**静默返回 0**（不是 assert）——测试 helper
+   （plant_clr/plant_abd）的 `ASSERT_EQ(编码返回值, 期望字节数)` 是防止这类 bug 静默写出空
+   文件的关键一环，不是可省略的装饰。
+9. 正面确认（不用改）：新终态落地后，既有 `raise_started_published()` 对 phase∈{3,4} 已正确返回
+   `AlreadyAtOrPastTargetPhase`（幂等重试语义恰好正确），未改动。
+
+**实现内容**（`native/include/hengyuan/intent_phase_advancer.hpp`）：
+- 两个新公开方法，均只接受 `build_nonce`（证据文件不是这次调用产生的，是读一份已经存在的）：
+  `raise_post_seal_finalizing()`（要求 `.clr` 已 `phase==kSealStartedCleanupPhaseAuthorized`）、
+  `raise_abandon_finalizing()`（要求 `.abd` 已
+  `phase==kSealStartedAbandonPhaseResumeAuthorized(6)`，`.abd` 本身从不被 unlink——spec:
+  "while A is still on disk"）。
+- 新私有 helper `read_verified_seq1_and_seq2()`：两个新函数共用，读回 durable 的 seq=1/seq=2
+  `.x1` 帧、MAC 验证、核对 ids（Finding 3）。返回 `bool` + out-param 失败状态（不复用
+  `PhaseAdvanceStatus` 里的某个真实枚举值当"成功"哨兵——那本身是个隐患，被在实现阶段自己发现并
+  改掉了，改用 `bool` + `out_failure_status` 更明确）。`raise_started_published()` 自己的单帧
+  Step 1 保持原样、不重构成调用这个 helper（尽量不动已发布代码的结构），只加两行 ids 核对
+  （Finding 3）。
+- 两个函数各自 Step 0-6：读 Intent（三分支前置检查，Finding 2）→ 读 seq1/seq2 → 读 `.clr`/`.abd`
+  并核对绑定字段+phase 门槛（Finding 2 的 bug #2/#3 修法：`.clr` 精确等于 `Authorized(0)`；`.abd`
+  精确等于 `ResumeAuthorized(6)`，不是 `>=`）→ 构造 `after`+seq=3 `CompactionIntentTransitionWire`
+  → `walk_x1_chain_raw`（3 帧链条，`TerminalBranchConflict` 这次真的会触发,显式检查仍保留做防御性
+  冗余）→ CREATE_NEW `.x1` seq=3（复用既有 `X1WriteProvenanceMemory`）→ `replace_intent_phase`。
+- 新增 8 个 `PhaseAdvanceStatus` 枚举值：`SeqTwoX1NotFound`/`SeqTwoX1Corrupt`（两个新函数共用）、
+  `AlreadyAtOppositeTerminalPhase`、`ClrNotFound`/`ClrCorrupt`/`ClrKeyNotFound`/
+  `ClrForeignBinding`/`ClrNotAuthorized`（PostSeal 专用）、`AbdNotFound`/`AbdCorrupt`/
+  `AbdKeyNotFound`/`AbdForeignBinding`/`AbdNotResumeAuthorized`（Abandon 专用）。
+- `test_intent_phase_advancer.cpp` 新增 32 个测试：1 个 `raise_started_published()` 的 Finding 3
+  回归测试，PostSeal 15 个，Abandon 16 个（成功路径、幂等重试、Reserved/Building 时拒绝、跨分支
+  拒绝、外部 build_nonce、证据缺失/损坏、phase 门槛不满足——含最重要的
+  RefusesAbandonAtGenGoneNotResumeAuthorized 直接对应 bug #3，以及证明门槛精确相等而非 `>=`
+  的 RefusesAbandonFinalizingWhenAbdAtAbdPending——绑定字段不一致、seq=1/seq=2 `.x1` 缺失/
+  损坏）。
+
+**验证（2026-08-16）**：
+- MSVC Release 全量构建：0 warning。全量 ctest：1137/1137（含新增 32 个 + 1 个回填测试；1 个
+  既有 POSIX-only skip）。
+- WSL2 GCC-14 Release（`HY_BUILD_DEMO=ON`）：1166/1166。
+- WSL2 ASan+UBSan（`HY_BUILD_DEMO=OFF` 目标构建：test_intent_phase_advancer +
+  compaction_lease_holder + seal_journal_cross_file_audit）：53/53，均无 ASan/UBSan 报告。
+- WSL2 TSan：**这一轮未单独重跑**——`test_intent_phase_advancer` 本来就不在
+  `wsl_verify.sh` 的 run_thread 目标列表里（`raise_intent_phase()`/`raise_started_published()`
+  落地时就是如此），这一轮不改 `compaction_lease.hpp`，没有新的并发/共享状态改动理由改变这一点。
+- `tools/spec_xref_check.py --quiet` / `tools/spec_enum_diff.py`：OK，同前几轮。
+
+**这一轮之后仍然明确不做**：`.clr` 跟 L 文件的跨文件字段核对；Abandon 边"A present"独立显式检查；
+`.xgc`/GC 授权；`TipExportProducerResume`（本仓库不存在这个符号）；真实 unlink M/V/L 或 A；
+`PostSealCommittedProof` 完整 4 项门槛（仅实现"`.clr` 已 Authorized"/"`.abd` 已
+ResumeAuthorized"这一半，`CURRENT.generation` 核对/`LastRemoteAckedTip` 覆盖检查/
+`GenerationBridge` 绑定/journal drain-completeness 继续不做）；MigratedV2Started；生产环境接线
+（继续 test-only，风险比 `raise_started_published()` 更尖锐——test-only 调用现在能把 `Intent.
+phase` 推到终态，未来真实的 PostSeal/Abandon 恢复实现会被迫当成"真实清理流程已完成"的证据）。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 
