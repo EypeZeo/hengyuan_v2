@@ -428,6 +428,26 @@ TEST(CompactionIntentGcAuthorizedCodec, RejectsTruncatedBuffer) {
               CompactionWireDecodeStatus::Truncated);
 }
 
+TEST(CompactionIntentGcAuthorizedCodec, PeekKekKeyIdReadsCorrectValue) {
+    const auto key = make_key(5);
+    const CompactionCandidateIntentWire intent = make_sample_intent();
+    CompactionIntentGcAuthorizedWire g = make_sample_gc(intent);
+    g.kek_key_id = 0xABCDEF01u;
+    std::array<std::byte, kCompactionIntentGcAuthorizedWireBytes> buf{};
+    encode_compaction_intent_gc_authorized_wire(buf, g, key);
+
+    std::uint32_t peeked = 0;
+    ASSERT_TRUE(peek_compaction_intent_gc_authorized_kek_key_id(buf, peeked));
+    EXPECT_EQ(peeked, 0xABCDEF01u);
+}
+
+TEST(CompactionIntentGcAuthorizedCodec, PeekKekKeyIdReturnsFalseOnTooShortBuffer) {
+    // Offset is 24, needs 4 more bytes -- 27 bytes is one short of enough.
+    std::array<std::byte, 27> buf{};
+    std::uint32_t peeked = 0;
+    EXPECT_FALSE(peek_compaction_intent_gc_authorized_kek_key_id(buf, peeked));
+}
+
 // ===========================================================================
 // Semantic validation
 // ===========================================================================

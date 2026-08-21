@@ -176,6 +176,13 @@ template <typename LeaseT>
 class SealStartedCleanupTombstoneLoader;
 class SealStartedAbandonLoader;
 
+// `.xgc` (docs/SPEC_INVARIANTS.md's "Seal-journal Round E `.xgc` decode +
+// loader" entry) -- read-only, same "one friend per consumer" discipline as
+// the six loaders above. Not a class template: the production instantiation
+// is the only one this loader ever needs (CandidateLease), same shape as
+// SealIdWatermarkLoader/SealExportStartedLoader/SealStartedAbandonLoader.
+class CompactionIntentGcAuthorizedLoader;
+
 // Round E receipt/raise_intent_phase() (docs/SPEC_INVARIANTS.md's "Seal-journal
 // Round E receipt + raise_intent_phase() (Building->Reserved)" entry) --
 // forward-declared friend for the phase-advance write path. See that class's
@@ -290,6 +297,7 @@ private:
     template <typename LeaseT>
     friend class hy::SealStartedCleanupTombstoneLoader;
     friend class hy::SealStartedAbandonLoader;
+    friend class hy::CompactionIntentGcAuthorizedLoader;
     // Coordinator's own pre-integration test accessor -- Modules 1-4's real
     // loader classes above don't exist yet at the point this lease extension
     // lands, so this round's own tests (test_compaction_lease.cpp) need a
@@ -362,6 +370,17 @@ private:
     LeaseReadResult read_seal_started_cleanup_tombstone(
         std::span<std::byte, kSealStartedCleanupWireBytes> out) noexcept;
     LeaseReadResult read_seal_started_abandon(std::span<std::byte, kSealStartedAbandonWireBytes> out) noexcept;
+
+    // `.xgc` (docs/SPEC_INVARIANTS.md's "Seal-journal Round E `.xgc` decode +
+    // loader" entry) -- read-only, same discipline as the six methods above,
+    // with one difference: the filename carries build_nonce (
+    // ValidatedArtifactName::for_xgc(build_nonce), compaction_breadcrumb_
+    // io.hpp), not a fixed literal -- there is exactly one `.xgc` per
+    // candidate, not one per breadcrumb-directory-worth of candidates, so
+    // build_nonce (this call's only variable input) selects which file,
+    // never a caller-supplied filename/path.
+    LeaseReadResult read_compaction_intent_gc_authorized(
+        std::uint64_t build_nonce, std::span<std::byte, kCompactionIntentGcAuthorizedWireBytes> out) noexcept;
 
     LeaseIoOutcome check_can_operate() noexcept;
     bool identity_still_matches_path() noexcept;
@@ -988,6 +1007,21 @@ inline LeaseReadResult CandidateLease::read_seal_started_abandon(
     if (result.outcome != LeaseIoOutcome::Ok) return result;
 
     const auto name = compaction_detail::ValidatedArtifactName::for_seal_started_abandon();
+#ifdef _WIN32
+    result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
+#else
+    result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseReadResult CandidateLease::read_compaction_intent_gc_authorized(
+    std::uint64_t build_nonce, std::span<std::byte, kCompactionIntentGcAuthorizedWireBytes> out) noexcept {
+    LeaseReadResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_xgc(build_nonce);
 #ifdef _WIN32
     result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
 #else

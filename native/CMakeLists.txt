@@ -660,6 +660,13 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_seal_started_abandon_loader)
     gtest_discover_tests(test_seal_started_abandon_loader)
 
+    # Seal-journal Round E `.xgc` decode + loader: CompactionIntentGcAuthorizedLoader
+    # (read-only .xgc loader; encode/decode themselves already landed in Round D).
+    add_executable(test_compaction_intent_gc_authorized_loader tests/test_compaction_intent_gc_authorized_loader.cpp)
+    target_link_libraries(test_compaction_intent_gc_authorized_loader PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_compaction_intent_gc_authorized_loader)
+    gtest_discover_tests(test_compaction_intent_gc_authorized_loader)
+
     # Round E breadcrumb L2 loaders: coordinator-only composition of Modules
     # 1/3/4's loaders into one call (load_all_breadcrumb_preconditions()) --
     # written after all three landed, see the header's own SCOPE comment.
