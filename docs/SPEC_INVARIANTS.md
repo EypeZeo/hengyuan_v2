@@ -1837,6 +1837,104 @@ ResumeAuthorized"这一半，`CURRENT.generation` 核对/`LastRemoteAckedTip` �
 （继续 test-only，风险比 `raise_started_published()` 更尖锐——test-only 调用现在能把 `Intent.
 phase` 推到终态，未来真实的 PostSeal/Abandon 恢复实现会被迫当成"真实清理流程已完成"的证据）。
 
+### Seal-journal Round E `.xgc`（CompactionIntentGcAuthorizedWire）decode + loader[已实现]
+
+PR #45 合并后，用户要求继续做 `.xgc`/GC 授权那一轮——本仓库自 Round D 起每一轮"明确不做"清单里
+都挂着、从未真正开工的最后一块拼图。
+
+**范围确认经过（研究阶段派了 2 个 Explore agent，结果一处被证伪，记进本条目作为经验）**：第一个
+agent 核实"现有代码到底有多少"，第二个核实"spec 到底要求什么"。第二个 agent 的 spec 结论是真实
+且关键的：真正合法的 `.xgc` CREATE，spec（`BINANCE_PRIVATE_REST_L4_SPEC.md:3624-3671`）要求
+`.clr`/`.abd` 必须先被真实 unlink 掉才能写 `.xgc`（"Forbidden: CREATE while L/V/M/Started still
+present"），且 `PostSealFinalizingClear`/`AbandonFinalizingClear` 两个 disposition 都硬性要求
+`cleanup_auth_flags` bit0（journal drain-complete）——这两件事本仓库都做不到，用户据此确认这一轮
+范围收窄为"只读 decode + loader"，跟 `CompactionIntentGcAuthorizedWire` struct 自己的文档注释
+（`durable_control_plane.hpp:1710-1715`）"can decode/verify... but no production code path ever
+constructs/publishes one"完全一致。
+
+**但第一个 agent 的结论是假的**：两个 agent 都报告"`encode_compaction_intent_gc_authorized_wire`/
+`decode_compaction_intent_gc_authorized_wire`/`VerifiedX` 包装类完全不存在，grep 零匹配"。真正
+打开 `compaction_intent_codec.hpp` 准备写这部分代码时才发现，这三样东西——外加
+`native/tests/test_compaction_intent_codec.cpp` 里完整的 CompactionIntentGcAuthorizedCodec
+测试组（round-trip、legacy v1 拒绝、total_bytes 不符、undefined flag bits、disposition 越界、
+MAC 篡改检测、截断 buffer，8 个测试）——**从 PR #34（"Round D — CompactionCandidateIntent
+codec/genesis"，2026-08-09，本仓库最早的一轮）就已经存在**，`git blame` 直接确认，不是任何并发
+写入或时序问题。类名是 `VerifiedGcAuthorized`（不是猜测中的 VerifiedCompactionIntentGcAuthorized）。
+**教训，记进这一轮**：任何 agent 报告"某某代码完全不存在"这种否定性结论，在真正开始写代码填补那个
+"空白"之前，必须自己用 Grep 工具原地复核一遍——这条纪律此前主要用于"审查类 agent 的发现是否
+真实"，这次证明同样适用于"探索类 agent 的'找不到'结论"，且后果更严重（如果没有在写代码前发现，
+会直接产出跟已有代码重复定义、编译失败的废弃工作）。
+
+**重新核实后的真实缺口**（这才是这一轮实际做的）：`peek_compaction_intent_gc_authorized_kek_
+key_id()` 不存在；`ValidatedArtifactName::for_xgc(build_nonce)` 只是注释占位
+（`compaction_breadcrumb_io.hpp:174-176`）；`CandidateLease` 没有任何 `.xgc` 读方法或 friend；
+没有任何 loader 类。
+
+**已确认 `decode_compaction_intent_gc_authorized_wire()` 自己的既有分层设计（不是这一轮的产出，
+只是核实清楚）**：跟 `CompactionCandidateIntentWire`/`CompactionIntentTransitionWire` 两个兄弟
+类型同一种"inline 逐字段检查"风格（不是 `seal_export_migration_cleanup_abandon_codec.hpp` 那种
+独立 `validate_*_shape()` 函数风格）——`decode_*` 只做结构+MAC 校验，**不**调用
+`is_legal_cleanup_auth_flags()` 那套 disposition/flag 组合业务规则，是有意的分层（HMAC 只证明
+"持有 key 的人写的"，业务合法性是独立纯函数的职责，见 `compaction_intent_codec.hpp:482-487` 的
+既有注释），这一轮的 loader 沿用同一条边界，不额外调用 `is_legal_cleanup_auth_flags()`。
+
+**实现内容**：
+- `peek_compaction_intent_gc_authorized_kek_key_id()`（`compaction_intent_codec.hpp`）——固定
+  偏移量 +24 读 4 字节 `kek_key_id`，不认证，照抄 `peek_compaction_candidate_intent_kek_key_id`
+  的模式。
+- `CompactionIntentGcAuthorizedLoader`（新文件 `compaction_intent_gc_authorized_loader.hpp`）
+  ——照抄 `seal_started_abandon_loader.hpp` 的 peek-then-pin-then-decode 模式，唯一的结构性
+  差异：`.xgc` 文件名带 `build_nonce`（不是固定字面量），所以 `load()`/`load_from()` 比既有六个
+  breadcrumb loader 多接一个 `build_nonce` 参数。
+- `CandidateLease::read_compaction_intent_gc_authorized(build_nonce, out)` + `friend class
+  hy::CompactionIntentGcAuthorizedLoader;`（`compaction_lease.hpp`）——只读，没有加任何写/
+  CREATE_NEW 方法。
+- `ValidatedArtifactName::for_xgc(build_nonce)`（`compaction_breadcrumb_io.hpp`）——把已经写好
+  10 天的注释占位变成真实实现，跟 `for_x1()` 同一个 `format_hex16` 模式，去掉 `transition_seq`
+  那一段（`.xgc` 是每个 candidate 一份，不是每个 transition 一份）。
+- 新测试文件 `test_compaction_intent_gc_authorized_loader.cpp`（18 个测试，照抄
+  `test_seal_started_abandon_loader.cpp` 的 mock-lease 单测结构：round-trip、5 类 outcome/
+  read-status 映射、format_version/total_bytes 非法、MAC 三处篡改点、未知 key、4000 次随机字节
+  property 测试、`static_assert` 构造性检查——外加一个既有六个 loader 测试文件都没有的第 13 项：
+  用真实 `CandidateLease` + std::ofstream 直接种 `.xgc` 文件（跟 `plant_watermark()` /
+  plant_clr / plant_abd 同一先例），端到端验证 `for_xgc(build_nonce)` 命名 + 新读方法真的接得上，并验证
+  `build_nonce` 不同时正确返回 `NotFound`，证明 `.xgc` 身份真的按 `build_nonce` 区分）。
+- `test_compaction_intent_codec.cpp` 给新 peek 函数补 2 个测试（成功读取；buffer 太短返回
+  false）。
+
+**实现过程中真实抓到的一个 UBSan bug（不是这一轮引入的新设计问题，是复制既有测试模板时带出来的
+既有缺陷，被新的随机种子/参数第一次触发）**：新 loader 测试文件的 mock lease
+（MockCandidateLeaseForGcAuthorized::read_compaction_intent_gc_authorized）里
+`std::memcpy(out.data(), canned_bytes.data(), n)` 在 canned_bytes 为空、`n==0` 时，
+canned_bytes.data() 可能返回 nullptr——`memcpy` 第二个参数在 glibc/GCC 下带 nonnull 标注，
+即使长度是 0，传 nullptr 仍然是 UB，WSL2 UBSan 4000 次随机字节 property 测试真的踩中并报出
+"null pointer passed as argument 2, which is declared to never be null"。这一行代码是逐字照抄
+已经合并的 `test_seal_started_abandon_loader.cpp` 的 mock 结构写的——核实后确认
+`test_seal_started_abandon_loader.cpp` 和 `test_seal_started_migration_cleanup_loader.cpp`
+两个已合并文件里有完全相同的未加保护写法，只是这两个文件里 property 测试用的固定 RNG 种子（跟这
+一轮相同的 `0xC0FFEE`）配合各自不同的 wire-字节数分布上界，此前的具体随机序列凑巧没有同时踩中
+"len==0 且 read_status==Ok"这个组合，不代表那两个文件的写法本身是安全的。这一轮把自己新增的
+mock 加了 `if (n > 0)` 保护并确认修复后 4000 次迭代全过；另外两个已合并文件的同一个 bug 已经
+spawn 一个独立后续任务去修，不在这个 PR 里顺手改（保持这个 PR 的改动范围只覆盖 `.xgc` 相关文件）。
+
+**明确不做**：`.xgc` CREATE/写路径；真实 C/A unlink（需要单写者锁协议 + fault-injection 崩溃
+安全矩阵，本条目上面"Seal-journal Round E `.xgc`"研究阶段记录的要求）；journal
+drain-completeness 检查；`TipExportProducerResume`（本仓库不存在这个符号）；调用
+`is_legal_cleanup_auth_flags()`（loader 沿用 decode 自己的既有分层，不在这一轮新增调用点）；
+任何生产环境接线。
+
+**验证（2026-08-18）**：
+- MSVC Release 全量构建：0 warning。全量 ctest：1157/1157（含新增 20 个测试；1 个既有
+  POSIX-only skip）。
+- WSL2 GCC-14 Release（`HY_BUILD_DEMO=ON`）：1186/1186。
+- WSL2 ASan+UBSan（`HY_BUILD_DEMO=OFF` 定向构建：test_compaction_intent_gc_authorized_loader +
+  test_compaction_intent_codec + test_compaction_lease + compaction_lease_holder）：真实抓到
+  上述 UBSan bug 并修复后，55/55（`.xgc` 相关）全过，无 ASan/UBSan 报告。
+- WSL2 TSan：这一轮改了 `compaction_lease.hpp`（新 friend + 新读方法），`test_compaction_lease`
+  在 `wsl_verify.sh` 的 run_thread 目标列表里，这次没有跳过——`ctest -L concurrency`
+  58/58，两个负控均正确报出 `WARNING: ThreadSanitizer: data race`。
+- `tools/spec_xref_check.py --quiet` / `tools/spec_enum_diff.py`：OK，同前几轮。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 

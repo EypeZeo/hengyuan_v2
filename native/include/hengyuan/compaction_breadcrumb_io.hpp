@@ -171,9 +171,19 @@ public:
         return ValidatedArtifactName(name);
     }
 
-    // Round E/F (not called by anything in Round D -- Round D never reads
-    // OR writes a `.xgc`, see compaction_lease.hpp's SCOPE comment):
-    //   for_xgc(build_nonce) -> "compaction-intent-gc-<nonce_hex16>.xgc"
+    // Round E/F (not called by anything in Round D -- Round D never reads OR
+    // writes a `.xgc`, see compaction_lease.hpp's SCOPE comment). Same
+    // format_hex16 pattern as for_x1() above, minus the transition_seq
+    // component -- `.xgc` identity is build_nonce alone (one `.xgc` per
+    // candidate, not one per transition_seq).
+    static ValidatedArtifactName for_xgc(std::uint64_t build_nonce) noexcept {
+        std::array<char, 17> nonce_hex{};
+        format_hex16(build_nonce, nonce_hex);
+        std::string name = "compaction-intent-gc-";
+        name += nonce_hex.data();
+        name += ".xgc";
+        return ValidatedArtifactName(name);
+    }
 
     // Round E breadcrumb L2 loaders (docs/SPEC_INVARIANTS.md's "Seal-journal
     // Round E breadcrumb L2 loaders" entry) -- six fixed literals for the

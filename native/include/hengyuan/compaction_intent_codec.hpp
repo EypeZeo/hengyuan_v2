@@ -479,6 +479,21 @@ inline CompactionWireDecodeStatus decode_compaction_intent_gc_authorized_wire(
     return CompactionWireDecodeStatus::Ok;
 }
 
+// Unauthenticated peek at kek_key_id only, same offset/purpose as
+// peek_compaction_candidate_intent_kek_key_id() above -- callers resolve
+// hmac_key from KeyRing for THIS key_id BEFORE calling decode_compaction_
+// intent_gc_authorized_wire(). Returning false here does not imply Corrupt,
+// the real decode call does that classification.
+inline bool peek_compaction_intent_gc_authorized_kek_key_id(std::span<const std::byte> in,
+                                                              std::uint32_t& out_key_id) noexcept {
+    constexpr std::size_t kKekKeyIdOffset = 4 + 4 + 8 + 8;  // format_version, total_bytes,
+                                                              // store_uuid_lo, store_uuid_hi
+    if (in.size() < kKekKeyIdOffset + 4) return false;
+    const std::byte* p = in.data() + kKekKeyIdOffset;
+    out_key_id = detail::read_u32_le(p);
+    return true;
+}
+
 // ===========================================================================
 // Semantic validation (SPEC_INVARIANTS.md's Round D entry: HMAC only proves
 // "the writer held the key," not "the transition is business-legal" -- these
