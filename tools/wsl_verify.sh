@@ -126,7 +126,8 @@ run_thread() {
         test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
         test_snapshot_refresh_gate tsan_control_relaxed_ring \
         tsan_control_export_worker_dual_consumer \
-        compaction_lease_holder test_compaction_lease test_compaction_intent_store
+        compaction_lease_holder test_compaction_lease test_compaction_intent_store \
+        test_migrated_v2_started_publisher
 
     echo "--- concurrency tests (must pass) ---"
     (

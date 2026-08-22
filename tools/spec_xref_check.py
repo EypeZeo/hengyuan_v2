@@ -121,6 +121,10 @@ SEARCH_FILES = [
     # Round E receipt + raise_intent_phase() (Building->Reserved)"): IntentPhaseAdvancer
     # and its receipt/status types are new load-bearing symbols, same gap as above.
     REPO_ROOT / "native" / "include" / "hengyuan" / "intent_phase_advancer.hpp",
+    # Round E MigratedV2Started (docs/SPEC_INVARIANTS.md "Seal-journal Round E
+    # MigratedV2Started (V+M companion write path)"): MigratedV2StartedPublisher and
+    # its status enum are new load-bearing symbols, same gap as above.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "migrated_v2_started_publisher.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
