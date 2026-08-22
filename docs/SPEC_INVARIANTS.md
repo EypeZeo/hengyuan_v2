@@ -1935,6 +1935,122 @@ drain-completeness 检查；`TipExportProducerResume`（本仓库不存在这个
   58/58，两个负控均正确报出 `WARNING: ThreadSanitizer: data race`。
 - `tools/spec_xref_check.py --quiet` / `tools/spec_enum_diff.py`：OK，同前几轮。
 
+### Seal-journal Round E MigratedV2Started（V+M companion 写路径，重新诠释为"L 已是 238B v2"场景）[已实现]
+
+PR #46（`.xgc` decode + loader）合并后，用户要求"下一步该怎么做？请你自主推进"。派了 2 轮
+Explore agent 研究才收敛到这一轮的真实范围。
+
+**第一轮排查（journal drain-completeness，已否决）**：本仓库没有任何生产 lease 类支持目录枚举
+（`SealJournalStoreLease`/`CandidateLease` 全部只有固定文件名或参数化的单文件读写，这是六轮
+review 定下的安全纪律），且 `.jts` 在 `.jhw` 已经被删除后（drain-complete 的目标状态本身）结构性
+地无法用现有的 `SealJournalTombstoneLoader::scan_up_to_watermark`（依赖存活的 `.jhw` 才能算出
+探测范围）枚举到。即使只做 spec 里"journal side"那半句窄定义，也需要先给 `SealJournalStoreLease`
+发明一个前所未有的目录枚举原语——用户确认放弃这个方向。
+
+**第二轮排查（MigratedV2Started，范围收窄）**：最初假设跟 `raise_started_published()` 同构。
+核实后发现 spec 里唯一具体的 V+M 写序程序（`BINANCE_PRIVATE_REST_L4_SPEC.md:4002-4016`）明确
+标注"Offline migration (operator tool only — never hot-path auto-upgrade)"——前置条件是"L 已经
+是一份 legacy 192 字节格式的预先存在文件"，本仓库从未 decode/encode 过这个格式（只有一个字节数
+常量 `kSealExportStartedLegacyV1Bytes = 192`，没有对应的字段布局/codec）。用户确认范围：只做
+V+M 的写步骤（spec 步骤 3-5），把"L"重新诠释成本仓库真正会写的 238 字节 v2 L（即
+`raise_started_published()` 已经写过的那份）——不碰 legacy 192B 格式，在头注释里显式声明这是
+对 spec offline-migration 步骤的诚实改编，不是字面场景的完整实现。用户随后对第一版计划提出
+ExitPlanMode 拒绝（无附言），紧接着转发一份 GPT Tier B 评审（10 条发现），要求据此优化调整
+方案再执行。
+
+**GPT Tier B 评审 10 条发现，逐条核实后采纳情况**：
+1. **（已用 Grep 核实为真）`encode_seal_export_started_wire()`（`seal_journal_precondition_
+   codec.hpp`）不会先调用 `validate_seal_export_started_shape()`**——只有对应的 `decode_*` 才在
+   MAC 校验前调用；这跟本文件（`seal_export_migration_cleanup_abandon_codec.hpp`）自己的三个
+   `encode_*` 都先 shape-validate、不合法返回 0 的纪律不一样，是该文件自己头注释里已经承认的
+   已知未回填缺口。**采纳**：新增 Step 3.5，构造 V 后、编码前，自己调用一次
+   `validate_seal_export_started_shape(v)`，不合法 → `VShapeInvalid`，不写任何文件。
+2. V 应该整体复制 L 再覆盖可变字段（`SealExportStartedWire v = l;` 再覆盖
+   `kek_key_id`/`registered_producer_mask`/`producer_count`/`ring_id`），不是逐字段列出 closed
+   set——更不容易漏字段（`new_key_id` 是最容易漏的一个，测试
+   PublishesVWithClosedFieldsCopiedFromL 专门断言这个字段）。**采纳**。
+3. `VKeyNotFound` 单独存在；M 不需要独立的 key-not-found——复用 V 那次已经 pin 成功的同一把
+   `v_kek_key_id`。**采纳**（`MigratedV2StartedPublishStatus` 枚举没有为 M 单开 key-not-found
+   分支，`publish()` 的 Step 4 直接复用 Step 3 的 `v_pin`）。
+4. 不额外做存在性预读——直接走既有 CREATE_NEW + collision byte-compare，不加一次 syscall、不开
+   TOCTOU 窗口。**确认，非改动**（本来就这么设计）。
+5. 不合并/削减 V 和 M 各自的 fsync 边界——V 必须先确认 `DurablyPublished` 才能进入 Step 4。
+   **确认，非改动**。
+6. `PublishedNamespaceUncertain` 必须逐文件保守处理，V 和 M 完全独立、各自立即 `return`，同一
+   实例同样入参重试即使命中 byte-equal 碰撞也必须仍然返回 `PublishUncertain`——跟
+   `X1WriteProvenanceMemory` 等既有 provenance-memory 同一纪律。**采纳**：`VWriteProvenanceMemory`/
+   `MWriteProvenanceMemory` 两个独立结构体，`Uncertain` 分支各自立即 `return`，`DurablyPublished`
+   才 `reset()`。
+7. 线程安全边界写进类头注释——单 owner 线程，不为这条冷路径加锁。**采纳**（头注释点 4）。
+8. 既有的 null/UB 防护纪律显式保持——构造函数用引用、磁盘字节全部走固定长度
+   `std::array<std::byte,N>` + fixed-extent `std::span`、decode 前严格 read-exact-size →
+   peek → pin → decode 的顺序。**确认，非改动**。
+9. MAC 比较继续只经由既有 `decode_*` 内部的 `constant_time_equal()` 发生，本类自己不用
+   memcmp/== 直接比对任何 MAC 字节。**采纳**（头注释点 8；`m.legacy_mac`/`m.v2_mac` 只是复制
+   L/V 各自已验证的 trailer，不参与判定）。
+10. 测试列表补全（幂等重试、M 的 MAC 只能用 v_kek_key_id 验证、VShapeInvalid 时验证 V/M 都不
+    存在、legacy-192-byte-sized L 的显式回归等）。**采纳**，见下方测试小节。
+
+**实现内容**：
+- 新文件 `native/include/hengyuan/migrated_v2_started_publisher.hpp`——
+  `MigratedV2StartedPublisher` 类，非 phase-advancer（不属于 `IntentPhaseAdvancer`，从不推进
+  `Intent.phase`）。`publish(build_nonce, v_kek_key_id, registered_producer_mask,
+  producer_count, ring_id)` 实现 Step 0（读+验证 Intent，精确要求
+  `phase == StartedPublished`）→ Step 1（读 L 的原始字节+decode+MAC 验证，`.mac` 供 Step 4
+  的 `legacy_file_digest` 输入用真实磁盘字节而非重建）→ Step 2（核对 L 绑定字段真的匹配这个
+  Intent，含 `L.new_generation == Intent.target_generation`）→ Step 3（整体复制 L 构造 V + 
+  shape-validate + pin `v_kek_key_id` + 编码 + CREATE_NEW，`Uncertain` 立即返回）→ Step 4
+  （只在 V 确认 `DurablyPublished` 后执行：SHA-256(L 原始字节)/SHA-256(V 编码字节) 作为
+  `legacy_file_digest`/`v2_file_digest`；`legacy_mac`/`v2_mac` 直接复制 L/V 各自已验证的
+  trailer；复用 Step 3 的 pin 编码 M + CREATE_NEW，`Uncertain` 立即返回）。
+- `compaction_lease.hpp` 新增：`friend class hy::MigratedV2StartedPublisher;` +
+  `CandidateLease::create_seal_export_started_migration_no_replace()`（CREATE_NEW，方法体
+  照抄 `create_seal_export_started_no_replace` 的模式，文件名用既有的
+  `ValidatedArtifactName::for_seal_export_started_migration()`）。V 复用既有的
+  `create_seal_export_started_no_replace(/*legacy_or_greenfield=*/false, ...)`——这个方法本来
+  就支持写两个文件名中的任意一个，这一轮只是第一次拿 `false` 调它，不需要新增方法。
+- 新测试文件 `native/tests/test_migrated_v2_started_publisher.cpp`（15 个测试，真实文件 I/O，
+  两把不同字节内容的 KeyRing key 分别签 L 和 V/M，使"M 的 MAC 只能用 v_kek_key_id 验证"这条
+  断言真正有意义而非平凡为真）：成功路径（PublishesVWithClosedFieldsCopiedFromL 逐字段断言 V
+  跟 L 完全一致，尤其 `new_key_id`；PublishesMWithCorrectDigestsAndMacs 用重新编码的 L/V 字节
+  独立核算 digest/mac 是否吻合）；MacOnlyVerifiesUnderVKeyNotLegacyKey（M 的字节用 L 的 key
+  decode 必须返回 `ChecksumMismatch`）；IdempotentRetrySameInputsReturnsPublished；
+  RefusesWhileReserved/RefusesWhilePostSealFinalizing（后者真实调用
+  `raise_post_seal_finalizing()` 把 Intent 推过 StartedPublished，证明门槛是精确相等不是
+  `>=`）；RefusesForeignBuildNonce；L 相关三个（`LNotFound`、MAC 篡改 `LCorrupt`、**legacy
+  192 字节尺寸的 L 显式回归 `LCorrupt`**——证明这个类复用的 `decode_seal_export_started_wire`
+  只认 238 字节 v2）；RefusesWhenLForeignBinding；RefusesIllegalTopologyAndWritesNeitherVNorM
+  （`registered_producer_mask==0`，并验证 V/M 事后都不存在）；RefusesWhenVKeyNotFound；
+  VWriteConflictReturnsVWriteFailed/MWriteConflictReturnsMWriteFailed。
+- 源码走查（非跑起来的测试，`Uncertain` 路径本身是既有四个 `raise_*` 函数的测试套件都没有强行
+  构造过的平台级不确定性场景，这一轮同样不专门造 mock 触发）：确认 `VWriteProvenanceMemory`/
+  `MWriteProvenanceMemory` 相互独立、`Uncertain` 分支在源码里确实立即 `return` 不下坠到下一步
+  （`migrated_v2_started_publisher.hpp:313`/`:383`）。
+
+**明确不做**（头注释显式声明）：legacy 192 字节 L 格式的 decode/校验；真实 operator 交互/CLI；
+接入任何真实触发流程；`.clr`/`.abd`/`.xgc` 相关的任何东西。
+
+**验证（2026-08-22）**：
+- MSVC Release 全量构建：0 warning（`/W4`）。全量 ctest：1172/1172（含新增 15 个测试；1 个既有
+  POSIX-only skip）。
+- WSL2 GCC-14 Release（`none` 档，`HY_BUILD_DEMO=ON`）：1201/1201。
+- WSL2 ASan+UBSan（`address` 档，`HY_BUILD_DEMO=OFF` 定向构建：
+  test_migrated_v2_started_publisher + test_compaction_lease + compaction_lease_holder +
+  test_compaction_intent_store，规避这台 WSL2 VM 在全量 demo ASan 构建下的既知 OOM）：48/48，
+  无 ASan/UBSan 报告。
+- WSL2 TSan（`thread` 档）：这一轮改了 `compaction_lease.hpp`（新 friend + 新写方法），从设计
+  阶段起就规划了 address/thread 两档，不是先跳过再回头补——`tools/wsl_verify.sh` 的
+  `run_thread()` 目标列表新增 test_migrated_v2_started_publisher（跟已有的
+  test_compaction_lease/compaction_lease_holder/test_compaction_intent_store 同一条
+  "本地覆盖比 CI 的 tsan-concurrency job 更宽"的既有先例，CI 那个 job 本身只构建纯并发原语，
+  不构建这几个）。`ctest -L concurrency` 73/73（含新增 15 个测试），两个负控
+  tsan_control_relaxed_ring/`tsan_control_export_worker_dual_consumer` 均正确报出
+  `WARNING: ThreadSanitizer: data race`。
+- `tools/spec_xref_check.py --quiet`：OK（`migrated_v2_started_publisher.hpp` 已加入该工具的
+  搜索文件列表；测试名/ExitPlanMode 工具名按既有惯例去掉反引号）。
+  `tools/spec_enum_diff.py`：OK（唯一警告是既有的 `SubmitOutcome::RateLimited` spec-ahead-of-code，
+  跟这一轮无关）。
+
 ### Phase 1：共享 DurableLogStore + ControlPlaneLogSink（以下 DurableLogStore/ControlPlaneLogSink
 及其成员方法均为本轮新引入的实现层符号，代码落地前不作为 spec_xref_check.py 反引号登记项）
 

@@ -667,6 +667,20 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_compaction_intent_gc_authorized_loader)
     gtest_discover_tests(test_compaction_intent_gc_authorized_loader)
 
+    # Seal-journal Round E MigratedV2Started (V+M companion write path):
+    # MigratedV2StartedPublisher -- new CandidateLease friend + write method,
+    # same concurrency label/TSan wrapper discipline as test_compaction_lease.
+    add_executable(test_migrated_v2_started_publisher tests/test_migrated_v2_started_publisher.cpp)
+    target_link_libraries(test_migrated_v2_started_publisher PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_migrated_v2_started_publisher)
+
+    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+        set_target_properties(test_migrated_v2_started_publisher PROPERTIES
+            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+    endif()
+
+    gtest_discover_tests(test_migrated_v2_started_publisher PROPERTIES LABELS concurrency)
+
     # Round E breadcrumb L2 loaders: coordinator-only composition of Modules
     # 1/3/4's loaders into one call (load_all_breadcrumb_preconditions()) --
     # written after all three landed, see the header's own SCOPE comment.

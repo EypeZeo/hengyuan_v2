@@ -191,6 +191,13 @@ class CompactionIntentGcAuthorizedLoader;
 // test-only this round, not wired into any production call path.
 class IntentPhaseAdvancer;
 
+// MigratedV2Started V+M companion write path (docs/SPEC_INVARIANTS.md's
+// "Seal-journal Round E MigratedV2Started (V+M companion write path)"
+// entry) -- NOT a phase-advancer (never touches Intent.phase, so it is a
+// separate class from IntentPhaseAdvancer, not folded into it). Single
+// owner-thread object, same discipline as CandidateLease itself.
+class MigratedV2StartedPublisher;
+
 namespace test_only {
 // Pre-integration test accessor -- see the friend declaration inside
 // CandidateLease below. Deliberately NOT in namespace hy::compaction_detail
@@ -328,6 +335,7 @@ private:
     // isolation between "what IntentStore does" and "what IntentPhaseAdvancer
     // does" is a code-review-discipline boundary, not a compiler-enforced one.
     friend class hy::IntentPhaseAdvancer;
+    friend class hy::MigratedV2StartedPublisher;
 
     LeaseWriteResult write_x1_frame_no_replace(std::uint64_t build_nonce, std::uint32_t seq,
                                                 std::span<const std::byte, 176> encoded_transition) noexcept;
@@ -367,6 +375,15 @@ private:
         bool legacy_or_greenfield, std::span<const std::byte, kSealExportStartedWireBytes> encoded_started) noexcept;
     LeaseReadResult read_seal_export_started_migration(
         std::span<std::byte, kSealExportStartedMigrationWireBytes> out) noexcept;
+    // MigratedV2Started V+M companion write path (docs/SPEC_INVARIANTS.md's
+    // "Seal-journal Round E MigratedV2Started (V+M companion write path)"
+    // entry): CREATE_NEW only for "M" ("V" reuses the existing
+    // create_seal_export_started_no_replace(/*legacy_or_greenfield=*/false, ...)
+    // above -- that method already supports either filename, this round is
+    // simply the first caller to pass `false`). No REPLACE variant -- M is
+    // written exactly once, same discipline as L.
+    LeaseWriteResult create_seal_export_started_migration_no_replace(
+        std::span<const std::byte, kSealExportStartedMigrationWireBytes> encoded_migration) noexcept;
     LeaseReadResult read_seal_started_cleanup_tombstone(
         std::span<std::byte, kSealStartedCleanupWireBytes> out) noexcept;
     LeaseReadResult read_seal_started_abandon(std::span<std::byte, kSealStartedAbandonWireBytes> out) noexcept;
@@ -1026,6 +1043,21 @@ inline LeaseReadResult CandidateLease::read_compaction_intent_gc_authorized(
     result.read = compaction_detail::read_validated_exact_win(dir_handle_, name, out);
 #else
     result.read = compaction_detail::read_validated_exact(dir_fd_, name, out);
+#endif
+    return result;
+}
+
+inline LeaseWriteResult CandidateLease::create_seal_export_started_migration_no_replace(
+    std::span<const std::byte, kSealExportStartedMigrationWireBytes> encoded_migration) noexcept {
+    LeaseWriteResult result{};
+    result.outcome = check_can_operate();
+    if (result.outcome != LeaseIoOutcome::Ok) return result;
+
+    const auto name = compaction_detail::ValidatedArtifactName::for_seal_export_started_migration();
+#ifdef _WIN32
+    result.publish = compaction_detail::write_validated_no_replace_win(dir_handle_, name, encoded_migration);
+#else
+    result.publish = compaction_detail::write_validated_no_replace(dir_fd_, name, encoded_migration);
 #endif
     return result;
 }
