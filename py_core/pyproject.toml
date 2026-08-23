@@ -21,7 +21,7 @@ test = [
 # separate top-level packages and refuses to build. Map "py_core" explicitly
 # onto "." so `import py_core.manual_ohlcv` etc. resolves as intended.
 package-dir = {"py_core" = "."}
-packages = ["py_core", "py_core.backtests", "py_core.core", "py_core.risk", "py_core.market_data", "py_core.validation"]
+packages = ["py_core", "py_core.backtests", "py_core.core", "py_core.risk", "py_core.market_data", "py_core.validation", "py_core.indicators"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
