@@ -144,6 +144,26 @@ def test_write_records_refuses_symlink_between_root_and_partition(tmp_path: Path
         wh.write_records(tmp_path, [rec])
 
 
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions are a Windows-only concept")
+def test_write_records_refuses_junction_between_root_and_partition(tmp_path: Path) -> None:
+    """Regression: Path.is_symlink() returns False for NTFS junctions entirely (verified
+    directly against `mklink /J`) -- a junction is a distinct reparse-point type, not a
+    symlink. This caught a real gap in _no_symlink_between()'s first implementation, which
+    only checked is_symlink() and silently let a junction through undetected."""
+    import subprocess
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "crypto_spot"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link_dir), str(real_dir)], capture_output=True, check=False
+    )
+    assert result.returncode == 0, "mklink /J failed -- test environment issue, not the code under test"
+    rec = _rec(datetime(2024, 1, 1, tzinfo=UTC), 100.0)
+    with pytest.raises(wh.WarehouseInvalidIdentityError):
+        wh.write_records(tmp_path, [rec])
+
+
 # ---------------------------------------------------------------------------
 # write_records(): fresh, cross-month, idempotent, empty list
 # ---------------------------------------------------------------------------

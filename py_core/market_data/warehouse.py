@@ -192,21 +192,40 @@ def _no_symlink_between(root: Path, target: Path) -> None:
     symlink/reparse point. Accepted trust boundary, not a full TOCTOU defense: a real
     open()-time O_NOFOLLOW directory-fd chain (POSIX) or reparse-point HANDLE check
     (Windows) would be needed for that, and this single-machine research repo does not
-    take on that complexity. This check catches the obvious/accidental cases."""
-    root_resolved = root.resolve()
+    take on that complexity. This check catches the obvious/accidental cases.
+
+    Deliberately does NOT call target.resolve() before walking -- resolve() itself follows
+    symlinks, so resolving first and then walking the *resolved* path's components would
+    silently walk straight through the very symlink this function exists to catch (this was
+    a real bug here, caught by CI: the original implementation did exactly that and let a
+    symlinked directory through undetected). Instead this walks the ORIGINAL, unresolved
+    path's components one at a time, checking at each step before proceeding to the next --
+    a not-yet-existing component correctly reports not-a-symlink/not-a-junction (neither is
+    an error), so this is safe to call both before and after the target directory is
+    actually created.
+
+    Checks both Path.is_symlink() (real NTFS/POSIX symlinks) and os.path.isjunction()
+    (Windows NTFS junctions -- a distinct reparse-point type that Path.is_symlink() does
+    NOT detect at all; verified directly: creating one with `mklink /J` and checking
+    .is_symlink() on it returns False. isjunction() is a no-op returning False on POSIX,
+    so calling it unconditionally on both platforms is safe.
+    """
     try:
-        relative = target.resolve().relative_to(root_resolved)
+        relative = target.relative_to(root)
     except ValueError as exc:
         raise WarehouseInvalidIdentityError(
-            f"path {target} escapes warehouse root {root}"
+            f"path {target} is not under root {root}"
         ) from exc
-    current = root_resolved
+    current = root
     for part in relative.parts:
         current = current / part
-        if current.is_symlink():
+        if current.is_symlink() or os.path.isjunction(current):
             raise WarehouseInvalidIdentityError(
-                f"refusing to follow symlink/reparse point at {current}"
+                f"refusing to follow symlink/junction/reparse point at {current}"
             )
+    root_resolved = root.resolve()
+    if not current.resolve().is_relative_to(root_resolved):
+        raise WarehouseInvalidIdentityError(f"path {target} escapes warehouse root {root}")
 
 
 def partition_path(
@@ -695,12 +714,15 @@ def write_records(root: Path, records: list[NormalizedOhlcvRecord]) -> WriteRepo
         for key in sorted_keys:
             market, symbol, timeframe, year, month = key
             final_path = partition_path(root, market, symbol, timeframe, year, month)
+            # Checked BEFORE mkdir: a symlink can already exist along this path (e.g. a
+            # pre-existing "crypto_spot" symlink) -- mkdir(parents=True, exist_ok=True)
+            # follows existing symlinked directories, so this check must run first or it
+            # would already be too late. Checked AGAIN after mkdir as a second, independent
+            # pass to catch a symlink introduced concurrently between the two calls
+            # (accepted trust boundary, not full TOCTOU defense; see
+            # _no_symlink_between()'s docstring).
+            _no_symlink_between(root, final_path.parent)
             final_path.parent.mkdir(parents=True, exist_ok=True)
-            # Re-check containment/symlink-safety after mkdir -- the directory could not
-            # have existed as a symlink before this call created it, but this check is the
-            # one that would catch a symlink introduced concurrently between the check and
-            # the lock acquisition below (accepted trust boundary, not full TOCTOU defense;
-            # see _no_symlink_between()'s docstring).
             _no_symlink_between(root, final_path.parent)
             lock_path = _lock_path_for(final_path)
 

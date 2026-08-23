@@ -36,11 +36,22 @@ def test_second_attempt_while_held_raises_busy(tmp_path: Path) -> None:
         pass  # pragma: no cover -- must not be reached
 
 
-def test_lock_file_gets_sentinel_byte(tmp_path: Path) -> None:
+def test_lock_file_exists_after_use(tmp_path: Path) -> None:
     lock_path = tmp_path / "p.parquet.lock"
     with partition_lock(lock_path):
         pass
     assert lock_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the sentinel byte is a Windows/msvcrt-only requirement")
+def test_lock_file_gets_sentinel_byte_on_windows(tmp_path: Path) -> None:
+    # msvcrt.locking() behaves inconsistently on a 0-byte file across some Windows/msvcrt
+    # version combinations, so the Windows branch writes one sentinel byte before locking.
+    # POSIX's flock() has no such requirement and correctly never writes one -- see
+    # test_lock_file_exists_after_use for the platform-neutral half of this invariant.
+    lock_path = tmp_path / "p.parquet.lock"
+    with partition_lock(lock_path):
+        pass
     assert lock_path.stat().st_size >= 1
 
 
