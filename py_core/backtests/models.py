@@ -26,7 +26,10 @@ class BacktestConfig:
     fee_bps: float = 0.0
     slippage_bps: float = 0.0
     risk_free_rate: float = 0.0
-    annualization_factor: int = 252
+    # None = 从数据自身的 market + timeframe 自动推导（见 py_core/backtests/annualization.py）。
+    # 之前这里硬编码 252（股票交易日数），对 7×24 的加密货币是错的，会系统性低估年化收益与
+    # Sharpe，周期越细错得越多。显式传值仍然可以覆盖自动推导。
+    annualization_factor: float | None = None
     output_label: str = BACKTEST_ESTIMATES_LABEL
 
     def __post_init__(self) -> None:
@@ -36,9 +39,10 @@ class BacktestConfig:
             raise ValueError(f"fee_bps 必须在 [0, 500] 范围内，当前值: {self.fee_bps}")
         if self.slippage_bps < 0 or self.slippage_bps > 500:
             raise ValueError(f"slippage_bps 必须在 [0, 500] 范围内，当前值: {self.slippage_bps}")
-        if self.annualization_factor <= 0:
+        if self.annualization_factor is not None and self.annualization_factor <= 0:
             raise ValueError(
-                f"annualization_factor 必须为正数，当前值: {self.annualization_factor}"
+                f"annualization_factor 必须为正数（或 None 表示自动推导），"
+                f"当前值: {self.annualization_factor}"
             )
 
 

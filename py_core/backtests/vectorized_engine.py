@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 from py_core.manual_ohlcv import NormalizedOhlcvRecord
 
+from py_core.backtests.annualization import annualization_factor_for_records
 from py_core.backtests.metrics import compute_metrics
 from py_core.backtests.models import (
     BACKTEST_ESTIMATES_LABEL,
@@ -145,13 +146,31 @@ def run_vectorized_backtest(
         raise ValueError("records 不能为空")
 
     df = records_to_dataframe(records)
-    return _run_vectorized_backtest_on_df(config, df, signals)
+    return _run_vectorized_backtest_on_df(
+        config, df, signals, annualization_factor=resolve_annualization_factor(config, records)
+    )
+
+
+def resolve_annualization_factor(
+    config: BacktestConfig,
+    records: list[NormalizedOhlcvRecord],
+) -> float:
+    """决定这次回测用哪个年化因子：显式配置优先，否则从数据的 market+timeframe 推导。
+
+    单独成函数是为了让两个入口（run_vectorized_backtest / run_risk_aware_backtest）和 CLI
+    共用同一套优先级规则，而不是各写一遍、各自漂移。
+    """
+    if config.annualization_factor is not None:
+        return float(config.annualization_factor)
+    return annualization_factor_for_records(records)
 
 
 def _run_vectorized_backtest_on_df(
     config: BacktestConfig,
     df: pd.DataFrame,
     signals: pd.Series[Any],
+    *,
+    annualization_factor: float,
 ) -> BacktestResult:
     """run_vectorized_backtest() 的内部实现，接收已经构建好的 OHLCV DataFrame。
 
@@ -163,6 +182,9 @@ def _run_vectorized_backtest_on_df(
         df: records_to_dataframe() 的输出形状（DatetimeIndex，按时间升序，
             columns=[open, high, low, close, volume]）。调用方负责保证这一点，本函数不
             重新校验 df 本身的形状（那是 records_to_dataframe() 的职责）。
+        annualization_factor: 一年多少根 bar。**keyword-only 且必填**——这个函数只拿得到
+            df，拿不到 records，没法自己推导；强制调用方传值可以确保
+            resolve_annualization_factor() 在上游被真正调用过，而不是悄悄退回一个默认魔数。
     """
     # 确保 signals 拥有 DatetimeIndex
     signals_work = signals.copy()
@@ -245,7 +267,7 @@ def _run_vectorized_backtest_on_df(
         positions=positions_list,
         cost_impact_total=cost_impact_total,
         initial_capital=config.initial_capital,
-        annualization_factor=config.annualization_factor,
+        annualization_factor=annualization_factor,
         risk_free_rate=config.risk_free_rate,
     )
 

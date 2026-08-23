@@ -17,7 +17,7 @@ def compute_metrics(
     positions: list[float],
     cost_impact_total: float,
     initial_capital: float,
-    annualization_factor: int = 252,
+    annualization_factor: float,
     risk_free_rate: float = 0.0,
 ) -> BacktestMetrics:
     """从 equity_curve / returns / positions 计算完整绩效指标集合。
@@ -28,7 +28,10 @@ def compute_metrics(
         positions: 每 bar 的持仓状态（0.0 或 1.0）。
         cost_impact_total: 总成本金额（绝对值）。
         initial_capital: 初始资本。
-        annualization_factor: 年化因子（默认 252）。
+        annualization_factor: 一年包含多少根 bar。**必填，刻意不给默认值**——之前这里默认
+            252（股票交易日数），对 7×24 的加密货币是错的且会静默生效；现在强制调用方明确
+            解析出这个值（通常经由 py_core.backtests.annualization 从数据的 market+timeframe
+            推导）。
         risk_free_rate: 年化无风险利率（默认 0.0）。
 
     Returns:

@@ -31,6 +31,7 @@ from py_core.backtests.models import (
 from py_core.backtests.vectorized_engine import (
     _run_vectorized_backtest_on_df,
     records_to_dataframe,
+    resolve_annualization_factor,
     validate_inputs,
 )
 from py_core.risk.risk_calculator import RiskCalculator
@@ -164,10 +165,16 @@ def run_risk_aware_backtest(
     if not validation_report.is_valid:
         raise ValueError(f"输入校验失败：{validation_report.issues}")
 
+    # ── 年化因子：显式配置优先，否则从数据的 market+timeframe 推导 ────────
+    # 基础回测与风险调整回测必须用同一个因子，否则两份 metrics 不可比。
+    annualization_factor = resolve_annualization_factor(config, records)
+
     # ── 运行基础回测（P2-BT-01，不做修改）────────────────────────────────
     # 复用上面已经构建好的 df，不再让 _run_vectorized_backtest_on_df 内部重新调用
     # records_to_dataframe(records) 构建第二份一样的 DataFrame。
-    base_result = _run_vectorized_backtest_on_df(config, df, signals)
+    base_result = _run_vectorized_backtest_on_df(
+        config, df, signals, annualization_factor=annualization_factor
+    )
 
     # ── next-bar 仓位（与 P2-BT-01 shift 语义相同）───────────────────────
     positions: pd.Series[Any] = signals_aligned.shift(1).fillna(0.0)
@@ -246,7 +253,7 @@ def run_risk_aware_backtest(
         positions=risk_positions_fraction,
         cost_impact_total=cost_impact_total,
         initial_capital=config.initial_capital,
-        annualization_factor=config.annualization_factor,
+        annualization_factor=annualization_factor,
         risk_free_rate=config.risk_free_rate,
     )
 

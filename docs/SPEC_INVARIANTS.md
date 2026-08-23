@@ -416,6 +416,24 @@ seal journal 不做，日志无限增长，这是已知缺口，等后续单独�
 `durable_control_plane.hpp` 与 `account_truth.hpp`，新符号通过 ledger 反引号自动被下一次抓取，
 无需手工登记列表。
 
+---
+
+> **⚠ 冻结通知（2026-08-23，owner 决策）**
+>
+> 从这里开始的全部 Seal-journal / compaction 条目（Round A–G，共 14 条 `[已实现]`）所描述的
+> 子系统**已冻结**：代码全部保留、CI 继续全量跑（含 TSan/ASan 与全部 TLA+ 负控），但**停止
+> 扩展**，并已从「走向实盘」的关键路径上移出。理由、精确文件清单、以及**解冻条件**见
+> `docs/SEAL_JOURNAL_FREEZE_NOTE.md`。
+>
+> 下面这些条目**仍然是准确的实现记录**，不因冻结而失效——它们是将来一旦解冻时的续接上下文。
+> 冻结的是继续开发，不是既有事实，也不是验证。
+>
+> 冻结**不影响** `durable_audit_sink.hpp` / `durable_log_store.hpp` / `durable_frame_codec.hpp`
+> 这三个真能工作的审计落盘组件（真 fsync、真 MAC 链、真 `recovery_scan()`）——它们不在冻结
+> 范围内，且是后续实盘审计的落地方案。
+
+---
+
 ### Seal-journal Round A（`.xgc` 家族 3 轮之第 1 轮）
 
 **[已实现]** L4 §10 唯一仍未转写的 seal-journal/`.xgc` wire-format 家族体量巨大（约 2,400 spec 行，
