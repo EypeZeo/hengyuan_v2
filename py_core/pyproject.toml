@@ -7,6 +7,7 @@ dependencies = [
   "pydantic>=2.8,<3.0",
   "pandas>=2.2,<3.0",
   "numpy>=2.1,<3.0",
+  "pyarrow>=25.0,<26.0",
 ]
 
 [project.optional-dependencies]
@@ -20,7 +21,7 @@ test = [
 # separate top-level packages and refuses to build. Map "py_core" explicitly
 # onto "." so `import py_core.manual_ohlcv` etc. resolves as intended.
 package-dir = {"py_core" = "."}
-packages = ["py_core", "py_core.backtests", "py_core.core", "py_core.risk"]
+packages = ["py_core", "py_core.backtests", "py_core.core", "py_core.risk", "py_core.market_data"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
