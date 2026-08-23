@@ -80,16 +80,16 @@ def _records(n: int, *, seed: int = 1) -> list[NormalizedOhlcvRecord]:
     ]
 
 
-def test_spec_strategy_requires_exactly_one_of_spec_path_or_spec() -> None:
+def test_spec_strategy_requires_exactly_one_of_spec_path_or_parsed_spec() -> None:
     with pytest.raises(ValueError, match="二者之一"):
         SpecStrategy()
     with pytest.raises(ValueError, match="二者之一"):
-        SpecStrategy(spec_path="does_not_matter.toml", spec=parse_spec(_SPEC_TEXT))
+        SpecStrategy(spec_path="does_not_matter.toml", parsed_spec=parse_spec(_SPEC_TEXT))
 
 
 def test_spec_strategy_from_parsed_spec_generates_valid_signal() -> None:
     spec = parse_spec(_SPEC_TEXT)
-    strategy = SpecStrategy(spec=spec)
+    strategy = SpecStrategy(parsed_spec=spec)
     records = _records(100)
     from py_core.backtests.vectorized_engine import records_to_dataframe
 
@@ -119,7 +119,7 @@ def test_spec_strategy_loads_via_load_strategy_trusted_namespace(tmp_path) -> No
 
 
 def test_spec_strategy_runs_through_full_vectorized_backtest() -> None:
-    strategy = SpecStrategy(spec=parse_spec(_SPEC_TEXT))
+    strategy = SpecStrategy(parsed_spec=parse_spec(_SPEC_TEXT))
     records = _records(150)
     from py_core.backtests.vectorized_engine import records_to_dataframe
 
