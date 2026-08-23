@@ -53,7 +53,11 @@ from py_core.backtests.artifact_export import (
 )
 from py_core.backtests.models import BacktestConfig, BacktestResult
 from py_core.backtests.risk_integration import run_risk_aware_backtest
-from py_core.backtests.vectorized_engine import _run_vectorized_backtest_on_df, records_to_dataframe
+from py_core.backtests.vectorized_engine import (
+    _run_vectorized_backtest_on_df,
+    records_to_dataframe,
+    resolve_annualization_factor,
+)
 from py_core.risk.risk_config import RiskConfig
 from py_core.strategies.base import load_strategy
 
@@ -553,8 +557,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         annualization_factor=args.annualization_factor,
     )
 
+    annualization_factor = resolve_annualization_factor(config, records)
+    if args.annualization_factor is None:
+        print(
+            f"[INFO] 年化因子自动推导: {annualization_factor:g}"
+            f"（market={args.market}, timeframe={args.timeframe}）"
+        )
+    else:
+        print(f"[INFO] 年化因子（显式指定）: {annualization_factor:g}")
+
     print("[INFO] 运行回测...")
-    result = _run_vectorized_backtest_on_df(config, df, signals)
+    result = _run_vectorized_backtest_on_df(
+        config, df, signals, annualization_factor=annualization_factor
+    )
 
     # 输出绩效摘要
     m = result.metrics
@@ -630,7 +645,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--risk-free-rate", type=float, default=0.0, help="年化无风险利率（默认 0.0）"
     )
     run_parser.add_argument(
-        "--annualization-factor", type=int, default=252, help="年化因子（默认 252）"
+        "--annualization-factor",
+        type=float,
+        default=None,
+        help="年化因子（默认自动从 --market + --timeframe 推导：crypto_spot 按 7×24 全年，"
+        "如 1d→365、1h→8760；显式传值可覆盖）",
     )
     run_parser.add_argument("--market", default="crypto_spot", help="市场类型（默认 crypto_spot）")
     run_parser.add_argument("--symbol", default="BTC/USDT", help="交易对符号（默认 BTC/USDT）")
