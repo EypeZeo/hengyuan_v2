@@ -1,22 +1,34 @@
 """
-Binance 公开 REST 历史 K 线拉取 — 本地 CLI 入口（P2-MD-02）
+Binance 公开 REST 历史 K 线拉取 / 仓库管理 — 本地 CLI 入口（P2-MD-02，批次 1）
 
-独立于 py_core/backtests/cli.py 的小 CLI，只做"拉数据存文件"这一件事——两个 CLI 之间只通过
-输出的 ohlcv.csv 文件耦合，不共享任何代码路径。
+独立于 py_core/backtests/cli.py 的小 CLI——两者只通过输出的 ohlcv.csv 文件耦合，不共享任何
+代码路径。`fetch` 是单次拉取写平铺文件；`backfill`/`status`/`verify` 是批次 1
+`py_core/market_data/warehouse.py`（按月分区 Parquet 仓库）的增量维护入口，两组子命令内部
+互不依赖，只是共享同一个 argparse 入口和输出风格。
 
 所有输出均为研究/回测用途的历史行情数据，不代表实盘数据源的授权或点位精度保证。
 
 用法：
     python -m py_core.market_data.cli fetch \\
-        --symbol BTCUSDT --interval 1d \\
-        --start 2024-01-01 --end 2024-06-01 \\
+        --symbol BTCUSDT --interval 1d --start 2024-01-01 --end 2024-06-01 \\
         --output-dir path/to/output_dir
 
-输出（--output-dir 是目录，原子发布——见 publish_fetch_output() 的实现）：
+    python -m py_core.market_data.cli backfill \\
+        --root path/to/warehouse --symbol BTCUSDT --interval 1d --start 2024-01-01
+
+    python -m py_core.market_data.cli status --root path/to/warehouse --symbol BTCUSDT --interval 1d
+    python -m py_core.market_data.cli verify --root path/to/warehouse --symbol BTCUSDT --interval 1d
+
+`fetch` 输出（--output-dir 是目录，原子发布——见 publish_fetch_output() 的实现）：
     <output-dir>/ohlcv.csv        —— timestamp_utc,open,high,low,close,volume，
                                       格式跟 py_core.backtests.cli.load_ohlcv_csv() 的读取端对得上
     <output-dir>/manifest.json    —— 复用既有的 ManualOhlcvImportManifest
     <output-dir>/fetch_meta.json  —— fetch-only 的 provenance（FetchMeta）
+
+`verify` 的退出码约定：0 = 仓库干净（或本来就没有数据），1 = `fetch`/`backfill` 本身执行
+失败（网络/校验错误），**也是** 1 = 仓库连续性有问题（存在缺口）——"命令失败"和"命令成功
+但报告了一个不连续的仓库"目前共用同一个非零退出码，靠打印内容区分，不是两个独立的错误
+通道；这个约定写在这里，避免被脚本调用方误当成"命令本身出错"。
 """
 
 from __future__ import annotations
@@ -45,12 +57,14 @@ from py_core.manual_ohlcv import (
     TimestampPosture,
     manifest_to_dict,
 )
-
+from py_core.market_data import warehouse as wh
 from py_core.market_data.binance_public_rest import (
     BinancePublicRestError,
     FetchMeta,
     fetch_binance_ohlcv,
 )
+from py_core.market_data.warehouse_backfill import BackfillError
+from py_core.market_data.warehouse_backfill import backfill as run_backfill
 
 NON_AUTH_NOTICE = (
     "\n[NOTICE] All fetched data is for RESEARCH/BACKTESTING USE ONLY.\n"
@@ -221,6 +235,103 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _identity_from_args(args: argparse.Namespace) -> tuple[Path, ManualMarket, CanonicalMarketSymbol, OhlcvTimeframe]:
+    """--root/--market/--symbol/--interval 是 backfill/status/verify 三个子命令共用的
+    身份四元组，集中解析一次，不在每个 cmd_* 里各写一遍。"""
+    root = Path(args.root).resolve()
+    market = ManualMarket(args.market)
+    symbol = CanonicalMarketSymbol(args.symbol)
+    timeframe = OhlcvTimeframe(args.interval)
+    return root, market, symbol, timeframe
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    print(NON_AUTH_NOTICE)
+
+    try:
+        root, market, symbol, timeframe = _identity_from_args(args)
+        start = _parse_utc_date(args.start)
+        end = _parse_utc_date(args.end) if args.end else datetime.now(UTC)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[INFO] backfill {symbol.value} {timeframe.value} -> [{start.isoformat()}, {end.isoformat()})")
+    try:
+        report = run_backfill(root, market, symbol, timeframe, start, end, max_requests=args.max_requests)
+    except (
+        ValueError,
+        BinancePublicRestError,
+        ManualOhlcvValidationError,
+        BackfillError,
+        wh.WarehouseError,
+    ) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    if report.already_current:
+        print(f"[INFO] 已是最新（resume 点 {report.resumed_from.isoformat()} >= 请求终点），未发起网络请求")
+        print(NON_AUTH_NOTICE)
+        return 0
+
+    print(f"[INFO] resume 点: {report.resumed_from.isoformat()}")
+    print(f"[INFO] 拉到 {report.fetched_records} 条记录")
+    print(
+        f"[INFO] 写入 {report.write_report.rows_written} 条，跳过 "
+        f"{report.write_report.rows_skipped_duplicate} 条重复"
+    )
+    if report.fetch_coverage_end_utc is not None and report.fetch_coverage_end_utc < end:
+        print(
+            f"[WARNING] 实际覆盖到 {report.fetch_coverage_end_utc.isoformat()}，早于请求的终点 "
+            f"{end.isoformat()}——末尾 K 线可能因为尚未收盘被丢弃，之后重跑 backfill 会自动"
+            "从这里继续。",
+            file=sys.stderr,
+        )
+    print(NON_AUTH_NOTICE)
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    try:
+        root, market, symbol, timeframe = _identity_from_args(args)
+        cov = wh.coverage(root, market, symbol, timeframe)
+    except (ValueError, wh.WarehouseError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    if cov is None:
+        print(f"[INFO] {symbol.value} {timeframe.value}: 无数据")
+        return 0
+
+    print(f"[INFO] {symbol.value} {timeframe.value}:")
+    print(f"  record_count : {cov.record_count}")
+    print(f"  covered      : [{cov.covered_start_utc.isoformat()}, {cov.covered_end_utc.isoformat()})")
+    print(f"  is_contiguous: {cov.is_contiguous}")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    try:
+        root, market, symbol, timeframe = _identity_from_args(args)
+        report = wh.scan_gaps(root, market, symbol, timeframe, max_issues=args.max_issues)
+    except (ValueError, wh.WarehouseError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    if report.total_issue_count == 0:
+        print(f"[INFO] {symbol.value} {timeframe.value}: 干净，无缺口")
+        return 0
+
+    print(f"[WARNING] {symbol.value} {timeframe.value}: 发现 {report.total_issue_count} 处缺口", file=sys.stderr)
+    for issue in report.issues:
+        print(f"  缺失于 {issue.at.isoformat()}（分区 {issue.partition}）", file=sys.stderr)
+    if report.truncated:
+        print(
+            f"  ...还有 {report.total_issue_count - len(report.issues)} 处未列出"
+            f"（--max-issues {args.max_issues}）",
+            file=sys.stderr,
+        )
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m py_core.market_data.cli",
@@ -250,6 +361,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fetch_parser.add_argument("--market", default="crypto_spot", help="市场类型（默认 crypto_spot）")
 
+    def _add_identity_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--root", required=True, help="仓库根目录（py_core.market_data.warehouse 的 root）")
+        p.add_argument("--symbol", required=True, help="Binance 现货交易对，如 BTCUSDT")
+        p.add_argument("--interval", required=True, help="K 线周期，如 1d/1h/15m")
+        p.add_argument("--market", default="crypto_spot", help="市场类型（默认 crypto_spot）")
+
+    backfill_parser = subparsers.add_parser(
+        "backfill", help="从已有覆盖尾部（或 --start，首次回补时）增量拉取到 --end"
+    )
+    _add_identity_args(backfill_parser)
+    backfill_parser.add_argument(
+        "--start", required=True, help="起始日期 YYYY-MM-DD（仅在这个 (symbol,interval) 组合还没有任何数据时使用；"
+        "已有数据时忽略，从已有覆盖尾部继续——若 --start 早于已有覆盖起点会报错，不静默忽略）"
+    )
+    backfill_parser.add_argument(
+        "--end", default=None, help="结束日期 YYYY-MM-DD（默认当次调用时的 UTC 当前时间）"
+    )
+    backfill_parser.add_argument(
+        "--max-requests", type=int, default=50, help="分页请求次数软上限（默认 50，硬上限 100）"
+    )
+
+    status_parser = subparsers.add_parser("status", help="打印一个 (symbol,interval) 组合的覆盖范围")
+    _add_identity_args(status_parser)
+
+    verify_parser = subparsers.add_parser(
+        "verify", help="扫描缺口；干净退出码 0，有缺口退出码 1（见模块文档的退出码约定）"
+    )
+    _add_identity_args(verify_parser)
+    verify_parser.add_argument(
+        "--max-issues", type=int, default=1000, help="最多列出多少条缺口（默认 1000，超过只计数不列出）"
+    )
+
     return parser
 
 
@@ -259,6 +402,12 @@ def main() -> None:
 
     if args.command == "fetch":
         sys.exit(cmd_fetch(args))
+    elif args.command == "backfill":
+        sys.exit(cmd_backfill(args))
+    elif args.command == "status":
+        sys.exit(cmd_status(args))
+    elif args.command == "verify":
+        sys.exit(cmd_verify(args))
     else:
         parser.print_help()
         sys.exit(1)

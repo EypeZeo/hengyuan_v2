@@ -17,19 +17,23 @@ from typing import Any
 from unittest import mock
 
 import pytest
+
 from py_core.manual_ohlcv import (
     CanonicalMarketSymbol,
     ManualMarket,
     NormalizedOhlcvRecord,
     OhlcvTimeframe,
 )
-
+from py_core.market_data import warehouse as wh
 from py_core.market_data.binance_public_rest import FetchMeta
 from py_core.market_data.cli import (
     _parse_utc_date,
     _write_ohlcv_csv,
     build_parser,
+    cmd_backfill,
     cmd_fetch,
+    cmd_status,
+    cmd_verify,
     publish_fetch_output,
 )
 
@@ -46,7 +50,7 @@ def _rec(day: int, close_p: float = 100.0) -> NormalizedOhlcvRecord:
         high_price=Decimal(str(close_p)),
         low_price=Decimal(str(close_p)),
         close_price=Decimal(str(close_p)),
-        volume=Decimal("10"),
+        volume=Decimal(10),
     )
 
 
@@ -102,7 +106,7 @@ def test_write_ohlcv_csv_matches_backtest_cli_reader(tmp_path: Path) -> None:
 
     loaded = load_ohlcv_csv(csv_path, market=ManualMarket.CRYPTO_SPOT, symbol="BTCUSDT", timeframe="1d")
     assert len(loaded) == 3
-    assert loaded[0].close_price == Decimal("100")
+    assert loaded[0].close_price == Decimal(100)
     assert loaded[0].event_time_utc == records[0].event_time_utc
 
 
@@ -322,3 +326,149 @@ def test_cmd_fetch_output_dir_already_exists_returns_error(tmp_path: Path, capsy
         rc = cmd_fetch(args)
     assert rc == 1
     assert "ERROR" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# backfill / status / verify: 批次 1 PR-2, warehouse.py-backed subcommands.
+# fetch_binance_ohlcv() is mocked at py_core.market_data.warehouse_backfill's import
+# site (not cli's) -- that is where backfill() actually calls it.
+# ---------------------------------------------------------------------------
+
+
+def _wh_args(tmp_path: Path, command: str, **overrides: Any) -> Any:
+    parser = build_parser()
+    argv = [command, "--root", str(tmp_path / "wh"), "--symbol", "BTCUSDT", "--interval", "1d"]
+    if command == "backfill":
+        argv += ["--start", "2024-01-01"]
+    for k, v in overrides.items():
+        argv.extend([f"--{k.replace('_', '-')}", str(v)])
+    return parser.parse_args(argv)
+
+
+def test_build_parser_backfill_requires_start() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["backfill", "--root", "x", "--symbol", "BTCUSDT", "--interval", "1d"])
+
+
+def test_cmd_backfill_fresh_identity_success(tmp_path: Path) -> None:
+    records = [_rec(i) for i in range(5)]
+    meta = _meta()
+    args = _wh_args(tmp_path, "backfill", end="2024-01-10")
+    with mock.patch(
+        "py_core.market_data.warehouse_backfill.fetch_binance_ohlcv", return_value=(records, meta)
+    ) as fake_fetch:
+        rc = cmd_backfill(args)
+    assert rc == 0
+    assert fake_fetch.call_count == 1
+    cov = wh.coverage(
+        tmp_path / "wh", ManualMarket.CRYPTO_SPOT, CanonicalMarketSymbol("BTCUSDT"), OhlcvTimeframe("1d")
+    )
+    assert cov is not None
+    assert cov.record_count == 5
+
+
+def test_cmd_backfill_already_current_zero_network_calls(tmp_path: Path, capsys: Any) -> None:
+    records = [_rec(i) for i in range(5)]
+    meta = _meta(coverage_end_utc=_BASE_DT + timedelta(days=5))
+    args = _wh_args(tmp_path, "backfill", end="2024-01-06")
+    with mock.patch(
+        "py_core.market_data.warehouse_backfill.fetch_binance_ohlcv", return_value=(records, meta)
+    ):
+        assert cmd_backfill(args) == 0
+
+    args2 = _wh_args(tmp_path, "backfill", end="2024-01-06")
+    with mock.patch("py_core.market_data.warehouse_backfill.fetch_binance_ohlcv") as fake_fetch2:
+        rc = cmd_backfill(args2)
+    assert rc == 0
+    fake_fetch2.assert_not_called()
+    assert "已是最新" in capsys.readouterr().out
+
+
+def test_cmd_backfill_rejects_bad_date(tmp_path: Path, capsys: Any) -> None:
+    args = _wh_args(tmp_path, "backfill", end="2024-01-10")
+    args.start = "not-a-date"
+    rc = cmd_backfill(args)
+    assert rc == 1
+    assert "ERROR" in capsys.readouterr().err
+
+
+def test_cmd_backfill_end_defaults_to_now(tmp_path: Path) -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["backfill", "--root", str(tmp_path / "wh"), "--symbol", "BTCUSDT", "--interval", "1d", "--start", "2024-01-01"]
+    )
+    assert args.end is None  # cmd_backfill() resolves this to datetime.now(UTC) at call time
+    records = [_rec(i) for i in range(2)]
+    meta = _meta(coverage_end_utc=_BASE_DT + timedelta(days=2))
+    with mock.patch(
+        "py_core.market_data.warehouse_backfill.fetch_binance_ohlcv", return_value=(records, meta)
+    ) as fake_fetch:
+        rc = cmd_backfill(args)
+    assert rc == 0
+    called_end = fake_fetch.call_args.args[3]
+    assert called_end > datetime.now(UTC) - timedelta(minutes=1)
+
+
+def test_cmd_status_no_data_prints_no_data_not_blank(tmp_path: Path, capsys: Any) -> None:
+    args = _wh_args(tmp_path, "status")
+    rc = cmd_status(args)
+    assert rc == 0
+    assert "无数据" in capsys.readouterr().out
+
+
+def test_cmd_status_prints_coverage(tmp_path: Path, capsys: Any) -> None:
+    records = [_rec(i) for i in range(5)]
+    meta = _meta()
+    args = _wh_args(tmp_path, "backfill", end="2024-01-10")
+    with mock.patch(
+        "py_core.market_data.warehouse_backfill.fetch_binance_ohlcv", return_value=(records, meta)
+    ):
+        cmd_backfill(args)
+
+    status_args = _wh_args(tmp_path, "status")
+    rc = cmd_status(status_args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "record_count" in out
+    assert "is_contiguous" in out
+
+
+def test_cmd_verify_clean_repository_exit_code_zero(tmp_path: Path, capsys: Any) -> None:
+    records = [_rec(i) for i in range(5)]
+    meta = _meta()
+    args = _wh_args(tmp_path, "backfill", end="2024-01-10")
+    with mock.patch(
+        "py_core.market_data.warehouse_backfill.fetch_binance_ohlcv", return_value=(records, meta)
+    ):
+        cmd_backfill(args)
+
+    verify_args = _wh_args(tmp_path, "verify")
+    rc = cmd_verify(verify_args)
+    assert rc == 0
+    assert "干净" in capsys.readouterr().out
+
+
+def test_cmd_verify_gap_exit_code_one(tmp_path: Path, capsys: Any) -> None:
+    root = tmp_path / "wh"
+    wh.write_records(
+        root,
+        [_rec(i) for i in (0, 1, 3, 4)],  # day 2 missing
+    )
+    args = _wh_args(tmp_path, "verify")
+    rc = cmd_verify(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "缺失" in err
+
+
+def test_cmd_verify_truncates_at_max_issues(tmp_path: Path, capsys: Any) -> None:
+    root = tmp_path / "wh"
+    present_days = [d for d in range(20) if d not in (2, 4, 6, 8, 10)]
+    wh.write_records(root, [_rec(d) for d in present_days])
+    args = _wh_args(tmp_path, "verify", max_issues=2)
+    rc = cmd_verify(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "未列出" in err
