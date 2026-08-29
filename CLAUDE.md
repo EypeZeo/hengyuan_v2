@@ -172,7 +172,10 @@ which isn't ctest-registered. Harmless on runners that don't need it (plain Ubun
 
 ## py_core (research stack)
 
-`py_core` (65 tracked files, ~15,254 lines) is the quantitative research stack running
+`py_core` (~66 tracked files, ~15,300 lines as of 2026-08-29 — AUDIT PYDOC-STALE-048: this
+count drifts with every batch of work and is not kept in sync by hand; run
+`git ls-files py_core | grep -v .venv | wc -l` / `... | xargs cat | wc -l` for the current
+number rather than trusting this one) is the quantitative research stack running
 parallel to the native execution stack (the 2026-08 dual-track roadmap's other half). It has
 its own CI channel, `ci-python.yml`, path-filtered to `py_core/**` and deliberately kept
 independent of `ci-native.yml`/`ci-spec-verification.yml` — same "a failure in one channel

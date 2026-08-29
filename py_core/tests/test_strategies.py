@@ -12,15 +12,18 @@ from typing import Any
 
 import pandas as pd
 import pytest
+
+from py_core.backtests.models import BacktestConfig
+from py_core.backtests.vectorized_engine import (
+    records_to_dataframe,
+    run_vectorized_backtest,
+)
 from py_core.manual_ohlcv import (
     CanonicalMarketSymbol,
     ManualMarket,
     NormalizedOhlcvRecord,
     OhlcvTimeframe,
 )
-
-from py_core.backtests.models import BacktestConfig
-from py_core.backtests.vectorized_engine import records_to_dataframe, run_vectorized_backtest
 from py_core.strategies.base import (
     Strategy,
     assert_no_lookahead,

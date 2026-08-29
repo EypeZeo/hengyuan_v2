@@ -17,12 +17,7 @@ from unittest import mock
 
 import pandas as pd
 import pytest
-from py_core.manual_ohlcv import (
-    CanonicalMarketSymbol,
-    ManualMarket,
-    NormalizedOhlcvRecord,
-    OhlcvTimeframe,
-)
+
 from py_core.backtests.artifact_export import (
     COMPLETION_MARKER,
     _decimal_to_float,
@@ -44,7 +39,16 @@ from py_core.backtests.models import (
     BacktestMetrics,
     ValidationReport,
 )
-from py_core.backtests.risk_integration import RiskAwareBacktestResult, run_risk_aware_backtest
+from py_core.backtests.risk_integration import (
+    RiskAwareBacktestResult,
+    run_risk_aware_backtest,
+)
+from py_core.manual_ohlcv import (
+    CanonicalMarketSymbol,
+    ManualMarket,
+    NormalizedOhlcvRecord,
+    OhlcvTimeframe,
+)
 from py_core.risk.risk_config import RiskConfig
 from py_core.risk.risk_decision_artifact import (
     RiskDecisionArtifact,
@@ -65,7 +69,7 @@ def _rec(day: int, close_p: float) -> NormalizedOhlcvRecord:
         high_price=Decimal(str(close_p)),
         low_price=Decimal(str(close_p)),
         close_price=Decimal(str(close_p)),
-        volume=Decimal("1000"),
+        volume=Decimal(1000),
     )
 
 
@@ -75,9 +79,9 @@ def _decision(
     warnings: list[str] | None = None,
 ) -> RiskDecisionArtifact:
     return RiskDecisionArtifact(
-        proposed_position_size=Decimal("1000"),
-        capped_position_size=Decimal("1000"),
-        risk_used=Decimal("200"),
+        proposed_position_size=Decimal(1000),
+        capped_position_size=Decimal(1000),
+        risk_used=Decimal(200),
         cap_reason=cap_reason,
         status=status,
         warnings=warnings or [],
@@ -124,7 +128,7 @@ def _risk_cfg(**kwargs: Any) -> RiskConfig:
     defaults: dict[str, Any] = {
         "risk_fraction": Decimal("0.02"),
         "max_position_fraction": Decimal("0.20"),
-        "max_notional": Decimal("20000"),
+        "max_notional": Decimal(20000),
         "max_risk_per_trade": Decimal("0.01"),
     }
     defaults.update(kwargs)
@@ -348,19 +352,19 @@ def test_compute_decision_counts_mixed() -> None:
 
 
 def test_serialize_summary_non_authorizing() -> None:
-    result, config, risk_config = _make_raa_result()
+    result, _config, _risk_config = _make_raa_result()
     summary: dict[str, Any] = serialize_summary("testrun", result)
     assert summary["non_authorizing"] is True
 
 
 def test_serialize_summary_output_label() -> None:
-    result, config, risk_config = _make_raa_result()
+    result, _config, _risk_config = _make_raa_result()
     summary: dict[str, Any] = serialize_summary("testrun", result)
     assert "NON-AUTHORIZING" in summary["output_label"]
 
 
 def test_serialize_summary_decision_counts_keys() -> None:
-    result, config, risk_config = _make_raa_result()
+    result, _config, _risk_config = _make_raa_result()
     summary: dict[str, Any] = serialize_summary("testrun", result)
     counts = summary["decision_counts"]
     assert str(RiskDecisionStatus.ACCEPTED) in counts
@@ -369,7 +373,7 @@ def test_serialize_summary_decision_counts_keys() -> None:
 
 
 def test_serialize_summary_decision_counts_sum() -> None:
-    result, config, risk_config = _make_raa_result()
+    result, _config, _risk_config = _make_raa_result()
     summary: dict[str, Any] = serialize_summary("testrun", result)
     counts = summary["decision_counts"]
     total: int = sum(counts.values())
@@ -377,13 +381,13 @@ def test_serialize_summary_decision_counts_sum() -> None:
 
 
 def test_serialize_summary_run_id() -> None:
-    result, config, risk_config = _make_raa_result()
+    result, _config, _risk_config = _make_raa_result()
     summary: dict[str, Any] = serialize_summary("myrun123", result)
     assert summary["run_id"] == "myrun123"
 
 
 def test_serialize_summary_json_serializable() -> None:
-    result, config, risk_config = _make_raa_result()
+    result, _config, _risk_config = _make_raa_result()
     summary: dict[str, Any] = serialize_summary("testrun", result)
     json.dumps(summary)
 
@@ -611,15 +615,17 @@ def test_export_leaves_no_partial_output_on_failure(tmp_path: Path) -> None:
             raise RuntimeError("boom")
         return real_dumps(*args, **kwargs)
 
-    with mock.patch("py_core.backtests.artifact_export.json.dumps", side_effect=flaky_dumps):
-        with pytest.raises(RuntimeError):
-            export_risk_aware_backtest_artifacts(
-                run_id=run_id,
-                result=result,
-                config=config,
-                risk_config=risk_config,
-                output_dir=tmp_path,
-            )
+    with (
+        mock.patch("py_core.backtests.artifact_export.json.dumps", side_effect=flaky_dumps),
+        pytest.raises(RuntimeError),
+    ):
+        export_risk_aware_backtest_artifacts(
+            run_id=run_id,
+            result=result,
+            config=config,
+            risk_config=risk_config,
+            output_dir=tmp_path,
+        )
 
     assert not (tmp_path / run_id).exists()
     assert list(tmp_path.glob(".tmp-*")) == []

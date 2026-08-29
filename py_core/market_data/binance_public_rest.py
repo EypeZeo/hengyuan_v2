@@ -19,6 +19,8 @@ point-in-time-safe 证据，manifest 里也如实标注这一点（point_in_time
 
 from __future__ import annotations
 
+import http.client
+import itertools
 import json
 import re
 import ssl
@@ -194,7 +196,13 @@ def _fetch_klines_page(
     except urllib.error.HTTPError as exc:
         try:
             body_excerpt = exc.read(_MAX_ERROR_BODY_BYTES).decode("utf-8", errors="replace")
-        except Exception:
+        # AUDIT LINT-BACKLOG-059: this is a best-effort diagnostic read of the error
+        # response body -- .decode(errors="replace") never raises, so the only real
+        # failure modes are the underlying socket read itself (OSError, e.g. a dropped
+        # connection) or an incomplete HTTP response (http.client.HTTPException, which is
+        # not an OSError subclass). Narrowed from a blind `except Exception` so a genuine
+        # bug elsewhere isn't silently swallowed here.
+        except (OSError, http.client.HTTPException):
             body_excerpt = ""
         retry_after = exc.headers.get("Retry-After") if exc.headers else None
         message = (
@@ -376,7 +384,7 @@ def fetch_binance_ohlcv(
             page_open_times.append(open_time_ms)
 
         # 页内连续性：相邻 open_time 必须恰好差一个 interval_ms。
-        for prev_ot, next_ot in zip(page_open_times, page_open_times[1:]):
+        for prev_ot, next_ot in itertools.pairwise(page_open_times):
             if next_ot - prev_ot != interval_ms:
                 raise BinanceKlineGapError(
                     f"页内 K 线不连续: open_time {prev_ot} 之后是 {next_ot}（期望间隔 {interval_ms}）"

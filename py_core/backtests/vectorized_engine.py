@@ -12,7 +12,6 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
-from py_core.manual_ohlcv import NormalizedOhlcvRecord
 
 from py_core.backtests.annualization import annualization_factor_for_records
 from py_core.backtests.metrics import compute_metrics
@@ -23,6 +22,7 @@ from py_core.backtests.models import (
     TradeRecord,
     ValidationReport,
 )
+from py_core.manual_ohlcv import NormalizedOhlcvRecord
 
 
 def records_to_dataframe(records: list[NormalizedOhlcvRecord]) -> pd.DataFrame:

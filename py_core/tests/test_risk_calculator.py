@@ -9,7 +9,13 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
-from py_core.risk import RiskCalculator, RiskConfig, RiskDecisionArtifact, RiskDecisionStatus
+
+from py_core.risk import (
+    RiskCalculator,
+    RiskConfig,
+    RiskDecisionArtifact,
+    RiskDecisionStatus,
+)
 from py_core.risk.risk_decision_artifact import (
     CAP_REASON_INVALID_INPUT,
     CAP_REASON_MAX_NOTIONAL,

@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "HengYuan v2 — reusable research/backtest utilities (no live execution, no risk gate, no exchange adapter)."
 requires-python = ">=3.13"
 dependencies = [
-  "pydantic>=2.8,<3.0",
   "pandas>=2.2,<3.0",
   "numpy>=2.1,<3.0",
   "pyarrow>=25.0,<26.0",
@@ -16,12 +15,22 @@ test = [
 ]
 
 [tool.setuptools]
-# core/, risk/, backtests/ live directly under this pyproject.toml's directory
-# (no src/ layout), so setuptools' automatic package discovery sees them as
+# risk/, backtests/ live directly under this pyproject.toml's directory (no
+# src/ layout), so setuptools' automatic package discovery sees them as
 # separate top-level packages and refuses to build. Map "py_core" explicitly
 # onto "." so `import py_core.manual_ohlcv` etc. resolves as intended.
 package-dir = {"py_core" = "."}
-packages = ["py_core", "py_core.backtests", "py_core.core", "py_core.risk", "py_core.market_data", "py_core.validation", "py_core.indicators", "py_core.strategies", "py_core.strategy_spec"]
+packages = ["py_core", "py_core.backtests", "py_core.risk", "py_core.market_data", "py_core.validation", "py_core.indicators", "py_core.strategies", "py_core.strategy_spec"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# AUDIT PYCI-WARN-047: previously no filterwarnings config at all, so a RuntimeWarning
+# from invalid/degenerate floating-point arithmetic (divide-by-zero, invalid-value) could
+# in principle be silently swallowed while the suite still reported green -- the
+# statistical-layer analogue of TEST-GAP-RISK-035 ("sanitizer green != actually verified").
+# Verified empirically before adding this (self-falsified the original premise: at audit
+# time, `-W error::RuntimeWarning` already produced the same 667 passed / 2 skipped result
+# -- there were zero warnings being swallowed, only the missing gate itself). Promoting
+# that ad-hoc flag to a permanent config closes the gate so a *future* regression that
+# introduces a swallowed warning fails loudly instead of passing silently.
+filterwarnings = ["error::RuntimeWarning"]
