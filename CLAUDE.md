@@ -54,6 +54,7 @@ Applies when: shared state, gate order, lifetime, or a spec/code contradiction c
 
 - One file, one concern per edit. Stay inside the assigned slice.
 - Each client works in its own git worktree: `git status` clean at start, commit per task (message carries the slice name), never touch main or another client's worktree.
+- **`master` only accepts merge commits from a merged PR — treat your local `master` as read-only.** `main-merge-guard.yml` checks every push to `master` against GitHub's PR records (`pr.merge_commit_sha === <pushed sha>`); a commit that doesn't resolve to a merged PR — or whose PR's required checks weren't green — is auto-reverted (`git revert` + force-push back to `master` under a `revert(main-merge-guard): ...` commit). This is a hard technical gate, independent of this file's no-task-packet-ceremony stance: do the actual work in your worktree or a named branch, but land it on `master` only through a merged PR, never a direct `git push origin HEAD:master`.
 - Report `file:symbol` only. No code dumps, no tutorials, no "可以考虑"-style advice.
 
 ## Local Validation Runbook (Windows + MSVC)
@@ -64,11 +65,25 @@ Local environment has MSVC 19.51 available via `vcvarsall.bat`. To validate any 
 # 1. Initialize MSVC 64-bit developer environment
 & "D:\VC_IDE\VS_Studio\VC\Auxiliary\Build\vcvarsall.bat" x64
 
-# 2. Configure with aggressive optimization and hardware vectorization flags
-# MSVC: /O2 /Ot /Oi /arch:AVX2 | GCC: -O3 -march=native -ffast-math
-cmake -B native/build-msvc -S native -DCMAKE_BUILD_TYPE=Release
+# 2. Optimization: CMAKE_BUILD_TYPE=Release supplies each toolchain's own default
+# (MSVC /O2, GCC -O3) -- /Ot /Oi /arch:AVX2 / -march=native are NOT currently
+# configured; adding them is a performance change requiring its own
+# before/after benchmark evidence (see "Run frequency" below), not a
+# configure-line default. -ffast-math is explicitly EXCLUDED, not merely
+# unconfigured: it breaks IEEE754 semantics and directly conflicts with
+# Engineering Mandate §5 (Arithmetic Safety). Do not add it.
+# HY_BUILD_DEMO=ON matches ci-native.yml/ci-native-sanitizers.yml(ASan job) --
+# without it, the L4/L5 Binance targets (test_binance_signer,
+# test_binance_environment, test_binance_query_signing, ...) are gated out by
+# if(HY_BUILD_DEMO) and never get built at all. Iterating on pure compute
+# core only (no L4/L5/Boost/OpenSSL path) can drop it (CMakeLists.txt's own
+# default is OFF) for a faster configure/build; HY_BUILD_TESTS (default ON)
+# is unaffected either way.
+cmake -B native/build-msvc -S native -DCMAKE_BUILD_TYPE=Release -DHY_BUILD_DEMO=ON
 
-# 3. Build with zero-warning threshold (-Wall -Wextra -Wconversion enforced)
+# 3. Build with zero-warning threshold (/W4 /WX /permissive- enforced --
+#    see native/cmake/CompilerWarnings.cmake; -Wall -Wextra -Wconversion is
+#    the WSL2/GCC tier's equivalent, not this one)
 cmake --build native/build-msvc --config Release
 
 # 4. Execute unit test harness
@@ -88,6 +103,20 @@ caught one of those in this repo, and the reverse is also true (GCC's `-Wconvers
 `-Wmaybe-uninitialized` have flagged things MSVC's `/W4` didn't). Both toolchains must be run
 before trusting a change; treat one green build as half a signal, not a full one.
 
+The repo has 6 CI workflows total; the other 4 (`ci-python.yml`, `ci-spec-verification.yml`,
+`codeql.yml`, `main-merge-guard.yml`) are each independently path-filtered, deliberately so a
+failure in one can't mask or block another (`ci-python.yml`'s own AUDIT CI-PY-013 comment
+states this reasoning explicitly). `ci-native-sanitizers.yml` also runs a third job,
+`arm64-weak-memory`, on `ubuntu-24.04-arm` — this is **not TSan**: its configure step is
+literally named "Release, no sanitizer" (`HY_SANITIZER` is unset). It's the only *hardware*
+verification in the matrix: an uninstrumented Release build run 10x
+(`ctest -L concurrency --repeat until-fail:10`) on real weak-memory-order silicon, catching an
+acquire/release-downgraded-to-relaxed bug that TSan's software model can verify but x86
+hardware itself never reveals (x86 gives acquire/release ordering for free even when the code
+only asked for relaxed). "Both toolchains" above means MSVC + WSL2/GCC; this arm64 job is a
+third, hardware-only leg on top of that, not a third toolchain for the same two sanitizer
+tiers.
+
 WSL2 (Ubuntu-24.04, matching CI's runner exactly) is the local way to run the GCC side and the
 sanitizers MSVC cannot provide (ASan/UBSan; MSVC has ASan but no TSan/UBSan).
 
@@ -105,10 +134,15 @@ wsl -d Ubuntu-24.04 -- bash -lc "bash ~/repos/hengyuan_v2/tools/wsl_sync.sh"
 
 # none = mirrors ci-native.yml (plain GCC-14 Release)
 # address = mirrors ci-native-sanitizers.yml's ASan+UBSan job
-# thread = mirrors the TSan concurrency job, INCLUDING the negative control
-#          (tsan_control_relaxed_ring) that must itself fail with a reported
-#          data race — see tools/wsl_verify.sh and formal/README.md's TLA+
-#          controls for the same "the control must still fail" discipline.
+# thread = mirrors the TSan concurrency job, INCLUDING the two negative
+#          controls that must themselves fail with a reported data race:
+#          tsan_control_relaxed_ring (a deliberately-racy ring using relaxed
+#          atomics where acquire/release was required -- proves TSan still
+#          catches that downgrade) and tsan_control_export_worker_dual_consumer
+#          (Phase 5 ExportOutboxRing's single-consumer contract violated by a
+#          second consumer -- proves TSan still catches that) — see
+#          tools/wsl_verify.sh and formal/README.md's TLA+ controls for the
+#          same "the control must still fail" discipline.
 wsl -d Ubuntu-24.04 -- bash -lc "bash ~/repos/hengyuan_v2/tools/wsl_verify.sh all"
 ```
 
@@ -135,6 +169,40 @@ region. `native/CMakeLists.txt` works around this via `CROSSCOMPILING_EMULATOR` 
 invocation, including CMake's own build-time `gtest_discover_tests` enumeration, with
 `setarch <arch> -R`); `tools/wsl_verify.sh` applies the same wrapper to the TSan control binary,
 which isn't ctest-registered. Harmless on runners that don't need it (plain Ubuntu CI).
+
+## py_core (research stack)
+
+`py_core` (65 tracked files, ~15,254 lines) is the quantitative research stack running
+parallel to the native execution stack (the 2026-08 dual-track roadmap's other half). It has
+its own CI channel, `ci-python.yml`, path-filtered to `py_core/**` and deliberately kept
+independent of `ci-native.yml`/`ci-spec-verification.yml` — same "a failure in one channel
+must not mask or block another" reasoning as the arm64 job above.
+
+**Local validation**:
+```bash
+cd py_core
+python -m pip install -r requirements.txt
+pip install -e . --no-deps
+python -m pytest tests/ -q
+```
+Python version is whatever `py_core/pyproject.toml`'s `requires-python` says (currently
+`>=3.13`) if it ever diverges from CI's pinned 3.13.
+
+**Lint status**: `ruff check .` runs in CI as **advisory-only** (`continue-on-error`), not yet
+a hard gate — no linter had ever run over `py_core` before that workflow existed, and turning
+ruff into a hard gate in the same change that introduces it would land an unrelated cleanup
+pass alongside. Made visible first, promoted to a gate once the existing findings are triaged.
+
+**Tier A/B still applies**: mechanical porting/test-completion/fixes are Tier A, new
+statistical methods/concurrency/state-machine design are Tier B — same judgment call as the
+native side above, just in Python.
+
+**The lesson `ci-python.yml`'s own AUDIT CI-PY-013 comment records, worth not re-learning**:
+`main-merge-guard.yml` treats "no workflow matched the changed paths" as a PASS (by design, so
+a docs-only PR isn't blocked forever). That means a change touching `py_core` behavior through
+files outside `py_core/**` — or a `py_core` change whose paths get misjudged — can merge with
+zero verification even though the merge guard shows green. If a change affects `py_core`
+behavior, confirm `ci-python.yml` actually ran; a green merge guard alone doesn't mean it did.
 
 ## Live-trading direction & boundary
 
