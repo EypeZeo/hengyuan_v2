@@ -818,6 +818,23 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_rest_snapshot)
         gtest_discover_tests(test_binance_rest_snapshot)
 
+        # L4 §3/§4: read-only private REST client -- first real network consumer of the
+        # signer/environment/query-signing/clock-sync foundation above, so it needs both that
+        # stack (OpenSSL) and the REST transport stack (Boost/Beast + simdjson via
+        # hengyuan_dataplane, same as test_binance_rest_snapshot above).
+        add_executable(test_binance_private_rest tests/test_binance_private_rest.cpp)
+        target_link_libraries(test_binance_private_rest PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_private_rest SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_private_rest PRIVATE tests)
+        target_compile_definitions(test_binance_private_rest PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_binance_private_rest)
+        hengyuan_allow_third_party_tsan_fences(test_binance_private_rest)
+        gtest_discover_tests(test_binance_private_rest)
+
         add_executable(test_binance_ws_session tests/test_binance_ws_session.cpp)
         target_link_libraries(test_binance_ws_session PRIVATE
             hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}

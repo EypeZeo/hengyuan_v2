@@ -30,6 +30,16 @@ namespace hy {
 static constexpr std::size_t kMaxAssets = 32;
 static constexpr std::size_t kAssetNameLen = 12;
 
+// L4 spec §4.2: Binance's GET /api/v3/account response reports every asset's free/locked
+// balance as a decimal string at up to 8 fractional digits, regardless of that asset's own
+// native precision -- unlike price/qty, which are symbol-specific (SymbolRules::price_scale/
+// qty_scale below). AssetBalance::free_ticks/locked_ticks are always at this fixed scale;
+// binance_private_rest.hpp's account-fetch parser is the sole producer of AssetBalance values
+// and enforces this by construction (rejects, rather than truncates, an input with more than
+// 8 fractional digits). See also §5.1.1's rescale_notional_ceil(), which normalizes a
+// price*qty product to this same scale before comparing it against a balance.
+static constexpr int kBalanceScale = 8;
+
 struct AssetBalance {
     char asset[kAssetNameLen]{};
     std::int64_t free_ticks{0};
