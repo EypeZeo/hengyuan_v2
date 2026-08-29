@@ -186,8 +186,33 @@ def compute_pbo(
             test_scores.append(selection_metric(test_eval.metrics))
 
         test_scores_arr = np.array(test_scores)
-        winner_index = int(np.argmax(train_scores))
+        # AUDIT PBO-NANARGMAX-054: np.argmax lets a NaN candidate hijack the winner slot --
+        # e.g. np.argmax([0.5, nan, 2.0]) == 1, not 2 -- because of how NaN compares inside
+        # numpy's reduction, whereas walk_forward.py's own winner selection (a plain `>`
+        # comparison starting from -inf) never picks a NaN score (NaN > anything is always
+        # False). That meant the same param_grid/scores could produce a DIFFERENT winner
+        # between the two orchestrators depending purely on which one happened to have a NaN
+        # candidate. This loop now uses the identical selection rule as
+        # walk_forward.run_walk_forward_analysis(): first candidate wins ties, and a NaN
+        # score can never become (or beat) best_train_score.
+        winner_index = 0
+        best_train_score = -math.inf
+        for i, score in enumerate(train_scores):
+            if score > best_train_score:
+                best_train_score = score
+                winner_index = i
         omega = _relative_rank(test_scores_arr[winner_index], test_scores_arr)
+        # AUDIT PBO-TIES-055: `logit_c <= 0` (not `< 0`) is the published Bailey et al.
+        # (2015) threshold, deliberately inclusive of an exact median tie -- an n-way tie
+        # among ALL test scores literally carries no information to distinguish "the
+        # in-sample winner did fine out-of-sample" from "it didn't", so classifying that
+        # boundary case as an overfitting instance is the paper's own convention, not a bug
+        # in this implementation. It becomes a practical concern only when ties are common
+        # enough to dominate the logit_distribution (e.g. many degenerate zero-variance
+        # candidates collapsing to the same selection_metric value, as metrics.py's
+        # zero-variance Sharpe handling used to do before METRIC-ZEROVAR-SHARPE-053) --
+        # worth knowing about when interpreting a PBO near 1.0, not a reason to change the
+        # threshold itself.
         logit = math.log(omega / (1.0 - omega))
 
         combination_results.append(

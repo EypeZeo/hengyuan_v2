@@ -216,3 +216,70 @@ def test_dsr_monte_carlo_calibration_under_null_averages_near_half() -> None:
         f"many repetitions -- got {mean_dsr:.3f}, suggesting the deflation is systematically "
         "over- or under-correcting"
     )
+
+
+# ---------------------------------------------------------------------------
+# 批次 4 修复回归 -- DSR-NANOPEN-044 / DSR-MOMENT-045 / DSR-PPF-TAIL-057
+# ---------------------------------------------------------------------------
+
+
+def test_compute_deflated_sharpe_ratio_rejects_nan_in_returns() -> None:
+    """AUDIT DSR-NANOPEN-044: previously returned dsr=nan silently instead of raising --
+    every guard downstream (std<=0, variance<0, se<=0) is NaN-transparent."""
+    with pytest.raises(ValueError, match="NaN"):
+        compute_deflated_sharpe_ratio([0.01, float("nan"), 0.02, 0.03], n_trials=10)
+
+
+def test_compute_deflated_sharpe_ratio_rejects_inf_in_returns() -> None:
+    with pytest.raises(ValueError, match="NaN"):
+        compute_deflated_sharpe_ratio([0.01, float("inf"), 0.02, 0.03], n_trials=10)
+
+
+def test_sharpe_ratio_standard_error_rejects_nan_inputs() -> None:
+    """The lower-level function must also reject NaN even when called directly (not just
+    through compute_deflated_sharpe_ratio's entry-point guard)."""
+    with pytest.raises(ValueError, match="无效"):
+        sharpe_ratio_standard_error(
+            float("nan"), skewness=0.0, kurtosis=3.0, n_observations=100
+        )
+    with pytest.raises(ValueError, match="无效"):
+        sharpe_ratio_standard_error(
+            1.0, skewness=float("nan"), kurtosis=3.0, n_observations=100
+        )
+
+
+def test_skewness_kurtosis_use_population_std_not_sample_std() -> None:
+    """AUDIT DSR-MOMENT-045: skewness/kurtosis were standardized by the ddof=1 sample std
+    while averaged with an unweighted (/n, ddof=0-shaped) np.mean -- an internally
+    inconsistent mix that understated skewness by ((n-1)/n)**1.5 and kurtosis by
+    ((n-1)/n)**2. With the fix (population std throughout), an independently computed
+    reference using population std must match exactly."""
+    rng = np.random.default_rng(7)
+    returns = rng.normal(0.0005, 0.01, size=30).tolist()
+    result = compute_deflated_sharpe_ratio(returns, n_trials=5)
+
+    arr = np.asarray(returns, dtype=np.float64)
+    mean = float(arr.mean())
+    pop_std = float(arr.std(ddof=0))
+    expected_skew = float(np.mean(((arr - mean) / pop_std) ** 3))
+    expected_kurt = float(np.mean(((arr - mean) / pop_std) ** 4))
+
+    assert result.skewness == pytest.approx(expected_skew, rel=1e-12)
+    assert result.kurtosis == pytest.approx(expected_kurt, rel=1e-12)
+
+    # The old (buggy) ddof=1-standardized moments would differ from the fixed ones by
+    # exactly ((n-1)/n)**1.5 / ((n-1)/n)**2 -- confirm the fix actually changed the value,
+    # not just that it matches a reference computed the same (right) way.
+    sample_std = float(arr.std(ddof=1))
+    old_buggy_skew = float(np.mean(((arr - mean) / sample_std) ** 3))
+    assert result.skewness != pytest.approx(old_buggy_skew, rel=1e-6)
+
+
+def test_norm_ppf_matches_independent_acklam_reference_in_the_deep_tail() -> None:
+    """AUDIT DSR-PPF-TAIL-057: the replaced bisection implementation disagreed with an
+    independent Acklam+Newton reference by 1.61e-11 at p=0.999999, growing worse at more
+    extreme p. The module now uses that same higher-accuracy method directly, so it must
+    round-trip through _norm_cdf to machine precision even deep in the tail."""
+    for p in (0.999999, 1.0 - 1e-9, 1e-9, 1.0 - 1e-12):
+        x = _norm_ppf(p)
+        assert _norm_cdf(x) == pytest.approx(p, rel=1e-9, abs=1e-15)
