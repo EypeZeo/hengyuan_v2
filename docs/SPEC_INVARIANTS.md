@@ -4,6 +4,11 @@
 `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`（当前 Revision 19 / round 19；注意 L4 文件内部的 round 计数与
 SUBMITPORT 文件不是同一套编号，两者靠 changelog 里的 "see L4 revision N" 互相交叉引用）。
 
+> **方向更新（2026-08，owner 决策）**：真实自动下单已成为明确开发目标——L4 spec（rev 72）是下一
+> 实现里程碑，L5 spec（rev 73）紧随其后，两份均为已接受的实现蓝图（见 `CLAUDE.md`）。本清单历史条目
+> 中出现的"`SubmitPort` 永久 mock-only"等表述记录的是**当时该轮的范围裁决**，已被本方向更新取代；
+> 字段 / ABI / 不变量级别的权威事实不受影响。
+
 ## 这份清单解决什么问题
 
 两份 spec 经过几十轮审阅后，绝大多数新 bug 不是原始设计缺陷，而是标记为
