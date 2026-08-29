@@ -19,7 +19,6 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
-from py_core.manual_ohlcv import NormalizedOhlcvRecord
 
 from py_core.backtests.metrics import compute_metrics
 from py_core.backtests.models import (
@@ -34,6 +33,7 @@ from py_core.backtests.vectorized_engine import (
     resolve_annualization_factor,
     validate_inputs,
 )
+from py_core.manual_ohlcv import NormalizedOhlcvRecord
 from py_core.risk.risk_calculator import RiskCalculator
 from py_core.risk.risk_config import RiskConfig
 from py_core.risk.risk_decision_artifact import RiskDecisionArtifact, RiskDecisionStatus

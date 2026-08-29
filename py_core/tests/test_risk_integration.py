@@ -14,17 +14,18 @@ from typing import Any
 
 import pandas as pd
 import pytest
-from py_core.manual_ohlcv import (
-    CanonicalMarketSymbol,
-    ManualMarket,
-    NormalizedOhlcvRecord,
-    OhlcvTimeframe,
-)
+
 from py_core.backtests.models import BacktestConfig
 from py_core.backtests.risk_integration import (
     RiskAwareBacktestResult,
     _signal_value_to_target,
     run_risk_aware_backtest,
+)
+from py_core.manual_ohlcv import (
+    CanonicalMarketSymbol,
+    ManualMarket,
+    NormalizedOhlcvRecord,
+    OhlcvTimeframe,
 )
 from py_core.risk.risk_config import RiskConfig
 from py_core.risk.risk_decision_artifact import RiskDecisionStatus
@@ -74,8 +75,8 @@ def _risk_cfg(**kwargs: Any) -> RiskConfig:
     defaults: dict = {
         "risk_fraction": Decimal("0.5"),
         "max_position_fraction": Decimal("1.0"),
-        "max_notional": Decimal("1000000"),
-        "max_risk_per_trade": Decimal("1000000"),
+        "max_notional": Decimal(1000000),
+        "max_risk_per_trade": Decimal(1000000),
     }
     defaults.update(kwargs)
     return RiskConfig(**defaults)
@@ -236,7 +237,7 @@ class TestMaxNotionalCap:
         # risk_fraction=50% → proposed = 5000，但 max_notional=100 → CAPPED
         tight_risk = _risk_cfg(
             risk_fraction=Decimal("0.5"),
-            max_notional=Decimal("100"),
+            max_notional=Decimal(100),
         )
         result = run_risk_aware_backtest(
             _cfg(initial_capital=10_000.0), records, signals, tight_risk
@@ -266,7 +267,7 @@ class TestMaxPositionFractionCap:
         tight_risk = _risk_cfg(
             risk_fraction=Decimal("0.9"),
             max_position_fraction=Decimal("0.1"),  # 强制上限 10%
-            max_notional=Decimal("9999999"),
+            max_notional=Decimal(9999999),
         )
         result = run_risk_aware_backtest(
             _cfg(initial_capital=10_000.0), records, signals, tight_risk
@@ -300,8 +301,8 @@ class TestStopDistance:
         # exposure lands at 2500/10_000 = 0.25.
         risk_cfg = _risk_cfg(
             risk_fraction=Decimal("0.5"),
-            max_risk_per_trade=Decimal("50"),
-            max_notional=Decimal("9999999"),
+            max_risk_per_trade=Decimal(50),
+            max_notional=Decimal(9999999),
         )
         result = run_risk_aware_backtest(
             _cfg(initial_capital=10_000.0),
@@ -323,15 +324,15 @@ class TestStopDistance:
         signals = _make_signals(records, [1.0, 1.0])
         risk_cfg = _risk_cfg(
             risk_fraction=Decimal("0.5"),
-            max_risk_per_trade=Decimal("50"),
-            max_notional=Decimal("9999999"),
+            max_risk_per_trade=Decimal(50),
+            max_notional=Decimal(9999999),
         )
         result = run_risk_aware_backtest(
             _cfg(initial_capital=10_000.0),
             records,
             signals,
             risk_cfg,
-            stop_distance_fraction=Decimal("50"),  # not a fraction
+            stop_distance_fraction=Decimal(50),  # not a fraction
         )
         decision = result.risk_decisions[1]
         assert any("stop_distance_fraction must be in (0, 1]" in w for w in decision.warnings)

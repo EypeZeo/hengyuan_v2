@@ -14,12 +14,6 @@ from unittest import mock
 
 import pandas as pd
 import pytest
-from py_core.manual_ohlcv import (
-    CanonicalMarketSymbol,
-    ManualMarket,
-    NormalizedOhlcvRecord,
-    OhlcvTimeframe,
-)
 
 from py_core.backtests.cli import (
     _parse_strategy_params,
@@ -30,6 +24,12 @@ from py_core.backtests.cli import (
 )
 from py_core.backtests.models import BacktestConfig, BacktestResult
 from py_core.backtests.vectorized_engine import run_vectorized_backtest
+from py_core.manual_ohlcv import (
+    CanonicalMarketSymbol,
+    ManualMarket,
+    NormalizedOhlcvRecord,
+    OhlcvTimeframe,
+)
 
 _BASE_DT = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -205,9 +205,11 @@ def test_save_results_leaves_no_partial_output_on_failure(tmp_path: Any) -> None
             raise RuntimeError("boom")
         return real_dumps(*args, **kwargs)
 
-    with mock.patch("py_core.backtests.cli.json.dumps", side_effect=flaky_dumps):
-        with pytest.raises(RuntimeError):
-            save_results(result, output_dir)
+    with (
+        mock.patch("py_core.backtests.cli.json.dumps", side_effect=flaky_dumps),
+        pytest.raises(RuntimeError),
+    ):
+        save_results(result, output_dir)
 
     assert not output_dir.exists()
     assert list(tmp_path.glob(".tmp-*")) == []

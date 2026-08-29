@@ -12,16 +12,17 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
+
+from py_core.backtests.models import BacktestConfig
+from py_core.backtests.vectorized_engine import (
+    run_vectorized_backtest,
+    validate_inputs,
+)
 from py_core.manual_ohlcv import (
     CanonicalMarketSymbol,
     ManualMarket,
     NormalizedOhlcvRecord,
     OhlcvTimeframe,
-)
-from py_core.backtests.models import BacktestConfig
-from py_core.backtests.vectorized_engine import (
-    run_vectorized_backtest,
-    validate_inputs,
 )
 
 _BASE_DT = datetime(2024, 1, 1, tzinfo=UTC)

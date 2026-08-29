@@ -12,19 +12,21 @@ NOT financial advice. NOT trading authorization. NOT a live data feed guarantee.
 from __future__ import annotations
 
 import io
+import itertools
 import urllib.error
 from datetime import UTC, datetime, timedelta
 from email.message import Message
-from typing import Any
+from typing import Any, Self
 from unittest import mock
 
 import pytest
-from py_core.manual_ohlcv import ManualOhlcvValidationError
 
+from py_core.manual_ohlcv import ManualOhlcvValidationError
 from py_core.market_data.binance_public_rest import (
     BinanceHttpError,
     BinanceIncompleteCoverageError,
     BinanceKlineGapError,
+    BinancePublicRestError,
     BinanceRateLimitedError,
     BinanceResponseError,
     BinanceTransportError,
@@ -52,10 +54,10 @@ class _FakeResponse:
     def read(self, n: int = -1) -> bytes:
         return self._body if n is None or n < 0 else self._body[:n]
 
-    def __enter__(self) -> "_FakeResponse":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, *exc: object) -> bool:
         return False
 
 
@@ -148,7 +150,7 @@ def test_pagination_advances_cursor_and_stitches_pages() -> None:
     assert meta.page_count == 2
     assert len(opener.calls) == 2
     # strictly ascending, no duplicates, no gaps
-    for prev, nxt in zip(records, records[1:]):
+    for prev, nxt in itertools.pairwise(records):
         assert nxt.event_time_utc - prev.event_time_utc == timedelta(days=1)
 
 
@@ -200,7 +202,7 @@ def test_exceeds_max_requests_raises() -> None:
     full_page = _consecutive_rows(_BASE_MS, 1000)
     # Every page is full, so the loop keeps requesting more pages than max_requests allows.
     patcher, _ = _patched_opener([_response_json(full_page)] * 3)
-    with patcher, pytest.raises(Exception):
+    with patcher, pytest.raises(BinancePublicRestError):
         fetch_binance_ohlcv(
             "BTCUSDT", _INTERVAL, _dt(0), _dt(0) + timedelta(days=5000), max_requests=2
         )
@@ -377,9 +379,8 @@ def test_strict_coverage_raises_incomplete_coverage_error() -> None:
 
 def test_http_429_raises_without_retry() -> None:
     patcher, opener = _patched_opener([_http_error(429, retry_after="5")])
-    with patcher:
-        with pytest.raises(BinanceRateLimitedError) as exc_info:
-            fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(5))
+    with patcher, pytest.raises(BinanceRateLimitedError) as exc_info:
+        fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(5))
     assert len(opener.calls) == 1  # no automatic retry
     assert exc_info.value.status_code == 429
     assert exc_info.value.retry_after == "5"
@@ -388,9 +389,8 @@ def test_http_429_raises_without_retry() -> None:
 
 def test_http_418_raises_without_retry() -> None:
     patcher, opener = _patched_opener([_http_error(418)])
-    with patcher:
-        with pytest.raises(BinanceRateLimitedError):
-            fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(5))
+    with patcher, pytest.raises(BinanceRateLimitedError):
+        fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(5))
     assert len(opener.calls) == 1
 
 

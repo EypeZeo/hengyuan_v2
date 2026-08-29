@@ -24,8 +24,8 @@ from py_core.risk.risk_decision_artifact import (
     RiskDecisionStatus,
 )
 
-_ZERO = Decimal("0")
-_ONE = Decimal("1")
+_ZERO = Decimal(0)
+_ONE = Decimal(1)
 _SUPPORTED_SIGNALS = frozenset({"long", "none", "short"})
 
 
