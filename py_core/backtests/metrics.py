@@ -109,8 +109,7 @@ def compute_metrics(
     peak = initial_capital
     max_dd = 0.0
     for eq in equity_curve:
-        if eq > peak:
-            peak = eq
+        peak = max(peak, eq)
         dd = (peak - eq) / peak if peak > 1e-12 else 0.0
         # AUDIT METRIC-DD-UNBOUNDED-050: eq can go negative (this is a simplistic
         # mark-to-equity model with no margin-call cutoff), which made dd exceed 1.0 --
@@ -119,8 +118,7 @@ def compute_metrics(
         # already total loss and clamping avoids an unbounded number leaking into
         # calmar_ratio and any downstream consumer that assumes a [0, 1] range.
         dd = min(dd, 1.0)
-        if dd > max_dd:
-            max_dd = dd
+        max_dd = max(max_dd, dd)
 
     # --- calmar_ratio ---
     # AUDIT METRIC-CALMAR-INF-049: max_dd <= 1e-12 used to map to +inf unconditionally, with

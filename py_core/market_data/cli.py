@@ -78,10 +78,9 @@ def _parse_utc_date(s: str) -> datetime:
     py_core.backtests.cli._parse_timestamp_utc's multi-format tolerance) -- this CLI's
     date args are always meant to be whole-day boundaries, not arbitrary timestamps."""
     try:
-        parsed = datetime.strptime(s.strip(), "%Y-%m-%d")
+        return datetime.strptime(s.strip(), "%Y-%m-%d").replace(tzinfo=UTC)
     except ValueError as exc:
         raise ValueError(f"日期必须是 YYYY-MM-DD 格式，收到: {s!r}") from exc
-    return parsed.replace(tzinfo=UTC)
 
 
 def _write_ohlcv_csv(path: Path, records: list[NormalizedOhlcvRecord]) -> None:

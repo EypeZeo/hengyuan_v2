@@ -89,7 +89,9 @@ def _parse_strategy_params(raw: str | None) -> dict[str, Any]:
     布尔值这些情况的类型推断没有明确定义，JSON 把类型解析完全交给 json.loads()，没有歧义。
 
     Raises:
-        ValueError: 不是合法 JSON，或合法 JSON 但顶层不是对象（dict）。
+        ValueError: 不是合法 JSON。
+        TypeError: 合法 JSON 但顶层不是对象（dict）——这是类型检查失败，不是值检查失败，
+            故用 TypeError 而非 ValueError（ruff TRY004）。
     """
     if not raw:
         return {}
@@ -98,7 +100,7 @@ def _parse_strategy_params(raw: str | None) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"--strategy-params 不是合法的 JSON: {exc}") from exc
     if not isinstance(parsed, dict):
-        raise ValueError(
+        raise TypeError(
             f"--strategy-params 必须是一个 JSON 对象（dict），收到: {type(parsed).__name__}"
         )
     return parsed
@@ -156,8 +158,7 @@ def _parse_timestamp_utc(s: str) -> datetime:
         "%Y-%m-%dT%H:%M:%SZ",
     ):
         try:
-            dt = datetime.strptime(s, fmt)
-            return dt.astimezone(UTC)
+            return datetime.strptime(s, fmt).astimezone(UTC)
         except ValueError:
             continue
     # Try naive → assume UTC
@@ -168,8 +169,7 @@ def _parse_timestamp_utc(s: str) -> datetime:
         "%Y-%m-%d",
     ):
         try:
-            dt = datetime.strptime(s, fmt)
-            return dt.replace(tzinfo=UTC)
+            return datetime.strptime(s, fmt).replace(tzinfo=UTC)
         except ValueError:
             continue
     raise ValueError(f"无法解析时间戳: {s!r}")
@@ -445,7 +445,7 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
         # it loudly rather than silently sizing the position ~1000x differently --
         # the whole point of the rename is that the wrong unit can no longer pass
         # through unnoticed.
-        if not (Decimal("0") < stop_distance_fraction <= Decimal("1")):
+        if not (Decimal(0) < stop_distance_fraction <= Decimal(1)):
             print(
                 f"[ERROR] --stop-distance-fraction 必须在 (0, 1] 区间内，"
                 f"当前值 {stop_distance_fraction}。它是价格的比例（0.02 = 2%），"

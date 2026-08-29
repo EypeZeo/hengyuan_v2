@@ -238,7 +238,7 @@ def validate_ohlcv_record(record: NormalizedOhlcvRecord) -> tuple[OhlcvValidatio
     for field_name, value in prices.items():
         if field_name in non_finite_fields:
             continue  # already reported; comparing a non-finite value further is unsafe
-        if value <= Decimal("0"):
+        if value <= Decimal(0):
             issues.append(
                 OhlcvValidationIssue(
                     code=OhlcvValidationIssueCode.NON_POSITIVE_PRICE,
@@ -247,7 +247,7 @@ def validate_ohlcv_record(record: NormalizedOhlcvRecord) -> tuple[OhlcvValidatio
                 )
             )
 
-    if "volume" not in non_finite_fields and record.volume < Decimal("0"):
+    if "volume" not in non_finite_fields and record.volume < Decimal(0):
         issues.append(
             OhlcvValidationIssue(
                 code=OhlcvValidationIssueCode.NEGATIVE_VOLUME,
@@ -343,9 +343,7 @@ def normalized_record_from_dict(payload: dict[str, object]) -> NormalizedOhlcvRe
         market=ManualMarket(str(payload["market"])),
         symbol=CanonicalMarketSymbol(str(payload["symbol"])),
         timeframe=OhlcvTimeframe(str(payload["timeframe"])),
-        event_time_utc=datetime.fromisoformat(
-            str(payload["event_time_utc"]).replace("Z", "+00:00")
-        ),
+        event_time_utc=datetime.fromisoformat(str(payload["event_time_utc"])),
         open_price=Decimal(str(payload["open"])),
         high_price=Decimal(str(payload["high"])),
         low_price=Decimal(str(payload["low"])),
@@ -402,19 +400,13 @@ def manifest_from_dict(payload: dict[str, object]) -> ManualOhlcvImportManifest:
         timestamp_posture=TimestampPosture(str(payload["timestamp_posture"])),
         available_time_posture=AvailableTimePosture(str(payload["available_time_posture"])),
         point_in_time_safe=bool(payload["point_in_time_safe"]),
-        imported_at_utc=datetime.fromisoformat(
-            str(payload["imported_at_utc"]).replace("Z", "+00:00")
-        ),
+        imported_at_utc=datetime.fromisoformat(str(payload["imported_at_utc"])),
         file_sha256=str(payload["file_sha256"]),
         record_count=int(str(payload["record_count"])),
         first_event_time_utc=(
-            datetime.fromisoformat(str(first_event_time).replace("Z", "+00:00"))
-            if first_event_time is not None
-            else None
+            datetime.fromisoformat(str(first_event_time)) if first_event_time is not None else None
         ),
         last_event_time_utc=(
-            datetime.fromisoformat(str(last_event_time).replace("Z", "+00:00"))
-            if last_event_time is not None
-            else None
+            datetime.fromisoformat(str(last_event_time)) if last_event_time is not None else None
         ),
     )

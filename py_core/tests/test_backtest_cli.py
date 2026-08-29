@@ -79,11 +79,13 @@ def test_parse_strategy_params_rejects_invalid_json() -> None:
 
 
 def test_parse_strategy_params_rejects_non_object_json() -> None:
-    with pytest.raises(ValueError):
+    # Valid JSON but wrong top-level type -> TypeError (ruff TRY004: a type check
+    # failure, not a value check failure -- distinct from the invalid-JSON case above).
+    with pytest.raises(TypeError):
         _parse_strategy_params("[1, 2, 3]")
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         _parse_strategy_params("5")
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         _parse_strategy_params('"a string"')
 
 
