@@ -33,7 +33,22 @@ class OhlcvInputFormat(StrEnum):
 
 
 class TimestampPosture(StrEnum):
-    """How event timestamps were interpreted during normalization."""
+    """How event timestamps were interpreted during normalization.
+
+    AUDIT TZ-POSTURE-DEAD-058: ``ManualOhlcvImportManifest`` is constructed at exactly one
+    call site in this codebase (``py_core/market_data/cli.py::publish_fetch_output()``),
+    and it always fetches from Binance's public REST API, whose payload always carries an
+    explicit UTC offset -- so that producer is correctly, unconditionally
+    ``OFFSET_PROVIDED_IN_PAYLOAD``. ``NAIVE_SOURCE_TIMEZONE_APPLIED`` is therefore reserved
+    for a manual/naive-timestamp import path (e.g. a CSV whose timestamps carry no
+    timezone and get a source timezone assumption applied during normalization) that does
+    not currently exist as a manifest-producing code path anywhere in this codebase -- it
+    is a legal value of this schema field, appears in ``manifest_to_dict()``/
+    ``manifest_from_dict()`` round-tripping, but no code path writes it today. Do not
+    assume it is exercised by any existing producer; before relying on a manifest's
+    ``timestamp_posture`` to distinguish "naive assumption applied" from "explicit offset"
+    in production data, confirm which (if any) producer is actually populating it.
+    """
 
     NAIVE_SOURCE_TIMEZONE_APPLIED = "naive_source_timezone_applied"
     OFFSET_PROVIDED_IN_PAYLOAD = "offset_provided_in_payload"
@@ -57,6 +72,14 @@ class OhlcvValidationIssueCode(StrEnum):
     NON_POSITIVE_PRICE = "NON_POSITIVE_PRICE"
     NEGATIVE_VOLUME = "NEGATIVE_VOLUME"
     INVALID_TIMESTAMP = "INVALID_TIMESTAMP"
+    # AUDIT TZ-POSTURE-DEAD-058: reserved for a batch of records within one import that
+    # mixes more than one TimestampPosture (e.g. some rows naive-with-assumed-timezone,
+    # others carrying an explicit offset). No current validation path tracks posture
+    # per-record -- NormalizedOhlcvRecord itself carries no posture field, only
+    # ManualOhlcvImportManifest does, once per whole import -- so this code is never
+    # actually emitted by validate_ohlcv_record()/validate_ohlcv_batch() today. Do not
+    # assume a caller will ever see this issue code without first checking whether a
+    # per-record posture-tracking path has been added.
     MIXED_TIMESTAMP_POSTURE = "MIXED_TIMESTAMP_POSTURE"
     DUPLICATE_EVENT_TIME = "DUPLICATE_EVENT_TIME"
     NON_MONOTONIC_EVENT_TIME = "NON_MONOTONIC_EVENT_TIME"
