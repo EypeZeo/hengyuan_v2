@@ -359,6 +359,23 @@ inline bool is_relative_name_traversal_safe(std::wstring_view name) noexcept {
     return true;
 }
 
+// AUDIT NIO-USTR-030: UNICODE_STRING::Length/MaximumLength are USHORT (16-bit,
+// 65535 bytes max). A name longer than this silently TRUNCATES when cast, and
+// a truncated relative name does not fail -- it names a DIFFERENT, shorter
+// file. For open_or_create_exclusive_relative() that means taking the lock on
+// the wrong file, i.e. mutual exclusion silently stops holding.
+//
+// open_directory_nt_path() and open_existing_relative() already bounded this
+// inline; create_new_relative(), open_or_create_exclusive_relative() and both
+// rename functions did not. Hoisted into one shared constant so the bound is
+// stated once and every construction site uses the same one.
+inline constexpr std::size_t kMaxUnicodeStringChars =
+    static_cast<std::size_t>((std::numeric_limits<USHORT>::max)()) / sizeof(WCHAR);
+
+inline bool is_relative_name_length_safe(std::size_t char_count) noexcept {
+    return char_count <= kMaxUnicodeStringChars;
+}
+
 enum class RelativeCreateResult : std::uint8_t {
     Created,
     AlreadyExists,  // STATUS_OBJECT_NAME_COLLISION -- caller decides what to do
@@ -377,6 +394,7 @@ inline RelativeCreateResult create_new_relative(const RawHandle& dir, const std:
                                                   RawHandle& out) noexcept {
     if (!native_api_available()) return RelativeCreateResult::Unsupported;
     if (!is_relative_name_traversal_safe(relative_name)) return RelativeCreateResult::Failed;
+    if (!is_relative_name_length_safe(relative_name.size())) return RelativeCreateResult::Failed;
     auto& t = detail::proc_table();
 
     UNICODE_STRING name{};
@@ -429,6 +447,7 @@ inline ExclusiveLockResult open_or_create_exclusive_relative(const RawHandle& di
                                                                 RawHandle& out) noexcept {
     if (!native_api_available()) return ExclusiveLockResult::Unsupported;
     if (!is_relative_name_traversal_safe(relative_name)) return ExclusiveLockResult::Failed;
+    if (!is_relative_name_length_safe(relative_name.size())) return ExclusiveLockResult::Failed;
     auto& t = detail::proc_table();
 
     UNICODE_STRING name{};
@@ -530,6 +549,14 @@ inline RelativeRenameResult rename_no_replace(const RawHandle& file, const RawHa
                                                 const std::wstring& new_relative_name,
                                                 NTSTATUS* out_status = nullptr) noexcept {
     if (!native_api_available()) return RelativeRenameResult::Unsupported;
+    // AUDIT NIO-RENAME-VALIDATE-031: the rename target used to be the only
+    // filesystem-touching name in this file with NO validation at all --
+    // neither the traversal check the three open-relative functions apply nor
+    // a length bound. FILE_RENAME_INFORMATION's FileName is resolved relative
+    // to RootDirectory and MAY contain backslashes, so an unvalidated target
+    // is if anything a wider escape surface than an open, not a narrower one.
+    if (!is_relative_name_traversal_safe(new_relative_name)) return RelativeRenameResult::Failed;
+    if (!is_relative_name_length_safe(new_relative_name.size())) return RelativeRenameResult::Failed;
     auto& t = detail::proc_table();
 
     const std::size_t name_bytes = new_relative_name.size() * sizeof(WCHAR);
@@ -566,6 +593,14 @@ inline RelativeRenameResult rename_with_replace(const RawHandle& file, const Raw
                                                    const std::wstring& new_relative_name,
                                                    NTSTATUS* out_status = nullptr) noexcept {
     if (!native_api_available()) return RelativeRenameResult::Unsupported;
+    // AUDIT NIO-RENAME-VALIDATE-031: the rename target used to be the only
+    // filesystem-touching name in this file with NO validation at all --
+    // neither the traversal check the three open-relative functions apply nor
+    // a length bound. FILE_RENAME_INFORMATION's FileName is resolved relative
+    // to RootDirectory and MAY contain backslashes, so an unvalidated target
+    // is if anything a wider escape surface than an open, not a narrower one.
+    if (!is_relative_name_traversal_safe(new_relative_name)) return RelativeRenameResult::Failed;
+    if (!is_relative_name_length_safe(new_relative_name.size())) return RelativeRenameResult::Failed;
     auto& t = detail::proc_table();
 
     const std::size_t name_bytes = new_relative_name.size() * sizeof(WCHAR);

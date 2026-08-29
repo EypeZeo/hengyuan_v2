@@ -233,6 +233,7 @@ if(HY_BUILD_TESTS)
 
     add_executable(test_spsc_ring tests/test_spsc_ring.cpp)
     target_link_libraries(test_spsc_ring PRIVATE hengyuan_core GTest::gtest_main)
+    target_include_directories(test_spsc_ring PRIVATE tests)
     hengyuan_set_warnings(test_spsc_ring)
     gtest_discover_tests(test_spsc_ring)
 

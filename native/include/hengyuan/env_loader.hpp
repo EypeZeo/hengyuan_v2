@@ -245,14 +245,23 @@ private:
             return result;
         }
 
-        // Re-check: if the opened handle is actually a reparse point, reject
+        // Re-check: if the opened handle is actually a reparse point, reject.
+        //
+        // AUDIT CRED-REPARSE-FAILOPEN-037: the query failing used to SKIP this
+        // check and proceed. windows_native_io.hpp already records this exact
+        // mistake and its fix ("an unconfirmed 'not a reparse point' must not
+        // be treated the same as a confirmed one"); this file had the same
+        // shape. Fail closed on query failure.
         BY_HANDLE_FILE_INFORMATION info{};
-        if (GetFileInformationByHandle(hFile, &info)) {
-            if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-                CloseHandle(hFile);
-                result.status = EnvLoadStatus::IsSymlink;
-                return result;
-            }
+        if (!GetFileInformationByHandle(hFile, &info)) {
+            CloseHandle(hFile);
+            result.status = EnvLoadStatus::ReadError;
+            return result;
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            CloseHandle(hFile);
+            result.status = EnvLoadStatus::IsSymlink;
+            return result;
         }
 
         // Size check

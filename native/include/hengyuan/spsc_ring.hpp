@@ -155,6 +155,15 @@ public:
     }
 
     bool empty_approx() const noexcept { return size_approx() == 0; }
+
+    // AUDIT TEST-GAP-SPSC-034: head_/tail_ are monotonic and never masked, so
+    // the occupancy arithmetic's correctness across the 2^64 counter wrap is a
+    // real property that no amount of pushing can reach (2^64 pushes). This
+    // hook seeds the counters so the wrap point is reachable in a test. It is
+    // the only way to set them to anything other than zero-then-increment;
+    // production code has no such path. Unconditional declaration, literal-
+    // identical across every TU, no ODR risk.
+    friend class SpscRingTestHooks;
 };
 
 }  // namespace hy

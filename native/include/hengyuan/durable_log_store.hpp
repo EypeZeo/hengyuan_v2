@@ -194,11 +194,24 @@ public:
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(offset);
         if (!SetFilePointerEx(log_handle_, pos, nullptr, FILE_BEGIN)) return false;
-        DWORD read_bytes = 0;
-        if (!ReadFile(log_handle_, buffer.data(), static_cast<DWORD>(effective_want), &read_bytes, nullptr)) {
-            return false;
+        // AUDIT IO-READCHUNK-036: this was a single ReadFile with no retry,
+        // while the POSIX branch below loops until either effective_want bytes
+        // are read or true EOF ("short read is legal, caller decides"). A short
+        // read here is not benign: run_recovery_scan() would see a truncated
+        // frame, classify it as a torn tail, stop scanning, and then be caught
+        // by the tip-anchor cross-check -- reporting Corrupt for a log that is
+        // perfectly intact. Loop so both platforms deliver the same contract.
+        std::size_t total = 0;
+        while (total < effective_want) {
+            DWORD read_bytes = 0;
+            const DWORD chunk = static_cast<DWORD>(effective_want - total);
+            if (!ReadFile(log_handle_, buffer.data() + total, chunk, &read_bytes, nullptr)) {
+                return false;
+            }
+            if (read_bytes == 0) break;  // EOF -- short read is legal, caller decides
+            total += static_cast<std::size_t>(read_bytes);
         }
-        out_read = static_cast<std::size_t>(read_bytes);
+        out_read = total;
         return true;
     }
     bool write_tip_anchor(std::span<const std::byte> anchor_bytes) noexcept {

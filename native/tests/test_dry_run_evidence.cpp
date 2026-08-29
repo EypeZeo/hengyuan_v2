@@ -101,3 +101,17 @@ TEST(DryRunEvidence, OverwritePathUpdatesRecord) {
     EXPECT_EQ(rec.timestamp_ms, 2000);
     EXPECT_EQ(rec.build_hash, 0x2222u);
 }
+
+// --- AUDIT EVID-OOB-038 regression ---
+// get() was the only path-indexed accessor without a bounds check; an
+// out-of-range EvidencePath was an out-of-bounds read returned by reference.
+TEST(DryRunEvidence, GetOutOfRangePathIsFailClosed) {
+    DryRunEvidenceChain chain;
+    chain.record(EvidencePath::SubmitSuccess, 1000, 0x1111, 1);
+
+    const auto bogus = static_cast<EvidencePath>(99);
+    const auto& rec = chain.get(bogus);
+    EXPECT_FALSE(rec.exercised);       // fail-closed, never "exercised"
+    EXPECT_EQ(rec.timestamp_ms, 0);
+    EXPECT_FALSE(chain.is_path_exercised(bogus));
+}

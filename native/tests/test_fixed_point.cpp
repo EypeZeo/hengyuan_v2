@@ -56,3 +56,49 @@ TEST(ProductExceeds, NoOverflowAtLargeValues) {
     // Uses division internally so no overflow occurs.
     EXPECT_TRUE(product_exceeds(big, big, 1'000'000));
 }
+
+// --- AUDIT ARITH-ABS-039 regressions ---
+//
+// abs_i64(INT64_MIN) used to be signed-overflow UB (negating a value with no
+// representable negation). These tests do not assert a "correct" magnitude for
+// that input -- |INT64_MIN| is not representable in int64, so no correct int64
+// answer exists -- they assert only that the operation is DEFINED and that the
+// unsigned form, which does have a representable answer, is exact.
+
+TEST(FixedPoint, AbsMagnitudeU64IsTotal) {
+    EXPECT_EQ(hy::abs_magnitude_u64(0), 0u);
+    EXPECT_EQ(hy::abs_magnitude_u64(5), 5u);
+    EXPECT_EQ(hy::abs_magnitude_u64(-5), 5u);
+    EXPECT_EQ(hy::abs_magnitude_u64(std::numeric_limits<std::int64_t>::max()),
+              static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()));
+    // The whole point: this input has a representable answer here and only here.
+    EXPECT_EQ(hy::abs_magnitude_u64(std::numeric_limits<std::int64_t>::min()),
+              static_cast<std::uint64_t>(1) << 63);
+}
+
+TEST(FixedPoint, AbsI64AtInt64MinIsDefinedNotUB) {
+    // Under UBSan this test is the assertion: it fails the build/run if the
+    // implementation reintroduces the negation.
+    const std::int64_t r = abs_i64(std::numeric_limits<std::int64_t>::min());
+    EXPECT_EQ(r, std::numeric_limits<std::int64_t>::min());  // defined, still not "correct"
+}
+
+TEST(FixedPoint, SafeAddI64Boundaries) {
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+    std::int64_t out = 0;
+
+    EXPECT_TRUE(hy::safe_add_i64(1, 2, out));
+    EXPECT_EQ(out, 3);
+    EXPECT_TRUE(hy::safe_add_i64(kMax, 0, out));
+    EXPECT_EQ(out, kMax);
+    EXPECT_TRUE(hy::safe_add_i64(kMin, 0, out));
+    EXPECT_EQ(out, kMin);
+    EXPECT_TRUE(hy::safe_add_i64(kMax - 1, 1, out));
+    EXPECT_EQ(out, kMax);
+
+    EXPECT_FALSE(hy::safe_add_i64(kMax, 1, out));
+    EXPECT_FALSE(hy::safe_add_i64(kMin, -1, out));
+    EXPECT_FALSE(hy::safe_add_i64(kMax, kMax, out));
+    EXPECT_FALSE(hy::safe_add_i64(kMin, kMin, out));
+}
