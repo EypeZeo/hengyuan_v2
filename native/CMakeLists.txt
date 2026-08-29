@@ -22,6 +22,28 @@ include(cmake/Sanitizers.cmake)
 # under TSan both invents false positives and loses real happens-before edges.
 hengyuan_enable_sanitizers()
 
+# TSan's shadow-memory setup can fail with "FATAL: ThreadSanitizer: unexpected
+# memory mapping" under WSL2, because WSL2's default ASLR layout doesn't match
+# what TSan expects for its fixed shadow region. CROSSCOMPILING_EMULATOR is
+# CMake's existing mechanism for prefixing every invocation of a test binary
+# with a wrapper command (designed for running cross-compiled binaries under an
+# emulator); `setarch -R` disables ASLR for just this process and needs no
+# root. Setting CMAKE_CROSSCOMPILING_EMULATOR here (a variable, not a
+# per-target property) makes CMake initialize the CROSSCOMPILING_EMULATOR
+# property on EVERY target created after this point -- previously this was an
+# opt-in set_target_properties() call repeated per threaded test target, and
+# three such targets (test_binance_environment, test_binance_ws_session,
+# test_seal_id_watermark_export_started_loader) were missing it, silently
+# skipping TSan coverage with no visible failure (AUDIT BUILD-TSAN-GUARD-001).
+# Applied unconditionally to all targets, not just threaded ones: harmless for
+# single-threaded binaries, and removes the maintenance burden of tracking
+# which targets need it. gtest_discover_tests() also runs each binary once at
+# build time to enumerate test names, and that invocation hits the same fatal
+# error if left unwrapped -- CMAKE_CROSSCOMPILING_EMULATOR is honored by both.
+if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
+    set(CMAKE_CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
+endif()
+
 # Needed unconditionally by the concurrency tests below. Previously this lived
 # inside if(HY_BUILD_DEMO), which meant a tests-only configure had no thread
 # support at all.
@@ -102,6 +124,21 @@ if(HY_BUILD_DEMO)
         add_library(Boost::system ALIAS hengyuan_boost_system)
     endif()
     find_package(OpenSSL REQUIRED)
+    # vcpkg's static (x64-windows-static-md) OpenSSL::Crypto does not itself
+    # carry Crypt32.lib/Ws2_32.lib as transitive link dependencies on
+    # Windows, even though its Windows cert-store backend (e_capi.c /
+    # winstore_store.c) and socket BIO backend (bss_sock.c / bio_sock*.c)
+    # need them -- every target here that links OpenSSL::Crypto needs
+    # Crypt32, or MSVC fails with ~40 unresolved __imp_Cert*/WSA* symbols
+    # at link time. A target that does NOT also link Boost::system (which
+    # itself pulls in Ws2_32 transitively) additionally needs Ws2_32
+    # explicitly, or linking fails on __imp_recv/__imp_send/etc. instead.
+    set(HY_OPENSSL_WIN32_LIBS "")
+    set(HY_OPENSSL_WIN32_LIBS_NO_BOOST "")
+    if(WIN32)
+        set(HY_OPENSSL_WIN32_LIBS crypt32)
+        set(HY_OPENSSL_WIN32_LIBS_NO_BOOST crypt32 ws2_32)
+    endif()
     # Threads is found unconditionally at the top of this file (the concurrency
     # tests need it whether or not demos are built).
 
@@ -109,7 +146,7 @@ if(HY_BUILD_DEMO)
     target_link_libraries(binance_feed_demo PRIVATE
         hengyuan_dataplane
         Boost::system
-        OpenSSL::SSL OpenSSL::Crypto
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
         Threads::Threads
     )
     target_include_directories(binance_feed_demo SYSTEM PRIVATE
@@ -117,12 +154,13 @@ if(HY_BUILD_DEMO)
         ${OPENSSL_INCLUDE_DIR}
     )
     hengyuan_set_warnings(binance_feed_demo)
+    hengyuan_allow_third_party_tsan_fences(binance_feed_demo)
 
     add_executable(binance_dry_run_demo src/binance_dry_run_demo.cpp)
     target_link_libraries(binance_dry_run_demo PRIVATE
         hengyuan_dataplane
         Boost::system
-        OpenSSL::SSL OpenSSL::Crypto
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
         Threads::Threads
     )
     target_include_directories(binance_dry_run_demo SYSTEM PRIVATE
@@ -130,6 +168,7 @@ if(HY_BUILD_DEMO)
         ${OPENSSL_INCLUDE_DIR}
     )
     hengyuan_set_warnings(binance_dry_run_demo)
+    hengyuan_allow_third_party_tsan_fences(binance_dry_run_demo)
 
     # P2-MD-02 / Track C: manual "VPS manual verification = L4" connectivity smoke test --
     # see the file's own header comment. Not registered with ctest; run by hand.
@@ -137,7 +176,7 @@ if(HY_BUILD_DEMO)
     target_link_libraries(binance_connectivity_smoke PRIVATE
         hengyuan_dataplane
         Boost::system
-        OpenSSL::SSL OpenSSL::Crypto
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
         Threads::Threads
     )
     target_include_directories(binance_connectivity_smoke SYSTEM PRIVATE
@@ -145,6 +184,7 @@ if(HY_BUILD_DEMO)
         ${OPENSSL_INCLUDE_DIR}
     )
     hengyuan_set_warnings(binance_connectivity_smoke)
+    hengyuan_allow_third_party_tsan_fences(binance_connectivity_smoke)
 
     add_executable(latency_bench src/latency_bench.cpp)
     target_link_libraries(latency_bench PRIVATE hengyuan_dataplane)
@@ -259,11 +299,6 @@ if(HY_BUILD_TESTS)
     add_executable(test_shm_heartbeat tests/test_shm_heartbeat.cpp)
     target_link_libraries(test_shm_heartbeat PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_shm_heartbeat)
-
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_shm_heartbeat PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
 
     gtest_discover_tests(test_shm_heartbeat PROPERTIES LABELS concurrency)
 
@@ -421,11 +456,6 @@ if(HY_BUILD_TESTS)
         HY_COMPACTION_LEASE_HOLDER_EXE="$<TARGET_FILE:compaction_lease_holder>")
     hengyuan_set_warnings(test_compaction_lease)
 
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_compaction_lease PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
-
     gtest_discover_tests(test_compaction_lease PROPERTIES LABELS concurrency)
 
     # Round E breadcrumb L2 loaders (docs/SPEC_INVARIANTS.md's "Seal-journal
@@ -437,11 +467,6 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_seal_journal_store_lease PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_seal_journal_store_lease)
 
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_seal_journal_store_lease PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
-
     gtest_discover_tests(test_seal_journal_store_lease PROPERTIES LABELS concurrency)
 
     # Round D: IntentStore -- genesis-only write/read/match/inspect via the
@@ -449,11 +474,6 @@ if(HY_BUILD_TESTS)
     add_executable(test_compaction_intent_store tests/test_compaction_intent_store.cpp)
     target_link_libraries(test_compaction_intent_store PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_compaction_intent_store)
-
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_compaction_intent_store PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
 
     gtest_discover_tests(test_compaction_intent_store PROPERTIES LABELS concurrency)
 
@@ -465,11 +485,6 @@ if(HY_BUILD_TESTS)
     add_executable(test_intent_phase_advancer tests/test_intent_phase_advancer.cpp)
     target_link_libraries(test_intent_phase_advancer PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_intent_phase_advancer)
-
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_intent_phase_advancer PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
 
     gtest_discover_tests(test_intent_phase_advancer PROPERTIES LABELS concurrency)
 
@@ -564,6 +579,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_env_loader)
     gtest_discover_tests(test_env_loader)
 
+    # Batch 4 round 1: Binance L4 §2.2/§7.1.2 clock offset tracking -- offline
+    # pure logic only, no OpenSSL/network dependency.
+    add_executable(test_binance_clock_sync tests/test_binance_clock_sync.cpp)
+    target_link_libraries(test_binance_clock_sync PRIVATE hengyuan_core GTest::gtest_main)
+    target_include_directories(test_binance_clock_sync PRIVATE tests)
+    hengyuan_set_warnings(test_binance_clock_sync)
+    gtest_discover_tests(test_binance_clock_sync)
+
     # Layer 2 of docs/SPEC_INVARIANTS.md: durable_control_plane.hpp ABI surface
     add_executable(test_durable_control_plane_abi tests/test_durable_control_plane_abi.cpp)
     target_link_libraries(test_durable_control_plane_abi PRIVATE hengyuan_core GTest::gtest_main)
@@ -631,11 +654,6 @@ if(HY_BUILD_TESTS)
         hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_seal_journal_commit_tombstone_loader)
 
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_seal_journal_commit_tombstone_loader PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
-
     gtest_discover_tests(test_seal_journal_commit_tombstone_loader)
 
     # Round E Slice 2b: SealExportStartedMigrationWire/SealStartedCleanupTombstoneWire/
@@ -674,11 +692,6 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_migrated_v2_started_publisher PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_migrated_v2_started_publisher)
 
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_migrated_v2_started_publisher PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
-
     gtest_discover_tests(test_migrated_v2_started_publisher PROPERTIES LABELS concurrency)
 
     # Round E breadcrumb L2 loaders: coordinator-only composition of Modules
@@ -715,21 +728,9 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_spsc_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_spsc_concurrency)
 
-    # TSan's shadow-memory setup can fail with "FATAL: ThreadSanitizer:
-    # unexpected memory mapping" under WSL2, because WSL2's default ASLR
-    # layout doesn't match what TSan expects for its fixed shadow region.
-    # CROSSCOMPILING_EMULATOR is CMake's existing mechanism for prefixing
-    # every invocation of a test binary with a wrapper command (designed for
-    # running cross-compiled binaries under an emulator); `setarch -R`
-    # disables ASLR for just this process and needs no root. It is applied
-    # here, not only in the CI/local verify script, because
-    # gtest_discover_tests() ALSO runs the binary once at build time to
-    # enumerate test names, and that invocation hits the same fatal error if
-    # left unwrapped — CROSSCOMPILING_EMULATOR is honored by both.
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_spsc_concurrency PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
+    # TSan/WSL2 ASLR wrapping (setarch -R) is applied globally via
+    # CMAKE_CROSSCOMPILING_EMULATOR near the top of this file — see that
+    # comment for the full rationale. No per-target property needed here.
 
     gtest_discover_tests(test_spsc_concurrency PROPERTIES LABELS concurrency)
 
@@ -737,16 +738,10 @@ if(HY_BUILD_TESTS)
     # live_submit_orchestrator.hpp's drain_reconcile_events() wiring) -- the
     # cross-thread claim test_order_tracker.cpp deliberately does NOT make
     # (that file is single-threaded by design, see its own header). Same
-    # "concurrency" label/CROSSCOMPILING_EMULATOR treatment as
-    # test_spsc_concurrency above, for the same reasons.
+    # "concurrency" label as test_spsc_concurrency above, for the same reasons.
     add_executable(test_reconcile_concurrency tests/test_reconcile_concurrency.cpp)
     target_link_libraries(test_reconcile_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_reconcile_concurrency)
-
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_reconcile_concurrency PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
 
     gtest_discover_tests(test_reconcile_concurrency PROPERTIES LABELS concurrency)
 
@@ -774,10 +769,32 @@ if(HY_BUILD_TESTS)
     if(HY_BUILD_DEMO)
         add_executable(test_binance_signer tests/test_binance_signer.cpp)
         target_link_libraries(test_binance_signer PRIVATE
-            hengyuan_core OpenSSL::SSL OpenSSL::Crypto GTest::gtest_main)
+            hengyuan_core OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST}
+            GTest::gtest_main)
         target_include_directories(test_binance_signer SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_signer PRIVATE tests)
         hengyuan_set_warnings(test_binance_signer)
         gtest_discover_tests(test_binance_signer)
+
+        # Batch 4 round 1: EnvironmentBinding + BoundHmacCredentials (depends
+        # on BinanceSigner, hence OpenSSL) and §2.1 query signing.
+        add_executable(test_binance_environment tests/test_binance_environment.cpp)
+        target_link_libraries(test_binance_environment PRIVATE
+            hengyuan_core OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST}
+            GTest::gtest_main)
+        target_include_directories(test_binance_environment SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_environment PRIVATE tests)
+        hengyuan_set_warnings(test_binance_environment)
+        gtest_discover_tests(test_binance_environment)
+
+        add_executable(test_binance_query_signing tests/test_binance_query_signing.cpp)
+        target_link_libraries(test_binance_query_signing PRIVATE
+            hengyuan_core OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST}
+            GTest::gtest_main)
+        target_include_directories(test_binance_query_signing SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_query_signing PRIVATE tests)
+        hengyuan_set_warnings(test_binance_query_signing)
+        gtest_discover_tests(test_binance_query_signing)
 
         # P2-MD-02 / Track C: REST/WS/Gate connectivity tests -- fully offline (local
         # blackhole/TLS fixtures, see tests/test_helpers/blackhole_acceptor.hpp), but they need
@@ -789,24 +806,26 @@ if(HY_BUILD_TESTS)
 
         add_executable(test_binance_rest_snapshot tests/test_binance_rest_snapshot.cpp)
         target_link_libraries(test_binance_rest_snapshot PRIVATE
-            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads
-            GTest::gtest_main)
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
         target_include_directories(test_binance_rest_snapshot SYSTEM PRIVATE
             ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
         target_include_directories(test_binance_rest_snapshot PRIVATE tests)
         target_compile_definitions(test_binance_rest_snapshot PRIVATE
             HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
         hengyuan_set_warnings(test_binance_rest_snapshot)
+        hengyuan_allow_third_party_tsan_fences(test_binance_rest_snapshot)
         gtest_discover_tests(test_binance_rest_snapshot)
 
         add_executable(test_binance_ws_session tests/test_binance_ws_session.cpp)
         target_link_libraries(test_binance_ws_session PRIVATE
-            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto Threads::Threads
-            GTest::gtest_main)
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
         target_include_directories(test_binance_ws_session SYSTEM PRIVATE
             ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
         target_include_directories(test_binance_ws_session PRIVATE tests)
         hengyuan_set_warnings(test_binance_ws_session)
+        hengyuan_allow_third_party_tsan_fences(test_binance_ws_session)
         gtest_discover_tests(test_binance_ws_session)
 
     endif()
@@ -824,11 +843,6 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_snapshot_refresh_gate PRIVATE
         hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_snapshot_refresh_gate)
-
-    if(HY_SANITIZER STREQUAL "thread" AND UNIX AND NOT APPLE)
-        set_target_properties(test_snapshot_refresh_gate PROPERTIES
-            CROSSCOMPILING_EMULATOR "setarch;${CMAKE_HOST_SYSTEM_PROCESSOR};-R")
-    endif()
 
     gtest_discover_tests(test_snapshot_refresh_gate PROPERTIES LABELS concurrency)
 

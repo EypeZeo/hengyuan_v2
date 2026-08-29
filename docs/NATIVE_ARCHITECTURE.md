@@ -8,7 +8,7 @@ Single living reference for `native/`, replacing v1's scattered P2-CORE-*/P2-EXE
 |---|---|---|
 | **Market data (hot path)** | `binance_market_event.hpp`, `spsc_ring.hpp`, `hot_thread.hpp`, `orderbook.hpp`/`.cpp`, `depth_manager.hpp`, `binance_json_parser.hpp`/`.cpp`, `event_recorder.hpp`, `fixed_point.hpp` | Zero-alloc WS ingestion → SPSC ring → order book reconstruction. This is the actual latency-critical path. |
 | **Network transport** | `binance_ws_session.hpp` (WS, market data), `binance_rest_snapshot.hpp` (public REST GET, depth snapshot), `transport_policy.hpp` (allowlist/rate-limit/clock-skew/TLS policy for *any* Binance REST call) | `binance_rest_snapshot.hpp` only talks to public, unauthenticated endpoints. No authenticated REST client exists — see SubmitPort below. |
-| **Secrets** | `env_parser.hpp` (L1, synthetic), `env_loader.hpp` (L3, real `.env` load + file-permission/anti-symlink/mlock/secure-wipe), `secure_wipe.hpp` | `binance_signer.hpp`'s HMAC-SHA256 is real and verified against Binance's own test vector, but signing without a network path attached is cryptography with nowhere to go yet. |
+| **Secrets** | `env_parser.hpp` (L1, synthetic), `env_loader.hpp` (L3, real `.env` load + file-permission/anti-symlink/mlock/secure-wipe), `secure_wipe.hpp`, `binance_signer.hpp`, `binance_environment.hpp`, `binance_query_signing.hpp`, `binance_clock_sync.hpp` | `binance_signer.hpp`'s HMAC-SHA256 is real and verified against Binance's own test vector; `binance_environment.hpp`/`binance_query_signing.hpp`/`binance_clock_sync.hpp` add environment binding, §2.1 query canonicalization/signing, and §2.2/§7.1.2 clock-offset freshness on top of it — but all of this is still offline logic with a network path not yet attached, i.e. cryptography with nowhere to go yet. |
 | **Risk / simulation** | `risk_gate.hpp`, `sim_executor.hpp`, `input_validator.hpp`, `trade_logger.hpp` | Pre-D12 simulation infrastructure (dry-run only). |
 | **Order truth chain (D12 series)** | `account_truth.hpp`, `order_lifecycle.hpp`, `exit_safety.hpp`, `audit_trail.hpp`, `dry_run_evidence.hpp`, `live_submit_orchestrator.hpp` | The gate chain gating real order submission. All pure logic — no network, no persistence beyond an in-memory ring. |
 | **Liveness / control** | `kill_switch.hpp`, `shm_heartbeat.hpp`, `intent_channel.hpp`, `preflight_gate.hpp` (renamed to `CODE-PREFLIGHT` internally — see naming note below) | Process-liveness watchdog + the 7-item code-layer preflight (distinct from the operational D3-LIVE checklist). |
@@ -20,8 +20,8 @@ Single living reference for `native/`, replacing v1's scattered P2-CORE-*/P2-EXE
 |---|---|---|
 | Synthetic env parsing | L1 | Implemented, tested |
 | Real `.env` credential load | L3 | Implemented, tested — never independently reviewed |
-| Signed read-only request (`GET /api/v3/account`) | L4 | **Does not exist** — no authenticated REST client anywhere |
-| Signed order submission (`POST /api/v3/order`) | L5 | **Does not exist** — `SubmitPort` is a mock-only dependency-injection point |
+| Signed read-only request (`GET /api/v3/account`) | L4 | **Next milestone** — spec rev 72 accepted as blueprint; no authenticated REST client implemented yet |
+| Signed order submission (`POST /api/v3/order`) | L5 | **Planned after L4** — `SubmitPort` mock is the DI seam; real adapter per spec rev 73 |
 
 ## A naming note (fixed 2026-07-18)
 
@@ -29,9 +29,17 @@ Single living reference for `native/`, replacing v1's scattered P2-CORE-*/P2-EXE
 
 ## Live-readiness status
 
-**Nothing here is live-ready, and this document does not change that.** Specifically:
+**Nothing here is live-ready, and this document does not change that.** Development direction
+(owner decision, 2026-08): real auto order submission — L4 signed read-only client first, then
+the L5 POST adapter. Specifically:
 
-- No real `SubmitPort` implementation exists. See `docs/BINANCE_PRIVATE_REST_L4_SPEC.md` (signed read-only foundation: environment binding, signing discipline, reconciliation, symbol registry, rate-limit accounting) and `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (the L5 POST adapter, depends on the L4 spec) — both design-only, both revised after a real Architect-role review rejected the original single-file draft for missing reconciliation, unreachable testnet, an incomplete ABI, and non-durable audit. Implementation requires both specs accepted first, then a code-level Architect/Senior-Reviewer pass — see `CLAUDE.md`'s boundary section.
+- No real `SubmitPort` implementation exists yet. `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`
+  (rev 72, signed read-only foundation: environment binding, signing discipline,
+  reconciliation, symbol registry, rate-limit accounting) and
+  `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (rev 73, the L5 POST adapter, depends on the
+  L4 spec) are accepted implementation blueprints. Implementation-level acceptance for each
+  is its own fault-injection matrix passing against real code — no v1-style
+  Architect/Senior-Reviewer ceremony (see `CLAUDE.md`).
 - No real Binance testnet or production credentials have ever been used against this code.
 - The operator manual-takeover procedure (`docs/NATIVE_EXIT_SAFETY_RUNBOOK.md`) exists as a document; it has not been drilled by a human against a real Binance account.
 - The ADR-018 operational D3-LIVE checklist and the code-layer CODE-PREFLIGHT checklist have never both been executed for real and recorded — only exercised via unit tests / synthetic fixtures.

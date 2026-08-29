@@ -1,8 +1,8 @@
-# Real `SubmitPort` Implementation — L5 POST Adapter Spec (Draft, Not Implemented)
+# Real `SubmitPort` Implementation — L5 POST Adapter Spec (Implementation Blueprint, rev 73)
 
 ## Status
 
-**Draft, revision 73.** No code from this spec has been written — **acceptance closes findings at the spec level only**; implementation-level closure is defined exclusively by the shared fault-injection matrix (end of this file / L4) passing against real code. The existing `native/` sources still implement the pre-revision model (no `Submitting → PartialFill`, no `Accepted`/`PartialFill` → `Cancelled`, no `EscalatedLedger`, no extended `OrderRecord` poll fields) — **nothing in this document may be claimed as compile-time or implementation-level P0 closure**. This is **L5** (per `docs/NATIVE_ARCHITECTURE.md`'s gate table — signed order-*submission*, the highest gate in this repo), and it **depends entirely on `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`** being accepted first.
+**Revision 73, accepted as the implementation blueprint.** Spec-level findings are closed; implementation-level closure is defined exclusively by the shared fault-injection matrix (end of this file / L4) passing against real code. The existing `native/` sources still implement the pre-revision model (no `Submitting → PartialFill`, no `EscalatedLedger`, no extended `OrderRecord` poll fields) — **nothing in this document may be claimed as compile-time or implementation-level P0 closure**. (`Accepted`/`PartialFill` → `Cancelled` is not on this remaining-gap list — revision 12 already closed it, see this file's own §4.3/L4 §6.5 discussion below, and `order_lifecycle.hpp::validate_transition()` already implements both edges.) This is **L5** (per `docs/NATIVE_ARCHITECTURE.md`'s gate table — signed order-*submission*, the highest gate in this repo), and it **depends entirely on `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`** being implemented first.
 
 ### Revision 2 changelog (Architect review round 1, rejected)
 

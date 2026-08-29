@@ -7,7 +7,8 @@ without v1's task-packet/ADR process. See `CLAUDE.md` for why and for the engine
 
 - `native/` — C++20/23 low-latency execution kernel: market data parsing, order book, risk gates,
   kill switch, a durable key-rotating audit trail (`DurableControlPlaneSink`), order lifecycle +
-  reconciliation, and the live-submit orchestrator (currently mock-only, see below). See
+  reconciliation, and the live-submit orchestrator (mock `SubmitPort` DI seam; the real L5
+  adapter is a planned milestone, see below). See
   `docs/NATIVE_ARCHITECTURE.md` for the module map and gate-level status.
 - `py_core/` — Python research/backtest utilities: vectorized backtest engine, risk-sizing
   simulator, a pluggable strategy framework (`py_core/strategies/`), and a read-only public-REST
@@ -18,8 +19,8 @@ without v1's task-packet/ADR process. See `CLAUDE.md` for why and for the engine
 - `docs/NATIVE_ARCHITECTURE.md`, `docs/NATIVE_EXIT_SAFETY_RUNBOOK.md` — consolidated native
   reference and the operator manual-takeover runbook.
 - `docs/BINANCE_PRIVATE_REST_L4_SPEC.md` + `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` —
-  design-only specs for signed private REST and real order submission. Not implemented; not
-  authorized.
+  implementation-blueprint specs for signed private REST (L4, rev 72 — next milestone) and
+  real order submission (L5, rev 73 — depends on L4).
 - `.github/workflows/` — CI: build+test, sanitizers, spec verification, CodeQL, dependency
   updates.
 
@@ -48,7 +49,15 @@ v2.
 
 ## Live-trading status
 
-`live_submit_orchestrator.hpp`'s `SubmitPort` is mock-only. No real Binance order-submission
-network path exists in this codebase, and no real testnet/production credentials have ever been
-used against it. See `CLAUDE.md`'s boundary section and `docs/NATIVE_ARCHITECTURE.md`'s
-"Live-readiness status" for what real trading would actually require.
+Development direction (owner decision, 2026-08): real auto order submission. Next milestone
+is the L4 signed read-only client (`docs/BINANCE_PRIVATE_REST_L4_SPEC.md`, rev 72), followed
+by the real L5 `SubmitPort` POST adapter (`docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md`,
+rev 73). Both specs are accepted as implementation blueprints; implementation-level
+acceptance is their fault-injection matrices passing against real code.
+
+Current state: `live_submit_orchestrator.hpp`'s `SubmitPort` is a mock dependency-injection
+seam; no authenticated REST client exists yet; no real testnet/production credentials have
+ever been used against this code. Creating real API keys, configuring IP allowlists, and the
+go/no-go for the first live order remain the account owner's own actions. See `CLAUDE.md`'s
+"Live-trading direction & boundary" and `docs/NATIVE_ARCHITECTURE.md`'s "Live-readiness
+status".
