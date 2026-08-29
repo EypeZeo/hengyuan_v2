@@ -14,6 +14,9 @@
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/websocket.hpp>
 
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+
 #include <chrono>
 #include <cstddef>
 #include <string>
@@ -49,6 +52,31 @@ inline void configure_ws_stream(WebSocketStream& ws, std::chrono::seconds idle_t
     wt.keep_alive_pings = true;
     ws.set_option(wt);
     ws.read_message_max(max_message_bytes);
+}
+
+// L4 spec §8: chain-of-trust verification (verify_peer + set_default_verify_paths(), both
+// already applied by configure_binance_ssl_context() above) is only as good as the trust store
+// it's checking against. set_default_verify_paths()'s actual behavior differs meaningfully
+// between this repo's two build targets (CLAUDE.md's dual-compiler setup) -- on GCC 14/Linux it
+// typically resolves to the system OpenSSL CA bundle; on MSVC 19.51/Windows, the OpenSSL build
+// in use may or may not bridge to the Windows Certificate Store. A build that silently ends up
+// with an EMPTY trust store would make every handshake fail closed on its face (a real TLS
+// error, not a bypassed check) -- but that failure mode is trivially misdiagnosable as "the
+// server's certificate is bad" rather than "our own trust store never loaded," which is a much
+// worse debugging experience than a clear, explicit signal at startup.
+//
+// This is a call-once-at-init() check, never per-request: it inspects whether the X509_STORE
+// configure_binance_ssl_context() just populated actually holds at least one certificate.
+// Ordering matters -- SSL_CTX_get_cert_store() must be called AFTER
+// configure_binance_ssl_context(ctx), since that is what invokes set_default_verify_paths() in
+// the first place; calling this before that returns an empty (not-yet-configured) store, which
+// would (correctly) report false, but for the wrong reason.
+inline bool binance_tls_trust_store_populated(boost::asio::ssl::context& ctx) noexcept {
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx.native_handle());
+    if (store == nullptr) return false;
+    STACK_OF(X509_OBJECT)* objs = X509_STORE_get0_objects(store);
+    if (objs == nullptr) return false;
+    return sk_X509_OBJECT_num(objs) > 0;
 }
 
 }  // namespace hy
