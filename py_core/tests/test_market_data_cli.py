@@ -18,6 +18,7 @@ from unittest import mock
 
 import pytest
 
+from py_core.backtests.artifact_export import COMPLETION_MARKER, is_complete_run
 from py_core.manual_ohlcv import (
     CanonicalMarketSymbol,
     ManualMarket,
@@ -124,6 +125,21 @@ def test_publish_fetch_output_writes_three_files(tmp_path: Path) -> None:
     assert (output_dir / "ohlcv.csv").exists()
     assert (output_dir / "manifest.json").exists()
     assert (output_dir / "fetch_meta.json").exists()
+
+
+def test_publish_fetch_output_writes_completion_marker(tmp_path: Path) -> None:
+    """AUDIT PYPUB-MDCLI-042: this was the one of three same-shaped atomic-publish sites
+    (alongside artifact_export.py / backtests/cli.py::save_results) that never wrote the
+    ``.complete`` marker is_complete_run() checks for -- a crash between the exclusive
+    output_dir.mkdir() and the last per-file rename left an indistinguishable-from-complete
+    partial directory with no way to detect it."""
+    records = [_rec(i) for i in range(3)]
+    meta = _meta()
+    output_dir = tmp_path / "out"
+    publish_fetch_output(records, meta, output_dir, symbol="BTCUSDT", interval="1d")
+
+    assert (output_dir / COMPLETION_MARKER).is_file()
+    assert is_complete_run(output_dir)
 
 
 def test_publish_fetch_output_refuses_to_overwrite_existing_nonempty_dir(tmp_path: Path) -> None:

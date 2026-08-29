@@ -40,14 +40,10 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from py_core.manual_ohlcv import (
-    CanonicalMarketSymbol,
-    ManualMarket,
-    NormalizedOhlcvRecord,
-    OhlcvTimeframe,
-)
 
 from py_core.backtests.artifact_export import (
+    _dumps,
+    _dumps_line,
     _write_completion_marker,
     export_risk_aware_backtest_artifacts,
 )
@@ -57,6 +53,12 @@ from py_core.backtests.vectorized_engine import (
     _run_vectorized_backtest_on_df,
     records_to_dataframe,
     resolve_annualization_factor,
+)
+from py_core.manual_ohlcv import (
+    CanonicalMarketSymbol,
+    ManualMarket,
+    NormalizedOhlcvRecord,
+    OhlcvTimeframe,
 )
 from py_core.risk.risk_config import RiskConfig
 from py_core.strategies.base import load_strategy
@@ -293,7 +295,18 @@ def save_results(
             "cost_impact_bps": result.metrics.cost_impact_bps,
             "cost_impact_total": result.metrics.cost_impact_total,
         }
-        (tmp_dir / "metrics.json").write_text(json.dumps(metrics_dict, indent=2), encoding="utf-8")
+        # AUDIT PYJSON-CLI-041: this used to be bare json.dumps(metrics_dict, indent=2) --
+        # metrics.calmar_ratio (or, since the batch-4 metrics.py fixes, sharpe_ratio too) can
+        # be float("inf")/float("-inf") whenever a strategy has no measured drawdown or zero
+        # return variance, and json.dumps serializes that as the bare token `Infinity`/
+        # `-Infinity`, which is not valid JSON (RFC 8259 has no such literal). That made
+        # every artifact from such a run rejected by any strict parser while looking fine to
+        # Python's own json.load. save_results() is reached from cmd_run(), a live CLI path,
+        # so this was not a theoretical residue -- artifact_export.py already closed this
+        # exact gap with _dumps()/_dumps_line() (which replace non-finite floats with `null`
+        # and set allow_nan=False as a safety net); this function now reuses those same
+        # helpers instead of a second, incomplete implementation of the same fix.
+        (tmp_dir / "metrics.json").write_text(_dumps(metrics_dict), encoding="utf-8")
 
         # validation_report.json
         vr_dict: dict[str, Any] = {
@@ -304,25 +317,23 @@ def save_results(
             "is_valid": result.validation_report.is_valid,
             "issues": result.validation_report.issues,
         }
-        (tmp_dir / "validation_report.json").write_text(
-            json.dumps(vr_dict, indent=2), encoding="utf-8"
-        )
+        (tmp_dir / "validation_report.json").write_text(_dumps(vr_dict), encoding="utf-8")
 
         # equity_curve.jsonl
         with (tmp_dir / "equity_curve.jsonl").open("w", encoding="utf-8") as f:
             for ts, eq in zip(result.timestamps, result.equity_curve, strict=True):
-                f.write(json.dumps({"timestamp_utc": ts.isoformat(), "equity": eq}) + "\n")
+                f.write(_dumps_line({"timestamp_utc": ts.isoformat(), "equity": eq}) + "\n")
 
         # positions.jsonl
         with (tmp_dir / "positions.jsonl").open("w", encoding="utf-8") as f:
             for ts, pos in zip(result.timestamps, result.positions, strict=True):
-                f.write(json.dumps({"timestamp_utc": ts.isoformat(), "position": pos}) + "\n")
+                f.write(_dumps_line({"timestamp_utc": ts.isoformat(), "position": pos}) + "\n")
 
         # trades.jsonl
         with (tmp_dir / "trades.jsonl").open("w", encoding="utf-8") as f:
             for tr in result.fills_approx:
                 f.write(
-                    json.dumps(
+                    _dumps_line(
                         {
                             "bar_index": tr.bar_index,
                             "timestamp_utc": tr.timestamp_utc.isoformat(),
@@ -351,9 +362,7 @@ def save_results(
             "python_version": sys.version,
             "pandas_version": pd.__version__,
         }
-        (tmp_dir / "run_manifest.json").write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        (tmp_dir / "run_manifest.json").write_text(_dumps(manifest), encoding="utf-8")
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise

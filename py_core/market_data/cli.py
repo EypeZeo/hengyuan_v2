@@ -45,6 +45,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from py_core.backtests.artifact_export import _write_completion_marker
 from py_core.manual_ohlcv import (
     AvailableTimePosture,
     CanonicalMarketSymbol,
@@ -128,9 +129,17 @@ def publish_fetch_output(
 ) -> None:
     """原子发布：临时目录写完三个文件 -> output_dir.mkdir(exist_ok=False) 真正原子的排他占位
     （不管目标是否已存在、是否为空，两个平台语义一致，不依赖目录级 rename 在不同操作系统上不
-    一致的行为）-> 把临时目录里的文件逐个搬进刚占好位的 output_dir -> 删除空的临时目录。
+    一致的行为）-> 把临时目录里的文件逐个搬进刚占好位的 output_dir -> 写入 ``.complete`` 标记
+    -> 删除空的临时目录。
 
     任何一步失败，只清理这一次自己创建的临时目录，不碰任何已经存在的东西。
+
+    AUDIT PYPUB-MDCLI-042: 搬运是逐文件 rename，所以在 output_dir 占位与最后一个文件落地之间
+    被 kill 会留下一个"存在但不完整"的目录——与 artifact_export.py::export_risk_aware_backtest_artifacts()
+    / backtests/cli.py::save_results() 完全同构的窗口（前者的审计 PY-PUB-014 已经记录过这个
+    机制）。这里此前是三个同构发布点中唯一没有写 ``.complete`` 标记的一个，消费方
+    （``is_complete_run()``）因此无法区分这里的输出是否完整。复用 artifact_export.py 已有的
+    ``_write_completion_marker()``，不第三次重新实现同一个修复。
 
     Raises:
         FileExistsError: output_dir 已经存在（不管是否为空）。
@@ -186,6 +195,10 @@ def publish_fetch_output(
     for f in tmp_dir.iterdir():
         f.rename(output_dir / f.name)
     tmp_dir.rmdir()
+
+    # AUDIT PYPUB-MDCLI-042: written LAST, so its presence is proof every other file
+    # already landed -- see docstring above and artifact_export.py's PY-PUB-014 comment.
+    _write_completion_marker(output_dir)
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
