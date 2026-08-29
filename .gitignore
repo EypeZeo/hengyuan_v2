@@ -36,3 +36,7 @@ formal/states/
 # py_core backtest CLI run output (py_core/backtests/cli.py's default .var/backtests/<run_id>
 # and .var/risk-aware-backtests/<run_id> artifact dirs)
 py_core/.var/
+
+# Local-only AI client rules & workspace state — not part of the shared repo
+.claude/
+Full Repo Audit Prompt.md
