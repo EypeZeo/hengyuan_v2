@@ -4,6 +4,9 @@
 
 #include <gtest/gtest.h>
 #include <hengyuan/spsc_ring.hpp>
+#include "spsc_ring_test_hooks.hpp"
+
+#include <limits>
 #include <hengyuan/binance_market_event.hpp>
 
 using hy::SpscRing;
@@ -180,4 +183,64 @@ TEST(SpscRing, WorksWithOtherTrivialTypes) {
     EXPECT_TRUE(ring.try_pop(out));
     EXPECT_EQ(out.a, 10);
     EXPECT_EQ(out.b, 20);
+}
+
+// --- AUDIT TEST-GAP-SPSC-034: counter wrap-around ---
+//
+// TEST(SpscRing, WrapAround) above covers the SLOT index wrapping (h & kMask)
+// -- after 40 pushes head_/tail_ are still 40, nowhere near their own limit.
+// This covers the actual 2^64 COUNTER wrap, which the occupancy arithmetic
+// (`h - cached_tail_ >= N`, unsigned modular subtraction) depends on and which
+// no amount of pushing can reach. Seeded via SpscRingTestHooks.
+
+TEST(SpscRing, CounterWrapPreservesFifoAndOccupancy) {
+    constexpr std::size_t N = 4;
+    SpscRing<BinanceMarketEvent, N> ring;
+
+    // Park both counters 2 pushes short of the wrap, so pushes 3.. occur with
+    // head_ wrapped past zero while tail_ has not yet wrapped -- the exact
+    // mixed state the modular subtraction has to get right.
+    hy::SpscRingTestHooks::seed_indices(ring, std::numeric_limits<std::size_t>::max() - 2);
+
+    uint64_t next_write = 0;
+    uint64_t next_read = 0;
+
+    for (int round = 0; round < 8; ++round) {
+        // Fill to capacity: must accept exactly N and then refuse.
+        for (std::size_t i = 0; i < N; ++i) {
+            BinanceMarketEvent ev{};
+            ev.event_id = next_write++;
+            ASSERT_TRUE(ring.try_push(ev)) << "round " << round << " push " << i;
+        }
+        BinanceMarketEvent overflow{};
+        EXPECT_FALSE(ring.try_push(overflow)) << "round " << round << ": full ring accepted a push";
+
+        // Drain: must return exactly what went in, in order.
+        for (std::size_t i = 0; i < N; ++i) {
+            BinanceMarketEvent out{};
+            ASSERT_TRUE(ring.try_pop(out)) << "round " << round << " pop " << i;
+            EXPECT_EQ(out.event_id, next_read++);
+        }
+        BinanceMarketEvent drained{};
+        EXPECT_FALSE(ring.try_pop(drained)) << "round " << round << ": empty ring yielded a pop";
+    }
+
+    // The counters really did cross zero during the loop above.
+    EXPECT_LT(hy::SpscRingTestHooks::head(ring), std::numeric_limits<std::size_t>::max() / 2)
+        << "counters did not actually wrap -- test is not exercising what it claims";
+}
+
+TEST(SpscRing, SizeApproxDoesNotUnderflowAcrossCounterWrap) {
+    constexpr std::size_t N = 8;
+    SpscRing<BinanceMarketEvent, N> ring;
+    hy::SpscRingTestHooks::seed_indices(ring, std::numeric_limits<std::size_t>::max() - 3);
+
+    for (std::size_t i = 0; i < N; ++i) {
+        BinanceMarketEvent ev{};
+        ev.event_id = i;
+        ASSERT_TRUE(ring.try_push(ev));
+        // Never the huge wrapped value an underflow would produce.
+        EXPECT_LE(ring.size_approx(), N);
+        EXPECT_EQ(ring.size_approx(), i + 1);
+    }
 }

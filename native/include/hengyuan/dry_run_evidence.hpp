@@ -54,8 +54,19 @@ public:
         return evidence_[idx].exercised;
     }
 
+    // AUDIT EVID-OOB-038: this was the only one of the three path-indexed
+    // accessors WITHOUT a bounds check -- record() and is_path_exercised()
+    // both had one, this indexed straight into the array. An out-of-range
+    // EvidencePath (a cast-in value, or a new enumerator added without
+    // bumping kEvidencePathCount) was an out-of-bounds read returned BY
+    // REFERENCE. Out-of-range now yields a never-exercised record, which is
+    // the fail-closed answer: live_ready() can only ever be made harder to
+    // satisfy by it, never easier.
     const EvidenceRecord& get(EvidencePath path) const noexcept {
-        return evidence_[static_cast<std::size_t>(path)];
+        static constexpr EvidenceRecord kNotExercised{};
+        const auto idx = static_cast<std::size_t>(path);
+        if (idx >= kEvidencePathCount) return kNotExercised;
+        return evidence_[idx];
     }
 
     // All 4 paths must be exercised before live is permitted.

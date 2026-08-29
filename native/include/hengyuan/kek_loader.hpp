@@ -187,9 +187,15 @@ private:
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) return KekLoadStatus::ReadError;
 
+        // AUDIT CRED-REPARSE-FAILOPEN-037: the `&&` short-circuited on query
+        // failure, silently skipping the reparse re-check. Same fix and same
+        // reasoning as env_loader.hpp's copy of this block.
         BY_HANDLE_FILE_INFORMATION info{};
-        if (GetFileInformationByHandle(hFile, &info) &&
-            (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        if (!GetFileInformationByHandle(hFile, &info)) {
+            CloseHandle(hFile);
+            return KekLoadStatus::ReadError;
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
             CloseHandle(hFile);
             return KekLoadStatus::IsSymlink;
         }
