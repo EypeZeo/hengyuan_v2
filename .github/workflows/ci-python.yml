@@ -65,15 +65,13 @@ jobs:
         working-directory: py_core
         run: python -m pytest tests/ -q
 
-      # Non-blocking on purpose for now: this repo has never run a linter over
-      # py_core, so turning ruff into a hard gate in the same change that
-      # introduces the workflow would mean landing an unrelated cleanup pass as
-      # well. Making it visible first, then promoting it to a gate once the
-      # existing findings are triaged, is the honest order -- a lint job whose
-      # failures are routinely ignored is worse than none.
-      - name: Lint (advisory)
+      # Promoted from advisory (continue-on-error) to a hard gate once the
+      # pre-existing 70-finding backlog this comment used to describe was fully
+      # triaged and fixed to zero (batch-4 py_core audit, PRs #62-#65, followed
+      # by this ruff-hard-gate change) -- a lint job whose failures are routinely
+      # ignored is worse than none, and that condition no longer holds.
+      - name: Lint
         working-directory: py_core
-        continue-on-error: true
         run: |
           pip install ruff
-          ruff check . || echo "::warning::ruff reported findings (advisory, not a gate yet)"
+          ruff check .

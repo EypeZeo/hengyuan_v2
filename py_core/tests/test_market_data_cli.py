@@ -56,20 +56,20 @@ def _rec(day: int, close_p: float = 100.0) -> NormalizedOhlcvRecord:
 
 
 def _meta(**overrides: Any) -> FetchMeta:
-    defaults: dict[str, Any] = dict(
-        request_symbol="BTCUSDT",
-        request_interval="1d",
-        request_start_utc=_BASE_DT,
-        request_end_utc=_BASE_DT + timedelta(days=5),
-        coverage_end_utc=_BASE_DT + timedelta(days=5),
-        retrieval_cutoff_utc=_BASE_DT + timedelta(days=10),
-        dropped_unclosed_bar_count=0,
-        host="data-api.binance.vision",
-        page_count=1,
-        csv_sha256="",
-        schema_version=1,
-        response_weight_headers={},
-    )
+    defaults: dict[str, Any] = {
+        "request_symbol": "BTCUSDT",
+        "request_interval": "1d",
+        "request_start_utc": _BASE_DT,
+        "request_end_utc": _BASE_DT + timedelta(days=5),
+        "coverage_end_utc": _BASE_DT + timedelta(days=5),
+        "retrieval_cutoff_utc": _BASE_DT + timedelta(days=10),
+        "dropped_unclosed_bar_count": 0,
+        "host": "data-api.binance.vision",
+        "page_count": 1,
+        "csv_sha256": "",
+        "schema_version": 1,
+        "response_weight_headers": {},
+    }
     defaults.update(overrides)
     return FetchMeta(**defaults)
 
@@ -175,9 +175,11 @@ def test_publish_fetch_output_leaves_no_partial_output_on_failure(tmp_path: Path
             raise RuntimeError("boom")
         return real_dumps(*args, **kwargs)
 
-    with mock.patch("py_core.market_data.cli.json.dumps", side_effect=flaky_dumps):
-        with pytest.raises(RuntimeError):
-            publish_fetch_output(records, meta, output_dir, symbol="BTCUSDT", interval="1d")
+    with (
+        mock.patch("py_core.market_data.cli.json.dumps", side_effect=flaky_dumps),
+        pytest.raises(RuntimeError),
+    ):
+        publish_fetch_output(records, meta, output_dir, symbol="BTCUSDT", interval="1d")
 
     assert not output_dir.exists()
     assert list(tmp_path.glob(".tmp-*")) == []

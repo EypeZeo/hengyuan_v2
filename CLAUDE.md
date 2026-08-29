@@ -191,10 +191,11 @@ python -m pytest tests/ -q
 Python version is whatever `py_core/pyproject.toml`'s `requires-python` says (currently
 `>=3.13`) if it ever diverges from CI's pinned 3.13.
 
-**Lint status**: `ruff check .` runs in CI as **advisory-only** (`continue-on-error`), not yet
-a hard gate — no linter had ever run over `py_core` before that workflow existed, and turning
-ruff into a hard gate in the same change that introduces it would land an unrelated cleanup
-pass alongside. Made visible first, promoted to a gate once the existing findings are triaged.
+**Lint status**: `ruff check .` is a **hard gate** in `ci-python.yml` — a PR that introduces a
+new finding fails CI. It started advisory-only (`continue-on-error`) because no linter had
+ever run over `py_core` before the workflow existed; the pre-existing 70-finding backlog was
+triaged and fixed to zero across the batch-4 py_core audit (PRs #62-#65), then the gate was
+promoted to blocking. Keep it at zero — do not reintroduce `continue-on-error`.
 
 **Tier A/B still applies**: mechanical porting/test-completion/fixes are Tier A, new
 statistical methods/concurrency/state-machine design are Tier B — same judgment call as the
