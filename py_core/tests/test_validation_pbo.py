@@ -17,7 +17,7 @@ import math
 import numpy as np
 import pytest
 
-from py_core.backtests.models import BacktestConfig
+from py_core.backtests.models import BacktestConfig, BacktestMetrics
 from py_core.tests.test_validation_walk_forward import (
     _autocorrelated_prices,
     _random_walk_prices,
@@ -172,4 +172,52 @@ def test_genuine_stable_edge_shows_lower_pbo_than_pure_noise_pool_on_average() -
         f"a pool of purely exchangeable noise candidates should show clearly higher PBO than "
         f"a pool with genuine structure on the same harness -- noise {noise_values} "
         f"(mean {mean_noise:.3f}) vs edge {edge_values} (mean {mean_edge:.3f})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 批次 4 修复回归 -- PBO-NANARGMAX-054
+# ---------------------------------------------------------------------------
+
+
+def test_compute_pbo_never_selects_a_nan_train_score_as_winner() -> None:
+    """AUDIT PBO-NANARGMAX-054: winner selection used to be `np.argmax(train_scores)`,
+    which lets a NaN score hijack the winner slot (np.argmax([0.5, nan, 2.0]) == 1, not the
+    genuinely-largest 2.0 at index 2) -- and walk_forward.run_walk_forward_analysis()'s own
+    selection (plain `>` from -inf) never picks NaN on the identical scores, so the two
+    orchestrators could disagree on the same input. Forces one candidate's train score to
+    NaN on every combination (exploiting compute_pbo's fully deterministic per-combination
+    call order: train then test, in param_grid order) and confirms it is never selected.
+    """
+    records = _records_from_prices(_random_walk_prices(300, seed=3))
+    config = BacktestConfig(initial_capital=100_000.0, fee_bps=5.0, slippage_bps=2.0)
+    grid = _sma_param_grid()
+    nan_candidate_index = 2
+    call_count = {"n": 0}
+
+    def selection_metric(metrics: BacktestMetrics) -> float:
+        i = call_count["n"]
+        call_count["n"] += 1
+        is_train_call = (i % 2) == 0
+        candidate_index = (i // 2) % len(grid)
+        if is_train_call and candidate_index == nan_candidate_index:
+            return float("nan")
+        return metrics.sharpe_ratio
+
+    report = compute_pbo(
+        config,
+        records,
+        "py_core.strategies.sma_crossover:SmaCrossoverStrategy",
+        grid,
+        n_groups=6,
+        selection_metric=selection_metric,
+    )
+
+    assert all(
+        cr.in_sample_winner_index != nan_candidate_index for cr in report.combination_results
+    )
+    # Confirm the forced NaN actually reached train_scores (the hijack scenario was really
+    # exercised), not that the strategy silently never produced a comparable score.
+    assert any(
+        math.isnan(cr.train_scores[nan_candidate_index]) for cr in report.combination_results
     )
