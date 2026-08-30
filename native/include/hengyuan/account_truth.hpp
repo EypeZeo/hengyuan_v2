@@ -88,6 +88,21 @@ inline FreshnessStatus check_freshness(
 
 static constexpr std::size_t kSymbolNameLen = 20;
 
+// L4 §5: the fixed capacity of a symbol registry snapshot -- how many distinct SymbolRules
+// entries SymbolRegistry (symbol_registry.hpp) can hold, and the array bound
+// ParsedExchangeInfo::symbols (binance_private_rest.hpp) fills from a real exchangeInfo
+// response. This is this system's own design capacity, not a Binance-imposed limit (Binance's
+// unfiltered GET /api/v3/exchangeInfo returns 2000+ symbols; callers are expected to pass a
+// `symbols` filter naming only what they actually trade). The single authoritative definition:
+// control_plane_frame_codec.hpp's kMaxSnapshotSymbols (wire-format capacity) is defined in
+// terms of this constant rather than as an independent literal, so the in-memory and
+// persisted-wire capacities cannot silently drift apart -- the exact class of bug this file's
+// own rescale_notional_ceil() work (§5.1.1) already had to close once for a hardcoded wire
+// size. Two unrelated `kMaxSymbols = 64` constants also exist in this codebase
+// (binance_json_parser.hpp, input_validator.hpp) for different arrays entirely; do not conflate
+// them with this one.
+static constexpr std::size_t kMaxSymbols = 64;
+
 struct SymbolRules {
     char symbol[kSymbolNameLen]{};
     bool is_trading{false};
@@ -135,6 +150,27 @@ struct SymbolRules {
     std::string_view symbol_name() const noexcept {
         return {symbol, std::strlen(symbol)};
     }
+};
+
+// L4 §5: the caller-owned result of BinancePrivateRestClient::fetch_exchange_info()
+// (binance_private_rest.hpp) -- same "fetch fills a result type the caller passed in, the
+// fetcher itself owns nothing" shape as fetch_account()/AccountSnapshot above. Lives here
+// rather than in binance_private_rest.hpp for the same reason AccountSnapshot does: it's a
+// pure data struct with zero dependency on the network stack, and symbol_registry.hpp's
+// refresh_from_exchange_info() needs this type too -- putting it in binance_private_rest.hpp
+// would force symbol_registry.hpp to pull in that file's Boost/Beast/OpenSSL dependency just
+// to name a parameter type, exactly the coupling this whole L4 §5 split is designed to avoid.
+struct ParsedExchangeInfo {
+    // exchangeInfo's top-level "serverTime" field (Binance server time, milliseconds) -- not
+    // the local system clock. SymbolRegistry::refresh_from_exchange_info() (symbol_registry.hpp)
+    // uses this as the durable snapshot's timestamp_ms, so the persisted record's timestamp is
+    // the exchange's own clock, not an uncalibrated local read -- the same posture this L4
+    // spec's clock-sync work (§2.2) takes everywhere else.
+    std::int64_t server_time_ms{0};
+    // rules_version is left 0 on every entry here -- that's a value SymbolRegistry assigns at
+    // publish time (§5.1), not something exchangeInfo itself reports.
+    std::array<SymbolRules, kMaxSymbols> symbols{};
+    std::size_t symbol_count{0};
 };
 
 // --- Order side / type (ADR-019 D7 M7; first path frozen to LIMIT per spec 6.8) ---

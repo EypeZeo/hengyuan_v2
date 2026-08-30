@@ -568,6 +568,32 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_account_truth)
     gtest_discover_tests(test_account_truth)
 
+    # L4 §5.1 (PR 5b): derive_scale_from_decimal_string()/parse_decimal_to_ticks_with_scale()
+    # (L1, no network -- binance_decimal.hpp is deliberately independent of the
+    # Boost/OpenSSL network stack test_binance_private_rest.cpp requires)
+    add_executable(test_binance_decimal tests/test_binance_decimal.cpp)
+    target_link_libraries(test_binance_decimal PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_binance_decimal)
+    gtest_discover_tests(test_binance_decimal)
+
+    # L4 §5.3/§5.3.1 (PR 5b): SymbolRegistry plain unit tests (no network, no concurrency --
+    # the concurrency test is a separate binary immediately below, same
+    # test_spsc_ring/test_spsc_concurrency split-by-label pattern used elsewhere in this file)
+    add_executable(test_symbol_registry tests/test_symbol_registry.cpp)
+    target_link_libraries(test_symbol_registry PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_symbol_registry)
+    gtest_discover_tests(test_symbol_registry)
+
+    # L4 §5.3.1's core invariant under real concurrent load: std::shared_mutex is the first
+    # shared-state concurrency primitive this L4 branch has introduced. Same "concurrency"
+    # label as test_reconcile_concurrency/test_spsc_concurrency above, for the same reasons --
+    # WSL2 TSan is required, not optional, before trusting this design (see the test file's
+    # own header comment).
+    add_executable(test_symbol_registry_concurrency tests/test_symbol_registry_concurrency.cpp)
+    target_link_libraries(test_symbol_registry_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_symbol_registry_concurrency)
+    gtest_discover_tests(test_symbol_registry_concurrency PROPERTIES LABELS concurrency)
+
     # P2-EXEC-LIVE-01 D12-3: transport policy (L4, no network, policy validation only)
     add_executable(test_transport_policy tests/test_transport_policy.cpp)
     target_link_libraries(test_transport_policy PRIVATE hengyuan_core GTest::gtest_main)

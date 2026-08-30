@@ -16,19 +16,23 @@
 //     AccountSnapshot. Fails closed on every one of §4.1-4.4's schema/precision/
 //     capacity conditions — the fetch either produces a complete, correctly-scaled
 //     snapshot or it changes nothing.
+//   - GET /api/v3/exchangeInfo (§5, public, unauthenticated): fetch_exchange_info()
+//     below. Symbol-registry durability/hot-swap (SymbolRegistry, §5.3/§5.3.1) is
+//     symbol_registry.hpp's job, not this file's — this function only fetches and
+//     parses the HTTP response into a caller-owned ParsedExchangeInfo, the same
+//     "write into what the caller passed in, own nothing" shape as fetch_account().
 //
-// Explicit non-goals for this first slice (see docs/SPEC_INVARIANTS.md's L4 entries
-// and the spec's own §5/§6/§7/§9/§10 sections): GET /api/v3/exchangeInfo (§5, symbol
-// registry), GET /api/v3/order (§6, reconciliation), rate-limit header accounting
-// (§7), the single-owner actor/scheduler thread model (§9), and a concrete
-// durable_control_plane.hpp-backed persistence implementation (§10, whose ABI
-// surface already exists per docs/SPEC_INVARIANTS.md but has no durability
-// requirement from §3/§4 specifically — §5.3.1's registry snapshot is the first
-// place the spec actually mandates a durable ACK-before-publish write). None of
-// those are implemented here. This client also does not itself enforce the
-// single-owner-thread discipline BoundHmacCredentials/§9 require — same contract
-// BoundHmacCredentials already has (construct + every sign()/copy_api_key() call
-// from one thread), the caller's responsibility, not this class's.
+// Explicit non-goals for this slice (see docs/SPEC_INVARIANTS.md's L4 entries and
+// the spec's own §6/§7/§9/§10 sections): GET /api/v3/order (§6, reconciliation),
+// rate-limit header accounting (§7), the single-owner actor/scheduler thread model
+// (§9), and a concrete durable_control_plane.hpp-backed persistence implementation
+// (§10, whose ABI surface already exists per docs/SPEC_INVARIANTS.md but has no
+// durability requirement from §3/§4 specifically — §5.3.1's registry snapshot is
+// the first place the spec actually mandates a durable ACK-before-publish write,
+// implemented in symbol_registry.hpp, not here). This client also does not itself
+// enforce the single-owner-thread discipline BoundHmacCredentials/§9 require — same
+// contract BoundHmacCredentials already has (construct + every sign()/copy_api_key()
+// call from one thread), the caller's responsibility, not this class's.
 //
 // Structurally mirrors binance_rest_snapshot.hpp's coroutine skeleton (resolve ->
 // connect -> TLS handshake -> write -> read, each with its own bounded deadline) —
@@ -47,6 +51,7 @@
 
 #include <hengyuan/account_truth.hpp>
 #include <hengyuan/binance_clock_sync.hpp>
+#include <hengyuan/binance_decimal.hpp>
 #include <hengyuan/binance_environment.hpp>
 #include <hengyuan/binance_query_signing.hpp>
 #include <hengyuan/binance_tls.hpp>
@@ -76,6 +81,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -123,67 +129,12 @@ enum class PrivateRestError : std::uint8_t {
     SigningFailed = 12,      // build_canonical_query()/build_signed_query()/copy_api_key()
 };
 
-// §4.2: lossless decimal-string -> fixed-point ticks at account_truth.hpp's kBalanceScale (8).
-// Deliberately NOT binance_json_parser.hpp::parse_decimal_to_fixed() reused as-is: that
-// function silently TRUNCATES a fractional part longer than its target scale (verified by
-// reading its implementation) -- correct for its own WS/L1 hot-path use (streaming price/qty,
-// governed by a different spec section with its own truncation-is-fine precedent), but exactly
-// the "never truncate a balance silently and proceed with a smaller number than the account
-// actually holds" failure §4.2 explicitly forbids. This is a fresh, deliberately stricter
-// parser: any of a non-digit character, more than 8 fractional digits, a negative sign
-// (balances are never negative), an empty string, or std::int64_t overflow at scale 8 all
-// REJECT (return false, `out_ticks` untouched) rather than truncating or clamping.
-inline bool parse_balance_decimal_to_ticks(std::string_view s, std::int64_t& out_ticks) noexcept {
-    if (s.empty()) return false;
-    if (s[0] == '-') return false;  // balances are never negative
-
-    std::size_t pos = 0;
-    std::int64_t integer_part = 0;
-    while (pos < s.size() && s[pos] != '.') {
-        const char c = s[pos];
-        if (c < '0' || c > '9') return false;
-        const int digit = c - '0';
-        if (integer_part > (std::numeric_limits<std::int64_t>::max() - digit) / 10) return false;
-        integer_part = integer_part * 10 + digit;
-        ++pos;
-    }
-
-    std::int64_t frac_part = 0;
-    int frac_digits = 0;
-    if (pos < s.size()) {
-        // Unreachable given the loop above (it only stops early on '.'), kept as an explicit
-        // precondition rather than an assumption.
-        if (s[pos] != '.') return false;
-        ++pos;
-        if (pos == s.size()) return false;  // trailing '.' with no digits after it ("5.")
-        while (pos < s.size()) {
-            const char c = s[pos];
-            if (c < '0' || c > '9') return false;
-            // The reject-not-truncate case §4.2 exists for.
-            if (frac_digits >= kBalanceScale) return false;
-            frac_part = frac_part * 10 + (c - '0');
-            ++frac_digits;
-            ++pos;
-        }
-    }
-
-    // Pad fewer-than-kBalanceScale fractional digits up to kBalanceScale (e.g. "1.5" -> frac
-    // 5 at 1 digit becomes 50000000 at 8 digits) so the final combine below is a single
-    // fixed-width scale throughout.
-    std::int64_t scale = 1;
-    for (int i = 0; i < kBalanceScale; ++i) scale *= 10;  // 10^8 -- fits trivially in int64
-    std::int64_t frac_scale = 1;
-    for (int i = 0; i < frac_digits; ++i) frac_scale *= 10;
-    const std::int64_t pad = scale / frac_scale;
-    if (frac_part > std::numeric_limits<std::int64_t>::max() / pad) return false;
-    frac_part *= pad;
-
-    if (integer_part > (std::numeric_limits<std::int64_t>::max() - frac_part) / scale) {
-        return false;
-    }
-    out_ticks = integer_part * scale + frac_part;
-    return true;
-}
+// §4.2's parse_balance_decimal_to_ticks() moved to binance_decimal.hpp (L4 §5 / PR 5b): the
+// exchangeInfo parser below (fetch_exchange_info()) needs the same function for the
+// MIN_NOTIONAL/NOTIONAL filter, but symbol_registry.hpp — which also needs it — must not pull in
+// this file's Boost/Beast/OpenSSL network dependency just to reuse a pure decimal parser. See
+// binance_decimal.hpp's header comment for the full three-function split. Signature and behavior
+// are unchanged; every call site in this file is unaffected.
 
 // §3: `{"serverTime": <ms>}`. A negative value is rejected outright (Binance never returns
 // one; a negative "server time" would corrupt every downstream RTT/offset computation that
@@ -278,6 +229,252 @@ inline PrivateRestError parse_account_response(std::string_view body, AccountSna
         slot.free_ticks = free_ticks;
         slot.locked_ticks = locked_ticks;
         ++built.asset_count;
+    }
+
+    out = built;
+    return PrivateRestError::None;
+}
+
+// L4 §5: real Binance symbols are uppercase alphanumeric only (e.g. "BTCUSDT") -- rejecting
+// anything else here means build_exchange_info_target() never has to build a request target
+// from unvalidated caller input.
+inline bool is_valid_exchange_info_symbol(std::string_view s) noexcept {
+    if (s.empty() || s.size() >= kSymbolNameLen) return false;
+    for (char c : s) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
+    }
+    return true;
+}
+
+// RFC 3986 percent-encoding, used only for the `symbols` JSON-array query parameter below --
+// see build_exchange_info_target()'s own comment for why this is needed at all.
+inline void percent_encode_append(std::string_view s, std::string& out) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    for (char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);  // explicit, not an implicit
+                                                         // sign-changing conversion in the loop
+                                                         // variable itself (GCC -Wsign-conversion)
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                 (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+                                 c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[(c >> 4) & 0xF]);
+            out.push_back(kHex[c & 0xF]);
+        }
+    }
+}
+
+// L4 §5: builds the GET /api/v3/exchangeInfo request target, with an optional `symbols`
+// filter -- see fetch_exchange_info()'s own doc comment for why this filter exists at all
+// (this system's own kMaxSymbols design capacity vs. Binance's 2000+-symbol unfiltered
+// response). Returns false (out_target left untouched) if any symbol fails
+// is_valid_exchange_info_symbol() -- fails closed rather than building a request target out of
+// unvalidated caller input.
+//
+//   - empty            -> "/api/v3/exchangeInfo" (no filter -- local testing / one-off use
+//                          only, see fetch_exchange_info()'s own warning against this in
+//                          production).
+//   - one symbol       -> "/api/v3/exchangeInfo?symbol=BTCUSDT" (Binance's short form; the
+//                          value itself is already known URI-safe by
+//                          is_valid_exchange_info_symbol()'s own alphabet, so no encoding is
+//                          needed here).
+//   - multiple symbols -> Binance's required JSON-array-string syntax, e.g.
+//                          ["BTCUSDT","ETHUSDT"] -- but '[' ']' '"' ',' are all reserved/illegal
+//                          characters in a raw HTTP request target. Building that string
+//                          unencoded and sending it as-is would be malformed on the wire (Beast's
+//                          own parser, or any reverse proxy in front of the real endpoint, can
+//                          reject it as a bad request). The percent-encoded form actually sent
+//                          is: "/api/v3/exchangeInfo?symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%5D"
+//                          (%5B='[', %22='"', %2C=',', %5D=']').
+inline bool build_exchange_info_target(std::span<const std::string_view> symbols,
+                                        std::string& out_target) {
+    for (const auto& s : symbols) {
+        if (!is_valid_exchange_info_symbol(s)) return false;
+    }
+
+    if (symbols.empty()) {
+        out_target = "/api/v3/exchangeInfo";
+        return true;
+    }
+    if (symbols.size() == 1) {
+        out_target = "/api/v3/exchangeInfo?symbol=";
+        out_target += symbols[0];
+        return true;
+    }
+
+    std::string json;
+    json += '[';
+    for (std::size_t i = 0; i < symbols.size(); ++i) {
+        if (i > 0) json += ',';
+        json += '"';
+        json += symbols[i];
+        json += '"';
+    }
+    json += ']';
+
+    out_target = "/api/v3/exchangeInfo?symbols=";
+    percent_encode_append(json, out_target);
+    return true;
+}
+
+// L4 §5: schema validation + per-symbol scale derivation, collapsed to a single outcome --
+// `out` is left completely UNCHANGED on any failure path, exactly mirroring
+// parse_account_response()'s own build-then-assign discipline.
+//
+// JSON parsing scope (deliberately narrower than the full exchangeInfo schema): only
+// symbols[].symbol/status/quoteAssetPrecision and three filters[] entries
+// (PRICE_FILTER/LOT_SIZE/MIN_NOTIONAL-or-NOTIONAL) are read. Every other filterType Binance may
+// send (PERCENT_PRICE_BY_SIDE, MARKET_LOT_SIZE, MAX_NUM_ORDERS, ICEBERG_PARTS, TRAILING_DELTA,
+// ...) is skipped silently, not rejected -- SymbolRules has no field for them, and Binance adds
+// new filter types over time; treating an unrecognized filterType as fatal would make this
+// parser brittle against Binance's own forward evolution.
+inline PrivateRestError parse_exchange_info_response(std::string_view body,
+                                                      ParsedExchangeInfo& out) {
+    auto padded = simdjson::padded_string(body);
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (parser.iterate(padded).get(doc)) return PrivateRestError::JsonParse;
+
+    std::int64_t server_time_ms = 0;
+    if (doc["serverTime"].get_int64().get(server_time_ms) != simdjson::SUCCESS) {
+        return PrivateRestError::MalformedResponse;
+    }
+    if (server_time_ms < 0) return PrivateRestError::MalformedResponse;
+
+    simdjson::ondemand::array symbols_arr;
+    if (doc["symbols"].get_array().get(symbols_arr) != simdjson::SUCCESS) {
+        return PrivateRestError::MalformedResponse;
+    }
+
+    ParsedExchangeInfo built{};
+    built.server_time_ms = server_time_ms;
+
+    for (auto sym_result : symbols_arr) {
+        simdjson::ondemand::object sym_obj;
+        if (sym_result.get_object().get(sym_obj) != simdjson::SUCCESS) {
+            return PrivateRestError::MalformedResponse;
+        }
+
+        // L4 §5's own capacity guard -- checked BEFORE writing this entry, never after (a
+        // check-after-write would already be the out-of-bounds write it exists to prevent).
+        // Rejects the WHOLE fetch rather than silently truncating to the first kMaxSymbols
+        // entries, same posture as parse_account_response()'s own §4.3 capacity check.
+        if (built.symbol_count >= kMaxSymbols) {
+            return PrivateRestError::CapacityExceeded;
+        }
+
+        std::string_view symbol_sv, status_sv;
+        if (sym_obj["symbol"].get_string().get(symbol_sv) != simdjson::SUCCESS) {
+            return PrivateRestError::MalformedResponse;
+        }
+        if (sym_obj["status"].get_string().get(status_sv) != simdjson::SUCCESS) {
+            return PrivateRestError::MalformedResponse;
+        }
+        std::int64_t quote_precision = 0;
+        if (sym_obj["quoteAssetPrecision"].get_int64().get(quote_precision) !=
+            simdjson::SUCCESS) {
+            return PrivateRestError::MalformedResponse;
+        }
+        // [0,18] mirrors every other scale's valid domain in this file (rescale_notional_ceil(),
+        // pow10_i64() -- account_truth.hpp).
+        if (quote_precision < 0 || quote_precision > 18) {
+            return PrivateRestError::MalformedResponse;
+        }
+
+        // Truncating an oversized symbol name into SymbolRules::symbol's fixed buffer would
+        // silently misattribute these rules to an ambiguous/wrong symbol -- reject, don't
+        // truncate, same philosophy as every other check in this file.
+        if (symbol_sv.empty() || symbol_sv.size() >= kSymbolNameLen) {
+            return PrivateRestError::MalformedResponse;
+        }
+
+        SymbolRules rules{};
+        std::memcpy(rules.symbol, symbol_sv.data(), symbol_sv.size());
+        rules.symbol[symbol_sv.size()] = '\0';
+        rules.is_trading = (status_sv == "TRADING");  // any other status -> false, per this
+                                                       // file's own documented JSON-parsing scope
+        rules.quote_scale = static_cast<std::uint8_t>(quote_precision);
+
+        simdjson::ondemand::array filters_arr;
+        if (sym_obj["filters"].get_array().get(filters_arr) != simdjson::SUCCESS) {
+            return PrivateRestError::MalformedResponse;
+        }
+
+        for (auto filter_result : filters_arr) {
+            simdjson::ondemand::object filter_obj;
+            if (filter_result.get_object().get(filter_obj) != simdjson::SUCCESS) {
+                return PrivateRestError::MalformedResponse;
+            }
+            std::string_view filter_type;
+            if (filter_obj["filterType"].get_string().get(filter_type) != simdjson::SUCCESS) {
+                return PrivateRestError::MalformedResponse;
+            }
+
+            if (filter_type == "PRICE_FILTER") {
+                std::string_view tick_sv, min_sv, max_sv;
+                if (filter_obj["tickSize"].get_string().get(tick_sv) != simdjson::SUCCESS ||
+                    filter_obj["minPrice"].get_string().get(min_sv) != simdjson::SUCCESS ||
+                    filter_obj["maxPrice"].get_string().get(max_sv) != simdjson::SUCCESS) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                std::uint8_t price_scale = 0;
+                if (!derive_scale_from_decimal_string(tick_sv, price_scale)) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                std::int64_t tick_ticks = 0, min_ticks = 0, max_ticks = 0;
+                if (!parse_decimal_to_ticks_with_scale(tick_sv, price_scale, tick_ticks) ||
+                    !parse_decimal_to_ticks_with_scale(min_sv, price_scale, min_ticks) ||
+                    !parse_decimal_to_ticks_with_scale(max_sv, price_scale, max_ticks)) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                rules.price_scale = price_scale;
+                rules.tick_size_ticks = tick_ticks;
+                rules.min_price_ticks = min_ticks;
+                rules.max_price_ticks = max_ticks;
+            } else if (filter_type == "LOT_SIZE") {
+                std::string_view step_sv, minq_sv, maxq_sv;
+                if (filter_obj["stepSize"].get_string().get(step_sv) != simdjson::SUCCESS ||
+                    filter_obj["minQty"].get_string().get(minq_sv) != simdjson::SUCCESS ||
+                    filter_obj["maxQty"].get_string().get(maxq_sv) != simdjson::SUCCESS) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                std::uint8_t qty_scale = 0;
+                if (!derive_scale_from_decimal_string(step_sv, qty_scale)) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                std::int64_t step_ticks = 0, minq_ticks = 0, maxq_ticks = 0;
+                if (!parse_decimal_to_ticks_with_scale(step_sv, qty_scale, step_ticks) ||
+                    !parse_decimal_to_ticks_with_scale(minq_sv, qty_scale, minq_ticks) ||
+                    !parse_decimal_to_ticks_with_scale(maxq_sv, qty_scale, maxq_ticks)) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                rules.qty_scale = qty_scale;
+                rules.step_size_ticks = step_ticks;
+                rules.min_qty_ticks = minq_ticks;
+                rules.max_qty_ticks = maxq_ticks;
+            } else if (filter_type == "MIN_NOTIONAL" || filter_type == "NOTIONAL") {
+                // Both names accepted -- spec text itself notes Binance renamed this filter
+                // across API versions; the field carrying the value (minNotional) is unchanged.
+                std::string_view min_notional_sv;
+                if (filter_obj["minNotional"].get_string().get(min_notional_sv) !=
+                    simdjson::SUCCESS) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                std::int64_t min_notional_ticks = 0;
+                if (!parse_balance_decimal_to_ticks(min_notional_sv, min_notional_ticks)) {
+                    return PrivateRestError::MalformedResponse;
+                }
+                rules.min_notional_ticks = min_notional_ticks;
+            }
+            // Else: unrecognized filterType -- skip silently, see this function's own scope
+            // comment above.
+        }
+
+        built.symbols[built.symbol_count] = rules;
+        ++built.symbol_count;
     }
 
     out = built;
@@ -477,6 +674,101 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
     }
 }
 
+// L4 §5: GET /api/v3/exchangeInfo is public/unauthenticated, but (unlike
+// fetch_server_time_coro's fixed "/api/v3/time" target) needs a caller-supplied target string
+// carrying the optional `symbols` filter -- this coroutine is fetch_server_time_coro's shape
+// (no X-MBX-APIKEY header; never signs anything) crossed with fetch_signed_body_coro's shape
+// (variable target, returns the raw response body for the caller to parse). Deliberately NOT a
+// third mode bolted onto fetch_signed_body_coro (e.g. an empty api_key parameter meaning
+// "skip the header"): keeping "always sets a real API key" as fetch_signed_body_coro's one
+// invariant, with no conditional to accidentally weaken for a genuinely signed call later, is
+// simpler to verify by inspection than a shared coroutine with a signed/unsigned branch.
+inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_body_coro(
+    std::string host, std::string target, PrivateRestConfig cfg) {
+    using namespace boost::asio::experimental::awaitable_operators;
+
+    PrivateRestError current_stage = PrivateRestError::Resolve;
+    try {
+        auto executor = co_await net::this_coro::executor;
+
+        ssl::context ssl_ctx(ssl::context::tlsv12_client);
+        hy::configure_binance_ssl_context(ssl_ctx);
+        if (!cfg.extra_trusted_ca_pem_path.empty()) {
+            ssl_ctx.load_verify_file(cfg.extra_trusted_ca_pem_path);
+        }
+
+        tcp::resolver resolver(executor);
+        beast::ssl_stream<beast::tcp_stream> stream(executor, ssl_ctx);
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+#endif
+        if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
+            co_return PrivateRestError::TlsHandshake;
+        }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+        hy::configure_binance_hostname_verification(stream, host);
+
+        const std::string& connect_host =
+            cfg.connect_host_override.empty() ? host : cfg.connect_host_override;
+        net::steady_timer resolve_timer(executor);
+        resolve_timer.expires_after(std::chrono::seconds(5));
+        auto resolve_result =
+            co_await (resolver.async_resolve(connect_host, cfg.port, net::use_awaitable) ||
+                      resolve_timer.async_wait(net::use_awaitable));
+        if (resolve_result.index() == 1) {
+            co_return PrivateRestError::Resolve;
+        }
+        auto results = std::get<0>(resolve_result);
+
+        current_stage = PrivateRestError::Connect;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        co_await beast::get_lowest_layer(stream).async_connect(results, net::use_awaitable);
+
+        current_stage = PrivateRestError::TlsHandshake;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
+
+        http::request<http::empty_body> req{http::verb::get, target, 11};
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "HengYuan/0.1");
+        // Public endpoint (spec §5): deliberately no X-MBX-APIKEY header, mirroring
+        // fetch_server_time_coro's own unsigned request. Never negotiates compression either
+        // (spec §8) -- no Accept-Encoding header is ever sent.
+
+        current_stage = PrivateRestError::Write;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        co_await http::async_write(stream, req, net::use_awaitable);
+
+        current_stage = PrivateRestError::Read;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
+        beast::flat_buffer buffer;
+        http::response_parser<http::string_body> parser;
+        parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
+        // exchangeInfo's response is far larger than /time or /account: Binance's full,
+        // unfiltered listing runs several MiB. 4 MiB is generous headroom for the `symbols`
+        // -filtered call production code is expected to make (see fetch_exchange_info()'s own
+        // doc comment on why an unfiltered call isn't a supported production shape in the first
+        // place) -- not a reflection of an expected size for the unfiltered case.
+        parser.body_limit(static_cast<std::uint64_t>(4 * 1024 * 1024));
+        co_await http::async_read(stream, buffer, parser, net::use_awaitable);
+        auto res = parser.release();
+
+        beast::get_lowest_layer(stream).close();
+
+        if (res.result() != http::status::ok) {
+            co_return PrivateRestError::HttpStatus;
+        }
+        co_return res.body();
+
+    } catch (...) {
+        co_return current_stage;
+    }
+}
+
 }  // namespace detail
 
 // Owns one bound credential set + one clock-offset publisher. Not internally thread-safe: the
@@ -600,6 +892,44 @@ public:
         parsed.timestamp_ms = fresh_ts_ms;
         out = parsed;
         return PrivateRestError::None;
+    }
+
+    // §5: unauthenticated, like sync_clock() -- never signs anything, never touches creds_.
+    //
+    // `symbols` should almost always be non-empty in production: Binance's unfiltered
+    // GET /api/v3/exchangeInfo returns 2000+ symbols, while kMaxSymbols is this system's own
+    // fixed design capacity (account_truth.hpp) -- callers are expected to name only the
+    // symbols they actually trade (e.g. {"BTCUSDT", "ETHUSDT"}), not fetch everything. An empty
+    // `symbols` is only meant for local testing / one-off inspection, not a production calling
+    // pattern; parse_exchange_info_response()'s own CapacityExceeded check is the fail-closed
+    // depth-of-defense backstop if a caller (or a future Binance response shape) violates that
+    // expectation, but it is a backstop, not the intended primary control.
+    //
+    // `out` is left COMPLETELY UNCHANGED on every failure path, exactly mirroring
+    // fetch_account()'s own build-then-assign discipline.
+    PrivateRestError fetch_exchange_info(ParsedExchangeInfo& out,
+                                          std::span<const std::string_view> symbols,
+                                          const PrivateRestConfig& cfg = {}) {
+        std::string target;
+        if (!build_exchange_info_target(symbols, target)) {
+            return PrivateRestError::InvalidConfig;
+        }
+
+        net::io_context ioc;
+        std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
+        net::co_spawn(
+            ioc, detail::fetch_public_body_coro(std::string(binding_.base_host()), target, cfg),
+            [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
+                if (eptr) std::rethrow_exception(eptr);
+                outcome = std::move(r);
+            });
+        ioc.run();
+
+        if (std::holds_alternative<PrivateRestError>(outcome)) {
+            return std::get<PrivateRestError>(outcome);
+        }
+
+        return parse_exchange_info_response(std::get<std::string>(outcome), out);
     }
 
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }

@@ -34,6 +34,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -55,11 +56,13 @@ using hy::PrivateRestConfig;
 using hy::PrivateRestError;
 using hy::QuerySigningError;
 using hy::SecureEnvLoader;
+using hy::build_exchange_info_target;
 using hy::fetch_clock_pair;
 using hy::is_snapshot_fresh;
 using hy::kBalanceScale;
 using hy::parse_account_response;
 using hy::parse_balance_decimal_to_ticks;
+using hy::parse_exchange_info_response;
 using hy::parse_server_time_response;
 
 namespace {
@@ -359,6 +362,194 @@ TEST(ParseAccountResponse, SyntacticallyInvalidJsonRejectedAtFieldAccess) {
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
 }
 
+// --- build_exchange_info_target() -- L4 §5's `symbols` filter query construction ---
+
+TEST(BuildExchangeInfoTarget, EmptyFilterReturnsUnfilteredPath) {
+    std::string target;
+    ASSERT_TRUE(build_exchange_info_target(std::span<const std::string_view>{}, target));
+    EXPECT_EQ(target, "/api/v3/exchangeInfo");
+}
+
+TEST(BuildExchangeInfoTarget, SingleSymbolUsesShortFormNoEncoding) {
+    std::string target;
+    const std::string_view symbols[] = {"BTCUSDT"};
+    ASSERT_TRUE(build_exchange_info_target(symbols, target));
+    EXPECT_EQ(target, "/api/v3/exchangeInfo?symbol=BTCUSDT");
+}
+
+TEST(BuildExchangeInfoTarget, MultipleSymbolsArePercentEncodedExactly) {
+    std::string target;
+    const std::string_view symbols[] = {"BTCUSDT", "ETHUSDT"};
+    ASSERT_TRUE(build_exchange_info_target(symbols, target));
+    // Exact byte-for-byte target, not a "contains the encoded form" check -- a single wrong
+    // hex digit or a swapped %5B/%5D would still pass a substring check but not this one.
+    EXPECT_EQ(target,
+              "/api/v3/exchangeInfo?symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%5D");
+}
+
+TEST(BuildExchangeInfoTarget, ThreeSymbolsEncodeCommasBetweenEach) {
+    std::string target;
+    const std::string_view symbols[] = {"BTCUSDT", "ETHUSDT", "BNBUSDT"};
+    ASSERT_TRUE(build_exchange_info_target(symbols, target));
+    EXPECT_EQ(target,
+              "/api/v3/exchangeInfo?symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%2C%22BNBUSDT%22%5D");
+}
+
+TEST(BuildExchangeInfoTarget, LowercaseSymbolIsRejected) {
+    std::string target;
+    const std::string_view symbols[] = {"btcusdt"};
+    EXPECT_FALSE(build_exchange_info_target(symbols, target));
+}
+
+TEST(BuildExchangeInfoTarget, EmptySymbolStringIsRejected) {
+    std::string target;
+    const std::string_view symbols[] = {""};
+    EXPECT_FALSE(build_exchange_info_target(symbols, target));
+}
+
+TEST(BuildExchangeInfoTarget, OverlongSymbolIsRejected) {
+    std::string target;
+    const std::string_view symbols[] = {"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"};  // >= kSymbolNameLen
+    EXPECT_FALSE(build_exchange_info_target(symbols, target));
+}
+
+TEST(BuildExchangeInfoTarget, SymbolWithInjectionCharactersIsRejected) {
+    std::string target;
+    const std::string_view symbols[] = {"BTC\"USDT"};
+    EXPECT_FALSE(build_exchange_info_target(symbols, target));
+}
+
+// --- parse_exchange_info_response() -- L4 §5 schema validation + scale derivation ---
+
+TEST(ParseExchangeInfoResponse, ValidResponseWithMultipleSymbolsAndUnknownFilterSkipped) {
+    constexpr std::string_view body = R"({
+        "serverTime": 1700000000000,
+        "symbols": [
+            {
+                "symbol": "BTCUSDT",
+                "status": "TRADING",
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "minPrice": "0.01000000",
+                     "maxPrice": "1000000.00000000", "tickSize": "0.01000000"},
+                    {"filterType": "LOT_SIZE", "minQty": "0.00001000",
+                     "maxQty": "9000.00000000", "stepSize": "0.00001000"},
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "10.00000000"},
+                    {"filterType": "MAX_NUM_ORDERS", "maxNumOrders": 200}
+                ]
+            },
+            {
+                "symbol": "ETHUSDT",
+                "status": "BREAK",
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "minPrice": "0.01000000",
+                     "maxPrice": "100000.00000000", "tickSize": "0.01000000"},
+                    {"filterType": "LOT_SIZE", "minQty": "0.00010000",
+                     "maxQty": "9000.00000000", "stepSize": "0.00010000"},
+                    {"filterType": "NOTIONAL", "minNotional": "5.00000000"}
+                ]
+            }
+        ]
+    })";
+
+    hy::ParsedExchangeInfo out{};
+    ASSERT_EQ(parse_exchange_info_response(body, out), PrivateRestError::None);
+    EXPECT_EQ(out.server_time_ms, 1700000000000);
+    ASSERT_EQ(out.symbol_count, 2u);
+
+    const auto& btc = out.symbols[0];
+    EXPECT_EQ(std::string_view(btc.symbol), "BTCUSDT");
+    EXPECT_TRUE(btc.is_trading);
+    EXPECT_EQ(btc.quote_scale, 8);
+    EXPECT_EQ(btc.price_scale, 2);
+    EXPECT_EQ(btc.min_price_ticks, 1);
+    EXPECT_EQ(btc.max_price_ticks, 100000000);
+    EXPECT_EQ(btc.tick_size_ticks, 1);
+    EXPECT_EQ(btc.qty_scale, 5);
+    EXPECT_EQ(btc.min_qty_ticks, 1);
+    EXPECT_EQ(btc.max_qty_ticks, 900000000);
+    EXPECT_EQ(btc.step_size_ticks, 1);
+    EXPECT_EQ(btc.min_notional_ticks, 1000000000);
+    EXPECT_EQ(btc.rules_version, 0u);  // not this parser's job to assign -- SymbolRegistry's
+
+    const auto& eth = out.symbols[1];
+    EXPECT_EQ(std::string_view(eth.symbol), "ETHUSDT");
+    EXPECT_FALSE(eth.is_trading);  // "BREAK", not "TRADING"
+    EXPECT_EQ(eth.qty_scale, 4);
+    EXPECT_EQ(eth.min_qty_ticks, 1);
+    EXPECT_EQ(eth.max_qty_ticks, 90000000);
+    EXPECT_EQ(eth.min_notional_ticks, 500000000);  // "NOTIONAL", not "MIN_NOTIONAL" -- same field
+}
+
+TEST(ParseExchangeInfoResponse, MissingServerTimeRejected) {
+    hy::ParsedExchangeInfo out{};
+    const auto err = parse_exchange_info_response(R"({"symbols":[]})", out);
+    EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+}
+
+TEST(ParseExchangeInfoResponse, MissingSymbolsArrayRejected) {
+    hy::ParsedExchangeInfo out{};
+    const auto err = parse_exchange_info_response(R"({"serverTime":1700000000000})", out);
+    EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+}
+
+TEST(ParseExchangeInfoResponse, EmptySymbolsArraySucceedsWithZeroCount) {
+    hy::ParsedExchangeInfo out{};
+    ASSERT_EQ(parse_exchange_info_response(R"({"serverTime":1700000000000,"symbols":[]})", out),
+              PrivateRestError::None);
+    EXPECT_EQ(out.symbol_count, 0u);
+}
+
+TEST(ParseExchangeInfoResponse, MissingFiltersArrayRejected) {
+    constexpr std::string_view body = R"({
+        "serverTime": 1700000000000,
+        "symbols": [{"symbol": "BTCUSDT", "status": "TRADING", "quoteAssetPrecision": 8}]
+    })";
+    hy::ParsedExchangeInfo out{};
+    EXPECT_EQ(parse_exchange_info_response(body, out), PrivateRestError::MalformedResponse);
+}
+
+TEST(ParseExchangeInfoResponse, OverlongSymbolNameRejectedNotTruncated) {
+    const std::string body =
+        R"({"serverTime":1700000000000,"symbols":[{"symbol":")" +
+        std::string(30, 'A') +  // >= kSymbolNameLen
+        R"(","status":"TRADING","quoteAssetPrecision":8,"filters":[]}]})";
+    hy::ParsedExchangeInfo out{};
+    EXPECT_EQ(parse_exchange_info_response(body, out), PrivateRestError::MalformedResponse);
+}
+
+TEST(ParseExchangeInfoResponse, MalformedPriceFilterDecimalRejectsWholeFetch) {
+    constexpr std::string_view body = R"({
+        "serverTime": 1700000000000,
+        "symbols": [{
+            "symbol": "BTCUSDT", "status": "TRADING", "quoteAssetPrecision": 8,
+            "filters": [{"filterType": "PRICE_FILTER", "minPrice": "not-a-number",
+                         "maxPrice": "1.0", "tickSize": "0.01"}]
+        }]
+    })";
+    hy::ParsedExchangeInfo out{};
+    EXPECT_EQ(parse_exchange_info_response(body, out), PrivateRestError::MalformedResponse);
+}
+
+TEST(ParseExchangeInfoResponse, MoreThanMaxSymbolsRejectsWholeFetchNotTruncated) {
+    std::string body = R"({"serverTime":1700000000000,"symbols":[)";
+    for (std::size_t i = 0; i < hy::kMaxSymbols + 1; ++i) {
+        if (i > 0) body += ',';
+        char sym[16];
+        std::snprintf(sym, sizeof(sym), "SYM%zuUSDT", i);
+        body += R"({"symbol":")";
+        body += sym;
+        body += R"(","status":"TRADING","quoteAssetPrecision":8,"filters":[]})";
+    }
+    body += "]}";
+
+    hy::ParsedExchangeInfo out{};
+    out.symbol_count = 999;  // sentinel -- must be left untouched on this failure path
+    EXPECT_EQ(parse_exchange_info_response(body, out), PrivateRestError::CapacityExceeded);
+    EXPECT_EQ(out.symbol_count, 999u);
+}
+
 // --- BinancePrivateRestClient::init() -- §8 trust-store check ---
 
 // binance_tls_trust_store_populated()'s own correctness is tested deterministically here,
@@ -534,4 +725,118 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
     out.asset_count = 9;  // sentinel
     EXPECT_EQ(client.fetch_account(out, fetch_cfg), PrivateRestError::HttpStatus);
     EXPECT_EQ(out.asset_count, 9u);  // untouched
+}
+
+// --- BinancePrivateRestClient::fetch_exchange_info() -- §5, network-layer ---
+
+TEST_F(BoundCredentialsFixture, FetchExchangeInfoRealSuccessPathParsesAndUsesNoApiKey) {
+    constexpr std::string_view body = R"({
+        "serverTime": 1700000000000,
+        "symbols": [
+            {
+                "symbol": "BTCUSDT",
+                "status": "TRADING",
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "minPrice": "0.01000000",
+                     "maxPrice": "1000000.00000000", "tickSize": "0.01000000"},
+                    {"filterType": "LOT_SIZE", "minQty": "0.00001000",
+                     "maxQty": "9000.00000000", "stepSize": "0.00001000"},
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "10.00000000"},
+                    {"filterType": "MAX_NUM_ORDERS", "maxNumOrders": 200}
+                ]
+            },
+            {
+                "symbol": "ETHUSDT",
+                "status": "TRADING",
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "minPrice": "0.01000000",
+                     "maxPrice": "100000.00000000", "tickSize": "0.01000000"},
+                    {"filterType": "LOT_SIZE", "minQty": "0.00010000",
+                     "maxQty": "9000.00000000", "stepSize": "0.00010000"},
+                    {"filterType": "NOTIONAL", "minNotional": "5.00000000"}
+                ]
+            }
+        ]
+    })";
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, std::string(body));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    hy::ParsedExchangeInfo out{};
+    const std::string_view symbols[] = {"BTCUSDT", "ETHUSDT"};
+    ASSERT_EQ(client.fetch_exchange_info(out, symbols, cfg), PrivateRestError::None);
+    EXPECT_EQ(out.server_time_ms, 1700000000000);
+    ASSERT_EQ(out.symbol_count, 2u);
+    EXPECT_EQ(std::string_view(out.symbols[0].symbol), "BTCUSDT");
+    EXPECT_EQ(out.symbols[0].min_notional_ticks, 1000000000);
+    EXPECT_EQ(std::string_view(out.symbols[1].symbol), "ETHUSDT");
+    EXPECT_EQ(out.symbols[1].min_notional_ticks, 500000000);
+
+    const auto reqs = server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    EXPECT_EQ(reqs[0].target,
+              "/api/v3/exchangeInfo?symbols=%5B%22BTCUSDT%22%2C%22ETHUSDT%22%5D");
+    EXPECT_TRUE(reqs[0].api_key_header.empty());  // §5 is unauthenticated -- no signing header,
+                                                   // same posture as §3's /time
+}
+
+TEST_F(BoundCredentialsFixture, FetchExchangeInfoSingleSymbolUsesShortFormTarget) {
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"serverTime":1700000000000,"symbols":[]})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    hy::ParsedExchangeInfo out{};
+    const std::string_view symbols[] = {"BTCUSDT"};
+    ASSERT_EQ(client.fetch_exchange_info(out, symbols, cfg), PrivateRestError::None);
+
+    const auto reqs = server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    EXPECT_EQ(reqs[0].target, "/api/v3/exchangeInfo?symbol=BTCUSDT");
+}
+
+TEST_F(BoundCredentialsFixture, FetchExchangeInfoInvalidSymbolFailsClosedWithoutNetworkAttempt) {
+    // No TlsResponseAcceptor at all -- build_exchange_info_target() must reject this before any
+    // connection is even attempted.
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    PrivateRestConfig cfg;
+    cfg.connect_host_override = "127.0.0.1";
+
+    hy::ParsedExchangeInfo out{};
+    out.symbol_count = 7;  // sentinel
+    const std::string_view symbols[] = {"not-a-valid-symbol"};
+    EXPECT_EQ(client.fetch_exchange_info(out, symbols, cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(out.symbol_count, 7u);  // untouched
+}
+
+TEST_F(BoundCredentialsFixture, FetchExchangeInfoHttpErrorStatusRejected) {
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 503, R"({"msg":"unavailable"})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    hy::ParsedExchangeInfo out{};
+    out.symbol_count = 7;  // sentinel
+    const std::string_view symbols[] = {"BTCUSDT"};
+    EXPECT_EQ(client.fetch_exchange_info(out, symbols, cfg), PrivateRestError::HttpStatus);
+    EXPECT_EQ(out.symbol_count, 7u);  // untouched
 }
