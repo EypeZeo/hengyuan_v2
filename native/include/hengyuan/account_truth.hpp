@@ -111,9 +111,26 @@ struct SymbolRules {
     // registry versions start at 1) — a caller with no registry wired up
     // therefore fails closed by construction against live_submit_orchestrator's
     // Gate 1 stale-version check, not by an extra null check anyone has to
-    // remember. No SymbolRegistry class exists in this codebase yet; this field
-    // is the data-model half of that future integration.
+    // remember. SymbolRegistry (native/include/hengyuan/symbol_registry.hpp) is
+    // the data-model's registry-side integration.
     std::uint32_t rules_version{0};
+
+    // L4 §5.1: decimal places implied by tick_size_ticks/step_size_ticks respectively --
+    // i.e. price_ticks/qty_ticks for THIS symbol are expressed at these scales, not at
+    // kBalanceScale. Symbol-dependent (unlike AssetBalance, which is always kBalanceScale
+    // per §4.2). See rescale_notional_ceil() below for why this matters and
+    // symbol_registry.hpp for how a real fetch populates these from exchangeInfo's
+    // PRICE_FILTER.tickSize / LOT_SIZE.stepSize.
+    std::uint8_t price_scale{0};
+    std::uint8_t qty_scale{0};
+    // L4 §5.1 (round-6 P0 fix): exchangeInfo's quoteAssetPrecision, populated directly (an
+    // integer field Binance already reports, not derived like price_scale/qty_scale above).
+    // Explicitly NOT guaranteed to equal kBalanceScale(8) -- conflating the two was
+    // "round-5's avg_fill_price_ticks bug" the spec names when scaling cummulativeQuoteQty.
+    // Unused by validate_pre_trade() below (that function only needs price_scale/qty_scale);
+    // carried here because it's part of the same per-symbol registry snapshot and has
+    // nowhere else to live.
+    std::uint8_t quote_scale{0};
 
     std::string_view symbol_name() const noexcept {
         return {symbol, std::strlen(symbol)};
@@ -182,6 +199,94 @@ inline bool checked_add(std::int64_t a, std::int64_t b, std::int64_t& out) noexc
     return true;
 }
 
+// L4 §5.1.1: 10^exp for exp in [0,18] -- 10^19 overflows int64
+// (9,223,372,036,854,775,807 < 10,000,000,000,000,000,000), so exp>=19 fails closed rather
+// than computing a wrapped value. A plain lookup table, not a loop: the valid domain is
+// small and fixed, and a table makes the exp==19 boundary a simple array-length check
+// instead of a runtime multiply-and-compare that would itself need overflow checking.
+inline bool pow10_i64(std::uint8_t exp, std::int64_t& out) noexcept {
+    static constexpr std::int64_t kPow10[] = {
+        1LL,
+        10LL,
+        100LL,
+        1'000LL,
+        10'000LL,
+        100'000LL,
+        1'000'000LL,
+        10'000'000LL,
+        100'000'000LL,
+        1'000'000'000LL,
+        10'000'000'000LL,
+        100'000'000'000LL,
+        1'000'000'000'000LL,
+        10'000'000'000'000LL,
+        100'000'000'000'000LL,
+        1'000'000'000'000'000LL,
+        10'000'000'000'000'000LL,
+        100'000'000'000'000'000LL,
+        1'000'000'000'000'000'000LL,  // 10^18
+    };
+    if (exp >= sizeof(kPow10) / sizeof(kPow10[0])) return false;
+    out = kPow10[exp];
+    return true;
+}
+
+// L4 §5.1.1 (a real, previously-shipped bug this closes): checked_notional()'s raw
+// price*qty product is at (price_scale + qty_scale) decimal places -- a symbol-dependent
+// scale -- but every threshold it used to be compared against directly
+// (SymbolRules::min_notional_ticks, ExposureLimits::single_order_notional_cap/
+// total_exposure_notional_cap/current_exposure_notional, and AssetBalance::free_ticks
+// per §4.2) is fixed at kBalanceScale (8). For any symbol where
+// price_scale+qty_scale != 8 that was comparing across two different scales. This
+// normalizes a value at native_scale to target_scale (always kBalanceScale in this
+// file's own callers) via lossless integer arithmetic.
+//
+// native_scale/target_scale are `int`, not `std::uint8_t`, deliberately: the spec's own
+// concrete attack scenario is a caller summing two out-of-range SymbolRules::price_scale/
+// qty_scale values (e.g. 200 each, themselves already invalid but not caught before this
+// call) -- 200+200 is 400 in `int` (correctly rejected by the [0,18] check below), but
+// summing them AS uint8_t first would wrap to 144 before this function ever saw the
+// input. Taking `int` parameters removes that narrowing step from existing entirely on
+// the caller's side.
+//
+// Rounds UP (ceiling) when scaling down (target_scale < native_scale): every caller uses
+// the result in a "must not exceed" or "must cover" comparison, so rounding up is the
+// conservative, fail-closed direction -- it can only make a real notional look larger
+// than it is, never smaller, so it can only make this function MORE likely to reject a
+// borderline order, never less.
+inline bool rescale_notional_ceil(std::int64_t raw_notional_native_scale,
+                                   int native_scale, int target_scale,
+                                   std::int64_t& out) noexcept {
+    if (raw_notional_native_scale < 0) return false;
+    if (native_scale < 0 || native_scale > 18) return false;
+    if (target_scale < 0 || target_scale > 18) return false;
+
+    if (target_scale >= native_scale) {
+        std::int64_t factor = 0;
+        if (!pow10_i64(static_cast<std::uint8_t>(target_scale - native_scale), factor)) {
+            return false;
+        }
+        if (raw_notional_native_scale > std::numeric_limits<std::int64_t>::max() / factor) {
+            return false;  // would overflow
+        }
+        out = raw_notional_native_scale * factor;
+        return true;
+    }
+
+    // Scaling down: ceiling division by 10^(native_scale - target_scale). divisor is
+    // always >= 1 (pow10_i64(0) == 1), so no divide-by-zero; the "+ divisor - 1" ceiling
+    // trick is valid because both operands are non-negative (checked above).
+    std::int64_t divisor = 0;
+    if (!pow10_i64(static_cast<std::uint8_t>(native_scale - target_scale), divisor)) {
+        return false;
+    }
+    if (raw_notional_native_scale > std::numeric_limits<std::int64_t>::max() - (divisor - 1)) {
+        return false;  // the ceiling adjustment itself would overflow
+    }
+    out = (raw_notional_native_scale + divisor - 1) / divisor;
+    return true;
+}
+
 struct ExposureLimits {
     std::int64_t single_order_notional_cap{0};
     std::int64_t total_exposure_notional_cap{0};
@@ -239,10 +344,32 @@ inline PreTradeCheck validate_pre_trade(
         }
     }
 
-    // Notional = price * qty (in ticks*ticks, caller must ensure same scale).
+    // L4 §5.1.1's own documented precondition risk (not defended against with new code
+    // here, per the spec's own framing of it as "worth stating explicitly" rather than
+    // requiring one): a default-constructed SymbolRules{} has price_scale=qty_scale=0,
+    // which rescale_notional_ceil() below will treat as a genuine native_scale=0 and
+    // scale UP by 10^8 -- silently inflating notional_native rather than failing. In
+    // practice `is_trading` also defaults false on such a struct, so the
+    // SymbolNotTrading check above already rejects an unpopulated `rules` before this
+    // point is reached; this rescale step still assumes a real registry entry, not an
+    // independent defense against one that was never populated.
+
+    // Notional = price * qty, at this symbol's NATIVE scale (price_scale + qty_scale).
     // Overflow → fail-closed: a wrapped product must never pass the caps below.
+    std::int64_t notional_native = 0;
+    if (!checked_notional(price_ticks, qty_ticks, notional_native)) {
+        return PreTradeCheck::NotionalOverflow;
+    }
+
+    // L4 §5.1.1: notional_native is symbol-dependent scale; min_notional_ticks/the two
+    // ExposureLimits caps/AssetBalance::free_ticks (§4.2) are all fixed at kBalanceScale.
+    // Rescale exactly once, here, and use ONLY `notional` (never notional_native again)
+    // for every comparison below -- including the Buy-side balance check further down,
+    // which also compares against a kBalanceScale-denominated AssetBalance::free_ticks.
     std::int64_t notional = 0;
-    if (!checked_notional(price_ticks, qty_ticks, notional)) {
+    if (!rescale_notional_ceil(notional_native,
+                               static_cast<int>(rules.price_scale) + static_cast<int>(rules.qty_scale),
+                               kBalanceScale, notional)) {
         return PreTradeCheck::NotionalOverflow;
     }
 
@@ -267,15 +394,26 @@ inline PreTradeCheck validate_pre_trade(
         }
     }
 
-    // Balance sufficiency — side-aware.
+    // Balance sufficiency — side-aware. AssetBalance::free_ticks is always at
+    // kBalanceScale regardless of asset (§4.2) — Buy already has `notional` rescaled to
+    // that above; Sell's qty_ticks is still at this symbol's native qty_scale and needs
+    // its own rescale before comparing against the base asset's balance (same scale
+    // mismatch as the notional one above, just for a plain quantity instead of a
+    // price*qty product — found while implementing §5.1.1's fix, not called out by name
+    // in the spec text, but the identical class of bug against the same §4.2 invariant).
     if (side == OrderSide::Buy) {
         const auto* bal = account.find(quote_asset);
         if (!bal || bal->free_ticks < notional) {
             return PreTradeCheck::InsufficientBalance;
         }
     } else {  // Sell: must hold enough base asset to deliver
+        std::int64_t qty_at_balance_scale = 0;
+        if (!rescale_notional_ceil(qty_ticks, static_cast<int>(rules.qty_scale), kBalanceScale,
+                                   qty_at_balance_scale)) {
+            return PreTradeCheck::NotionalOverflow;
+        }
         const auto* bal = account.find(base_asset);
-        if (!bal || bal->free_ticks < qty_ticks) {
+        if (!bal || bal->free_ticks < qty_at_balance_scale) {
             return PreTradeCheck::InsufficientBalance;
         }
     }

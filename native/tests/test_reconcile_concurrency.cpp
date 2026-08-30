@@ -151,6 +151,12 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     rules.max_qty_ticks = 1000000;
     rules.step_size_ticks = 10;
     rules.min_notional_ticks = 1000;
+    // price_scale=0, qty_scale=8 (native=8=kBalanceScale) makes
+    // rescale_notional_ceil() an identity transform, matching the fixture
+    // fix applied in test_account_truth.cpp / test_live_submit_orchestrator.cpp
+    // for the same PR 5a scale-mismatch change.
+    rules.price_scale = 0;
+    rules.qty_scale = 8;
     rules.rules_version = 1;
 
     std::strncpy(account.assets[0].asset, "USDT", 5);

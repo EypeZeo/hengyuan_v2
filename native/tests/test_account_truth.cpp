@@ -43,6 +43,15 @@ static SymbolRules make_btcusdt_rules() {
     r.max_qty_ticks = 1000000;
     r.step_size_ticks = 10;
     r.min_notional_ticks = 1000;
+    // AUDIT L4-SYMBOLRULES-SCALE (§5.1.1): price_scale=0, qty_scale=8 makes BOTH
+    // rescale_notional_ceil() calls inside validate_pre_trade() an identity transform
+    // for every test in this file that predates scale-awareness (notional's native scale
+    // = price_scale+qty_scale = 8 = kBalanceScale already; the Sell-side qty rescale's
+    // native scale = qty_scale = 8 = kBalanceScale already) -- chosen deliberately so none
+    // of this file's existing numeric expectations needed to change when the rescale was
+    // introduced, not because 0/8 is a realistic BTCUSDT precision pair.
+    r.price_scale = 0;
+    r.qty_scale = 8;
     return r;
 }
 
@@ -329,6 +338,164 @@ TEST(CheckedMath, AddDetectsOverflow) {
     EXPECT_FALSE(hy::checked_add(std::numeric_limits<std::int64_t>::max(), 1, out));
     EXPECT_TRUE(hy::checked_add(100, 200, out));
     EXPECT_EQ(out, 300);
+}
+
+// --- L4 §5.1.1: pow10_i64 / rescale_notional_ceil ---
+
+TEST(Pow10I64, ValidExponentsMatchExpectedPowersOfTen) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::pow10_i64(0, out));
+    EXPECT_EQ(out, 1);
+    ASSERT_TRUE(hy::pow10_i64(4, out));
+    EXPECT_EQ(out, 10000);
+    ASSERT_TRUE(hy::pow10_i64(18, out));
+    EXPECT_EQ(out, 1'000'000'000'000'000'000LL);
+}
+
+TEST(Pow10I64, Exponent19FailsClosedOnOverflow) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::pow10_i64(19, out));
+    EXPECT_FALSE(hy::pow10_i64(255, out));
+}
+
+TEST(RescaleNotionalCeil, IdentityWhenScalesEqual) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::rescale_notional_ceil(12345, 8, 8, out));
+    EXPECT_EQ(out, 12345);
+}
+
+TEST(RescaleNotionalCeil, ScalesUpByExactPowerOfTen) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::rescale_notional_ceil(100, 4, 8, out));  // *10^4
+    EXPECT_EQ(out, 1'000'000);
+}
+
+TEST(RescaleNotionalCeil, ScalesDownWithCeilingNotTruncation) {
+    // raw=100 at scale 2 -> scale 0 is dividing by 10^2=100. 100/100 = 1 exactly (no
+    // rounding needed) -- pick a value that actually exercises the ceiling.
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::rescale_notional_ceil(150, 2, 0, out));
+    // 150/100 = 1.5 -> ceiling is 2, NOT a truncating 1. This is the specific behavior
+    // the fail-closed "must not exceed" direction depends on.
+    EXPECT_EQ(out, 2);
+
+    ASSERT_TRUE(hy::rescale_notional_ceil(100, 2, 0, out));
+    EXPECT_EQ(out, 1);  // exact division still gives the exact (non-inflated) answer
+}
+
+TEST(RescaleNotionalCeil, RejectsOutOfRangeScales) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::rescale_notional_ceil(100, -1, 8, out));
+    EXPECT_FALSE(hy::rescale_notional_ceil(100, 19, 8, out));
+    EXPECT_FALSE(hy::rescale_notional_ceil(100, 8, -1, out));
+    EXPECT_FALSE(hy::rescale_notional_ceil(100, 8, 19, out));
+    // The spec's own concrete attack: two out-of-range uint8_t scales (200 each) summed
+    // as `int` -- correctly rejected here (400 > 18), not silently accepted after
+    // wrapping to 144 the way summing them as uint8_t first would have.
+    EXPECT_FALSE(hy::rescale_notional_ceil(100, 200 + 200, 8, out));
+}
+
+TEST(RescaleNotionalCeil, RejectsNegativeInput) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::rescale_notional_ceil(-1, 4, 8, out));
+}
+
+TEST(RescaleNotionalCeil, ScaleUpOverflowFailsClosed) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::rescale_notional_ceil(std::numeric_limits<std::int64_t>::max(), 0, 8, out));
+}
+
+// --- L4 §5.1.1 regression: the real scale-mismatch bug this closes ---
+//
+// Both worked examples below use price_scale+qty_scale != kBalanceScale(8) deliberately
+// (the exact precondition §5.1.1 names) and pick real-world-shaped numbers whose OLD
+// (pre-fix, comparing checked_notional()'s raw native-scale product directly against a
+// kBalanceScale-8 threshold) and NEW (rescaled first) outcomes provably differ -- these
+// are not synthetic edge cases, they demonstrate the bug fails OPEN (lets a real
+// violation through), which is the dangerous direction for a risk gate.
+
+TEST(PreTradeScaleMismatch, NativeScaleAboveTargetPreviouslyMaskedBelowMinNotional) {
+    // price_scale=6, qty_scale=6 -> native_scale=12 (> kBalanceScale=8, needs ceiling
+    // scale-DOWN). price_ticks=500000 (=$0.50 at scale 6), qty_ticks=1000000 (=1.0 at
+    // scale 6) -> a real $0.50 order.
+    auto rules = make_btcusdt_rules();
+    rules.price_scale = 6;
+    rules.qty_scale = 6;
+    rules.min_notional_ticks = 100'000'000;  // $1.00 at kBalanceScale=8
+    rules.tick_size_ticks = 0;   // disable PRICE_FILTER -- not what this test is about
+    rules.step_size_ticks = 0;   // disable LOT_SIZE -- not what this test is about
+    auto account = make_account(1000, true);
+    auto limits = make_limits();
+    limits.single_order_notional_cap = 0;    // isolate MIN_NOTIONAL, don't hit the cap
+    limits.total_exposure_notional_cap = 0;
+
+    auto r = validate_pre_trade(rules, hy::OrderSide::Buy, 500000, 1000000, account,
+                                "BTC", "USDT", 1010, limits);
+    // notional_native = 500000*1000000 = 5e11 (scale 12) -- comparing that RAW number
+    // directly against min_notional_ticks=1e8 would say "5e11 is not < 1e8", i.e. pass.
+    // The real order is $0.50 < the $1.00 minimum and must be rejected once rescaled
+    // (5e11 ceiling-divided by 10^4 = 5e7 = $0.50000000 < $1.00 minimum).
+    EXPECT_EQ(r, PreTradeCheck::BelowMinNotional);
+}
+
+TEST(PreTradeScaleMismatch, NativeScaleBelowTargetPreviouslyMaskedExceedsSingleOrderCap) {
+    // price_scale=1, qty_scale=1 -> native_scale=2 (< kBalanceScale=8, needs scale-UP by
+    // 10^6). price_ticks=100 (=$10.0 at scale 1), qty_ticks=100 (=10.0 at scale 1) -> a
+    // real $100 order.
+    auto rules = make_btcusdt_rules();
+    rules.price_scale = 1;
+    rules.qty_scale = 1;
+    rules.min_notional_ticks = 0;  // isolate the single-order cap
+    rules.tick_size_ticks = 0;     // disable PRICE_FILTER -- not what this test is about
+    rules.step_size_ticks = 0;     // disable LOT_SIZE -- not what this test is about
+    auto account = make_account(1000, true);
+    auto limits = make_limits();
+    limits.single_order_notional_cap = 5'000'000'000;  // $50.00 at kBalanceScale=8
+    limits.total_exposure_notional_cap = 0;
+
+    auto r = validate_pre_trade(rules, hy::OrderSide::Buy, 100, 100, account,
+                                "BTC", "USDT", 1010, limits);
+    // notional_native = 100*100 = 10000 (scale 2) -- comparing that RAW number directly
+    // against a cap of 5e9 would say "10000 is not > 5e9", i.e. pass. The real order is
+    // $100 > the $50 cap and must be rejected once rescaled (10000 * 10^6 = 1e10 > 5e9).
+    EXPECT_EQ(r, PreTradeCheck::ExceedsSingleOrderCap);
+}
+
+TEST(PreTradeScaleMismatch, SellSideQtyIsRescaledBeforeComparingAgainstBaseBalance) {
+    // Found while implementing the fix above, not named explicitly in the spec text:
+    // AssetBalance::free_ticks is always at kBalanceScale (§4.2) regardless of which
+    // asset it holds, so the Sell-side "enough base asset to deliver" check
+    // (qty_ticks vs. free_ticks) has the identical scale-mismatch shape as the notional
+    // checks above, just for a plain quantity instead of a price*qty product.
+    auto rules = make_btcusdt_rules();
+    rules.qty_scale = 1;         // native scale for the qty comparison, deliberately != 8
+    rules.tick_size_ticks = 0;   // disable PRICE_FILTER -- not what this test is about
+    rules.min_qty_ticks = 0;     // disable LOT_SIZE min/step -- the qty values below (1, 3)
+    rules.step_size_ticks = 0;   // are deliberately small and wouldn't clear the fixture's
+    rules.max_qty_ticks = 0;     // default min_qty_ticks=10/step_size_ticks=10
+    rules.min_notional_ticks = 0;  // isolate the balance check from MIN_NOTIONAL
+    auto account = make_account(1000, true);
+    account.assets[1].free_ticks = 20'000'000;  // 0.2 BTC at kBalanceScale=8
+    auto limits = make_limits();
+    limits.single_order_notional_cap = 0;
+    limits.total_exposure_notional_cap = 0;
+    limits.freshness_max_age_ms = 30000;
+
+    // qty_ticks=1 at qty_scale=1 means a real quantity of 0.1 BTC -- comfortably under
+    // the 0.2 BTC held, so this must pass once qty is correctly rescaled to kBalanceScale
+    // (1 * 10^7 = 10,000,000 <= 20,000,000). The OLD buggy comparison (1 vs 20,000,000)
+    // would also happen to pass here by coincidence of magnitude -- the next test picks
+    // numbers where the two disagree.
+    auto ok = validate_pre_trade(rules, hy::OrderSide::Sell, 1000, 1, account,
+                                 "BTC", "USDT", 1010, limits);
+    EXPECT_EQ(ok, PreTradeCheck::Ok);
+
+    // qty_ticks=3 at qty_scale=1 means a real quantity of 0.3 BTC -- exceeds the 0.2 BTC
+    // held, so this must be rejected once correctly rescaled (3*10^7=30,000,000 >
+    // 20,000,000). The OLD buggy comparison (raw 3 vs. 20,000,000) would have passed.
+    auto insufficient = validate_pre_trade(rules, hy::OrderSide::Sell, 1000, 3, account,
+                                           "BTC", "USDT", 1010, limits);
+    EXPECT_EQ(insufficient, PreTradeCheck::InsufficientBalance);
 }
 
 // --- F1 regression: side-aware balance (buy→quote, sell→base) ---
