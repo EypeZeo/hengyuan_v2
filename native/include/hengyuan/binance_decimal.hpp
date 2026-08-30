@@ -20,7 +20,9 @@
 #include <hengyuan/account_truth.hpp>
 
 #include <cstdint>
+#include <cstdio>
 #include <limits>
+#include <span>
 #include <string_view>
 
 namespace hy {
@@ -229,6 +231,49 @@ inline bool parse_balance_decimal_to_ticks(std::string_view s, std::int64_t& out
         return false;
     }
     out_ticks = integer_part * scale + frac_part;
+    return true;
+}
+
+// TODO 1A.3: the reverse direction of parse_decimal_to_ticks_with_scale() -- a real
+// POST /api/v3/order request must send price/quantity as decimal strings ("50000.12",
+// "0.001000"), and this codebase had no ticks->string formatter until now (only the
+// string->ticks parse direction existed). Pure integer division/modulo, zero heap
+// allocation, caller-owned stack buffer -- no double, no std::string concatenation,
+// consistent with this file's own arithmetic discipline throughout.
+//
+// scale==0 formats as a bare integer (no decimal point) -- Binance's own documented
+// examples do this for whole-number fields; `%0*lld` for the fractional part
+// zero-pads to exactly `scale` digits (e.g. scale=6, frac=1 -> "000001", never "1"),
+// matching the fixed-width fractional format Binance itself sends and this file's own
+// parse functions expect back.
+//
+// Fails closed (false, out_len untouched) on: ticks<0 (price/qty ticks are never
+// negative), scale>18 (pow10_i64()'s own domain), an out_buf too small for the
+// formatted result (snprintf's truncation-detection convention: return value >=
+// buffer size means truncated), or an internal pow10_i64()/snprintf failure.
+inline bool format_ticks_to_decimal(std::int64_t ticks, std::uint8_t scale,
+                                     std::span<char> out_buf, std::size_t& out_len) noexcept {
+    if (ticks < 0 || out_buf.empty()) return false;
+
+    if (scale == 0) {
+        const int n = std::snprintf(out_buf.data(), out_buf.size(), "%lld",
+                                     static_cast<long long>(ticks));
+        if (n <= 0 || static_cast<std::size_t>(n) >= out_buf.size()) return false;
+        out_len = static_cast<std::size_t>(n);
+        return true;
+    }
+
+    std::int64_t divisor = 0;
+    if (!pow10_i64(scale, divisor)) return false;  // scale > 18 -- pow10_i64's own domain
+
+    const std::int64_t int_part = ticks / divisor;
+    const std::int64_t frac_part = ticks % divisor;
+
+    const int n = std::snprintf(out_buf.data(), out_buf.size(), "%lld.%0*lld",
+                                 static_cast<long long>(int_part), static_cast<int>(scale),
+                                 static_cast<long long>(frac_part));
+    if (n <= 0 || static_cast<std::size_t>(n) >= out_buf.size()) return false;
+    out_len = static_cast<std::size_t>(n);
     return true;
 }
 

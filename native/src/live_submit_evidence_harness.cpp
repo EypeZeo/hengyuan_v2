@@ -103,6 +103,8 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::InFlightRegistryUnavailable: return "InFlightRegistryUnavailable";
         case OrchestratorGate::SubmitStaleRulesVersion: return "SubmitStaleRulesVersion";
         case OrchestratorGate::AuditWriteNotAcked: return "AuditWriteNotAcked";
+        case OrchestratorGate::SubmitPartialFill: return "SubmitPartialFill";
+        case OrchestratorGate::SubmitFilled: return "SubmitFilled";
     }
     return "?";
 }

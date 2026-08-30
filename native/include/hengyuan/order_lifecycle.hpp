@@ -108,7 +108,13 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
             if (to == OrderState::Accepted ||
                 to == OrderState::Rejected ||
                 to == OrderState::Ambiguous ||
-                to == OrderState::Filled)     // immediate fill
+                to == OrderState::Filled ||       // immediate fill
+                to == OrderState::PartialFill)    // immediate partial fill (TODO 1A.3) --
+                                                    // a real POST /api/v3/order response
+                                                    // can report PARTIALLY_FILLED status
+                                                    // right at submit time if the resting
+                                                    // order matched some, but not all, of
+                                                    // available opposing liquidity.
                 return TransitionResult::Ok;
             break;
         case OrderState::Accepted:
