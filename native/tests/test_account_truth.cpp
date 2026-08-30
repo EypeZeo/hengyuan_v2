@@ -405,6 +405,82 @@ TEST(RescaleNotionalCeil, ScaleUpOverflowFailsClosed) {
     EXPECT_FALSE(hy::rescale_notional_ceil(std::numeric_limits<std::int64_t>::max(), 0, 8, out));
 }
 
+// --- L4 §6.1.1: checked_scaled_mul_div ---
+
+TEST(CheckedScaledMulDiv, ZeroExponentIsPlainDivision) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::checked_scaled_mul_div(100, 0, 4, out));
+    EXPECT_EQ(out, 25);
+}
+
+TEST(CheckedScaledMulDiv, PositiveExponentScalesUpBeforeDividing) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::checked_scaled_mul_div(5, 3, 2, out));  // (5 * 1000) / 2
+    EXPECT_EQ(out, 2500);
+}
+
+TEST(CheckedScaledMulDiv, NegativeExponentScalesDivisorUp) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::checked_scaled_mul_div(500, -2, 1, out));  // 500 / (1 * 100)
+    EXPECT_EQ(out, 5);
+}
+
+TEST(CheckedScaledMulDiv, NegativeExponentDenomExceedsValueYieldsZero) {
+    std::int64_t out = -1;
+    ASSERT_TRUE(hy::checked_scaled_mul_div(5, -2, 1, out));  // denom=100 > value=5
+    EXPECT_EQ(out, 0);
+}
+
+TEST(CheckedScaledMulDiv, ZeroValueShortCircuitsToZero) {
+    std::int64_t out = -1;
+    ASSERT_TRUE(hy::checked_scaled_mul_div(0, 5, 3, out));
+    EXPECT_EQ(out, 0);
+}
+
+TEST(CheckedScaledMulDiv, ExponentBoundaryEighteenAccepted) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::checked_scaled_mul_div(1, 18, 1, out));
+    EXPECT_EQ(out, 1'000'000'000'000'000'000LL);
+    // exponent=-18 against divisor=1: denominator 10^18 vastly exceeds value=1 -> 0, not a
+    // rejection -- exercises the negative-boundary path through the same accepted range.
+    ASSERT_TRUE(hy::checked_scaled_mul_div(1, -18, 1, out));
+    EXPECT_EQ(out, 0);
+}
+
+TEST(CheckedScaledMulDiv, ExponentBeyondEighteenRejectedBothDirections) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::checked_scaled_mul_div(1, 19, 1, out));
+    EXPECT_FALSE(hy::checked_scaled_mul_div(1, -19, 1, out));
+}
+
+TEST(CheckedScaledMulDiv, NonPositiveDivisorRejected) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::checked_scaled_mul_div(100, 0, 0, out));
+    EXPECT_FALSE(hy::checked_scaled_mul_div(100, 0, -1, out));
+}
+
+TEST(CheckedScaledMulDiv, NegativeValueRejected) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::checked_scaled_mul_div(-1, 0, 1, out));
+}
+
+TEST(CheckedScaledMulDiv, PositiveExponentQuotientOverflowFailsClosed) {
+    std::int64_t out = 0;
+    // (INT64_MAX * 100) / 1 vastly exceeds INT64_MAX -- the widened multiply itself never
+    // overflows (128-bit intermediate), but the quotient narrowing back to int64_t must reject.
+    EXPECT_FALSE(hy::checked_scaled_mul_div(std::numeric_limits<std::int64_t>::max(), 2, 1, out));
+}
+
+TEST(CheckedScaledMulDiv, NegativeExponentHugeDivisorWidensPastValueYieldsZeroNotFailure) {
+    std::int64_t out = -1;
+    // divisor * 10^1 overflows 64 bits (high word nonzero on the MSVC path / denom > value on
+    // the __int128 path) -- this is a defined, correct "quotient underflows to 0" result, not
+    // a rejection: value <= INT64_MAX is always < an actually-overflowing 65-bit-plus denominator.
+    ASSERT_TRUE(hy::checked_scaled_mul_div(std::numeric_limits<std::int64_t>::max(), -1,
+                                            std::numeric_limits<std::int64_t>::max(), out));
+    EXPECT_EQ(out, 0);
+}
+
 // --- L4 §5.1.1 regression: the real scale-mismatch bug this closes ---
 //
 // Both worked examples below use price_scale+qty_scale != kBalanceScale(8) deliberately

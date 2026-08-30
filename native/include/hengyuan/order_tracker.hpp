@@ -72,22 +72,38 @@ struct QueryResult {
     std::int64_t exchange_order_id{0};
     std::int64_t filled_qty_ticks{0};
     std::int64_t avg_fill_price_ticks{0};
+    // L4 §6.3/§7.3: NEW fields, appended LAST -- existing 5-positional-arg
+    // aggregate inits (test_order_tracker.cpp, test_reconcile_concurrency.cpp)
+    // depend on trailing-only placement to keep compiling. binance_private_rest.hpp's
+    // query_order() never populates these this batch (no parse_retry_after() yet,
+    // §7.3 is a separate, not-yet-built rate-limiter batch) -- ABI reserved now so
+    // that batch won't need a second breaking change to this struct.
+    bool retry_after_present{false};
+    std::int64_t retry_after_deadline_ms{0};
 };
 
 // --- QueryPort: same injection pattern and signature style as SubmitPort ---
-// (live_submit_orchestrator.hpp) -- const char*, not a value/reference wrapper,
-// and a null fn folds into Inconclusive rather than a dedicated error value,
-// matching SubmitPort::call()'s own precedent on both counts. A real network
-// implementation is separate, not-yet-built work.
+// (live_submit_orchestrator.hpp) -- a null fn folds into Inconclusive rather
+// than a dedicated error value, matching SubmitPort::call()'s own precedent.
+// A real network implementation lives in binance_private_rest.hpp's
+// query_order_adapter() (L4 §6).
+//
+// QueryFn takes an OrderExpectation, not a bare client_order_id: a real
+// query_order() must both build a fully-specified signed GET request (symbol,
+// not just the COID) AND validate the response's side/type/price/qty/
+// timeInForce against what was actually submitted (L4 §6.1.2) -- a bare COID
+// carries neither. expected.rules_snapshot_at_submit.symbol is the sole
+// source of truth for which symbol to query, matching L4 §6.1.2's "carry the
+// snapshot, don't re-derive" pattern.
 struct QueryPort {
-    using QueryFn = QueryResult(*)(const char* client_order_id, void* user_data);
+    using QueryFn = QueryResult(*)(const OrderExpectation& expected, void* user_data);
 
     QueryFn fn{nullptr};
     void* user_data{nullptr};
 
-    QueryResult call(const char* coid) const noexcept {
+    QueryResult call(const OrderExpectation& expected) const noexcept {
         if (!fn) return {};  // Inconclusive by default-construction
-        return fn(coid, user_data);
+        return fn(expected, user_data);
     }
 
     bool is_valid() const noexcept { return fn != nullptr; }
@@ -274,7 +290,8 @@ namespace detail {
 inline bool is_legal_ambiguous_target(OrderState s) noexcept {
     return s == OrderState::Accepted || s == OrderState::PartialFill ||
            s == OrderState::Filled || s == OrderState::Cancelled ||
-           s == OrderState::Rejected || s == OrderState::Expired;
+           s == OrderState::Rejected || s == OrderState::Expired ||
+           s == OrderState::CancelRequested;  // L4 §6.5: confirmed PENDING_CANCEL
 }
 
 // True iff a query on an order currently in `from` may legitimately report `to`.
@@ -298,11 +315,17 @@ inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
         case OrderState::Ambiguous:
             return is_legal_ambiguous_target(to);
         case OrderState::Accepted:
+            // CancelRequested (L4 §6.6): the exchange can report PENDING_CANCEL for
+            // an already-live order during a normal live-poll, not only via
+            // Ambiguous reconciliation -- without this arm, a real cancel-in-
+            // progress observation on a resting order would be silently discarded
+            // here as an "illegal" result rather than tracked.
             return to == OrderState::PartialFill || to == OrderState::Filled ||
-                   to == OrderState::Cancelled || to == OrderState::Expired;
+                   to == OrderState::Cancelled || to == OrderState::Expired ||
+                   to == OrderState::CancelRequested;
         case OrderState::PartialFill:
             return to == OrderState::Filled || to == OrderState::Cancelled ||
-                   to == OrderState::Expired;
+                   to == OrderState::Expired || to == OrderState::CancelRequested;
         default:
             return false;
     }
@@ -430,11 +453,7 @@ inline void poll_once(OrderTracker& tracker,
         tracker.note_polled(coid, now_ms);
         ++queries_this_tick;
 
-        char coid_buf[kClientOrderIdLen + 1];
-        auto n = coid.size() < kClientOrderIdLen ? coid.size() : kClientOrderIdLen;
-        std::memcpy(coid_buf, coid.data(), n);
-        coid_buf[n] = '\0';
-        QueryResult result = query_port.call(coid_buf);
+        QueryResult result = query_port.call(OrderExpectation::from(record));
 
         // query_attempts is incremented on every genuine attempt (Inconclusive
         // included), matching determine_reconcile_action()'s existing contract

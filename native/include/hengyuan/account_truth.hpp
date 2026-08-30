@@ -23,6 +23,10 @@
 #include <limits>
 #include <string_view>
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
 namespace hy {
 
 // --- Account balance snapshot ---
@@ -321,6 +325,132 @@ inline bool rescale_notional_ceil(std::int64_t raw_notional_native_scale,
     }
     out = (raw_notional_native_scale + divisor - 1) / divisor;
     return true;
+}
+
+// L4 §6.1.1: computes (value * 10^exponent) / divisor as a single checked
+// operation, where `exponent` may be negative (meaning "divide by 10^|exponent|
+// first," pure integer arithmetic throughout, never a floating-point
+// intermediate). Needed to derive avg_fill_price_ticks from a GET
+// /api/v3/order response: price_scale + qty_scale - quote_scale can be
+// positive, negative, or zero depending on the symbol, so a plain
+// rescale_notional_ceil()-style single-direction rescale isn't enough here —
+// this fuses a multiply against one value with a divide against a SEPARATE
+// value, which rescale_notional_ceil() never needs to do.
+//
+// value must be non-negative (a quote-asset notional, never negative by
+// construction), divisor must be strictly positive (an executed quantity),
+// exponent is bounded to [-18,18] (pow10_i64()'s own domain — each of
+// price_scale/qty_scale/quote_scale is independently bounded to [0,18], so
+// the combined exponent can in principle reach 36; that is deliberately
+// rejected here, not clamped, as an unsupported/extreme symbol configuration
+// — matching this file's existing fail-closed convention for out-of-range
+// scale inputs). Any rejection or overflow returns false with `out`
+// untouched — callers fold this into their own fail-closed outcome (in this
+// codebase's only caller so far, an Inconclusive reconciliation result;
+// never a fabricated or silently-truncated average price).
+//
+// Two code paths, deliberately never doing a full 128÷128 division:
+//   - GCC/Clang: a single widen-then-divide in __int128 (widening cannot
+//     overflow 128 bits; the result is range-checked back into int64_t).
+//   - MSVC (no __int128): _umul128() for the one widening multiply that's
+//     actually needed, never both operands at once —
+//       * exponent >= 0: only `value` is widened (by 10^exponent); `divisor`
+//         stays a plain int64_t. The pre-check `high < divisor` is REQUIRED
+//         before calling _udiv128() — that intrinsic's behavior when the
+//         quotient would not fit in 64 bits is a hardware #DE (divide error)
+//         fault, not a catchable C++ error, so skipping this check would
+//         turn a "should return false" case into a process crash.
+//       * exponent < 0: only `divisor` is widened (by 10^|exponent|); if
+//         that widened denominator doesn't fit in 64 bits (`high != 0`) the
+//         true quotient is 0 (value <= INT64_MAX < 2^63 < denominator) —
+//         returned directly, never divided. Otherwise this is a plain
+//         int64/int64 division; _udiv128() is never called in this branch.
+inline bool checked_scaled_mul_div(std::int64_t value, int exponent,
+                                    std::int64_t divisor, std::int64_t& out) noexcept {
+    if (value < 0 || divisor <= 0 || exponent < -18 || exponent > 18) [[unlikely]] {
+        return false;
+    }
+    if (value == 0) [[unlikely]] {
+        out = 0;
+        return true;
+    }
+
+    if (exponent >= 0) {
+        std::int64_t scale_mult = 0;
+        if (!pow10_i64(static_cast<std::uint8_t>(exponent), scale_mult)) [[unlikely]] {
+            return false;
+        }
+#if defined(_MSC_VER) && !defined(__clang__)
+        unsigned __int64 high = 0;
+        const unsigned __int64 low = _umul128(static_cast<unsigned __int64>(value),
+                                               static_cast<unsigned __int64>(scale_mult), &high);
+        const auto u_div = static_cast<unsigned __int64>(divisor);
+        if (high >= u_div) [[unlikely]] {
+            return false;  // quotient would not fit in 64 bits -- _udiv128() would #DE
+        }
+        unsigned __int64 rem = 0;
+        const unsigned __int64 q = _udiv128(high, low, u_div, &rem);
+        if (q > static_cast<unsigned __int64>(std::numeric_limits<std::int64_t>::max())) [[unlikely]] {
+            return false;
+        }
+        out = static_cast<std::int64_t>(q);
+        return true;
+#else
+        // __int128 is a GCC/Clang extension, not ISO C++ -- this repo's WSL2/GCC tier builds
+        // with -Wpedantic -Werror (native/cmake/CompilerWarnings.cmake), which flags its use
+        // even though the extension itself is fully supported and portable across both
+        // compilers this branch actually targets. Scoped suppression, not a blanket one.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+        const unsigned __int128 num = static_cast<unsigned __int128>(value) *
+                                       static_cast<unsigned __int128>(scale_mult);
+        const unsigned __int128 q = num / static_cast<unsigned __int128>(divisor);
+        const bool overflows =
+            q > static_cast<unsigned __int128>(std::numeric_limits<std::int64_t>::max());
+#pragma GCC diagnostic pop
+        if (overflows) [[unlikely]] {
+            return false;
+        }
+        out = static_cast<std::int64_t>(q);
+        return true;
+#endif
+    }
+
+    // exponent < 0: value / (divisor * 10^|exponent|).
+    const std::uint8_t neg_exp = static_cast<std::uint8_t>(-exponent);
+    std::int64_t scale_mult = 0;
+    if (!pow10_i64(neg_exp, scale_mult)) [[unlikely]] {
+        return false;
+    }
+#if defined(_MSC_VER) && !defined(__clang__)
+    unsigned __int64 high = 0;
+    const unsigned __int64 low = _umul128(static_cast<unsigned __int64>(divisor),
+                                           static_cast<unsigned __int64>(scale_mult), &high);
+    if (high > 0) [[unlikely]] {
+        out = 0;  // denominator > 2^64 > INT64_MAX >= value -- quotient is 0
+        return true;
+    }
+    if (low > static_cast<unsigned __int64>(value)) {
+        out = 0;
+        return true;
+    }
+    out = value / static_cast<std::int64_t>(low);
+    return true;
+#else
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+    const unsigned __int128 denom = static_cast<unsigned __int128>(divisor) *
+                                     static_cast<unsigned __int128>(scale_mult);
+    const bool denom_exceeds_value = denom > static_cast<unsigned __int128>(value);
+    const unsigned __int128 wide_value = static_cast<unsigned __int128>(value);
+#pragma GCC diagnostic pop
+    if (denom_exceeds_value) {
+        out = 0;
+        return true;
+    }
+    out = static_cast<std::int64_t>(wide_value / denom);
+    return true;
+#endif
 }
 
 struct ExposureLimits {

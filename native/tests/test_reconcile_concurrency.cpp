@@ -94,7 +94,7 @@ std::uint32_t mock_current_rules_version(void* /*ud*/) { return 1; }
 // point is the cross-thread handoff, not backoff/retry timing (already
 // covered single-threaded by test_order_tracker.cpp).
 
-QueryResult mock_query(const char* /*coid*/, void* /*ud*/) {
+QueryResult mock_query(const OrderExpectation& /*expected*/, void* /*ud*/) {
     return QueryResult{QueryOutcome::Found, OrderState::Filled,
                         /*exchange_order_id=*/777, /*filled_qty=*/10,
                         /*avg_price=*/5000};
