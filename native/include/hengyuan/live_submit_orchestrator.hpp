@@ -34,6 +34,7 @@
 #include <hengyuan/kill_switch.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
+#include <hengyuan/spot_rate_limit_budget.hpp>
 #include <hengyuan/transport_policy.hpp>
 
 #include <cstdint>
@@ -260,7 +261,7 @@ struct OrchestratorContext {
     const DryRunEvidenceChain* evidence{nullptr};
     bool signer_ready{false};
     bool depth_synced{false};
-    RequestWeightTracker* rate_tracker{nullptr};
+    SpotRateLimitTracker* rate_limiter{nullptr};
     OrderConfirmation confirmation{};       // F3: bound operator CONFIRM
     InFlightRegistry* in_flight{nullptr};   // F4: idempotency / no-blind-retry guard
     // Real durable-audit gate (spec §3/§6.2/§6.4). Value type, same injection
@@ -423,7 +424,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // already out of budget, without charging weight for an attempt that may
     // still be rejected by CONFIRM/port-validity below. The real charge
     // happens at Gate 12c, right before the network call is actually made.
-    if (!ctx.rate_tracker || !ctx.rate_tracker->can_send(ctx.order_weight)) {
+    if (!ctx.rate_limiter ||
+        !ctx.rate_limiter->can_send_order(RateLimitLane::Strategy, ctx.order_weight)) {
         result.gate = OrchestratorGate::RateLimitExhausted;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
@@ -520,7 +522,10 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // Gate 12c: Rate limit — actual charge (F11), right before the network
     // call. Re-checked here (not just at Gate 8) because time may have passed
     // since the pre-check and the window may have rotated unfavorably.
-    if (!ctx.rate_tracker->try_consume(ctx.order_weight)) {
+    // try_reserve_order() atomically reserves REQUEST_WEIGHT, RAW_REQUESTS, and
+    // ORDERS together (weight -> raw -> orders, rolling back on partial failure) —
+    // Gate 8's can_send_order() already null-checked ctx.rate_limiter above.
+    if (!ctx.rate_limiter->try_reserve_order(RateLimitLane::Strategy, ctx.order_weight)) {
         result.gate = OrchestratorGate::RateLimitExhausted;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;

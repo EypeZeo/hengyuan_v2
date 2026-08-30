@@ -95,7 +95,7 @@ protected:
     AuditRingSink audit_;
     KillSwitch kill_switch_;
     DryRunEvidenceChain evidence_;
-    RequestWeightTracker rate_tracker_;
+    SpotRateLimitTracker rate_limiter_;
     InFlightRegistry in_flight_;
     SymbolRules rules_{};
     AccountSnapshot account_{};
@@ -107,7 +107,7 @@ protected:
         audit_.set_available(true);
         kill_switch_.operator_reset();  // Normal
         fill_evidence();
-        rate_tracker_.reset(6000, 500);
+        rate_limiter_.configure(6000, 500, 60000, 5000, 100, 10);
 
         std::strncpy(rules_.symbol, "BTCUSDT", sizeof(rules_.symbol) - 1);
         rules_.is_trading = true;
@@ -137,7 +137,7 @@ protected:
         ctx_.evidence = &evidence_;
         ctx_.signer_ready = true;
         ctx_.depth_synced = true;
-        ctx_.rate_tracker = &rate_tracker_;
+        ctx_.rate_limiter = &rate_limiter_;
         ctx_.in_flight = &in_flight_;
         ctx_.symbol_rules = &rules_;
         ctx_.account = &account_;
@@ -331,8 +331,21 @@ TEST_F(LiveSubmitTest, PreTradePriceStepViolation) {
 // --- Gate 8: Rate limit ---
 
 TEST_F(LiveSubmitTest, RateLimitExhausted) {
-    rate_tracker_.reset(10, 5);  // only 5 effective
-    rate_tracker_.try_consume(5);
+    // PartitionedRateBudget floors the 80/10/10 split on TOP of limit-safety: weight
+    // available_total = 100-0 = 100, Strategy lane = floor(100*80/100) = 80.
+    rate_limiter_.configure(/*weight*/ 100, 0, /*raw*/ 100000, 0, /*orders*/ 100000, 0);
+    ASSERT_TRUE(rate_limiter_.try_reserve_order(RateLimitLane::Strategy, 80));  // exhausts the weight lane
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::RateLimitExhausted);
+}
+
+// TODO 1A.2: this scenario was structurally impossible to express before this batch —
+// ORDERS wasn't tracked at all, only weight. Confirms try_reserve_order()'s third
+// (ORDERS) stage genuinely gates Gate 12c, not just weight/raw.
+TEST_F(LiveSubmitTest, RateLimitExhaustedOnOrdersLaneOnlyStillBlocksSubmission) {
+    // orders available_total = 2-0 = 2, Strategy lane = floor(2*80/100) = 1.
+    rate_limiter_.configure(/*weight*/ 100000, 0, /*raw*/ 100000, 0, /*orders*/ 2, 0);
+    ASSERT_TRUE(rate_limiter_.try_reserve_order(RateLimitLane::Strategy, 1));  // exhausts only orders
     auto r = orchestrate_submit(ctx_);
     EXPECT_EQ(r.gate, OrchestratorGate::RateLimitExhausted);
 }

@@ -136,7 +136,7 @@ struct Fixture {
     AuditRingSink audit;
     KillSwitch kill_switch;
     DryRunEvidenceChain evidence;
-    RequestWeightTracker rate_tracker;
+    SpotRateLimitTracker rate_limiter;
     InFlightRegistry in_flight;
     SymbolRules rules{};
     AccountSnapshot account{};
@@ -150,7 +150,7 @@ struct Fixture {
     Fixture() {
         audit.set_available(true);
         kill_switch.operator_reset();
-        rate_tracker.reset(6000, 500);
+        rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
 
         durable_audit_path = durable_audit_temp_path();
         remove_durable_audit_files(durable_audit_path);
@@ -183,7 +183,7 @@ struct Fixture {
         ctx.evidence = &evidence;
         ctx.signer_ready = true;
         ctx.depth_synced = true;
-        ctx.rate_tracker = &rate_tracker;
+        ctx.rate_limiter = &rate_limiter;
         ctx.in_flight = &in_flight;
         ctx.symbol_rules = &rules;
         ctx.account = &account;

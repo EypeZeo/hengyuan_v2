@@ -600,6 +600,12 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_transport_policy)
     gtest_discover_tests(test_transport_policy)
 
+    # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
+    add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
+    target_link_libraries(test_spot_rate_limit_budget PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_spot_rate_limit_budget)
+    gtest_discover_tests(test_spot_rate_limit_budget)
+
     # P2-EXEC-LIVE-01 D12-2: secure env loader (L3, file I/O + permission check)
     add_executable(test_env_loader tests/test_env_loader.cpp)
     target_link_libraries(test_env_loader PRIVATE hengyuan_core GTest::gtest_main)
