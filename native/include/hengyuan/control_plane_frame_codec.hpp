@@ -1425,12 +1425,15 @@ inline bool decode_symbol_rules(std::span<const std::byte, kSymbolRulesWireSize>
     return true;
 }
 
-// durable_control_plane.hpp:531's own comment references "<= kMaxSymbols", a
-// constant that is NOT defined in that header (only in the unrelated
-// binance_json_parser.hpp/input_validator.hpp, at the same value) -- see
-// docs/SPEC_INVARIANTS.md's "Phase 1" entry. Defined locally here rather than
-// pulling in either of those unrelated files as a dependency.
-inline constexpr std::size_t kMaxSnapshotSymbols = 64;
+// durable_control_plane.hpp:531's own comment references "<= kMaxSymbols" --
+// L4 §5 (PR 5b) gave that constant a real, correctly-scoped home in
+// account_truth.hpp (hy::kMaxSymbols), distinct from the two unrelated
+// same-named constants in binance_json_parser.hpp/input_validator.hpp. This
+// wire-format capacity is defined IN TERMS OF that constant, not as its own
+// independent literal, so the in-memory (SymbolRegistry/ParsedExchangeInfo)
+// and persisted-wire capacities cannot silently drift apart -- see
+// docs/SPEC_INVARIANTS.md's "Phase 1" entry.
+inline constexpr std::size_t kMaxSnapshotSymbols = kMaxSymbols;
 
 inline constexpr std::size_t kSnapshotPayloadFixedWireSize =
     8 +  // timestamp_ms
