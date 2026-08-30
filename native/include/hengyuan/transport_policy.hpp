@@ -135,13 +135,22 @@ public:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
+    // window_seconds: trailing default (60, matching this class's original hardcoded
+    // window) so every existing 2-arg/3-arg call site keeps identical behavior.
+    // Genuinely needed for spot_rate_limit_budget.hpp's RAW_REQUESTS (~300s) and
+    // ORDERS (~10s) trackers — forcing either through the old hardcoded 60s window
+    // would be a real fail-open (resetting far more often than Binance actually
+    // allows), not a cosmetic simplification. 0 fails closed to 60 rather than
+    // producing a zero-length window (which effective_used_now()'s division would
+    // otherwise choke on).
     void reset(std::uint32_t limit, std::uint32_t safety_margin,
-               TimePoint now = Clock::now()) noexcept {
+               TimePoint now = Clock::now(), std::uint32_t window_seconds = 60) noexcept {
         limit_ = limit;
         safety_ = safety_margin;
         used_current_ = 0;
         used_previous_ = 0;
         window_start_ = now;
+        window_seconds_ = window_seconds > 0 ? window_seconds : 60;
     }
 
     // Try to consume `weight` units. Returns false if would exceed limit.
@@ -156,6 +165,17 @@ public:
         }
         used_current_ += weight;
         return true;
+    }
+
+    // Undoes a prior try_consume() by the same weight -- needed by
+    // spot_rate_limit_budget.hpp's multi-dimension atomic reserve (weight -> raw
+    // -> orders), which must unwind an earlier successful reservation when a
+    // later one fails. Saturates at 0 rather than underflowing: a rollback that
+    // races a window rotation (used_current_ already zeroed) is a safe no-op, not
+    // a wrap-around toward UINT32_MAX.
+    void rollback(std::uint32_t weight, TimePoint now = Clock::now()) noexcept {
+        maybe_rotate_window(now);
+        used_current_ = weight <= used_current_ ? used_current_ - weight : 0;
     }
 
     // Check if we can send a request with given weight (non-consuming).
@@ -183,56 +203,82 @@ private:
         return safety_ < limit_ ? (limit_ - safety_) : 0;
     }
 
+    // ceil(numerator / denominator) for two non-negative 64-bit operands.
+    // denominator is always window_seconds_*1000 here, which reset()'s
+    // zero-clamp guarantees is > 0.
+    static std::uint32_t ceil_div_u64(std::uint64_t numerator, std::uint64_t denominator) noexcept {
+        return static_cast<std::uint32_t>((numerator + denominator - 1) / denominator);
+    }
+
     // True sliding-window estimate (weighted two-bucket counter): the previous
-    // minute's usage is discounted by how far we've slid into the current
-    // minute, so a burst right at a fixed-window boundary can't get ~2x the
+    // window's usage is discounted by how far we've slid into the current
+    // window, so a burst right at a fixed-window boundary can't get ~2x the
     // intended limit (the tumbling-window bug this replaces). Pure function of
     // `now` + stored buckets — safe to call from a const method (can_send)
     // without mutating state; try_consume calls maybe_rotate_window() first so
     // the buckets it reads back here are already current.
+    //
+    // Pure integer fixed-point (millisecond resolution), not floating point:
+    // this runs on the hot submit-thread path (Gate 8/12c, every order
+    // submission) — CLAUDE.md §5's arithmetic-safety mandate applies to the
+    // code path even though the values themselves aren't order economics.
+    // Ceiling division (never plain rounding) so this can only ever
+    // OVER-report usage relative to the exact real-valued decay, never
+    // under-report it — the conservative direction the original double
+    // implementation's own comment already intended but only approximated via
+    // "+0.5" (round-to-nearest, not true ceiling).
     std::uint32_t effective_used_now(TimePoint now) const noexcept {
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - window_start_).count();
-        double elapsed_s = elapsed_ms > 0 ? static_cast<double>(elapsed_ms) / 1000.0 : 0.0;
+        const std::int64_t w_ms = static_cast<std::int64_t>(window_seconds_) * 1000;
 
-        double effective;
-        if (elapsed_s >= 120.0) {
-            effective = 0.0;  // both buckets are stale (no traffic for 2+ windows)
-        } else if (elapsed_s >= 60.0) {
-            double frac = (elapsed_s - 60.0) / 60.0;
-            frac = frac > 1.0 ? 1.0 : frac;
-            effective = static_cast<double>(used_current_) * (1.0 - frac);
-        } else {
-            double frac = elapsed_s / 60.0;
-            effective = static_cast<double>(used_previous_) * (1.0 - frac) +
-                        static_cast<double>(used_current_);
+        if (elapsed_ms <= 0) [[unlikely]] {
+            return used_current_;
         }
-        // Round up conservatively so float rounding never under-counts usage
-        // relative to the integer weight actually charged.
-        return static_cast<std::uint32_t>(effective + 0.5);
+        if (elapsed_ms >= 2 * w_ms) [[unlikely]] {
+            return 0;  // both buckets are stale (no traffic for 2+ windows)
+        }
+        if (elapsed_ms >= w_ms) {
+            // 1 window <= elapsed < 2 windows: used_current_ decays to 0 as
+            // elapsed approaches 2*w_ms. remain_ms == 0 at elapsed==2*w_ms,
+            // == w_ms at elapsed==w_ms (fully counted, matches the boundary).
+            const std::int64_t remain_ms = 2 * w_ms - elapsed_ms;
+            return ceil_div_u64(static_cast<std::uint64_t>(used_current_) *
+                                     static_cast<std::uint64_t>(remain_ms),
+                                 static_cast<std::uint64_t>(w_ms));
+        }
+        // elapsed < 1 window: used_previous_ decays linearly to 0 as elapsed
+        // approaches w_ms; used_current_ counts in full (it's the live bucket).
+        const std::int64_t remain_ms = w_ms - elapsed_ms;
+        const std::uint32_t prev_discounted = ceil_div_u64(
+            static_cast<std::uint64_t>(used_previous_) * static_cast<std::uint64_t>(remain_ms),
+            static_cast<std::uint64_t>(w_ms));
+        return prev_discounted + used_current_;
     }
 
     void maybe_rotate_window(TimePoint now) noexcept {
-        auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+        const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
             now - window_start_).count();
-        if (elapsed_s < 60) return;
-        if (elapsed_s >= 120) {
+        const auto w_s = static_cast<std::int64_t>(window_seconds_);
+        if (elapsed_s < w_s) return;
+        if (elapsed_s >= 2 * w_s) {
             used_previous_ = 0;
             used_current_ = 0;
         } else {
             used_previous_ = used_current_;
             used_current_ = 0;
         }
-        // Advance by whole 60s windows (not to "now") so the fractional phase
+        // Advance by whole windows (not to "now") so the fractional phase
         // within the new window stays accurate instead of resetting to zero.
-        auto windows_passed = elapsed_s / 60;
-        window_start_ += std::chrono::seconds(60 * windows_passed);
+        const auto windows_passed = elapsed_s / w_s;
+        window_start_ += std::chrono::seconds(w_s * windows_passed);
     }
 
     std::uint32_t limit_{6000};
     std::uint32_t safety_{500};
     std::uint32_t used_current_{0};
     std::uint32_t used_previous_{0};
+    std::uint32_t window_seconds_{60};
     std::chrono::steady_clock::time_point window_start_{std::chrono::steady_clock::now()};
 };
 

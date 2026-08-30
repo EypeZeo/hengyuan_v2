@@ -127,7 +127,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     AuditRingSink audit;
     KillSwitch kill_switch;
     DryRunEvidenceChain evidence;
-    RequestWeightTracker rate_tracker;
+    SpotRateLimitTracker rate_limiter;
     InFlightRegistry in_flight;
     SymbolRules rules{};
     AccountSnapshot account{};
@@ -140,7 +140,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     evidence.record(EvidencePath::SubmitReject, 2, 0xABCD, 1);
     evidence.record(EvidencePath::SubmitAmbiguous, 3, 0xABCD, 1);
     evidence.record(EvidencePath::KillSwitch, 4, 0xABCD, 1);
-    rate_tracker.reset(100000, 500);  // headroom well above kIterations
+    rate_limiter.configure(100000, 500, 100000, 500, 100000, 500);  // headroom well above kIterations
 
     std::strncpy(rules.symbol, "BTCUSDT", sizeof(rules.symbol) - 1);
     rules.is_trading = true;
@@ -218,7 +218,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
             ctx.evidence = &evidence;
             ctx.signer_ready = true;
             ctx.depth_synced = true;
-            ctx.rate_tracker = &rate_tracker;
+            ctx.rate_limiter = &rate_limiter;
             ctx.in_flight = &in_flight;
             ctx.symbol_rules = &rules;
             ctx.account = &account;

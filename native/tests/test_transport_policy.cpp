@@ -226,6 +226,68 @@ TEST(RequestWeightTracker, NoTrafficForTwoWindowsResetsCleanly) {
     EXPECT_TRUE(t.can_send(100, t_far));
 }
 
+// --- TODO 1A.2: window_seconds parameterization + rollback() ---
+
+TEST(RequestWeightTracker, WindowSecondsDefaultMatchesLegacyBehavior) {
+    // reset() with no 4th argument must behave identically to the pre-1A.2 hardcoded
+    // 60s window -- re-runs SlidingWindowDiscountsPreviousUsageGradually's exact
+    // sequence via the 3-arg overload to pin that the default truly didn't change.
+    using Clock = RequestWeightTracker::Clock;
+    RequestWeightTracker t;
+    auto t0 = Clock::now();
+    t.reset(100, 0, t0);  // no window_seconds -- defaults to 60
+    ASSERT_TRUE(t.try_consume(100, t0));
+
+    EXPECT_FALSE(t.can_send(100, t0 + std::chrono::seconds(60)));
+    EXPECT_GT(t.used(t0 + std::chrono::seconds(60)), 90u);
+    EXPECT_EQ(t.used(t0 + std::chrono::seconds(90)), 50u);
+    EXPECT_EQ(t.used(t0 + std::chrono::seconds(120)), 0u);
+}
+
+TEST(RequestWeightTracker, WindowSecondsParameterizesRotationTiming) {
+    // A 10s window must rotate/decay on a 10s cadence, not the default 60s --
+    // exercises the exact same shape as SlidingWindowDiscountsPreviousUsageGradually,
+    // scaled down 6x.
+    using Clock = RequestWeightTracker::Clock;
+    RequestWeightTracker t;
+    auto t0 = Clock::now();
+    t.reset(100, 0, t0, /*window_seconds=*/10);
+    ASSERT_TRUE(t.try_consume(100, t0));
+
+    EXPECT_FALSE(t.can_send(100, t0 + std::chrono::seconds(10)))
+        << "sliding window allowed a full second burst immediately at the 10s boundary";
+    EXPECT_EQ(t.used(t0 + std::chrono::seconds(10)), 100u);
+    EXPECT_EQ(t.used(t0 + std::chrono::seconds(15)), 50u);
+    EXPECT_EQ(t.used(t0 + std::chrono::seconds(20)), 0u);
+}
+
+TEST(RequestWeightTracker, RollbackUndoesReservationWithinWindow) {
+    using Clock = RequestWeightTracker::Clock;
+    RequestWeightTracker t;
+    auto t0 = Clock::now();
+    t.reset(100, 0, t0);
+    ASSERT_TRUE(t.try_consume(60, t0));
+    EXPECT_EQ(t.used(t0), 60u);
+
+    t.rollback(60, t0);
+    EXPECT_EQ(t.used(t0), 0u);
+    EXPECT_TRUE(t.try_consume(100, t0)) << "the full budget must be available again";
+}
+
+TEST(RequestWeightTracker, RollbackNeverUnderflowsBelowZero) {
+    using Clock = RequestWeightTracker::Clock;
+    RequestWeightTracker t;
+    auto t0 = Clock::now();
+    t.reset(100, 0, t0);
+    ASSERT_TRUE(t.try_consume(10, t0));
+
+    // Rolling back more than was ever consumed must saturate at 0, never wrap toward
+    // UINT32_MAX (which would silently look like the budget is fully exhausted).
+    t.rollback(1000, t0);
+    EXPECT_EQ(t.used(t0), 0u);
+    EXPECT_TRUE(t.try_consume(100, t0));
+}
+
 // --- Clock skew ---
 
 TEST(ClockSkew, WithinWindowPasses) {
