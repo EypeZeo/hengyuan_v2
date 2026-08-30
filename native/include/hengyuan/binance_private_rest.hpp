@@ -55,6 +55,8 @@
 #include <hengyuan/binance_environment.hpp>
 #include <hengyuan/binance_query_signing.hpp>
 #include <hengyuan/binance_tls.hpp>
+#include <hengyuan/order_lifecycle.hpp>
+#include <hengyuan/order_tracker.hpp>
 
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -479,6 +481,131 @@ inline PrivateRestError parse_exchange_info_response(std::string_view body,
 
     out = built;
     return PrivateRestError::None;
+}
+
+// L4 §6.5's status-string -> OrderState table. Returns false (out untouched) for anything
+// unrecognized -- "not a guess": an unrecognized `status` value is not evidence of any
+// particular outcome and must fail schema validation in parse_order_query_response() below,
+// exactly like a missing/malformed field, never be silently mapped to some default state.
+// EXPIRED_IN_MATCH (self-trade-prevention-triggered expiry) is deliberately folded into the
+// same terminal bucket as EXPIRED -- OrderState has no dedicated STP-expiry state; §6.5's own
+// text documents this as a deliberate simplification, not an oversight.
+inline bool map_binance_order_status(std::string_view status, OrderState& out) noexcept {
+    if (status == "NEW") { out = OrderState::Accepted; return true; }
+    if (status == "PARTIALLY_FILLED") { out = OrderState::PartialFill; return true; }
+    if (status == "FILLED") { out = OrderState::Filled; return true; }
+    if (status == "PENDING_CANCEL") { out = OrderState::CancelRequested; return true; }
+    if (status == "CANCELED") { out = OrderState::Cancelled; return true; }
+    if (status == "REJECTED") { out = OrderState::Rejected; return true; }
+    if (status == "EXPIRED") { out = OrderState::Expired; return true; }
+    if (status == "EXPIRED_IN_MATCH") { out = OrderState::Expired; return true; }
+    return false;
+}
+
+// L4 §6.1.2: schema + field-match validation for a GET /api/v3/order response, checked
+// against the OrderExpectation captured at submit time -- never a live re-lookup that could
+// have moved on. Returns QueryResult directly (not a PrivateRestError like
+// parse_account_response/parse_exchange_info_response) because every failure mode here --
+// missing/malformed field, a field that disagrees with `expected`, an unrecognized status, an
+// overflow in checked_scaled_mul_div() -- collapses to the exact same caller-visible outcome:
+// QueryOutcome::Inconclusive. A richer error channel would be dead code; the caller
+// (query_order() below) never distinguishes any of these cases from one another, matching
+// §6.1.2's own "every one of the following collapses to Inconclusive" framing.
+inline QueryResult parse_order_query_response(std::string_view body,
+                                               const OrderExpectation& expected) noexcept {
+    auto padded = simdjson::padded_string(body);
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (parser.iterate(padded).get(doc)) return {};  // Inconclusive: JSON parse failure
+
+    // §6.1.2 step 1 -- schema: all 11 required fields must be present.
+    std::string_view symbol_sv, client_order_id_sv, price_sv, orig_qty_sv, executed_qty_sv,
+        cumulative_quote_qty_sv, status_sv, side_sv, type_sv, time_in_force_sv;
+    std::int64_t order_id = 0;
+    if (doc["symbol"].get_string().get(symbol_sv) != simdjson::SUCCESS) return {};
+    if (doc["orderId"].get_int64().get(order_id) != simdjson::SUCCESS) return {};
+    if (doc["clientOrderId"].get_string().get(client_order_id_sv) != simdjson::SUCCESS) return {};
+    if (doc["price"].get_string().get(price_sv) != simdjson::SUCCESS) return {};
+    if (doc["origQty"].get_string().get(orig_qty_sv) != simdjson::SUCCESS) return {};
+    if (doc["executedQty"].get_string().get(executed_qty_sv) != simdjson::SUCCESS) return {};
+    if (doc["cummulativeQuoteQty"].get_string().get(cumulative_quote_qty_sv) != simdjson::SUCCESS) {
+        return {};
+    }
+    if (doc["status"].get_string().get(status_sv) != simdjson::SUCCESS) return {};
+    if (doc["side"].get_string().get(side_sv) != simdjson::SUCCESS) return {};
+    if (doc["type"].get_string().get(type_sv) != simdjson::SUCCESS) return {};
+    if (doc["timeInForce"].get_string().get(time_in_force_sv) != simdjson::SUCCESS) return {};
+
+    if (order_id < 0) return {};
+
+    // §6.1.2 step 2 -- field-match against `expected`, the captured snapshot, never a live
+    // lookup. Any mismatch is exactly as untrustworthy as a schema failure -- a response that
+    // identifies itself by clientOrderId but disagrees on symbol/side/price/qty/timeInForce is
+    // not evidence about THIS order.
+    if (client_order_id_sv != expected.client_order_id.view()) return {};
+    if (symbol_sv != expected.rules_snapshot_at_submit.symbol_name()) return {};
+    if (side_sv != std::string_view(order_side_name(expected.side))) return {};
+    // OrderType is frozen to exactly one member (Limit, ADR-019 D7 M7) -- no parser needed,
+    // a literal comparison is the whole check.
+    if (type_sv != "LIMIT") return {};
+    // This codebase only ever sends GTC (L5 §1) -- any other value is not evidence of *this*
+    // order, exactly like a mismatched symbol/side (fixes the gap §6.1.2 itself calls out:
+    // the field's presence was always required, but no earlier revision checked its value).
+    if (time_in_force_sv != "GTC") return {};
+
+    std::int64_t price_ticks = 0, orig_qty_ticks = 0;
+    if (!parse_decimal_to_ticks_with_scale(price_sv, expected.rules_snapshot_at_submit.price_scale,
+                                            price_ticks)) {
+        return {};
+    }
+    if (price_ticks != expected.intended_price_ticks) return {};
+    if (!parse_decimal_to_ticks_with_scale(orig_qty_sv, expected.rules_snapshot_at_submit.qty_scale,
+                                            orig_qty_ticks)) {
+        return {};
+    }
+    if (orig_qty_ticks != expected.intended_qty_ticks) return {};
+
+    OrderState confirmed_state{};
+    if (!map_binance_order_status(status_sv, confirmed_state)) return {};
+
+    // §6.1.1 -- avg_fill_price_ticks, only when executed_qty_ticks > 0 (never divide by zero,
+    // never fabricate a price for a fill that didn't happen).
+    std::int64_t executed_qty_ticks = 0;
+    if (!parse_decimal_to_ticks_with_scale(executed_qty_sv,
+                                            expected.rules_snapshot_at_submit.qty_scale,
+                                            executed_qty_ticks)) {
+        return {};
+    }
+
+    QueryResult result{};
+    result.outcome = QueryOutcome::Found;
+    result.confirmed_state = confirmed_state;
+    result.exchange_order_id = order_id;
+
+    if (executed_qty_ticks == 0) {
+        result.filled_qty_ticks = 0;
+        result.avg_fill_price_ticks = 0;
+        return result;
+    }
+
+    std::int64_t cumulative_quote_qty_ticks = 0;
+    if (!parse_decimal_to_ticks_with_scale(cumulative_quote_qty_sv,
+                                            expected.rules_snapshot_at_submit.quote_scale,
+                                            cumulative_quote_qty_ticks)) {
+        return {};
+    }
+    const int exponent = static_cast<int>(expected.rules_snapshot_at_submit.price_scale) +
+                          static_cast<int>(expected.rules_snapshot_at_submit.qty_scale) -
+                          static_cast<int>(expected.rules_snapshot_at_submit.quote_scale);
+    std::int64_t avg_fill_price_ticks = 0;
+    if (!checked_scaled_mul_div(cumulative_quote_qty_ticks, exponent, executed_qty_ticks,
+                                 avg_fill_price_ticks)) {
+        return {};  // overflow, or a scale combination too extreme to represent -- Inconclusive
+    }
+
+    result.filled_qty_ticks = executed_qty_ticks;
+    result.avg_fill_price_ticks = avg_fill_price_ticks;
+    return result;
 }
 
 namespace detail {
@@ -932,6 +1059,85 @@ public:
         return parse_exchange_info_response(std::get<std::string>(outcome), out);
     }
 
+    // L4 §6: signed, single attempt -- the retry loop (§6.2) lives in the orchestrator/
+    // order_tracker.hpp's poll_once(), which already owns query_attempts and backoff; this
+    // method never loops or sleeps internally. Structurally mirrors fetch_account() (same
+    // clock-freshness gate, same build_canonical_query/build_signed_query/copy_api_key
+    // sequence, same detail::fetch_signed_body_coro reuse) with two deliberate additions
+    // fetch_account() itself does not need:
+    //
+    //   1. Explicit `noexcept` -- required by QueryPort::QueryFn's ABI (order_tracker.hpp),
+    //      a plain C-style function pointer with no exception-propagation path. fetch_account()
+    //      is NOT noexcept and can let an exceptional (should-never-happen) exception from the
+    //      coroutine's completion handler propagate to its caller; this method has no such
+    //      freedom -- the same rethrow would call std::terminate() here, taking down whichever
+    //      thread poll_once() runs on along with every other order it was tracking. The
+    //      try/catch below folds that into Inconclusive instead, which is strictly safer: it
+    //      routes even a genuinely unexpected internal fault through the same retry/backoff/
+    //      eventual-EscalateToOperator path every other Inconclusive already uses, rather than
+    //      crashing the reconcile thread.
+    //   2. Explicit entry guards (`creds_`/`expected` non-empty) that fetch_account() also
+    //      lacks today (a known, separately-tracked gap) -- no reason for this new method to
+    //      replicate it.
+    QueryResult query_order(const OrderExpectation& expected,
+                             const PrivateRestConfig& cfg = {}) noexcept {
+        if (!creds_) return {};
+        if (expected.client_order_id.empty()) return {};
+        if (expected.rules_snapshot_at_submit.symbol[0] == '\0') return {};
+
+        try {
+            std::int64_t fresh_ts_ms = 0;
+            if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
+                return {};  // ClockNotFresh -> Inconclusive
+            }
+
+            char recv_window_buf[24];
+            const int n = std::snprintf(recv_window_buf, sizeof(recv_window_buf), "%lld",
+                                         static_cast<long long>(cfg.recv_window_ms));
+            if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(recv_window_buf)) {
+                return {};
+            }
+            const std::pair<std::string_view, std::string_view> params[] = {
+                {"origClientOrderId", expected.client_order_id.view()},
+                {"recvWindow", std::string_view(recv_window_buf, static_cast<std::size_t>(n))},
+                {"symbol", expected.rules_snapshot_at_submit.symbol_name()},
+            };
+            auto [qerr, unsigned_query] = build_canonical_query(params);
+            if (qerr != QuerySigningError::Ok) return {};
+
+            auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, fresh_ts_ms);
+            if (serr != QuerySigningError::Ok) return {};
+
+            std::array<char, kApiKeyLen> key_buf{};
+            std::size_t key_len = 0;
+            if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
+                return {};
+            }
+
+            const std::string target = "/api/v3/order?" + std::string(signed_query.wire_bytes());
+
+            net::io_context ioc;
+            std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
+            net::co_spawn(
+                ioc,
+                detail::fetch_signed_body_coro(std::string(binding_.base_host()), target,
+                                                std::string(key_buf.data(), key_len), cfg),
+                [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
+                    if (eptr) std::rethrow_exception(eptr);
+                    outcome = std::move(r);
+                });
+            ioc.run();
+
+            if (std::holds_alternative<PrivateRestError>(outcome)) {
+                return {};  // network/HTTP-status/JSON-transport failure -> Inconclusive
+            }
+
+            return parse_order_query_response(std::get<std::string>(outcome), expected);
+        } catch (...) {
+            return {};  // see the noexcept note above -- never let this method throw
+        }
+    }
+
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }
 
 private:
@@ -939,5 +1145,15 @@ private:
     std::unique_ptr<BoundHmacCredentials> creds_;
     ClockOffsetPublisher clock_pub_;
 };
+
+// Bridges BinancePrivateRestClient::query_order() to QueryPort::QueryFn's plain
+// function-pointer ABI (order_tracker.hpp) -- the production wiring: `QueryPort{
+// &query_order_adapter, &client}`. Lives here, not in order_tracker.hpp, so that L1 file
+// (explicitly no network dependency, per its own header comment) never has to #include
+// Boost/Beast/OpenSSL/simdjson.
+inline QueryResult query_order_adapter(const OrderExpectation& expected, void* user_data) noexcept {
+    if (!user_data) return {};
+    return static_cast<BinancePrivateRestClient*>(user_data)->query_order(expected);
+}
 
 }  // namespace hy

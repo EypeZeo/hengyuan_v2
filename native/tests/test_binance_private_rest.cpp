@@ -49,21 +49,32 @@ using hy::AccountSnapshot;
 using hy::AssetBalance;
 using hy::BinancePrivateRestClient;
 using hy::BoundHmacCredentials;
+using hy::ClientOrderId;
 using hy::ClockOffsetSnapshot;
 using hy::EnvAllowlist;
 using hy::EnvironmentBinding;
+using hy::OrderExpectation;
+using hy::OrderSide;
+using hy::OrderState;
+using hy::OrderType;
 using hy::PrivateRestConfig;
 using hy::PrivateRestError;
+using hy::QueryOutcome;
+using hy::QueryResult;
 using hy::QuerySigningError;
 using hy::SecureEnvLoader;
+using hy::SymbolRules;
 using hy::build_exchange_info_target;
 using hy::fetch_clock_pair;
 using hy::is_snapshot_fresh;
 using hy::kBalanceScale;
+using hy::map_binance_order_status;
 using hy::parse_account_response;
 using hy::parse_balance_decimal_to_ticks;
 using hy::parse_exchange_info_response;
+using hy::parse_order_query_response;
 using hy::parse_server_time_response;
+using hy::query_order_adapter;
 
 namespace {
 
@@ -80,6 +91,31 @@ constexpr std::string_view kTestnetAllowedKeys[] = {
     "HENGYUAN_BINANCE_TESTNET_SECRET",
 };
 constexpr EnvAllowlist kTestnetAllowlist{kTestnetAllowedKeys, 2};
+
+// L4 §6: a Binance-realistic (not the intentionally-degenerate 0/8 pair
+// test_account_truth.cpp uses) price_scale/qty_scale/quote_scale triple, chosen so exponent =
+// price_scale + qty_scale - quote_scale == 0 for the worked success-path example below (keeps
+// the hand-verified avg_fill_price_ticks arithmetic simple: a plain integer division, no
+// scale-shift to also verify by hand).
+OrderExpectation make_btcusdt_expectation(std::string_view coid) {
+    SymbolRules rules{};
+    std::strncpy(rules.symbol, "BTCUSDT", sizeof(rules.symbol) - 1);
+    rules.is_trading = true;
+    rules.price_scale = 2;
+    rules.qty_scale = 6;
+    rules.quote_scale = 8;
+
+    OrderExpectation exp{};
+    std::strncpy(exp.client_order_id.id, coid.data(),
+                 std::min(coid.size(), sizeof(exp.client_order_id.id) - 1));
+    exp.symbol_id = 1;
+    exp.side = OrderSide::Buy;
+    exp.order_type = OrderType::Limit;
+    exp.intended_price_ticks = 5'000'012;  // "50000.12" at price_scale=2
+    exp.intended_qty_ticks = 100'000;      // "0.100000" at qty_scale=6
+    exp.rules_snapshot_at_submit = rules;
+    return exp;
+}
 
 class BoundCredentialsFixture : public ::testing::Test {
 protected:
@@ -360,6 +396,164 @@ TEST(ParseAccountResponse, SyntacticallyInvalidJsonRejectedAtFieldAccess) {
     AccountSnapshot out{};
     const auto err = parse_account_response("not json", out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+}
+
+// --- map_binance_order_status() -- L4 §6.5's status-string table ---
+
+TEST(MapBinanceOrderStatus, EveryKnownStatusMapsToItsDocumentedState) {
+    const std::pair<std::string_view, OrderState> kTable[] = {
+        {"NEW", OrderState::Accepted},
+        {"PARTIALLY_FILLED", OrderState::PartialFill},
+        {"FILLED", OrderState::Filled},
+        {"PENDING_CANCEL", OrderState::CancelRequested},
+        {"CANCELED", OrderState::Cancelled},
+        {"REJECTED", OrderState::Rejected},
+        {"EXPIRED", OrderState::Expired},
+        {"EXPIRED_IN_MATCH", OrderState::Expired},
+    };
+    for (const auto& [status, expected] : kTable) {
+        OrderState out{};
+        ASSERT_TRUE(map_binance_order_status(status, out)) << status;
+        EXPECT_EQ(out, expected) << status;
+    }
+}
+
+TEST(MapBinanceOrderStatus, UnrecognizedStatusIsRejectedNotGuessed) {
+    OrderState out = OrderState::Filled;  // sentinel
+    EXPECT_FALSE(map_binance_order_status("SOME_FUTURE_STATUS", out));
+    EXPECT_EQ(out, OrderState::Filled);  // untouched
+}
+
+// --- parse_order_query_response() -- L4 §6.1.2 schema + field-match, §6.1.1 fill derivation ---
+
+TEST(ParseOrderQueryResponse, FullSuccessPathFindsAndDerivesAvgFillPrice) {
+    const auto expected = make_btcusdt_expectation("test-coid-001");
+    const auto result = parse_order_query_response(
+        R"({"symbol":"BTCUSDT","orderId":12345,"clientOrderId":"test-coid-001",)"
+        R"("price":"50000.12","origQty":"0.100000","executedQty":"0.050000",)"
+        R"("cummulativeQuoteQty":"2500.00000000","status":"PARTIALLY_FILLED",)"
+        R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})",
+        expected);
+    ASSERT_EQ(result.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.confirmed_state, OrderState::PartialFill);
+    EXPECT_EQ(result.exchange_order_id, 12345);
+    EXPECT_EQ(result.filled_qty_ticks, 50'000);          // "0.050000" at qty_scale=6
+    EXPECT_EQ(result.avg_fill_price_ticks, 5'000'000);   // 2500.00000000/0.050000 = 50000.00
+}
+
+TEST(ParseOrderQueryResponse, UnfilledOrderReportsZeroFillFieldsNotDivideByZero) {
+    const auto expected = make_btcusdt_expectation("test-coid-002");
+    const auto result = parse_order_query_response(
+        R"({"symbol":"BTCUSDT","orderId":1,"clientOrderId":"test-coid-002",)"
+        R"("price":"50000.12","origQty":"0.100000","executedQty":"0.000000",)"
+        R"("cummulativeQuoteQty":"0.00000000","status":"NEW",)"
+        R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})",
+        expected);
+    ASSERT_EQ(result.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.confirmed_state, OrderState::Accepted);
+    EXPECT_EQ(result.filled_qty_ticks, 0);
+    EXPECT_EQ(result.avg_fill_price_ticks, 0);
+}
+
+TEST(ParseOrderQueryResponse, MalformedJsonIsInconclusive) {
+    const auto expected = make_btcusdt_expectation("test-coid-003");
+    EXPECT_EQ(parse_order_query_response("not json", expected).outcome, QueryOutcome::Inconclusive);
+}
+
+TEST(ParseOrderQueryResponse, EachMissingRequiredFieldIsInconclusive) {
+    const auto expected = make_btcusdt_expectation("test-coid-004");
+    // One full valid body, then each required field independently removed.
+    const std::string_view kFields[] = {
+        "symbol", "orderId", "clientOrderId", "price", "origQty", "executedQty",
+        "cummulativeQuoteQty", "status", "side", "type", "timeInForce",
+    };
+    for (auto field : kFields) {
+        std::string body =
+            R"({"symbol":"BTCUSDT","orderId":1,"clientOrderId":"test-coid-004",)"
+            R"("price":"50000.12","origQty":"0.100000","executedQty":"0.000000",)"
+            R"("cummulativeQuoteQty":"0.00000000","status":"NEW",)"
+            R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})";
+        // Rename the target field's key so it's absent under its expected name (cheaper than
+        // building 11 bespoke bodies, and just as precise -- the parser looks up by name).
+        const std::string needle = "\"" + std::string(field) + "\":";
+        const auto pos = body.find(needle);
+        ASSERT_NE(pos, std::string::npos) << field;
+        body.replace(pos, needle.size(), "\"_absent_\":");
+        EXPECT_EQ(parse_order_query_response(body, expected).outcome, QueryOutcome::Inconclusive)
+            << "field=" << field;
+    }
+}
+
+TEST(ParseOrderQueryResponse, EachFieldMismatchIsInconclusive) {
+    const auto expected = make_btcusdt_expectation("test-coid-005");
+    auto body_with = [](std::string_view coid, std::string_view symbol, std::string_view side,
+                         std::string_view type, std::string_view tif, std::string_view price,
+                         std::string_view qty) {
+        return std::string(R"({"symbol":")") + std::string(symbol) +
+               R"(","orderId":1,"clientOrderId":")" + std::string(coid) + R"(",)" + R"("price":")" +
+               std::string(price) + R"(","origQty":")" + std::string(qty) +
+               R"(","executedQty":"0.000000","cummulativeQuoteQty":"0.00000000",)" +
+               R"("status":"NEW","side":")" + std::string(side) + R"(","type":")" +
+               std::string(type) + R"(","timeInForce":")" + std::string(tif) + R"("})";
+    };
+    EXPECT_EQ(parse_order_query_response(
+                  body_with("WRONG-COID", "BTCUSDT", "BUY", "LIMIT", "GTC", "50000.12", "0.100000"),
+                  expected)
+                  .outcome,
+              QueryOutcome::Inconclusive)
+        << "coid mismatch";
+    EXPECT_EQ(parse_order_query_response(
+                  body_with("test-coid-005", "ETHUSDT", "BUY", "LIMIT", "GTC", "50000.12",
+                            "0.100000"),
+                  expected)
+                  .outcome,
+              QueryOutcome::Inconclusive)
+        << "symbol mismatch";
+    EXPECT_EQ(parse_order_query_response(
+                  body_with("test-coid-005", "BTCUSDT", "SELL", "LIMIT", "GTC", "50000.12",
+                            "0.100000"),
+                  expected)
+                  .outcome,
+              QueryOutcome::Inconclusive)
+        << "side mismatch";
+    EXPECT_EQ(parse_order_query_response(
+                  body_with("test-coid-005", "BTCUSDT", "BUY", "MARKET", "GTC", "50000.12",
+                            "0.100000"),
+                  expected)
+                  .outcome,
+              QueryOutcome::Inconclusive)
+        << "type mismatch";
+    EXPECT_EQ(parse_order_query_response(
+                  body_with("test-coid-005", "BTCUSDT", "BUY", "LIMIT", "IOC", "50000.12",
+                            "0.100000"),
+                  expected)
+                  .outcome,
+              QueryOutcome::Inconclusive)
+        << "timeInForce mismatch";
+    EXPECT_EQ(parse_order_query_response(
+                  body_with("test-coid-005", "BTCUSDT", "BUY", "LIMIT", "GTC", "1.00", "0.100000"),
+                  expected)
+                  .outcome,
+              QueryOutcome::Inconclusive)
+        << "price mismatch";
+    EXPECT_EQ(parse_order_query_response(
+                  body_with("test-coid-005", "BTCUSDT", "BUY", "LIMIT", "GTC", "50000.12",
+                            "9.000000"),
+                  expected)
+                  .outcome,
+              QueryOutcome::Inconclusive)
+        << "qty mismatch";
+}
+
+TEST(ParseOrderQueryResponse, UnrecognizedStatusIsInconclusive) {
+    const auto expected = make_btcusdt_expectation("test-coid-006");
+    const auto result = parse_order_query_response(
+        R"({"symbol":"BTCUSDT","orderId":1,"clientOrderId":"test-coid-006",)"
+        R"("price":"50000.12","origQty":"0.100000","executedQty":"0.000000",)"
+        R"("cummulativeQuoteQty":"0.00000000","status":"SOME_FUTURE_STATUS",)"
+        R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})",
+        expected);
+    EXPECT_EQ(result.outcome, QueryOutcome::Inconclusive);
 }
 
 // --- build_exchange_info_target() -- L4 §5's `symbols` filter query construction ---
@@ -725,6 +919,134 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
     out.asset_count = 9;  // sentinel
     EXPECT_EQ(client.fetch_account(out, fetch_cfg), PrivateRestError::HttpStatus);
     EXPECT_EQ(out.asset_count, 9u);  // untouched
+}
+
+// --- BinancePrivateRestClient::query_order() -- L4 §6, network-layer ---
+
+TEST_F(BoundCredentialsFixture, QueryOrderFailsClosedWithoutPriorClockSync) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    const auto expected = make_btcusdt_expectation("coid-no-clock");
+    // No sync_clock() call -- must never attempt to sign or send anything.
+    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::Inconclusive);
+}
+
+TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"serverTime":1700000000000})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    sync_cfg.connect_host_override = "127.0.0.1";
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    const auto expected = make_btcusdt_expectation("coid-success-001");
+    hy::test_helpers::TlsResponseAcceptor order_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"symbol":"BTCUSDT","orderId":777,"clientOrderId":"coid-success-001",)"
+        R"("price":"50000.12","origQty":"0.100000","executedQty":"0.050000",)"
+        R"("cummulativeQuoteQty":"2500.00000000","status":"PARTIALLY_FILLED",)"
+        R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})");
+    PrivateRestConfig fetch_cfg;
+    fetch_cfg.port = std::to_string(order_server.port());
+    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    fetch_cfg.connect_host_override = "127.0.0.1";
+
+    const auto result = client.query_order(expected, fetch_cfg);
+    ASSERT_EQ(result.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.confirmed_state, OrderState::PartialFill);
+    EXPECT_EQ(result.exchange_order_id, 777);
+    EXPECT_EQ(result.filled_qty_ticks, 50'000);
+    EXPECT_EQ(result.avg_fill_price_ticks, 5'000'000);
+
+    const auto reqs = order_server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    EXPECT_EQ(reqs[0].target.substr(0, 14), "/api/v3/order?");
+    EXPECT_EQ(reqs[0].api_key_header, kSyntheticApiKey);
+    // §2.1 alphabetical order: origClientOrderId, recvWindow, symbol, then timestamp/signature
+    // always appended last.
+    const auto& target = reqs[0].target;
+    const auto pos_coid = target.find("origClientOrderId=");
+    const auto pos_recv = target.find("&recvWindow=");
+    const auto pos_symbol = target.find("&symbol=");
+    const auto pos_ts = target.find("&timestamp=");
+    const auto pos_sig = target.find("&signature=");
+    ASSERT_NE(pos_coid, std::string::npos);
+    ASSERT_NE(pos_recv, std::string::npos);
+    ASSERT_NE(pos_symbol, std::string::npos);
+    ASSERT_NE(pos_ts, std::string::npos);
+    ASSERT_NE(pos_sig, std::string::npos);
+    EXPECT_LT(pos_coid, pos_recv);
+    EXPECT_LT(pos_recv, pos_symbol);
+    EXPECT_LT(pos_symbol, pos_ts);
+    EXPECT_LT(pos_ts, pos_sig);
+}
+
+TEST_F(BoundCredentialsFixture, QueryOrderHttpErrorStatusIsInconclusiveNotFailure) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"serverTime":1700000000000})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    sync_cfg.connect_host_override = "127.0.0.1";
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    hy::test_helpers::TlsResponseAcceptor error_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 429,
+        R"({"code":-1003,"msg":"Too many requests"})");
+    PrivateRestConfig fetch_cfg;
+    fetch_cfg.port = std::to_string(error_server.port());
+    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    fetch_cfg.connect_host_override = "127.0.0.1";
+
+    const auto expected = make_btcusdt_expectation("coid-http-error");
+    // Never Rejected/"does not exist" -- collapses to the same Inconclusive as every other
+    // untrustworthy outcome (L4 §6.1.2's exhaustive list).
+    EXPECT_EQ(client.query_order(expected, fetch_cfg).outcome, QueryOutcome::Inconclusive);
+}
+
+TEST_F(BoundCredentialsFixture, QueryOrderMalformedJsonIsInconclusive) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"serverTime":1700000000000})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    sync_cfg.connect_host_override = "127.0.0.1";
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    hy::test_helpers::TlsResponseAcceptor bad_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, "not json");
+    PrivateRestConfig fetch_cfg;
+    fetch_cfg.port = std::to_string(bad_server.port());
+    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    fetch_cfg.connect_host_override = "127.0.0.1";
+
+    const auto expected = make_btcusdt_expectation("coid-bad-json");
+    EXPECT_EQ(client.query_order(expected, fetch_cfg).outcome, QueryOutcome::Inconclusive);
+}
+
+TEST(QueryOrderEntryGuards, NullCredentialsFoldsIntoInconclusiveWithoutNetworkAttempt) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), nullptr);
+    const auto expected = make_btcusdt_expectation("coid-null-creds");
+    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::Inconclusive);
+}
+
+// --- query_order_adapter() -- production QueryPort::QueryFn wiring ---
+
+TEST(QueryOrderAdapter, NullUserDataFoldsIntoInconclusive) {
+    OrderExpectation expected{};
+    EXPECT_EQ(query_order_adapter(expected, nullptr).outcome, QueryOutcome::Inconclusive);
 }
 
 // --- BinancePrivateRestClient::fetch_exchange_info() -- §5, network-layer ---

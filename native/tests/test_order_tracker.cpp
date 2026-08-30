@@ -18,7 +18,7 @@ using namespace hy;
 static QueryResult g_mock_query_result{};
 static int g_mock_query_call_count = 0;
 
-static QueryResult mock_query(const char* /*coid*/, void* /*ud*/) {
+static QueryResult mock_query(const OrderExpectation& /*expected*/, void* /*ud*/) {
     ++g_mock_query_call_count;
     return g_mock_query_result;
 }
@@ -197,6 +197,27 @@ TEST_F(OrderTrackerTest, AcceptedOrderReachesOperatorCancelledAndLeavesTracker) 
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::Cancelled);
     EXPECT_EQ(tracker_.count(), 0u);
+}
+
+TEST_F(OrderTrackerTest, AcceptedOrderDiscoversCancelRequestedViaLivePoll) {
+    // L4 §6.6: a resting order's ordinary flat-cadence live poll (NOT an Ambiguous
+    // reconciliation) can discover PENDING_CANCEL -- exercises
+    // detail::is_legal_query_target()'s Accepted->CancelRequested edge specifically, which is
+    // a separate legality table from detail::is_legal_ambiguous_target() and was the bug this
+    // batch's external review caught: it gates poll_once() for the live-poll path (line ~450)
+    // before validate_transition() is ever consulted.
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::CancelRequested, 555, 0, 0};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev)) << "state changed (Accepted -> CancelRequested), must emit";
+    EXPECT_EQ(ev.resulting_state, OrderState::CancelRequested);
+    // CancelRequested is not exchange-final -- the cancel is still in flight on Binance's side,
+    // so the order must stay tracked, unlike the *Cancelled tests above.
+    EXPECT_EQ(tracker_.count(), 1u);
 }
 
 TEST_F(OrderTrackerTest, PartialFillOrderReachesCancelled) {

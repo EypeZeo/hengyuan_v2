@@ -440,6 +440,15 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     result.order.intended_price_ticks = ctx.price_ticks;
     result.order.intended_qty_ticks = ctx.qty_ticks;
     result.order.submit_timestamp_ms = ctx.now_ms;
+    // L4 §6.1.2: without these, OrderExpectation::from(result.order) would carry
+    // a fabricated Buy/Limit/empty-SymbolRules triple regardless of what was
+    // actually submitted, and every genuine reconciliation Found response would
+    // fail field-match validation against it. ctx.pre_trade_rules_snapshot is
+    // the same L4 §5.3 snapshot this order was actually validated/formatted
+    // against (see the ctx.pre_trade_rules_snapshot assignment above, Gate 1).
+    result.order.side = ctx.side;
+    result.order.order_type = ctx.order_type;
+    result.order.rules_snapshot_at_submit = ctx.pre_trade_rules_snapshot;
 
     // Gate 10: Audit intent
     {

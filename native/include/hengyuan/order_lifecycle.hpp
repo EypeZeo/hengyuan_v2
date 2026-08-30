@@ -13,11 +13,14 @@
 
 #pragma once
 
+#include <hengyuan/account_truth.hpp>
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <type_traits>
 
 namespace hy {
 
@@ -144,12 +147,20 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
             // that can discover "actually still live" via reconciliation — an earlier
             // revision of this file deliberately left these two out pending that
             // work; this is that work.
+            //
+            // CancelRequested (L4 §6.5): confirmed PENDING_CANCEL — still live, a
+            // cancel is in progress on Binance's side. NOTE: order_tracker.hpp's
+            // detail::is_legal_ambiguous_target() and detail::is_legal_query_target()
+            // independently gate the same set of targets before this function is
+            // even reached — both were updated alongside this edge; see their own
+            // comments for why is_legal_query_target() in particular is not optional.
             if (to == OrderState::Accepted ||
                 to == OrderState::PartialFill ||
                 to == OrderState::Filled ||
                 to == OrderState::Cancelled ||
                 to == OrderState::Rejected ||
                 to == OrderState::Expired ||
+                to == OrderState::CancelRequested ||
                 to == OrderState::EscalatedToOperator)
                 return TransitionResult::Ok;
             break;
@@ -227,6 +238,15 @@ struct OrderRecord {
     std::uint8_t query_attempts{0};       // reconciliation query count
     static constexpr std::uint8_t kMaxQueryAttempts = 3;
 
+    // L4 §6.1.2: captured once at submit time, never mutated afterward — the
+    // basis for OrderExpectation::from(), which a reconciliation query
+    // validates a Binance response against. Without these, a query response
+    // could only be checked by clientOrderId, which is not enough to trust a
+    // Found result (see OrderExpectation below).
+    OrderSide side{OrderSide::Buy};
+    OrderType order_type{OrderType::Limit};
+    SymbolRules rules_snapshot_at_submit{};
+
     TransitionResult transition_to(OrderState next) noexcept {
         auto result = validate_transition(state, next);
         if (result == TransitionResult::Ok) {
@@ -240,6 +260,37 @@ struct OrderRecord {
                query_attempts >= kMaxQueryAttempts;
     }
 };
+
+// L4 §6.1.2: everything a reconciliation query needs to validate a GET
+// /api/v3/order response against — captured once at submit time (via
+// from()), never re-derived from a live lookup that could have moved on
+// since. A response that identifies itself by clientOrderId but disagrees on
+// symbol/side/price/qty/timeInForce is not trustworthy evidence about THIS
+// order and must never be treated as Found (see binance_private_rest.hpp's
+// parse_order_query_response()).
+struct OrderExpectation {
+    ClientOrderId client_order_id{};
+    std::uint32_t symbol_id{0};
+    OrderSide side{OrderSide::Buy};
+    OrderType order_type{OrderType::Limit};
+    std::int64_t intended_price_ticks{0};
+    std::int64_t intended_qty_ticks{0};
+    SymbolRules rules_snapshot_at_submit{};
+
+    static OrderExpectation from(const OrderRecord& rec) noexcept {
+        OrderExpectation exp{};
+        exp.client_order_id = rec.client_order_id;
+        exp.symbol_id = rec.symbol_id;
+        exp.side = rec.side;
+        exp.order_type = rec.order_type;
+        exp.intended_price_ticks = rec.intended_price_ticks;
+        exp.intended_qty_ticks = rec.intended_qty_ticks;
+        exp.rules_snapshot_at_submit = rec.rules_snapshot_at_submit;
+        return exp;
+    }
+};
+static_assert(std::is_trivially_copyable_v<OrderExpectation>);
+static_assert(std::is_standard_layout_v<OrderExpectation>);
 
 // --- Reconciliation action ---
 

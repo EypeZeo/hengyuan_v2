@@ -319,6 +319,7 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::Ambiguous,       OrderState::Cancelled},
     {OrderState::Ambiguous,       OrderState::Rejected},
     {OrderState::Ambiguous,       OrderState::Expired},
+    {OrderState::Ambiguous,       OrderState::CancelRequested},  // L4 §6.5: confirmed PENDING_CANCEL
     {OrderState::Ambiguous,       OrderState::EscalatedToOperator},
     // PartialFill: still open.
     {OrderState::PartialFill,     OrderState::Filled},
@@ -331,9 +332,10 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::CancelRequested, OrderState::Expired},
 };
 constexpr std::size_t kValidCount = sizeof(kValidTransitions) / sizeof(kValidTransitions[0]);
-// 22 -> 24, deliberately: Accepted->Cancelled and PartialFill->Cancelled
-// (audit STATE-TRANS-011 -- operator/exchange cancel with no local CancelRequested).
-static_assert(kValidCount == 24, "the Ok set changed size — update deliberately");
+// 22 -> 24 (audit STATE-TRANS-011 -- Accepted->Cancelled and PartialFill->Cancelled,
+// operator/exchange cancel with no local CancelRequested) -> 25 (L4 §6.5 --
+// Ambiguous->CancelRequested, confirmed PENDING_CANCEL discovered via reconciliation).
+static_assert(kValidCount == 25, "the Ok set changed size — update deliberately");
 
 bool is_listed_valid(OrderState from, OrderState to) {
     for (std::size_t i = 0; i < kValidCount; ++i) {
@@ -369,9 +371,10 @@ TEST(TransitionRelation, EveryOneOf144PairsMatchesTheTable) {
     // empties kAllStates would otherwise "pass" with zero comparisons).
     EXPECT_EQ(ok_count + invalid_count + terminal_count, 144);
     // 22 -> 24: Accepted->Cancelled and PartialFill->Cancelled (audit STATE-TRANS-011).
-    EXPECT_EQ(ok_count, 24);
+    // 24 -> 25: Ambiguous->CancelRequested (L4 §6.5, confirmed PENDING_CANCEL).
+    EXPECT_EQ(ok_count, 25);
     EXPECT_EQ(terminal_count, 72) << "6 terminal states x 12 targets";
-    EXPECT_EQ(invalid_count, 48);
+    EXPECT_EQ(invalid_count, 47);
 }
 
 // Called out separately because these four were the specific blind spot: no test
