@@ -1381,8 +1381,14 @@ inline constexpr std::size_t kSymbolRulesWireSize =
     8 +               // max_price_ticks
     8 +               // tick_size_ticks
     8 +               // min_notional_ticks
-    4;                // rules_version
-static_assert(kSymbolRulesWireSize == 81);
+    4 +               // rules_version
+    1 +               // price_scale     -- AUDIT L4-SYMBOLRULES-SCALE: added with L4 §5.1's
+    1 +               // qty_scale       -- price_scale/qty_scale/quote_scale fields. Appended
+    1;                // quote_scale     -- after rules_version (not inserted mid-struct) --
+                       // SymbolRegistrySnapshot has never been written by any real code path
+                       // before this (§5 was an explicit non-goal until now), so there is no
+                       // existing durable frame to stay backward-compatible with.
+static_assert(kSymbolRulesWireSize == 84);
 
 inline void encode_symbol_rules(std::span<std::byte, kSymbolRulesWireSize> out, const SymbolRules& v) noexcept {
     std::byte* p = out.data();
@@ -1396,6 +1402,9 @@ inline void encode_symbol_rules(std::span<std::byte, kSymbolRulesWireSize> out, 
     detail::write_i64_le(p, v.tick_size_ticks);
     detail::write_i64_le(p, v.min_notional_ticks);
     detail::write_u32_le(p, v.rules_version);
+    detail::write_u8(p, v.price_scale);
+    detail::write_u8(p, v.qty_scale);
+    detail::write_u8(p, v.quote_scale);
 }
 
 inline bool decode_symbol_rules(std::span<const std::byte, kSymbolRulesWireSize> in, SymbolRules& out) noexcept {
@@ -1410,6 +1419,9 @@ inline bool decode_symbol_rules(std::span<const std::byte, kSymbolRulesWireSize>
     out.tick_size_ticks = detail::read_i64_le(p);
     out.min_notional_ticks = detail::read_i64_le(p);
     out.rules_version = detail::read_u32_le(p);
+    out.price_scale = detail::read_u8(p);
+    out.qty_scale = detail::read_u8(p);
+    out.quote_scale = detail::read_u8(p);
     return true;
 }
 
@@ -1428,7 +1440,7 @@ static_assert(kSnapshotPayloadFixedWireSize == 16);
 
 inline constexpr std::size_t kMaxSnapshotFrameSize =
     kFrameEnvelopeOverhead + kSnapshotPayloadFixedWireSize + kMaxSnapshotSymbols * kSymbolRulesWireSize;
-static_assert(kMaxSnapshotFrameSize == 91 + 16 + 64 * 81);
+static_assert(kMaxSnapshotFrameSize == 91 + 16 + 64 * 84);
 
 // Variable-length encode: entries.size() must equal payload.symbol_count and
 // must not exceed kMaxSnapshotSymbols -- both checked BEFORE any arithmetic

@@ -118,6 +118,13 @@ protected:
         rules_.max_qty_ticks = 1000000;
         rules_.step_size_ticks = 10;
         rules_.min_notional_ticks = 1000;
+        // AUDIT L4-SYMBOLRULES-SCALE (§5.1.1): see test_account_truth.cpp's
+        // make_btcusdt_rules() for why 0/8 specifically -- makes both of
+        // validate_pre_trade()'s rescale_notional_ceil() calls (notional and, for the
+        // Sell-side test below, the base-asset qty check) an identity transform, so none
+        // of this fixture's existing numeric expectations needed to change.
+        rules_.price_scale = 0;
+        rules_.qty_scale = 8;
 
         std::strncpy(account_.assets[0].asset, "USDT", 5);
         account_.assets[0].free_ticks = 999999;

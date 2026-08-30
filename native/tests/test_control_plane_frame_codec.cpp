@@ -404,6 +404,15 @@ SymbolRules make_symbol(const char* name, std::uint32_t version) {
     s.tick_size_ticks = 6;
     s.min_notional_ticks = 7;
     s.rules_version = version;
+    // AUDIT L4-SYMBOLRULES-SCALE: deliberately non-zero and mutually distinct. A
+    // round-trip test only proves the encoder/decoder actually touch these fields if the
+    // values aren't 0 -- SymbolRules{} already defaults price_scale/qty_scale/
+    // quote_scale to 0, so an encoder that silently never writes them and a decoder that
+    // silently never reads them would still make an all-zero round-trip "pass" by
+    // coincidence.
+    s.price_scale = 4;
+    s.qty_scale = 8;
+    s.quote_scale = 6;
     return s;
 }
 
@@ -452,6 +461,12 @@ TEST(ControlPlaneFrameCodec, SnapshotOneEntryRoundTrips) {
     ASSERT_EQ(entry_count, 1u);
     EXPECT_STREQ(out_entries[0].symbol, "BTCUSDT");
     EXPECT_EQ(out_entries[0].rules_version, 7u);
+    // AUDIT L4-SYMBOLRULES-SCALE: the specific regression a missing encode/decode update
+    // would produce -- these three would silently read back as 0 instead of make_symbol()'s
+    // non-zero inputs.
+    EXPECT_EQ(out_entries[0].price_scale, 4);
+    EXPECT_EQ(out_entries[0].qty_scale, 8);
+    EXPECT_EQ(out_entries[0].quote_scale, 6);
 }
 
 TEST(ControlPlaneFrameCodec, SnapshotMaxEntriesRoundTrips) {
