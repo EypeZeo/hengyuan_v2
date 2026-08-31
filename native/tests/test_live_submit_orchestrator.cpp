@@ -206,6 +206,53 @@ TEST_F(LiveSubmitTest, HappyPathAccepted) {
     EXPECT_GE(audit_.count(), 3u);  // intent + submitted + accepted
 }
 
+// TODO 1A.3: exchange_status now actually drives which OrderState is reached, not a blanket
+// OrderState::Accepted for every SubmitOutcome::Accepted response.
+
+TEST_F(LiveSubmitTest, ExchangeStatusPartialFillRoutesToPartialFillAndWritesBackFillFields) {
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 555;
+    g_mock_response.exchange_status = OrderState::PartialFill;
+    g_mock_response.filled_qty_ticks = 40;
+    g_mock_response.avg_fill_price_ticks = 5000;
+
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitPartialFill);
+    EXPECT_EQ(r.order.state, OrderState::PartialFill);
+    EXPECT_EQ(r.order.filled_qty_ticks, 40);
+    EXPECT_EQ(r.order.avg_fill_price_ticks, 5000);
+}
+
+TEST_F(LiveSubmitTest, ExchangeStatusFilledRoutesToFilledReleasesInFlightAndSkipsReconcile) {
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 556;
+    g_mock_response.exchange_status = OrderState::Filled;
+    g_mock_response.filled_qty_ticks = 100;
+    g_mock_response.avg_fill_price_ticks = 5000;
+
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitFilled);
+    EXPECT_EQ(r.order.state, OrderState::Filled);
+    EXPECT_EQ(r.order.filled_qty_ticks, 100);
+    EXPECT_EQ(r.order.avg_fill_price_ticks, 5000);
+    // Filled is exchange-final -- the in-flight slot must be released immediately, same as
+    // Rejected, not left occupied waiting on a reconcile push that would never resolve it
+    // (is_exchange_final() is already true; nothing would ever consume that push).
+    EXPECT_FALSE(in_flight_.is_in_flight(r.order.client_order_id.view()));
+}
+
+TEST_F(LiveSubmitTest, ExchangeStatusAmbiguousDefaultFallsBackToPlainAccepted) {
+    // 3-arg positional init (matching every pre-1A.3 test in this file) leaves
+    // exchange_status at its default OrderState::Ambiguous -- must fall back to the original
+    // OrderState::Accepted behavior, not be treated as a genuinely ambiguous outcome.
+    g_mock_response = {SubmitOutcome::Accepted, 557, 0};
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(r.order.state, OrderState::Accepted);
+}
+
 // --- Gate 1: Audit unavailable ---
 
 TEST_F(LiveSubmitTest, AuditUnavailableBlocks) {
