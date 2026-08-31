@@ -117,6 +117,7 @@ TEST(EndpointWeight, PinnedDefaultsMatchSpecSection74) {
     EXPECT_EQ(endpoint_weight(t, PrivateRestEndpoint::PostOrder), 1u);
     EXPECT_EQ(endpoint_weight(t, PrivateRestEndpoint::GetOrder), 4u);
     EXPECT_EQ(endpoint_weight(t, PrivateRestEndpoint::GetAccount), 20u);
+    EXPECT_EQ(endpoint_weight(t, PrivateRestEndpoint::GetRateLimitOrder), 40u);
     EXPECT_EQ(endpoint_weight(t, PrivateRestEndpoint::GetExchangeInfo), 20u);
     EXPECT_EQ(endpoint_weight(t, PrivateRestEndpoint::GetServerTime), 1u);
 }

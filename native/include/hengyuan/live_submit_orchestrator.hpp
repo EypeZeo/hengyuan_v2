@@ -68,6 +68,24 @@ struct SubmitResponse {
     SubmitOutcome outcome{SubmitOutcome::NetworkError};
     std::int64_t exchange_order_id{0};
     std::int32_t error_code{0};
+    // TODO 1A.3: appended AFTER the three original fields, never inserted
+    // earlier or reordered -- test_live_submit_orchestrator.cpp has 15+
+    // existing `g_mock_response = {SubmitOutcome::X, id, code};` 3-arg
+    // positional aggregate inits that must keep compiling unchanged (trailing
+    // members default-init). Same discipline as QueryResult (§6 batch) and
+    // OrderRecord (1A.2 batch).
+    OrderState exchange_status{OrderState::Ambiguous};  // valid only when a
+                                                          // real response body
+                                                          // was parsed (§4.2)
+    std::int64_t filled_qty_ticks{0};
+    std::int64_t avg_fill_price_ticks{0};
+    // Not populated this batch (no response-header parsing / 429 detection
+    // exists yet -- matches spot_rate_limit_budget.hpp's own already-landed
+    // "ABI reserved, not yet filled" precedent for the identically-shaped
+    // QueryResult::retry_after_* fields). retry_after_deadline_ms is ABSOLUTE
+    // UTC wall-clock ms, never a steady-clock value, per spec §4.1.
+    bool retry_after_present{false};
+    std::int64_t retry_after_deadline_ms{0};
 };
 
 struct SubmitPort {
@@ -231,11 +249,21 @@ enum class OrchestratorGate : std::uint8_t {
     // limited to the fast-reject + snapshot-carrying mechanism only, so every
     // gate that runs before the pre-trade block is completely unaffected.
     //
+    // TODO 1A.3: claimed now that submit_order()'s real response can actually
+    // distinguish an immediate partial fill from an immediate full fill at
+    // submit time (previously only ever reachable via reconciliation).
+    // Assigned by target_state, not by "is_exchange_final() == true" blanket
+    // logic -- SubmitFilled specifically means Filled, never a stand-in label
+    // for "any terminal state reached from this branch."
+    SubmitPartialFill = 18,
+    SubmitFilled = 19,
+    // = 20 (SubmitRateLimited) remains deliberately unclaimed -- matches
+    // SubmitOutcome::RateLimited's own still-unclaimed status (see below):
+    // no header-parsing/429-detection exists yet to ever produce it.
+    //
     // = 21, not 18: matches the spec's own numbering exactly (spec line
     // 835-842 — SubmitPartialFill=18, SubmitFilled=19, SubmitRateLimited=20 sit
-    // between this file's existing values and this one there). 18-20 are
-    // deliberately left unclaimed rather than "helpfully" renumbered to the
-    // next free slot — those three gates are out of scope for this round.
+    // between this file's existing values and this one there).
     SubmitStaleRulesVersion = 21,
     // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §3 (spec line 845): real durable
     // append to ctx.durable_audit was not Acked. Gate 5/9/13 (Intent/Prepared/
@@ -619,14 +647,30 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // path is unreachable under a fenced sink"), not an oversight of this round.
     switch (resp.outcome) {
         case SubmitOutcome::Accepted: {
+            // TODO 1A.3: exchange_status now actually carries the real, validated status a
+            // genuine submit_order() response parsed (Accepted/PartialFill/Filled). Left at
+            // its default OrderState::Ambiguous, it means "no specific status was populated"
+            // -- true for every pre-1A.3 mock (`g_mock_response = {SubmitOutcome::Accepted,
+            // id, code}`, a 3-arg positional init that never touches this trailing field) --
+            // and falls back to the original, simpler OrderState::Accepted behavior those
+            // mocks already depend on, not a genuine ambiguous outcome.
+            const OrderState target_state = (resp.exchange_status == OrderState::Ambiguous)
+                                                 ? OrderState::Accepted
+                                                 : resp.exchange_status;
+
             AuditRecord ar{};
             ar.timestamp_ms = ctx.now_ms;
-            ar.event_type = AuditEventType::OrderAccepted;
+            ar.event_type = (target_state == OrderState::Filled)     ? AuditEventType::OrderFilled
+                             : (target_state == OrderState::PartialFill)
+                                 ? AuditEventType::OrderPartialFill
+                                 : AuditEventType::OrderAccepted;
             ar.mode = ctx.mode;
             ar.symbol_id = ctx.symbol_id;
             ar.exchange_order_id = resp.exchange_order_id;
             ar.set_client_order_id(coid.view());
-            ar.resulting_state = OrderState::Accepted;
+            ar.resulting_state = target_state;
+            ar.filled_qty_ticks = resp.filled_qty_ticks;
+            ar.avg_fill_price_ticks = resp.avg_fill_price_ticks;
 
             if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
@@ -634,21 +678,38 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             }
 
             result.order.exchange_order_id = resp.exchange_order_id;
-            result.order.transition_to(OrderState::Accepted);
-            result.gate = OrchestratorGate::SubmitAccepted;
+            result.order.filled_qty_ticks = resp.filled_qty_ticks;
+            result.order.avg_fill_price_ticks = resp.avg_fill_price_ticks;
+            result.order.transition_to(target_state);
+            // Gate value chosen by which state was actually reached, not by finality alone
+            // -- an audit log entry should say what happened, not just whether the order is
+            // now trackable via reconciliation or not.
+            result.gate = (target_state == OrderState::Filled)     ? OrchestratorGate::SubmitFilled
+                           : (target_state == OrderState::PartialFill)
+                               ? OrchestratorGate::SubmitPartialFill
+                               : OrchestratorGate::SubmitAccepted;
             ctx.audit->append(ar);
-            if (ctx.to_reconcile) {
-                // AUDIT EXEC-INFLIGHT-003: an Accepted order keeps its in-flight slot
-                // (correctly -- it is resting on the exchange and must stay blocked
-                // against a blind resubmit), but nothing used to hand it to anyone who
-                // could ever discover its terminal state. drain_reconcile_events()
-                // releases a slot only on is_exchange_final(), so without this push the
-                // slot was unreleasable for the life of the process and 64 accepted
-                // orders fail-closed every subsequent submit. Same capacity argument as
-                // the Timeout branch below: this push only ever happens for an order
-                // that just consumed one of ctx.in_flight's <= kMaxInFlight slots, and
-                // ToReconcileRing's capacity equals kMaxInFlight, so unconsumed pushes
-                // can never outnumber ring capacity.
+
+            if (is_exchange_final(target_state)) {
+                // Filled: nothing left to discover. Release the in-flight slot now, same as
+                // the Rejected branch below -- no reconcile push, is_exchange_final() already
+                // true, drain_reconcile_events() would never have had anything to do with it.
+                // ctx.in_flight is already guaranteed non-null here (Gate
+                // InFlightRegistryUnavailable returned early otherwise), matching the
+                // Rejected branch's own unguarded call below.
+                ctx.in_flight->mark_resolved(coid.view());
+            } else if (ctx.to_reconcile) {
+                // AUDIT EXEC-INFLIGHT-003: an order that's still live (Accepted or
+                // PartialFill) keeps its in-flight slot (correctly -- it is resting on the
+                // exchange and must stay blocked against a blind resubmit), but nothing used
+                // to hand it to anyone who could ever discover its terminal state.
+                // drain_reconcile_events() releases a slot only on is_exchange_final(),
+                // so without this push the slot was unreleasable for the life of the
+                // process and 64 accepted orders fail-closed every subsequent submit. Same
+                // capacity argument as the Timeout branch below: this push only ever happens
+                // for an order that just consumed one of ctx.in_flight's <= kMaxInFlight
+                // slots, and ToReconcileRing's capacity equals kMaxInFlight, so unconsumed
+                // pushes can never outnumber ring capacity.
                 (void)ctx.to_reconcile->try_push(ReconcileIngress{in_flight_handle, result.order});
             }
             break;

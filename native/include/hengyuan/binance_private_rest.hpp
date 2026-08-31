@@ -55,6 +55,7 @@
 #include <hengyuan/binance_environment.hpp>
 #include <hengyuan/binance_query_signing.hpp>
 #include <hengyuan/binance_tls.hpp>
+#include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
 
@@ -608,6 +609,154 @@ inline QueryResult parse_order_query_response(std::string_view body,
     return result;
 }
 
+// SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §4.2: schema + field-match validation for a
+// POST /api/v3/order response, checked against what THIS call actually sent -- there is
+// no captured OrderExpectation here (submit_order() is the FIRST leg; OrderExpectation is
+// built from an OrderRecord only after a submission already exists), so the caller-supplied
+// parameters below play the same "never a live re-lookup" role §6.1.2 requires for the
+// GET-side reconciliation path. Any schema or cross-check failure collapses to
+// SubmitOutcome::NetworkError (routing into the orchestrator's existing Ambiguous path,
+// same as any other network-layer failure) -- a 2xx response whose content disagrees with
+// what was sent is not trustworthy evidence about whether the order actually went through;
+// never fabricate Accepted or Rejected from it. avg_fill_price_ticks reuses the exact same
+// checked_scaled_mul_div() formula §6.1.1/parse_order_query_response() already establish --
+// one formula, one implementation, for both code paths that compute a fill's average price
+// (spec §4.2's own requirement).
+inline SubmitResponse parse_submit_order_response(std::string_view body,
+                                                    std::string_view expected_client_order_id,
+                                                    const SymbolRules& rules_snapshot,
+                                                    OrderSide expected_side,
+                                                    OrderType expected_type,
+                                                    std::int64_t expected_price_ticks,
+                                                    std::int64_t expected_qty_ticks) noexcept {
+    auto padded = simdjson::padded_string(body);
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (parser.iterate(padded).get(doc)) {
+        return {SubmitOutcome::NetworkError, 0, -1};  // JSON parse failure
+    }
+
+    // §4.2 -- 12 required fields.
+    std::string_view symbol_sv, client_order_id_sv, price_sv, orig_qty_sv, executed_qty_sv,
+        cumulative_quote_qty_sv, status_sv, side_sv, type_sv, time_in_force_sv;
+    std::int64_t order_id = 0, transact_time_ms = 0;
+    if (doc["symbol"].get_string().get(symbol_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["orderId"].get_int64().get(order_id) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["clientOrderId"].get_string().get(client_order_id_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["transactTime"].get_int64().get(transact_time_ms) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["price"].get_string().get(price_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["origQty"].get_string().get(orig_qty_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["executedQty"].get_string().get(executed_qty_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["cummulativeQuoteQty"].get_string().get(cumulative_quote_qty_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["status"].get_string().get(status_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["timeInForce"].get_string().get(time_in_force_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["type"].get_string().get(type_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (doc["side"].get_string().get(side_sv) != simdjson::SUCCESS) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (order_id < 0 || transact_time_ms < 0) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+
+    // §4.2 -- 7-field cross-check against what THIS call actually sent, never a live lookup.
+    if (client_order_id_sv != expected_client_order_id) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (symbol_sv != rules_snapshot.symbol_name()) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (side_sv != std::string_view(order_side_name(expected_side))) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    // OrderType is frozen to exactly one member (Limit, ADR-019 D7 M7) -- the parameter is
+    // taken for ABI/future-extensibility symmetry with the rest of this submission's call
+    // signature, but the actual check is a literal comparison, matching
+    // parse_order_query_response()'s identical reasoning. expected_type is intentionally
+    // unused beyond this comment for that same reason.
+    (void)expected_type;
+    if (type_sv != "LIMIT") {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (time_in_force_sv != "GTC") {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+
+    std::int64_t price_ticks = 0, orig_qty_ticks = 0;
+    if (!parse_decimal_to_ticks_with_scale(price_sv, rules_snapshot.price_scale, price_ticks)) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (price_ticks != expected_price_ticks) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (!parse_decimal_to_ticks_with_scale(orig_qty_sv, rules_snapshot.qty_scale, orig_qty_ticks)) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (orig_qty_ticks != expected_qty_ticks) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+
+    OrderState exchange_status{};
+    if (!map_binance_order_status(status_sv, exchange_status)) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+
+    SubmitResponse resp{};
+    resp.outcome = SubmitOutcome::Accepted;
+    resp.exchange_order_id = order_id;
+    resp.exchange_status = exchange_status;
+
+    // §4.2/§6.1.1 -- avg_fill_price_ticks, only when executed_qty_ticks > 0 (never divide by
+    // zero, never fabricate a price for a fill that didn't happen).
+    std::int64_t executed_qty_ticks = 0;
+    if (!parse_decimal_to_ticks_with_scale(executed_qty_sv, rules_snapshot.qty_scale,
+                                            executed_qty_ticks)) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    if (executed_qty_ticks == 0) {
+        return resp;  // filled_qty_ticks/avg_fill_price_ticks stay at their default 0
+    }
+
+    std::int64_t cumulative_quote_qty_ticks = 0;
+    if (!parse_decimal_to_ticks_with_scale(cumulative_quote_qty_sv, rules_snapshot.quote_scale,
+                                            cumulative_quote_qty_ticks)) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+    const int exponent = static_cast<int>(rules_snapshot.price_scale) +
+                          static_cast<int>(rules_snapshot.qty_scale) -
+                          static_cast<int>(rules_snapshot.quote_scale);
+    std::int64_t avg_fill_price_ticks = 0;
+    if (!checked_scaled_mul_div(cumulative_quote_qty_ticks, exponent, executed_qty_ticks,
+                                 avg_fill_price_ticks)) {
+        return {SubmitOutcome::NetworkError, 0, -1};  // overflow -- never a fabricated price
+    }
+
+    resp.filled_qty_ticks = executed_qty_ticks;
+    resp.avg_fill_price_ticks = avg_fill_price_ticks;
+    return resp;
+}
+
 namespace detail {
 
 // Everything compute_clock_offset() needs from one real §3 round trip.
@@ -718,8 +867,14 @@ fetch_server_time_coro(std::string host, PrivateRestConfig cfg) {
     }
 }
 
+// verb: trailing default (http::verb::get, matching every existing call site's actual
+// behavior) so fetch_account()/query_order() need zero changes. TODO 1A.3's submit_order()
+// passes http::verb::post -- Binance's POST /api/v3/order accepts the fully-signed query
+// string exactly like GET does (no request body needed), so this is the only change a POST
+// caller needs; the body stays http::empty_body for both verbs.
 inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_body_coro(
-    std::string host, std::string target, std::string api_key, PrivateRestConfig cfg) {
+    std::string host, std::string target, std::string api_key, PrivateRestConfig cfg,
+    http::verb verb = http::verb::get) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     PrivateRestError current_stage = PrivateRestError::Resolve;
@@ -767,7 +922,7 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
         co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
 
-        http::request<http::empty_body> req{http::verb::get, target, 11};
+        http::request<http::empty_body> req{verb, target, 11};
         req.set(http::field::host, host);
         req.set(http::field::user_agent, "HengYuan/0.1");
         // Never negotiates compression (spec §8): no Accept-Encoding header is ever sent, so
@@ -1138,6 +1293,117 @@ public:
         }
     }
 
+    // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §2: signed, single attempt -- no internal retry
+    // (the same "retry loop lives in the caller, not here" discipline query_order() already
+    // follows; SubmitPort::call() is invoked exactly once per orchestrate_submit() attempt).
+    // Structurally mirrors query_order() (same clock-freshness gate, same
+    // build_canonical_query/build_signed_query/copy_api_key sequence, same
+    // detail::fetch_signed_body_coro reuse -- just http::verb::post instead of the default
+    // GET) with the same `noexcept`+try/catch+entry-guard discipline query_order() already
+    // established (required here for the identical reason: this method crosses
+    // SubmitPort::SubmitFn's plain C-style function-pointer ABI, which has no exception-
+    // propagation path -- an uncaught exception here would call std::terminate() on whichever
+    // thread orchestrate_submit() runs on).
+    //
+    // price_ticks/quantity_ticks are formatted to decimal strings via the new
+    // format_ticks_to_decimal() (binance_decimal.hpp) -- the reverse of the parsing this file
+    // already does everywhere else.
+    //
+    // Any non-2xx HTTP status collapses to SubmitOutcome::NetworkError (routes into the
+    // orchestrator's existing Ambiguous handling) -- this batch deliberately does not
+    // implement spec §4.4.1's HTTP-400-error-code allowlist that would let some responses be
+    // classified as a definite Rejected directly from the POST response: misclassifying a
+    // genuine Rejected as Ambiguous only costs one extra (already fully working) GET
+    // /api/v3/order round trip before query_order() correctly resolves it to Rejected; the
+    // reverse mistake -- misclassifying an ambiguous response as a confident Rejected -- is
+    // the one that actually risks a wrong conclusion, so this batch never attempts that
+    // classification at all.
+    SubmitResponse submit_order(std::string_view client_order_id, std::uint32_t symbol_id,
+                                 OrderSide side, OrderType type, std::int64_t price_ticks,
+                                 std::int64_t qty_ticks, const SymbolRules& rules_snapshot,
+                                 const PrivateRestConfig& cfg = {}) noexcept {
+        // symbol_id is part of SubmitPort::SubmitFn's ABI (matches how the orchestrator's
+        // OrchestratorContext/OrderRecord carry it), but the wire request is built from
+        // rules_snapshot.symbol_name() exclusively (§5.3's "carry the snapshot, don't
+        // re-derive" pattern) -- this parameter is genuinely unused by this implementation.
+        (void)symbol_id;
+        if (!creds_) return {SubmitOutcome::NetworkError, 0, -1};
+        if (client_order_id.empty()) return {SubmitOutcome::NetworkError, 0, -1};
+        if (rules_snapshot.symbol[0] == '\0') return {SubmitOutcome::NetworkError, 0, -1};
+        if (price_ticks <= 0 || qty_ticks <= 0) return {SubmitOutcome::NetworkError, 0, -1};
+
+        try {
+            std::int64_t fresh_ts_ms = 0;
+            if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
+                return {SubmitOutcome::NetworkError, 0, -1};  // ClockNotFresh
+            }
+
+            char price_buf[32];
+            std::size_t price_len = 0;
+            if (!format_ticks_to_decimal(price_ticks, rules_snapshot.price_scale, price_buf,
+                                          price_len)) {
+                return {SubmitOutcome::NetworkError, 0, -1};
+            }
+            char qty_buf[32];
+            std::size_t qty_len = 0;
+            if (!format_ticks_to_decimal(qty_ticks, rules_snapshot.qty_scale, qty_buf, qty_len)) {
+                return {SubmitOutcome::NetworkError, 0, -1};
+            }
+            char recv_window_buf[24];
+            const int n = std::snprintf(recv_window_buf, sizeof(recv_window_buf), "%lld",
+                                         static_cast<long long>(cfg.recv_window_ms));
+            if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(recv_window_buf)) {
+                return {SubmitOutcome::NetworkError, 0, -1};
+            }
+
+            const std::pair<std::string_view, std::string_view> params[] = {
+                {"symbol", rules_snapshot.symbol_name()},
+                {"side", std::string_view(order_side_name(side))},
+                {"type", "LIMIT"},
+                {"timeInForce", "GTC"},
+                {"quantity", std::string_view(qty_buf, qty_len)},
+                {"price", std::string_view(price_buf, price_len)},
+                {"newClientOrderId", client_order_id},
+                {"recvWindow", std::string_view(recv_window_buf, static_cast<std::size_t>(n))},
+            };
+            auto [qerr, unsigned_query] = build_canonical_query(params);
+            if (qerr != QuerySigningError::Ok) return {SubmitOutcome::NetworkError, 0, -1};
+
+            auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, fresh_ts_ms);
+            if (serr != QuerySigningError::Ok) return {SubmitOutcome::NetworkError, 0, -1};
+
+            std::array<char, kApiKeyLen> key_buf{};
+            std::size_t key_len = 0;
+            if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
+                return {SubmitOutcome::NetworkError, 0, -1};
+            }
+
+            const std::string target = "/api/v3/order?" + std::string(signed_query.wire_bytes());
+
+            net::io_context ioc;
+            std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
+            net::co_spawn(
+                ioc,
+                detail::fetch_signed_body_coro(std::string(binding_.base_host()), target,
+                                                std::string(key_buf.data(), key_len), cfg,
+                                                http::verb::post),
+                [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
+                    if (eptr) std::rethrow_exception(eptr);
+                    outcome = std::move(r);
+                });
+            ioc.run();
+
+            if (std::holds_alternative<PrivateRestError>(outcome)) {
+                return {SubmitOutcome::NetworkError, 0, -1};
+            }
+
+            return parse_submit_order_response(std::get<std::string>(outcome), client_order_id,
+                                                rules_snapshot, side, type, price_ticks, qty_ticks);
+        } catch (...) {
+            return {SubmitOutcome::NetworkError, 0, -1};  // see the noexcept note above
+        }
+    }
+
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }
 
 private:
@@ -1154,6 +1420,25 @@ private:
 inline QueryResult query_order_adapter(const OrderExpectation& expected, void* user_data) noexcept {
     if (!user_data) return {};
     return static_cast<BinancePrivateRestClient*>(user_data)->query_order(expected);
+}
+
+// Bridges BinancePrivateRestClient::submit_order() to SubmitPort::SubmitFn's plain
+// function-pointer ABI (live_submit_orchestrator.hpp) -- the production wiring: `SubmitPort{
+// &submit_order_adapter, &client, &current_rules_version_adapter}`. Mirrors
+// query_order_adapter() exactly, including the null-guard discipline -- `client_order_id`
+// guarded separately from `user_data` since orchestrate_submit() always passes a real,
+// internally-generated, non-null C string, but a defensive check here costs nothing and
+// matches this codebase's established "don't trust a C-ABI caller" posture at every other
+// adapter boundary.
+inline SubmitResponse submit_order_adapter(const char* client_order_id, std::uint32_t symbol_id,
+                                            OrderSide side, OrderType type,
+                                            std::int64_t price_ticks, std::int64_t qty_ticks,
+                                            const SymbolRules& rules_snapshot,
+                                            void* user_data) noexcept {
+    if (!user_data || !client_order_id) return {SubmitOutcome::NetworkError, 0, -1};
+    return static_cast<BinancePrivateRestClient*>(user_data)
+        ->submit_order(client_order_id, symbol_id, side, type, price_ticks, qty_ticks,
+                        rules_snapshot);
 }
 
 }  // namespace hy
