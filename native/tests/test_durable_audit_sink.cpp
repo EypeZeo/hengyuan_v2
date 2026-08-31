@@ -568,6 +568,118 @@ TEST_F(DurableAuditSinkTest, CheckpointToOrderRecordPreservesAllFields) {
     EXPECT_EQ(rec.intended_qty_ticks, 10);
 }
 
+// TODO 1A.3 follow-up: regression test for the "silently defaults to Buy"
+// bug -- OrderRecoveryCheckpoint/AuditRecord never carried side before this
+// batch, so every recovered order (regardless of its real side) silently
+// came back as OrderSide::Buy. This constructs a genuine Sell order's
+// OrderIntentCreated frame (the ONLY frame run_recovery_scan_impl() reads
+// .side from, on a fresh COID's first appearance) and confirms it survives
+// the full append -> restart -> recover -> checkpoint_to_order_record() path.
+TEST_F(DurableAuditSinkTest, CheckpointToOrderRecordPreservesSellSide) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        AuditRecord intent = make_intent("HY-SELL", 100, 10, 1);
+        intent.side = OrderSide::Sell;
+        ASSERT_TRUE(sink.append_durable(intent, 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-SELL", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-SELL", 1, 555), 1002).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].side, OrderSide::Sell);
+
+    OrderRecord rec = checkpoint_to_order_record(cps[0]);
+    EXPECT_EQ(rec.side, OrderSide::Sell);
+}
+
+TEST_F(DurableAuditSinkTest, CheckpointToOrderRecordDefaultsBuySideWhenNeverSet) {
+    // Sanity control for the test above: a genuinely-Buy order (make_intent()'s
+    // own default) round-trips as Buy, not by coincidence of an unset field.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-BUY", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-BUY", 100, 10, 1), 1001).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].side, OrderSide::Buy);
+}
+
+// --- seed_position_truth() ---
+
+// PartialFill, not Filled -- Filled is exchange-final, and
+// run_recovery_scan_impl()'s own recovery loop explicitly skips
+// exchange-final states ("nothing to recover", is_exchange_final(rs.state)),
+// so a fully-Filled order never produces a checkpoint at all. seed_position_
+// truth()'s real audience is exactly this "still resting/uncertain, needs
+// PositionTruth applied at boot before ordinary reconciliation resumes"
+// case, not the fully-resolved case (which .side's OWN companion fix,
+// applied at the moment a real order's terminal AuditRecord is written, or
+// ReconcileEvent's fold-in path -- see order_tracker.hpp -- already covers
+// for the live-process case).
+AuditRecord make_partial_fill(const char* coid, std::uint32_t symbol_id, std::int64_t exch_id,
+                               std::int64_t filled_qty, std::int64_t avg_price) {
+    AuditRecord rec{};
+    rec.timestamp_ms = 1002;
+    rec.event_type = AuditEventType::OrderPartialFill;
+    rec.mode = ExecutionMode::Live;
+    rec.symbol_id = symbol_id;
+    rec.set_client_order_id(coid);
+    rec.exchange_order_id = exch_id;
+    rec.resulting_state = OrderState::PartialFill;
+    rec.filled_qty_ticks = filled_qty;
+    rec.avg_fill_price_ticks = avg_price;
+    return rec;
+}
+
+TEST_F(DurableAuditSinkTest, SeedPositionTruthFoldsEachRecoveredCheckpointsFilledAmount) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        AuditRecord buy_intent = make_intent("HY-BUY", 100, 10, 1);
+        ASSERT_TRUE(sink.append_durable(buy_intent, 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-BUY", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_partial_fill("HY-BUY", 1, 555, 6, 100), 1002).acked());
+
+        AuditRecord sell_intent = make_intent("HY-SELL", 200, 5, 2);
+        sell_intent.side = OrderSide::Sell;
+        ASSERT_TRUE(sink.append_durable(sell_intent, 1003).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-SELL", 200, 5, 2), 1004).acked());
+        ASSERT_TRUE(sink.append_durable(make_partial_fill("HY-SELL", 2, 556, 3, 200), 1005).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 2u);
+
+    PositionTruth truth;
+    seed_position_truth(truth, cps);
+    EXPECT_EQ(truth.net_qty_ticks(1), 6);    // buy partial fill
+    EXPECT_EQ(truth.net_qty_ticks(2), -3);   // sell partial fill
+}
+
+TEST_F(DurableAuditSinkTest, SeedPositionTruthSkipsCheckpointsWithNoFill) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        // Never filled -- still Submitting/Ambiguous when the process "crashed".
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    ASSERT_EQ(cps[0].filled_qty_ticks, 0);
+
+    PositionTruth truth;
+    seed_position_truth(truth, cps);
+    EXPECT_EQ(truth.net_qty_ticks(1), 0);
+    EXPECT_EQ(truth.tracked_symbol_count(), 0u);  // no slot allocated for a zero-fill checkpoint
+}
+
 // --- Phase 4: rotate_active_key() ---
 
 TEST_F(DurableAuditSinkTest, RotateActiveKeyRequiresNewKeyAlreadyLoaded) {

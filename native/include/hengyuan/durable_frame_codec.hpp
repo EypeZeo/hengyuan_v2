@@ -41,6 +41,21 @@
 // `git log`), so the migration cost of the break is genuinely zero, same
 // reasoning this file's original scope note already used to justify skipping
 // v1/v2 legacy decode support entirely.
+//
+// FORMAT v4 -> v5 (TODO 1A.3 follow-up, minimal PositionTruth): AuditRecord
+// gained a `side` field (audit_trail.hpp) -- without it, a crash-recovered
+// OrderRecord (durable_audit_sink.hpp's checkpoint_to_order_record()) had no
+// way to tell a buy fill from a sell fill and silently defaulted every
+// recovered order to Buy. A real wire-format break, not additive, for the
+// same reason v3->v4 was: bumping kAuditRecordWireSize without also bumping
+// kFrameFormatVersion would make a pre-existing frame's payload_length
+// silently stop matching the new wire size and get misclassified as
+// PayloadLengthInvalid instead of the correct UnknownVersion -- a worse
+// failure mode than an honest version bump. Migration cost is zero, same
+// reasoning as v3->v4: per CLAUDE.md, no real testnet or production
+// credentials have ever been used against this code, so there is no real
+// deployed v4 data anywhere, only this repo's own test fixtures (updated in
+// the same commit).
 
 #pragma once
 
@@ -55,7 +70,7 @@
 
 namespace hy {
 
-inline constexpr std::uint8_t kFrameFormatVersion = 4;
+inline constexpr std::uint8_t kFrameFormatVersion = 5;
 inline constexpr std::size_t kMacLen = 32;
 
 // --- AuditRecord wire encoding (the OrderEvent payload) ---
@@ -79,7 +94,8 @@ inline constexpr std::size_t kAuditRecordWireSize =
     64 +                             // detail_msg
     1 +                              // resulting_state
     8 +                              // filled_qty_ticks
-    8;                               // avg_fill_price_ticks
+    8 +                              // avg_fill_price_ticks
+    1;                               // side
 
 namespace detail {
 
@@ -156,6 +172,10 @@ inline bool is_legal_order_state(std::uint8_t v) noexcept {
     return v <= static_cast<std::uint8_t>(OrderState::EscalatedToOperator);
 }
 
+inline bool is_legal_order_side(std::uint8_t v) noexcept {
+    return v <= static_cast<std::uint8_t>(OrderSide::Sell);
+}
+
 inline bool is_legal_durable_record_type(std::uint8_t v) noexcept {
     return v <= static_cast<std::uint8_t>(DurableRecordType::SealJournalApplied);
 }
@@ -185,6 +205,7 @@ inline void encode_audit_record(std::span<std::byte, kAuditRecordWireSize> out,
     detail::write_u8(p, static_cast<std::uint8_t>(rec.resulting_state));
     detail::write_i64_le(p, rec.filled_qty_ticks);
     detail::write_i64_le(p, rec.avg_fill_price_ticks);
+    detail::write_u8(p, static_cast<std::uint8_t>(rec.side));
 }
 
 // Decodes an AuditRecord from exactly kAuditRecordWireSize bytes. Returns
@@ -224,6 +245,11 @@ inline bool decode_audit_record(std::span<const std::byte, kAuditRecordWireSize>
 
     out.filled_qty_ticks = detail::read_i64_le(p);
     out.avg_fill_price_ticks = detail::read_i64_le(p);
+
+    const std::uint8_t side_raw = detail::read_u8(p);
+    if (!detail::is_legal_order_side(side_raw)) return false;
+    out.side = static_cast<OrderSide>(side_raw);
+
     return true;
 }
 

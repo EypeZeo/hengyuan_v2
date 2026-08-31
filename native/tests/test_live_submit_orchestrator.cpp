@@ -253,6 +253,93 @@ TEST_F(LiveSubmitTest, ExchangeStatusAmbiguousDefaultFallsBackToPlainAccepted) {
     EXPECT_EQ(r.order.state, OrderState::Accepted);
 }
 
+// --- PositionTruth direct-fill fold-in (TODO 1A.3 follow-up) ---
+
+TEST_F(LiveSubmitTest, PositionTruthUnsetIsNoOp) {
+    // Backward compatibility: every test above (and every pre-1A.3-follow-up
+    // caller) leaves ctx_.position_truth at its default nullptr and must keep
+    // behaving exactly as before -- no crash, no change in result.
+    ASSERT_EQ(ctx_.position_truth, nullptr);
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+}
+
+TEST_F(LiveSubmitTest, PlainAcceptedWithNoFillDoesNotTouchPositionTruth) {
+    PositionTruth truth;
+    ctx_.position_truth = &truth;
+    g_mock_response = {SubmitOutcome::Accepted, 12345, 0};  // filled_qty_ticks defaults to 0
+
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 0);
+    EXPECT_EQ(truth.tracked_symbol_count(), 0u);
+}
+
+TEST_F(LiveSubmitTest, ExchangeStatusPartialFillFoldsIntoPositionTruth) {
+    PositionTruth truth;
+    ctx_.position_truth = &truth;
+    ctx_.side = OrderSide::Buy;
+    bind_confirmation();  // re-bind: side is part of the confirmation binding
+
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 555;
+    g_mock_response.exchange_status = OrderState::PartialFill;
+    g_mock_response.filled_qty_ticks = 40;
+    g_mock_response.avg_fill_price_ticks = 5000;
+
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitPartialFill);
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 40);
+}
+
+TEST_F(LiveSubmitTest, ExchangeStatusFilledFoldsIntoPositionTruth) {
+    PositionTruth truth;
+    ctx_.position_truth = &truth;
+
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 556;
+    g_mock_response.exchange_status = OrderState::Filled;
+    g_mock_response.filled_qty_ticks = 100;
+    g_mock_response.avg_fill_price_ticks = 5000;
+
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitFilled);
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 100);
+}
+
+TEST_F(LiveSubmitTest, SellSideFillFoldsAsNegativePosition) {
+    PositionTruth truth;
+    ctx_.position_truth = &truth;
+    std::strncpy(account_.assets[1].asset, "BTC", 4);
+    account_.assets[1].free_ticks = 999999;  // enough base to deliver
+    account_.asset_count = 2;
+    ctx_.side = OrderSide::Sell;
+    bind_confirmation();  // re-bind: side is part of the confirmation binding
+
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 558;
+    g_mock_response.exchange_status = OrderState::Filled;
+    g_mock_response.filled_qty_ticks = 100;
+    g_mock_response.avg_fill_price_ticks = 5000;
+
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitFilled);
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), -100);
+}
+
+TEST_F(LiveSubmitTest, RejectedDoesNotTouchPositionTruth) {
+    PositionTruth truth;
+    ctx_.position_truth = &truth;
+    g_mock_response = {SubmitOutcome::Rejected, 0, -1013};
+
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitRejected);
+    EXPECT_EQ(truth.tracked_symbol_count(), 0u);
+}
+
 // --- Gate 1: Audit unavailable ---
 
 TEST_F(LiveSubmitTest, AuditUnavailableBlocks) {

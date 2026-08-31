@@ -246,3 +246,80 @@ TEST_F(DurableLogStoreTest, WriteTipAnchorToNonexistentDirectoryFailsCleanly) {
 
     EXPECT_FALSE(store.write_tip_anchor(make_bytes("wont-land")));
 }
+
+// --- IoWriteStatus classification (TODO 1A.3 follow-up) ---
+
+TEST_F(DurableLogStoreTest, LastWriteStatusIsOkAfterFreshConstruction) {
+    auto store = make_store();
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::Ok);
+}
+
+TEST_F(DurableLogStoreTest, LastWriteStatusIsOkAfterSuccessfulAppend) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("fine")));
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::Ok);
+}
+
+TEST_F(DurableLogStoreTest, WriteTipAnchorToNonexistentDirectoryIsClassifiedOtherError) {
+    // A missing directory is a real, portably-triggerable I/O failure (both
+    // platforms) that is NOT disk-full -- the correct control for proving
+    // this classification doesn't just default everything to DiskFull.
+    const std::string bogus_path = base_path_ + "_nonexistent_subdir/tip";
+    DurableLogStore store(base_path_, base_path_ + ".lock", bogus_path);
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+
+    ASSERT_FALSE(store.write_tip_anchor(make_bytes("wont-land")));
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::OtherError);
+}
+
+TEST_F(DurableLogStoreTest, LastWriteStatusIsNotStickyAcrossASubsequentSuccess) {
+    // Fail once (classified OtherError), then succeed on a fresh store over a
+    // valid path -- confirms last_write_status() reflects only the MOST
+    // RECENT call, not a latched failure from an earlier one.
+    {
+        const std::string bogus_path = base_path_ + "_nonexistent_subdir/tip";
+        DurableLogStore bad_store(base_path_, base_path_ + ".lock", bogus_path);
+        ASSERT_TRUE(bad_store.acquire_lock());
+        ASSERT_TRUE(bad_store.open_log());
+        ASSERT_FALSE(bad_store.write_tip_anchor(make_bytes("wont-land")));
+        ASSERT_EQ(bad_store.last_write_status(), IoWriteStatus::OtherError);
+    }
+    auto good_store = make_store();
+    ASSERT_TRUE(good_store.acquire_lock());
+    ASSERT_TRUE(good_store.open_log());
+    ASSERT_TRUE(good_store.write_tip_anchor(make_bytes("this-lands-fine")));
+    EXPECT_EQ(good_store.last_write_status(), IoWriteStatus::Ok);
+}
+
+#ifndef _WIN32
+// /dev/full is a real Linux device that always fails a write with ENOSPC --
+// the standard portable-on-POSIX way to genuinely trigger disk-full without
+// actually filling a real filesystem. No equivalent trick exists on Windows
+// (no portable way to force ERROR_DISK_FULL in a unit test without a real or
+// virtual full volume), so this DiskFull-specific assertion is POSIX-only;
+// the classification logic itself (record_write_failure() in
+// durable_log_store.hpp) is identical code on both platforms modulo the
+// errno/GetLastError() check, and is exercised on Windows by the
+// OtherError-path tests above plus MSVC code review of the mapping.
+TEST(DurableLogStoreDevFullTest, AppendAndFsyncOnDevFullIsClassifiedDiskFull) {
+    // /dev/full is not a "log" DurableLogStore opens itself (it opens
+    // log_path_ via O_CREAT, which /dev/full already exists and is not a
+    // regular file for) -- exercise the classification helper's contract
+    // directly through the one write path that's simplest to redirect: point
+    // log_path_ itself at /dev/full so append_and_fsync()'s ::write() call
+    // lands there.
+    DurableLogStore store("/dev/full", "/tmp/hy_dls_devfull_lock", "/tmp/hy_dls_devfull_tip");
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+
+    ASSERT_FALSE(store.append_and_fsync(make_bytes("this-will-not-fit-on-a-full-disk")));
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::DiskFull);
+
+    store.release_lock();
+    std::remove("/tmp/hy_dls_devfull_lock");
+    std::remove("/tmp/hy_dls_devfull_tip");
+}
+#endif

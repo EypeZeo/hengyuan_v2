@@ -43,6 +43,7 @@
 
 #include <hengyuan/audit_trail.hpp>
 #include <hengyuan/order_lifecycle.hpp>
+#include <hengyuan/position_truth.hpp>
 #include <hengyuan/spsc_ring.hpp>
 
 #include <array>
@@ -270,6 +271,21 @@ struct ReconcileEvent {     // reconcile thread -> hot thread: a discovered resu
     std::int64_t exchange_order_id{0};
     std::int64_t filled_qty_ticks{0};
     std::int64_t avg_fill_price_ticks{0};
+
+    // TODO 1A.3 follow-up (PositionTruth). Appended at the end, not inserted
+    // earlier -- matches this struct's own field-ordering convention.
+    // symbol_id/side: fixed at order-intent time, carried through so
+    // drain_reconcile_events() can both fix a pre-existing bug (see that
+    // function's own comment: OrderReconciled/OrderEscalated AuditRecords
+    // never set symbol_id) and fold a fill into PositionTruth.
+    // fill_delta_qty_ticks: the INCREMENTAL amount filled since the last
+    // observation (resolved.filled_qty_ticks - attempted.filled_qty_ticks at
+    // push time in poll_once()), not the cumulative total -- PositionTruth::
+    // apply_fill() needs a delta, and InFlightRegistry retains no history to
+    // derive one from on the consuming side.
+    std::uint32_t symbol_id{0};
+    OrderSide side{OrderSide::Buy};
+    std::int64_t fill_delta_qty_ticks{0};
 };
 
 static_assert(std::is_trivially_copyable_v<OrderRecord>,
@@ -499,6 +515,17 @@ inline void poll_once(OrderTracker& tracker,
         ev.exchange_order_id = resolved.exchange_order_id;
         ev.filled_qty_ticks = resolved.filled_qty_ticks;
         ev.avg_fill_price_ticks = resolved.avg_fill_price_ticks;
+        ev.symbol_id = resolved.symbol_id;
+        ev.side = resolved.side;
+        // Incremental amount filled since the last observation, not the
+        // cumulative total -- attempted.filled_qty_ticks is the pre-transition
+        // baseline this same poll_once() call started from (either the last
+        // successfully-polled figure, or 0 for a never-before-resolved order).
+        // Never negative: attempted/resolved.filled_qty_ticks only ever grows
+        // (is_valid_query_result() already rejects a response reporting less
+        // filled than previously observed), but guard with the same
+        // non-negative floor apply_fill() itself enforces, defensively.
+        ev.fill_delta_qty_ticks = resolved.filled_qty_ticks - attempted.filled_qty_ticks;
 
         if (outbound.try_push(ev)) {
             if (is_exchange_final(resolved.state)) {
@@ -528,10 +555,20 @@ inline void poll_once(OrderTracker& tracker,
 // EscalatedToOperator and the still-live Accepted/PartialFill are audited but
 // do not release (see docs/SPEC_INVARIANTS.md's InFlightRegistry entry: an
 // order that may still be live must keep its slot).
+//
+// `position_truth` is a trailing-default parameter (nullptr = no-op, same
+// backward-compatible-extension pattern as RequestWeightTracker::reset()'s
+// window_seconds and fetch_signed_body_coro's verb) -- every existing call
+// site's behavior is unchanged. When non-null, folds ev.fill_delta_qty_ticks
+// into it (only for a real transition, which is the only time a
+// ReconcileEvent exists at all; the "same state, fill grew" case is a
+// documented, pre-existing gap -- see position_truth.hpp's own header
+// comment).
 inline void drain_reconcile_events(InFlightRegistry& in_flight,
                                     AuditRingSink* audit,
                                     ReconcileEventRing& events,
-                                    std::int64_t now_ms) noexcept {
+                                    std::int64_t now_ms,
+                                    PositionTruth* position_truth = nullptr) noexcept {
     ReconcileEvent ev{};
     while (events.try_pop(ev)) {
         if (audit) {
@@ -540,12 +577,25 @@ inline void drain_reconcile_events(InFlightRegistry& in_flight,
             ar.event_type = (ev.resulting_state == OrderState::EscalatedToOperator)
                                  ? AuditEventType::OrderEscalated
                                  : AuditEventType::OrderReconciled;
+            // AUDIT ORDER-RECONCILED-SYMBOL-014: symbol_id was never assigned
+            // here since OrderReconciled/OrderEscalated were first introduced
+            // (this is the only place either is ever emitted) -- every such
+            // AuditRecord's symbol_id has been the struct's default (0) since
+            // this function landed, unlike orchestrate_submit()'s own
+            // AuditRecord constructions, which do assign ctx.symbol_id. Found
+            // and fixed as part of adding ReconcileEvent::symbol_id/side for
+            // PositionTruth below -- not a design change, a historical bug fix.
+            ar.symbol_id = ev.symbol_id;
             ar.exchange_order_id = ev.exchange_order_id;
             ar.set_client_order_id(ev.coid.view());
             ar.resulting_state = ev.resulting_state;
             ar.filled_qty_ticks = ev.filled_qty_ticks;
             ar.avg_fill_price_ticks = ev.avg_fill_price_ticks;
+            ar.side = ev.side;
             audit->append(ar);
+        }
+        if (position_truth && ev.fill_delta_qty_ticks > 0) {
+            position_truth->apply_fill(ev.symbol_id, ev.side, ev.fill_delta_qty_ticks);
         }
         if (is_exchange_final(ev.resulting_state)) {
             in_flight.mark_resolved_handle(ev.handle, ev.coid.view());

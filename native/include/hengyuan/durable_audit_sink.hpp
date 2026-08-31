@@ -46,6 +46,7 @@
 #include <hengyuan/durable_log_store.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/order_lifecycle.hpp>
+#include <hengyuan/position_truth.hpp>
 #include <hengyuan/secure_wipe.hpp>
 
 #include <array>
@@ -279,6 +280,17 @@ inline bool fill_random_bytes(std::span<std::byte> out) noexcept {
 
 }  // namespace detail
 
+// TODO 1A.3 follow-up: WHY this sink fenced, without changing fenced()'s
+// existing meaning or the unconditional-permanent-fence policy itself --
+// still fences on any failure, including DiskFull; this only makes the
+// reason diagnosable. See durable_log_store.hpp's IoWriteStatus for the same
+// framing at the platform-I/O layer this is sourced from.
+enum class FenceReason : std::uint8_t {
+    None = 0,       // not fenced
+    IoError = 1,    // encode failure, non-disk-full I/O failure, or a non-clean recovery scan
+    DiskFull = 2,   // ENOSPC/EDQUOT (POSIX) or ERROR_DISK_FULL/ERROR_HANDLE_DISK_FULL (Windows)
+};
+
 class DurableAuditSink {
 public:
     // path: base path for the log (e.g. "state/audit.log"); the lock sidecar
@@ -336,6 +348,11 @@ public:
             // is_open()/recovery_status() can report on them; append_durable()
             // itself checks fenced_.
             fenced_ = true;
+            // Not disk-full-specific: this is a recovery-time READ/scan
+            // failure (Corrupt/CapacityExceeded/IoError), never a write
+            // running out of space. recovery_status() already carries the
+            // precise reason; fence_reason() just needs to say "not none".
+            fence_reason_ = FenceReason::IoError;
         }
 
         // Phase 5 (docs/SPEC_INVARIANTS.md): store identity, same "own
@@ -361,6 +378,11 @@ public:
     // append_durable() itself refuses once fenced() regardless.
     bool is_open() const noexcept { return log_open_; }
     bool fenced() const noexcept { return fenced_; }
+    // None whenever !fenced(). Sticky once set (unlike DurableLogStore::
+    // last_write_status(), which reflects only the latest call) -- fencing
+    // itself is permanent, so the reason for it should stay readable for the
+    // rest of this object's lifetime, not just until the next failed call.
+    FenceReason fence_reason() const noexcept { return fence_reason_; }
     RecoveryScanStatus recovery_status() const noexcept { return recovery_status_; }
 
     // Every non-exchange-final order recovery_scan() found, in scan order.
@@ -402,13 +424,19 @@ public:
                                                  FrameTimeKind::ServerCorrectedUtc,
                                                  now_ms, rec, tip_mac_, hmac_key);
         if (n != kOrderEventFrameSize) {
+            // Pure encoding-size check, never touches log_store_ -- not a
+            // disk-full scenario by construction.
             fenced_ = true;
+            fence_reason_ = FenceReason::IoError;
             result.status = AuditAppendResult::Status::Failed;
             return result;
         }
 
         if (!append_bytes_to_log(buf.data(), buf.size())) {
             fenced_ = true;
+            fence_reason_ = (log_store_.last_write_status() == IoWriteStatus::DiskFull)
+                                 ? FenceReason::DiskFull
+                                 : FenceReason::IoError;
             result.status = AuditAppendResult::Status::Failed;
             return result;
         }
@@ -418,6 +446,9 @@ public:
 
         if (!write_tip_anchor(next_sequence_, this_mac, active_key_id_, hmac_key)) {
             fenced_ = true;
+            fence_reason_ = (log_store_.last_write_status() == IoWriteStatus::DiskFull)
+                                 ? FenceReason::DiskFull
+                                 : FenceReason::IoError;
             result.status = AuditAppendResult::Status::Failed;
             return result;
         }
@@ -540,6 +571,9 @@ public:
         if (next_sequence_ != 0) {
             if (!write_tip_anchor(next_sequence_ - 1, tip_mac_, new_key_id, new_hmac_key)) {
                 fenced_ = true;  // genuine I/O failure -- same self-fencing discipline as append_durable()
+                fence_reason_ = (log_store_.last_write_status() == IoWriteStatus::DiskFull)
+                                     ? FenceReason::DiskFull
+                                     : FenceReason::IoError;
                 secure_wipe(new_key_block.data(), new_key_block.size());
                 return false;
             }
@@ -610,6 +644,10 @@ private:
         std::int64_t avg_fill_price_ticks{0};
         std::uint32_t symbol_id{0};
         std::int64_t exchange_order_id{0};
+        // TODO 1A.3 follow-up (PositionTruth): captured once on first appearance,
+        // same treatment as symbol_id -- direction is fixed at order-intent time
+        // and never changes across an order's lifetime.
+        OrderSide side{OrderSide::Buy};
     };
 
     // AUDIT REC-NOEXCEPT-006: the scan below allocates in several places (the whole
@@ -704,6 +742,7 @@ private:
                 rs.intended_price_ticks = frame.record.price_ticks;
                 rs.intended_qty_ticks = frame.record.qty_ticks;
                 rs.symbol_id = frame.record.symbol_id;
+                rs.side = frame.record.side;
             } else if (frame.record.resulting_state == rs.state) {
                 if (frame.record.filled_qty_ticks < rs.filled_qty_ticks) return RecoveryScanStatus::Corrupt;
                 if (frame.record.filled_qty_ticks > rs.intended_qty_ticks) return RecoveryScanStatus::Corrupt;
@@ -774,6 +813,7 @@ private:
             cp.avg_fill_price_ticks = rs.avg_fill_price_ticks;
             cp.symbol_id = rs.symbol_id;
             cp.exchange_order_id = rs.exchange_order_id;
+            cp.side = rs.side;
             checkpoints_[checkpoint_count_++] = cp;
         }
 
@@ -1122,6 +1162,7 @@ private:
 
     bool log_open_{false};
     bool fenced_{false};
+    FenceReason fence_reason_{FenceReason::None};
     RecoveryScanStatus recovery_status_{RecoveryScanStatus::IoError};
 
     std::uint64_t next_sequence_{0};
@@ -1197,6 +1238,11 @@ inline OrderRecord checkpoint_to_order_record(const OrderRecoveryCheckpoint& cp)
     rec.intended_qty_ticks = cp.intended_qty_ticks;
     rec.filled_qty_ticks = cp.filled_qty_ticks;
     rec.avg_fill_price_ticks = cp.avg_fill_price_ticks;
+    // TODO 1A.3 follow-up (PositionTruth): this used to be missing, which meant
+    // every recovered OrderRecord silently defaulted to OrderSide::Buy
+    // regardless of the real side -- a minimal PositionTruth folding recovered
+    // orders (seed_position_truth(), below) needs the real direction.
+    rec.side = cp.side;
     return rec;
 }
 
@@ -1216,6 +1262,30 @@ inline std::size_t repopulate_in_flight_registry(InFlightRegistry& registry,
         if (registry.register_submit(std::string_view(cp.client_order_id.id))) ++registered;
     }
     return registered;
+}
+
+// TODO 1A.3 follow-up (PositionTruth): seeds a freshly-constructed (all-zero)
+// PositionTruth from recovered checkpoints at startup, the same role
+// repopulate_in_flight_registry() plays for InFlightRegistry above. Same
+// scope caveat as that function's own header comment: this does NOT wire
+// into any real process-startup call path -- orchestrate_submit() has no
+// real construction site outside test/demo harnesses today (see this
+// header's own "Startup recovery integration" note above), so there is no
+// real "process boot" code to fold this into yet. Exercised directly from
+// tests, exactly like checkpoint_to_order_record() already is.
+//
+// Each checkpoint's filled_qty_ticks is a CUMULATIVE per-order total, not a
+// delta -- but because `truth` starts at zero for every symbol here, adding
+// each checkpoint's full filled_qty_ticks once is the correct one-time seed
+// (this is establishing bootstrap state from a set of DISTINCT orders, not a
+// live incremental update against an already-partially-seeded truth; unlike
+// PositionTruth's live-path callers, which must pass a delta because their
+// target may already be non-zero).
+inline void seed_position_truth(PositionTruth& truth, std::span<const OrderRecoveryCheckpoint> checkpoints) noexcept {
+    for (const auto& cp : checkpoints) {
+        if (cp.filled_qty_ticks <= 0) continue;
+        truth.apply_fill(cp.symbol_id, cp.side, cp.filled_qty_ticks);
+    }
 }
 
 }  // namespace hy

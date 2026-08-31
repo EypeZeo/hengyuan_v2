@@ -606,6 +606,12 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_spot_rate_limit_budget)
     gtest_discover_tests(test_spot_rate_limit_budget)
 
+    # TODO 1A.3 follow-up: minimal net-quantity PositionTruth
+    add_executable(test_position_truth tests/test_position_truth.cpp)
+    target_link_libraries(test_position_truth PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_position_truth)
+    gtest_discover_tests(test_position_truth)
+
     # P2-EXEC-LIVE-01 D12-2: secure env loader (L3, file I/O + permission check)
     add_executable(test_env_loader tests/test_env_loader.cpp)
     target_link_libraries(test_env_loader PRIVATE hengyuan_core GTest::gtest_main)
