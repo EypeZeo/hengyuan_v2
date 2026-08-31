@@ -307,6 +307,13 @@ struct OrchestratorContext {
     ToReconcileRing* to_reconcile{nullptr};
     ReconcileEventRing* reconcile_events{nullptr};
 
+    // TODO 1A.3 follow-up (minimal PositionTruth). Nullable, defaults to
+    // nullptr for the same backward-compatibility reason as to_reconcile/
+    // reconcile_events above -- unset means orchestrate_submit() behaves
+    // exactly as before (no PositionTruth updates). Owned by the same thread
+    // that owns in_flight (position_truth.hpp's own THREAD OWNERSHIP note).
+    PositionTruth* position_truth{nullptr};
+
     // Order parameters
     const SymbolRules* symbol_rules{nullptr};
     // Captured by value from *symbol_rules at the top of orchestrate_submit(),
@@ -350,7 +357,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // if this thread's gates keep failing closed. Both ctx.in_flight and
     // ctx.reconcile_events must be wired for there to be anything to drain into.
     if (ctx.in_flight && ctx.reconcile_events) {
-        drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms);
+        drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms, ctx.position_truth);
     }
 
     // Gate 1: Audit available
@@ -491,6 +498,12 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.qty_ticks = ctx.qty_ticks;
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
+        // The first durable frame ever written for this coid (resulting_state
+        // == Intent) -- run_recovery_scan_impl() reads .side from exactly this
+        // frame on a fresh COID's first appearance (durable_audit_sink.hpp),
+        // so this is the load-bearing site for PositionTruth's recovery path,
+        // not just completeness.
+        ar.side = ctx.side;
         ctx.audit->append(ar);
 
         // Gate 10b (spec §3/§6.2): real durable Ack, fail closed, before
@@ -521,6 +534,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.symbol_id = ctx.symbol_id;
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
+        ar.side = ctx.side;
         ar.set_detail("confirmation does not authorize this order");
         ctx.audit->append(ar);
         return result;
@@ -535,6 +549,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.mode = ctx.mode;
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
+        ar.side = ctx.side;
         ar.set_detail("submit port invalid");
         ctx.audit->append(ar);
         return result;
@@ -561,6 +576,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.mode = ctx.mode;
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
+        ar.side = ctx.side;
         ctx.audit->append(ar);
         return result;
     }
@@ -578,6 +594,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.mode = ctx.mode;
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
+        ar.side = ctx.side;
         ar.set_detail("duplicate in-flight - reconcile, do NOT resubmit");
         ctx.audit->append(ar);
         return result;
@@ -599,6 +616,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.qty_ticks = ctx.qty_ticks;
         ar.set_client_order_id(coid.view());
         ar.resulting_state = OrderState::Submitting;  // target state this record authorizes; not applied yet
+        ar.side = ctx.side;
 
         if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
             // Never release the in-flight slot here -- a Failed result may still
@@ -622,6 +640,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.qty_ticks = ctx.qty_ticks;
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
+        ar.side = ctx.side;
         ctx.audit->append(ar);
     }
 
@@ -671,6 +690,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.resulting_state = target_state;
             ar.filled_qty_ticks = resp.filled_qty_ticks;
             ar.avg_fill_price_ticks = resp.avg_fill_price_ticks;
+            ar.side = ctx.side;
 
             if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
@@ -689,6 +709,16 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                                ? OrchestratorGate::SubmitPartialFill
                                : OrchestratorGate::SubmitAccepted;
             ctx.audit->append(ar);
+
+            // TODO 1A.3 follow-up (PositionTruth): first-observed fill on the
+            // direct-POST path (baseline is always 0 here -- this coid was just
+            // registered in-flight moments ago, it cannot have been folded in
+            // before), so the full amount IS the delta. apply_fill() itself
+            // no-ops when resp.filled_qty_ticks <= 0 (the plain Accepted-with-
+            // no-fill-yet case), so no target_state branch is needed here.
+            if (ctx.position_truth) {
+                ctx.position_truth->apply_fill(ctx.symbol_id, ctx.side, resp.filled_qty_ticks);
+            }
 
             if (is_exchange_final(target_state)) {
                 // Filled: nothing left to discover. Release the in-flight slot now, same as
@@ -724,6 +754,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.detail_code = resp.error_code;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Rejected;
+            ar.side = ctx.side;
             ar.set_detail("exchange rejected");
 
             if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
@@ -750,6 +781,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.symbol_id = ctx.symbol_id;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Ambiguous;
+            ar.side = ctx.side;
             ar.set_detail("POST timeout - ambiguous, do NOT retry");
 
             if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
@@ -781,6 +813,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.symbol_id = ctx.symbol_id;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Ambiguous;
+            ar.side = ctx.side;
             ar.set_detail("network error - ambiguous");
 
             if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
@@ -816,6 +849,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.symbol_id = ctx.symbol_id;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Ambiguous;
+            ar.side = ctx.side;
             ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
 
             if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {

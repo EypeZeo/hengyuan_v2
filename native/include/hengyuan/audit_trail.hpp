@@ -105,6 +105,18 @@ struct AuditRecord {
     std::int64_t filled_qty_ticks{0};
     std::int64_t avg_fill_price_ticks{0};
 
+    // TODO 1A.3 follow-up (PositionTruth): direction was never durably recorded
+    // before this field -- durable_control_plane.hpp's OrderRecoveryCheckpoint
+    // deliberately scoped it out ("Deliberately NOT chasing the spec text's
+    // other proposed fields (side, ...)"), which meant a crash-recovered
+    // OrderRecord silently defaulted to Buy for every order regardless of its
+    // real side. Appended at the end, matching this struct's own convention
+    // for resulting_state/filled_qty_ticks/avg_fill_price_ticks above (added
+    // as a trailing block, not inserted earlier) -- the minimal diff, and
+    // consistent with how durable_frame_codec.hpp encodes/decodes fields in
+    // declaration order.
+    OrderSide side{OrderSide::Buy};
+
     void set_client_order_id(std::string_view coid) noexcept {
         auto len = coid.size() < kClientOrderIdLen ? coid.size() : kClientOrderIdLen;
         std::memcpy(client_order_id, coid.data(), len);

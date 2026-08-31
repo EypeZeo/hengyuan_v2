@@ -305,6 +305,43 @@ TEST_F(OrderTrackerTest, LivePartialFillGrowthUpdatesRecordWithoutEvent) {
     EXPECT_EQ(tracker_.count(), 0u);
 }
 
+// --- ReconcileEvent symbol_id/side/fill_delta_qty_ticks (TODO 1A.3 follow-up) ---
+
+TEST_F(OrderTrackerTest, ReconcileEventCarriesSymbolIdSideAndFillDelta) {
+    auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
+    rec.symbol_id = 7;
+    rec.side = OrderSide::Sell;
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.symbol_id, 7u);
+    EXPECT_EQ(ev.side, OrderSide::Sell);
+    // Baseline was 0 (never polled before track()) -> full amount is the delta.
+    EXPECT_EQ(ev.fill_delta_qty_ticks, 100);
+}
+
+TEST_F(OrderTrackerTest, ReconcileEventFillDeltaIsIncrementalNotCumulative) {
+    // PartialFill(40) already resting when tracked (as if a prior poll had
+    // already observed 40 filled), THEN discovered PartialFill(60) growing to
+    // Filled(100) on this poll -- the delta must be 100-40=60, not the full
+    // 100, or PositionTruth would double-count the first 40.
+    auto rec = make_live_record("HY-LIVE", OrderState::PartialFill);
+    rec.filled_qty_ticks = 40;
+    rec.avg_fill_price_ticks = 5000;
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.fill_delta_qty_ticks, 60);
+}
+
 TEST_F(OrderTrackerTest, FilledWithShortQuantityIsRejected) {
     // An exchange (or a buggy adapter) claiming FILLED while filled_qty is short of
     // intended must not release the in-flight slot on an order that still has
@@ -639,6 +676,94 @@ TEST_F(DrainEventsTest, NullAuditSinkIsToleratedNotCrashed) {
     ASSERT_TRUE(events_.try_push(ev));
 
     drain_reconcile_events(in_flight_, /*audit=*/nullptr, events_, 2000);
+
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+}
+
+// TODO 1A.3 follow-up: regression test for a real, pre-existing bug found
+// while adding these fields -- drain_reconcile_events() is the ONLY place
+// OrderReconciled/OrderEscalated AuditRecords are ever emitted, and it never
+// assigned ar.symbol_id (or, before this batch, ar.side) at all. Every such
+// AuditRecord's symbol_id had been the struct's default (0) since this
+// function landed, unlike orchestrate_submit()'s own AuditRecord
+// constructions, which do assign ctx.symbol_id.
+TEST_F(DrainEventsTest, SymbolIdAndSideCarriedIntoAuditRecord) {
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::Filled;
+    ev.symbol_id = 9;
+    ev.side = OrderSide::Sell;
+    ASSERT_TRUE(events_.try_push(ev));
+
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000);
+
+    ASSERT_NE(audit_.count(), 0u);
+    EXPECT_EQ(audit_.last()->symbol_id, 9u);
+    EXPECT_EQ(audit_.last()->side, OrderSide::Sell);
+}
+
+// --- PositionTruth fold-in ---
+
+TEST_F(DrainEventsTest, PositionTruthFoldsPositiveFillDelta) {
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::Filled;
+    ev.symbol_id = 3;
+    ev.side = OrderSide::Buy;
+    ev.fill_delta_qty_ticks = 25;
+    ASSERT_TRUE(events_.try_push(ev));
+
+    PositionTruth truth;
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, &truth);
+
+    EXPECT_EQ(truth.net_qty_ticks(3), 25);
+}
+
+TEST_F(DrainEventsTest, PositionTruthIgnoresNonPositiveFillDelta) {
+    // A state transition with no fill growth (e.g. Accepted -> Cancelled)
+    // must not touch PositionTruth at all.
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::Cancelled;
+    ev.symbol_id = 3;
+    ev.fill_delta_qty_ticks = 0;
+    ASSERT_TRUE(events_.try_push(ev));
+
+    PositionTruth truth;
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, &truth);
+
+    EXPECT_EQ(truth.net_qty_ticks(3), 0);
+    EXPECT_EQ(truth.tracked_symbol_count(), 0u);
+}
+
+TEST_F(DrainEventsTest, NullPositionTruthIsToleratedNotCrashed) {
+    // Trailing-default-parameter backward compatibility -- every existing
+    // call site (this file's own earlier tests, live_submit_orchestrator.hpp
+    // callers that predate this batch) omits the argument entirely and must
+    // keep behaving exactly as before.
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::Filled;
+    ev.fill_delta_qty_ticks = 10;
+    ASSERT_TRUE(events_.try_push(ev));
+
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000);  // no position_truth argument
 
     EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
 }

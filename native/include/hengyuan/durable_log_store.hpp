@@ -107,6 +107,24 @@ inline auto retry_on_eintr(Fn&& fn) noexcept -> decltype(fn()) {
 
 }  // namespace detail
 
+// TODO 1A.3 follow-up: classifies WHY the most recent append_and_fsync()/
+// write_tip_anchor() call returned false, without changing either method's
+// existing bool return -- every call site in this codebase (DurableAuditSink,
+// ControlPlaneLogSink) keeps compiling and behaving identically. Disk-full
+// and every other I/O failure (corruption, permissions, hardware fault) used
+// to collapse into the same plain `false`, indistinguishable to an operator
+// after DurableAuditSink permanently fences on either. This does NOT change
+// that fencing policy -- still unconditional and permanent on any failure
+// including DiskFull -- it only makes the reason diagnosable. Loosening
+// fencing (e.g. retrying after ENOSPC clears) is a separate, materially
+// riskier state-machine change against ADR-019 D10's fail-closed invariant,
+// explicitly out of scope here.
+enum class IoWriteStatus : std::uint8_t {
+    Ok = 0,
+    DiskFull = 1,   // ENOSPC/EDQUOT (POSIX), ERROR_DISK_FULL/ERROR_HANDLE_DISK_FULL (Windows)
+    OtherError = 2,  // anything else -- corruption, permissions, hardware fault, etc.
+};
+
 class DurableLogStore {
 public:
     // log_path: the durable log file itself. lock_path: OS-level exclusive
@@ -129,6 +147,14 @@ public:
     DurableLogStore& operator=(DurableLogStore&&) = delete;
 
     bool is_log_open() const noexcept { return log_open_; }
+
+    // Reflects the outcome of the MOST RECENT append_and_fsync()/
+    // write_tip_anchor() call only -- Ok after a successful one, DiskFull/
+    // OtherError after a failed one. Not sticky across calls (a later
+    // successful write resets it to Ok), so callers that want to record a
+    // failure's reason must read this immediately after that call returns
+    // false, before making any other call on this object.
+    IoWriteStatus last_write_status() const noexcept { return last_write_status_; }
 
     // --- Platform I/O (verbatim port of DurableAuditSink's pre-existing
     // platform branches, one file lower so ControlPlaneLogSink can share it
@@ -173,13 +199,28 @@ public:
         return ok && static_cast<std::size_t>(read_bytes) == out.size();
     }
     bool append_and_fsync(std::span<const std::byte> bytes) noexcept {
-        if (SetFilePointer(log_handle_, 0, nullptr, FILE_END) == INVALID_SET_FILE_POINTER) return false;
-        DWORD written = 0;
-        if (!WriteFile(log_handle_, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr)) {
+        last_write_status_ = IoWriteStatus::Ok;
+        if (SetFilePointer(log_handle_, 0, nullptr, FILE_END) == INVALID_SET_FILE_POINTER) {
+            record_write_failure();
             return false;
         }
-        if (static_cast<std::size_t>(written) != bytes.size()) return false;
-        return FlushFileBuffers(log_handle_) != 0;
+        DWORD written = 0;
+        if (!WriteFile(log_handle_, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr)) {
+            record_write_failure();
+            return false;
+        }
+        if (static_cast<std::size_t>(written) != bytes.size()) {
+            // Short write with no Win32 error reported (rare, but the API
+            // permits it) -- not attributable to a specific errno-like cause,
+            // classify as OtherError rather than guessing DiskFull.
+            last_write_status_ = IoWriteStatus::OtherError;
+            return false;
+        }
+        if (FlushFileBuffers(log_handle_) == 0) {
+            record_write_failure();
+            return false;
+        }
+        return true;
     }
     std::uint64_t log_size() const noexcept {
         LARGE_INTEGER size{};
@@ -215,22 +256,41 @@ public:
         return true;
     }
     bool write_tip_anchor(std::span<const std::byte> anchor_bytes) noexcept {
+        last_write_status_ = IoWriteStatus::Ok;
         const std::string tmp_path = tip_path_ + ".tmp";
         HANDLE h = CreateFileA(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return false;
+        if (h == INVALID_HANDLE_VALUE) {
+            record_write_failure();
+            return false;
+        }
         DWORD written = 0;
-        BOOL ok = WriteFile(h, anchor_bytes.data(), static_cast<DWORD>(anchor_bytes.size()), &written, nullptr);
-        ok = ok && (static_cast<std::size_t>(written) == anchor_bytes.size());
-        ok = ok && FlushFileBuffers(h);
+        if (!WriteFile(h, anchor_bytes.data(), static_cast<DWORD>(anchor_bytes.size()), &written, nullptr)) {
+            record_write_failure();
+            CloseHandle(h);
+            return false;
+        }
+        if (static_cast<std::size_t>(written) != anchor_bytes.size()) {
+            last_write_status_ = IoWriteStatus::OtherError;  // short write, no Win32 error to classify
+            CloseHandle(h);
+            return false;
+        }
+        if (!FlushFileBuffers(h)) {
+            record_write_failure();
+            CloseHandle(h);
+            return false;
+        }
         CloseHandle(h);
-        if (!ok) return false;
 
         // MOVEFILE_WRITE_THROUGH: NTFS + FlushFileBuffers on the file handle
         // above is the honest contract here -- this is NOT POSIX directory-
         // fsync equivalence (no parent-directory metadata flush on Windows).
-        return MoveFileExA(tmp_path.c_str(), tip_path_.c_str(),
-                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+        if (MoveFileExA(tmp_path.c_str(), tip_path_.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+            record_write_failure();
+            return false;
+        }
+        return true;
     }
     bool read_tip_anchor(std::vector<std::byte>& out) noexcept {
         HANDLE h = CreateFileA(tip_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -257,6 +317,13 @@ public:
     }
 
 private:
+    void record_write_failure() noexcept {
+        const DWORD err = GetLastError();
+        last_write_status_ = (err == ERROR_DISK_FULL || err == ERROR_HANDLE_DISK_FULL)
+                                  ? IoWriteStatus::DiskFull
+                                  : IoWriteStatus::OtherError;
+    }
+
     HANDLE lock_handle_{INVALID_HANDLE_VALUE};
     HANDLE log_handle_{INVALID_HANDLE_VALUE};
 
@@ -308,15 +375,35 @@ public:
         return true;
     }
     bool append_and_fsync(std::span<const std::byte> bytes) noexcept {
-        if (::lseek(log_fd_, 0, SEEK_END) < 0) return false;
+        last_write_status_ = IoWriteStatus::Ok;
+        if (::lseek(log_fd_, 0, SEEK_END) < 0) {
+            record_write_failure();
+            return false;
+        }
         std::size_t total = 0;
         while (total < bytes.size()) {
             const ssize_t written = detail::retry_on_eintr(
                 [&] { return ::write(log_fd_, bytes.data() + total, bytes.size() - total); });
-            if (written <= 0) return false;
+            if (written <= 0) {
+                // written == 0 (no error, nothing written) is as unrecoverable
+                // here as a real error -- there is no legal "short write, try
+                // again later" for a regular file -- but errno is not
+                // meaningful in that case, so don't misattribute it to
+                // whatever errno happens to hold.
+                if (written < 0) {
+                    record_write_failure();
+                } else {
+                    last_write_status_ = IoWriteStatus::OtherError;
+                }
+                return false;
+            }
             total += static_cast<std::size_t>(written);
         }
-        return detail::retry_on_eintr([&] { return ::fsync(log_fd_); }) == 0;
+        if (detail::retry_on_eintr([&] { return ::fsync(log_fd_); }) != 0) {
+            record_write_failure();
+            return false;
+        }
+        return true;
     }
     std::uint64_t log_size() const noexcept {
         struct stat st{};
@@ -342,9 +429,13 @@ public:
         return true;
     }
     bool write_tip_anchor(std::span<const std::byte> anchor_bytes) noexcept {
+        last_write_status_ = IoWriteStatus::Ok;
         const std::string tmp_path = tip_path_ + ".tmp";
         int fd = ::open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0) return false;
+        if (fd < 0) {
+            record_write_failure();
+            return false;
+        }
         std::size_t total = 0;
         bool ok = true;
         while (ok && total < anchor_bytes.size()) {
@@ -352,16 +443,27 @@ public:
                 return ::write(fd, anchor_bytes.data() + total, anchor_bytes.size() - total);
             });
             if (written <= 0) {
+                if (written < 0) {
+                    record_write_failure();
+                } else {
+                    last_write_status_ = IoWriteStatus::OtherError;  // 0 bytes, errno not meaningful
+                }
                 ok = false;
                 break;
             }
             total += static_cast<std::size_t>(written);
         }
-        ok = ok && (detail::retry_on_eintr([&] { return ::fsync(fd); }) == 0);
+        if (ok && detail::retry_on_eintr([&] { return ::fsync(fd); }) != 0) {
+            record_write_failure();
+            ok = false;
+        }
         ::close(fd);
         if (!ok) return false;
 
-        if (::rename(tmp_path.c_str(), tip_path_.c_str()) != 0) return false;
+        if (::rename(tmp_path.c_str(), tip_path_.c_str()) != 0) {
+            record_write_failure();
+            return false;
+        }
 
         // Directory-entry fsync: the rename itself needs the containing
         // directory's metadata flushed for crash-durability, not just the
@@ -369,8 +471,12 @@ public:
         const auto slash = tip_path_.find_last_of('/');
         const std::string dir = (slash == std::string::npos) ? "." : tip_path_.substr(0, slash);
         int dir_fd = ::open(dir.c_str(), O_RDONLY);
-        if (dir_fd < 0) return false;
+        if (dir_fd < 0) {
+            record_write_failure();
+            return false;
+        }
         const bool dir_ok = (detail::retry_on_eintr([&] { return ::fsync(dir_fd); }) == 0);
+        if (!dir_ok) record_write_failure();
         ::close(dir_fd);
         return dir_ok;
     }
@@ -409,6 +515,11 @@ public:
     }
 
 private:
+    void record_write_failure() noexcept {
+        last_write_status_ =
+            (errno == ENOSPC || errno == EDQUOT) ? IoWriteStatus::DiskFull : IoWriteStatus::OtherError;
+    }
+
     int lock_fd_{-1};
     int log_fd_{-1};
 #endif
@@ -418,6 +529,7 @@ private:
     std::string lock_path_;
     std::string tip_path_;
     bool log_open_{false};
+    IoWriteStatus last_write_status_{IoWriteStatus::Ok};
 };
 
 }  // namespace hy

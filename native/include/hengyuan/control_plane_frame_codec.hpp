@@ -1582,7 +1582,8 @@ inline FrameDecodeStatus decode_snapshot_frame(std::span<const std::byte> in, st
 // Layout (marker occupies the same structural position
 // write_control_plane_header's format_version byte does, but is a reserved
 // sentinel -- 0xFE -- chosen to be unambiguously distinct from
-// kFrameFormatVersion (4) and any plausible future growth of that shared
+// kFrameFormatVersion (5 as of TODO 1A.3's follow-up bump) and any plausible
+// further growth of that shared
 // envelope's version number, so a mixed-type scan can peek byte 0 and know
 // which decoder to call before ever touching DurableRecordType/
 // is_legal_durable_record_type at all):

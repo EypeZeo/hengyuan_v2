@@ -1851,12 +1851,20 @@ struct OrderRecoveryCheckpoint {
     // carries both, and OrderRecord needs both restored for correctness (order
     // book/exposure accounting needs symbol_id; a resolved order's exchange
     // identity needs exchange_order_id), not just diagnostics. Deliberately NOT
-    // chasing the spec text's other proposed fields (side, order_type, a
+    // chasing the spec text's other proposed fields (order_type, a
     // rules_snapshot-at-submit SymbolRules join, an escalated-ledger array) --
     // those pull in symbol-registry-snapshot recovery, out of scope for the
     // minimal durable-log slice this struct currently serves.
     std::uint32_t symbol_id{0};
     std::int64_t exchange_order_id{0};
+
+    // TODO 1A.3 follow-up (PositionTruth): this reverses the "side" half of the
+    // "Deliberately NOT chasing" note above -- a minimal PositionTruth folding
+    // recovered orders (durable_audit_sink.hpp's checkpoint_to_order_record())
+    // needs to tell a buy fill from a sell fill, and nothing needed side before
+    // now. order_type/the SymbolRules join/escalated-ledger array remain out of
+    // scope, unchanged.
+    OrderSide side{OrderSide::Buy};
 };
 static_assert(std::is_trivially_copyable_v<OrderRecoveryCheckpoint>);
 static_assert(std::is_standard_layout_v<OrderRecoveryCheckpoint>);

@@ -33,6 +33,7 @@ AuditRecord make_sample_record() {
     rec.resulting_state = OrderState::Filled;
     rec.filled_qty_ticks = 100;
     rec.avg_fill_price_ticks = 499950;
+    rec.side = OrderSide::Sell;  // non-default, matches every other field's convention here
     return rec;
 }
 
@@ -63,6 +64,7 @@ TEST(AuditRecordCodec, RoundTripPreservesEveryField) {
     EXPECT_EQ(decoded.resulting_state, rec.resulting_state);
     EXPECT_EQ(decoded.filled_qty_ticks, rec.filled_qty_ticks);
     EXPECT_EQ(decoded.avg_fill_price_ticks, rec.avg_fill_price_ticks);
+    EXPECT_EQ(decoded.side, rec.side);
 }
 
 TEST(AuditRecordCodec, DefaultConstructedRecordRoundTrips) {
@@ -73,6 +75,7 @@ TEST(AuditRecordCodec, DefaultConstructedRecordRoundTrips) {
     ASSERT_TRUE(decode_audit_record(buf, decoded));
     EXPECT_EQ(decoded.event_type, AuditEventType::OrderIntentCreated);
     EXPECT_EQ(decoded.resulting_state, OrderState::Intent);
+    EXPECT_EQ(decoded.side, OrderSide::Buy);
 }
 
 TEST(AuditRecordCodec, OutOfRangeEventTypeRejected) {
@@ -88,10 +91,21 @@ TEST(AuditRecordCodec, OutOfRangeResultingStateRejected) {
     AuditRecord rec = make_sample_record();
     std::array<std::byte, kAuditRecordWireSize> buf{};
     encode_audit_record(buf, rec);
-    // resulting_state is the last single byte before the two trailing i64
-    // fields: offset = kAuditRecordWireSize - 8 - 8 - 1.
-    const std::size_t offset = kAuditRecordWireSize - 8 - 8 - 1;
+    // resulting_state sits before filled_qty_ticks(8) + avg_fill_price_ticks(8)
+    // + side(1), the three fields written after it:
+    // offset = kAuditRecordWireSize - 8 - 8 - 1(side) - 1(resulting_state itself).
+    const std::size_t offset = kAuditRecordWireSize - 8 - 8 - 1 - 1;
     buf[offset] = std::byte{200};
+    AuditRecord decoded{};
+    EXPECT_FALSE(decode_audit_record(buf, decoded));
+}
+
+TEST(AuditRecordCodec, OutOfRangeSideRejected) {
+    AuditRecord rec = make_sample_record();
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+    // side is the very last byte of the payload.
+    buf[kAuditRecordWireSize - 1] = std::byte{200};
     AuditRecord decoded{};
     EXPECT_FALSE(decode_audit_record(buf, decoded));
 }
@@ -245,7 +259,7 @@ TEST(OrderEventFrameCodec, WrongFormatVersionRejected) {
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
     encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
-    buf[0] = std::byte{5};  // valid-looking but not kFrameFormatVersion(4)
+    buf[0] = std::byte{6};  // valid-looking but not kFrameFormatVersion(5)
 
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
