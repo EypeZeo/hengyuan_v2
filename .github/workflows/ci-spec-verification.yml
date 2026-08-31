@@ -48,11 +48,20 @@ on:
       - 'docs/BINANCE_PRIVATE_REST_L4_SPEC.md'
       - 'tools/**'
       - 'formal/**'
-      - 'native/include/hengyuan/durable_control_plane.hpp'
-      - 'native/include/hengyuan/order_lifecycle.hpp'
-      - 'native/include/hengyuan/compaction_lease.hpp'
-      - 'native/include/hengyuan/compaction_intent_store.hpp'
-      - 'native/include/hengyuan/compaction_intent_codec.hpp'
+      # Was 5 hardcoded filenames (durable_control_plane.hpp, order_lifecycle.hpp,
+      # compaction_lease.hpp, compaction_intent_store.hpp, compaction_intent_codec.hpp).
+      # tools/spec_enum_diff.py's own scan scope is a full glob over this directory
+      # (HEADER_DIR.glob("*.hpp"), no subdirectories exist here) -- the hardcoded
+      # subset silently let PRs that touched an unlisted header (e.g. TODO 1A.2's
+      # spot_rate_limit_budget.hpp) merge with ZERO CI Spec Verification runs, not
+      # a skip: GitHub Actions never even created a run, and main-merge-guard.yml
+      # treats that null status as a pass. Confirmed via `gh run list` against PRs
+      # #67/#68/#69/#71 -- each got 0 runs; #71 shipped a real enum VALUE_CONFLICT
+      # (PrivateRestEndpoint numbering vs L4 spec §7.4) that only surfaced later, on
+      # PR #72, because that PR happened to also touch order_lifecycle.hpp. Glob
+      # matches the tool's actual scan scope exactly instead of a hand-maintained
+      # subset that silently drifts out of sync with new headers.
+      - 'native/include/hengyuan/*.hpp'
       - '.github/workflows/ci-spec-verification.yml'
   pull_request:
     branches: [master]
@@ -62,11 +71,7 @@ on:
       - 'docs/BINANCE_PRIVATE_REST_L4_SPEC.md'
       - 'tools/**'
       - 'formal/**'
-      - 'native/include/hengyuan/durable_control_plane.hpp'
-      - 'native/include/hengyuan/order_lifecycle.hpp'
-      - 'native/include/hengyuan/compaction_lease.hpp'
-      - 'native/include/hengyuan/compaction_intent_store.hpp'
-      - 'native/include/hengyuan/compaction_intent_codec.hpp'
+      - 'native/include/hengyuan/*.hpp'
       - '.github/workflows/ci-spec-verification.yml'
   workflow_dispatch:
 
