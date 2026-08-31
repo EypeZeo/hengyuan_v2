@@ -47,28 +47,33 @@
 
 namespace hy {
 
-// --- Endpoints this codebase actually calls (binance_private_rest.hpp /
-// live_submit_orchestrator.hpp's SubmitPort) ---
-//
-// Deliberately NOT the full Binance-documented endpoint table: an enum value with no
-// real call site (e.g. GetRateLimitOrder, §7.1.1's ORDERS startup baseline) would be
-// dead, untestable surface.
+// --- Endpoint enum: numeric values pinned to match L4 spec §7.4's PrivateRestEndpoint
+// (docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2313) exactly, checked build-time by
+// tools/spec_enum_diff.py (CI Spec Verification). GetRateLimitOrder=3 has no real call
+// site in this codebase this batch (no caller wires GET /api/v3/rateLimit/order yet --
+// see this file's header comment on scope) but MUST keep the spec's numeric slot: a
+// codebase-only subset enum (omitting it and shifting GetExchangeInfo/GetServerTime
+// down by one) is exactly the VALUE_CONFLICT this tool exists to catch, since it
+// silently reinterprets any wire/persisted discriminator sharing this numbering.
+// Transcribe the spec block verbatim rather than adjusting the spec to match the code.
 enum class PrivateRestEndpoint : std::uint8_t {
-    PostOrder = 0,        // POST /api/v3/order        (live_submit_orchestrator.hpp Gate 12c)
-    GetOrder = 1,          // GET  /api/v3/order         (order_tracker.hpp QueryPort, reconcile thread)
-    GetAccount = 2,        // GET  /api/v3/account
-    GetExchangeInfo = 3,   // GET  /api/v3/exchangeInfo
-    GetServerTime = 4,     // GET  /api/v3/time
+    PostOrder = 0,           // POST /api/v3/order        (live_submit_orchestrator.hpp Gate 12c)
+    GetOrder = 1,             // GET  /api/v3/order         (order_tracker.hpp QueryPort, reconcile thread)
+    GetAccount = 2,           // GET  /api/v3/account
+    GetRateLimitOrder = 3,    // GET  /api/v3/rateLimit/order -- reserved spec slot, no caller this batch
+    GetExchangeInfo = 4,      // GET  /api/v3/exchangeInfo
+    GetServerTime = 5,        // GET  /api/v3/time
 };
-inline constexpr std::size_t kPrivateRestEndpointCount = 5;
+inline constexpr std::size_t kPrivateRestEndpointCount = 6;
 
 // Binance spot REST documented weights (IP-scoped), pinned to match L4 spec §7.4's
-// kPinnedEndpointWeight values for these 5 endpoints exactly.
+// kPinnedEndpointWeight values for these 6 endpoints exactly.
 struct EndpointWeightTable {
     std::uint32_t weights[kPrivateRestEndpointCount] = {
         /*PostOrder*/ 1u,
         /*GetOrder*/ 4u,
         /*GetAccount*/ 20u,
+        /*GetRateLimitOrder*/ 40u,
         /*GetExchangeInfo*/ 20u,
         /*GetServerTime*/ 1u,
     };
