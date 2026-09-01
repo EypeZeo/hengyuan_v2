@@ -28,6 +28,7 @@
 
 #include <hengyuan/account_truth.hpp>
 #include <hengyuan/audit_trail.hpp>
+#include <hengyuan/binance_user_data_event.hpp>
 #include <hengyuan/dry_run_evidence.hpp>
 #include <hengyuan/durable_audit_sink.hpp>
 #include <hengyuan/exit_safety.hpp>
@@ -307,6 +308,11 @@ struct OrchestratorContext {
     ToReconcileRing* to_reconcile{nullptr};
     ReconcileEventRing* reconcile_events{nullptr};
 
+    // TODO 1A.4: WS user-data-stream event drain, same nullable/backward-compatible-default
+    // convention as reconcile_events above -- unset means orchestrate_submit() behaves exactly
+    // as before (no WS event draining).
+    UserDataWsEventRing* user_data_events{nullptr};
+
     // TODO 1A.3 follow-up (minimal PositionTruth). Nullable, defaults to
     // nullptr for the same backward-compatibility reason as to_reconcile/
     // reconcile_events above -- unset means orchestrate_submit() behaves
@@ -358,6 +364,13 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // ctx.reconcile_events must be wired for there to be anything to drain into.
     if (ctx.in_flight && ctx.reconcile_events) {
         drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms, ctx.position_truth);
+    }
+    // TODO 1A.4: same unconditional-before-gates placement and reasoning as the reconcile drain
+    // above -- even a KillSwitch-halted or audit-unavailable call still owns the only writer
+    // access to ctx.in_flight/ctx.audit on this thread, so draining WS-observed events here
+    // rather than deferring keeps them from piling up for an arbitrarily long time.
+    if (ctx.in_flight && ctx.user_data_events) {
+        drain_user_data_events(*ctx.in_flight, ctx.audit, *ctx.user_data_events, ctx.now_ms);
     }
 
     // Gate 1: Audit available

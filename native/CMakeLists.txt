@@ -156,6 +156,24 @@ if(HY_BUILD_DEMO)
     hengyuan_set_warnings(binance_feed_demo)
     hengyuan_allow_third_party_tsan_fences(binance_feed_demo)
 
+    # TODO 1A.4 prerequisite: first process in native/src/ that actually runs
+    # poll_once()/drain_reconcile_events() in a continuous loop (previously test-only),
+    # alongside a real BinanceUserDataWsSession on a second thread. See the file's own
+    # header comment for exactly what's real vs. simulated here.
+    add_executable(live_submit_reconcile_harness_demo src/live_submit_reconcile_harness_demo.cpp)
+    target_link_libraries(live_submit_reconcile_harness_demo PRIVATE
+        hengyuan_dataplane
+        Boost::system
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+        Threads::Threads
+    )
+    target_include_directories(live_submit_reconcile_harness_demo SYSTEM PRIVATE
+        ${Boost_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+    )
+    hengyuan_set_warnings(live_submit_reconcile_harness_demo)
+    hengyuan_allow_third_party_tsan_fences(live_submit_reconcile_harness_demo)
+
     add_executable(binance_dry_run_demo src/binance_dry_run_demo.cpp)
     target_link_libraries(binance_dry_run_demo PRIVATE
         hengyuan_dataplane
@@ -612,6 +630,13 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_position_truth)
     gtest_discover_tests(test_position_truth)
 
+    # TODO 1A.4: user-data-stream event struct/ring/drain function -- deliberately Boost-free
+    # (see binance_user_data_event.hpp's own header comment), same tier as test_position_truth.
+    add_executable(test_binance_user_data_event tests/test_binance_user_data_event.cpp)
+    target_link_libraries(test_binance_user_data_event PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_binance_user_data_event)
+    gtest_discover_tests(test_binance_user_data_event)
+
     # P2-EXEC-LIVE-01 D12-2: secure env loader (L3, file I/O + permission check)
     add_executable(test_env_loader tests/test_env_loader.cpp)
     target_link_libraries(test_env_loader PRIVATE hengyuan_core GTest::gtest_main)
@@ -625,6 +650,13 @@ if(HY_BUILD_TESTS)
     target_include_directories(test_binance_clock_sync PRIVATE tests)
     hengyuan_set_warnings(test_binance_clock_sync)
     gtest_discover_tests(test_binance_clock_sync)
+
+    # TODO 1A.4: listenKey cross-thread publisher -- offline pure logic only, same
+    # no-OpenSSL/no-network dependency shape as test_binance_clock_sync above.
+    add_executable(test_listen_key_publisher tests/test_listen_key_publisher.cpp)
+    target_link_libraries(test_listen_key_publisher PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_listen_key_publisher)
+    gtest_discover_tests(test_listen_key_publisher)
 
     # Layer 2 of docs/SPEC_INVARIANTS.md: durable_control_plane.hpp ABI surface
     add_executable(test_durable_control_plane_abi tests/test_durable_control_plane_abi.cpp)
@@ -784,6 +816,17 @@ if(HY_BUILD_TESTS)
 
     gtest_discover_tests(test_reconcile_concurrency PROPERTIES LABELS concurrency)
 
+    # TODO 1A.4: real two-thread stress for the two NEW cross-thread boundaries this batch
+    # introduces (UserDataWsEventRing, ListenKeyPublisher) -- the first new cross-thread
+    # boundary in this codebase since order_tracker.hpp's own SpscRing pair. Deliberately
+    # Boost-free (binance_listen_key_publisher.hpp/binance_user_data_event.hpp both are), same
+    # "concurrency" label/reasoning as test_spsc_concurrency/test_reconcile_concurrency above.
+    add_executable(test_user_data_ws_concurrency tests/test_user_data_ws_concurrency.cpp)
+    target_link_libraries(test_user_data_ws_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_user_data_ws_concurrency)
+
+    gtest_discover_tests(test_user_data_ws_concurrency PROPERTIES LABELS concurrency)
+
     # Negative control for the TSan gate: a deliberately-racy ring that TSan MUST
     # report. Built only on demand — it is NOT registered with ctest, because a
     # deliberate data race must never look like a suite failure. CI runs the
@@ -883,6 +926,20 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_ws_session)
         hengyuan_allow_third_party_tsan_fences(test_binance_ws_session)
         gtest_discover_tests(test_binance_ws_session)
+
+        # TODO 1A.4: user-data-stream WS session -- same Boost/Beast/OpenSSL/simdjson
+        # dependency shape as test_binance_ws_session above, same blackhole-acceptor
+        # no-real-network fixture pattern.
+        add_executable(test_binance_user_data_ws_session tests/test_binance_user_data_ws_session.cpp)
+        target_link_libraries(test_binance_user_data_ws_session PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_user_data_ws_session SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_user_data_ws_session PRIVATE tests)
+        hengyuan_set_warnings(test_binance_user_data_ws_session)
+        hengyuan_allow_third_party_tsan_fences(test_binance_user_data_ws_session)
+        gtest_discover_tests(test_binance_user_data_ws_session)
 
     endif()
 

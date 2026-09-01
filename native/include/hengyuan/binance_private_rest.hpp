@@ -238,6 +238,31 @@ inline PrivateRestError parse_account_response(std::string_view body, AccountSna
     return PrivateRestError::None;
 }
 
+// TODO 1A.4: listenKey is a ~60-char alphanumeric token; 128 is generous headroom without being
+// unbounded, matching kApiKeyLen's own "fixed, not unbounded" philosophy (binance_environment.hpp).
+inline constexpr std::size_t kListenKeyLen = 128;
+
+// POST /api/v3/userDataStream's `{"listenKey": "..."}` response. PUT/DELETE return `{}` on
+// success and need no body parsing at all -- fetch_signed_body_coro()'s own HttpStatus check
+// (non-200 -> PrivateRestError::HttpStatus) is already the complete success/failure signal for
+// those two, so only the create path needs a parser. `out_buf` is left COMPLETELY UNCHANGED on
+// any failure path, matching parse_account_response()'s own build-then-assign discipline.
+inline bool parse_listen_key_response(std::string_view body, std::span<char> out_buf,
+                                       std::size_t& out_len) noexcept {
+    auto padded = simdjson::padded_string(body);
+    simdjson::ondemand::parser parser;
+    simdjson::ondemand::document doc;
+    if (parser.iterate(padded).get(doc)) return false;
+
+    std::string_view key_sv;
+    if (doc["listenKey"].get_string().get(key_sv) != simdjson::SUCCESS) return false;
+    if (key_sv.empty() || key_sv.size() >= out_buf.size()) return false;
+
+    std::memcpy(out_buf.data(), key_sv.data(), key_sv.size());
+    out_len = key_sv.size();
+    return true;
+}
+
 // L4 §5: real Binance symbols are uppercase alphanumeric only (e.g. "BTCUSDT") -- rejecting
 // anything else here means build_exchange_info_target() never has to build a request target
 // from unvalidated caller input.
@@ -1176,6 +1201,65 @@ public:
         return PrivateRestError::None;
     }
 
+    // TODO 1A.4: POST/PUT/DELETE /api/v3/userDataStream (listenKey lifecycle). These three are
+    // Binance's USER_STREAM-type endpoints -- confirmed against long-stable, version-independent
+    // Binance API behavior (cross-checked, not this repo's own spec; see the 1A.4 plan's own
+    // caveat about which specifics still want a final live-docs check): X-MBX-APIKEY header
+    // only, NO HMAC signature/timestamp/recvWindow. That means none of the three calls
+    // build_canonical_query()/build_signed_query()/try_get_signing_timestamp_ms() -- there is no
+    // `timestamp` parameter to sign, and gating this on clock freshness would fail-closed a call
+    // that was never time-sensitive in the first place. Structurally simpler than
+    // fetch_account()/query_order(), not a bigger reuse: just copy_api_key() + a plain target
+    // string + fetch_signed_body_coro() (which only cares that a target and an api_key were
+    // supplied, not whether the target carries a signature).
+    //
+    // create_listen_key(): `out_buf`/`out_len` are left COMPLETELY UNCHANGED on any failure path,
+    // matching fetch_account()'s own build-then-assign discipline.
+    PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len,
+                                        const PrivateRestConfig& cfg = {}) {
+        if (!creds_) return PrivateRestError::SigningFailed;
+
+        std::array<char, kApiKeyLen> key_buf{};
+        std::size_t key_len = 0;
+        if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
+            return PrivateRestError::SigningFailed;
+        }
+
+        net::io_context ioc;
+        std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
+        net::co_spawn(
+            ioc,
+            detail::fetch_signed_body_coro(std::string(binding_.base_host()),
+                                            "/api/v3/userDataStream",
+                                            std::string(key_buf.data(), key_len), cfg,
+                                            http::verb::post),
+            [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
+                if (eptr) std::rethrow_exception(eptr);
+                outcome = std::move(r);
+            });
+        ioc.run();
+
+        if (std::holds_alternative<PrivateRestError>(outcome)) {
+            return std::get<PrivateRestError>(outcome);
+        }
+        if (!parse_listen_key_response(std::get<std::string>(outcome), out_buf, out_len)) {
+            return PrivateRestError::MalformedResponse;
+        }
+        return PrivateRestError::None;
+    }
+
+    // keepalive_listen_key()/close_listen_key(): both return `{}` on success -- fetch_signed_body_coro()'s
+    // own non-200 -> HttpStatus check is the complete success/failure signal, no body to parse.
+    PrivateRestError keepalive_listen_key(std::string_view listen_key,
+                                           const PrivateRestConfig& cfg = {}) {
+        return call_listen_key_endpoint(listen_key, http::verb::put, cfg);
+    }
+
+    PrivateRestError close_listen_key(std::string_view listen_key,
+                                       const PrivateRestConfig& cfg = {}) {
+        return call_listen_key_endpoint(listen_key, http::verb::delete_, cfg);
+    }
+
     // §5: unauthenticated, like sync_clock() -- never signs anything, never touches creds_.
     //
     // `symbols` should almost always be non-empty in production: Binance's unfiltered
@@ -1407,6 +1491,41 @@ public:
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }
 
 private:
+    // Shared by keepalive_listen_key()/close_listen_key() -- identical shape (percent-encode the
+    // listenKey into the query string, copy_api_key(), fetch_signed_body_coro(), no body to
+    // parse on success), differing only in HTTP verb.
+    PrivateRestError call_listen_key_endpoint(std::string_view listen_key, http::verb verb,
+                                               const PrivateRestConfig& cfg) {
+        if (!creds_) return PrivateRestError::SigningFailed;
+        if (listen_key.empty()) return PrivateRestError::InvalidConfig;
+
+        std::array<char, kApiKeyLen> key_buf{};
+        std::size_t key_len = 0;
+        if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
+            return PrivateRestError::SigningFailed;
+        }
+
+        std::string target = "/api/v3/userDataStream?listenKey=";
+        percent_encode_append(listen_key, target);
+
+        net::io_context ioc;
+        std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
+        net::co_spawn(
+            ioc,
+            detail::fetch_signed_body_coro(std::string(binding_.base_host()), target,
+                                            std::string(key_buf.data(), key_len), cfg, verb),
+            [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
+                if (eptr) std::rethrow_exception(eptr);
+                outcome = std::move(r);
+            });
+        ioc.run();
+
+        if (std::holds_alternative<PrivateRestError>(outcome)) {
+            return std::get<PrivateRestError>(outcome);
+        }
+        return PrivateRestError::None;
+    }
+
     EnvironmentBinding binding_;
     std::unique_ptr<BoundHmacCredentials> creds_;
     ClockOffsetPublisher clock_pub_;

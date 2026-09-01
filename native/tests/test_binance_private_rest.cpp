@@ -68,7 +68,9 @@ using hy::build_exchange_info_target;
 using hy::fetch_clock_pair;
 using hy::is_snapshot_fresh;
 using hy::kBalanceScale;
+using hy::kListenKeyLen;
 using hy::map_binance_order_status;
+using hy::parse_listen_key_response;
 using hy::parse_account_response;
 using hy::parse_balance_decimal_to_ticks;
 using hy::parse_exchange_info_response;
@@ -1510,4 +1512,163 @@ TEST_F(BoundCredentialsFixture, FetchExchangeInfoHttpErrorStatusRejected) {
     const std::string_view symbols[] = {"BTCUSDT"};
     EXPECT_EQ(client.fetch_exchange_info(out, symbols, cfg), PrivateRestError::HttpStatus);
     EXPECT_EQ(out.symbol_count, 7u);  // untouched
+}
+
+// --- parse_listen_key_response() -- TODO 1A.4 ---
+
+TEST(ParseListenKeyResponse, ValidResponseExtractsKey) {
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    ASSERT_TRUE(parse_listen_key_response(R"({"listenKey":"abc123def456"})", buf, len));
+    EXPECT_EQ(std::string_view(buf, len), "abc123def456");
+}
+
+TEST(ParseListenKeyResponse, MissingListenKeyFieldRejected) {
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_FALSE(parse_listen_key_response(R"({"somethingElse":"x"})", buf, len));
+    EXPECT_EQ(len, 0u);
+}
+
+TEST(ParseListenKeyResponse, MalformedJsonRejected) {
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_FALSE(parse_listen_key_response("not json", buf, len));
+}
+
+TEST(ParseListenKeyResponse, EmptyKeyRejected) {
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_FALSE(parse_listen_key_response(R"({"listenKey":""})", buf, len));
+    EXPECT_EQ(len, 0u);
+}
+
+TEST(ParseListenKeyResponse, KeyTooLargeForBufferRejectedNotTruncated) {
+    char buf[8]{};  // deliberately tiny -- key won't fit
+    std::size_t len = 0;
+    EXPECT_FALSE(parse_listen_key_response(R"({"listenKey":"way-too-long-for-this-buffer"})", buf,
+                                            len));
+    EXPECT_EQ(len, 0u);
+}
+
+// --- BinancePrivateRestClient::create_listen_key()/keepalive_listen_key()/close_listen_key()
+// -- TODO 1A.4, network-layer ---
+
+TEST_F(BoundCredentialsFixture, CreateListenKeySucceedsWithoutPriorClockSync) {
+    // No sync_clock() call anywhere in this test -- these three endpoints are USER_STREAM-type
+    // (API-key header only, no HMAC signature/timestamp), so they must not depend on a fresh
+    // clock-offset snapshot the way fetch_account()/query_order()/submit_order() do.
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"listenKey":"pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    ASSERT_EQ(client.create_listen_key(buf, len, cfg), PrivateRestError::None);
+    EXPECT_EQ(std::string_view(buf, len),
+              "pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1");
+
+    const auto reqs = server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    EXPECT_EQ(reqs[0].target, "/api/v3/userDataStream");
+    EXPECT_EQ(reqs[0].api_key_header, kSyntheticApiKey);
+    // Never a signed query -- no timestamp/signature params on this endpoint.
+    EXPECT_EQ(reqs[0].target.find("signature="), std::string::npos);
+    EXPECT_EQ(reqs[0].target.find("timestamp="), std::string::npos);
+}
+
+TEST_F(BoundCredentialsFixture, CreateListenKeyHttpErrorIsHttpStatus) {
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 429,
+        R"({"code":-1003,"msg":"Too many requests"})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    char buf[kListenKeyLen]{};
+    std::size_t len = 7;  // sentinel
+    EXPECT_EQ(client.create_listen_key(buf, len, cfg), PrivateRestError::HttpStatus);
+    EXPECT_EQ(len, 7u);  // untouched on failure
+}
+
+TEST_F(BoundCredentialsFixture, CreateListenKeyMalformedJsonIsMalformedResponse) {
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, "not json");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_EQ(client.create_listen_key(buf, len, cfg), PrivateRestError::MalformedResponse);
+}
+
+TEST_F(BoundCredentialsFixture, KeepaliveListenKeySucceedsAndPercentEncodesTheKeyInTheQuery) {
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    EXPECT_EQ(client.keepalive_listen_key("abc123def456", cfg), PrivateRestError::None);
+
+    const auto reqs = server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    EXPECT_EQ(reqs[0].target, "/api/v3/userDataStream?listenKey=abc123def456");
+}
+
+TEST_F(BoundCredentialsFixture, CloseListenKeySucceeds) {
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({})");
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+
+    EXPECT_EQ(client.close_listen_key("abc123def456", cfg), PrivateRestError::None);
+
+    const auto reqs = server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    EXPECT_EQ(reqs[0].target, "/api/v3/userDataStream?listenKey=abc123def456");
+}
+
+TEST(ListenKeyEntryGuards, NullCredentialsFoldsIntoSigningFailedWithoutNetworkAttempt) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), nullptr);
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_EQ(client.create_listen_key(buf, len), PrivateRestError::SigningFailed);
+    EXPECT_EQ(client.keepalive_listen_key("some-key"), PrivateRestError::SigningFailed);
+    EXPECT_EQ(client.close_listen_key("some-key"), PrivateRestError::SigningFailed);
+}
+
+TEST_F(BoundCredentialsFixture, KeepaliveListenKeyEmptyKeyIsInvalidConfigWithoutNetworkAttempt) {
+    // No TlsResponseAcceptor at all -- an empty listenKey must be rejected before any
+    // connection is even attempted.
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    PrivateRestConfig cfg;
+    cfg.connect_host_override = "127.0.0.1";
+    EXPECT_EQ(client.keepalive_listen_key("", cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client.close_listen_key("", cfg), PrivateRestError::InvalidConfig);
 }

@@ -43,6 +43,13 @@ enum class AuditEventType : std::uint8_t {
     ClockSkewDetected = 18,
     RateLimitApproaching = 19,
     OrderSubmitPrepared = 20,
+    // TODO 1A.4: WS observed an event (executionReport/outboundAccountPosition/
+    // listenKeyExpired) for a coid this process is actively tracking
+    // (InFlightRegistry::is_in_flight()) -- drain_user_data_events()
+    // (binance_user_data_ws_session.hpp) is the only place this is ever emitted. Appended at
+    // the end, matching this enum's own established convention (every prior addition was a
+    // trailing value, never inserted).
+    UserDataStreamEventObserved = 21,
 };
 
 inline const char* audit_event_name(AuditEventType t) noexcept {
@@ -68,6 +75,7 @@ inline const char* audit_event_name(AuditEventType t) noexcept {
         case AuditEventType::ClockSkewDetected: return "CLOCK_SKEW_DETECTED";
         case AuditEventType::RateLimitApproaching: return "RATE_LIMIT_APPROACHING";
         case AuditEventType::OrderSubmitPrepared: return "ORDER_SUBMIT_PREPARED";
+        case AuditEventType::UserDataStreamEventObserved: return "USER_DATA_STREAM_EVENT_OBSERVED";
     }
     return "UNKNOWN";
 }

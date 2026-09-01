@@ -283,6 +283,31 @@ public:
         return true;
     }
 
+    // TODO 1A.4: weight + raw only, same shape as try_reserve_weight_only() above, but for a
+    // caller-supplied weight rather than a PrivateRestEndpoint lookup -- deliberately NOT
+    // routed through PrivateRestEndpoint/EndpointWeightTable. tools/spec_enum_diff.py treats
+    // PrivateRestEndpoint (docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2313) as a FULL enum block (no
+    // "... existing ... unchanged ..." delta marker), so any enumerator the code adds that the
+    // spec doesn't already list is a build-failing NAME_CONFLICT, not a warning -- confirmed by
+    // direct read of that tool's diff() logic. listenKey management (POST/PUT/DELETE
+    // /api/v3/userDataStream, binance_private_rest.hpp) has no spec-pinned weight to transcribe
+    // (this repo's two accepted specs predate the WS user-data-stream design entirely), so it
+    // must never be added as a new PrivateRestEndpoint enumerator -- this method is the
+    // structurally-safe way to give it rate-limit coverage without touching that spec-verified
+    // enum at all. `weight` is expected to be a caller-supplied, conservative constant (see the
+    // call site's own comment for provenance), not looked up from any table.
+    bool try_reserve_weight_only_explicit(RateLimitLane lane, std::uint32_t weight,
+                                           TimePoint now = Clock::now()) noexcept {
+        if (!weight_.try_consume(lane, weight, now)) {
+            return false;
+        }
+        if (!raw_.try_consume(lane, 1, now)) {
+            weight_.rollback(lane, weight, now);
+            return false;
+        }
+        return true;
+    }
+
 private:
     PartitionedRateBudget weight_{};
     PartitionedRateBudget raw_{};

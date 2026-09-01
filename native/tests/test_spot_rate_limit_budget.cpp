@@ -205,3 +205,36 @@ TEST(SpotRateLimitTracker, TryReserveWeightOnlyRejectsUnknownEndpoint) {
     auto bogus = static_cast<PrivateRestEndpoint>(200);
     EXPECT_FALSE(tr.try_reserve_weight_only(RateLimitLane::Strategy, bogus, table));
 }
+
+// TODO 1A.4: try_reserve_weight_only_explicit() -- listenKey calls' rate-limit path, deliberately
+// NOT routed through PrivateRestEndpoint (see the function's own header comment: adding a
+// PrivateRestEndpoint enumerator with no spec basis is a build-failing NAME_CONFLICT per
+// tools/spec_enum_diff.py).
+
+TEST(SpotRateLimitTracker, TryReserveWeightOnlyExplicitConsumesTheGivenWeight) {
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 100, 0, /*raw*/ 100, 0, /*orders*/ 100, 0));
+    // Strategy lane = floor(100*80/100) = 80.
+    EXPECT_TRUE(tr.try_reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/2));
+}
+
+TEST(SpotRateLimitTracker, TryReserveWeightOnlyExplicitNeverTouchesOrdersLane) {
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 100000, 0, /*raw*/ 100000, 0, /*orders*/ 1, 0));
+    EXPECT_TRUE(tr.try_reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/2));
+}
+
+TEST(SpotRateLimitTracker, TryReserveWeightOnlyExplicitRefusesWhenWeightExceedsBudget) {
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 1, 0, /*raw*/ 100000, 0, /*orders*/ 100000, 0));
+    // Strategy lane = floor(1*80/100) = 0 -- any positive weight must be refused.
+    EXPECT_FALSE(tr.try_reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/2));
+}
+
+TEST(SpotRateLimitTracker, TryReserveWeightOnlyExplicitFailsClosedWhenRawExhausted) {
+    SpotRateLimitTracker tr;
+    // raw: Strategy lane = floor(1*80/100) = 0 -- the raw-consume stage must fail even though
+    // the weight budget alone would allow this call.
+    ASSERT_TRUE(tr.configure(/*weight*/ 100000, 0, /*raw*/ 1, 0, /*orders*/ 100000, 0));
+    EXPECT_FALSE(tr.try_reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/2));
+}
