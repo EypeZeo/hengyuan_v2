@@ -193,6 +193,33 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
     return TransitionResult::InvalidTransition;
 }
 
+// L4 §6.5's status-string -> OrderState table. Returns false (out untouched) for anything
+// unrecognized -- "not a guess": an unrecognized `status` value is not evidence of any
+// particular outcome and must fail schema validation in the caller, exactly like a
+// missing/malformed field, never be silently mapped to some default state.
+// EXPIRED_IN_MATCH (self-trade-prevention-triggered expiry) is deliberately folded into the
+// same terminal bucket as EXPIRED -- OrderState has no dedicated STP-expiry state; §6.5's own
+// text documents this as a deliberate simplification, not an oversight.
+//
+// TODO 1A.4 batch 2: relocated here (verbatim, still inline) from binance_private_rest.hpp so
+// binance_user_data_ws_session.hpp's executionReport "X" field parsing can reuse it without
+// pulling in that file's Boost.Beast/Asio/OpenSSL/simdjson weight -- same "no real reason for
+// a light consumer to drag in the heavy L4 REST client" reasoning binance_user_data_event.hpp's
+// own header comment already gives for keeping the event/ring types Boost-free.
+// binance_private_rest.hpp already includes this header, so its own call sites see this
+// transparently -- zero behavior change, pure move.
+inline bool map_binance_order_status(std::string_view status, OrderState& out) noexcept {
+    if (status == "NEW") { out = OrderState::Accepted; return true; }
+    if (status == "PARTIALLY_FILLED") { out = OrderState::PartialFill; return true; }
+    if (status == "FILLED") { out = OrderState::Filled; return true; }
+    if (status == "PENDING_CANCEL") { out = OrderState::CancelRequested; return true; }
+    if (status == "CANCELED") { out = OrderState::Cancelled; return true; }
+    if (status == "REJECTED") { out = OrderState::Rejected; return true; }
+    if (status == "EXPIRED") { out = OrderState::Expired; return true; }
+    if (status == "EXPIRED_IN_MATCH") { out = OrderState::Expired; return true; }
+    return false;
+}
+
 // --- Client order ID (idempotency key) ---
 
 static constexpr std::size_t kClientOrderIdLen = 36;

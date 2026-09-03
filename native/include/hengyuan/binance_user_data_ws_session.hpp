@@ -37,13 +37,15 @@
 // io_context::run() return before that posted work ever executes, leaving pending operations
 // (and this object, kept alive via shared_from_this()) in limbo.
 //
-// JSON parsing scope, deliberately narrow (see the 1A.4 plan's own reasoning): only the "e"
-// event-type discriminator and, for executionReport specifically, "c" (clientOrderId) and "i"
-// (orderId) are extracted. Full field-accurate executionReport parsing (l/z/L/S/X/price/qty/
-// commission fields) and any PositionTruth::apply_fill() fold-in are out of scope for this
-// slice -- position_truth.hpp's own header comment already warns that a naive per-message
-// delta would double-apply a fill across a WS redelivery, and this codebase has no
-// execution-id-level dedup to guard against that yet.
+// JSON parsing scope (TODO 1A.4 batch 2 -- widened from the first slice's "e"/"E"/"c"/"i"
+// only): now extracts the full executionReport field set (T/l/z/Z/L/S/X/x/f/q/p, alongside the
+// original c/i/E) as raw decimal char[24] strings -- conversion to ticks needs a per-symbol
+// scale this parser has no way to know (no SymbolRegistry access here), so it happens on the
+// hot thread in drain_user_data_events() instead, via OrderFillContext (see that function's own
+// header comment in binance_user_data_event.hpp). The double-apply hazard position_truth.hpp's
+// own header comment warns about is guarded there too, via
+// OrderFillContext::consume_delta() -- not solved in this parser, which stays a pure,
+// side-effect-free field extractor.
 //
 // The event struct/ring this session pushes into, and the hot-thread drain function that
 // consumes them, live in the lightweight binance_user_data_event.hpp, not here -- see that
@@ -149,15 +151,81 @@ public:
         if (event_type == "executionReport") {
             out.kind = UserDataEventKind::ExecutionReport;
 
+            // Field access ordered to roughly match Binance's own documented executionReport
+            // JSON field order (e,E,s,c,S,o,f,q,p,P,F,g,C,x,X,r,i,l,z,L,n,N,T,t,I,w,m,M,O,Z,...)
+            // -- simdjson's on-demand API supports out-of-order object field access, but forward
+            // order avoids the extra rewind-and-rescan cost that would otherwise be paid on
+            // every field. Every field here is best-effort/tolerant-of-absence, same discipline
+            // already established for "E" above -- only "c" (coid) is load-bearing for
+            // attribution; a missing/malformed decimal field leaves its char[24] buffer at its
+            // default all-zero (empty string), which parse_decimal_to_ticks_with_scale()
+            // (drain_user_data_events(), binance_user_data_event.hpp) already treats as a parse
+            // failure via its own empty-string check, not a silently-wrong number.
             std::string_view coid_sv;
             if (doc["c"].get_string().get(coid_sv) == simdjson::SUCCESS && !coid_sv.empty() &&
                 coid_sv.size() <= kClientOrderIdLen) {
                 std::memcpy(out.coid.id, coid_sv.data(), coid_sv.size());
                 out.coid.id[coid_sv.size()] = '\0';
             }
+
+            std::string_view side_sv;
+            if (doc["S"].get_string().get(side_sv) == simdjson::SUCCESS) {
+                out.side_known = parse_binance_order_side(side_sv, out.side);
+            }
+
+            std::string_view tif_sv;
+            if (doc["f"].get_string().get(tif_sv) == simdjson::SUCCESS) {
+                out.tif_is_gtc = (tif_sv == "GTC");
+            }
+
+            std::string_view order_qty_sv;
+            if (doc["q"].get_string().get(order_qty_sv) == simdjson::SUCCESS) {
+                copy_raw_decimal_field(order_qty_sv, out.order_qty_raw);
+            }
+            std::string_view order_price_sv;
+            if (doc["p"].get_string().get(order_price_sv) == simdjson::SUCCESS) {
+                copy_raw_decimal_field(order_price_sv, out.order_price_raw);
+            }
+
+            std::string_view exec_type_sv;
+            if (doc["x"].get_string().get(exec_type_sv) == simdjson::SUCCESS) {
+                // Best-effort, audit-only (see ExecutionType's own header comment) -- an
+                // unrecognized value leaves out.exec_type at its default Unknown, not a parse
+                // failure for the whole event.
+                (void)parse_binance_execution_type(exec_type_sv, out.exec_type);
+            }
+
+            std::string_view order_status_sv;
+            if (doc["X"].get_string().get(order_status_sv) == simdjson::SUCCESS) {
+                out.order_status_known = map_binance_order_status(order_status_sv, out.order_status);
+            }
+
             std::int64_t order_id = 0;
             if (doc["i"].get_int64().get(order_id) == simdjson::SUCCESS) {
                 out.exchange_order_id = order_id;
+            }
+
+            std::string_view last_qty_sv;
+            if (doc["l"].get_string().get(last_qty_sv) == simdjson::SUCCESS) {
+                copy_raw_decimal_field(last_qty_sv, out.last_qty_raw);
+            }
+            std::string_view cumulative_filled_qty_sv;
+            if (doc["z"].get_string().get(cumulative_filled_qty_sv) == simdjson::SUCCESS) {
+                copy_raw_decimal_field(cumulative_filled_qty_sv, out.cumulative_filled_qty_raw);
+            }
+            std::string_view last_price_sv;
+            if (doc["L"].get_string().get(last_price_sv) == simdjson::SUCCESS) {
+                copy_raw_decimal_field(last_price_sv, out.last_price_raw);
+            }
+
+            std::int64_t transaction_time_ms = 0;
+            if (doc["T"].get_int64().get(transaction_time_ms) == simdjson::SUCCESS) {
+                out.transaction_time_ms = transaction_time_ms;
+            }
+
+            std::string_view cumulative_quote_qty_sv;
+            if (doc["Z"].get_string().get(cumulative_quote_qty_sv) == simdjson::SUCCESS) {
+                copy_raw_decimal_field(cumulative_quote_qty_sv, out.cumulative_quote_qty_raw);
             }
         } else if (event_type == "outboundAccountPosition") {
             out.kind = UserDataEventKind::OutboundAccountPosition;
@@ -170,6 +238,14 @@ public:
     }
 
 private:
+    // "Reject, don't truncate" (same discipline as binance_listen_key_publisher.hpp's own
+    // publish()) -- an empty or overlong-for-char[24] decimal string is left as the field's
+    // default all-zero/empty buffer rather than silently truncated into a shorter, wrong number.
+    static void copy_raw_decimal_field(std::string_view sv, char (&out)[24]) noexcept {
+        if (sv.empty() || sv.size() >= sizeof(out)) return;
+        std::memcpy(out, sv.data(), sv.size());
+    }
+
     simdjson::ondemand::parser parser_;
     std::string padded_buf_ = std::string(static_cast<std::size_t>(4 * 1024), '\0');
 };
@@ -190,6 +266,12 @@ struct UserDataWsSessionStats {
     std::uint64_t push_ok{0};
     std::uint64_t push_dropped{0};
     std::uint64_t errors{0};
+    // TODO 1A.4 batch 2: listenKeyExpired is deliberately NOT wired to any immediate-reconnect
+    // signal this batch (see binance_user_data_ws_supervisor.hpp's own header comment for why --
+    // the normal fail-stop path already handles it, just not as fast as a dedicated channel
+    // would). This counter is the cheap alternative: makes the event observable instead of
+    // silently folded into the generic parse_ok count.
+    std::uint64_t listen_key_expired_events{0};
     beast::error_code last_error_ec{};
     std::string last_error_stage;  // e.g. "resolve", "connect", "ssl_handshake", "read",
                                     // "no_listen_key" (this session's own addition -- see
@@ -240,6 +322,16 @@ public:
     }
 
     bool stopped() const { return stop_.load(std::memory_order_relaxed); }
+
+    // TODO 1A.4 batch 2: the one new piece of cross-thread state this batch adds -- set once, on
+    // the strand, right before the read loop starts (on_handshake()); polled from any thread
+    // (the hot-thread-owned UserDataWsSessionSupervisor, binance_user_data_ws_supervisor.hpp).
+    // A plain relaxed load, safe to call at any time, same as stopped() -- NOT the
+    // "join first" convention stats_snapshot() carries (that one is about getting a
+    // time-final snapshot, not about data-race safety). The supervisor needs this precisely to
+    // distinguish "brand-new instance, DNS/TCP/TLS/WS-handshake still in flight" from "healthy,
+    // reset the retry counter" -- see that file's own header comment.
+    bool is_connected() const { return connected_.load(std::memory_order_relaxed); }
 
     // Safe to call from any thread once the driving io_context's thread has been joined
     // following stop() -- same contract as BinanceWsSession::stats_snapshot().
@@ -325,6 +417,7 @@ private:
     void on_handshake(beast::error_code ec) {
         if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "ws_handshake");
+        connected_.store(true, std::memory_order_relaxed);
         do_read();
     }
 
@@ -352,6 +445,9 @@ private:
             stats_.bytes_received += bytes_transferred;
             if (pr == UserDataParseResult::Ok) {
                 ++stats_.parse_ok;
+                if (event.kind == UserDataEventKind::ListenKeyExpired) {
+                    ++stats_.listen_key_expired_events;
+                }
             } else {
                 ++stats_.parse_failed;
             }
@@ -416,6 +512,7 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> started_{false};
+    std::atomic<bool> connected_{false};
 };
 
 }  // namespace hy

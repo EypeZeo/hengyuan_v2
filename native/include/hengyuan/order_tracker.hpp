@@ -42,6 +42,7 @@
 #pragma once
 
 #include <hengyuan/audit_trail.hpp>
+#include <hengyuan/order_fill_context.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/position_truth.hpp>
 #include <hengyuan/spsc_ring.hpp>
@@ -559,16 +560,33 @@ inline void poll_once(OrderTracker& tracker,
 // `position_truth` is a trailing-default parameter (nullptr = no-op, same
 // backward-compatible-extension pattern as RequestWeightTracker::reset()'s
 // window_seconds and fetch_signed_body_coro's verb) -- every existing call
-// site's behavior is unchanged. When non-null, folds ev.fill_delta_qty_ticks
-// into it (only for a real transition, which is the only time a
-// ReconcileEvent exists at all; the "same state, fill grew" case is a
-// documented, pre-existing gap -- see position_truth.hpp's own header
-// comment).
+// site's behavior is unchanged.
+//
+// `fill_context` (TODO 1A.4 batch 2, same trailing-default-nullptr convention):
+// when non-null, this is the SAME OrderFillContext table
+// live_submit_orchestrator.hpp's direct-fill branch and
+// binance_user_data_event.hpp's drain_user_data_events() also route through --
+// the fix for the cross-mechanism double-count hazard those files' own
+// comments describe (a WS executionReport crediting part of a fill via its
+// own baseline, then this function separately crediting the full cumulative
+// amount via ev.fill_delta_qty_ticks -- computed from OrderTracker's own
+// private, WS-unaware baseline -- would double-apply the WS-observed
+// portion). When configured, the safe delta is recomputed here via
+// consume_delta(ev.coid.view(), ev.filled_qty_ticks) -- ev.filled_qty_ticks
+// is the CUMULATIVE observed fill (poll_once()'s resolved.filled_qty_ticks),
+// not ev.fill_delta_qty_ticks, precisely because the correct increment must
+// be measured against the SHARED baseline, not OrderTracker::Slot's own
+// private one. When fill_context is null (existing callers/tests), behavior
+// is byte-identical to before: ev.fill_delta_qty_ticks is used directly.
+// OrderFillContext::remove() is called at exactly the same point
+// mark_resolved_handle() is -- one of this batch's own verified-exhaustive 3
+// real call sites (see order_fill_context.hpp's own header comment).
 inline void drain_reconcile_events(InFlightRegistry& in_flight,
                                     AuditRingSink* audit,
                                     ReconcileEventRing& events,
                                     std::int64_t now_ms,
-                                    PositionTruth* position_truth = nullptr) noexcept {
+                                    PositionTruth* position_truth = nullptr,
+                                    OrderFillContext* fill_context = nullptr) noexcept {
     ReconcileEvent ev{};
     while (events.try_pop(ev)) {
         if (audit) {
@@ -594,11 +612,16 @@ inline void drain_reconcile_events(InFlightRegistry& in_flight,
             ar.side = ev.side;
             audit->append(ar);
         }
-        if (position_truth && ev.fill_delta_qty_ticks > 0) {
-            position_truth->apply_fill(ev.symbol_id, ev.side, ev.fill_delta_qty_ticks);
+
+        const std::int64_t safe_delta_qty_ticks =
+            fill_context ? fill_context->consume_delta(ev.coid.view(), ev.filled_qty_ticks)
+                         : ev.fill_delta_qty_ticks;
+        if (position_truth && safe_delta_qty_ticks > 0) {
+            position_truth->apply_fill(ev.symbol_id, ev.side, safe_delta_qty_ticks);
         }
         if (is_exchange_final(ev.resulting_state)) {
             in_flight.mark_resolved_handle(ev.handle, ev.coid.view());
+            if (fill_context) fill_context->remove(ev.coid.view());
         }
     }
 }
