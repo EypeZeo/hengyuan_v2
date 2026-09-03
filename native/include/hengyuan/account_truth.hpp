@@ -194,6 +194,19 @@ inline const char* order_side_name(OrderSide s) noexcept {
     return s == OrderSide::Buy ? "BUY" : "SELL";
 }
 
+// TODO 1A.4 batch 2: the reverse of order_side_name() -- Binance executionReport's "S" field is
+// a string this codebase only ever uses defensively (cross-check against a locally-known,
+// submit-time-captured side, never as the operational value -- see order_fill_context.hpp's own
+// header comment), so a real parser is needed where every prior REST call site only ever did an
+// inline equality check against an already-known expected value. Returns false (out untouched)
+// for anything unrecognized, same "not a guess" discipline as map_binance_order_status()
+// (order_lifecycle.hpp).
+inline bool parse_binance_order_side(std::string_view s, OrderSide& out) noexcept {
+    if (s == "BUY") { out = OrderSide::Buy; return true; }
+    if (s == "SELL") { out = OrderSide::Sell; return true; }
+    return false;
+}
+
 // --- Pre-trade validation (ADR-019 D7) ---
 
 enum class PreTradeCheck : std::uint8_t {

@@ -320,6 +320,17 @@ struct OrchestratorContext {
     // that owns in_flight (position_truth.hpp's own THREAD OWNERSHIP note).
     PositionTruth* position_truth{nullptr};
 
+    // TODO 1A.4 batch 2 (order_fill_context.hpp). Nullable, same backward-compatible-default
+    // convention as position_truth above -- unset means this function's fill-application
+    // behaves exactly as it did before this batch (direct apply_fill() with the "baseline is
+    // always 0" assumption, unaware of any WS-observed partial fill for the same order). When
+    // set, this is the SAME table drain_reconcile_events()/drain_user_data_events() also route
+    // through, closing the cross-mechanism double-count hazard those functions' own comments
+    // describe. track()/remove() are called at the exact same call sites as
+    // ctx.in_flight->register_submit_handle()/mark_resolved() below -- see
+    // order_fill_context.hpp's own header comment for the verified-exhaustive 3-call-site list.
+    OrderFillContext* fill_context{nullptr};
+
     // Order parameters
     const SymbolRules* symbol_rules{nullptr};
     // Captured by value from *symbol_rules at the top of orchestrate_submit(),
@@ -363,14 +374,19 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // if this thread's gates keep failing closed. Both ctx.in_flight and
     // ctx.reconcile_events must be wired for there to be anything to drain into.
     if (ctx.in_flight && ctx.reconcile_events) {
-        drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms, ctx.position_truth);
+        drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms,
+                                ctx.position_truth, ctx.fill_context);
     }
     // TODO 1A.4: same unconditional-before-gates placement and reasoning as the reconcile drain
     // above -- even a KillSwitch-halted or audit-unavailable call still owns the only writer
     // access to ctx.in_flight/ctx.audit on this thread, so draining WS-observed events here
-    // rather than deferring keeps them from piling up for an arbitrarily long time.
+    // rather than deferring keeps them from piling up for an arbitrarily long time. Now also
+    // "before gates" for a second reason (TODO 1A.4 batch 2): if a downstream risk gate ever
+    // reads PositionTruth::net_qty_ticks(), this drain must run before it for the WS-observed
+    // fold-in to be visible to that gate in the SAME call -- not just a style convention anymore.
     if (ctx.in_flight && ctx.user_data_events) {
-        drain_user_data_events(*ctx.in_flight, ctx.audit, *ctx.user_data_events, ctx.now_ms);
+        drain_user_data_events(*ctx.in_flight, ctx.audit, *ctx.user_data_events, ctx.now_ms,
+                                ctx.position_truth, ctx.fill_context);
     }
 
     // Gate 1: Audit available
@@ -613,6 +629,22 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         return result;
     }
 
+    // TODO 1A.4 batch 2: OrderFillContext::track(), at the exact same call site as the
+    // register_submit_handle() success just above -- the fresh baseline (0) is correct here
+    // because this coid was just registered in-flight moments ago, it cannot have any prior
+    // fold-in. A false return (already tracked/capacity exhausted) is intentionally not
+    // checked here -- symmetrically with the untracked-coid case drain_user_data_events()/
+    // drain_reconcile_events() already treat as a normal, silently-skipped miss (see
+    // order_fill_context.hpp's own header comment), a failed track() just means this order's
+    // fills won't get the shared-baseline dedup safety net, not a reason to fail the submit
+    // itself -- ctx.in_flight's own kMaxInFlight bound already governs real capacity.
+    if (ctx.fill_context) {
+        (void)ctx.fill_context->track(coid.view(), ctx.symbol_id, ctx.side,
+                                       ctx.pre_trade_rules_snapshot.price_scale,
+                                       ctx.pre_trade_rules_snapshot.qty_scale,
+                                       ctx.pre_trade_rules_snapshot.quote_scale);
+    }
+
     // Gate 12d (spec §3/§6.2): real durable Ack for OrderSubmitPrepared, before
     // the Submitting transition -- this moved the transition itself off of
     // in-flight registration and onto this Ack (see AuditWriteNotAcked's doc
@@ -723,14 +755,24 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                                : OrchestratorGate::SubmitAccepted;
             ctx.audit->append(ar);
 
-            // TODO 1A.3 follow-up (PositionTruth): first-observed fill on the
-            // direct-POST path (baseline is always 0 here -- this coid was just
-            // registered in-flight moments ago, it cannot have been folded in
-            // before), so the full amount IS the delta. apply_fill() itself
-            // no-ops when resp.filled_qty_ticks <= 0 (the plain Accepted-with-
-            // no-fill-yet case), so no target_state branch is needed here.
+            // TODO 1A.3 follow-up (PositionTruth), TODO 1A.4 batch 2 (cross-mechanism dedup):
+            // this WAS "baseline is always 0 here, so the full amount IS the delta" -- true
+            // only when direct-POST-fill is the sole fill source. Once WS is a second,
+            // independently-timed source for the SAME coid (drain_user_data_events() ran just
+            // above, on this same call, before this branch), that assumption no longer holds:
+            // WS may have already observed and folded in part of this fill via its own
+            // consume_delta() call before this POST response was even parsed. Route through
+            // the SAME OrderFillContext table when configured -- consume_delta() re-derives
+            // the correct incremental amount against the SHARED baseline; falls back to the
+            // raw resp.filled_qty_ticks (the original behavior) when fill_context is unset.
+            // apply_fill() itself no-ops on a non-positive delta, so no extra branch is needed
+            // for the plain Accepted-with-no-fill-yet case either way.
+            const std::int64_t safe_fill_delta_ticks =
+                ctx.fill_context
+                    ? ctx.fill_context->consume_delta(coid.view(), resp.filled_qty_ticks)
+                    : resp.filled_qty_ticks;
             if (ctx.position_truth) {
-                ctx.position_truth->apply_fill(ctx.symbol_id, ctx.side, resp.filled_qty_ticks);
+                ctx.position_truth->apply_fill(ctx.symbol_id, ctx.side, safe_fill_delta_ticks);
             }
 
             if (is_exchange_final(target_state)) {
@@ -741,6 +783,10 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 // InFlightRegistryUnavailable returned early otherwise), matching the
                 // Rejected branch's own unguarded call below.
                 ctx.in_flight->mark_resolved(coid.view());
+                // TODO 1A.4 batch 2: OrderFillContext::remove(), exactly paired with the
+                // mark_resolved() call directly above -- one of the verified-exhaustive 3 real
+                // call sites (order_fill_context.hpp's own header comment).
+                if (ctx.fill_context) ctx.fill_context->remove(coid.view());
             } else if (ctx.to_reconcile) {
                 // AUDIT EXEC-INFLIGHT-003: an order that's still live (Accepted or
                 // PartialFill) keeps its in-flight slot (correctly -- it is resting on the
@@ -781,6 +827,12 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             // retired. Accepted/Ambiguous stay registered (order may exist on the
             // exchange; blind resubmit must remain blocked until reconciled).
             ctx.in_flight->mark_resolved(coid.view());
+            // TODO 1A.4 batch 2: OrderFillContext::remove(), exactly paired with mark_resolved()
+            // directly above -- the second of the verified-exhaustive 3 real call sites
+            // (order_fill_context.hpp's own header comment). A rejected order has no fill to
+            // ever be observed for; nothing depends on this beyond keeping the two tables'
+            // lifecycles symmetric.
+            if (ctx.fill_context) ctx.fill_context->remove(coid.view());
             ctx.audit->append(ar);
             break;
         }

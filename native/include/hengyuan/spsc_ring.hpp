@@ -90,7 +90,32 @@ public:
                 return false;  // genuinely full
             }
         }
+        // TODO 1A.4 batch 2 (AUDIT BUILD-STRINGOP-UDS-EVENT-021): GCC 14, -O3 Release (the
+        // "none" tier this repo mirrors from ci-native.yml), false-positives
+        // -Werror=stringop-overflow= here once T grows large enough (first observed with
+        // UserDataWsEvent, ~200 bytes with six embedded char[24] fields) AND this call gets
+        // deeply inlined through several layers of caller (a test helper calling
+        // drain_user_data_events()-adjacent code, or BinanceUserDataWsSession::on_read()) --
+        // the diagnostic's own reported "destination object" is a totally unrelated
+        // std::atomic<size_t>'s 8-byte _M_i member from an unrelated header pulled in
+        // transitively (e.g. gtest's own <memory> include), not this array -- a clear
+        // cross-attribution error in GCC's -O3 points-to analysis after inlining, not a real
+        // bug: buf_[h & kMask] is bounded by kMask by construction (same array-index masking
+        // idiom every other ring/table in this codebase uses), and this exact line has been
+        // exercised without incident by every SMALLER T this template has ever been
+        // instantiated with (BinanceMarketEvent, ReconcileEvent, ...) plus MSVC's own /W4 and
+        // this same file's ASan-tier build, none of which flag anything here. Scoped to GNU
+        // only (Clang has no such warning), and to this one assignment -- same "diagnostic-only,
+        // changes no code generation" reasoning CompilerWarnings.cmake's own
+        // hengyuan_allow_third_party_tsan_fences() documents for a different GCC false positive.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
         buf_[h & kMask] = item;  // (1) write the slot fully
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         // (2) release: the slot write above is guaranteed to be visible to a
         // consumer that observes this new head value. Blocks both compiler and
         // CPU reordering -> no torn read.

@@ -340,6 +340,60 @@ TEST_F(LiveSubmitTest, RejectedDoesNotTouchPositionTruth) {
     EXPECT_EQ(truth.tracked_symbol_count(), 0u);
 }
 
+// --- OrderFillContext cross-mechanism dedup (TODO 1A.4 batch 2) ---
+
+// The regression test this batch's own plan calls for: submit -> Accepted(PartialFill 30) ->
+// a duplicate WS executionReport for the SAME coid, reporting the SAME cumulative fill (30) ->
+// drain -> PositionTruth must stay at 30, not double to 60. Uses PartialFill (not Filled) so
+// the OrderFillContext entry is still tracked when the WS event arrives -- a Filled order would
+// have already had its entry removed by the same call, which would test the (also correct, but
+// different) "untracked coid" skip path instead of the dedup path this test targets.
+TEST_F(LiveSubmitTest, DuplicateWsEventAfterDirectFillDoesNotDoubleApply) {
+    PositionTruth truth;
+    OrderFillContext fill_context;
+    UserDataWsEventRing ws_events;
+    ctx_.position_truth = &truth;
+    ctx_.fill_context = &fill_context;
+    ctx_.user_data_events = &ws_events;
+
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 555;
+    g_mock_response.exchange_status = OrderState::PartialFill;
+    g_mock_response.filled_qty_ticks = 30;
+    g_mock_response.avg_fill_price_ticks = 5000;
+
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitPartialFill);
+    ASSERT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 30);
+    ASSERT_NE(fill_context.find(r.order.client_order_id.view()), nullptr)
+        << "still-live PartialFill must keep its OrderFillContext entry";
+
+    // Same coid this call generated (make_client_order_id is a pure function of
+    // now_ms/sequence/symbol_id, all unchanged since the call above).
+    const auto coid = make_client_order_id(ctx_.now_ms, ctx_.sequence, ctx_.symbol_id);
+    UserDataWsEvent ev{};
+    ev.kind = UserDataEventKind::ExecutionReport;
+    // snprintf, not strncpy: coid.view().data() is a runtime buffer GCC cannot bound at
+    // exactly kClientOrderIdLen chars, which -Werror=stringop-truncation flags (same reasoning
+    // this file's own make_live_record()-adjacent precedent in test_order_tracker.cpp gives).
+    std::snprintf(ev.coid.id, sizeof(ev.coid.id), "%s", coid.view().data());
+    // rules_.qty_scale == 8 (fixture default) -- "0.00000030" at scale 8 decodes to the same
+    // 30 ticks resp.filled_qty_ticks already reported, simulating a genuine WS redelivery of
+    // the SAME cumulative fill, not a different one.
+    std::snprintf(ev.cumulative_filled_qty_raw, sizeof(ev.cumulative_filled_qty_raw), "%s",
+                  "0.00000030");
+    ASSERT_TRUE(ws_events.try_push(ev));
+
+    // A second orchestrate_submit() call drains ws_events at its own top before attempting
+    // another submission -- the second submission attempt itself will hit DuplicateInFlight
+    // (same coid, still in-flight) and is irrelevant to this test; only the drain's side effect
+    // on `truth` is being asserted.
+    (void)orchestrate_submit(ctx_);
+
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 30) << "duplicate WS z must not double-apply";
+}
+
 // --- Gate 1: Audit unavailable ---
 
 TEST_F(LiveSubmitTest, AuditUnavailableBlocks) {

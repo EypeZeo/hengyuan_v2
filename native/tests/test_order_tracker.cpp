@@ -768,6 +768,116 @@ TEST_F(DrainEventsTest, NullPositionTruthIsToleratedNotCrashed) {
     EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
 }
 
+// --- OrderFillContext fold-in: the cross-mechanism double-count fix (TODO 1A.4 batch 2) ---
+
+// THE key regression test for this batch's own core structural claim: without a shared
+// baseline, an REST-observed cumulative fill and a previously-WS-observed partial fill of the
+// SAME order would double-count. Pre-seeds OrderFillContext's baseline to 30 (simulating "WS
+// already credited 30 via its own consume_delta() call, elsewhere"), then pushes a
+// ReconcileEvent computed by poll_once()'s own WS-unaware private baseline as
+// {filled_qty_ticks=100, fill_delta_qty_ticks=100} (poll_once() has no way to know WS already
+// saw 30 of this). Asserts PositionTruth receives only +70 (100 shared-baseline-relative, minus
+// the 30 already applied), not +100 -- proving the fix actually blocks the double-count, not
+// just "reads correctly in isolation" the way order_fill_context.hpp's own unit tests already
+// do for the primitive alone.
+TEST_F(DrainEventsTest, FillContextPreventsCrossMechanismDoubleCount) {
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    OrderFillContext fill_context;
+    ASSERT_TRUE(fill_context.track("HY-A", /*symbol_id=*/3, OrderSide::Buy, 0, 0, 0));
+    ASSERT_EQ(fill_context.consume_delta("HY-A", 30), 30);  // simulates a prior WS credit
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::Filled;
+    ev.symbol_id = 3;
+    ev.side = OrderSide::Buy;
+    ev.filled_qty_ticks = 100;       // OrderTracker's own view: cumulative fill is now 100
+    ev.fill_delta_qty_ticks = 100;   // OrderTracker's own (WS-unaware) private baseline was 0
+    ASSERT_TRUE(events_.try_push(ev));
+
+    PositionTruth truth;
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, &truth, &fill_context);
+
+    EXPECT_EQ(truth.net_qty_ticks(3), 70) << "must apply only the shared-baseline-relative "
+                                              "delta (100-30=70), not the raw 100";
+}
+
+TEST_F(DrainEventsTest, FillContextRemovedOnExchangeFinalSymmetricWithInFlightRegistry) {
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    OrderFillContext fill_context;
+    ASSERT_TRUE(fill_context.track("HY-A", 3, OrderSide::Buy, 0, 0, 0));
+    ASSERT_EQ(fill_context.count(), 1u);
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::Filled;  // exchange-final
+    ev.filled_qty_ticks = 50;
+    ASSERT_TRUE(events_.try_push(ev));
+
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, /*position_truth=*/nullptr,
+                            &fill_context);
+
+    // The two tables' lifecycles must stay symmetric -- both released together, matching
+    // InFlightRegistry's own resolve call in the same branch.
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(fill_context.count(), in_flight_.count());
+    EXPECT_EQ(fill_context.find("HY-A"), nullptr);
+}
+
+TEST_F(DrainEventsTest, FillContextNotRemovedWhenNotExchangeFinal) {
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    OrderFillContext fill_context;
+    ASSERT_TRUE(fill_context.track("HY-A", 3, OrderSide::Buy, 0, 0, 0));
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::PartialFill;  // still live, not exchange-final
+    ev.symbol_id = 3;
+    ev.side = OrderSide::Buy;
+    ev.filled_qty_ticks = 40;
+    ASSERT_TRUE(events_.try_push(ev));
+
+    PositionTruth truth;
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, &truth, &fill_context);
+
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_NE(fill_context.find("HY-A"), nullptr) << "still-live orders keep their fill baseline";
+    EXPECT_EQ(truth.net_qty_ticks(3), 40);
+}
+
+TEST_F(DrainEventsTest, NullFillContextIsUnchangedFromNarrowerSlice) {
+    // Trailing-default-parameter backward compatibility, same discipline as
+    // NullPositionTruthIsToleratedNotCrashed above -- every call site that predates this batch
+    // (including this file's own earlier PositionTruth-only tests) omits the argument and must
+    // keep using ev.fill_delta_qty_ticks directly, byte-identical to before.
+    auto handle = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(handle.valid());
+
+    ReconcileEvent ev{};
+    ev.handle = handle;
+    std::strncpy(ev.coid.id, "HY-A", kClientOrderIdLen);
+    ev.resulting_state = OrderState::Filled;
+    ev.symbol_id = 3;
+    ev.side = OrderSide::Buy;
+    ev.filled_qty_ticks = 100;
+    ev.fill_delta_qty_ticks = 25;  // deliberately NOT equal to filled_qty_ticks
+    ASSERT_TRUE(events_.try_push(ev));
+
+    PositionTruth truth;
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, &truth);  // no fill_context
+
+    EXPECT_EQ(truth.net_qty_ticks(3), 25) << "must use fill_delta_qty_ticks directly, unchanged";
+}
+
 // --- Backpressure: a full outbound ring must not lose a resolution ---
 
 TEST_F(OrderTrackerTest, FullOutboundRingKeepsOrderTrackedForRetry) {

@@ -637,6 +637,13 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_binance_user_data_event)
     gtest_discover_tests(test_binance_user_data_event)
 
+    # TODO 1A.4 batch 2: dedup-safe per-in-flight-order WS-fill baseline, shared by all three
+    # fill-application paths -- same Boost-free tier as the two targets above.
+    add_executable(test_order_fill_context tests/test_order_fill_context.cpp)
+    target_link_libraries(test_order_fill_context PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_order_fill_context)
+    gtest_discover_tests(test_order_fill_context)
+
     # P2-EXEC-LIVE-01 D12-2: secure env loader (L3, file I/O + permission check)
     add_executable(test_env_loader tests/test_env_loader.cpp)
     target_link_libraries(test_env_loader PRIVATE hengyuan_core GTest::gtest_main)
@@ -940,6 +947,23 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_user_data_ws_session)
         hengyuan_allow_third_party_tsan_fences(test_binance_user_data_ws_session)
         gtest_discover_tests(test_binance_user_data_ws_session)
+
+        # TODO 1A.4 batch 2: the reconnect supervisor -- constructs real
+        # BinanceUserDataWsSession instances (via the same blackhole-acceptor no-real-network
+        # fixture pattern as test_binance_user_data_ws_session above), so it needs the same
+        # Boost/Beast/OpenSSL/simdjson dependency shape. Single-threaded (poll() is called
+        # directly, not from a real io_context-driving thread, for most of this file's tests) --
+        # not labelled concurrency.
+        add_executable(test_binance_user_data_ws_supervisor tests/test_binance_user_data_ws_supervisor.cpp)
+        target_link_libraries(test_binance_user_data_ws_supervisor PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_user_data_ws_supervisor SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_user_data_ws_supervisor PRIVATE tests)
+        hengyuan_set_warnings(test_binance_user_data_ws_supervisor)
+        hengyuan_allow_third_party_tsan_fences(test_binance_user_data_ws_supervisor)
+        gtest_discover_tests(test_binance_user_data_ws_supervisor)
 
     endif()
 

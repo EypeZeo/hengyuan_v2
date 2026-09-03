@@ -509,24 +509,10 @@ inline PrivateRestError parse_exchange_info_response(std::string_view body,
     return PrivateRestError::None;
 }
 
-// L4 §6.5's status-string -> OrderState table. Returns false (out untouched) for anything
-// unrecognized -- "not a guess": an unrecognized `status` value is not evidence of any
-// particular outcome and must fail schema validation in parse_order_query_response() below,
-// exactly like a missing/malformed field, never be silently mapped to some default state.
-// EXPIRED_IN_MATCH (self-trade-prevention-triggered expiry) is deliberately folded into the
-// same terminal bucket as EXPIRED -- OrderState has no dedicated STP-expiry state; §6.5's own
-// text documents this as a deliberate simplification, not an oversight.
-inline bool map_binance_order_status(std::string_view status, OrderState& out) noexcept {
-    if (status == "NEW") { out = OrderState::Accepted; return true; }
-    if (status == "PARTIALLY_FILLED") { out = OrderState::PartialFill; return true; }
-    if (status == "FILLED") { out = OrderState::Filled; return true; }
-    if (status == "PENDING_CANCEL") { out = OrderState::CancelRequested; return true; }
-    if (status == "CANCELED") { out = OrderState::Cancelled; return true; }
-    if (status == "REJECTED") { out = OrderState::Rejected; return true; }
-    if (status == "EXPIRED") { out = OrderState::Expired; return true; }
-    if (status == "EXPIRED_IN_MATCH") { out = OrderState::Expired; return true; }
-    return false;
-}
+// map_binance_order_status() moved to order_lifecycle.hpp (TODO 1A.4 batch 2) so
+// binance_user_data_ws_session.hpp can reuse it without depending on this heavy L4 file --
+// still inline, still reachable here transparently since order_lifecycle.hpp is already
+// included above.
 
 // L4 §6.1.2: schema + field-match validation for a GET /api/v3/order response, checked
 // against the OrderExpectation captured at submit time -- never a live re-lookup that could
