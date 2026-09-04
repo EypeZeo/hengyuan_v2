@@ -965,6 +965,24 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_user_data_ws_supervisor)
         gtest_discover_tests(test_binance_user_data_ws_supervisor)
 
+        # Batch H, H3: listenKey keepalive/expiry scheduler -- constructs a real
+        # BinancePrivateRestClient against a local TlsResponseAcceptor (test_binance_private_rest
+        # above's own no-real-network fixture pattern), so it needs the same Boost/Beast/
+        # OpenSSL/simdjson dependency shape and the same HY_TEST_FIXTURE_DIR compile definition
+        # (set once above, reused here).
+        add_executable(test_binance_listen_key_keepalive tests/test_binance_listen_key_keepalive.cpp)
+        target_link_libraries(test_binance_listen_key_keepalive PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_listen_key_keepalive SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_listen_key_keepalive PRIVATE tests)
+        target_compile_definitions(test_binance_listen_key_keepalive PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_binance_listen_key_keepalive)
+        hengyuan_allow_third_party_tsan_fences(test_binance_listen_key_keepalive)
+        gtest_discover_tests(test_binance_listen_key_keepalive)
+
     endif()
 
     # AUDIT VERIF-TSAN-016: SnapshotRefreshGate spawns a real std::thread and hands a
