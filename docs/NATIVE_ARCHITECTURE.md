@@ -24,6 +24,23 @@ Single living reference for `native/`, replacing v1's scattered P2-CORE-*/P2-EXE
 | Signed read-only request (`GET /api/v3/account`) | L4 | **Adapter implemented and unit-tested** (spec rev 72, `binance_private_rest.hpp`) — not yet wired into any running process with real credentials |
 | Signed order submission (`POST /api/v3/order`) | L5 | **Adapter implemented and unit-tested** (spec rev 73, `binance_private_rest.hpp`) — `SubmitPort`/`QueryPort` remain mock DI seams in every runnable harness; real adapter not yet wired in |
 
+## Scope decisions
+
+**ExecutionJournal — evaluated and dropped (2026-09).** PR #72's original TODO 1A.5 exclusion
+list named "Minimal PositionTruth/ExecutionJournal" together; PositionTruth (`position_truth.hpp`)
+is the only half that was implemented. ExecutionJournal — a per-fill trade ledger (trade_id,
+per-fill price/qty, commission, maker/taker) distinct from `AuditRecord`'s cumulative-fill event
+stream — was never defined in any spec or ADR, and `OrderFillContext::consume_delta()` already
+closed the cross-mechanism dedup problem it was presumably meant to solve. No ADR, spec, or
+`py_core` code anywhere in the repository requires it. If a real need surfaces later (PnL
+attribution, trade-quality analysis), start from `docs/adr/ADR-019-*.md` D10's migration/DB-review
+packet requirement, and from two evaluated implementation paths: extending `AuditRecord` with a
+new `AuditEventType` value (small, reuses the existing 165-byte durable pipeline) versus a bespoke
+non-`DurableRecordType` frame following the `KeyRotatedRecord` precedent (large — that precedent
+solves a signing-order problem unrelated to trade persistence). A new `DurableRecordType` enum
+value is not an option — that enum is closed/spec-transcribed and CI-enforced via
+`tools/spec_enum_diff.py`.
+
 ## A naming note (fixed 2026-07-18)
 
 `preflight_gate.hpp`'s 7-item code-layer checklist (kill switch, risk gate, depth sync, heartbeat, signer, operator confirm, regression cert) and ADR-018's operational "D3-LIVE 7 项" (no-withdrawal key, account-truth reconciliation, fail-closed on stale data, exposure caps, phone-app drills, geo/service re-verification, SSH hardening) are **two different lists that both gate the L5 transition independently** — they used to share the name "D3-LIVE 7 项" in comments, which invited confusion. The code-layer one is now labeled `CODE-PREFLIGHT` in comments/printed output; the ADR-018 operational list keeps the "D3-LIVE" name since that's its origin. Passing one does not imply the other passed.

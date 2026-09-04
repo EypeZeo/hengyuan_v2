@@ -87,6 +87,33 @@ TEST(AuditRecordCodec, OutOfRangeEventTypeRejected) {
     EXPECT_FALSE(decode_audit_record(buf, decoded));
 }
 
+// is_legal_audit_event_type()'s bound was stale (capped at OrderSubmitPrepared=20, one short
+// of UserDataStreamEventObserved=21, the newest AuditEventType value TODO 1A.4's
+// drain_user_data_events() already constructs) -- found during Batch G's ExecutionJournal
+// research, fixed as a one-line bound correction. These two tests pin the fix from both
+// directions: the newest legal value must now round-trip, and the value immediately past it
+// must still be rejected (not just "some value far out of range" like
+// OutOfRangeEventTypeRejected's 200 above already covers).
+TEST(AuditRecordCodec, NewestEventTypeRoundTrips) {
+    AuditRecord rec = make_sample_record();
+    rec.event_type = AuditEventType::UserDataStreamEventObserved;
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+
+    AuditRecord decoded{};
+    ASSERT_TRUE(decode_audit_record(buf, decoded));
+    EXPECT_EQ(decoded.event_type, AuditEventType::UserDataStreamEventObserved);
+}
+
+TEST(AuditRecordCodec, EventTypeOneAboveNewestStillRejected) {
+    AuditRecord rec = make_sample_record();
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+    buf[8] = std::byte{22};  // one past UserDataStreamEventObserved=21, the new bound
+    AuditRecord decoded{};
+    EXPECT_FALSE(decode_audit_record(buf, decoded));
+}
+
 TEST(AuditRecordCodec, OutOfRangeResultingStateRejected) {
     AuditRecord rec = make_sample_record();
     std::array<std::byte, kAuditRecordWireSize> buf{};

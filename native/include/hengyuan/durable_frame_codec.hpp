@@ -161,7 +161,16 @@ inline void read_bytes(const std::byte*& p, void* dst, std::size_t n) noexcept {
 }
 
 inline bool is_legal_audit_event_type(std::uint8_t v) noexcept {
-    return v <= static_cast<std::uint8_t>(AuditEventType::OrderSubmitPrepared);
+    // Bound was OrderSubmitPrepared (20) and went stale the moment
+    // AuditEventType::UserDataStreamEventObserved (21, audit_trail.hpp) was appended --
+    // TODO 1A.4's drain_user_data_events() (binance_user_data_event.hpp) has been constructing
+    // AuditRecord instances with that event_type ever since, but decode_audit_record() would
+    // reject any of them as MalformedEnum once they hit a real DurableAuditSink (the only
+    // reason this hasn't bitten yet is that the sole runnable harness today uses the in-memory
+    // AuditRingSink, which never calls this decode path at all). Found during Batch G's
+    // ExecutionJournal research; unrelated to that decision, fixed here since it's a one-line
+    // bound correction with an existing regression-test template to extend.
+    return v <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
 }
 
 inline bool is_legal_execution_mode(std::uint8_t v) noexcept {

@@ -202,6 +202,9 @@ Binance native 实盘提交不得只定义成功路径。须先落地：
 - 实盘尝试、风控审批/拒绝、kill switch 触发、关键状态转换必须可审计、append-only；
 - dry-run 与 live 的业务状态/事件/配置/运行痕迹不得糊成一条模糊数据流；
 - 若需新增 live 业务表 / 状态表 / reconciliation 表 / ledger，须独立 migration + DB review packet；
+  （注：2026-09 评估过一次候选新增——`ExecutionJournal`，逐笔成交台账——`OrderFillContext`
+  已闭环解决它原本可能针对的跨机制去重问题，决定不新增，按此条要求本应走的独立立项流程未
+  启动。见 `docs/NATIVE_ARCHITECTURE.md`「Scope decisions」的完整记录。）
 - secret 不得进入仓库、文档、run note、review note、日志、截图、`system_settings`、测试 fixture（接 ADR-010 第 2 条 + SECURITY_BASELINE）；
 - **审计写入失败时不得提交新订单**：如果 audit 写面不可用（DB 不可达、写失败），系统必须 fail-closed，禁止在审计盲区内继续提交。
 
