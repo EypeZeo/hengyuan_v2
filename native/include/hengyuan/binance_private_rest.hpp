@@ -58,6 +58,7 @@
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
+#include <hengyuan/spot_rate_limit_budget.hpp>
 
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -1072,9 +1073,26 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_
 // (explicit non-goal for this slice; see this file's header comment).
 class BinancePrivateRestClient {
 public:
+    // rate_limiter/weight_table: TODO 1A.5-follow-up (Batch H, H1) -- trailing defaulted
+    // parameters, not inserted earlier, so the 30+ existing call sites in
+    // test_binance_private_rest.cpp constructing this with just (binding, creds) keep
+    // compiling unchanged. nullptr means "no local rate-limit awareness" (this class's
+    // pre-H1 behavior) -- query_order() below only reserves budget when a tracker is
+    // actually supplied. spot_rate_limit_budget.hpp's own header comment already
+    // anticipated this exact call site ("rate-limit awareness for query_order()... those
+    // run on threads other than the one this tracker is owned by" -- true when written,
+    // no longer true once a caller wires query_order()/submit_order() onto the same
+    // single hot/submit thread this whole batch's design already requires; see
+    // SpotRateLimitTracker's THREAD OWNERSHIP comment). Non-owning: the tracker/table
+    // must outlive this client, same convention EnvironmentBinding/creds_ already follow.
     BinancePrivateRestClient(EnvironmentBinding binding,
-                              std::unique_ptr<BoundHmacCredentials> creds) noexcept
-        : binding_(binding), creds_(std::move(creds)) {}
+                              std::unique_ptr<BoundHmacCredentials> creds,
+                              SpotRateLimitTracker* rate_limiter = nullptr,
+                              EndpointWeightTable weight_table = {}) noexcept
+        : binding_(binding),
+          creds_(std::move(creds)),
+          rate_limiter_(rate_limiter),
+          weight_table_(weight_table) {}
 
     // Call once, before the first sync_clock()/fetch_account(), on the same thread that will
     // make those calls. Spec §8: verifies the TLS trust store this process would actually use
@@ -1316,6 +1334,32 @@ public:
                 return {};  // ClockNotFresh -> Inconclusive
             }
 
+            // docs/BINANCE_PRIVATE_REST_L4_SPEC.md §7.4 (P0): every signed/public REST send
+            // path must reserve budget via try_reserve_weight_only() before sending --
+            // GetOrder was the one confirmed-missing call site (Batch H, H1). rate_limiter_
+            // == nullptr means no tracker was wired in (this class's pre-H1 default,
+            // preserved for every existing caller/test) -- skip the check entirely rather
+            // than fail closed on an absent tracker; a caller that wants the limit enforced
+            // must opt in by supplying one. KNOWN COUPLING, deliberately not addressed here
+            // (see Batch H plan's own H1 note): order_tracker.hpp's poll_once() increments
+            // an Ambiguous order's query_attempts on every call to this function regardless
+            // of whether a real network round trip happened, so a rate-limit-induced early
+            // return here counts the same as a real Inconclusive query toward
+            // kMaxQueryAttempts (3) -- three ticks blocked by local rate limiting would
+            // prematurely escalate an order to EscalatedToOperator, which never releases its
+            // InFlightRegistry slot. The safe line this batch relies on instead: the default
+            // RateLimitLane::Reconciliation budget (10% of REQUEST_WEIGHT/RAW_REQUESTS,
+            // spot_rate_limit_budget.hpp) comfortably covers ordinary reconcile-loop query
+            // volume, so this path is not expected to trigger under normal polling cadence.
+            // Threading QueryResult::retry_after_present through so order_tracker.hpp can
+            // distinguish "locally throttled" from "genuinely inconclusive" is a real,
+            // separate follow-up, not attempted in this slice.
+            if (rate_limiter_ && !rate_limiter_->try_reserve_weight_only(
+                                      RateLimitLane::Reconciliation, PrivateRestEndpoint::GetOrder,
+                                      weight_table_)) {
+                return {};  // Inconclusive, same fail-closed shape as every other early return here
+            }
+
             char recv_window_buf[24];
             const int n = std::snprintf(recv_window_buf, sizeof(recv_window_buf), "%lld",
                                          static_cast<long long>(cfg.recv_window_ms));
@@ -1515,6 +1559,8 @@ private:
     EnvironmentBinding binding_;
     std::unique_ptr<BoundHmacCredentials> creds_;
     ClockOffsetPublisher clock_pub_;
+    SpotRateLimitTracker* rate_limiter_{nullptr};
+    EndpointWeightTable weight_table_{};
 };
 
 // Bridges BinancePrivateRestClient::query_order() to QueryPort::QueryFn's plain

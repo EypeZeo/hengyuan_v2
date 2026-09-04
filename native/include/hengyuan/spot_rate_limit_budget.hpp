@@ -39,6 +39,8 @@
 // binance_clock_sync.hpp's ClockOffsetPublisher, mutex + by-value copy/swap) -- that is
 // a real, separate design fork for a future batch, not something this file attempts.
 
+#pragma once
+
 #include <hengyuan/transport_policy.hpp>
 
 #include <cstdint>
