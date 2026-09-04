@@ -1187,6 +1187,65 @@ TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
     EXPECT_LT(pos_ts, pos_sig);
 }
 
+// --- query_order() rate-limit gate (Batch H, H1) ---
+//
+// rate_limiter_ defaults to nullptr on every constructor call in this file that doesn't
+// pass one explicitly (all 30+ of them, including every test above this point) -- these
+// two tests are the only ones that actually wire a SpotRateLimitTracker in, covering both
+// directions of the guard added to query_order().
+
+TEST_F(BoundCredentialsFixture, QueryOrderExhaustedRateLimiterReturnsInconclusiveWithoutNetworkAttempt) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"serverTime":1700000000000})");
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(0, 0, 0, 0, 0, 0));  // zero budget in every lane -- exhausted
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    sync_cfg.connect_host_override = "127.0.0.1";
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    // No order-endpoint server is even started -- if query_order() attempted a network
+    // call despite the exhausted budget, it would have nothing to connect to and this
+    // test's own setup would be wrong, not just the assertion below.
+    const auto expected = make_btcusdt_expectation("coid-rate-limited");
+    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::Inconclusive);
+}
+
+TEST_F(BoundCredentialsFixture, QueryOrderRateLimiterWithBudgetStillSendsRealRequest) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"serverTime":1700000000000})");
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));  // ample budget every lane
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    sync_cfg.connect_host_override = "127.0.0.1";
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    const auto expected = make_btcusdt_expectation("coid-rate-ok");
+    hy::test_helpers::TlsResponseAcceptor order_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"symbol":"BTCUSDT","orderId":777,"clientOrderId":"coid-rate-ok",)"
+        R"("price":"50000.12","origQty":"0.100000","executedQty":"0.050000",)"
+        R"("cummulativeQuoteQty":"2500.00000000","status":"PARTIALLY_FILLED",)"
+        R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})");
+    PrivateRestConfig fetch_cfg;
+    fetch_cfg.port = std::to_string(order_server.port());
+    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    fetch_cfg.connect_host_override = "127.0.0.1";
+
+    EXPECT_EQ(client.query_order(expected, fetch_cfg).outcome, QueryOutcome::Found);
+    EXPECT_EQ(order_server.requests().size(), 1u);  // budget was available -- real request sent
+}
+
 TEST_F(BoundCredentialsFixture, QueryOrderHttpErrorStatusIsInconclusiveNotFailure) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
