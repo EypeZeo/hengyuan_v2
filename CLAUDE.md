@@ -154,6 +154,17 @@ wsl -d Ubuntu-24.04 -- bash -lc "bash ~/repos/hengyuan_v2/tools/wsl_verify.sh al
 `tools/wsl_verify.sh` auto-detects ccache/ninja/mold (installed by the one-time setup above)
 and turns repeat edit/build/verify loops into mostly cache hits.
 
+**WSL2 instability → auto-fallback to `tokyo-vps`, no need to ask each time (owner decision,
+2026-09-04):** WSL2 on this machine periodically wedges (`Wsl/Service/E_UNEXPECTED`, sometimes
+self-inflicted by overlapping `wsl.exe` invocations from the same session). If a WSL2
+validation step (any `wsl_verify.sh` tier, or the one-time setup) fails, hangs, or times out
+**twice in a row**, stop retrying WSL2 for that validation and continue from the `tokyo-vps`
+SSH alias instead (see `reference_tokyo_vps.md` memory for the standing per-turn-remote-work
+authorization this already falls under) — mirror the same `none`/`address`/`thread`/`all`
+tiers there via the repo synced onto the VPS, same run-frequency discipline as above. Do not
+re-ask permission for this fallback each time; just do it and report which path was used in
+the final validation summary.
+
 **A real finding from standing this up, worth remembering**: on this toolchain (GCC 14.2,
 WSL2), TSan silently misses races on multi-word struct copies at `-O1` and even at `-O2`
 (RelWithDebInfo's default) — confirmed with standalone repros before touching the real code.
