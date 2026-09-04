@@ -107,13 +107,49 @@ struct PrivateRestConfig {
     std::string port = "443";
     // Binance's own recvWindow business parameter (§2.1) — how long, from `timestamp`, the
     // server accepts this request as still fresh. Not related to this client's own network
-    // timeouts below (which bound how long WE wait for the network).
+    // timeouts below (which bound how long WE wait for the network) -- but the two interact
+    // operationally: if the sum of the timeout fields below (resolve+connect+handshake+write)
+    // approaches or exceeds recv_window_ms, a request that's slow to actually leave this
+    // process can arrive with an already-stale signed timestamp and get rejected by Binance
+    // with -1021 ("Timestamp for this request was outside of the recvWindow"). Keep that sum
+    // comfortably under recv_window_ms; this is a documentation reminder, not a checked
+    // invariant -- validating it would need its own design (e.g. what to do when violated).
     std::int64_t recv_window_ms = 5000;
 
     // Test-only escape hatches, matching RestSnapshotConfig's own (binance_rest_snapshot.hpp)
     // — empty by default, production callers never set either.
     std::string extra_trusted_ca_pem_path;
     std::string connect_host_override;
+
+    // Batch H, H2: per-stage network timeouts for the three coroutines below
+    // (fetch_server_time_coro/fetch_signed_body_coro/fetch_public_body_coro), one field per
+    // PrivateRestError stage (Resolve/Connect/TlsHandshake/Write/Read) they can each fail
+    // with. Defaults match this file's long-standing hardcoded values exactly, so a
+    // default-constructed PrivateRestConfig{} preserves prior behavior byte-for-byte.
+    // <= 0 is treated as "unset" and falls back to the default via the effective_*() accessors
+    // below, rather than being passed straight to Asio's expires_after() (which would fire
+    // immediately on a non-positive duration).
+    std::int64_t resolve_timeout_ms{5000};
+    std::int64_t connect_timeout_ms{5000};
+    std::int64_t handshake_timeout_ms{5000};
+    std::int64_t write_timeout_ms{5000};
+    std::int64_t read_timeout_ms{10000};
+
+    std::int64_t effective_resolve_timeout_ms() const noexcept {
+        return resolve_timeout_ms > 0 ? resolve_timeout_ms : 5000;
+    }
+    std::int64_t effective_connect_timeout_ms() const noexcept {
+        return connect_timeout_ms > 0 ? connect_timeout_ms : 5000;
+    }
+    std::int64_t effective_handshake_timeout_ms() const noexcept {
+        return handshake_timeout_ms > 0 ? handshake_timeout_ms : 5000;
+    }
+    std::int64_t effective_write_timeout_ms() const noexcept {
+        return write_timeout_ms > 0 ? write_timeout_ms : 5000;
+    }
+    std::int64_t effective_read_timeout_ms() const noexcept {
+        return read_timeout_ms > 0 ? read_timeout_ms : 10000;
+    }
 };
 
 enum class PrivateRestError : std::uint8_t {
@@ -811,7 +847,7 @@ fetch_server_time_coro(std::string host, PrivateRestConfig cfg) {
         const std::string& connect_host =
             cfg.connect_host_override.empty() ? host : cfg.connect_host_override;
         net::steady_timer resolve_timer(executor);
-        resolve_timer.expires_after(std::chrono::seconds(5));
+        resolve_timer.expires_after(std::chrono::milliseconds(cfg.effective_resolve_timeout_ms()));
         auto resolve_result =
             co_await (resolver.async_resolve(connect_host, cfg.port, net::use_awaitable) ||
                       resolve_timer.async_wait(net::use_awaitable));
@@ -821,11 +857,11 @@ fetch_server_time_coro(std::string host, PrivateRestConfig cfg) {
         auto results = std::get<0>(resolve_result);
 
         current_stage = PrivateRestError::Connect;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_connect_timeout_ms()));
         co_await beast::get_lowest_layer(stream).async_connect(results, net::use_awaitable);
 
         current_stage = PrivateRestError::TlsHandshake;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_handshake_timeout_ms()));
         co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
 
         http::request<http::empty_body> req{http::verb::get, "/api/v3/time", 11};
@@ -837,11 +873,11 @@ fetch_server_time_coro(std::string host, PrivateRestConfig cfg) {
         ClockPairSample t0 = fetch_clock_pair();
 
         current_stage = PrivateRestError::Write;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_write_timeout_ms()));
         co_await http::async_write(stream, req, net::use_awaitable);
 
         current_stage = PrivateRestError::Read;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_read_timeout_ms()));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
         parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
@@ -917,7 +953,7 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         const std::string& connect_host =
             cfg.connect_host_override.empty() ? host : cfg.connect_host_override;
         net::steady_timer resolve_timer(executor);
-        resolve_timer.expires_after(std::chrono::seconds(5));
+        resolve_timer.expires_after(std::chrono::milliseconds(cfg.effective_resolve_timeout_ms()));
         auto resolve_result =
             co_await (resolver.async_resolve(connect_host, cfg.port, net::use_awaitable) ||
                       resolve_timer.async_wait(net::use_awaitable));
@@ -927,11 +963,11 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         auto results = std::get<0>(resolve_result);
 
         current_stage = PrivateRestError::Connect;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_connect_timeout_ms()));
         co_await beast::get_lowest_layer(stream).async_connect(results, net::use_awaitable);
 
         current_stage = PrivateRestError::TlsHandshake;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_handshake_timeout_ms()));
         co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
 
         http::request<http::empty_body> req{verb, target, 11};
@@ -942,11 +978,11 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         req.set("X-MBX-APIKEY", api_key);
 
         current_stage = PrivateRestError::Write;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_write_timeout_ms()));
         co_await http::async_write(stream, req, net::use_awaitable);
 
         current_stage = PrivateRestError::Read;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_read_timeout_ms()));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
         parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
@@ -1009,7 +1045,7 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_
         const std::string& connect_host =
             cfg.connect_host_override.empty() ? host : cfg.connect_host_override;
         net::steady_timer resolve_timer(executor);
-        resolve_timer.expires_after(std::chrono::seconds(5));
+        resolve_timer.expires_after(std::chrono::milliseconds(cfg.effective_resolve_timeout_ms()));
         auto resolve_result =
             co_await (resolver.async_resolve(connect_host, cfg.port, net::use_awaitable) ||
                       resolve_timer.async_wait(net::use_awaitable));
@@ -1019,11 +1055,11 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_
         auto results = std::get<0>(resolve_result);
 
         current_stage = PrivateRestError::Connect;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_connect_timeout_ms()));
         co_await beast::get_lowest_layer(stream).async_connect(results, net::use_awaitable);
 
         current_stage = PrivateRestError::TlsHandshake;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_handshake_timeout_ms()));
         co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
 
         http::request<http::empty_body> req{http::verb::get, target, 11};
@@ -1034,11 +1070,11 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_
         // (spec §8) -- no Accept-Encoding header is ever sent.
 
         current_stage = PrivateRestError::Write;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_write_timeout_ms()));
         co_await http::async_write(stream, req, net::use_awaitable);
 
         current_stage = PrivateRestError::Read;
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_read_timeout_ms()));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
         parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
@@ -1085,14 +1121,24 @@ public:
     // single hot/submit thread this whole batch's design already requires; see
     // SpotRateLimitTracker's THREAD OWNERSHIP comment). Non-owning: the tracker/table
     // must outlive this client, same convention EnvironmentBinding/creds_ already follow.
+    // default_cfg: Batch H, H2 -- the config every below-8-method no-cfg-arg overload
+    // forwards to (see e.g. query_order(const OrderExpectation&) further down). Passed by
+    // value and moved into default_cfg_ deliberately: this constructor is noexcept, and
+    // PrivateRestConfig holds std::string members (port/extra_trusted_ca_pem_path/
+    // connect_host_override) -- a copy-construction from a const& could theoretically throw
+    // (bad_alloc), which inside a noexcept constructor would call std::terminate(). Taking
+    // it by value pushes any such copy to the caller's side of this function's boundary;
+    // std::string's move constructor itself never throws.
     BinancePrivateRestClient(EnvironmentBinding binding,
                               std::unique_ptr<BoundHmacCredentials> creds,
                               SpotRateLimitTracker* rate_limiter = nullptr,
-                              EndpointWeightTable weight_table = {}) noexcept
+                              EndpointWeightTable weight_table = {},
+                              PrivateRestConfig default_cfg = {}) noexcept
         : binding_(binding),
           creds_(std::move(creds)),
           rate_limiter_(rate_limiter),
-          weight_table_(weight_table) {}
+          weight_table_(weight_table),
+          default_cfg_(std::move(default_cfg)) {}
 
     // Call once, before the first sync_clock()/fetch_account(), on the same thread that will
     // make those calls. Spec §8: verifies the TLS trust store this process would actually use
@@ -1109,11 +1155,23 @@ public:
         }
     }
 
+    // Batch H, H2: read-only view of what every no-cfg overload below forwards to.
+    const PrivateRestConfig& default_config() const noexcept { return default_cfg_; }
+
+    // No-cfg overload -- Batch H, H2: forwards to default_cfg_ (see the constructor's own
+    // comment on why). This is what every caller that omits cfg resolves to, including
+    // query_order_adapter()/submit_order_adapter() below and any direct caller (H3's
+    // keepalive scheduler, H6's cold-start sequence) that never had a reason to know about
+    // per-call config in the first place -- they all automatically pick up whatever
+    // default_cfg_ this instance was constructed with, without needing to remember to pass
+    // it explicitly at every call site.
+    PrivateRestError sync_clock() { return sync_clock(default_cfg_); }
+
     // §3: unauthenticated. On success, computes the offset (RTT > kMaxUsableRttMs is silently
     // discarded -- compute_clock_offset()'s own contract, not a bug here) and publishes it via
     // clock_publisher(), closing the previously-offline-only clock-sync loop. Never signs
     // anything and never touches creds_.
-    PrivateRestError sync_clock(const PrivateRestConfig& cfg = {}) {
+    PrivateRestError sync_clock(const PrivateRestConfig& cfg) {
         net::io_context ioc;
         std::variant<detail::ServerTimeFetchResult, PrivateRestError> outcome =
             PrivateRestError::None;
@@ -1148,10 +1206,15 @@ public:
     // §4: signed. Fails closed on a stale/never-synced clock -- try_get_signing_timestamp_ms()
     // is the sole call site for that judgment, and this function never falls back to
     // uncalibrated local system time on its own failure (spec §2.2's core invariant). `out` is
+    // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above).
+    PrivateRestError fetch_account(AccountSnapshot& out) {
+        return fetch_account(out, default_cfg_);
+    }
+
     // left COMPLETELY UNCHANGED on every failure path (§4.4) -- this function only ever
     // assigns to `out` once, on total success, exactly mirroring parse_account_response()'s own
     // build-then-assign discipline.
-    PrivateRestError fetch_account(AccountSnapshot& out, const PrivateRestConfig& cfg = {}) {
+    PrivateRestError fetch_account(AccountSnapshot& out, const PrivateRestConfig& cfg) {
         std::int64_t fresh_ts_ms = 0;
         if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
             return PrivateRestError::ClockNotFresh;
@@ -1217,10 +1280,15 @@ public:
     // string + fetch_signed_body_coro() (which only cares that a target and an api_key were
     // supplied, not whether the target carries a signature).
     //
+    // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above).
+    PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len) {
+        return create_listen_key(out_buf, out_len, default_cfg_);
+    }
+
     // create_listen_key(): `out_buf`/`out_len` are left COMPLETELY UNCHANGED on any failure path,
     // matching fetch_account()'s own build-then-assign discipline.
     PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len,
-                                        const PrivateRestConfig& cfg = {}) {
+                                        const PrivateRestConfig& cfg) {
         if (!creds_) return PrivateRestError::SigningFailed;
 
         std::array<char, kApiKeyLen> key_buf{};
@@ -1252,15 +1320,27 @@ public:
         return PrivateRestError::None;
     }
 
+    // No-cfg overloads -- Batch H, H2 (see sync_clock()'s own overload comment above). H3's
+    // ListenKeyKeepaliveScheduler is the intended real caller of the no-cfg
+    // keepalive_listen_key() -- it never had a PrivateRestConfig to thread through in the
+    // first place, so it now automatically gets whatever default_cfg_ this client was
+    // constructed with instead of the compiled-in literal defaults.
+    PrivateRestError keepalive_listen_key(std::string_view listen_key) {
+        return keepalive_listen_key(listen_key, default_cfg_);
+    }
+    PrivateRestError close_listen_key(std::string_view listen_key) {
+        return close_listen_key(listen_key, default_cfg_);
+    }
+
     // keepalive_listen_key()/close_listen_key(): both return `{}` on success -- fetch_signed_body_coro()'s
     // own non-200 -> HttpStatus check is the complete success/failure signal, no body to parse.
     PrivateRestError keepalive_listen_key(std::string_view listen_key,
-                                           const PrivateRestConfig& cfg = {}) {
+                                           const PrivateRestConfig& cfg) {
         return call_listen_key_endpoint(listen_key, http::verb::put, cfg);
     }
 
     PrivateRestError close_listen_key(std::string_view listen_key,
-                                       const PrivateRestConfig& cfg = {}) {
+                                       const PrivateRestConfig& cfg) {
         return call_listen_key_endpoint(listen_key, http::verb::delete_, cfg);
     }
 
@@ -1275,11 +1355,17 @@ public:
     // depth-of-defense backstop if a caller (or a future Binance response shape) violates that
     // expectation, but it is a backstop, not the intended primary control.
     //
+    // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above).
+    PrivateRestError fetch_exchange_info(ParsedExchangeInfo& out,
+                                          std::span<const std::string_view> symbols) {
+        return fetch_exchange_info(out, symbols, default_cfg_);
+    }
+
     // `out` is left COMPLETELY UNCHANGED on every failure path, exactly mirroring
     // fetch_account()'s own build-then-assign discipline.
     PrivateRestError fetch_exchange_info(ParsedExchangeInfo& out,
                                           std::span<const std::string_view> symbols,
-                                          const PrivateRestConfig& cfg = {}) {
+                                          const PrivateRestConfig& cfg) {
         std::string target;
         if (!build_exchange_info_target(symbols, target)) {
             return PrivateRestError::InvalidConfig;
@@ -1322,8 +1408,18 @@ public:
     //   2. Explicit entry guards (`creds_`/`expected` non-empty) that fetch_account() also
     //      lacks today (a known, separately-tracked gap) -- no reason for this new method to
     //      replicate it.
+    // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above).
+    // query_order_adapter() below is the intended real caller: QueryPort::QueryFn's fixed
+    // C-ABI signature (order_tracker.hpp) has no PrivateRestConfig parameter at all, so
+    // there was previously no way for a caller to inject a custom timeout into the one
+    // production path that actually triggers this call -- this overload is what makes
+    // default_cfg_ reachable from there.
+    QueryResult query_order(const OrderExpectation& expected) noexcept {
+        return query_order(expected, default_cfg_);
+    }
+
     QueryResult query_order(const OrderExpectation& expected,
-                             const PrivateRestConfig& cfg = {}) noexcept {
+                             const PrivateRestConfig& cfg) noexcept {
         if (!creds_) return {};
         if (expected.client_order_id.empty()) return {};
         if (expected.rules_snapshot_at_submit.symbol[0] == '\0') return {};
@@ -1432,10 +1528,22 @@ public:
     // reverse mistake -- misclassifying an ambiguous response as a confident Rejected -- is
     // the one that actually risks a wrong conclusion, so this batch never attempts that
     // classification at all.
+    // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above and
+    // query_order()'s: submit_order_adapter() below is the intended real caller, and
+    // SubmitPort::SubmitFn's fixed C-ABI signature has no PrivateRestConfig parameter
+    // either).
+    SubmitResponse submit_order(std::string_view client_order_id, std::uint32_t symbol_id,
+                                 OrderSide side, OrderType type, std::int64_t price_ticks,
+                                 std::int64_t qty_ticks,
+                                 const SymbolRules& rules_snapshot) noexcept {
+        return submit_order(client_order_id, symbol_id, side, type, price_ticks, qty_ticks,
+                             rules_snapshot, default_cfg_);
+    }
+
     SubmitResponse submit_order(std::string_view client_order_id, std::uint32_t symbol_id,
                                  OrderSide side, OrderType type, std::int64_t price_ticks,
                                  std::int64_t qty_ticks, const SymbolRules& rules_snapshot,
-                                 const PrivateRestConfig& cfg = {}) noexcept {
+                                 const PrivateRestConfig& cfg) noexcept {
         // symbol_id is part of SubmitPort::SubmitFn's ABI (matches how the orchestrator's
         // OrchestratorContext/OrderRecord carry it), but the wire request is built from
         // rules_snapshot.symbol_name() exclusively (§5.3's "carry the snapshot, don't
@@ -1561,6 +1669,7 @@ private:
     ClockOffsetPublisher clock_pub_;
     SpotRateLimitTracker* rate_limiter_{nullptr};
     EndpointWeightTable weight_table_{};
+    PrivateRestConfig default_cfg_{};
 };
 
 // Bridges BinancePrivateRestClient::query_order() to QueryPort::QueryFn's plain
