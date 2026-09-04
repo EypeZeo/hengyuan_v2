@@ -92,19 +92,44 @@ enum class BinanceEnvironment : std::uint8_t {
 // instance; the constructor is private. Both factories hardcode their own
 // host, transport policy, and credential env-var names, so there is no
 // parameter a caller could pass to accidentally cross environments.
+//
+// Batch H, H4: ws_host_/ws_port_ follow the exact same discipline as every existing field
+// here -- std::string_view (never std::string, or the is_trivially_copyable_v static_assert
+// below stops compiling), no default value on the private constructor, and each factory
+// passes its own string-literal values explicitly (static storage duration, valid for the
+// whole process). ws_port_ is a string_view rather than e.g. uint16_t specifically because
+// UserDataWsSessionConfig::port (binance_user_data_ws_session.hpp) is itself a std::string --
+// a string_view converts into that with no extra allocation, whereas a numeric port would
+// need its own std::to_string() first (CLAUDE.md Engineering Mandate §1: zero heap
+// allocation on this kind of wiring path).
+//
+// ws_host_/ws_port_ are DELIBERATELY NOT part of transport_policy_'s endpoint_allowlist --
+// BinanceUserDataWsSession connects directly via its own resolver call on the raw host, it
+// never consults this allowlist, and production_transport_policy()'s allowlist
+// (binance_default_endpoints()) already uses all 4 of TransportPolicy::kMaxEndpoints's slots
+// for REST hosts. Adding a WS host there would silently overflow that fixed-size array; WS
+// and REST transport policy are two independent mechanisms and must stay that way.
+//
+// Testnet WS port confirmed 443 (not 9443, despite one worked example on Binance's own docs
+// page using :9443 -- the base endpoint statement on that same page states no port, which for
+// a wss:// URL means the default 443; both ports were independently confirmed reachable via a
+// live TCP probe against stream.testnet.binance.vision before picking 443 as the documented
+// default rather than the example's alternate port).
 class EnvironmentBinding {
 public:
     static EnvironmentBinding testnet() noexcept {
         return EnvironmentBinding(BinanceEnvironment::Testnet, "testnet.binance.vision",
                                    testnet_transport_policy(),
                                    "HENGYUAN_BINANCE_TESTNET_API_KEY",
-                                   "HENGYUAN_BINANCE_TESTNET_SECRET");
+                                   "HENGYUAN_BINANCE_TESTNET_SECRET",
+                                   "stream.testnet.binance.vision", "443");
     }
     static EnvironmentBinding production() noexcept {
         return EnvironmentBinding(BinanceEnvironment::Production, "api.binance.com",
                                    production_transport_policy(),
                                    "HENGYUAN_BINANCE_LIVE_API_KEY",
-                                   "HENGYUAN_BINANCE_LIVE_SECRET");
+                                   "HENGYUAN_BINANCE_LIVE_SECRET",
+                                   "stream.binance.com", "9443");
     }
 
     BinanceEnvironment environment() const noexcept { return environment_; }
@@ -112,16 +137,21 @@ public:
     const TransportPolicy& transport_policy() const noexcept { return transport_policy_; }
     std::string_view api_key_env_key() const noexcept { return api_key_env_key_; }
     std::string_view secret_env_key() const noexcept { return secret_env_key_; }
+    std::string_view ws_host() const noexcept { return ws_host_; }
+    std::string_view ws_port() const noexcept { return ws_port_; }
 
 private:
     EnvironmentBinding(BinanceEnvironment env, std::string_view host,
                        TransportPolicy policy, std::string_view api_key_env,
-                       std::string_view secret_env) noexcept
+                       std::string_view secret_env, std::string_view ws_host,
+                       std::string_view ws_port) noexcept
         : environment_(env), base_host_(host), transport_policy_(policy),
-          api_key_env_key_(api_key_env), secret_env_key_(secret_env) {}
+          api_key_env_key_(api_key_env), secret_env_key_(secret_env), ws_host_(ws_host),
+          ws_port_(ws_port) {}
 
     // Endpoint allowlist contains ONLY testnet.binance.vision — never
-    // shares state with production_transport_policy().
+    // shares state with production_transport_policy(). Deliberately does NOT include
+    // ws_host_ -- see this class's own header comment above.
     static TransportPolicy testnet_transport_policy() noexcept {
         TransportPolicy p{};
         p.endpoint_allowlist = EndpointAllowlist{};
@@ -130,7 +160,8 @@ private:
         return p;
     }
     // Default TransportPolicy already uses binance_default_endpoints()
-    // (api.binance.com + api1/2/3.binance.com).
+    // (api.binance.com + api1/2/3.binance.com) -- all 4 of kMaxEndpoints's slots already
+    // spoken for; ws_host_ must never be added here (see this class's own header comment).
     static TransportPolicy production_transport_policy() noexcept { return TransportPolicy{}; }
 
     BinanceEnvironment environment_;
@@ -138,6 +169,8 @@ private:
     TransportPolicy transport_policy_;
     std::string_view api_key_env_key_;
     std::string_view secret_env_key_;
+    std::string_view ws_host_;
+    std::string_view ws_port_;
 };
 
 static_assert(std::is_trivially_copyable_v<EnvironmentBinding>);

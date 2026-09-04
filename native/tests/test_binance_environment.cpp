@@ -136,6 +136,52 @@ TEST(EnvironmentBinding, ProductionFactoryFieldsAreCorrect) {
     EXPECT_FALSE(b.transport_policy().endpoint_allowlist.contains("testnet.binance.vision"));
 }
 
+// --- Batch H, H4: ws_host()/ws_port() ---
+
+TEST(EnvironmentBinding, TestnetWsHostAndPortAreCorrect) {
+    auto b = EnvironmentBinding::testnet();
+    EXPECT_EQ(b.ws_host(), "stream.testnet.binance.vision");
+    EXPECT_EQ(b.ws_port(), "443");
+}
+
+TEST(EnvironmentBinding, ProductionWsHostAndPortAreCorrect) {
+    auto b = EnvironmentBinding::production();
+    EXPECT_EQ(b.ws_host(), "stream.binance.com");
+    EXPECT_EQ(b.ws_port(), "9443");
+}
+
+// Only ws_host() is asserted distinct across environments -- environment isolation is the
+// job of ws_host()/base_host()/the credential env-var names, never the port number. Both
+// environments happening to use the same port (or even swapped ports, hypothetically) would
+// not itself indicate a cross-environment bug, so no EXPECT_NE on ws_port() here.
+TEST(EnvironmentBinding, WsHostDiffersAcrossEnvironments) {
+    EXPECT_NE(EnvironmentBinding::testnet().ws_host(), EnvironmentBinding::production().ws_host());
+}
+
+// ws_host_/ws_port_ must never be folded into transport_policy().endpoint_allowlist --
+// BinanceUserDataWsSession connects directly on the raw host, never consults this allowlist,
+// and production's allowlist already uses all 4 of its fixed slots for REST hosts (see this
+// class's own header comment). This is a regression guard against a future "helpful" edit
+// that tries to add ws_host_ there.
+TEST(EnvironmentBinding, WsHostNeverInTransportPolicyAllowlist) {
+    auto testnet = EnvironmentBinding::testnet();
+    EXPECT_FALSE(testnet.transport_policy().endpoint_allowlist.contains(testnet.ws_host()));
+    auto production = EnvironmentBinding::production();
+    EXPECT_FALSE(production.transport_policy().endpoint_allowlist.contains(production.ws_host()));
+}
+
+// static_assert(is_trivially_copyable_v<EnvironmentBinding>) already proves this at compile
+// time; this is a cheap runtime double-check that a copy is genuinely independent (not, say,
+// accidentally aliasing shared state through some field this class might grow later).
+TEST(EnvironmentBinding, TriviallyCopyableValueSemantics) {
+    static_assert(std::is_trivially_copyable_v<EnvironmentBinding>);
+    auto b1 = EnvironmentBinding::testnet();
+    auto b2 = b1;  // explicit value copy
+    EXPECT_EQ(b2.ws_host(), b1.ws_host());
+    EXPECT_EQ(b2.ws_port(), b1.ws_port());
+    EXPECT_EQ(b2.base_host(), b1.base_host());
+}
+
 // --- is_valid_api_key ---
 
 TEST(IsValidApiKey, AcceptsWellFormedKey) {
