@@ -32,6 +32,7 @@
 #include "test_helpers/blackhole_acceptor.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <span>
@@ -1018,6 +1019,60 @@ TEST_F(BoundCredentialsFixture, SyncClockReadStageTimeoutAfterSuccessfulHandshak
     // Handshake succeeds (hostname matches, CA is trusted); the fixture never sends an HTTP
     // response, so this proves the read-stage deadline actually fires rather than hanging.
     EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::Read);
+}
+
+// Batch H, H2: a separate test from the one above -- SyncClockReadStageTimeoutAfterSuccessful
+// Handshake is deliberately left untouched (it's the only test in this file exercising the
+// true zero-config default-timeout path; changing it to a short timeout would erase that
+// coverage), so custom-timeout behavior gets its own test instead.
+TEST_F(BoundCredentialsFixture, SyncClockCustomShortReadTimeoutFiresFast) {
+    hy::test_helpers::TlsBlackholeAcceptor tls_blackhole(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(tls_blackhole.port());
+    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+    cfg.connect_host_override = "127.0.0.1";
+    cfg.read_timeout_ms = 50;  // far below the 10s default -- proves the field is actually
+                                // wired to the Asio deadline, not just stored and ignored
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::Read);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::milliseconds(1000));
+}
+
+// PrivateRestConfig::effective_*_timeout_ms() -- pure in-CPU accessors, no network/timer
+// involved, so the <= 0 fallback-to-default case costs nothing to test (unlike a
+// end-to-end proof, which would have to actually let a real Asio timer fire).
+TEST(PrivateRestConfigEffectiveTimeouts, PositiveValuesPassThroughUnchanged) {
+    PrivateRestConfig cfg;
+    cfg.resolve_timeout_ms = 111;
+    cfg.connect_timeout_ms = 222;
+    cfg.handshake_timeout_ms = 333;
+    cfg.write_timeout_ms = 444;
+    cfg.read_timeout_ms = 555;
+    EXPECT_EQ(cfg.effective_resolve_timeout_ms(), 111);
+    EXPECT_EQ(cfg.effective_connect_timeout_ms(), 222);
+    EXPECT_EQ(cfg.effective_handshake_timeout_ms(), 333);
+    EXPECT_EQ(cfg.effective_write_timeout_ms(), 444);
+    EXPECT_EQ(cfg.effective_read_timeout_ms(), 555);
+}
+
+TEST(PrivateRestConfigEffectiveTimeouts, NonPositiveValuesFallBackToDefaults) {
+    PrivateRestConfig cfg;
+    cfg.resolve_timeout_ms = 0;
+    cfg.connect_timeout_ms = -1;
+    cfg.handshake_timeout_ms = 0;
+    cfg.write_timeout_ms = -1000;
+    cfg.read_timeout_ms = 0;
+    EXPECT_EQ(cfg.effective_resolve_timeout_ms(), 5000);
+    EXPECT_EQ(cfg.effective_connect_timeout_ms(), 5000);
+    EXPECT_EQ(cfg.effective_handshake_timeout_ms(), 5000);
+    EXPECT_EQ(cfg.effective_write_timeout_ms(), 5000);
+    EXPECT_EQ(cfg.effective_read_timeout_ms(), 10000);  // read's own default differs from the rest
 }
 
 TEST_F(BoundCredentialsFixture, SyncClockRealSuccessPathPublishesOffset) {
