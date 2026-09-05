@@ -983,6 +983,25 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_listen_key_keepalive)
         gtest_discover_tests(test_binance_listen_key_keepalive)
 
+        # Batch H, H5: binance_submit_adapter.hpp -- composite SubmitPort wiring combining
+        # BinancePrivateRestClient (Boost/Beast/OpenSSL, same as test_binance_private_rest
+        # above) with SymbolRegistry (hengyuan_core only). Registered in this Boost-linked
+        # group, not test_symbol_registry's lightweight one, since it needs the union of both
+        # dependency sets. Same TlsResponseAcceptor/HY_TEST_FIXTURE_DIR fixture pattern as
+        # test_binance_private_rest/test_binance_listen_key_keepalive above.
+        add_executable(test_binance_submit_adapter tests/test_binance_submit_adapter.cpp)
+        target_link_libraries(test_binance_submit_adapter PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_submit_adapter SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_submit_adapter PRIVATE tests)
+        target_compile_definitions(test_binance_submit_adapter PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_binance_submit_adapter)
+        hengyuan_allow_third_party_tsan_fences(test_binance_submit_adapter)
+        gtest_discover_tests(test_binance_submit_adapter)
+
     endif()
 
     # AUDIT VERIF-TSAN-016: SnapshotRefreshGate spawns a real std::thread and hands a
