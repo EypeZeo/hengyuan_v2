@@ -1683,9 +1683,15 @@ inline QueryResult query_order_adapter(const OrderExpectation& expected, void* u
 }
 
 // Bridges BinancePrivateRestClient::submit_order() to SubmitPort::SubmitFn's plain
-// function-pointer ABI (live_submit_orchestrator.hpp) -- the production wiring: `SubmitPort{
-// &submit_order_adapter, &client, &current_rules_version_adapter}`. Mirrors
-// query_order_adapter() exactly, including the null-guard discipline -- `client_order_id`
+// function-pointer ABI (live_submit_orchestrator.hpp). This adapter alone only fills
+// SubmitPort::fn with no Gate 1 version-fencing (SubmitPort::current_rules_version_fn stays
+// null, which fails closed by construction -- see that struct's own comment). Production
+// wiring that also needs SymbolRegistry-backed Gate 1 fencing uses the composite adapters in
+// binance_submit_adapter.hpp (make_binance_submit_port()/composite_submit_order_adapter()/
+// composite_current_rules_version_adapter()) instead of this one -- deliberately not
+// included from this file (see that header's own comment on why: symbol_registry.hpp pulls
+// in the whole durable_control_plane.hpp persistence chain, which this file stays free of).
+// Mirrors query_order_adapter() exactly, including the null-guard discipline -- `client_order_id`
 // guarded separately from `user_data` since orchestrate_submit() always passes a real,
 // internally-generated, non-null C string, but a defensive check here costs nothing and
 // matches this codebase's established "don't trust a C-ABI caller" posture at every other
