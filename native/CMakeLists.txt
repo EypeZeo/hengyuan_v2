@@ -174,6 +174,23 @@ if(HY_BUILD_DEMO)
     hengyuan_set_warnings(live_submit_reconcile_harness_demo)
     hengyuan_allow_third_party_tsan_fences(live_submit_reconcile_harness_demo)
 
+    # Batch H, H6: cold-start harness wiring H1-H5 against a real (owner-supplied,
+    # testnet-only) credential -- same Boost/Beast/OpenSSL dependency shape as the mock-
+    # credential harness above.
+    add_executable(live_submit_real_credentials_demo src/live_submit_real_credentials_demo.cpp)
+    target_link_libraries(live_submit_real_credentials_demo PRIVATE
+        hengyuan_dataplane
+        Boost::system
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+        Threads::Threads
+    )
+    target_include_directories(live_submit_real_credentials_demo SYSTEM PRIVATE
+        ${Boost_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+    )
+    hengyuan_set_warnings(live_submit_real_credentials_demo)
+    hengyuan_allow_third_party_tsan_fences(live_submit_real_credentials_demo)
+
     add_executable(binance_dry_run_demo src/binance_dry_run_demo.cpp)
     target_link_libraries(binance_dry_run_demo PRIVATE
         hengyuan_dataplane
