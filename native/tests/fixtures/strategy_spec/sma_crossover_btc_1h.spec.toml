@@ -1,0 +1,61 @@
+spec_version = 1
+name = "sma_crossover_btc_1h"
+description = "20/50 SMA 金叉做多，用 RSI 过滤超买 -- docs/STRATEGY_SPEC.md §7's worked example verbatim"
+
+[market]
+market    = "crypto_spot"
+symbol    = "BTCUSDT"
+timeframe = "1h"
+
+[[indicators]]
+id = "fast"
+op = "sma"
+input = "close"
+window = 20
+
+[[indicators]]
+id = "slow"
+op = "sma"
+input = "close"
+window = 50
+
+[[indicators]]
+id = "rsi14"
+op = "rsi"
+input = "close"
+window = 14
+
+[[indicators]]
+id = "not_overbought"
+op = "lt"
+left = "rsi14"
+right = 70.0
+
+[[indicators]]
+id = "trend_up"
+op = "gt"
+left = "fast"
+right = "slow"
+
+[[indicators]]
+id = "entry"
+op = "and"
+left = "trend_up"
+right = "not_overbought"
+
+[signal]
+node = "entry"
+mode = "boolean"
+
+# Machine-generated only -- see py_core/tools/generate_strategy_spec_fixture.py's own
+# docstring. Not a real validated result (this is a cross-language consistency fixture, not a
+# real strategy).
+[validation]
+validated_at   = "2026-09-15T08:30:00Z"
+validated_by   = "batch5-5c-fixture-generator"
+data_start_utc = "2024-01-01T00:00:00Z"
+data_end_utc   = "2024-01-06T00:00:00Z"
+data_digest    = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+oos_sharpe     = 1.34
+pbo            = 0.21
+trials         = 480

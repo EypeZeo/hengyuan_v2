@@ -108,6 +108,25 @@ def _evaluate_node(node: schema.IndicatorNode, node_values: dict[str, pd.Series]
     )
 
 
+def evaluate_spec_nodes(spec: schema.StrategySpecDoc, df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Evaluate every ``[[indicators]]`` node in declared order and return the full per-node
+    Series map -- not just the ``[signal]``-mapped final output ``evaluate_spec()`` returns.
+
+    Batch 5's cross-language consistency fixture generator (``py_core/tools/
+    generate_strategy_spec_fixture.py``) and its own drift-protection test
+    (``py_core/tests/test_strategy_spec_fixture_consistency.py``) both need node-level
+    introspection that ``evaluate_spec()`` alone doesn't expose -- the C++ side's
+    ``StreamingEvaluator::node_value()`` (``strategy_spec_evaluator.hpp``) has the same
+    per-node-not-just-final-signal shape for the identical reason. Extracted out of
+    ``evaluate_spec()`` (which now calls this) rather than duplicated, so there is exactly one
+    place the per-node evaluation loop lives.
+    """
+    node_values: dict[str, pd.Series] = {}
+    for node in spec.indicators:
+        node_values[node.id] = _evaluate_node(node, node_values, df)
+    return node_values
+
+
 def evaluate_spec(spec: schema.StrategySpecDoc, df: pd.DataFrame) -> pd.Series[Any]:
     """Evaluate every ``[[indicators]]`` node in declared order, then apply ``[signal]``'s
     mode to produce the final target-position Series (§4.4).
@@ -121,10 +140,7 @@ def evaluate_spec(spec: schema.StrategySpecDoc, df: pd.DataFrame) -> pd.Series[A
         ``[-1.0, 1.0]`` (``mode="scaled"``) -- never NaN (both modes map warm-up/undefined to
         ``0.0``, per §4.4).
     """
-    node_values: dict[str, pd.Series] = {}
-    for node in spec.indicators:
-        node_values[node.id] = _evaluate_node(node, node_values, df)
-
+    node_values = evaluate_spec_nodes(spec, df)
     signal_series = node_values[spec.signal.node]
     if spec.signal.mode == "boolean":
         arr = signal_series.to_numpy(dtype=np.float64)

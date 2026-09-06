@@ -666,6 +666,25 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_strategy_spec_evaluator)
     gtest_discover_tests(test_strategy_spec_evaluator)
 
+    # Batch 5, 5c: cross-language consistency test -- reads the checked-in golden fixtures
+    # under tests/fixtures/strategy_spec/ (produced by
+    # py_core/tools/generate_strategy_spec_fixture.py) via simdjson's DOM API. Links simdjson
+    # directly (not via hengyuan_dataplane, which would drag in Boost/OpenSSL for no reason
+    # here) -- same SYSTEM-include-dir workaround hengyuan_dataplane itself uses above, so
+    # simdjson's own headers don't trip this project's /W4 /WX.
+    add_executable(test_strategy_spec_consistency tests/test_strategy_spec_consistency.cpp)
+    target_link_libraries(test_strategy_spec_consistency PRIVATE hengyuan_strategy_spec simdjson GTest::gtest_main)
+    if(_simdjson_inc)
+        target_include_directories(test_strategy_spec_consistency SYSTEM PRIVATE ${_simdjson_inc})
+    endif()
+    # Dedicated macro (not the unrelated, Boost-gated HY_TEST_FIXTURE_DIR set much later in
+    # this file for the TLS-fixture-using tests) -- this target has no Boost/OpenSSL
+    # dependency and must not be coupled to that variable's file-order-dependent availability.
+    target_compile_definitions(test_strategy_spec_consistency PRIVATE
+        HY_STRATEGY_SPEC_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/strategy_spec")
+    hengyuan_set_warnings(test_strategy_spec_consistency)
+    gtest_discover_tests(test_strategy_spec_consistency)
+
     # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
     add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
     target_link_libraries(test_spot_rate_limit_budget PRIVATE hengyuan_core GTest::gtest_main)
