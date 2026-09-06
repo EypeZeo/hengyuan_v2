@@ -219,6 +219,25 @@ if(HY_BUILD_DEMO)
     hengyuan_set_warnings(live_bar_feed_signal_demo)
     hengyuan_allow_third_party_tsan_fences(live_bar_feed_signal_demo)
 
+    # 批次 6 6b-1: H6's cold-start chain + 6a-1 kline stream + new depth stream + real
+    # KillSwitch + dry-run evidence replay -- ctx.submit_port stays mock throughout (see the
+    # file's own header comment), so this produces zero real network writes and needs no L5
+    # review. Same dependency shape as live_submit_real_credentials_demo + live_bar_feed_signal_demo.
+    add_executable(live_submit_preflight_harness src/live_submit_preflight_harness.cpp)
+    target_link_libraries(live_submit_preflight_harness PRIVATE
+        hengyuan_dataplane
+        hengyuan_strategy_spec
+        Boost::system
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+        Threads::Threads
+    )
+    target_include_directories(live_submit_preflight_harness SYSTEM PRIVATE
+        ${Boost_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+    )
+    hengyuan_set_warnings(live_submit_preflight_harness)
+    hengyuan_allow_third_party_tsan_fences(live_submit_preflight_harness)
+
     add_executable(binance_dry_run_demo src/binance_dry_run_demo.cpp)
     target_link_libraries(binance_dry_run_demo PRIVATE
         hengyuan_dataplane
@@ -600,6 +619,14 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_live_submit_orchestrator PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_live_submit_orchestrator)
     gtest_discover_tests(test_live_submit_orchestrator)
+
+    # 批次 6 6b-1: proves orchestrate_submit() reaches exactly OperatorNotConfirmed given a
+    # fully gate-satisfying context with confirmation never bound -- same no-real-network,
+    # hengyuan_core-only dependency shape as live_submit_evidence_harness.cpp's own Fixture.
+    add_executable(test_live_submit_preflight_harness tests/test_live_submit_preflight_harness.cpp)
+    target_link_libraries(test_live_submit_preflight_harness PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_live_submit_preflight_harness)
+    gtest_discover_tests(test_live_submit_preflight_harness)
 
     # P2-EXEC-LIVE-01 D12-5: order lifecycle state machine + idempotency (L1)
     add_executable(test_order_lifecycle tests/test_order_lifecycle.cpp)
