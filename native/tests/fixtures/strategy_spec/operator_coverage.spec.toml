@@ -1,0 +1,95 @@
+spec_version = 1
+name = "operator_coverage"
+description = "Batch 5, 5c: exercises every operator docs/STRATEGY_SPEC.md §7's worked example does not -- ema, stddev, rolling_max/rolling_min, roc, lag, div (incl. a literal zero denominator), crosses_above with a literal operand, not, if_then_else, and a scaled-mode [signal]."
+
+[market]
+market    = "crypto_spot"
+symbol    = "BTCUSDT"
+timeframe = "1h"
+
+[[indicators]]
+id = "ema_fast"
+op = "ema"
+input = "close"
+window = 5
+
+[[indicators]]
+id = "vol"
+op = "stddev"
+input = "close"
+window = 10
+
+[[indicators]]
+id = "hh"
+op = "rolling_max"
+input = "high"
+window = 10
+
+[[indicators]]
+id = "ll"
+op = "rolling_min"
+input = "low"
+window = 10
+
+[[indicators]]
+id = "momentum"
+op = "roc"
+input = "close"
+window = 5
+
+[[indicators]]
+id = "close_lag1"
+op = "lag"
+input = "close"
+n = 1
+
+[[indicators]]
+id = "ratio"
+op = "div"
+left = "close"
+right = "close_lag1"
+
+# Literal zero denominator -- every bar of this node must be NaN, never +inf/-inf.
+[[indicators]]
+id = "always_nan_div"
+op = "div"
+left = "close"
+right = 0.0
+
+# Literal operand on crosses_above -- verified spec<->implementation arbitration (Batch 5,
+# 5a): evaluator.py's _resolve_series() broadcasts a bare literal into a constant series, and
+# schema.py never restricts crosses_above/crosses_below's operands to string-only.
+[[indicators]]
+id = "broke_100"
+op = "crosses_above"
+left = "close"
+right = 100.0
+
+[[indicators]]
+id = "not_broke_100"
+op = "not"
+input = "broke_100"
+
+[[indicators]]
+id = "signal_value"
+op = "if_then_else"
+cond = "broke_100"
+then = "momentum"
+otherwise = "ratio"
+
+[signal]
+node = "signal_value"
+mode = "scaled"
+
+# Machine-generated only -- see py_core/tools/generate_strategy_spec_fixture.py's own
+# docstring. Not a real validated result (this is a cross-language consistency fixture, not a
+# real strategy).
+[validation]
+validated_at   = "2026-09-15T08:30:00Z"
+validated_by   = "batch5-5c-fixture-generator"
+data_start_utc = "2024-01-01T00:00:00Z"
+data_end_utc   = "2024-01-04T08:00:00Z"
+data_digest    = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+oos_sharpe     = 0.5
+pbo            = 0.5
+trials         = 1
