@@ -83,6 +83,16 @@ if(_simdjson_inc)
 endif()
 hengyuan_set_warnings(hengyuan_dataplane)
 
+# --- Batch 5, 5a: StrategySpec TOML parser (docs/STRATEGY_SPEC.md). Deliberately its own
+# static library, not folded into hengyuan_dataplane (parser/orderbook/validator, an unrelated
+# concern) or hengyuan_core (header-only) -- no Boost/OpenSSL dependency, so it stays outside
+# if(HY_BUILD_DEMO) and builds unconditionally, same posture as hengyuan_dataplane itself.
+add_library(hengyuan_strategy_spec STATIC
+    src/strategy_spec_toml_parser.cpp
+)
+target_link_libraries(hengyuan_strategy_spec PUBLIC hengyuan_core)
+hengyuan_set_warnings(hengyuan_strategy_spec)
+
 # --- D12-9 dry-run evidence harness (header-only, no Boost/OpenSSL needed) ---
 add_executable(live_submit_evidence_harness src/live_submit_evidence_harness.cpp)
 target_link_libraries(live_submit_evidence_harness PRIVATE hengyuan_core)
@@ -634,6 +644,13 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_transport_policy PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_transport_policy)
     gtest_discover_tests(test_transport_policy)
+
+    # Batch 5, 5a: StrategySpec TOML parser -- fail-closed load/validation tests, no
+    # Boost/OpenSSL needed (hengyuan_strategy_spec has none).
+    add_executable(test_strategy_spec_toml_parser tests/test_strategy_spec_toml_parser.cpp)
+    target_link_libraries(test_strategy_spec_toml_parser PRIVATE hengyuan_strategy_spec GTest::gtest_main)
+    hengyuan_set_warnings(test_strategy_spec_toml_parser)
+    gtest_discover_tests(test_strategy_spec_toml_parser)
 
     # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
     add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
