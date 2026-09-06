@@ -652,6 +652,20 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_strategy_spec_toml_parser)
     gtest_discover_tests(test_strategy_spec_toml_parser)
 
+    # Batch 5, 5b: streaming operators (header-only, hengyuan_core only) -- per-operator unit
+    # tests against hand-computed sequences.
+    add_executable(test_strategy_spec_operators tests/test_strategy_spec_operators.cpp)
+    target_link_libraries(test_strategy_spec_operators PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_strategy_spec_operators)
+    gtest_discover_tests(test_strategy_spec_operators)
+
+    # Batch 5, 5b: StreamingEvaluator -- DAG-level warm-up/signal-mode/capacity-gate tests.
+    # Needs hengyuan_strategy_spec too (loads specs via load_strategy_spec()).
+    add_executable(test_strategy_spec_evaluator tests/test_strategy_spec_evaluator.cpp)
+    target_link_libraries(test_strategy_spec_evaluator PRIVATE hengyuan_strategy_spec GTest::gtest_main)
+    hengyuan_set_warnings(test_strategy_spec_evaluator)
+    gtest_discover_tests(test_strategy_spec_evaluator)
+
     # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
     add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
     target_link_libraries(test_spot_rate_limit_budget PRIVATE hengyuan_core GTest::gtest_main)
