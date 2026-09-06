@@ -996,6 +996,20 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_user_data_ws_session)
         gtest_discover_tests(test_binance_user_data_ws_session)
 
+        # 批次 6 6a-1: public kline/candlestick WS session -- same Boost/Beast/OpenSSL/simdjson
+        # dependency shape and blackhole-acceptor no-real-network fixture pattern as
+        # test_binance_user_data_ws_session above.
+        add_executable(test_binance_kline_ws_session tests/test_binance_kline_ws_session.cpp)
+        target_link_libraries(test_binance_kline_ws_session PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_kline_ws_session SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_kline_ws_session PRIVATE tests)
+        hengyuan_set_warnings(test_binance_kline_ws_session)
+        hengyuan_allow_third_party_tsan_fences(test_binance_kline_ws_session)
+        gtest_discover_tests(test_binance_kline_ws_session)
+
         # TODO 1A.4 batch 2: the reconnect supervisor -- constructs real
         # BinanceUserDataWsSession instances (via the same blackhole-acceptor no-real-network
         # fixture pattern as test_binance_user_data_ws_session above), so it needs the same
