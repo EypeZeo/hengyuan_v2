@@ -201,6 +201,24 @@ if(HY_BUILD_DEMO)
     hengyuan_set_warnings(live_submit_real_credentials_demo)
     hengyuan_allow_third_party_tsan_fences(live_submit_real_credentials_demo)
 
+    # 批次 6 6a-2: public kline feed -> StreamingEvaluator -> HoldingStateTracker, log only --
+    # zero order-related code anywhere in this target. Needs hengyuan_strategy_spec (loads specs
+    # via load_strategy_spec()) on top of the usual Boost/Beast/OpenSSL dependency shape.
+    add_executable(live_bar_feed_signal_demo src/live_bar_feed_signal_demo.cpp)
+    target_link_libraries(live_bar_feed_signal_demo PRIVATE
+        hengyuan_dataplane
+        hengyuan_strategy_spec
+        Boost::system
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+        Threads::Threads
+    )
+    target_include_directories(live_bar_feed_signal_demo SYSTEM PRIVATE
+        ${Boost_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+    )
+    hengyuan_set_warnings(live_bar_feed_signal_demo)
+    hengyuan_allow_third_party_tsan_fences(live_bar_feed_signal_demo)
+
     add_executable(binance_dry_run_demo src/binance_dry_run_demo.cpp)
     target_link_libraries(binance_dry_run_demo PRIVATE
         hengyuan_dataplane
@@ -684,6 +702,13 @@ if(HY_BUILD_TESTS)
         HY_STRATEGY_SPEC_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/strategy_spec")
     hengyuan_set_warnings(test_strategy_spec_consistency)
     gtest_discover_tests(test_strategy_spec_consistency)
+
+    # 批次 6 6a-2: HoldingStateTracker -- pure value-type state machine, header-only
+    # (hengyuan_core only, no Boost/OpenSSL/strategy_spec dependency of its own).
+    add_executable(test_holding_state_tracker tests/test_holding_state_tracker.cpp)
+    target_link_libraries(test_holding_state_tracker PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_holding_state_tracker)
+    gtest_discover_tests(test_holding_state_tracker)
 
     # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
     add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
