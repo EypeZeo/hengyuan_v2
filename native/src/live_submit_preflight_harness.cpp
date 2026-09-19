@@ -483,6 +483,12 @@ int main(int argc, char* argv[]) {
     // Real DurableAuditSink -- this harness never gets far enough to write an order-lifecycle
     // record worth persisting (confirmation is never bound), so an ephemeral per-run temp file
     // (cleaned at shutdown) is appropriate here, unlike a genuine production audit trail.
+    //
+    // DEMO-ONLY, and NOT a recovery path (外部复核 P0-06): a fresh temp log with a fixture KEK can
+    // never contain a previous run's orders, so this process cannot recover anything. Anything that
+    // may submit for real must run startup_recovery.hpp's Bootstrapping -> Recovering ->
+    // Reconciling -> Ready sequence over a PERSISTENT log first (6b-0d builds and tests that; the
+    // 6b-2 harness wires it, once the owner has decided how the audit key is provisioned).
     const std::string durable_audit_path = durable_audit_temp_path();
     remove_durable_audit_files(durable_audit_path);
     std::array<std::byte, kKekSize> kek{};

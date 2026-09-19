@@ -620,6 +620,13 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_live_submit_orchestrator)
     gtest_discover_tests(test_live_submit_orchestrator)
 
+    # 批次 6 6b-0d: startup recovery -- state machine + apply_recovery() against a REAL
+    # DurableAuditSink temp file and the real reconcile path (only the exchange is faked).
+    add_executable(test_startup_recovery tests/test_startup_recovery.cpp)
+    target_link_libraries(test_startup_recovery PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_startup_recovery)
+    gtest_discover_tests(test_startup_recovery)
+
     # 批次 6 6b-0c: target-position planner -- pure logic; only account_truth.hpp (hengyuan_core).
     add_executable(test_target_position_planner tests/test_target_position_planner.cpp)
     target_link_libraries(test_target_position_planner PRIVATE hengyuan_core GTest::gtest_main)
