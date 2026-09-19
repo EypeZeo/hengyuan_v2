@@ -252,3 +252,142 @@ trials         = 1
     StreamingEvaluator evaluator;
     EXPECT_FALSE(evaluator.init(load.dag));
 }
+
+// --- 批次 6 6b-0c: warmup_complete() ---------------------------------------------------------
+// Builds a minimal valid spec whose [signal] node is the LAST indicator in `indicators_toml`.
+namespace {
+
+std::string spec_with_indicators(const std::string& indicators_toml, const std::string& signal_node) {
+    return std::string(R"(
+spec_version = 1
+name = "warmup_probe"
+
+[market]
+market    = "crypto_spot"
+symbol    = "BTCUSDT"
+timeframe = "1h"
+)") + indicators_toml + "\n[signal]\nnode = \"" + signal_node + R"("
+mode = "scaled"
+
+[validation]
+validated_at   = "2026-09-15T08:30:00Z"
+validated_by   = "x"
+data_start_utc = "2021-01-01T00:00:00Z"
+data_end_utc   = "2026-06-30T00:00:00Z"
+data_digest    = "sha256:0"
+oos_sharpe     = 1.0
+pbo            = 0.1
+trials         = 1
+)";
+}
+
+// A deterministic, never-flat price series (flat data would make rsi/stddev degenerate).
+Bar probe_bar(int i) {
+    const double close = 100.0 + 0.7 * static_cast<double>(i % 11) - 0.3 * static_cast<double>(i % 5) +
+                         0.05 * static_cast<double>(i);
+    Bar b{};
+    b.open = close - 0.2 + 0.1 * static_cast<double>(i % 3);
+    b.high = close + 0.5;
+    b.low = close - 0.5;
+    b.close = close;
+    b.volume = 1000.0 + static_cast<double>(i);
+    return b;
+}
+
+struct ProbeResult {
+    std::uint32_t warmup{0};
+    int first_defined_seen{-1};   // seen_bars at the first bar whose signal node value is not NaN
+    int first_complete_seen{-1};  // seen_bars at the first bar where warmup_complete() is true
+    bool complete_but_undefined{false};  // the safety violation: complete while node value is NaN
+};
+
+ProbeResult probe(const std::string& indicators_toml, const std::string& signal_node) {
+    const auto load = load_strategy_spec(spec_with_indicators(indicators_toml, signal_node));
+    EXPECT_TRUE(load.ok());
+    StreamingEvaluator evaluator;
+    EXPECT_TRUE(evaluator.init(load.dag));
+    ProbeResult r;
+    r.warmup = evaluator.effective_warmup();
+    EXPECT_FALSE(evaluator.warmup_complete());  // nothing fed yet
+    const std::size_t sig = load.dag.signal_node_idx;
+    for (int i = 0; i < static_cast<int>(r.warmup) + 40; ++i) {
+        evaluator.step(probe_bar(i));
+        const int seen = static_cast<int>(evaluator.seen_bars());
+        const bool defined = !std::isnan(evaluator.node_value(sig));
+        if (defined && r.first_defined_seen < 0) r.first_defined_seen = seen;
+        if (evaluator.warmup_complete()) {
+            if (r.first_complete_seen < 0) r.first_complete_seen = seen;
+            if (!defined) r.complete_but_undefined = true;
+        }
+    }
+    return r;
+}
+
+}  // namespace
+
+// The safety property: whenever warmup_complete() is true, the signal node is actually defined.
+// Checked across every operator shape whose warm-up arithmetic differs.
+TEST(StrategySpecEvaluatorWarmup, CompleteImpliesSignalNodeIsDefinedForEveryOperatorShape) {
+    const struct { const char* name; std::string toml; const char* signal; } cases[] = {
+        {"sma", "\n[[indicators]]\nid = \"s\"\nop = \"sma\"\ninput = \"close\"\nwindow = 5\n", "s"},
+        {"ema", "\n[[indicators]]\nid = \"s\"\nop = \"ema\"\ninput = \"close\"\nwindow = 5\n", "s"},
+        {"stddev", "\n[[indicators]]\nid = \"s\"\nop = \"stddev\"\ninput = \"close\"\nwindow = 5\n", "s"},
+        {"rolling_max", "\n[[indicators]]\nid = \"s\"\nop = \"rolling_max\"\ninput = \"close\"\nwindow = 5\n", "s"},
+        {"rolling_min", "\n[[indicators]]\nid = \"s\"\nop = \"rolling_min\"\ninput = \"close\"\nwindow = 5\n", "s"},
+        {"roc", "\n[[indicators]]\nid = \"s\"\nop = \"roc\"\ninput = \"close\"\nwindow = 5\n", "s"},
+        {"rsi", "\n[[indicators]]\nid = \"s\"\nop = \"rsi\"\ninput = \"close\"\nwindow = 5\n", "s"},
+        {"lag", "\n[[indicators]]\nid = \"s\"\nop = \"lag\"\ninput = \"close\"\nn = 3\n", "s"},
+        {"crosses_above_raw",
+         "\n[[indicators]]\nid = \"s\"\nop = \"crosses_above\"\nleft = \"close\"\nright = \"open\"\n", "s"},
+        {"crosses_above_sma",
+         "\n[[indicators]]\nid = \"f\"\nop = \"sma\"\ninput = \"close\"\nwindow = 3\n"
+         "\n[[indicators]]\nid = \"g\"\nop = \"sma\"\ninput = \"close\"\nwindow = 6\n"
+         "\n[[indicators]]\nid = \"s\"\nop = \"crosses_above\"\nleft = \"f\"\nright = \"g\"\n",
+         "s"},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        const ProbeResult r = probe(c.toml, c.signal);
+        EXPECT_FALSE(r.complete_but_undefined);
+        EXPECT_GE(r.first_complete_seen, 1);
+        // Never earlier than the node's first defined value.
+        EXPECT_GE(r.first_complete_seen, r.first_defined_seen);
+        // ...and conservative by AT MOST one bar past it (so this gate never costs more than one
+        // extra bar of waiting).
+        EXPECT_LE(r.first_complete_seen, r.first_defined_seen + 1);
+    }
+}
+
+// Pins the two facts warmup_complete()'s comment relies on -- why the boundary is `>` and not `>=`.
+TEST(StrategySpecEvaluatorWarmup, WindowAverageIsDefinedOnTheWarmupBarSoTheGateIsOneBarConservativeThere) {
+    const ProbeResult r = probe("\n[[indicators]]\nid = \"s\"\nop = \"sma\"\ninput = \"close\"\nwindow = 5\n", "s");
+    EXPECT_EQ(r.warmup, 5u);
+    EXPECT_EQ(r.first_defined_seen, 5);   // defined exactly when seen_bars == W
+    EXPECT_EQ(r.first_complete_seen, 6);  // the gate waits one extra bar
+}
+
+TEST(StrategySpecEvaluatorWarmup, LagAndCrossesOverRawFieldsUndercountByOneSoGreaterOrEqualWouldBeUnsafe) {
+    const ProbeResult lag = probe("\n[[indicators]]\nid = \"s\"\nop = \"lag\"\ninput = \"close\"\nn = 3\n", "s");
+    EXPECT_EQ(lag.warmup, 3u);
+    EXPECT_EQ(lag.first_defined_seen, 4);   // still undefined when seen_bars == W
+    EXPECT_EQ(lag.first_complete_seen, 4);  // `>` is exact here; `>=` would have fired one bar early
+
+    const ProbeResult crosses = probe(
+        "\n[[indicators]]\nid = \"s\"\nop = \"crosses_above\"\nleft = \"close\"\nright = \"open\"\n", "s");
+    EXPECT_EQ(crosses.warmup, 1u);
+    EXPECT_EQ(crosses.first_defined_seen, 2);
+    EXPECT_EQ(crosses.first_complete_seen, 2);
+}
+
+TEST(StrategySpecEvaluatorWarmup, NotCompleteBeforeInitAndAfterReset) {
+    const auto load = load_strategy_spec(kWorkedExample);
+    ASSERT_TRUE(load.ok());
+    StreamingEvaluator evaluator;
+    EXPECT_FALSE(evaluator.warmup_complete());  // never init()'d
+    ASSERT_TRUE(evaluator.init(load.dag));
+    for (int i = 0; i < 80; ++i) evaluator.step(probe_bar(i));
+    EXPECT_TRUE(evaluator.warmup_complete());
+    evaluator.reset();  // the restart / gap-recovery path
+    EXPECT_FALSE(evaluator.warmup_complete());
+    EXPECT_EQ(evaluator.seen_bars(), 0u);
+}

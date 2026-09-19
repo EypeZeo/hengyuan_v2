@@ -620,6 +620,12 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_live_submit_orchestrator)
     gtest_discover_tests(test_live_submit_orchestrator)
 
+    # 批次 6 6b-0c: target-position planner -- pure logic; only account_truth.hpp (hengyuan_core).
+    add_executable(test_target_position_planner tests/test_target_position_planner.cpp)
+    target_link_libraries(test_target_position_planner PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_target_position_planner)
+    gtest_discover_tests(test_target_position_planner)
+
     # 批次 6 6b-0a: feed validity gate -- pure logic (header needs only <cstdint>), no Boost.
     add_executable(test_feed_validity_gate tests/test_feed_validity_gate.cpp)
     target_link_libraries(test_feed_validity_gate PRIVATE hengyuan_core GTest::gtest_main)
