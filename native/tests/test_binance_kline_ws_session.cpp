@@ -269,6 +269,106 @@ TEST(KlineBarGapGuard, ResumeClearsSuspensionAndResetsBaseline) {
     EXPECT_FALSE(guard.is_suspended());
 }
 
+// --- ingest_closed_bar(): ring-full is a gap too (外部复核 P0-04) ---
+// The bug this group is the regression for: KlineBarGapGuard::accept() advances its continuity
+// baseline BEFORE the ring push, so a failed push used to leave the guard believing "no gap"
+// while the consumer was one bar short -- every later contiguous bar then sailed through and
+// silently corrupted SMA/EMA/RSI state. These tests exercise the real SpscRing (no network).
+
+namespace {
+
+// Contiguous 1-second-ish bars: bar i spans [1000*i, 1000*i + 999], so bar i+1 opens at
+// (close of bar i) + 1 exactly -- the continuity rule KlineBarGapGuard enforces.
+KlineWsEvent contiguous_bar(std::int64_t i) {
+    KlineWsEvent ev{};
+    ev.open_time_ms = 1000 * i;
+    ev.close_time_ms = 1000 * i + 999;
+    ev.is_closed = true;
+    return ev;
+}
+
+}  // namespace
+
+TEST(IngestClosedBar, ContiguousBarsArePushed) {
+    KlineBarGapGuard guard;
+    KlineWsEventRing ring;
+    EXPECT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(0)), hy::KlineIngestResult::Pushed);
+    EXPECT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(1)), hy::KlineIngestResult::Pushed);
+    EXPECT_FALSE(guard.is_suspended());
+}
+
+TEST(IngestClosedBar, GapIsDetectedAndTheGapBarIsNotPushed) {
+    KlineBarGapGuard guard;
+    KlineWsEventRing ring;
+    ASSERT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(0)), hy::KlineIngestResult::Pushed);
+    EXPECT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(5)),  // bars 1-4 missing
+              hy::KlineIngestResult::GapDetected);
+    EXPECT_TRUE(guard.is_suspended());
+
+    KlineWsEvent popped{};
+    ASSERT_TRUE(ring.try_pop(popped));  // bar 0 only
+    EXPECT_EQ(popped.open_time_ms, 0);
+    EXPECT_FALSE(ring.try_pop(popped));  // the gap bar never reached the ring
+}
+
+// THE regression for P0-04: fill the ring with no consumer, lose one closed bar, then let the
+// consumer drain EVERYTHING and offer the very next contiguous bar. Before the fix that bar was
+// accepted (the guard's baseline had advanced past the lost bar) and the consumer was silently
+// one bar short from then on. It must now be refused until resume().
+TEST(IngestClosedBar, RingFullSuspendsAndLaterContiguousBarsAreRefusedEvenAfterTheConsumerDrains) {
+    KlineBarGapGuard guard;
+    KlineWsEventRing ring;
+    const std::int64_t capacity = static_cast<std::int64_t>(KlineWsEventRing::capacity());
+
+    for (std::int64_t i = 0; i < capacity; ++i) {
+        ASSERT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(i)), hy::KlineIngestResult::Pushed)
+            << "bar " << i;
+    }
+    // The ring is now genuinely full: this closed bar is lost.
+    EXPECT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(capacity)),
+              hy::KlineIngestResult::RingFull);
+    EXPECT_TRUE(guard.is_suspended());
+
+    // Consumer catches up completely -- the ring now has plenty of room.
+    KlineWsEvent popped{};
+    std::int64_t drained = 0;
+    while (ring.try_pop(popped)) ++drained;
+    ASSERT_EQ(drained, capacity);
+
+    // The next bar is contiguous with the LOST bar, so the old baseline would have accepted it.
+    EXPECT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(capacity + 1)),
+              hy::KlineIngestResult::SuspendedEarlier);
+    EXPECT_FALSE(ring.try_pop(popped));  // nothing leaked into the ring
+}
+
+TEST(IngestClosedBar, ResumeAfterRingFullRestoresIngestionFromTheNextBar) {
+    KlineBarGapGuard guard;
+    KlineWsEventRing ring;
+    const std::int64_t capacity = static_cast<std::int64_t>(KlineWsEventRing::capacity());
+    for (std::int64_t i = 0; i < capacity; ++i) {
+        ASSERT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(i)), hy::KlineIngestResult::Pushed);
+    }
+    ASSERT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(capacity)),
+              hy::KlineIngestResult::RingFull);
+    KlineWsEvent popped{};
+    while (ring.try_pop(popped)) {}
+
+    guard.resume();  // the caller's explicit "I have rebuilt state" acknowledgement
+    EXPECT_EQ(hy::ingest_closed_bar(guard, ring, contiguous_bar(capacity + 10)),
+              hy::KlineIngestResult::Pushed);  // new baseline, no continuity check against the past
+    EXPECT_FALSE(guard.is_suspended());
+}
+
+TEST(KlineBarGapGuard, ForceSuspendRejectsEverythingUntilResume) {
+    KlineBarGapGuard guard;
+    ASSERT_TRUE(guard.accept(contiguous_bar(0)));
+    guard.force_suspend();
+    EXPECT_TRUE(guard.is_suspended());
+    EXPECT_FALSE(guard.accept(contiguous_bar(1)));  // would have been contiguous
+    guard.resume();
+    EXPECT_TRUE(guard.accept(contiguous_bar(1)));
+}
+
 // --- BinanceKlineWsSession: lifecycle / connection failure (blackhole fixture, no real network) ---
 
 TEST(BinanceKlineWsSessionLifecycle, InvalidConfigFailsWithoutTouchingNetwork) {

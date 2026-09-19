@@ -320,6 +320,14 @@ public:
 
     bool is_suspended() const noexcept { return suspended_; }
 
+    // Suspends WITHOUT a continuity mismatch having been observed. Exists for one case only: a
+    // bar this guard accepted (advancing prev_close_time_ms_) then failed to actually reach its
+    // consumer -- ring full (see ingest_closed_bar() below). Without this, the guard's baseline
+    // says "no gap" while the consumer is in fact one bar short, and every later bar still passes
+    // the continuity check, silently corrupting SMA/EMA/RSI state (external review P0-04,
+    // verified against this file's own earlier handle_closed_bar()).
+    void force_suspend() noexcept { suspended_ = true; }
+
     // Clears suspension and the continuity baseline -- the next accept() call is unconditionally
     // accepted and becomes the new baseline, with no check against the pre-gap value. Caller's
     // responsibility to only call this once it is actually safe to trust the next observed bar
@@ -336,6 +344,30 @@ private:
     std::int64_t prev_close_time_ms_{0};
 };
 
+enum class KlineIngestResult : std::uint8_t {
+    Pushed = 0,           // accepted by the guard AND actually in the ring
+    RingFull = 1,         // accepted by the guard but the ring was full -- guard now suspended
+    GapDetected = 2,      // continuity mismatch -- this call suspended the guard, bar NOT pushed
+    SuspendedEarlier = 3, // guard was already suspended -- bar discarded, nothing touched
+};
+
+// The one place a closed bar is admitted to the ring. Requirement 3 of this file's design (added
+// by external review P0-04): "accepted by the continuity guard" and "delivered to the consumer"
+// are two different facts, and only the second one is what keeps downstream indicator state
+// correct. A full ring therefore suspends exactly like a gap does -- the consumer is now missing
+// a bar, which is a gap the consumer itself cannot see from timestamps it never received.
+// Free function (not a member) so it is unit-testable against a real ring with no session/network.
+inline KlineIngestResult ingest_closed_bar(KlineBarGapGuard& guard, KlineWsEventRing& ring,
+                                            const KlineWsEvent& event) noexcept {
+    if (guard.is_suspended()) return KlineIngestResult::SuspendedEarlier;
+    if (!guard.accept(event)) return KlineIngestResult::GapDetected;
+    if (!ring.try_push(event)) {
+        guard.force_suspend();
+        return KlineIngestResult::RingFull;
+    }
+    return KlineIngestResult::Pushed;
+}
+
 struct KlineWsSessionStats {
     std::uint64_t messages_received{0};
     std::uint64_t bytes_received{0};
@@ -347,6 +379,8 @@ struct KlineWsSessionStats {
     std::uint64_t push_ok{0};
     std::uint64_t push_dropped{0};
     std::uint64_t gap_detected_count{0};  // bar-gap continuity check failures -- requirement 2
+    std::uint64_t ring_overflow_suspended{0};  // closed bar lost to a full ring -> suspended
+                                                // (ingest_closed_bar()); also counted in push_dropped
     std::uint64_t errors{0};
     beast::error_code last_error_ec{};
     std::string last_error_stage;  // e.g. "resolve", "connect", "ssl_handshake", "read"
@@ -547,23 +581,33 @@ private:
     // is strand-only state: touched only from here and from resume_after_gap()'s strand-posted
     // lambda -- never from any other thread.
     void handle_closed_bar(const KlineWsEvent& event) {
-        const bool was_suspended = gap_guard_.is_suspended();
-        const bool accepted = gap_guard_.accept(event);
-        if (!was_suspended && gap_guard_.is_suspended()) {
-            // This call is the one that just detected the gap -- count it exactly once, not on
-            // every further discard while suspended (see the else-branch below).
-            suspended_.store(true, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> lock(stats_mutex_);
-            ++stats_.gap_detected_count;
-            return;  // the gap-triggering bar itself is also NOT pushed -- see header comment
-        }
-        if (!accepted) return;  // already suspended from an earlier gap -- discard silently
-
-        std::lock_guard<std::mutex> lock(stats_mutex_);
-        if (ring_.try_push(event)) {
-            ++stats_.push_ok;
-        } else {
-            ++stats_.push_dropped;
+        switch (ingest_closed_bar(gap_guard_, ring_, event)) {
+            case KlineIngestResult::Pushed: {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                ++stats_.push_ok;
+                break;
+            }
+            case KlineIngestResult::GapDetected: {
+                // This call is the one that just detected the gap -- counted exactly once, not on
+                // every further discard while suspended (SuspendedEarlier below). The
+                // gap-triggering bar itself is also NOT pushed -- see header comment.
+                suspended_.store(true, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                ++stats_.gap_detected_count;
+                break;
+            }
+            case KlineIngestResult::RingFull: {
+                // A closed bar was lost, and the guard has already suspended itself -- mirror
+                // that into the cross-thread-visible flag so a consumer polling is_suspended()
+                // sees it. push_dropped keeps its existing meaning (any push that failed).
+                suspended_.store(true, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                ++stats_.push_dropped;
+                ++stats_.ring_overflow_suspended;
+                break;
+            }
+            case KlineIngestResult::SuspendedEarlier:
+                break;  // discard silently; already counted when the suspension began
         }
     }
 

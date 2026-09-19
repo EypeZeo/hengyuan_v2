@@ -620,6 +620,12 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_live_submit_orchestrator)
     gtest_discover_tests(test_live_submit_orchestrator)
 
+    # 批次 6 6b-0a: feed validity gate -- pure logic (header needs only <cstdint>), no Boost.
+    add_executable(test_feed_validity_gate tests/test_feed_validity_gate.cpp)
+    target_link_libraries(test_feed_validity_gate PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_feed_validity_gate)
+    gtest_discover_tests(test_feed_validity_gate)
+
     # 批次 6 6b-1: proves orchestrate_submit() reaches exactly OperatorNotConfirmed given a
     # fully gate-satisfying context with confirmation never bound -- same no-real-network,
     # hengyuan_core-only dependency shape as live_submit_evidence_harness.cpp's own Fixture.

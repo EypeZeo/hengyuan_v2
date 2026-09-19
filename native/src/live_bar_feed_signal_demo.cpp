@@ -23,6 +23,7 @@
 
 #include <hengyuan/binance_kline_ws_session.hpp>
 #include <hengyuan/binance_tls.hpp>
+#include <hengyuan/feed_validity_gate.hpp>
 #include <hengyuan/holding_state_tracker.hpp>
 #include <hengyuan/strategy_spec_evaluator.hpp>
 #include <hengyuan/strategy_spec_toml_parser.hpp>
@@ -164,22 +165,22 @@ int main(int argc, char* argv[]) {
     std::printf("This process NEVER constructs an order or submit port -- log-only milestone.\n\n");
 
     std::uint64_t bars_seen = 0;
-    bool was_suspended = false;
+    int exit_code = 0;
+    // Consumer-side continuity check (外部复核 P0-04): independent of the session's own guard,
+    // validated against the timestamps of bars that ACTUALLY reached this consumer.
+    hy::KlineBarGapGuard consumer_guard;
+    const auto run_start = std::chrono::steady_clock::now();
     while (!g_stop.load()) {
-        // Bar-gap suspend is observable/alertable here, but recovery (StreamingEvaluator::
-        // reset() + REST backfill, or human intervention) is deliberately out of this demo's
-        // scope -- see binance_kline_ws_session.hpp's own header comment, requirement 2.
-        const bool now_suspended = session->is_suspended();
-        if (now_suspended && !was_suspended) {
-            std::fprintf(stderr,
-                          "ALERT: bar-gap detected -- kline session SUSPENDED, no further bars "
-                          "will reach the evaluator until an operator resumes it (out of scope "
-                          "for this demo).\n");
-        }
-        was_suspended = now_suspended;
-
         hy::KlineWsEvent ev{};
         while (ring.try_pop(ev)) {
+            if (!consumer_guard.accept(ev)) {
+                // A bar is missing between what the session delivered and what came before it.
+                // Never feed a gapped sequence into the windowed indicators; drop evaluator
+                // state so nothing stale can be read afterwards. Recovery (REST backfill) is
+                // 6b-0f -- until then this demo stops and must be restarted.
+                evaluator.reset();
+                break;
+            }
             const hy::Bar bar{ev.open, ev.high, ev.low, ev.close, ev.volume};
             const double target_position = evaluator.step(bar);
             const auto action = tracker.on_target_position(target_position);
@@ -193,6 +194,32 @@ int main(int argc, char* argv[]) {
                 std::printf("  SUGGESTED_ACTION=%s", action_name(action));
             }
             std::printf("\n");
+        }
+
+        // Feed validity is evaluated AFTER draining what the ring already holds (those bars are
+        // contiguous and still valid). This demo has no depth stream, so depth_tracking is passed
+        // as true and depth_session_stopped as false -- "not applicable", not a claim about depth.
+        hy::FeedHealthInputs health;
+        health.kline_session_stopped = session->stopped();
+        health.kline_session_suspended = session->is_suspended();
+        health.consumer_continuity_broken = consumer_guard.is_suspended();
+        health.depth_tracking = true;
+        const hy::FeedInvalidReason invalid = hy::evaluate_feed_validity(health);
+        if (hy::feed_invalid_reason_is_terminal(invalid)) {
+            std::fprintf(stderr,
+                          "ALERT: feed invalid (%s) -- no further bars will be trusted. This "
+                          "process stops here; restart to recover (in-process backfill is 6b-0f).\n",
+                          hy::feed_invalid_reason_name(invalid));
+            exit_code = 2;
+            break;
+        }
+
+        const auto elapsed = std::chrono::steady_clock::now() - run_start;
+        if (elapsed >= std::chrono::seconds(hy::kDefaultMaxRunSeconds)) {
+            std::printf("Reached the default max run time (%d h) -- stopping cleanly before "
+                        "Binance's 24h connection limit.\n",
+                        hy::kDefaultMaxRunSeconds / 3600);
+            break;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -211,10 +238,12 @@ int main(int argc, char* argv[]) {
     std::printf("Parse OK (closed bars): %" PRIu64 "  unclosed skipped: %" PRIu64
                 "  parse failed: %" PRIu64 "\n",
                 stats.parse_ok, stats.unclosed_skipped, stats.parse_failed);
-    std::printf("Ring push OK: %" PRIu64 "  dropped: %" PRIu64 "  gap-detected: %" PRIu64 "\n",
-                stats.push_ok, stats.push_dropped, stats.gap_detected_count);
+    std::printf("Ring push OK: %" PRIu64 "  dropped: %" PRIu64 "  gap-detected: %" PRIu64
+                "  ring-overflow-suspended: %" PRIu64 "\n",
+                stats.push_ok, stats.push_dropped, stats.gap_detected_count,
+                stats.ring_overflow_suspended);
     std::printf("Bars evaluated: %" PRIu64 "  final holding state: %s\n", bars_seen,
                 tracker.state() == hy::HoldingState::Long ? "LONG" : "FLAT");
 
-    return 0;
+    return exit_code;
 }

@@ -44,6 +44,7 @@
 #include <hengyuan/binance_user_data_ws_supervisor.hpp>
 #include <hengyuan/binance_ws_session.hpp>
 #include <hengyuan/env_loader.hpp>
+#include <hengyuan/feed_validity_gate.hpp>
 #include <hengyuan/holding_state_tracker.hpp>
 #include <hengyuan/depth_manager.hpp>
 #include <hengyuan/input_validator.hpp>
@@ -230,7 +231,15 @@ int main(int argc, char* argv[]) {
     const std::string spec_path = argv[1];
     int duration_s = argc >= 3 ? std::atoi(argv[2]) : 60;
     if (duration_s <= 0) duration_s = 60;
+    if (duration_s > kDefaultMaxRunSeconds) {
+        // Stay clear of Binance's 24h connection limit (feed_validity_gate.hpp) -- both public
+        // sessions are fail-stop, so a run that reaches it would end abruptly instead of cleanly.
+        std::printf("NOTE: requested duration clamped to the default max run time (%d h).\n",
+                    kDefaultMaxRunSeconds / 3600);
+        duration_s = kDefaultMaxRunSeconds;
+    }
     const std::string interval = argc >= 4 ? argv[3] : "1h";
+    int exit_code = 0;
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
@@ -397,6 +406,9 @@ int main(int argc, char* argv[]) {
     auto kline_session =
         std::make_shared<BinanceKlineWsSession>(ioc, ssl_ctx, kline_ring, kline_parser, kline_cfg);
     kline_session->start();
+    // Consumer-side continuity check (外部复核 P0-04), independent of the session's own guard:
+    // validated against the timestamps of bars that ACTUALLY reached this consumer.
+    KlineBarGapGuard kline_consumer_guard;
 
     // --- New: public depth stream -> DepthManager -> ctx.depth_synced (确认发现 1 的直接修复) --
     constexpr std::size_t kDepthRingSize = 65536;
@@ -437,6 +449,17 @@ int main(int argc, char* argv[]) {
         return fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier, cfg);
     };
     SnapshotRefreshGate depth_gate(testnet_depth_fetcher);
+
+    // Everything feed_validity_gate.hpp needs, gathered in one place.
+    auto gather_feed_health = [&]() {
+        FeedHealthInputs h;
+        h.kline_session_stopped = kline_session->stopped();
+        h.kline_session_suspended = kline_session->is_suspended();
+        h.depth_session_stopped = depth_session->stopped();
+        h.depth_tracking = (depth_mgr.state() == DepthState::Tracking);
+        h.consumer_continuity_broken = kline_consumer_guard.is_suspended();
+        return h;
+    };
 
     std::thread io_thread([&ioc]() { ioc.run(); });
 
@@ -566,8 +589,20 @@ int main(int argc, char* argv[]) {
         }
         const bool depth_synced = (depth_mgr.state() == DepthState::Tracking);
 
+        // Feed validity (批次 6 6b-0a), evaluated BEFORE draining so a suggested action derived
+        // from a bar below is only ever probed while the feed is currently trustworthy.
+        const FeedInvalidReason feed_reason = evaluate_feed_validity(gather_feed_health());
+
         KlineWsEvent kev{};
         while (kline_ring.try_pop(kev)) {
+            if (!kline_consumer_guard.accept(kev)) {
+                // A bar went missing between what the session delivered and what came before it.
+                // Never feed a gapped sequence into the windowed indicators; drop evaluator state
+                // so nothing stale can be read afterwards. Recovery is 6b-0f -- until then this
+                // process stops (terminal check right after this loop) and must be restarted.
+                evaluator.reset();
+                break;
+            }
             const Bar bar{kev.open, kev.high, kev.low, kev.close, kev.volume};
             const double target_position = evaluator.step(bar);
             const auto action = tracker.on_target_position(target_position);
@@ -575,6 +610,12 @@ int main(int argc, char* argv[]) {
                         target_position, tracker.state() == HoldingState::Long ? "LONG" : "FLAT");
 
             if (action == SuggestedAction::None) continue;
+
+            if (feed_reason != FeedInvalidReason::None) {
+                std::printf("  [suppressed] suggested action not probed: feed invalid (%s)\n",
+                            feed_invalid_reason_name(feed_reason));
+                continue;
+            }
 
             ++preflight_probes;
             const auto tob = depth_mgr.book().top_of_book();
@@ -641,6 +682,18 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Terminal feed conditions end the run: with no in-process backfill yet (6b-0f), a stopped
+        // or suspended feed cannot heal, and continuing would only keep polling a dead feed.
+        const FeedInvalidReason feed_reason_after = evaluate_feed_validity(gather_feed_health());
+        if (feed_invalid_reason_is_terminal(feed_reason_after)) {
+            std::fprintf(stderr,
+                         "ALERT: feed invalid (%s) -- stopping. Restart to recover; in-process "
+                         "backfill is 6b-0f.\n",
+                         feed_invalid_reason_name(feed_reason_after));
+            exit_code = 2;
+            break;
+        }
+
         ++poll_ticks;
         if (duration_s > 0 && (now_ms - loop_start_ms) >= static_cast<std::int64_t>(duration_s) * 1000) {
             break;
@@ -676,13 +729,14 @@ int main(int argc, char* argv[]) {
                 : depth_mgr.state() == DepthState::Syncing ? "Syncing" : "Buffering");
     const auto kline_stats = kline_session->stats_snapshot();
     std::printf("Kline: closed_bars=%" PRIu64 " unclosed_skipped=%" PRIu64 " gap_detected=%" PRIu64
-                " suspended=%s\n",
+                " ring_overflow_suspended=%" PRIu64 " suspended=%s\n",
                 kline_stats.parse_ok, kline_stats.unclosed_skipped, kline_stats.gap_detected_count,
+                kline_stats.ring_overflow_suspended,
                 kline_session->is_suspended() ? "true" : "false");
 
     durable_audit_sink.reset();  // close before removing the temp file
     key_ring.reset();
     remove_durable_audit_files(durable_audit_path);
 
-    return 0;
+    return exit_code;
 }
