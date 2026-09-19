@@ -209,6 +209,23 @@ public:
 
     std::uint32_t effective_warmup() const noexcept { return dag_.effective_warmup; }
 
+    // Bars fed through step() since init()/reset(). 批次 6 6b-0c: read-only, added so an order
+    // planner can refuse to act on a signal the evaluator has not had time to define yet.
+    std::uint64_t seen_bars() const noexcept { return seen_bars_; }
+
+    // True once the [signal] node's value is safe to act on. Deliberately `seen_bars > warmup`,
+    // NOT `>=`: effective_warmup() (compute_effective_warmup(), §6) is exact for window-average
+    // ops (sma(n): first defined value on the n-th bar, W=n) but UNDERCOUNTS by one bar for
+    // lag/roc/crosses over raw fields (lag(n): first defined value on bar n+1, W=n; crosses over
+    // raw fields needs two bars, W=1) -- see test_strategy_spec_evaluator.cpp's warm-up boundary
+    // tests. `>` is therefore safe for every operator and merely one bar conservative for the
+    // window-average family. Why this matters: apply_signal_mode() maps a still-undefined (NaN)
+    // signal to 0.0, so after a restart an acting-on-level planner would read "target position
+    // zero" during warm-up and could propose selling a real holding.
+    bool warmup_complete() const noexcept {
+        return initialized_ && seen_bars_ > dag_.effective_warmup;
+    }
+
     bool is_initialized() const noexcept { return initialized_; }
 
     // Clears all runtime state (history pool, per-node accumulators, bar counter) without

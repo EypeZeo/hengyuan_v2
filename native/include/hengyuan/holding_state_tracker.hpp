@@ -20,9 +20,17 @@
 // to 6b-1's implementation.
 //
 // No I/O, no network, no order-construction code of any kind -- a pure, standalone value-type
-// state machine, meant to be reused unchanged by 6a-2 (log-only, this batch), 6b-1 (still
-// log-only, real gate chain minus confirmation), and 6b-2 (the real confirmation-gated order
-// path) -- one place this translation logic lives, not three.
+// state machine.
+//
+// *** NOT AN ORDER SOURCE (外部复核 P0-02, verified 2026-09-19) ***
+// This tracker is for LOGGING signal transitions (6a-2's demo, 6b-1's preflight probe) and nothing
+// else. It advances state_ in the same call that emits the action, before any order exists; it
+// defaults to Flat and never reads the real account. So a rejected confirmation, a failed POST, an
+// UNKNOWN outcome, a partial fill or a restart leaves it disagreeing with the actual position:
+// after an emitted-but-failed Open every later Long signal is silent (no retry), after an
+// emitted-but-unfilled Close a real holding is never closed, and after a restart with a holding it
+// still says Flat. Anything that derives an ORDER must use target_position_planner.hpp, which is
+// level-triggered against the actual position and keeps no per-signal state to reconcile.
 
 #pragma once
 
