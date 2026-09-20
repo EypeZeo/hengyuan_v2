@@ -988,6 +988,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_public_feed_supervisor_concurrency)
     gtest_discover_tests(test_public_feed_supervisor_concurrency PROPERTIES LABELS concurrency)
 
+    # Batch 6, 6b-0f-3a: single-flight worker-thread fetch gate (the klines backfill's non-blocking
+    # runner). Boost-free and injected-clock, so it is tested with a hand-released fetcher on a real
+    # worker thread; carries the `concurrency` label because worker thread + mailbox is what TSan
+    # is for.
+    add_executable(test_single_flight_fetch_gate tests/test_single_flight_fetch_gate.cpp)
+    target_link_libraries(test_single_flight_fetch_gate PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_single_flight_fetch_gate)
+    gtest_discover_tests(test_single_flight_fetch_gate PROPERTIES LABELS concurrency)
+
     # Negative control for the TSan gate: a deliberately-racy ring that TSan MUST
     # report. Built only on demand — it is NOT registered with ctest, because a
     # deliberate data race must never look like a suite failure. CI runs the
