@@ -63,6 +63,7 @@
 #pragma once
 
 #include <hengyuan/binance_tls.hpp>
+#include <hengyuan/kline_bar.hpp>
 #include <hengyuan/spsc_ring.hpp>
 
 #include <boost/asio.hpp>
@@ -105,34 +106,9 @@ namespace websocket = beast::websocket;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
-// A closed candle only, double-valued -- deliberately NOT hy::BinanceMarketEvent's int64-ticks
-// shape. This session has no SymbolRegistry access (same discipline as UserDataWsEvent, see
-// binance_user_data_event.hpp's own header comment) and its one consumer,
-// hy::strategy_spec::Bar (strategy_spec_operators.hpp), is itself all-double -- converting to
-// fixed-point ticks here would just be undone one layer up for zero benefit. symbol_id is
-// stamped by the session from KlineWsSessionConfig::symbol_id (the caller's own SymbolRegistry
-// id for the single symbol this session subscribes to), never parsed from the JSON payload.
-struct KlineWsEvent {
-    std::int64_t open_time_ms{0};   // "k"."t"
-    std::int64_t close_time_ms{0};  // "k"."T"
-    double open{0.0};               // "k"."o"
-    double high{0.0};               // "k"."h"
-    double low{0.0};                // "k"."l"
-    double close{0.0};              // "k"."c"
-    double volume{0.0};             // "k"."v"
-    std::uint32_t symbol_id{0};     // stamped by the session, not parsed -- see struct comment
-    bool is_closed{false};          // always true for anything actually pushed to the ring (see
-                                     // this file's header comment, requirement 1) -- kept as an
-                                     // explicit field anyway so a consumer never has to trust
-                                     // "if it's in the ring it must be closed" as an unstated
-                                     // invariant.
-};
-static_assert(std::is_trivially_copyable_v<KlineWsEvent>,
-              "KlineWsEvent crosses the SpscRing producer/consumer boundary");
-
-// Small, closed-candles-only ring -- see this file's header comment, requirement 1, for why a
-// large ring would just paper over a filtering bug instead of catching it.
-using KlineWsEventRing = SpscRing<KlineWsEvent, 16>;
+// KlineWsEvent, KlineWsEventRing, KlineBarGapGuard, KlineIngestResult and ingest_closed_bar()
+// live in kline_bar.hpp (Boost-free, 批次 6 6b-0f) -- moved there verbatim so the REST backfill
+// codec and the feed supervisor can use them without this header's Boost/Beast/OpenSSL weight.
 
 enum class KlineParseResult : std::uint8_t {
     Ok = 0,             // closed candle ("k"."x" == true), event fully populated -- push it
@@ -270,18 +246,9 @@ inline bool is_valid_kline_symbol(std::string_view s) {
     return true;
 }
 
-// Binance's documented kline interval set. "1M" (calendar month, capital M) is deliberately
-// listed distinctly from "1m" (minute) -- this is Binance's own convention, not a typo.
-inline bool is_valid_kline_interval(std::string_view s) {
-    static constexpr std::string_view kValid[] = {
-        "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h",
-        "6h", "8h", "12h", "1d", "3d", "1w", "1M",
-    };
-    for (const auto v : kValid) {
-        if (s == v) return true;
-    }
-    return false;
-}
+// Delegates to kline_bar.hpp's Boost-free hy::is_valid_kline_interval() (the same allow-list, now
+// shared with the REST backfill codec).
+inline bool is_valid_kline_interval(std::string_view s) { return hy::is_valid_kline_interval(s); }
 
 }  // namespace detail
 
@@ -293,79 +260,6 @@ inline bool validate_kline_ws_config(const KlineWsSessionConfig& cfg) {
     if (!detail::is_valid_kline_symbol(cfg.symbol)) return false;
     if (!detail::is_valid_kline_interval(cfg.interval)) return false;
     return true;
-}
-
-// Bar-gap (跳空) continuity + suspend state machine, extracted out of BinanceKlineWsSession so
-// it can be unit-tested directly against synthetic KlineWsEvent values (see
-// test_binance_kline_ws_session.cpp's KlineBarGapGuard test group) -- no I/O, no Boost/Beast
-// dependency of its own. Enforces this file's header comment, requirement 2: consecutive closed
-// bars' boundaries must be exactly 1ms apart (Binance's own kline open_time/close_time
-// convention, true for every interval), or the guard suspends and every event is rejected
-// (including the gap-triggering one) until resume() is explicitly called.
-class KlineBarGapGuard {
-public:
-    // Returns true if `event` is the accepted next bar in an unbroken sequence (caller should
-    // push it); false if it was rejected -- either because this call is the one that just
-    // detected a gap (is_suspended() flips true), or because the guard was already suspended.
-    bool accept(const KlineWsEvent& event) noexcept {
-        if (suspended_) return false;
-        if (have_prev_close_ && event.open_time_ms != prev_close_time_ms_ + 1) {
-            suspended_ = true;
-            return false;
-        }
-        prev_close_time_ms_ = event.close_time_ms;
-        have_prev_close_ = true;
-        return true;
-    }
-
-    bool is_suspended() const noexcept { return suspended_; }
-
-    // Suspends WITHOUT a continuity mismatch having been observed. Exists for one case only: a
-    // bar this guard accepted (advancing prev_close_time_ms_) then failed to actually reach its
-    // consumer -- ring full (see ingest_closed_bar() below). Without this, the guard's baseline
-    // says "no gap" while the consumer is in fact one bar short, and every later bar still passes
-    // the continuity check, silently corrupting SMA/EMA/RSI state (external review P0-04,
-    // verified against this file's own earlier handle_closed_bar()).
-    void force_suspend() noexcept { suspended_ = true; }
-
-    // Clears suspension and the continuity baseline -- the next accept() call is unconditionally
-    // accepted and becomes the new baseline, with no check against the pre-gap value. Caller's
-    // responsibility to only call this once it is actually safe to trust the next observed bar
-    // (human confirmation, or StreamingEvaluator::reset() + REST backfill already done) -- see
-    // this file's header comment, requirement 2.
-    void resume() noexcept {
-        have_prev_close_ = false;
-        suspended_ = false;
-    }
-
-private:
-    bool have_prev_close_{false};
-    bool suspended_{false};
-    std::int64_t prev_close_time_ms_{0};
-};
-
-enum class KlineIngestResult : std::uint8_t {
-    Pushed = 0,           // accepted by the guard AND actually in the ring
-    RingFull = 1,         // accepted by the guard but the ring was full -- guard now suspended
-    GapDetected = 2,      // continuity mismatch -- this call suspended the guard, bar NOT pushed
-    SuspendedEarlier = 3, // guard was already suspended -- bar discarded, nothing touched
-};
-
-// The one place a closed bar is admitted to the ring. Requirement 3 of this file's design (added
-// by external review P0-04): "accepted by the continuity guard" and "delivered to the consumer"
-// are two different facts, and only the second one is what keeps downstream indicator state
-// correct. A full ring therefore suspends exactly like a gap does -- the consumer is now missing
-// a bar, which is a gap the consumer itself cannot see from timestamps it never received.
-// Free function (not a member) so it is unit-testable against a real ring with no session/network.
-inline KlineIngestResult ingest_closed_bar(KlineBarGapGuard& guard, KlineWsEventRing& ring,
-                                            const KlineWsEvent& event) noexcept {
-    if (guard.is_suspended()) return KlineIngestResult::SuspendedEarlier;
-    if (!guard.accept(event)) return KlineIngestResult::GapDetected;
-    if (!ring.try_push(event)) {
-        guard.force_suspend();
-        return KlineIngestResult::RingFull;
-    }
-    return KlineIngestResult::Pushed;
 }
 
 struct KlineWsSessionStats {
