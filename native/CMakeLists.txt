@@ -972,6 +972,22 @@ if(HY_BUILD_TESTS)
 
     gtest_discover_tests(test_user_data_ws_concurrency PROPERTIES LABELS concurrency)
 
+    # Batch 6, 6b-0f-2: public-feed reconnect supervisor. The state machine is generic over the
+    # session type and Boost-free, so it is unit-tested against fakes with a fake clock
+    # (test_public_feed_supervisor); the one arrangement it relies on and cannot prove by itself --
+    # consecutive session generations pushing into one shared SpscRing from the single I/O thread --
+    # has a real two-thread test under the same "concurrency" label/reasoning as the tests above.
+    add_executable(test_public_feed_supervisor tests/test_public_feed_supervisor.cpp)
+    target_link_libraries(test_public_feed_supervisor PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_public_feed_supervisor)
+    gtest_discover_tests(test_public_feed_supervisor)
+
+    add_executable(test_public_feed_supervisor_concurrency tests/test_public_feed_supervisor_concurrency.cpp)
+    target_link_libraries(test_public_feed_supervisor_concurrency PRIVATE
+        hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_public_feed_supervisor_concurrency)
+    gtest_discover_tests(test_public_feed_supervisor_concurrency PROPERTIES LABELS concurrency)
+
     # Negative control for the TSan gate: a deliberately-racy ring that TSan MUST
     # report. Built only on demand — it is NOT registered with ctest, because a
     # deliberate data race must never look like a suite failure. CI runs the
