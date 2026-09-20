@@ -113,12 +113,18 @@ jobs:
       # in Boost/OpenSSL and putting the whole binary behind HY_BUILD_DEMO -- which
       # this job turns OFF. The one genuinely-networked test moved to
       # test_binance_rest_snapshot.cpp so the state machine could come here.
+      # test_public_feed_supervisor_concurrency is the fourth (批次 6 6b-0f-2): consecutive public-feed
+      # session generations pushing into ONE shared SpscRing (whose producer-side cached index is a
+      # plain variable, so it is only legal because every push comes from the single I/O thread),
+      # with the supervisor and the ring's only consumer on the other thread. NOTE this job builds
+      # an explicit target list: a test that merely carries the `concurrency` label but is not named
+      # here is never built, so `ctest -L concurrency` below silently never runs it.
       - name: Build concurrency targets only
         working-directory: native
         run: |
           cmake --build build-tsan -j$(nproc) \
             --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
-            test_snapshot_refresh_gate \
+            test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
             tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
@@ -214,7 +220,8 @@ jobs:
         working-directory: native
         run: |
           cmake --build build-arm -j$(nproc) \
-            --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat
+            --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
+            test_public_feed_supervisor_concurrency
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the
