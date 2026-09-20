@@ -1044,6 +1044,24 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_rest_snapshot)
         gtest_discover_tests(test_binance_rest_snapshot)
 
+        # Batch 6, 6b-0f-1: native klines REST backfill transport (binance_klines_rest.hpp) -- same
+        # Boost/OpenSSL/simdjson shape as test_binance_rest_snapshot above. TlsResponseAcceptor answers
+        # a real HTTP request over a real TLS handshake so the success path runs end to end; the
+        # blackhole fixtures cover the timeout stages. The pure codec has its own Boost-free test
+        # (test_binance_klines_codec) in the default build.
+        add_executable(test_binance_klines_rest tests/test_binance_klines_rest.cpp)
+        target_link_libraries(test_binance_klines_rest PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_klines_rest SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_klines_rest PRIVATE tests)
+        target_compile_definitions(test_binance_klines_rest PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_binance_klines_rest)
+        hengyuan_allow_third_party_tsan_fences(test_binance_klines_rest)
+        gtest_discover_tests(test_binance_klines_rest)
+
         # L4 §3/§4: read-only private REST client -- first real network consumer of the
         # signer/environment/query-signing/clock-sync foundation above, so it needs both that
         # stack (OpenSSL) and the REST transport stack (Boost/Beast + simdjson via
@@ -1180,4 +1198,12 @@ if(HY_BUILD_TESTS)
         hengyuan_dataplane GTest::gtest_main)
     hengyuan_set_warnings(test_binance_depth_snapshot_codec)
     gtest_discover_tests(test_binance_depth_snapshot_codec)
+
+    # 批次 6 6b-0f-1: klines REST response codec -- same Boost/OpenSSL-free shape as the depth
+    # snapshot codec above (pure simdjson parsing, header-only kline_bar.hpp).
+    add_executable(test_binance_klines_codec tests/test_binance_klines_codec.cpp)
+    target_link_libraries(test_binance_klines_codec PRIVATE
+        hengyuan_dataplane GTest::gtest_main)
+    hengyuan_set_warnings(test_binance_klines_codec)
+    gtest_discover_tests(test_binance_klines_codec)
 endif()

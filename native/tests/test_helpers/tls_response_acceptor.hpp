@@ -62,6 +62,7 @@ public:
     struct RequestRecord {
         std::string target;
         std::string api_key_header;  // empty if the header was absent
+        std::string host_header;     // empty if the header was absent (public-REST clients assert on it)
     };
 
     // Guarded by mu_: the accept loop runs on a background thread while the test's main thread
@@ -100,6 +101,8 @@ private:
                     rec.target = std::string(req->target());
                     auto it = req->find("X-MBX-APIKEY");
                     if (it != req->end()) rec.api_key_header = std::string(it->value());
+                    const auto host_it = req->find(http::field::host);
+                    if (host_it != req->end()) rec.host_header = std::string(host_it->value());
                     requests_.push_back(std::move(rec));
                 }
                 auto res = std::make_shared<http::response<http::string_body>>(
