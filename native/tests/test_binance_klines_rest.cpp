@@ -483,3 +483,80 @@ TEST(BinanceKlinesRestConnectivity, ReadStageTimeoutAfterASuccessfulHandshake) {
     EXPECT_EQ(r.error, PublicRestError::Read);
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(20));
 }
+
+// --- the outcome type and fetcher body SingleFlightFetchGate runs (6b-0f-3c) -----------------------------------
+
+TEST(BinanceKlinesRestOutcome, TheFetcherBodyCarriesStatusAndBarsInOneValue) {
+    auto server = make_server(200, bars(5));
+    const hy::KlinesBackfillRequest request{"BTCUSDT", "1h", 7, 3};
+    const auto out = hy::fetch_klines_backfill_outcome(request, testnet_cfg(server->port()), clock_at(kFarFuture));
+
+    ASSERT_TRUE(out.ok());
+    ASSERT_EQ(out.bars().size(), 5U);
+    EXPECT_EQ(out.bars().front().open_time_ms, 0);
+    EXPECT_EQ(out.bars().back().close_time_ms, 5 * kHour - 1);
+    EXPECT_EQ(out.bars()[2].symbol_id, 3U);  // stamped from the request, like the live session does
+    const auto reqs = server->requests();
+    ASSERT_EQ(reqs.size(), 1U);
+    EXPECT_EQ(reqs[0].target, "/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=7");
+}
+
+TEST(BinanceKlinesRestOutcome, AFailedFetchIsAnOutcomeWithNoBarsNotAnException) {
+    auto server = make_server(503, bars(5));  // a perfectly valid body behind a failing status
+    const auto out = hy::fetch_klines_backfill_outcome(hy::KlinesBackfillRequest{"BTCUSDT", "1h", 7, 3},
+                                                        testnet_cfg(server->port()), clock_at(kFarFuture));
+    EXPECT_FALSE(out.ok());
+    EXPECT_EQ(out.status.transport, PublicRestError::HttpStatus);
+    EXPECT_EQ(out.status.http_status, 503);
+    EXPECT_TRUE(out.bars().empty()) << "bars from a refused response must never be visible";
+}
+
+TEST(BinanceKlinesRestOutcome, ARequestTheEndpointWouldRefuseNeverReachesTheWire) {
+    PlainBlackholeAcceptor blackhole;
+    PublicRestConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = std::to_string(blackhole.port());
+    for (const hy::KlinesBackfillRequest& bad :
+         {hy::KlinesBackfillRequest{"btcusdt", "1h", 7, 3},                                 // lowercase symbol
+          hy::KlinesBackfillRequest{"BTCUSDT", "7m", 7, 3},                                 // not an interval
+          hy::KlinesBackfillRequest{"BTCUSDT", "1h", 0, 3},                                 // limit 0
+          hy::KlinesBackfillRequest{"BTCUSDT", "1h", 1001, 3},                              // over Binance's max
+          hy::KlinesBackfillRequest{"BTCUSDT", "1h", std::numeric_limits<std::uint32_t>::max(), 3}}) {
+        const auto out = hy::fetch_klines_backfill_outcome(bad, cfg, clock_at(kFarFuture));
+        EXPECT_EQ(out.status.transport, PublicRestError::InvalidConfig) << bad.symbol << " " << bad.interval << " " << bad.limit;
+    }
+    EXPECT_EQ(blackhole.accepted_connections(), 0U);
+}
+
+TEST(BinanceKlinesRestOutcome, TheCooldownPolicyBacksOffHardestWhereTheExchangeAsksUsTo) {
+    static_assert(hy::kKlinesBackfillFailureCooldownMs < hy::kKlinesBackfillRateLimitCooldownMs);
+    static_assert(hy::kKlinesBackfillRateLimitCooldownMs < hy::kKlinesBackfillBanCooldownMs);
+    static_assert(hy::kKlinesBackfillFailureCooldownMs > 0);
+
+    hy::KlinesBackfillOutcome ok;  // default-constructed: transport None, parse None
+    ASSERT_TRUE(ok.ok());
+    EXPECT_EQ(hy::klines_backfill_cooldown_ms(ok), 0);
+
+    auto failed_with = [](int http_status) {
+        hy::KlinesBackfillOutcome o;
+        o.status.transport = PublicRestError::HttpStatus;
+        o.status.http_status = http_status;
+        return o;
+    };
+    EXPECT_EQ(hy::klines_backfill_cooldown_ms(failed_with(418)), hy::kKlinesBackfillBanCooldownMs);
+    EXPECT_EQ(hy::klines_backfill_cooldown_ms(failed_with(429)), hy::kKlinesBackfillRateLimitCooldownMs);
+    for (int status : {301, 400, 403, 404, 500, 502, 503}) {
+        EXPECT_EQ(hy::klines_backfill_cooldown_ms(failed_with(status)), hy::kKlinesBackfillFailureCooldownMs)
+            << "status=" << status;
+    }
+
+    hy::KlinesBackfillOutcome transport_failure;  // no HTTP status at all (timeout, TLS, refused)
+    transport_failure.status.transport = PublicRestError::Read;
+    EXPECT_EQ(hy::klines_backfill_cooldown_ms(transport_failure), hy::kKlinesBackfillFailureCooldownMs);
+
+    hy::KlinesBackfillOutcome parse_failure;  // a 200 whose body was not klines
+    parse_failure.status.http_status = 200;
+    parse_failure.status.parse = KlinesParseError::MalformedJson;
+    ASSERT_FALSE(parse_failure.ok());
+    EXPECT_EQ(hy::klines_backfill_cooldown_ms(parse_failure), hy::kKlinesBackfillFailureCooldownMs);
+}

@@ -39,7 +39,6 @@
 #pragma warning(pop)
 #endif
 
-#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -49,8 +48,8 @@
 
 namespace hy {
 
-// Binance's own maximum `limit` for /api/v3/klines.
-inline constexpr std::size_t kMaxBackfillBars = 1000;
+// kMaxBackfillBars and KlineBackfill live in kline_bar.hpp (data types, no simdjson) so the feed
+// driver can use them without this header's JSON dependency.
 
 enum class KlinesParseError : std::uint8_t {
     None = 0,
@@ -80,13 +79,6 @@ inline constexpr const char* klines_parse_error_name(KlinesParseError e) noexcep
     }
     return "?";
 }
-
-// Caller-owned (64 KB): keep one long-lived instance, not a stack local in a hot function.
-struct KlineBackfill {
-    std::array<KlineWsEvent, kMaxBackfillBars> bars{};
-    std::size_t count{0};
-    bool dropped_unclosed_tail{false};
-};
 
 namespace detail {
 
