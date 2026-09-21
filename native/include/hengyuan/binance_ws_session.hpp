@@ -170,6 +170,13 @@ public:
 
     bool stopped() const { return stop_.load(std::memory_order_relaxed); }
 
+    // True once the WebSocket handshake has completed and the read loop has started -- NOT merely
+    // when TCP/TLS came up. A plain relaxed flag, same as BinanceKlineWsSession::is_connected() and
+    // BinanceUserDataWsSession::is_connected(): it is how PublicFeedSupervisor (public_feed_supervisor.hpp)
+    // tells "still connecting" from "healthy" from any thread. Never cleared again -- a session that
+    // later fails reports stopped(), and a replacement is a NEW session object.
+    bool is_connected() const { return connected_.load(std::memory_order_relaxed); }
+
     // Safe to call from any thread once the driving io_context's thread has been joined
     // following stop() -- see this file's header comment. The internal mutex also makes this
     // safe to call while I/O is still in flight (it just won't reflect writes made after the
@@ -269,6 +276,7 @@ private:
     void on_handshake(beast::error_code ec) {
         if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "ws_handshake");
+        connected_.store(true, std::memory_order_relaxed);
         do_read();
     }
 
@@ -380,6 +388,7 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> started_{false};
+    std::atomic<bool> connected_{false};
 };
 
 }  // namespace hy

@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 #include <hengyuan/binance_kline_ws_session.hpp>
+#include <hengyuan/kline_feed_driver.hpp>
 
 #include "test_helpers/blackhole_acceptor.hpp"
 
@@ -127,6 +128,70 @@ TEST(KlineJsonParser, NonNumericDecimalStringRejected) {
         R"({"e":"kline","k":{"t":1,"T":2,"o":"not-a-number","h":"1","l":"1","c":"1","v":"1","x":true}})";
     EXPECT_EQ(parser.parse(body, ev), KlineParseResult::MissingFields);
 }
+
+// The live parser used to check only from_chars' error code -- which accepts "nan"/"inf" and parses
+// "1.5abc" as 1.5 -- so a non-finite or partially-parsed number could reach the ring. Every one of
+// these must now be refused, on EACH numeric field (a per-field bug would otherwise hide).
+namespace {
+std::string kline_body_with_fields(std::string_view o, std::string_view h, std::string_view l,
+                                    std::string_view c, std::string_view v) {
+    std::string body = R"({"e":"kline","E":1,"s":"BNBBTC","k":{"t":100,"T":159,"s":"BNBBTC","i":"1m",)"
+                       R"("f":1,"L":2,"o":")";
+    body += o;
+    body += R"(","c":")";
+    body += c;
+    body += R"(","h":")";
+    body += h;
+    body += R"(","l":")";
+    body += l;
+    body += R"(","v":")";
+    body += v;
+    body += R"(","n":1,"x":true,"q":"1","V":"1","Q":"1","B":"1"}})";
+    return body;
+}
+}  // namespace
+
+TEST(KlineJsonParser, OnlyAWholeFiniteDecimalStringIsAccepted) {
+    const char* const bad[] = {"nan",  "NaN",   "-nan", "inf",  "-inf",  "Infinity", "1.5abc", "1.5 ", " 1.5",
+                               "1.5.2", "1,5",  "+1.5", "0x10", "--1",   "1e",       "1e999",  "-1e999"};
+    for (std::size_t field = 0; field < 5; ++field) {
+        for (const char* value : bad) {
+            std::string_view v[5] = {"1.0", "1.0", "1.0", "1.0", "1.0"};  // o, h, l, c, v
+            v[field] = value;
+            KlineJsonParser parser;
+            KlineWsEvent ev{};
+            const auto body = kline_body_with_fields(v[0], v[1], v[2], v[3], v[4]);
+            EXPECT_EQ(parser.parse(body, ev), KlineParseResult::MissingFields)
+                << "field #" << field << " value=\"" << value << "\"";
+        }
+    }
+}
+
+TEST(KlineJsonParser, OrdinaryBinanceDecimalsStillParseExactly) {
+    struct Case {
+        const char* text;
+        double expected;
+    };
+    const Case good[] = {{"0", 0.0},
+                         {"0.00000000", 0.0},
+                         {"148976.11427815", 148976.11427815},
+                         {"0.01634790", 0.0163479},
+                         {"1E3", 1000.0},
+                         {"1e-8", 1e-8},
+                         {"12345678.9", 12345678.9}};
+    for (const Case& c : good) {
+        KlineJsonParser parser;
+        KlineWsEvent ev{};
+        const auto body = kline_body_with_fields("1.0", "1.0", "1.0", c.text, "1.0");
+        ASSERT_EQ(parser.parse(body, ev), KlineParseResult::Ok) << c.text;
+        EXPECT_DOUBLE_EQ(ev.close, c.expected) << c.text;
+    }
+}
+
+// The real session must plug into both the reconnect supervisor and the per-tick driver: a concept
+// mismatch here is a compile error, long before the harness ever links against it.
+static_assert(hy::SupervisedFeedSession<hy::BinanceKlineWsSession>);
+static_assert(hy::KlineFeedSession<hy::BinanceKlineWsSession>);
 
 TEST(KlineJsonParser, ReusedAcrossCallsWithDifferentBodySizes) {
     // Exercises the reused-padded-buffer growth path (binance_json_parser.hpp's own AUDIT
