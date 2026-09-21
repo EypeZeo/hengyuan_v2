@@ -756,6 +756,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_holding_state_tracker)
     gtest_discover_tests(test_holding_state_tracker)
 
+    # 批次 6 6b-0f-3b: consumer side of the kline feed -- the only path by which a bar reaches
+    # StreamingEvaluator::step() (duplicate filter + continuity guard + rebuild from backfill). Pure
+    # logic over the strategy-spec evaluator and kline_bar.hpp; loads its spec via load_strategy_spec(),
+    # so it needs hengyuan_strategy_spec exactly like test_strategy_spec_evaluator above.
+    add_executable(test_kline_feed_sync tests/test_kline_feed_sync.cpp)
+    target_link_libraries(test_kline_feed_sync PRIVATE hengyuan_strategy_spec GTest::gtest_main)
+    hengyuan_set_warnings(test_kline_feed_sync)
+    gtest_discover_tests(test_kline_feed_sync)
+
     # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
     add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
     target_link_libraries(test_spot_rate_limit_budget PRIVATE hengyuan_core GTest::gtest_main)
