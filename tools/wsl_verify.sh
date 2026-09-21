@@ -125,7 +125,7 @@ run_thread() {
     cmake --build build-linux-tsan -j"${BUILD_JOBS}" --target \
         test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
         test_snapshot_refresh_gate test_public_feed_supervisor_concurrency test_single_flight_fetch_gate \
-        tsan_control_relaxed_ring \
+        test_kline_feed_driver tsan_control_relaxed_ring \
         tsan_control_export_worker_dual_consumer \
         compaction_lease_holder test_compaction_lease test_compaction_intent_store \
         test_migrated_v2_started_publisher

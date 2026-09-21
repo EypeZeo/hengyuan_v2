@@ -42,6 +42,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -281,6 +282,45 @@ inline KlinesFetchResult fetch_klines_backfill(std::string_view symbol, std::str
     result.parse = parse_klines_response(response.body, closed_before_ms, symbol_id,
                                           kline_interval_span_ms(interval), out);
     return result;
+}
+
+// One backfill attempt as SingleFlightFetchGate carries it: the transport/parse status AND the bars
+// in a single value. A KlineBackfill is ~64 KB and lives in the gate's mailbox, so the gate itself
+// belongs on the heap or in a long-lived object.
+struct KlinesBackfillOutcome {
+    KlinesFetchResult status;
+    KlineBackfill data;
+
+    bool ok() const noexcept { return status.ok(); }
+    std::span<const KlineWsEvent> bars() const noexcept { return {data.bars.data(), data.count}; }
+};
+
+// The Fetcher body for SingleFlightFetchGate<KlinesBackfillRequest, KlinesBackfillOutcome>. It runs on
+// the gate's WORKER thread, so `cfg` must be a value (copied into the closure) and `now_ms` may read
+// only thread-safe state -- e.g. a ClockOffsetPublisher snapshot plus the wall clock -- never anything
+// the hot thread mutates.
+inline KlinesBackfillOutcome fetch_klines_backfill_outcome(const KlinesBackfillRequest& request,
+                                                            const PublicRestConfig& cfg,
+                                                            const std::function<std::int64_t()>& now_ms) {
+    KlinesBackfillOutcome outcome;
+    outcome.status = fetch_klines_backfill(request.symbol, request.interval, static_cast<int>(request.limit),
+                                            request.symbol_id, cfg, now_ms, outcome.data);
+    return outcome;
+}
+
+// How long to leave the endpoint alone after `outcome` (the gate's CooldownFn). 0 on success. 429 (rate
+// limit) and 418 (an IP ban) are the exchange telling us to stop; asking again too soon would escalate
+// a ban. The numbers have no spec basis -- the response's Retry-After header is not parsed -- and are a
+// starting point to revisit with operational experience.
+inline constexpr std::int64_t kKlinesBackfillFailureCooldownMs = 5'000;
+inline constexpr std::int64_t kKlinesBackfillRateLimitCooldownMs = 60'000;
+inline constexpr std::int64_t kKlinesBackfillBanCooldownMs = 300'000;
+
+inline std::int64_t klines_backfill_cooldown_ms(const KlinesBackfillOutcome& outcome) noexcept {
+    if (outcome.ok()) return 0;
+    if (outcome.status.http_status == 418) return kKlinesBackfillBanCooldownMs;
+    if (outcome.status.http_status == 429) return kKlinesBackfillRateLimitCooldownMs;
+    return kKlinesBackfillFailureCooldownMs;
 }
 
 }  // namespace hy

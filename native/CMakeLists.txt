@@ -765,6 +765,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_kline_feed_sync)
     gtest_discover_tests(test_kline_feed_sync)
 
+    # 批次 6 6b-0f-3c: the per-tick orchestration over the supervisor, the fetch gate, the sync and the
+    # ring. Everything but the session and the fetch is real in the test, and the fetch gate runs its
+    # worker on a real thread -- so this binary carries the `concurrency` label like the gate's own.
+    add_executable(test_kline_feed_driver tests/test_kline_feed_driver.cpp)
+    target_link_libraries(test_kline_feed_driver PRIVATE hengyuan_strategy_spec GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_kline_feed_driver)
+    gtest_discover_tests(test_kline_feed_driver PROPERTIES LABELS concurrency)
+
     # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
     add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
     target_link_libraries(test_spot_rate_limit_budget PRIVATE hengyuan_core GTest::gtest_main)

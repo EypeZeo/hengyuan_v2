@@ -17,7 +17,10 @@
 
 #include <hengyuan/spsc_ring.hpp>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
@@ -80,6 +83,29 @@ static_assert(std::is_trivially_copyable_v<KlineWsEvent>,
 // Small, closed-candles-only ring -- see binance_kline_ws_session.hpp's header comment,
 // requirement 1, for why a large ring would just paper over a filtering bug instead of catching it.
 using KlineWsEventRing = SpscRing<KlineWsEvent, 16>;
+
+// Binance's own maximum `limit` for /api/v3/klines (verified against the official docs: "max: 1000,
+// Default: 500"). Moved here from binance_klines_codec.hpp with KlineBackfill (6b-0f-3c): both are
+// plain data the feed driver needs without the codec's simdjson dependency.
+inline constexpr std::size_t kMaxBackfillBars = 1000;
+
+// What a successful klines parse yields: closed bars only, oldest first, contiguous.
+// Caller-owned (64 KB): keep one long-lived instance, not a stack local in a hot function.
+struct KlineBackfill {
+    std::array<KlineWsEvent, kMaxBackfillBars> bars{};
+    std::size_t count{0};
+    bool dropped_unclosed_tail{false};
+};
+
+// What a backfill fetcher is asked for. Value-semantic: SingleFlightFetchGate hands its worker thread
+// a private copy. Lives here (not next to the fetcher) so the Boost-free feed driver and the
+// Boost-dependent REST fetcher can share it without including each other.
+struct KlinesBackfillRequest {
+    std::string symbol;    // UPPERCASE, as the REST endpoint wants it (the WS stream name is lowercase)
+    std::string interval;  // Binance's own spelling, e.g. "1h"
+    std::uint32_t limit{0};
+    std::uint32_t symbol_id{0};
+};
 
 // Bar-gap (跳空) continuity + suspend state machine, extracted out of BinanceKlineWsSession so
 // it can be unit-tested directly against synthetic KlineWsEvent values (see
