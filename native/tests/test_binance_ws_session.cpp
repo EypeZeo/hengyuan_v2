@@ -6,6 +6,7 @@
 #include <hengyuan/binance_json_parser.hpp>
 #include <hengyuan/binance_market_event.hpp>
 #include <hengyuan/binance_ws_session.hpp>
+#include <hengyuan/public_feed_supervisor.hpp>
 #include <hengyuan/spsc_ring.hpp>
 
 #include "test_helpers/blackhole_acceptor.hpp"
@@ -122,6 +123,7 @@ TEST(BinanceWsSessionConnectivity, TlsHandshakeStageTimeout) {
 
     auto stats = session->stats_snapshot();
     EXPECT_TRUE(session->stopped());
+    EXPECT_FALSE(session->is_connected()) << "a TLS-handshake timeout never reached the WebSocket handshake";
     EXPECT_NE(stats.last_error_ec.value(), 0);
     EXPECT_EQ(stats.errors, 1u);
     EXPECT_LT(elapsed, std::chrono::seconds(20));
@@ -215,9 +217,48 @@ TEST(BinanceWsSessionLifecycle, InvalidConfigFailsWithoutTouchingNetwork) {
     io_thread.join();
 
     EXPECT_TRUE(session->stopped());
+    EXPECT_FALSE(session->is_connected());
     auto stats = session->stats_snapshot();
     EXPECT_EQ(stats.last_error_stage, "invalid_config");
 }
+
+// PublicFeedSupervisor needs is_connected() to tell "still connecting" from "healthy". It must mean the
+// WebSocket handshake completed, not merely that TCP came up. (The positive path -- true after a real
+// handshake -- needs a WebSocket server fixture, which the repo does not have yet; what is pinned here is
+// that it is false at every stage this fixture can reach.)
+TEST(BinanceWsSessionLifecycle, IsConnectedStaysFalseWhileTcpIsUpButNoHandshakeHasCompleted) {
+    hy::test_helpers::PlainBlackholeAcceptor blackhole;
+    SessionFixture fx;
+
+    WsSessionConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = std::to_string(blackhole.port());
+    cfg.subscribe_streams = {"btcusdt@trade"};
+
+    auto session = std::make_shared<BinanceWsSession<1024>>(fx.ioc, fx.ssl_ctx, fx.ring, fx.parser, cfg);
+    EXPECT_FALSE(session->is_connected()) << "never started";
+    session->start();
+    std::thread io_thread([&fx] { fx.ioc.run(); });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (blackhole.accepted_connections() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool accepted = blackhole.accepted_connections() > 0;
+    const bool connected_while_stalled = session->is_connected();  // TCP accepted, TLS stalled
+    session->stop();
+    io_thread.join();
+
+    ASSERT_TRUE(accepted) << "the fixture never accepted the client's TCP connection";
+    EXPECT_FALSE(connected_while_stalled) << "reported connected with a stalled TLS handshake";
+    EXPECT_FALSE(session->is_connected());
+    EXPECT_TRUE(session->stopped());
+}
+
+// The real session must plug into the reconnect supervisor: a mismatch is a compile error here, long
+// before a harness ever links against it.
+static_assert(hy::SupervisedFeedSession<BinanceWsSession<1024>>);
+static_assert(hy::SupervisedFeedSession<BinanceWsSession<65536>>);
 
 TEST(BinanceWsSessionLifecycle, DeadReconnectFieldsAreGoneAtCompileTime) {
     // This test's only job is to fail to compile if WsSessionConfig/WsSessionStats ever grow

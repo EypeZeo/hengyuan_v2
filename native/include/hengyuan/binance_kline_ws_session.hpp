@@ -90,6 +90,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -200,13 +201,21 @@ private:
     // allocation-free and locale-independent, matching CLAUDE.md §1/§5's zero-heap-alloc /
     // no-implicit-conversion discipline even though this parser is not itself on the
     // sub-microsecond order-submission hot path.
+    //
+    // STRICT (批次 6 6b-0f-3c-2): the WHOLE string must be one finite decimal. std::from_chars stops at
+    // the first character it cannot use -- "1.5abc" parses as 1.5 with ec == errc{} -- and it accepts
+    // "nan" / "inf" / "infinity", so checking the error code alone let a partially-parsed number or a
+    // non-finite one reach the ring. The REST backfill codec (binance_klines_codec.hpp) was already
+    // strict; KlineFeedSync re-checks every bar as the second line of defence, but the parser is the
+    // right place to refuse it, and a refused bar shows up in parse_failed instead of vanishing later.
     static bool parse_decimal_field(simdjson::ondemand::object& obj, std::string_view key,
                                      double& out) noexcept {
         std::string_view sv;
         if (obj[key].get_string().get(sv) != simdjson::SUCCESS || sv.empty()) return false;
         double v = 0.0;
-        const auto res = std::from_chars(sv.data(), sv.data() + sv.size(), v);
-        if (res.ec != std::errc{}) return false;
+        const char* const end = sv.data() + sv.size();
+        const auto res = std::from_chars(sv.data(), end, v);
+        if (res.ec != std::errc{} || res.ptr != end || !std::isfinite(v)) return false;
         out = v;
         return true;
     }
