@@ -17,6 +17,8 @@
 #include <hengyuan/binance_kline_ws_session.hpp>
 #include <hengyuan/binance_market_event.hpp>
 #include <hengyuan/binance_ws_session.hpp>
+#include <hengyuan/depth_manager.hpp>
+#include <hengyuan/public_feed_policy.hpp>
 #include <hengyuan/public_feed_supervisor.hpp>
 
 #include "test_helpers/ws_loopback_server.hpp"
@@ -397,6 +399,83 @@ TEST(WsLoopbackSupervisor, ASessionStuckInTheUpgradeIsStoppedAtTheConnectDeadlin
     EXPECT_FALSE(sup.healthy());
     EXPECT_GE(sup.stats().total_failures, 1U);
     EXPECT_EQ(server->upgrades(), 0U);
+    sup.shutdown();
+}
+
+// A minimal, valid single-level snapshot -- enough to move DepthManager out of Buffering so the
+// test can observe it going back there on the next generation.
+hy::DepthSnapshot make_snapshot(std::uint64_t last_update_id, std::int64_t bid_price) {
+    hy::DepthSnapshot snap;
+    snap.last_update_id = last_update_id;
+    snap.bids[0] = hy::PriceLevel{bid_price, 100};
+    snap.bid_count = 1;
+    snap.asks[0] = hy::PriceLevel{bid_price + 100, 100};
+    snap.ask_count = 1;
+    return snap;
+}
+
+// 批次 6 6b-0f-4: wrapping the depth session in a real PublicFeedSupervisor makes it reconnect --
+// but a fresh generation's update ids do not continue the previous generation's sequence, so the
+// consumer MUST reset DepthManager to Buffering exactly once per new generation (FeedGenerationTracker,
+// public_feed_policy.hpp) before trusting any of that generation's events. This proves the wiring, not
+// just the tracker's own pure logic (already covered in test_public_feed_supervisor.cpp): a real
+// reconnect against a real server, with a real DepthManager on the other end.
+TEST(WsLoopbackSupervisor, EachNewGenerationResetsDepthManagerToBufferingExactlyOnce) {
+    auto server = make_server();
+    hy::BinanceJsonParser parser;
+    ASSERT_TRUE(parser.register_symbol("BTCUSDT", 0));
+    hy::SpscRing<hy::BinanceMarketEvent, 1024> ring;
+    ClientRig rig;
+    const auto cfg = depth_cfg(*server);
+    hy::PublicFeedSupervisor<hy::BinanceWsSession<1024>> sup(
+        [&](std::uint64_t) {
+            return std::make_shared<hy::BinanceWsSession<1024>>(rig.ioc, rig.ssl_ctx, ring, parser, cfg);
+        },
+        fast_policy());
+
+    hy::DepthManager depth_mgr;
+    hy::FeedGenerationTracker gen_tracker;
+    int resets = 0;
+    auto tick_once = [&] {
+        sup.poll(steady_ms());
+        if (gen_tracker.observe(sup.generation())) {
+            depth_mgr.start_buffering();
+            ++resets;
+        }
+    };
+    auto poll_until = [&](const std::function<bool()>& pred) {
+        return wait_until([&] {
+            tick_once();
+            return pred();
+        });
+    };
+
+    // Generation 1: connects, resets exactly once, and a snapshot + one event is enough to reach
+    // Tracking -- proving the reset leaves the manager genuinely usable, not just flipped and ignored.
+    ASSERT_TRUE(poll_until([&] { return sup.healthy(); }));
+    EXPECT_EQ(resets, 1);
+    EXPECT_EQ(depth_mgr.state(), hy::DepthState::Buffering);
+    ASSERT_TRUE(depth_mgr.apply_snapshot(make_snapshot(100, 67890'00000000LL)));
+    EXPECT_TRUE(depth_mgr.on_depth_event(hy::BinanceMarketEvent{}, 101, 101));
+    ASSERT_EQ(depth_mgr.state(), hy::DepthState::Tracking);
+    EXPECT_EQ(depth_mgr.stats().events_applied, 1U);
+
+    // The connection drops; the supervisor starts a genuinely new generation (a fresh TCP+TLS+WS
+    // handshake against the server, not a resumed session with continuing update ids).
+    server->drop_all();
+    ASSERT_TRUE(poll_until([&] { return sup.generation() == 2U && sup.healthy(); }));
+    EXPECT_EQ(resets, 2) << "a second generation must reset the book exactly once, not zero and not twice";
+    EXPECT_EQ(depth_mgr.state(), hy::DepthState::Buffering)
+        << "must not still read Tracking against generation 1's now-meaningless update-id baseline";
+
+    // A snapshot + event using update ids that would make NO sense as a continuation of generation
+    // 1's sequence (100/101 above) must still be accepted cleanly -- proof the reset actually took,
+    // rather than the manager silently carrying generation 1's last_applied_u_ forward.
+    ASSERT_TRUE(depth_mgr.apply_snapshot(make_snapshot(5, 67891'00000000LL)));
+    EXPECT_TRUE(depth_mgr.on_depth_event(hy::BinanceMarketEvent{}, 6, 6));
+    EXPECT_EQ(depth_mgr.state(), hy::DepthState::Tracking);
+    EXPECT_EQ(depth_mgr.stats().resyncs, 0U) << "a proper reset is not a gap: it must not count as one";
+
     sup.shutdown();
 }
 
