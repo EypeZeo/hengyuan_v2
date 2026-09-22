@@ -1160,6 +1160,23 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_kline_ws_session)
         gtest_discover_tests(test_binance_kline_ws_session)
 
+        # 批次 6 6b-0f-3d: the REAL public sessions (depth, kline) and the feed supervisor against a
+        # local TLS WebSocket server (tests/test_helpers/ws_loopback_server.hpp) -- the positive paths the
+        # blackhole fixtures above can never reach. HY_TEST_FIXTURE_DIR locates the loopback certificate
+        # (SAN IP:127.0.0.1) the client trusts; same compile-definition pattern as the REST tests.
+        add_executable(test_ws_loopback_sessions tests/test_ws_loopback_sessions.cpp)
+        target_link_libraries(test_ws_loopback_sessions PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_ws_loopback_sessions SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_ws_loopback_sessions PRIVATE tests)
+        target_compile_definitions(test_ws_loopback_sessions PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_ws_loopback_sessions)
+        hengyuan_allow_third_party_tsan_fences(test_ws_loopback_sessions)
+        gtest_discover_tests(test_ws_loopback_sessions)
+
         # TODO 1A.4 batch 2: the reconnect supervisor -- constructs real
         # BinanceUserDataWsSession instances (via the same blackhole-acceptor no-real-network
         # fixture pattern as test_binance_user_data_ws_session above), so it needs the same
