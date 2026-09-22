@@ -6,6 +6,7 @@
 // ring across generations) is in test_public_feed_supervisor_concurrency.cpp.
 
 #include <gtest/gtest.h>
+#include <hengyuan/public_feed_policy.hpp>
 #include <hengyuan/public_feed_supervisor.hpp>
 
 #include <atomic>
@@ -850,4 +851,146 @@ TEST(PublicFeedSupervisor, AnAbsurdBackoffIsCappedAtADay) {
     rig.last().die();
     rig.sup.poll(0);
     EXPECT_EQ(rig.sup.stats().next_attempt_ms, hy::detail::kFeedMaxBackoffCapMs);
+}
+
+// --- the harness policy (public_feed_policy.hpp) ---------------------------------------------------------------
+
+TEST(PublicFeedPolicy, TheRolloverFiresWellInsideBinancesTwentyFourHourConnectionLimit) {
+    static_assert(hy::kBinanceWsConnectionLimitMs == 24LL * 60 * 60 * 1000);
+    const FeedSupervisorPolicy p = hy::make_public_feed_policy(42);
+    EXPECT_GT(p.max_connection_age_ms, 0) << "0 would mean no planned rollover at all";
+    EXPECT_LT(p.max_connection_age_ms, hy::kBinanceWsConnectionLimitMs);
+    // Slack for a slow reconnect (backoff + handshake + a backfill after it) to still land in time.
+    EXPECT_GE(hy::kBinanceWsConnectionLimitMs - p.max_connection_age_ms, 30LL * 60 * 1000);
+}
+
+TEST(PublicFeedPolicy, ADeadFeedEndsTheRunInsteadOfLeavingItBlind) {
+    const FeedSupervisorPolicy p = hy::make_public_feed_policy(1);
+    EXPECT_EQ(p.max_consecutive_failures, hy::kPublicFeedMaxConsecutiveFailures);
+    EXPECT_GT(p.max_consecutive_failures, 0U) << "0 means never give up";
+}
+
+TEST(PublicFeedPolicy, TheSeedIsCarriedAndEverythingElseKeepsTheSupervisorDefaults) {
+    const FeedSupervisorPolicy defaults;
+    const FeedSupervisorPolicy p = hy::make_public_feed_policy(7);
+    EXPECT_EQ(p.jitter_seed, 7U);
+    EXPECT_EQ(p.initial_backoff_ms, defaults.initial_backoff_ms);
+    EXPECT_EQ(p.backoff_multiplier, defaults.backoff_multiplier);
+    EXPECT_EQ(p.max_backoff_ms, defaults.max_backoff_ms);
+    EXPECT_EQ(p.jitter_percent, defaults.jitter_percent);
+    EXPECT_EQ(p.connect_deadline_ms, defaults.connect_deadline_ms);
+    EXPECT_EQ(p.drain_timeout_ms, defaults.drain_timeout_ms);
+    EXPECT_EQ(p.stable_after_ms, defaults.stable_after_ms);
+}
+
+// The policy against the real supervisor: what the harness actually gets.
+TEST(PublicFeedPolicy, ASessionIsRolledOverAtTwentyThreeHoursAndNotBefore) {
+    Rig rig(hy::make_public_feed_policy(1));
+    rig.sup.poll(0);
+    rig.last().connect();
+    rig.sup.poll(10);  // connected at 10
+
+    rig.sup.poll(10 + hy::kPublicFeedMaxConnectionAgeMs - 1);
+    EXPECT_EQ(rig.last().stop_calls.load(), 0);
+    rig.sup.poll(10 + hy::kPublicFeedMaxConnectionAgeMs);
+    EXPECT_EQ(rig.last().stop_calls.load(), 1);
+}
+
+TEST(PublicFeedPolicy, TenConsecutiveFailuresMakeTheFeedTerminal) {
+    Rig rig(hy::make_public_feed_policy(1));
+    std::int64_t now = 0;
+    rig.sup.poll(now);
+    for (std::uint32_t failure = 1; failure <= hy::kPublicFeedMaxConsecutiveFailures; ++failure) {
+        ASSERT_FALSE(rig.sup.terminal()) << "gave up early, at failure " << failure - 1;
+        rig.last().die();
+        rig.sup.poll(now);
+        if (failure < hy::kPublicFeedMaxConsecutiveFailures) {
+            ASSERT_EQ(rig.sup.state(), FeedState::Backoff);
+            now = rig.sup.stats().next_attempt_ms;
+            rig.sup.poll(now);
+        }
+    }
+    EXPECT_TRUE(rig.sup.terminal());
+    EXPECT_EQ(rig.sup.terminal_reason(), FeedTerminalReason::TooManyFailures);
+}
+
+TEST(PublicFeedPolicy, TheKlineRolloverWindowOpensOnlyRightAfterABarCloses) {
+    constexpr std::int64_t kHourSpan = 3'600'000;
+    constexpr std::int64_t last = 1'700'000'000'000;  // an arbitrary bar close
+    // `live`/`last_close` are never varied across the calls below, so they are not lambda
+    // parameters at all -- a default argument cannot name a local of the enclosing scope
+    // (not even a constexpr one: [dcl.fct.default]p9, "Local variables shall not be used in a
+    // default argument"). MSVC accepts it as a non-conformant extension; GCC correctly rejects
+    // it ("local variable ... may not appear in this context"), caught by the WSL2/tokyo-vps
+    // validation tier this header's tests hadn't run under before.
+    auto open = [&](std::int64_t now, std::int64_t span) {
+        return hy::kline_rollover_window_open(true, last, now, span);
+    };
+
+    // 1h bars: the first 60s after the close, exactly.
+    EXPECT_TRUE(open(last, kHourSpan));
+    EXPECT_TRUE(open(last + 59'999, kHourSpan));
+    EXPECT_FALSE(open(last + 60'000, kHourSpan));
+    EXPECT_FALSE(open(last + kHourSpan / 2, kHourSpan));
+
+    // 1m bars: a quarter of the span (15s), not the full 60s.
+    EXPECT_TRUE(open(last + 14'999, 60'000));
+    EXPECT_FALSE(open(last + 15'000, 60'000));
+    // 1s bars: 250ms.
+    EXPECT_TRUE(open(last + 249, 1'000));
+    EXPECT_FALSE(open(last + 250, 1'000));
+    // "1M" has no fixed span: 60s.
+    EXPECT_TRUE(open(last + 59'999, 0));
+    EXPECT_FALSE(open(last + 60'000, 0));
+}
+
+TEST(PublicFeedPolicy, TheKlineRolloverWindowStaysShutWhenTheFeedIsNotInSyncOrTheInputsAreNonsense) {
+    constexpr std::int64_t last = 1'700'000'000'000;
+    EXPECT_FALSE(hy::kline_rollover_window_open(false, last, last + 10, 3'600'000)) << "not live: leave a recovering feed alone";
+    EXPECT_FALSE(hy::kline_rollover_window_open(true, 0, 10, 3'600'000)) << "no bar consumed yet";
+    EXPECT_FALSE(hy::kline_rollover_window_open(true, -5, 10, 3'600'000));
+    EXPECT_FALSE(hy::kline_rollover_window_open(true, last, last - 1, 3'600'000)) << "the clock is behind the bar";
+    EXPECT_FALSE(hy::kline_rollover_window_open(true, last, last + 10, 3));  // a span so small its quarter is zero
+    // Extreme timestamps must not overflow.
+    EXPECT_FALSE(hy::kline_rollover_window_open(true, 1, kI64Max, 3'600'000));
+    EXPECT_TRUE(hy::kline_rollover_window_open(true, kI64Max - 5, kI64Max, 3'600'000));
+}
+
+// --- FeedGenerationTracker (public_feed_policy.hpp) -------------------------------------------------------------
+
+TEST(FeedGenerationTracker, FiresOnceForTheFirstRealGenerationButNeverForTheZeroSentinel) {
+    hy::FeedGenerationTracker t;
+    EXPECT_FALSE(t.observe(0)) << "0 = PublicFeedSupervisor's own 'no session yet': nothing to reset from";
+    EXPECT_TRUE(t.observe(1));
+    EXPECT_FALSE(t.observe(1)) << "same generation again: not a new connection";
+    EXPECT_FALSE(t.observe(1));
+}
+
+TEST(FeedGenerationTracker, FiresExactlyOnceForEachSubsequentGenerationChange) {
+    hy::FeedGenerationTracker t;
+    EXPECT_TRUE(t.observe(1));
+    EXPECT_TRUE(t.observe(2));
+    EXPECT_FALSE(t.observe(2));
+    EXPECT_FALSE(t.observe(2));
+    EXPECT_TRUE(t.observe(3));
+    EXPECT_FALSE(t.observe(3));
+}
+
+TEST(FeedGenerationTracker, ADroppedThenLaterObservedZeroNeverFiresEvenAfterARealGeneration) {
+    hy::FeedGenerationTracker t;
+    EXPECT_TRUE(t.observe(1));
+    // 0 never fires, whether it's the first value seen or comes after a real one -- current()
+    // only ever returns null between generations, never generation 0 itself.
+    EXPECT_FALSE(t.observe(0));
+    EXPECT_FALSE(t.observe(0));
+    EXPECT_TRUE(t.observe(2));
+}
+
+TEST(FeedGenerationTracker, GenerationNumbersNeedNotBeConsecutive) {
+    hy::FeedGenerationTracker t;
+    EXPECT_TRUE(t.observe(5));
+    EXPECT_FALSE(t.observe(5));
+    EXPECT_TRUE(t.observe(9));  // supervisors never skip generations in practice, but the tracker
+                                // only ever compares for CHANGE, not for a +1 step
+    EXPECT_FALSE(t.observe(9));
 }
