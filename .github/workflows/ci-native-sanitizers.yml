@@ -121,6 +121,9 @@ jobs:
       # gate whose mailbox is handed across threads, like SnapshotRefreshGate but injected-clock.
       # test_kline_feed_driver is the sixth (批次 6 6b-0f-3c): the per-tick recovery orchestration
       # driving that gate's real worker thread under a real supervisor/sync/ring.
+      # test_depth_feed_driver is the seventh (批次 6 6b-0f-6): the depth-side mirror of
+      # test_kline_feed_driver -- SnapshotRefreshGate's real worker thread under a real
+      # PublicFeedSupervisor/DepthManager/InputValidator/ring.
       # NOTE this job builds an explicit target list: a test that merely carries the `concurrency`
       # label but is not named here is never built, so `ctest -L concurrency` below silently never
       # runs it.
@@ -130,7 +133,7 @@ jobs:
           cmake --build build-tsan -j$(nproc) \
             --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
             test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
-            test_single_flight_fetch_gate test_kline_feed_driver \
+            test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
             tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
