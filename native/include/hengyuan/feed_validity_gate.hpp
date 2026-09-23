@@ -16,17 +16,36 @@
 // NOT a recovery mechanism: "invalid" only ever means "no new intents". Getting out of invalid
 // after a suspension needs the backfill protocol of 6b-0f; until that lands, the demo/harness
 // treat a suspension or a stopped session as terminal (exit non-zero, restart into recovery).
+//
+// 批次 6 6b-0f-5: FeedHealthInputs/evaluate_feed_validity above assume a bare, fail-stop session --
+// stopped() meaning "dead, the whole process must restart". Once a session is wrapped in
+// PublicFeedSupervisor (kline: 6b-0f-2 onward; depth: 6b-0f-4's generation reset is the consumer-side
+// half of the same move), stopped() on the underlying session is no longer the right signal: it is
+// legitimately true between generations even in a healthy, actively-reconnecting feed. See
+// SupervisedFeedInputs/evaluate_supervised_feed_validity further down for the supervisor-aware
+// replacement. The two vocabularies deliberately COEXIST rather than one replacing the other in
+// place: live_submit_preflight_harness.cpp (6b-1) still drives raw, unsupervised sessions and keeps
+// compiling against the old names until it is rewritten to use the supervisors -- at which point
+// FeedHealthInputs/evaluate_feed_validity/FeedInvalidReason have no remaining caller and can be
+// deleted, rather than being half-migrated underneath a file that still needs the old behavior.
 
 #pragma once
+
+#include <hengyuan/public_feed_supervisor.hpp>
 
 #include <cstdint>
 
 namespace hy {
 
-// Default upper bound on one process run. Binance closes a WebSocket connection after 24h (the
-// external review's citation of the official docs -- not independently re-fetched this session,
-// to be confirmed when 6b-0f implements the rollover); a fail-stop session would then end the run
-// abruptly, so stop cleanly well before that. Overridable by the caller, never larger than the
+// Default upper bound on one process run -- NOT a workaround for Binance's 24h WebSocket
+// connection limit any more. That limit is real (confirmed 2026-09-21 against the official docs,
+// github.com/binance/binance-spot-api-docs, web-socket-streams.md, "General WSS information";
+// see public_feed_policy.hpp's own citation), but a PublicFeedSupervisor-wrapped feed now rolls
+// over well before it hits on its own (public_feed_policy.hpp's kPublicFeedMaxConnectionAgeMs /
+// kline_rollover_window_open()) -- a session that reconnects on schedule does not "end the run
+// abruptly" the way the old fail-stop-only sessions this comment used to describe did. This is
+// now a plain operational bound (log rotation, a predictable restart cadence) a caller may choose
+// to enforce, orthogonal to feed correctness. Overridable by the caller, never larger than the
 // caller's own request.
 inline constexpr int kDefaultMaxRunSeconds = 20 * 60 * 60;
 
@@ -76,6 +95,64 @@ inline constexpr const char* feed_invalid_reason_name(FeedInvalidReason r) noexc
         case FeedInvalidReason::KlineSessionSuspended: return "KlineSessionSuspended";
         case FeedInvalidReason::ConsumerContinuityBroken: return "ConsumerContinuityBroken";
         case FeedInvalidReason::DepthNotTracking: return "DepthNotTracking";
+    }
+    return "?";
+}
+
+// --- 6b-0f-5: the supervised-feed vocabulary (see the header comment above) --------------------
+
+struct SupervisedFeedInputs {
+    // PublicFeedSupervisor<BinanceKlineWsSession>::state() / PublicFeedSupervisor<BinanceWsSession<N>>::state()
+    FeedState kline_feed_state{FeedState::Idle};
+    FeedState depth_feed_state{FeedState::Idle};
+    bool kline_sync_live{false};  // KlineFeedSync::live() -- the CONSUMER side: a connected session
+                                   // can still be NeedsBackfill (a gap was just detected, or the
+                                   // initial backfill after startup hasn't landed yet)
+    bool depth_tracking{false};   // DepthManager::state() == DepthState::Tracking
+};
+
+enum class SupervisedFeedInvalidReason : std::uint8_t {
+    None = 0,             // feed valid
+    KlineFeedGaveUp = 1,  // supervisor reached FeedState::Terminal: unrecoverable without a process restart
+    DepthFeedGaveUp = 2,
+    KlineDisconnected = 3,  // supervisor is reconnecting (Connecting/Draining/Backoff) -- transient
+    DepthDisconnected = 4,
+    KlineNotSynced = 5,   // session connected, but the consumer-side sync is not live yet
+    DepthNotTracking = 6, // session connected, but DepthManager has not (yet) reached Tracking
+};
+
+// Priority order, kline before depth throughout (matching evaluate_feed_validity's own kline-first
+// convention above): a Terminal supervisor outranks a merely-reconnecting one, which outranks a
+// connected-but-not-yet-synced one -- the same "how bad is it" ordering as the unsupervised gate,
+// just restated in terms a reconnecting feed can actually be in.
+inline constexpr SupervisedFeedInvalidReason evaluate_supervised_feed_validity(const SupervisedFeedInputs& in) noexcept {
+    if (in.kline_feed_state == FeedState::Terminal) return SupervisedFeedInvalidReason::KlineFeedGaveUp;
+    if (in.depth_feed_state == FeedState::Terminal) return SupervisedFeedInvalidReason::DepthFeedGaveUp;
+    if (in.kline_feed_state != FeedState::Connected) return SupervisedFeedInvalidReason::KlineDisconnected;
+    if (in.depth_feed_state != FeedState::Connected) return SupervisedFeedInvalidReason::DepthDisconnected;
+    if (!in.kline_sync_live) return SupervisedFeedInvalidReason::KlineNotSynced;
+    if (!in.depth_tracking) return SupervisedFeedInvalidReason::DepthNotTracking;
+    return SupervisedFeedInvalidReason::None;
+}
+
+// True only for the reasons a supervisor itself has given up on -- everything else is the
+// supervisor actively working (reconnecting, or a session connected but not yet synced), which
+// heals on its own without any caller action. This is the whole point of wrapping a feed in
+// PublicFeedSupervisor: unlike feed_invalid_reason_is_terminal() above, a mere disconnect is no
+// longer terminal.
+inline constexpr bool supervised_feed_invalid_reason_is_terminal(SupervisedFeedInvalidReason r) noexcept {
+    return r == SupervisedFeedInvalidReason::KlineFeedGaveUp || r == SupervisedFeedInvalidReason::DepthFeedGaveUp;
+}
+
+inline constexpr const char* supervised_feed_invalid_reason_name(SupervisedFeedInvalidReason r) noexcept {
+    switch (r) {
+        case SupervisedFeedInvalidReason::None: return "None";
+        case SupervisedFeedInvalidReason::KlineFeedGaveUp: return "KlineFeedGaveUp";
+        case SupervisedFeedInvalidReason::DepthFeedGaveUp: return "DepthFeedGaveUp";
+        case SupervisedFeedInvalidReason::KlineDisconnected: return "KlineDisconnected";
+        case SupervisedFeedInvalidReason::DepthDisconnected: return "DepthDisconnected";
+        case SupervisedFeedInvalidReason::KlineNotSynced: return "KlineNotSynced";
+        case SupervisedFeedInvalidReason::DepthNotTracking: return "DepthNotTracking";
     }
     return "?";
 }
