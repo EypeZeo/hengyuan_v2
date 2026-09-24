@@ -773,6 +773,18 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_kline_feed_driver)
     gtest_discover_tests(test_kline_feed_driver PROPERTIES LABELS concurrency)
 
+    # 批次 6 6b-0f-6: the depth-side mirror of test_kline_feed_driver above -- the per-tick
+    # orchestration over the supervisor, the generation tracker, the snapshot gate, the validator and
+    # DepthManager. Everything but the session and the REST fetcher is real, and the snapshot gate runs
+    # its worker on a real thread, so this binary carries the `concurrency` label too.
+    # hengyuan_dataplane (not just hengyuan_core): InputValidator::validate() has a real .cpp
+    # (src/input_validator.cpp), compiled into that library, unlike DepthManager/SnapshotRefreshGate/
+    # PublicFeedSupervisor which are header-only.
+    add_executable(test_depth_feed_driver tests/test_depth_feed_driver.cpp)
+    target_link_libraries(test_depth_feed_driver PRIVATE hengyuan_dataplane GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_depth_feed_driver)
+    gtest_discover_tests(test_depth_feed_driver PROPERTIES LABELS concurrency)
+
     # TODO 1A.2: spot rate-limit budget (REQUEST_WEIGHT/RAW_REQUESTS/ORDERS, 80/10/10 lanes)
     add_executable(test_spot_rate_limit_budget tests/test_spot_rate_limit_budget.cpp)
     target_link_libraries(test_spot_rate_limit_budget PRIVATE hengyuan_core GTest::gtest_main)
