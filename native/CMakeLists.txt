@@ -1189,6 +1189,23 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_ws_loopback_sessions)
         gtest_discover_tests(test_ws_loopback_sessions)
 
+        # 批次 6 6b-0f-7: the whole public-feed pipeline (kline + depth supervised feeds, their drivers,
+        # gates and the validity verdict) against REAL sessions on the loopback server; only the two REST
+        # fetches are scripted. Needs the strategy-spec library for the evaluator/spec loader on top of the
+        # same Boost/OpenSSL set as test_ws_loopback_sessions.
+        add_executable(test_public_feed_pipeline tests/test_public_feed_pipeline.cpp)
+        target_link_libraries(test_public_feed_pipeline PRIVATE
+            hengyuan_strategy_spec hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto
+            ${HY_OPENSSL_WIN32_LIBS} Threads::Threads GTest::gtest_main)
+        target_include_directories(test_public_feed_pipeline SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_public_feed_pipeline PRIVATE tests)
+        target_compile_definitions(test_public_feed_pipeline PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_public_feed_pipeline)
+        hengyuan_allow_third_party_tsan_fences(test_public_feed_pipeline)
+        gtest_discover_tests(test_public_feed_pipeline)
+
         # TODO 1A.4 batch 2: the reconnect supervisor -- constructs real
         # BinanceUserDataWsSession instances (via the same blackhole-acceptor no-real-network
         # fixture pattern as test_binance_user_data_ws_session above), so it needs the same

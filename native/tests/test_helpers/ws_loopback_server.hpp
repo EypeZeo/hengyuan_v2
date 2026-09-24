@@ -98,21 +98,30 @@ public:
     }
 
     // --- scripted behaviour (safe from any thread; executed on the server's own thread) ------------
-    void send_text(std::string text) {
-        net::post(ioc_, [this, payload = std::move(text)] {
-            for (auto& conn : conns_) conn->enqueue(payload);
+    // Each takes an optional `target`: only connections whose upgrade request target equals it (e.g.
+    // "/ws/btcusdt@kline_1h") are affected, so a test can drive the kline feed and the depth feed
+    // separately over ONE server. Empty (the default) means every connection.
+    void send_text(std::string text, std::string target = {}) {
+        net::post(ioc_, [this, payload = std::move(text), filter = std::move(target)] {
+            for (auto& conn : conns_) {
+                if (conn->matches(filter)) conn->enqueue(payload);
+            }
         });
     }
     // Abrupt TCP close with no close frame: a network drop.
-    void drop_all() {
-        net::post(ioc_, [this] {
-            for (auto& conn : conns_) conn->abort();
+    void drop_all(std::string target = {}) {
+        net::post(ioc_, [this, filter = std::move(target)] {
+            for (auto& conn : conns_) {
+                if (conn->matches(filter)) conn->abort();
+            }
         });
     }
     // A graceful WebSocket close.
-    void close_all() {
-        net::post(ioc_, [this] {
-            for (auto& conn : conns_) conn->close_gracefully();
+    void close_all(std::string target = {}) {
+        net::post(ioc_, [this, filter = std::move(target)] {
+            for (auto& conn : conns_) {
+                if (conn->matches(filter)) conn->close_gracefully();
+            }
         });
     }
 
@@ -123,6 +132,9 @@ private:
         explicit Connection(WsLoopbackServer& s) : server(s), ws(s.ioc_, s.ssl_ctx_) {}
 
         tcp::socket& socket() { return ws.next_layer().next_layer(); }
+
+        // An empty filter matches everything (including a connection that has not upgraded yet).
+        bool matches(const std::string& filter) const { return filter.empty() || target == filter; }
 
         void abort() {
             boost::system::error_code ignored;
@@ -173,6 +185,7 @@ private:
         beast::flat_buffer buffer;
         http::request<http::string_body> request;
         std::deque<std::string> outbox;
+        std::string target;  // the upgrade request's target; empty until the request has been read
         bool writing{false};
         bool upgraded{false};
         bool dead{false};
@@ -203,9 +216,10 @@ private:
                                          on_closed(conn);
                                          return;
                                      }
+                                     conn->target = std::string(conn->request.target());
                                      {
                                          std::lock_guard<std::mutex> lock(targets_mutex_);
-                                         targets_.emplace_back(conn->request.target());
+                                         targets_.push_back(conn->target);
                                      }
                                      conn->ws.async_accept(conn->request, [this, conn](boost::system::error_code uec) {
                                          if (uec) {
