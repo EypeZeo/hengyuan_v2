@@ -145,15 +145,16 @@ private:
             socket().close(ignored);
         }
 
-        // Only an UPGRADED connection takes a frame (and only one can be closed gracefully): send_text()/
-        // close_all() are posted tasks that run on this same server thread, FIFO behind the accept handler that
-        // sets `upgraded`, so a test that sends right after its client reports "connected" is safe -- unlike a
-        // direct read of upgrades(), which is not queued behind anything (see server_counted_upgrades() in
-        // test_ws_loopback_sessions.cpp).
+        // A frame for a connection whose upgrade is still completing is KEPT, not dropped: the accept handler's
+        // own do_write() sends it once `upgraded` is set. The client reports "connected" the moment it has read
+        // the 101, but Beast's accept is a composed operation whose final completion runs several queued
+        // handlers later on this thread -- so a task a test posts right after "connected" (send_text/close_all)
+        // can run BEFORE `upgraded` is set. Dropping the frame there was a real, timing-dependent loss: the
+        // reconnect's depth events vanished in 2 of 10 ASan runs on tokyo-vps.
         void enqueue(const std::string& message) {
-            if (!upgraded || dead) return;
+            if (dead) return;
             outbox.push_back(message);
-            do_write();
+            if (upgraded) do_write();
         }
 
         void do_write() {
@@ -169,6 +170,7 @@ private:
                                }
                                self->outbox.pop_front();
                                self->do_write();
+                               self->maybe_close();  // a close asked for earlier waits for the queue to drain
                            });
         }
 
@@ -183,8 +185,18 @@ private:
             });
         }
 
+        // Same reasoning for a graceful close: it is remembered, and performed once the connection is upgraded
+        // and everything already queued has been written (maybe_close() is called after the accept and after each
+        // write completes). Before, a close asked for while the upgrade or a write was in flight was ignored.
         void close_gracefully() {
-            if (!upgraded || dead || writing) return;
+            if (dead) return;
+            close_requested = true;
+            maybe_close();
+        }
+
+        void maybe_close() {
+            if (!close_requested || closing || !upgraded || dead || writing || !outbox.empty()) return;
+            closing = true;
             ws.async_close(websocket::close_code::going_away, [](boost::system::error_code) {});
         }
 
@@ -197,6 +209,8 @@ private:
         bool writing{false};
         bool upgraded{false};
         bool dead{false};
+        bool close_requested{false};
+        bool closing{false};
     };
 
     void accept_loop() {
@@ -239,7 +253,8 @@ private:
                                          open_.fetch_add(1, std::memory_order_release);
                                          conn->buffer.consume(conn->buffer.size());
                                          conn->do_read();
-                                         conn->do_write();
+                                         conn->do_write();     // frames queued while the upgrade completed
+                                         conn->maybe_close();  // ... and a close asked for meanwhile
                                      });
                                  });
             });
