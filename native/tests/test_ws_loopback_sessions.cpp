@@ -45,6 +45,15 @@ std::unique_ptr<WsLoopbackServer> make_server(WsLoopbackServer::UpgradeBehavior 
                                               fixture_path("test_leaf_key_loopback.pem"), behavior);
 }
 
+// The server counts an upgrade when ITS accept completes, and the client's handshake can overtake that: a
+// client that has read the 101 is "connected" before the server thread has run its completion handler (a
+// slow run -- ASan -- showed exactly that). So a test that asserts on upgrades() right after the client
+// reports connected must first wait for the server's own view. targets() needs no such wait: the target is
+// recorded before the 101 is even sent.
+bool server_counted_upgrades(const WsLoopbackServer& server, std::uint32_t at_least) {
+    return wait_until([&] { return server.upgrades() >= at_least; });
+}
+
 // The shared harness-shaped client I/O setup (ws_client_rig.hpp). Declare the ring and parser a session
 // points at BEFORE the rig: the rig is then destroyed first, and its destructor joins the I/O thread, so
 // nothing can still be pushing into a ring that is being torn down.
@@ -101,6 +110,7 @@ TEST(WsLoopbackDepthSession, ReportsConnectedOnlyAfterTheHandshakeAndDeliversPar
     EXPECT_FALSE(session->stopped());
     ASSERT_EQ(server->targets().size(), 1U);
     EXPECT_EQ(server->targets()[0], "/ws/btcusdt@depth@100ms");
+    EXPECT_TRUE(server_counted_upgrades(*server, 1U));
     EXPECT_EQ(server->upgrades(), 1U);
 
     server->send_text(kDepthUpdate);
@@ -294,6 +304,7 @@ TEST(WsLoopbackSupervisor, AReconnectedRealSessionResumesDeliveringBars) {
     ASSERT_TRUE(poll_until([&] { return sup.generation() == 2U && sup.healthy(); }))
         << "state=" << hy::feed_state_name(sup.state()) << " generation=" << sup.generation();
     EXPECT_EQ(sup.stats().total_failures, 1U);
+    EXPECT_TRUE(server_counted_upgrades(*server, 2U));
     EXPECT_EQ(server->upgrades(), 2U) << "the second generation must be a fresh, real connection";
 
     server->send_text(kline_body(true, 60'000, 119'999));
@@ -328,6 +339,7 @@ TEST(WsLoopbackSupervisor, APlannedRolloverReplacesAHealthyRealSessionWithoutCou
         << "state=" << hy::feed_state_name(sup.state()) << " rollovers=" << sup.stats().rollovers
         << " upgrades=" << server->upgrades();
     EXPECT_EQ(sup.stats().total_failures, 0U);
+    EXPECT_TRUE(server_counted_upgrades(*server, 3U));
     EXPECT_GE(server->upgrades(), 3U) << "every rollover is a genuinely new connection";
     EXPECT_GE(sup.generation(), 3U);
 

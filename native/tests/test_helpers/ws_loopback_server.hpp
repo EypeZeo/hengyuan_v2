@@ -87,7 +87,10 @@ public:
 
     // --- observability (safe from any thread) ---------------------------------------------------
     std::uint32_t tls_handshakes() const noexcept { return tls_handshakes_.load(std::memory_order_acquire); }
-    // WebSocket upgrades that completed since construction (a reconnect adds one).
+    // WebSocket upgrades that completed since construction (a reconnect adds one). Counted when the SERVER's
+    // accept completes, which can lag a client that has already read the 101: wait for it (wait_until) rather
+    // than reading it the instant the client reports "connected". targets() has no such lag -- the target is
+    // recorded before the 101 is sent.
     std::uint32_t upgrades() const noexcept { return upgrades_.load(std::memory_order_acquire); }
     // Upgraded connections that are still open.
     std::uint32_t open_connections() const noexcept { return open_.load(std::memory_order_acquire); }
@@ -142,6 +145,11 @@ private:
             socket().close(ignored);
         }
 
+        // Only an UPGRADED connection takes a frame (and only one can be closed gracefully): send_text()/
+        // close_all() are posted tasks that run on this same server thread, FIFO behind the accept handler that
+        // sets `upgraded`, so a test that sends right after its client reports "connected" is safe -- unlike a
+        // direct read of upgrades(), which is not queued behind anything (see server_counted_upgrades() in
+        // test_ws_loopback_sessions.cpp).
         void enqueue(const std::string& message) {
             if (!upgraded || dead) return;
             outbox.push_back(message);
