@@ -14,8 +14,9 @@
 // objects and pass them in, which is also what makes it exhaustively unit-testable.
 //
 // NOT a recovery mechanism: "invalid" only ever means "no new intents". Getting out of invalid
-// after a suspension needs the backfill protocol of 6b-0f; until that lands, the demo/harness
-// treat a suspension or a stopped session as terminal (exit non-zero, restart into recovery).
+// after a suspension needs the backfill protocol of 6b-0f, which the preflight harness now gets from
+// PublicFeedPipeline (public_feed_pipeline.hpp); the 6a-2 demo, which still drives one bare session,
+// treats a suspension or a stopped session as terminal (exit non-zero, restart into recovery).
 //
 // 批次 6 6b-0f-5: FeedHealthInputs/evaluate_feed_validity above assume a bare, fail-stop session --
 // stopped() meaning "dead, the whole process must restart". Once a session is wrapped in
@@ -24,10 +25,12 @@
 // legitimately true between generations even in a healthy, actively-reconnecting feed. See
 // SupervisedFeedInputs/evaluate_supervised_feed_validity further down for the supervisor-aware
 // replacement. The two vocabularies deliberately COEXIST rather than one replacing the other in
-// place: live_submit_preflight_harness.cpp (6b-1) still drives raw, unsupervised sessions and keeps
-// compiling against the old names until it is rewritten to use the supervisors -- at which point
-// FeedHealthInputs/evaluate_feed_validity/FeedInvalidReason have no remaining caller and can be
-// deleted, rather than being half-migrated underneath a file that still needs the old behavior.
+// place. live_submit_preflight_harness.cpp now uses the supervised one (through PublicFeedPipeline,
+// 6b-0f-8); the only remaining caller of the old names is live_bar_feed_signal_demo.cpp (6a-2), a
+// kline-only observer with no depth feed that still drives one bare, fail-stop session. When that
+// demo gets a supervised kline-only path of its own, FeedHealthInputs/evaluate_feed_validity/
+// FeedInvalidReason have no caller left and can be deleted, rather than being half-migrated
+// underneath a file that still needs the old behavior.
 
 #pragma once
 
