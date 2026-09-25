@@ -23,6 +23,7 @@ using hy::kMaxUsableRttMs;
 using hy::kOffsetTtlMs;
 using hy::server_now_ms_for_signing;
 using hy::server_now_ms_pessimistic;
+using hy::try_get_pessimistic_server_now_ms;
 using hy::try_get_signing_timestamp_ms;
 
 constexpr std::int64_t kI64Max = std::numeric_limits<std::int64_t>::max();
@@ -234,6 +235,71 @@ TEST(TryGetSigningTimestampMs, StaleSnapshotFails) {
     std::int64_t out = -1;
     EXPECT_FALSE(try_get_signing_timestamp_ms(pub, ClockPairSampleTestHooks::make(1000, 1000), out));
     EXPECT_EQ(out, -1);  // untouched on failure
+}
+
+// --- try_get_pessimistic_server_now_ms ---
+// The clock a kline backfill judges "has this bar closed yet" against (binance_klines_rest.hpp): freshness
+// as strict as for signing, but the estimate must only ever be BEHIND the exchange.
+
+namespace {
+ClockOffsetSnapshot fetched_at_1000(std::int64_t offset_ms, std::int64_t error_bound_ms) {
+    ClockOffsetSnapshot s{};
+    s.offset_ms = offset_ms;
+    s.error_bound_ms = error_bound_ms;
+    s.system_at_fetch_ms = 1000;
+    s.steady_at_fetch_ms = 1000;
+    return s;
+}
+}  // namespace
+
+TEST(TryGetPessimisticServerNowMs, FreshSnapshotGivesTheLowerBound) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(fetched_at_1000(/*offset*/ 77, /*error bound*/ 30)));
+
+    std::int64_t pessimistic = 0;
+    std::int64_t for_signing = 0;
+    ASSERT_TRUE(try_get_pessimistic_server_now_ms(pub, ClockPairSampleTestHooks::make(1500, 1500), pessimistic));
+    ASSERT_TRUE(try_get_signing_timestamp_ms(pub, ClockPairSampleTestHooks::make(1500, 1500), for_signing));
+    EXPECT_EQ(pessimistic, 1500 + 77 - 30);
+    EXPECT_EQ(for_signing - pessimistic, 30);  // behind the signing estimate by exactly the error bound
+}
+
+TEST(TryGetPessimisticServerNowMs, NeverPublishedFailsAndLeavesOutUntouched) {
+    ClockOffsetPublisher pub;
+    std::int64_t out = -1;
+    EXPECT_FALSE(try_get_pessimistic_server_now_ms(pub, ClockPairSampleTestHooks::make(1000, 1000), out));
+    EXPECT_EQ(out, -1);
+}
+
+TEST(TryGetPessimisticServerNowMs, ASnapshotPastItsTtlFails) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(fetched_at_1000(77, 30)));
+    std::int64_t out = -1;
+    EXPECT_TRUE(try_get_pessimistic_server_now_ms(
+        pub, ClockPairSampleTestHooks::make(1000 + kOffsetTtlMs, 1000 + kOffsetTtlMs), out));  // the last fresh instant
+    out = -1;
+    EXPECT_FALSE(try_get_pessimistic_server_now_ms(
+        pub, ClockPairSampleTestHooks::make(1000 + kOffsetTtlMs + 1, 1000 + kOffsetTtlMs + 1), out));
+    EXPECT_EQ(out, -1);
+}
+
+TEST(TryGetPessimisticServerNowMs, AWallClockJumpSinceTheFetchFails) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(fetched_at_1000(77, 30)));
+    std::int64_t out = -1;
+    // 500 ms of steady time passed, but the wall clock moved kMaxClockDriftMs + 1 further than that: a real
+    // step change (NTP, manual set), not slew -- the offset no longer describes this machine's clock.
+    EXPECT_FALSE(try_get_pessimistic_server_now_ms(
+        pub, ClockPairSampleTestHooks::make(1000 + 500 + kMaxClockDriftMs + 1, 1000 + 500), out));
+    EXPECT_EQ(out, -1);
+}
+
+TEST(TryGetPessimisticServerNowMs, ArithmeticOverflowFailsClosed) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(fetched_at_1000(kI64Max, 20)));
+    std::int64_t out = -1;
+    EXPECT_FALSE(try_get_pessimistic_server_now_ms(pub, ClockPairSampleTestHooks::make(1500, 1500), out));
+    EXPECT_EQ(out, -1);
 }
 
 // --- compute_clock_offset / fetch_clock_pair ---

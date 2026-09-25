@@ -218,4 +218,19 @@ inline bool try_get_signing_timestamp_ms(const ClockOffsetPublisher& pub,
     return server_now_ms_for_signing(s, now.system_ms(), out);
 }
 
+// The exchange-corrected wall clock for a decision that must never run AHEAD of the exchange -- "has this
+// kline closed yet" (binance_klines_rest.hpp counts a bar as closed only once a margin has elapsed past its
+// close_time). Same freshness rule as signing: a stale or wall-jumped snapshot yields nothing, and there is
+// no fall-back to the uncalibrated local clock. But it is the PESSIMISTIC estimate (local + offset -
+// error_bound): it can only be behind the exchange, so a bar may be judged "not closed yet" a moment too
+// long and is never judged closed too early. Not a signature timestamp, so it does not have to be generated
+// as the last step before use; it is a bound.
+inline bool try_get_pessimistic_server_now_ms(const ClockOffsetPublisher& pub,
+                                               ClockPairSample now,
+                                               std::int64_t& out) noexcept {
+    const ClockOffsetSnapshot s = pub.load();
+    if (!is_snapshot_fresh(s, now)) return false;
+    return server_now_ms_pessimistic(s, now.system_ms(), out);
+}
+
 }  // namespace hy

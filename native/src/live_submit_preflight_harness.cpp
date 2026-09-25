@@ -7,16 +7,26 @@
 // SymbolRegistry/BinancePrivateRestClient/make_binance_submit_port/clock sync/exchangeInfo/
 // listenKey/private user-data WS -- see that file's own header comment, all still accurate here)
 // with three things H6 never had:
-//   1. 批次 6a-1's BinanceKlineWsSession, feeding a loaded StreamingEvaluator (批次 5) +
-//      HoldingStateTracker (批次 6a-2) -- real bar-by-bar signal evaluation.
-//   2. A real public depth stream ("<symbol>@depth@100ms") through DepthManager/
-//      SnapshotRefreshGate (a manual drain loop, not hot_thread.hpp's HotThread -- see the
-//      depth ring setup below for why), so ctx.depth_synced can genuinely become true (H6 never
-//      set this field at all -- confirmed via grep before this batch's plan was written).
+//   1. The public kline stream feeding a loaded StreamingEvaluator (批次 5) + HoldingStateTracker
+//      (批次 6a-2) -- real bar-by-bar signal evaluation.
+//   2. A real public depth stream ("<symbol>@depth@100ms") through DepthManager, so
+//      ctx.depth_synced can genuinely become true (H6 never set this field at all -- confirmed via
+//      grep before this batch's plan was written).
 //   3. A real KillSwitch (Normal) + a DryRunEvidenceChain replayed with all 4 EvidencePath
 //      scenarios at process start (DryRunEvidenceChain::live_ready() is purely in-memory --
 //      dry_run_evidence.hpp's own reset()/no serialization -- so this must happen fresh every
 //      process start, not "once, ever").
+//
+// Items 1 and 2 are one PublicFeedPipeline (批次 6b-0f, public_feed_pipeline.hpp): each feed is
+// supervised (reconnect with backoff, a planned rollover before Binance's 24 h connection limit), a
+// kline gap is repaired from a REST backfill that re-warms the evaluator, the depth book is rebuilt
+// from a fresh snapshot after every reconnect, and one verdict -- "is the feed trustworthy right now"
+// -- is read off the real objects. This file used to wire all of that by hand in main(), which no
+// test could reach; the wiring is now the pipeline's, exercised against real sessions
+// (test_public_feed_pipeline.cpp), and main() is a caller. (Not hot_thread.hpp's HotThread: that pulls
+// in intent_channel.hpp/sim_executor.hpp, whose execution_types.hpp defines its OWN
+// hy::OrderSide/OrderType, colliding with account_truth.hpp's -- MSVC C2011 -- in the one translation
+// unit that needs both, which is this one, via live_submit_orchestrator.hpp.)
 //
 // SAFETY PROPERTY THIS FILE EXISTS TO DEMONSTRATE: ctx.submit_port stays pointed at a MOCK
 // SubmitFn for the entire life of this process -- never swapped to the real
@@ -35,20 +45,26 @@
 // Usage: run from the repository root (so ./.env resolves), after `chmod 600 .env`:
 //   ./live_submit_preflight_harness <spec_toml_path> [duration_seconds=60] [interval=1h]
 // Symbol is fixed to BTCUSDT/btcusdt throughout, matching H6's own single-symbol scope.
+//
+// NOT covered here, deliberately (each is its own batch): data-level staleness (a connection that
+// stays up -- Binance's pings keep the sessions' 90 s idle timeout satisfied -- while the depth or
+// kline DATA stops changing is not noticed: only a closed connection is); the durable startup
+// recovery and the target-position planner (this file still probes on HoldingStateTracker
+// transitions); operator confirmation. An AI session compiles this file but never runs it with real
+// credentials.
 
-#include <hengyuan/binance_json_parser.hpp>
-#include <hengyuan/binance_kline_ws_session.hpp>
+#include <hengyuan/binance_clock_sync.hpp>
+#include <hengyuan/binance_klines_rest.hpp>
 #include <hengyuan/binance_listen_key_keepalive.hpp>
 #include <hengyuan/binance_rest_snapshot.hpp>
 #include <hengyuan/binance_submit_adapter.hpp>
 #include <hengyuan/binance_user_data_ws_supervisor.hpp>
-#include <hengyuan/binance_ws_session.hpp>
+#include <hengyuan/depth_manager.hpp>
 #include <hengyuan/env_loader.hpp>
 #include <hengyuan/feed_validity_gate.hpp>
 #include <hengyuan/holding_state_tracker.hpp>
-#include <hengyuan/depth_manager.hpp>
-#include <hengyuan/input_validator.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/public_feed_pipeline.hpp>
 #include <hengyuan/strategy_spec_evaluator.hpp>
 #include <hengyuan/strategy_spec_toml_parser.hpp>
 
@@ -62,6 +78,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -231,13 +248,8 @@ int main(int argc, char* argv[]) {
     const std::string spec_path = argv[1];
     int duration_s = argc >= 3 ? std::atoi(argv[2]) : 60;
     if (duration_s <= 0) duration_s = 60;
-    if (duration_s > kDefaultMaxRunSeconds) {
-        // Stay clear of Binance's 24h connection limit (feed_validity_gate.hpp) -- both public
-        // sessions are fail-stop, so a run that reaches it would end abruptly instead of cleanly.
-        std::printf("NOTE: requested duration clamped to the default max run time (%d h).\n",
-                    kDefaultMaxRunSeconds / 3600);
-        duration_s = kDefaultMaxRunSeconds;
-    }
+    // No maximum run time: the public feeds are supervised and roll their connections over before
+    // Binance's 24 h connection limit on their own.
     const std::string interval = argc >= 4 ? argv[3] : "1h";
     int exit_code = 0;
 
@@ -394,53 +406,29 @@ int main(int argc, char* argv[]) {
     ReconcilePollPolicy poll_policy{};
     QueryPort query_port{&query_order_adapter, &client};
 
-    // --- 6a-1's kline stream + StreamingEvaluator (already loaded above) -------------------
-    KlineWsSessionConfig kline_cfg;
-    kline_cfg.host = std::string(binding.ws_host());
-    kline_cfg.port = std::string(binding.ws_port());
-    kline_cfg.symbol = "btcusdt";
-    kline_cfg.interval = interval;
-    kline_cfg.symbol_id = 0;
-    KlineWsEventRing kline_ring;
-    KlineJsonParser kline_parser;
-    auto kline_session =
-        std::make_shared<BinanceKlineWsSession>(ioc, ssl_ctx, kline_ring, kline_parser, kline_cfg);
-    kline_session->start();
-    // Consumer-side continuity check (外部复核 P0-04), independent of the session's own guard:
-    // validated against the timestamps of bars that ACTUALLY reached this consumer.
-    KlineBarGapGuard kline_consumer_guard;
+    // --- Both public feeds, supervised (批次 6b-0f) --------------------------------------------
+    // The io_context needs a work guard: the sessions are created LATER, by the supervisors'
+    // poll(), and run() returns at once when nothing is pending -- after which no session would
+    // ever run. Released at shutdown, once every feed has been told to stop.
+    auto ioc_guard = boost::asio::make_work_guard(ioc);
 
-    // --- New: public depth stream -> DepthManager -> ctx.depth_synced (确认发现 1 的直接修复) --
-    constexpr std::size_t kDepthRingSize = 65536;
-    BinanceJsonParser depth_parser;
-    if (!depth_parser.register_symbol("BTCUSDT", 0, price_mult, qty_mult)) {
-        std::fprintf(stderr, "FATAL: could not register BTCUSDT with the depth parser.\n");
-        return 1;
-    }
-    auto depth_ring = std::make_unique<SpscRing<BinanceMarketEvent, kDepthRingSize>>();
-    DepthManager depth_mgr;
-    // Manual depth-ring drain below (not hot_thread.hpp's HotThread) -- HotThread pulls in
-    // intent_channel.hpp/sim_executor.hpp, whose execution_types.hpp defines its OWN
-    // hy::OrderSide/hy::OrderType that collide (a real, pre-existing conflict between two
-    // independently-evolved headers, confirmed by MSVC's C2011 "unsigned enum 类型重定义" the
-    // first time this file tried to include both) with account_truth.hpp's OrderSide/OrderType,
-    // which live_submit_orchestrator.hpp (this file's whole reason for existing) already needs.
-    // This harness has no use for HotThread's multi-symbol-book/heartbeat/intent-channel
-    // machinery anyway -- only the depth-event -> DepthManager path, which is a handful of
-    // lines using InputValidator directly (see the main loop below).
-    InputValidator depth_validator;
+    // The exchange-corrected wall clock in epoch ms, for the two decisions that must be judged
+    // against EXCHANGE time rather than this machine's: which klines a backfill may count as
+    // closed (that runs on the backfill gate's worker thread, so this reads only thread-safe
+    // state: a mutex-guarded offset snapshot and two clock reads) and when a planned rollover may
+    // happen. It is the pessimistic bound, and 0 when the offset is stale or the wall clock has
+    // jumped: the backfill treats a non-positive reading as "no usable clock" and FAILS (retried
+    // after its cooldown) instead of falling back to the uncalibrated local clock; a rollover
+    // just waits.
+    auto exchange_now_ms = [&client]() -> std::int64_t {
+        std::int64_t now = 0;
+        return try_get_pessimistic_server_now_ms(client.clock_publisher(), fetch_clock_pair(), now) ? now : 0;
+    };
 
-    WsSessionConfig depth_ws_cfg;
-    depth_ws_cfg.host = std::string(binding.ws_host());
-    depth_ws_cfg.port = std::string(binding.ws_port());
-    depth_ws_cfg.subscribe_streams = {"btcusdt@depth@100ms"};
-    auto depth_session = std::make_shared<BinanceWsSession<kDepthRingSize>>(
-        ioc, ssl_ctx, *depth_ring, depth_parser, depth_ws_cfg);
-    depth_session->start();
-
-    // Testnet REST host override -- make_default_snapshot_fetcher() (binance_rest_snapshot.hpp)
-    // is hardcoded to api.binance.com (production); this batch is testnet-only throughout, so a
-    // dedicated fetcher pinned to binding.base_host() is used instead.
+    // Testnet REST host overrides -- make_default_snapshot_fetcher() (binance_rest_snapshot.hpp)
+    // is hardcoded to api.binance.com (production) and PublicRestConfig has no default host by
+    // design; this batch is testnet-only throughout, so both fetchers are pinned to
+    // binding.base_host(). They run on the gates' worker threads, so they capture values only.
     const std::string rest_host(binding.base_host());
     auto testnet_depth_fetcher = [rest_host](const SnapshotRequest& req) -> std::optional<DepthSnapshot> {
         RestSnapshotConfig cfg;
@@ -448,19 +436,44 @@ int main(int argc, char* argv[]) {
         cfg.port = "443";
         return fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier, cfg);
     };
-    SnapshotRefreshGate depth_gate(testnet_depth_fetcher);
-
-    // Everything feed_validity_gate.hpp needs, gathered in one place.
-    auto gather_feed_health = [&]() {
-        FeedHealthInputs h;
-        h.kline_session_stopped = kline_session->stopped();
-        h.kline_session_suspended = kline_session->is_suspended();
-        h.depth_session_stopped = depth_session->stopped();
-        h.depth_tracking = (depth_mgr.state() == DepthState::Tracking);
-        h.consumer_continuity_broken = kline_consumer_guard.is_suspended();
-        return h;
+    PublicRestConfig klines_rest;
+    klines_rest.host = rest_host;
+    klines_rest.port = "443";
+    auto testnet_klines_fetcher = [klines_rest, exchange_now_ms](const KlinesBackfillRequest& req) {
+        return fetch_klines_backfill_outcome(req, klines_rest, exchange_now_ms);
     };
 
+    PublicFeedPipelineConfig feed_cfg;
+    feed_cfg.ws_host = std::string(binding.ws_host());
+    feed_cfg.ws_port = std::string(binding.ws_port());
+    feed_cfg.symbol = "BTCUSDT";
+    feed_cfg.interval = interval;
+    feed_cfg.symbol_id = 0;
+    // Derived above from the real rules: the same scale validate_pre_trade() checks against.
+    feed_cfg.price_multiplier = price_mult;
+    feed_cfg.qty_multiplier = qty_mult;
+    // Real entropy for the two supervisors' reconnect jitter (the pipeline's defaults are fixed seeds).
+    std::random_device entropy;
+    auto jitter_seed = [&entropy]() {
+        return (static_cast<std::uint64_t>(entropy()) << 32) | static_cast<std::uint64_t>(entropy());
+    };
+    feed_cfg.kline_policy = make_public_feed_policy(jitter_seed());
+    feed_cfg.depth_policy = make_public_feed_policy(jitter_seed());
+
+    constexpr std::size_t kDepthRingSize = 65536;
+    PipelineInitError feed_init_error = PipelineInitError::None;
+    auto pipeline = PublicFeedPipeline<kDepthRingSize>::create(
+        ioc, ssl_ctx, evaluator, load_result.dag, std::move(feed_cfg), testnet_klines_fetcher,
+        testnet_depth_fetcher, exchange_now_ms, feed_init_error);
+    if (!pipeline) {
+        std::fprintf(stderr, "FATAL: the public feed pipeline refused to start (%s).\n",
+                     pipeline_init_error_name(feed_init_error));
+        return 1;
+    }
+
+    // From here to the shutdown block at the end of main() there is deliberately no `return`: the
+    // pipeline's sessions run on this thread, and it must be joined before the pipeline is destroyed
+    // (public_feed_pipeline.hpp's lifetime contract).
     std::thread io_thread([&ioc]() { ioc.run(); });
 
     // --- Real KillSwitch (Normal) + DryRunEvidenceChain replay (确认发现 4 的直接修复) --------
@@ -517,6 +530,8 @@ int main(int argc, char* argv[]) {
     const std::int64_t loop_start_ms = get_now_ms();
     std::uint64_t poll_ticks = 0;
     std::uint64_t preflight_probes = 0;
+    // Starts at the verdict of a pipeline that has not connected yet, so the first change is logged.
+    SupervisedFeedInvalidReason last_feed_validity = SupervisedFeedInvalidReason::KlineDisconnected;
 
     while (!g_stop.load()) {
         const std::int64_t now_ms = get_now_ms();
@@ -561,73 +576,31 @@ int main(int argc, char* argv[]) {
         drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth, &fill_context);
         ws_supervisor.poll(now_ms);
 
-        // Manual depth-ring drain -- see depth_validator's own declaration comment for why this
-        // isn't HotThread::run_once(). Same drain-bound discipline as HotThread's own
-        // kMaxEventsPerRun (hot_thread.hpp): bounded per call so a burst cannot starve the rest
-        // of this loop (clock resync, keepalive, kline draining) for an unbounded stretch.
-        {
-            BinanceMarketEvent ev{};
-            std::size_t drained = 0;
-            while (drained < 4096 && depth_ring->try_pop(ev)) {
-                ++drained;
-                const auto vr = depth_validator.validate(ev);
-                if (vr == ValidationResult::ResyncRequired) {
-                    depth_mgr.start_buffering();
-                    continue;
-                }
-                if (vr == ValidationResult::RejectNegativePrice ||
-                    vr == ValidationResult::RejectZeroPrice ||
-                    vr == ValidationResult::RejectNegativeQty ||
-                    vr == ValidationResult::RejectSeqRollback ||
-                    vr == ValidationResult::DropDuplicate) {
-                    continue;
-                }
-                if (ev.type == EventType::DepthDelta) {
-                    depth_mgr.on_depth_event(ev, ev.aux_id, ev.event_id);
-                }
-            }
-        }
-        if (auto snap = depth_gate.poll(depth_mgr.needs_snapshot(), {"BTCUSDT", price_mult, qty_mult})) {
-            const bool ok = depth_mgr.apply_snapshot(*snap);
-            std::printf("Depth snapshot: lastUpdateId=%" PRIu64 " sync=%s\n", snap->last_update_id,
-                        ok ? "OK" : "RESYNC_NEEDED");
-            depth_gate.notify_apply_result(ok);
-        }
-        const bool depth_synced = (depth_mgr.state() == DepthState::Tracking);
-
-        // Feed validity (批次 6 6b-0a), evaluated BEFORE draining so a suggested action derived
-        // from a bar below is only ever probed while the feed is currently trustworthy.
-        const FeedInvalidReason feed_reason = evaluate_feed_validity(gather_feed_health());
-
-        KlineWsEvent kev{};
-        while (kline_ring.try_pop(kev)) {
-            if (!kline_consumer_guard.accept(kev)) {
-                // A bar went missing between what the session delivered and what came before it.
-                // Never feed a gapped sequence into the windowed indicators; drop evaluator state
-                // so nothing stale can be read afterwards. Recovery is 6b-0f -- until then this
-                // process stops (terminal check right after this loop) and must be restarted.
-                evaluator.reset();
-                break;
-            }
-            const Bar bar{kev.open, kev.high, kev.low, kev.close, kev.volume};
-            const double target_position = evaluator.step(bar);
+        // What a live closed bar does. Called by the pipeline, in order, for every bar that reached the
+        // evaluator (a backfill after a gap warms the evaluator without calling it).
+        auto on_bar = [&](const KlineWsEvent& kev, double target_position) {
             const auto action = tracker.on_target_position(target_position);
             std::printf("[bar close=%" PRId64 "] signal=%.4f state=%s\n", kev.close_time_ms,
                         target_position, tracker.state() == HoldingState::Long ? "LONG" : "FLAT");
 
-            if (action == SuggestedAction::None) continue;
+            if (action == SuggestedAction::None) return;
 
-            if (feed_reason != FeedInvalidReason::None) {
+            // A suggested action derived from a bar is only ever probed while the feed is currently
+            // trustworthy. This runs inside tick(), before that tick's depth work, so the depth side of
+            // the verdict is as of the previous tick (one loop period, 50 ms).
+            const SupervisedFeedInvalidReason feed_reason =
+                evaluate_supervised_feed_validity(pipeline->supervised_inputs());
+            if (feed_reason != SupervisedFeedInvalidReason::None) {
                 std::printf("  [suppressed] suggested action not probed: feed invalid (%s)\n",
-                            feed_invalid_reason_name(feed_reason));
-                continue;
+                            supervised_feed_invalid_reason_name(feed_reason));
+                return;
             }
 
             ++preflight_probes;
-            const auto tob = depth_mgr.book().top_of_book();
+            const auto tob = pipeline->depth_manager().book().top_of_book();
             if (!tob) {
                 std::printf("  [preflight probe #%" PRIu64 "] no book yet -- skipping\n", preflight_probes);
-                continue;
+                return;
             }
             const OrderSide side = (action == SuggestedAction::Open) ? OrderSide::Buy : OrderSide::Sell;
             const std::int64_t price_ticks = (side == OrderSide::Buy) ? tob->second : tob->first;
@@ -646,7 +619,7 @@ int main(int argc, char* argv[]) {
             ctx.kill_switch = &kill_switch;
             ctx.evidence = &evidence;
             ctx.signer_ready = true;
-            ctx.depth_synced = depth_synced;
+            ctx.depth_synced = (pipeline->depth_manager().state() == DepthState::Tracking);
             ctx.rate_limiter = &rate_limiter;
             ctx.in_flight = &in_flight;
             ctx.durable_audit = make_durable_order_audit_port(*durable_audit_sink);
@@ -686,16 +659,39 @@ int main(int argc, char* argv[]) {
                              "normal early in the run, e.g. depth/account not synced yet).\n",
                              gate_name(result.gate));
             }
+        };
+
+        // Both public feeds, one call: the kline supervisor is polled, live bars reach on_bar, the
+        // depth feed is drained and rebuilt as needed. `feed.validity` is the one verdict.
+        const PublicFeedTickReport feed = pipeline->tick(now_ms, on_bar);
+
+        // What the feeds did this tick, for whoever reads the log.
+        if (feed.kline.gap_detected) {
+            std::printf("Kline gap detected -- waiting for a backfill\n");
+        }
+        if (feed.kline.backfill_collected) {
+            std::printf("Kline backfill: fetch=%s applied=%s bars=%zu warmup_complete=%s\n",
+                        feed.kline.backfill_fetch_ok ? "ok" : "FAILED",
+                        feed.kline.backfill_applied ? "yes" : "no", feed.kline.bars_applied,
+                        feed.kline.warmup_complete_after_apply ? "yes" : "no");
+        }
+        if (feed.depth.generation_reset) {
+            std::printf("Depth: new connection -- book reset, rebuilding from a snapshot\n");
+        }
+        if (feed.depth.snapshot_applied) {
+            std::printf("Depth snapshot: sync=%s\n", feed.depth.snapshot_apply_ok ? "OK" : "RESYNC_NEEDED");
+        }
+        if (feed.validity != last_feed_validity) {
+            std::printf("Feed validity: %s -> %s\n", supervised_feed_invalid_reason_name(last_feed_validity),
+                        supervised_feed_invalid_reason_name(feed.validity));
+            last_feed_validity = feed.validity;
         }
 
-        // Terminal feed conditions end the run: with no in-process backfill yet (6b-0f), a stopped
-        // or suspended feed cannot heal, and continuing would only keep polling a dead feed.
-        const FeedInvalidReason feed_reason_after = evaluate_feed_validity(gather_feed_health());
-        if (feed_invalid_reason_is_terminal(feed_reason_after)) {
-            std::fprintf(stderr,
-                         "ALERT: feed invalid (%s) -- stopping. Restart to recover; in-process "
-                         "backfill is 6b-0f.\n",
-                         feed_invalid_reason_name(feed_reason_after));
+        // A supervisor that has given up is not coming back -- nothing reconnects it -- so continuing
+        // would only keep polling a dead feed. End the run with a non-zero exit code.
+        if (feed.terminal()) {
+            std::fprintf(stderr, "ALERT: a public feed gave up (%s) -- stopping. Restart to recover.\n",
+                         supervised_feed_invalid_reason_name(feed.validity));
             exit_code = 2;
             break;
         }
@@ -707,9 +703,12 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    depth_session->stop();
-    kline_session->stop();
+    // Shutdown order (public_feed_pipeline.hpp's lifetime contract): tell every feed to stop, release
+    // the work guard so run() returns once their pending handlers have finished, join the io thread --
+    // and only then may the pipeline go out of scope.
+    pipeline->shutdown();
     ws_supervisor.shutdown();
+    ioc_guard.reset();
     if (io_thread.joinable()) io_thread.join();
 
     const std::int64_t shutdown_now_ms = get_now_ms();
@@ -728,17 +727,37 @@ int main(int argc, char* argv[]) {
                 poll_ticks, preflight_probes,
                 tracker.state() == HoldingState::Long ? "LONG" : "FLAT");
     std::printf("Audit records written: %zu\n", audit.count());
+    const DepthManager& depth_mgr = pipeline->depth_manager();
     const auto ds = depth_mgr.stats();
     std::printf("Depth: snapshots=%" PRIu64 " applied=%" PRIu64 " resyncs=%" PRIu64 " final_state=%s\n",
                 ds.snapshots, ds.events_applied, ds.resyncs,
                 depth_mgr.state() == DepthState::Tracking ? "Tracking"
                 : depth_mgr.state() == DepthState::Syncing ? "Syncing" : "Buffering");
-    const auto kline_stats = kline_session->stats_snapshot();
-    std::printf("Kline: closed_bars=%" PRIu64 " unclosed_skipped=%" PRIu64 " gap_detected=%" PRIu64
-                " ring_overflow_suspended=%" PRIu64 " suspended=%s\n",
-                kline_stats.parse_ok, kline_stats.unclosed_skipped, kline_stats.gap_detected_count,
-                kline_stats.ring_overflow_suspended,
-                kline_session->is_suspended() ? "true" : "false");
+    const FeedSupervisorStats kline_sup = pipeline->kline_supervisor_stats();
+    const KlineFeedDriverStats& kline_drv = pipeline->kline_driver_stats();
+    std::printf("Kline feed: sessions=%" PRIu64 " failures=%" PRIu64 " rollovers=%" PRIu64
+                " | backfills applied=%" PRIu64 " fetch_failed=%" PRIu64 " rejected=%" PRIu64
+                " | resumes=%" PRIu64 "\n",
+                kline_sup.generation, kline_sup.total_failures, kline_sup.rollovers,
+                kline_drv.backfills_applied, kline_drv.backfill_fetch_failures,
+                kline_drv.backfills_rejected, kline_drv.resumes_posted);
+    const FeedSupervisorStats depth_sup = pipeline->depth_supervisor_stats();
+    const DepthFeedDriverStats& depth_drv = pipeline->depth_driver_stats();
+    std::printf("Depth feed: sessions=%" PRIu64 " failures=%" PRIu64 " rollovers=%" PRIu64
+                " | generation_resets=%" PRIu64 " resyncs=%" PRIu64 " snapshots applied=%" PRIu64
+                " rejected=%" PRIu64 "\n",
+                depth_sup.generation, depth_sup.total_failures, depth_sup.rollovers,
+                depth_drv.generation_resets, depth_drv.resyncs_requested, depth_drv.snapshots_applied,
+                depth_drv.snapshots_rejected);
+    // The kline session of the last generation, if there is one (its counters are that connection's
+    // own; the io thread is joined, so reading them is safe).
+    if (const auto kline_session = pipeline->kline_session()) {
+        const auto kline_stats = kline_session->stats_snapshot();
+        std::printf("Kline (last session): closed_bars=%" PRIu64 " unclosed_skipped=%" PRIu64
+                    " gap_detected=%" PRIu64 " ring_overflow_suspended=%" PRIu64 " suspended=%s\n",
+                    kline_stats.parse_ok, kline_stats.unclosed_skipped, kline_stats.gap_detected_count,
+                    kline_stats.ring_overflow_suspended, kline_session->is_suspended() ? "true" : "false");
+    }
 
     durable_audit_sink.reset();  // close before removing the temp file
     key_ring.reset();
