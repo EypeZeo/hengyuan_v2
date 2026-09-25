@@ -66,4 +66,11 @@ ValidationResult InputValidator::validate(const BinanceMarketEvent& ev) noexcept
     return result;
 }
 
+void InputValidator::reset_sequences() noexcept {
+    for (auto& per_symbol : seq_state_) {
+        for (auto& state : per_symbol) state = SeqState{};
+    }
+    for (auto& clock : clock_state_) clock = ClockState{};
+}
+
 }  // namespace hy

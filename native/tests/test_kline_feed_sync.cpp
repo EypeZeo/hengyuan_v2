@@ -379,12 +379,27 @@ TEST(KlineFeedSync, InvalidatingFromLiveResetsTheEvaluatorImmediately) {
     EXPECT_EQ(rig.sync.stats().invalidations, 3U);
     EXPECT_EQ(rig.sync.stats().session_suspended_invalidations, 1U);
     EXPECT_EQ(rig.sync.stats().manual_invalidations, 2U);
+    EXPECT_EQ(rig.sync.stats().overdue_invalidations, 0U);
     EXPECT_EQ(rig.sync.stats().gaps_detected, 0U);
     EXPECT_FALSE(rig.sync.live());
 
     // And the very same object recovers.
     ASSERT_EQ(rig.sync.apply_backfill(bars(100, 60)).status, BackfillApplyStatus::Applied);
     EXPECT_TRUE(same_state(rig.evaluator, rig.reference(100, 60), rig.nodes()));
+}
+
+TEST(KlineFeedSync, AnOverdueInvalidationIsCountedOnItsOwnAndResetsLikeTheOthers) {
+    Rig rig;
+    ASSERT_EQ(rig.sync.apply_backfill(bars(0, 60)).status, BackfillApplyStatus::Applied);
+    rig.sync.invalidate(KlineSyncInvalidReason::BarOverdue);
+    EXPECT_FALSE(rig.sync.live());
+    EXPECT_EQ(rig.sync.last_invalid_reason(), KlineSyncInvalidReason::BarOverdue);
+    EXPECT_EQ(rig.sync.stats().overdue_invalidations, 1U);
+    EXPECT_EQ(rig.sync.stats().invalidations, 1U);
+    EXPECT_EQ(rig.sync.stats().gaps_detected, 0U) << "silence is not a gap that a later bar revealed";
+    EXPECT_EQ(rig.sync.stats().manual_invalidations, 0U);
+    EXPECT_EQ(rig.sync.last_close_time_ms(), 0);
+    EXPECT_EQ(rig.evaluator.seen_bars(), 0U);
 }
 
 // --- malformed input -----------------------------------------------------------------------------------------------
@@ -581,7 +596,7 @@ TEST(KlineFeedSync, SaneClosedKlineAcceptsTheOrdinaryCaseAndZeroVolume) {
 TEST(KlineFeedSync, NamesAreDistinct) {
     const KlineSyncInvalidReason reasons[] = {KlineSyncInvalidReason::Startup, KlineSyncInvalidReason::ConsumerGap,
                                               KlineSyncInvalidReason::SessionSuspended,
-                                              KlineSyncInvalidReason::Manual};
+                                              KlineSyncInvalidReason::Manual, KlineSyncInvalidReason::BarOverdue};
     for (std::size_t i = 0; i < std::size(reasons); ++i) {
         EXPECT_STRNE(hy::kline_sync_invalid_reason_name(reasons[i]), "?");
         for (std::size_t j = i + 1; j < std::size(reasons); ++j) {

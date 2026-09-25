@@ -31,6 +31,16 @@
 //   3. Drain. Only while the sync is live, and at most max_bars_per_tick bars, so a burst cannot
 //      starve the rest of the loop. While NOT live the ring is left alone on purpose: it is the buffer
 //      that holds the bars closing during the fetch.
+//   4. Overdue (6b-0f-9), AFTER the drain so that a bar that has arrived but not yet been drained is never
+//      mistaken for a missing one. A live feed whose next closed bar has not arrived by its due time plus a
+//      grace is a silent stream that still looks connected: Binance's pings keep the WS idle timeout happy,
+//      and the consumer-side gap check only fires when a LATER bar shows up. The sync is invalidated
+//      (BarOverdue), and the ordinary REST backfill starts on the next tick -- the repair does not depend on
+//      the websocket at all. The session is restarted only if it was already up when the bar was due
+//      (connection age >= how long the bar has been due): a connection younger than that connected after the
+//      bar closed, so it is not the suspect and the backfill alone repairs what it missed. It needs the
+//      EXCHANGE clock (epoch ms, from the caller); without one (0), or without the interval's fixed span (0:
+//      "1M"), nothing is judged -- a missing clock must not kill a healthy connection.
 //
 // KNOWN LIMIT: the ring holds 16 bars. A fetch that outlasts 16 bar intervals (a 1s timeframe with a
 // slow REST call) overflows it; the session then suspends and the whole recovery repeats. Sensible
@@ -77,6 +87,11 @@ struct KlineFeedDriverConfig {
     std::int64_t resume_retry_ms{2000};
     // Cap on the request's limit: Binance's own maximum (kline_bar.hpp).
     std::uint32_t max_backfill_bars{static_cast<std::uint32_t>(kMaxBackfillBars)};
+    // Overdue detection (see the header comment). The interval's fixed bar span in ms (kline_interval_span_ms;
+    // 0 for "1M" and for unknown = no detection) and how long after a bar is due it may still arrive. Binance
+    // delivers a closed bar within about a second of its close, so 30 s is generous; 0 = no detection.
+    std::int64_t interval_span_ms{0};
+    std::int64_t overdue_grace_ms{30'000};
 };
 
 // What happened during one tick -- the caller prints from this; the driver never does I/O.
@@ -94,6 +109,8 @@ struct KlineFeedTickReport {
     BackfillApplyStatus apply_status{BackfillApplyStatus::NotNeeded};
     bool warmup_complete_after_apply{false};
     std::size_t bars_applied{0};
+    bool bar_overdue{false};                // the next bar was overdue: the sync was invalidated for a backfill
+    bool overdue_session_restarted{false};  // ... and the session, which was up when the bar was due, was stopped
 };
 
 struct KlineFeedDriverStats {
@@ -104,6 +121,8 @@ struct KlineFeedDriverStats {
     std::uint64_t backfills_rejected{0};        // fetched fine, refused by the sync
     std::uint64_t backfills_applied{0};
     std::uint64_t stale_outcomes_ignored{0};    // an outcome that arrived while the sync was already live
+    std::uint64_t overdue_invalidations{0};
+    std::uint64_t overdue_session_restarts{0};
 };
 
 template <KlineFeedSession Session, KlinesBackfillOutcomeLike Outcome>
@@ -126,13 +145,15 @@ public:
     KlineFeedDriver& operator=(const KlineFeedDriver&) = delete;
 
     // `on_bar(const KlineWsEvent&, double target_position)` is called for every bar that reached the
-    // evaluator, in order. Must not call back into this driver.
+    // evaluator, in order. Must not call back into this driver. `epoch_now_ms` is the exchange-corrected
+    // wall clock (0 = unavailable: nothing is judged overdue); `now_ms` is the caller's monotonic clock.
     template <typename OnBar>
-    KlineFeedTickReport tick(std::int64_t now_ms, OnBar&& on_bar) {
+    KlineFeedTickReport tick(std::int64_t now_ms, OnBar&& on_bar, std::int64_t epoch_now_ms = 0) {
         KlineFeedTickReport report;
         watch_session(now_ms, report);
         recover(now_ms, report);
         drain(report, on_bar);
+        watch_overdue(now_ms, epoch_now_ms, report);
         return report;
     }
 
@@ -158,6 +179,33 @@ private:
             resume_posted_at_ms_ = now_ms;
             report.resume_posted = true;
             ++stats_.resumes_posted;
+        }
+    }
+
+    void watch_overdue(std::int64_t now_ms, std::int64_t epoch_now_ms, KlineFeedTickReport& report) {
+        if (config_.interval_span_ms <= 0 || config_.overdue_grace_ms <= 0 || epoch_now_ms <= 0 || !sync_.live()) {
+            return;
+        }
+        // The next closed bar closes one span after the last one; the exchange delivers it within about a
+        // second, so it is overdue once the grace has also passed.
+        const std::int64_t due = detail::feed_sat_add_ms(sync_.last_close_time_ms(), config_.interval_span_ms);
+        if (epoch_now_ms <= detail::feed_sat_add_ms(due, config_.overdue_grace_ms)) return;
+
+        sync_.invalidate(KlineSyncInvalidReason::BarOverdue);  // the ordinary backfill starts on the next tick
+        report.bar_overdue = true;
+        ++stats_.overdue_invalidations;
+
+        // Blame the connection only if it was already up when the bar was due: a connection that is younger
+        // than the bar's lateness connected AFTER it closed, so the missing bar is not its doing and the
+        // backfill alone repairs it.
+        const FeedSupervisorStats sup = supervisor_.stats();
+        if (sup.state != FeedState::Connected) return;
+        const std::int64_t overdue_for_ms = detail::feed_elapsed_ms(epoch_now_ms, due);
+        if (detail::feed_elapsed_ms(now_ms, sup.last_connected_ms) < overdue_for_ms) return;
+        if (const std::shared_ptr<Session> session = supervisor_.current()) {
+            session->stop();  // the supervisor's own failure path (backoff, a new generation) takes over
+            report.overdue_session_restarted = true;
+            ++stats_.overdue_session_restarts;
         }
     }
 

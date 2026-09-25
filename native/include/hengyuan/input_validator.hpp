@@ -38,6 +38,13 @@ public:
     const ValidationCounters& counters() const noexcept { return counters_; }
     void reset_counters() noexcept { counters_ = {}; }
 
+    // Forgets every symbol's last event id and last event time (the counters stay). A new connection's
+    // update ids need not continue the previous one's -- an exchange-side reset (Binance testnet does this)
+    // restarts them from a low number -- and judging the new sequence against the old one would reject ALL of
+    // it as a rollback while the book sat frozen. Called on every new feed generation
+    // (depth_feed_driver.hpp), at the one moment no producer of the old generation is being consumed.
+    void reset_sequences() noexcept;
+
 private:
     // Sequence/duplicate state is keyed by (symbol_id, event_type): Binance
     // trade ids, aggTrade ids and depth update ids are independent sequences

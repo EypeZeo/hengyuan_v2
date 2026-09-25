@@ -66,6 +66,7 @@ enum class KlineSyncInvalidReason : std::uint8_t {
     ConsumerGap = 1,       // a live bar after a hole (detected here)
     SessionSuspended = 2,  // the session's own guard suspended: a gap or a ring overflow lost bars
     Manual = 3,            // the caller's decision (e.g. the feed supervisor gave up, an operator reset)
+    BarOverdue = 4,        // the next closed bar did not arrive within its grace: a silent or stalled stream
 };
 
 inline constexpr const char* kline_sync_invalid_reason_name(KlineSyncInvalidReason r) noexcept {
@@ -74,6 +75,7 @@ inline constexpr const char* kline_sync_invalid_reason_name(KlineSyncInvalidReas
         case KlineSyncInvalidReason::ConsumerGap: return "ConsumerGap";
         case KlineSyncInvalidReason::SessionSuspended: return "SessionSuspended";
         case KlineSyncInvalidReason::Manual: return "Manual";
+        case KlineSyncInvalidReason::BarOverdue: return "BarOverdue";
     }
     return "?";
 }
@@ -133,6 +135,7 @@ struct KlineSyncStats {
     std::uint64_t gaps_detected{0};
     std::uint64_t session_suspended_invalidations{0};
     std::uint64_t manual_invalidations{0};
+    std::uint64_t overdue_invalidations{0};
 };
 
 // A bar the evaluator may be fed: closed, forward in time, finite positive prices that are
@@ -190,6 +193,7 @@ public:
         if (reason == KlineSyncInvalidReason::ConsumerGap) ++stats_.gaps_detected;
         if (reason == KlineSyncInvalidReason::SessionSuspended) ++stats_.session_suspended_invalidations;
         if (reason == KlineSyncInvalidReason::Manual) ++stats_.manual_invalidations;
+        if (reason == KlineSyncInvalidReason::BarOverdue) ++stats_.overdue_invalidations;
     }
 
     // Rebuilds the evaluator from `bars` (oldest first; contiguous, closed, sane -- validated here

@@ -44,10 +44,11 @@ struct FakeSession {
     void start() {}
     void stop() { stopped_flag.store(true); }
     bool stopped() const { return stopped_flag.load(); }
-    bool is_connected() const { return true; }
+    bool is_connected() const { return connected.load(); }
 
     const std::uint64_t generation;
     std::atomic<bool> stopped_flag{false};
+    std::atomic<bool> connected{true};  // a test that needs a session stuck in Connecting clears it
 };
 static_assert(hy::SupervisedFeedSession<FakeSession>);
 
@@ -403,4 +404,158 @@ TEST(DepthFeedDriver, ABufferOverflowDuringBufferingRejectsTheSnapshotAndTellsTh
     }
     EXPECT_EQ(rig.fetcher.call_count(), 1)
         << "a rejected apply must reach the gate's own cooldown, not an immediate retry";
+}
+
+// --- staleness (6b-0f-9) -----------------------------------------------------------------------------
+//
+// A connected feed whose depth events stop being accepted is a frozen book that still looks healthy (the WS
+// idle timeout is satisfied by pings, DepthManager stays Tracking). The driver must fail closed on the data.
+
+namespace {
+
+DepthFeedDriverConfig stale_after(std::int64_t ms) {
+    DepthFeedDriverConfig cfg;
+    cfg.stale_after_ms = ms;
+    return cfg;
+}
+
+}  // namespace
+
+TEST(DepthFeedDriverStaleness, AFeedThatKeepsDeliveringEventsIsNeverStale) {
+    Rig rig(stale_after(100));
+    go_tracking(rig, 100);
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        rig.push(depth_event(101 + i, 101 + i));
+        const auto r = rig.tick(static_cast<std::int64_t>(60 * (i + 1)));  // 600 ms in all: well past 100
+        EXPECT_EQ(r.events_applied, 1U);
+        EXPECT_FALSE(r.stale_restart);
+    }
+    EXPECT_FALSE(rig.driver.stale());
+    EXPECT_FALSE(rig.session().stopped());
+    EXPECT_EQ(rig.driver.stats().stale_restarts, 0U);
+    EXPECT_EQ(rig.driver.last_activity_ms(), 600);
+}
+
+TEST(DepthFeedDriverStaleness, SilenceLongerThanStaleAfterFailsClosedAndStopsTheSession) {
+    Rig rig(stale_after(100));
+    go_tracking(rig, 100);  // the generation began at t=0
+
+    const auto at_limit = rig.tick(100);  // exactly stale_after_ms of silence: not yet
+    EXPECT_FALSE(at_limit.stale_restart);
+    EXPECT_EQ(rig.depth_mgr->state(), DepthState::Tracking);
+
+    const auto r = rig.tick(101);
+    EXPECT_TRUE(r.stale_restart);
+    EXPECT_TRUE(rig.driver.stale());
+    EXPECT_EQ(rig.depth_mgr->state(), DepthState::Buffering) << "the frozen book is no longer trusted";
+    EXPECT_TRUE(rig.session().stopped()) << "the connection that stopped delivering is replaced";
+    EXPECT_EQ(rig.driver.stats().stale_restarts, 1U);
+
+    // Once per generation: the following silent ticks neither restart it again nor count it again.
+    const auto again = rig.tick(102);
+    EXPECT_FALSE(again.stale_restart);
+    EXPECT_EQ(rig.driver.stats().stale_restarts, 1U);
+}
+
+TEST(DepthFeedDriverStaleness, NoSnapshotIsFetchedForABookThatIsAboutToBeReset) {
+    Rig rig(stale_after(100));
+    go_tracking(rig, 100);
+    ASSERT_EQ(rig.fetcher.call_count(), 1);
+
+    ASSERT_TRUE(rig.tick(101).stale_restart);  // the manager is Buffering again: needs_snapshot() is true
+    for (int i = 0; i < 50; ++i) {
+        (void)rig.tick(102);  // still the stale generation (the supervisor has not been polled past it)
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_EQ(rig.fetcher.call_count(), 1) << "the new generation resets the book anyway: a fetch now is wasted";
+}
+
+TEST(DepthFeedDriverStaleness, TheSupervisorsFailurePathBringsTheFeedBackAndANewGenerationClearsStaleness) {
+    Rig rig(stale_after(100));
+    go_tracking(rig, 100);
+    ASSERT_TRUE(rig.tick(101).stale_restart);
+
+    rig.tick_until_generation(2, 200);
+    EXPECT_FALSE(rig.driver.stale());
+    EXPECT_EQ(rig.driver.stats().generation_resets, 2U);
+    EXPECT_EQ(rig.supervisor.stats().total_failures, 1U) << "a stale restart is a failure, not a planned rollover";
+    EXPECT_EQ(rig.supervisor.stats().rollovers, 0U);
+    EXPECT_EQ(rig.depth_mgr->state(), DepthState::Buffering);
+}
+
+TEST(DepthFeedDriverStaleness, ANewGenerationGetsAWholeStaleAfterToDeliverItsFirstEvent) {
+    Rig rig(stale_after(100));
+    go_tracking(rig, 100);
+    ASSERT_TRUE(rig.tick(101).stale_restart);
+    rig.tick_until_generation(2, 200);
+    const std::int64_t began = rig.driver.last_activity_ms();  // re-armed at the tick that saw generation 2
+    ASSERT_GE(began, 200);
+
+    EXPECT_FALSE(rig.tick(began + 100).stale_restart) << "exactly stale_after_ms into the new connection";
+    EXPECT_TRUE(rig.tick(began + 101).stale_restart) << "and a connection that never delivers is stale too";
+    EXPECT_EQ(rig.driver.stats().stale_restarts, 2U);
+}
+
+TEST(DepthFeedDriverStaleness, EventsThatAreOnlyDrainedAndRejectedAreNotActivity) {
+    Rig rig(stale_after(100));
+    go_tracking(rig, 100);
+
+    // Something is arriving, but all of it is thrown away -- the frozen book this exists for.
+    for (int i = 1; i <= 4; ++i) {
+        BinanceMarketEvent bad = depth_event(101, 101);
+        bad.price_ticks = -5;  // InputValidator::RejectNegativePrice
+        rig.push(bad);
+        const auto r = rig.tick(20 * i);  // 20..80 ms: still inside stale_after_ms
+        EXPECT_EQ(r.events_drained, 1U);
+        EXPECT_EQ(r.events_applied, 0U);
+    }
+    BinanceMarketEvent trade = depth_event(101, 101);  // accepted by the validator, never a depth event
+    trade.type = EventType::Trade;
+    rig.push(trade);
+    EXPECT_EQ(rig.tick(100).events_drained, 1U);
+    EXPECT_FALSE(rig.driver.stale());
+
+    EXPECT_TRUE(rig.tick(101).stale_restart);
+}
+
+TEST(DepthFeedDriverStaleness, AConnectingFeedIsTheSupervisorsBusinessNotStaleness) {
+    Rig rig(stale_after(100));
+    (void)rig.tick(0);                     // generation 1 starts: Connecting
+    rig.session().connected = false;       // ... and never gets connected
+    const auto r = rig.tick(1'000'000);    // ages later: the supervisor's connect deadline applies, not this
+    EXPECT_FALSE(r.stale_restart);
+    EXPECT_FALSE(rig.driver.stale());
+    EXPECT_EQ(rig.driver.stats().stale_restarts, 0U);
+}
+
+TEST(DepthFeedDriverStaleness, ZeroDisablesTheJudgement) {
+    Rig rig(stale_after(0));
+    go_tracking(rig, 100);
+    const auto r = rig.tick(1'000'000'000);
+    EXPECT_FALSE(r.stale_restart);
+    EXPECT_FALSE(rig.driver.stale());
+    EXPECT_EQ(rig.depth_mgr->state(), DepthState::Tracking);
+}
+
+// --- a new generation forgets the old one's update ids ------------------------------------------------
+
+// Binance testnet is reset from time to time, and update ids then restart from a low number. The book of
+// the OLD connection is meaningless anyway, but the validator must not judge the new sequence against the
+// old one either: it would reject every event of the new connection as a rollback, forever.
+TEST(DepthFeedDriverStaleness, AnExchangeSideResetToLowUpdateIdsIsAcceptedByTheNextGeneration) {
+    Rig rig;
+    go_tracking(rig, 5000);
+    rig.push(depth_event(5001, 5001));
+    ASSERT_EQ(rig.tick(1).events_applied, 1U);
+
+    rig.session().stop();  // the connection drops; the exchange comes back reset
+    rig.tick_until_generation(2, 1000);
+    ASSERT_TRUE(WaitForCallCount(rig.fetcher, 2, std::chrono::seconds(2)));
+    rig.fetcher.unblock(snapshot(40));
+    ASSERT_TRUE(rig.tick_until_snapshot_collected(2000).snapshot_apply_ok);
+
+    rig.push(depth_event(41, 41));
+    const auto r = rig.tick(2001);
+    EXPECT_EQ(r.events_rejected, 0U) << "the validator must not treat the reset ids as a rollback";
+    EXPECT_EQ(r.events_applied, 1U);
 }

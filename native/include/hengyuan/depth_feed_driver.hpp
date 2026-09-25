@@ -27,7 +27,15 @@
 //      DepthManager::on_depth_event(). Bounded per tick so a burst cannot starve the rest of the
 //      caller's loop (clock resync, keepalive, the kline side) -- same discipline as
 //      KlineFeedDriver::drain()'s own max_bars_per_tick.
-//   4. Snapshot. Poll the SnapshotRefreshGate; a delivered snapshot is applied via
+//   4. Staleness (6b-0f-9). A connected feed whose depth events stop being ACCEPTED for
+//      stale_after_ms is a frozen book that still looks healthy: the WS-level idle timeout is satisfied
+//      by Binance's pings, and DepthManager stays Tracking. So the driver fails closed on the data
+//      itself -- the manager goes back to Buffering, the current session is stopped, and the
+//      supervisor's own failure path (backoff, a new generation, the reset in step 2) takes over. The
+//      clock is re-armed by every new generation and by every event DepthManager consumes; events that are
+//      only drained and rejected are not activity (a validator/manager that throws everything away is
+//      exactly the frozen book this is for). No snapshot is fetched for a book that is about to be reset.
+//   5. Snapshot. Poll the SnapshotRefreshGate; a delivered snapshot is applied via
 //      DepthManager::apply_snapshot() and the outcome reported straight back to the gate, so its
 //      own cooldown-on-rejection logic (snapshot_refresh_gate.hpp) still applies unchanged.
 //
@@ -48,6 +56,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace hy {
 
@@ -58,6 +67,7 @@ struct DepthFeedTickReport {
                                         // not necessarily changed the book -- see that function)
     std::uint32_t events_rejected{0};  // InputValidator rejected (not a resync)
     bool generation_reset{false};      // a new generation fired this tick: DepthManager reset to Buffering
+    bool stale_restart{false};         // the feed was judged stale this tick: book reset, session stopped
     bool resync_requested{false};      // InputValidator saw ResyncRequired this tick
     bool snapshot_applied{false};      // a snapshot was collected from the gate this tick
     bool snapshot_apply_ok{false};     // ... and DepthManager::apply_snapshot() accepted it
@@ -70,6 +80,7 @@ struct DepthFeedDriverStats {
     std::uint64_t events_rejected{0};
     std::uint64_t snapshots_applied{0};
     std::uint64_t snapshots_rejected{0};
+    std::uint64_t stale_restarts{0};
 };
 
 struct DepthFeedDriverConfig {
@@ -77,6 +88,14 @@ struct DepthFeedDriverConfig {
     // (live_submit_preflight_harness.cpp): large enough that a normal burst drains in one tick,
     // small enough that a runaway feed cannot starve the rest of the caller's loop indefinitely.
     std::uint32_t max_events_per_tick{4096};
+    // How long a CONNECTED feed may go without a single depth event being accepted before it is judged
+    // stale (see the header comment). 0 = never. BTCUSDT's 100 ms stream updates several times a second, so
+    // a minute is far above any quiet spell; a symbol that can genuinely be silent for longer needs a larger
+    // value, not 0. It equals the supervisor's stable_after_ms on purpose: a connection that delivered and
+    // then went quiet has been up long enough for its end to count as a long healthy run that ended (the
+    // failure streak restarts) rather than escalating towards Terminal on a merely quiet market -- while one
+    // that never delivers a single event still escalates, as a dead feed should.
+    std::int64_t stale_after_ms{60'000};
 };
 
 template <SupervisedFeedSession Session, std::size_t RingCapacity>
@@ -108,11 +127,21 @@ public:
 
         if (gen_tracker_.observe(supervisor_.generation())) {
             depth_mgr_.start_buffering();
+            // The new connection's update ids need not continue the old one's (an exchange-side reset
+            // restarts them): forget the old sequence, or all of the new one is rejected as a rollback.
+            validator_.reset_sequences();
+            stale_ = false;
+            last_activity_ms_ = now_ms;  // a new connection gets a whole stale_after_ms to deliver
             report.generation_reset = true;
             ++stats_.generation_resets;
         }
 
         drain(report);
+        if (report.events_applied > 0) last_activity_ms_ = now_ms;
+        judge_staleness(now_ms, report);
+
+        // Not for a book that is about to be reset by the new generation anyway.
+        if (stale_) return report;
 
         if (auto snap = snapshot_gate_.poll(depth_mgr_.needs_snapshot(), snapshot_request_)) {
             const bool ok = depth_mgr_.apply_snapshot(*snap);
@@ -130,7 +159,23 @@ public:
 
     const DepthFeedDriverStats& stats() const noexcept { return stats_; }
 
+    // True from the moment the feed is judged stale until the supervisor's next generation begins.
+    bool stale() const noexcept { return stale_; }
+    // The caller's clock at the last event DepthManager consumed (or at the start of the current
+    // generation): the age of the book, for whoever prices an order from it.
+    std::int64_t last_activity_ms() const noexcept { return last_activity_ms_; }
+
 private:
+    void judge_staleness(std::int64_t now_ms, DepthFeedTickReport& report) {
+        if (config_.stale_after_ms <= 0 || stale_ || supervisor_.state() != FeedState::Connected) return;
+        if (detail::feed_elapsed_ms(now_ms, last_activity_ms_) <= config_.stale_after_ms) return;
+        stale_ = true;
+        depth_mgr_.start_buffering();  // fail closed: the book is no longer trusted
+        if (const std::shared_ptr<Session> session = supervisor_.current()) session->stop();
+        report.stale_restart = true;
+        ++stats_.stale_restarts;
+    }
+
     void drain(DepthFeedTickReport& report) {
         BinanceMarketEvent ev{};
         std::uint32_t taken = 0;
@@ -167,6 +212,8 @@ private:
     DepthFeedDriverConfig config_;
     FeedGenerationTracker gen_tracker_;
     DepthFeedDriverStats stats_{};
+    bool stale_{false};
+    std::int64_t last_activity_ms_{0};
 };
 
 }  // namespace hy

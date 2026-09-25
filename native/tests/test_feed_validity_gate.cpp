@@ -170,6 +170,12 @@ TEST(SupervisedFeedValidityGate, EachConditionAloneInvalidatesTheFeed) {
         h.depth_tracking = false;
         EXPECT_EQ(evaluate_supervised_feed_validity(h), SupervisedFeedInvalidReason::DepthNotTracking);
     }
+    {
+        // A frozen book: still connected, still (as far as DepthManager knows) Tracking.
+        auto h = supervised_healthy();
+        h.depth_stale = true;
+        EXPECT_EQ(evaluate_supervised_feed_validity(h), SupervisedFeedInvalidReason::DepthStale);
+    }
 }
 
 // A supervisor that has given up is reported ahead of everything else, kline ahead of depth --
@@ -188,6 +194,10 @@ TEST(SupervisedFeedValidityGate, GaveUpTakesPriorityOverEverythingElse) {
     h.depth_feed_state = FeedState::Connected;
     EXPECT_EQ(evaluate_supervised_feed_validity(h), SupervisedFeedInvalidReason::KlineNotSynced);
     h.kline_sync_live = true;
+    h.depth_stale = true;
+    EXPECT_EQ(evaluate_supervised_feed_validity(h), SupervisedFeedInvalidReason::DepthStale)
+        << "staleness resets the book to Buffering: the cause outranks the symptom";
+    h.depth_stale = false;
     EXPECT_EQ(evaluate_supervised_feed_validity(h), SupervisedFeedInvalidReason::DepthNotTracking);
 }
 
@@ -200,6 +210,8 @@ TEST(SupervisedFeedValidityGate, OnlyGaveUpReasonsAreTerminal) {
     EXPECT_FALSE(supervised_feed_invalid_reason_is_terminal(SupervisedFeedInvalidReason::DepthDisconnected));
     EXPECT_FALSE(supervised_feed_invalid_reason_is_terminal(SupervisedFeedInvalidReason::KlineNotSynced));
     EXPECT_FALSE(supervised_feed_invalid_reason_is_terminal(SupervisedFeedInvalidReason::DepthNotTracking));
+    EXPECT_FALSE(supervised_feed_invalid_reason_is_terminal(SupervisedFeedInvalidReason::DepthStale))
+        << "a stale feed is restarted by its supervisor: it heals without a process restart";
     EXPECT_TRUE(supervised_feed_invalid_reason_is_terminal(SupervisedFeedInvalidReason::KlineFeedGaveUp));
     EXPECT_TRUE(supervised_feed_invalid_reason_is_terminal(SupervisedFeedInvalidReason::DepthFeedGaveUp));
 }
@@ -213,6 +225,7 @@ TEST(SupervisedFeedValidityGate, EveryReasonHasADistinctName) {
         SupervisedFeedInvalidReason::DepthDisconnected,
         SupervisedFeedInvalidReason::KlineNotSynced,
         SupervisedFeedInvalidReason::DepthNotTracking,
+        SupervisedFeedInvalidReason::DepthStale,
     };
     for (std::size_t i = 0; i < std::size(all); ++i) {
         EXPECT_STRNE(supervised_feed_invalid_reason_name(all[i]), "?");
