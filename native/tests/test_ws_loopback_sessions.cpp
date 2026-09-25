@@ -21,6 +21,7 @@
 #include <hengyuan/public_feed_policy.hpp>
 #include <hengyuan/public_feed_supervisor.hpp>
 
+#include "test_helpers/ws_client_rig.hpp"
 #include "test_helpers/ws_loopback_server.hpp"
 
 #include <chrono>
@@ -33,25 +34,10 @@
 
 namespace {
 
+using hy::test_helpers::fixture_path;
+using hy::test_helpers::steady_ms;
+using hy::test_helpers::wait_until;
 using hy::test_helpers::WsLoopbackServer;
-
-std::string fixture_path(const char* filename) {
-    return std::string(HY_TEST_FIXTURE_DIR) + "/" + filename;
-}
-
-bool wait_until(const std::function<bool()>& pred, int timeout_ms = 5000) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (!pred()) {
-        if (std::chrono::steady_clock::now() > deadline) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return true;
-}
-
-std::int64_t steady_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
 
 std::unique_ptr<WsLoopbackServer> make_server(WsLoopbackServer::UpgradeBehavior behavior =
                                                   WsLoopbackServer::UpgradeBehavior::Answer) {
@@ -59,36 +45,19 @@ std::unique_ptr<WsLoopbackServer> make_server(WsLoopbackServer::UpgradeBehavior 
                                               fixture_path("test_leaf_key_loopback.pem"), behavior);
 }
 
-// A TLS context that trusts the loopback certificate, and the harness-shaped I/O thread: one thread,
-// kept alive by a work guard so that sessions created LATER (by a supervisor's poll()) still run.
-//
-// Declare the ring and parser a session points at BEFORE the rig: the rig is then destroyed first, and its
-// destructor joins the I/O thread, so nothing can still be pushing into a ring that is being torn down.
-struct ClientRig {
-    ClientRig()
-        : ssl_ctx(boost::asio::ssl::context::tlsv12_client), guard(boost::asio::make_work_guard(ioc)) {
-        hy::configure_binance_ssl_context(ssl_ctx);
-        ssl_ctx.load_verify_file(fixture_path("test_leaf_cert_loopback.pem"));
-        io_thread = std::thread([this] { ioc.run(); });
-    }
-    ~ClientRig() {
-        // Every test stops and waits out its sessions, so nothing is pending on the normal path. On a
-        // failed ASSERT the test returns early and a session may still be connected with a read pending:
-        // waiting for run() to drain would then hang the whole binary instead of failing the test. stop()
-        // makes run() return at once; the leftover handlers (and the sessions they keep alive) are
-        // destroyed with the io_context, after the thread has been joined.
-        guard.reset();
-        ioc.stop();
-        if (io_thread.joinable()) io_thread.join();
-    }
-    ClientRig(const ClientRig&) = delete;
-    ClientRig& operator=(const ClientRig&) = delete;
+// The server counts an upgrade when ITS accept completes, and the client's handshake can overtake that: a
+// client that has read the 101 is "connected" before the server thread has run its completion handler (a
+// slow run -- ASan -- showed exactly that). So a test that asserts on upgrades() right after the client
+// reports connected must first wait for the server's own view. targets() needs no such wait: the target is
+// recorded before the 101 is even sent.
+bool server_counted_upgrades(const WsLoopbackServer& server, std::uint32_t at_least) {
+    return wait_until([&] { return server.upgrades() >= at_least; });
+}
 
-    boost::asio::io_context ioc;
-    boost::asio::ssl::context ssl_ctx;
-    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> guard;
-    std::thread io_thread;  // last: starts only once everything above is constructed
-};
+// The shared harness-shaped client I/O setup (ws_client_rig.hpp). Declare the ring and parser a session
+// points at BEFORE the rig: the rig is then destroyed first, and its destructor joins the I/O thread, so
+// nothing can still be pushing into a ring that is being torn down.
+using ClientRig = hy::test_helpers::WsClientRig;
 
 std::string kline_body(bool closed, std::int64_t open_time_ms, std::int64_t close_time_ms) {
     return R"({"e":"kline","E":123456789,"s":"BTCUSDT","k":{)"
@@ -141,6 +110,7 @@ TEST(WsLoopbackDepthSession, ReportsConnectedOnlyAfterTheHandshakeAndDeliversPar
     EXPECT_FALSE(session->stopped());
     ASSERT_EQ(server->targets().size(), 1U);
     EXPECT_EQ(server->targets()[0], "/ws/btcusdt@depth@100ms");
+    EXPECT_TRUE(server_counted_upgrades(*server, 1U));
     EXPECT_EQ(server->upgrades(), 1U);
 
     server->send_text(kDepthUpdate);
@@ -334,6 +304,7 @@ TEST(WsLoopbackSupervisor, AReconnectedRealSessionResumesDeliveringBars) {
     ASSERT_TRUE(poll_until([&] { return sup.generation() == 2U && sup.healthy(); }))
         << "state=" << hy::feed_state_name(sup.state()) << " generation=" << sup.generation();
     EXPECT_EQ(sup.stats().total_failures, 1U);
+    EXPECT_TRUE(server_counted_upgrades(*server, 2U));
     EXPECT_EQ(server->upgrades(), 2U) << "the second generation must be a fresh, real connection";
 
     server->send_text(kline_body(true, 60'000, 119'999));
@@ -368,6 +339,7 @@ TEST(WsLoopbackSupervisor, APlannedRolloverReplacesAHealthyRealSessionWithoutCou
         << "state=" << hy::feed_state_name(sup.state()) << " rollovers=" << sup.stats().rollovers
         << " upgrades=" << server->upgrades();
     EXPECT_EQ(sup.stats().total_failures, 0U);
+    EXPECT_TRUE(server_counted_upgrades(*server, 3U));
     EXPECT_GE(server->upgrades(), 3U) << "every rollover is a genuinely new connection";
     EXPECT_GE(sup.generation(), 3U);
 
