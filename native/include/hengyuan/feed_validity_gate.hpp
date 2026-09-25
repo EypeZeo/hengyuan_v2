@@ -112,6 +112,8 @@ struct SupervisedFeedInputs {
                                    // can still be NeedsBackfill (a gap was just detected, or the
                                    // initial backfill after startup hasn't landed yet)
     bool depth_tracking{false};   // DepthManager::state() == DepthState::Tracking
+    bool depth_stale{false};      // DepthFeedDriver::stale(): connected, but no depth event was accepted for
+                                   // stale_after_ms -- the book is frozen, and the session is being restarted
 };
 
 enum class SupervisedFeedInvalidReason : std::uint8_t {
@@ -122,18 +124,21 @@ enum class SupervisedFeedInvalidReason : std::uint8_t {
     DepthDisconnected = 4,
     KlineNotSynced = 5,   // session connected, but the consumer-side sync is not live yet
     DepthNotTracking = 6, // session connected, but DepthManager has not (yet) reached Tracking
+    DepthStale = 7,       // connected and (if it were Tracking) fine on paper, but the data stopped -- transient
 };
 
 // Priority order, kline before depth throughout (matching evaluate_feed_validity's own kline-first
 // convention above): a Terminal supervisor outranks a merely-reconnecting one, which outranks a
 // connected-but-not-yet-synced one -- the same "how bad is it" ordering as the unsupervised gate,
-// just restated in terms a reconnecting feed can actually be in.
+// just restated in terms a reconnecting feed can actually be in. A stale depth book ranks above "not
+// tracking": staleness resets the manager to Buffering, and the reason worth logging is the cause.
 inline constexpr SupervisedFeedInvalidReason evaluate_supervised_feed_validity(const SupervisedFeedInputs& in) noexcept {
     if (in.kline_feed_state == FeedState::Terminal) return SupervisedFeedInvalidReason::KlineFeedGaveUp;
     if (in.depth_feed_state == FeedState::Terminal) return SupervisedFeedInvalidReason::DepthFeedGaveUp;
     if (in.kline_feed_state != FeedState::Connected) return SupervisedFeedInvalidReason::KlineDisconnected;
     if (in.depth_feed_state != FeedState::Connected) return SupervisedFeedInvalidReason::DepthDisconnected;
     if (!in.kline_sync_live) return SupervisedFeedInvalidReason::KlineNotSynced;
+    if (in.depth_stale) return SupervisedFeedInvalidReason::DepthStale;
     if (!in.depth_tracking) return SupervisedFeedInvalidReason::DepthNotTracking;
     return SupervisedFeedInvalidReason::None;
 }
@@ -156,6 +161,7 @@ inline constexpr const char* supervised_feed_invalid_reason_name(SupervisedFeedI
         case SupervisedFeedInvalidReason::DepthDisconnected: return "DepthDisconnected";
         case SupervisedFeedInvalidReason::KlineNotSynced: return "KlineNotSynced";
         case SupervisedFeedInvalidReason::DepthNotTracking: return "DepthNotTracking";
+        case SupervisedFeedInvalidReason::DepthStale: return "DepthStale";
     }
     return "?";
 }

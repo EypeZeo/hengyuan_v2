@@ -46,12 +46,15 @@
 //   ./live_submit_preflight_harness <spec_toml_path> [duration_seconds=60] [interval=1h]
 // Symbol is fixed to BTCUSDT/btcusdt throughout, matching H6's own single-symbol scope.
 //
-// NOT covered here, deliberately (each is its own batch): data-level staleness (a connection that
-// stays up -- Binance's pings keep the sessions' 90 s idle timeout satisfied -- while the depth or
-// kline DATA stops changing is not noticed: only a closed connection is); the durable startup
-// recovery and the target-position planner (this file still probes on HoldingStateTracker
-// transitions); operator confirmation. An AI session compiles this file but never runs it with real
-// credentials.
+// Data-level staleness is the pipeline's too: Binance's pings keep the sessions' 90 s idle timeout
+// satisfied, so a connection can stay up while the DATA stops -- a depth feed with no accepted event
+// for stale_after_ms resets the book and replaces its connection, and a kline whose next bar is
+// overdue on the exchange clock is repaired from REST (and its connection replaced if it was up when
+// the bar was due).
+//
+// NOT covered here, deliberately (each is its own batch): the durable startup recovery and the
+// target-position planner (this file still probes on HoldingStateTracker transitions); operator
+// confirmation. An AI session compiles this file but never runs it with real credentials.
 
 #include <hengyuan/binance_clock_sync.hpp>
 #include <hengyuan/binance_klines_rest.hpp>
@@ -669,6 +672,10 @@ int main(int argc, char* argv[]) {
         if (feed.kline.gap_detected) {
             std::printf("Kline gap detected -- waiting for a backfill\n");
         }
+        if (feed.kline.bar_overdue) {
+            std::printf("Kline bar overdue -- backfilling from REST (connection replaced: %s)\n",
+                        feed.kline.overdue_session_restarted ? "yes" : "no");
+        }
         if (feed.kline.backfill_collected) {
             std::printf("Kline backfill: fetch=%s applied=%s bars=%zu warmup_complete=%s\n",
                         feed.kline.backfill_fetch_ok ? "ok" : "FAILED",
@@ -677,6 +684,9 @@ int main(int argc, char* argv[]) {
         }
         if (feed.depth.generation_reset) {
             std::printf("Depth: new connection -- book reset, rebuilding from a snapshot\n");
+        }
+        if (feed.depth.stale_restart) {
+            std::printf("Depth feed stale -- no depth event accepted for a while; book reset, connection replaced\n");
         }
         if (feed.depth.snapshot_applied) {
             std::printf("Depth snapshot: sync=%s\n", feed.depth.snapshot_apply_ok ? "OK" : "RESYNC_NEEDED");
@@ -737,18 +747,19 @@ int main(int argc, char* argv[]) {
     const KlineFeedDriverStats& kline_drv = pipeline->kline_driver_stats();
     std::printf("Kline feed: sessions=%" PRIu64 " failures=%" PRIu64 " rollovers=%" PRIu64
                 " | backfills applied=%" PRIu64 " fetch_failed=%" PRIu64 " rejected=%" PRIu64
-                " | resumes=%" PRIu64 "\n",
+                " | resumes=%" PRIu64 " | overdue bars=%" PRIu64 " (connections replaced=%" PRIu64 ")\n",
                 kline_sup.generation, kline_sup.total_failures, kline_sup.rollovers,
                 kline_drv.backfills_applied, kline_drv.backfill_fetch_failures,
-                kline_drv.backfills_rejected, kline_drv.resumes_posted);
+                kline_drv.backfills_rejected, kline_drv.resumes_posted, kline_drv.overdue_invalidations,
+                kline_drv.overdue_session_restarts);
     const FeedSupervisorStats depth_sup = pipeline->depth_supervisor_stats();
     const DepthFeedDriverStats& depth_drv = pipeline->depth_driver_stats();
     std::printf("Depth feed: sessions=%" PRIu64 " failures=%" PRIu64 " rollovers=%" PRIu64
                 " | generation_resets=%" PRIu64 " resyncs=%" PRIu64 " snapshots applied=%" PRIu64
-                " rejected=%" PRIu64 "\n",
+                " rejected=%" PRIu64 " | stale restarts=%" PRIu64 "\n",
                 depth_sup.generation, depth_sup.total_failures, depth_sup.rollovers,
                 depth_drv.generation_resets, depth_drv.resyncs_requested, depth_drv.snapshots_applied,
-                depth_drv.snapshots_rejected);
+                depth_drv.snapshots_rejected, depth_drv.stale_restarts);
     // The kline session of the last generation, if there is one (its counters are that connection's
     // own; the io thread is joined, so reading them is safe).
     if (const auto kline_session = pipeline->kline_session()) {

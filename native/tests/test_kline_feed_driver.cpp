@@ -329,6 +329,12 @@ struct Rig {
         return driver.tick(now_ms, [this](const KlineWsEvent& b, double target) { delivered.push_back({b, target}); });
     }
 
+    // With the exchange clock (epoch ms), which is what overdue-bar detection needs.
+    KlineFeedTickReport tick(std::int64_t now_ms, std::int64_t epoch_now_ms) {
+        return driver.tick(
+            now_ms, [this](const KlineWsEvent& b, double target) { delivered.push_back({b, target}); }, epoch_now_ms);
+    }
+
     // Ticks (at a frozen synthetic time) until the gate delivers an outcome; returns THAT tick's report.
     KlineFeedTickReport tick_until_collected(std::int64_t now_ms) {
         KlineFeedTickReport report;
@@ -684,4 +690,162 @@ TEST(KlineFeedDriver, WithoutACurrentSessionThereIsNothingToResumeAndRecoverySti
     EXPECT_FALSE(r.session_suspended);
     EXPECT_FALSE(r.resume_posted);
     EXPECT_TRUE(r.backfill_started);
+}
+
+// --- overdue bar (6b-0f-9) ---------------------------------------------------------------------------------
+//
+// A silent stream that still looks connected: the WS idle timeout is satisfied by Binance's pings, and the
+// consumer-side gap check only fires when a LATER bar arrives. The driver judges the next bar overdue from
+// the exchange clock, repairs it with the ordinary REST backfill, and restarts the session only if that
+// session was already up when the bar was due.
+
+namespace {
+
+KlineFeedDriverConfig overdue_cfg(std::int64_t span_ms = kHour, std::int64_t grace_ms = 30'000) {
+    KlineFeedDriverConfig c;
+    c.interval_span_ms = span_ms;
+    c.overdue_grace_ms = grace_ms;
+    return c;
+}
+
+// go_live() leaves the sync Live at bar 59, whose close_time is 60 * kHour - 1: the next bar closes one hour on.
+constexpr std::int64_t kNextDue = 61 * kHour - 1;
+
+// The rig's supervisor was polled once (Connecting); a second poll observes the fake session connected.
+void connect(Rig& rig, std::int64_t at_ms) {
+    rig.supervisor.poll(at_ms);
+    ASSERT_EQ(rig.supervisor.state(), hy::FeedState::Connected);
+}
+
+}  // namespace
+
+TEST(KlineFeedDriverOverdue, ABarThatArrivesWithinItsGraceIsNeverOverdue) {
+    Rig rig(overdue_cfg());
+    go_live(rig);
+    ASSERT_NO_FATAL_FAILURE(connect(rig, 0));
+
+    const auto at_grace = rig.tick(1'000'000, kNextDue + 30'000);  // exactly the grace: not yet
+    EXPECT_FALSE(at_grace.bar_overdue);
+    EXPECT_TRUE(rig.sync.live());
+
+    // The bar arrives after the grace has passed but before the driver has drained it: draining comes first,
+    // so a bar that is sitting in the ring is never mistaken for a missing one.
+    rig.push_bars(60, 1);
+    const auto r = rig.tick(1'000'001, kNextDue + 31'000);
+    EXPECT_EQ(r.bars_stepped, 1U);
+    EXPECT_FALSE(r.bar_overdue);
+    EXPECT_TRUE(rig.sync.live());
+    EXPECT_EQ(rig.driver.stats().overdue_invalidations, 0U);
+}
+
+TEST(KlineFeedDriverOverdue, ASilentFeedIsInvalidatedAndTheOrdinaryBackfillRepairsIt) {
+    Rig rig(overdue_cfg());
+    go_live(rig);
+    ASSERT_NO_FATAL_FAILURE(connect(rig, 0));
+    ASSERT_EQ(rig.gate.stats().fetches_started, 1U) << "only the initial backfill so far";
+
+    const auto r = rig.tick(5'000, kNextDue + 30'001);
+    EXPECT_TRUE(r.bar_overdue);
+    EXPECT_FALSE(rig.sync.live()) << "the evaluator state can no longer be trusted to be current";
+    EXPECT_EQ(rig.sync.last_invalid_reason(), hy::KlineSyncInvalidReason::BarOverdue);
+    EXPECT_EQ(rig.driver.stats().overdue_invalidations, 1U);
+    EXPECT_EQ(rig.sync.stats().overdue_invalidations, 1U);
+
+    // The backfill starts on the next tick and needs nothing from the websocket: REST hands back the bar the
+    // stream never delivered (61 closed bars now: 0..60).
+    const auto next = rig.tick(5'001, kNextDue + 30'050);
+    EXPECT_TRUE(next.backfill_started);
+    ASSERT_TRUE(wait_until([&] { return rig.controlled.calls.load() == 2; }));
+    const auto done = rig.complete_fetch(good(0, 61), 5'002);
+    EXPECT_TRUE(done.backfill_applied);
+    EXPECT_TRUE(rig.sync.live());
+    EXPECT_EQ(rig.sync.last_close_time_ms(), 61 * kHour - 1);
+
+    // The baseline moved on by an hour: the same clock is no longer overdue.
+    EXPECT_FALSE(rig.tick(5'003, kNextDue + 30'100).bar_overdue);
+}
+
+TEST(KlineFeedDriverOverdue, TheSessionIsRestartedWhenItWasUpWhenTheBarWasDue) {
+    Rig rig(overdue_cfg());
+    go_live(rig);
+    ASSERT_NO_FATAL_FAILURE(connect(rig, 0));
+
+    // Two hours into a connection that has never dropped, the bar is 31 s overdue: the connection is the suspect.
+    const auto r = rig.tick(2 * kHour, kNextDue + 31'000);
+    EXPECT_TRUE(r.bar_overdue);
+    EXPECT_TRUE(r.overdue_session_restarted);
+    EXPECT_TRUE(rig.session().stopped_flag.load());
+    EXPECT_EQ(rig.driver.stats().overdue_session_restarts, 1U);
+}
+
+TEST(KlineFeedDriverOverdue, ASessionThatConnectedAfterTheBarWasDueIsNotBlamedForIt) {
+    Rig rig(overdue_cfg());
+    go_live(rig);
+    constexpr std::int64_t kConnectedAt = 1'000'000;
+    ASSERT_NO_FATAL_FAILURE(connect(rig, kConnectedAt));
+
+    // The bar is 31 s overdue, but this connection is only 5 s old: it connected after the bar closed (it was
+    // down when it was due), so the missing bar is not its doing -- the backfill alone repairs it.
+    const auto r = rig.tick(kConnectedAt + 5'000, kNextDue + 31'000);
+    EXPECT_TRUE(r.bar_overdue);
+    EXPECT_FALSE(r.overdue_session_restarted);
+    EXPECT_FALSE(rig.session().stopped_flag.load());
+    EXPECT_EQ(rig.driver.stats().overdue_session_restarts, 0U);
+}
+
+TEST(KlineFeedDriverOverdue, AConnectionExactlyAsOldAsTheLatenessWasUpWhenTheBarWasDue) {
+    Rig rig(overdue_cfg());
+    go_live(rig);
+    constexpr std::int64_t kConnectedAt = 1'000'000;
+    ASSERT_NO_FATAL_FAILURE(connect(rig, kConnectedAt));
+
+    const auto r = rig.tick(kConnectedAt + 31'000, kNextDue + 31'000);  // age == how long the bar has been due
+    EXPECT_TRUE(r.overdue_session_restarted);
+}
+
+TEST(KlineFeedDriverOverdue, ANotYetConnectedSessionIsInvalidatedForButNeverStopped) {
+    Rig rig(overdue_cfg());
+    go_live(rig);  // the supervisor is still Connecting: nobody polled it a second time
+
+    const auto r = rig.tick(2 * kHour, kNextDue + 31'000);
+    EXPECT_TRUE(r.bar_overdue) << "the REST backfill does not depend on the websocket";
+    EXPECT_FALSE(r.overdue_session_restarted);
+    EXPECT_FALSE(rig.session().stopped_flag.load()) << "the supervisor's own connect deadline governs a connecting session";
+}
+
+TEST(KlineFeedDriverOverdue, WithoutTheExchangeClockNothingIsJudged) {
+    Rig rig(overdue_cfg());
+    go_live(rig);
+    ASSERT_NO_FATAL_FAILURE(connect(rig, 0));
+
+    // An unavailable clock (0) must never be read as "the bar is hopelessly late" and kill a healthy connection.
+    const auto r = rig.tick(100 * kHour, 0);
+    EXPECT_FALSE(r.bar_overdue);
+    EXPECT_TRUE(rig.sync.live());
+    EXPECT_FALSE(rig.session().stopped_flag.load());
+    EXPECT_FALSE(rig.tick(100 * kHour + 1).bar_overdue) << "the overload without a clock behaves the same";
+}
+
+TEST(KlineFeedDriverOverdue, AZeroSpanOrAZeroGraceSwitchesTheDetectionOff) {
+    {
+        Rig rig(overdue_cfg(/*span*/ 0));  // "1M": the span varies with the calendar month
+        go_live(rig);
+        ASSERT_NO_FATAL_FAILURE(connect(rig, 0));
+        EXPECT_FALSE(rig.tick(2 * kHour, kNextDue + 365LL * 24 * kHour).bar_overdue);
+    }
+    {
+        Rig rig(overdue_cfg(kHour, /*grace*/ 0));
+        go_live(rig);
+        ASSERT_NO_FATAL_FAILURE(connect(rig, 0));
+        EXPECT_FALSE(rig.tick(2 * kHour, kNextDue + 365LL * 24 * kHour).bar_overdue);
+    }
+}
+
+TEST(KlineFeedDriverOverdue, NothingIsJudgedWhileTheSyncIsNotLive) {
+    Rig rig(overdue_cfg());
+    (void)rig.tick(0);  // NeedsBackfill: the initial fetch is out, nothing to be overdue against
+    ASSERT_FALSE(rig.sync.live());
+    const auto r = rig.tick(1000, 1'000'000 * kHour);
+    EXPECT_FALSE(r.bar_overdue);
+    EXPECT_EQ(rig.driver.stats().overdue_invalidations, 0U);
 }

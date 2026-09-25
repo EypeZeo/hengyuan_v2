@@ -9,10 +9,10 @@
 // exercised against real sessions (test_public_feed_pipeline.cpp) and the harness shrinks to a caller.
 //
 // WHAT IT DOES per tick(): polls the kline supervisor, ticks the kline driver (session watch -> backfill
-// recovery -> drain live bars into the evaluator), ticks the depth driver (which polls its own supervisor:
-// reset on a new generation -> validate + drain depth events -> snapshot), and reports the resulting
-// SupervisedFeedInputs and its verdict (evaluate_supervised_feed_validity). "Feed valid" therefore means
-// what feed_validity_gate.hpp says it means, evaluated over the real objects.
+// recovery -> drain live bars into the evaluator -> overdue-bar check), ticks the depth driver (which polls its
+// own supervisor: reset on a new generation -> validate + drain depth events -> staleness -> snapshot), and
+// reports the resulting SupervisedFeedInputs and its verdict (evaluate_supervised_feed_validity). "Feed
+// valid" therefore means what feed_validity_gate.hpp says it means, evaluated over the real objects.
 //
 // WHAT IT DELIBERATELY DOES NOT OWN:
 //   * the io_context, the TLS context and the thread that runs the io_context (the harness also runs the
@@ -23,7 +23,8 @@
 //   * how a klines backfill or a depth snapshot is FETCHED. Both are injected: they run on the gates'
 //     worker threads, so they must not throw and may read only thread-safe state (a ClockOffsetPublisher
 //     snapshot, an immutable config copy). The production fetchers live with the harness; tests script them.
-//   * the clock the kline rollover window is judged against (epoch ms, hot thread only).
+//   * the clock the kline rollover window and the overdue-bar check are judged against (the EXCHANGE-corrected
+//     epoch ms, hot thread only; 0 = unavailable, and then neither acts).
 //
 // LIFETIME CONTRACT -- read before destroying one. The sessions hold references into this object (the
 // rings and parsers) and outlive a supervisor's shutdown() (their own pending handlers keep them alive
@@ -186,9 +187,10 @@ public:
     PublicFeedTickReport tick(std::int64_t now_ms, OnBar&& on_bar) {
         PublicFeedTickReport report;
         // The kline driver watches the supervisor's current session but does not poll it (the caller
-        // does); the depth driver polls its own supervisor as part of its tick.
+        // does); the depth driver polls its own supervisor as part of its tick. The kline driver also
+        // gets the exchange clock, to notice a next bar that is overdue (0 = unavailable: it judges nothing).
         kline_sup_.poll(now_ms);
-        report.kline = kline_driver_.tick(now_ms, on_bar);
+        report.kline = kline_driver_.tick(now_ms, on_bar, epoch_now_ms_());
         report.depth = depth_driver_.tick(now_ms);
         report.inputs = supervised_inputs();
         report.validity = evaluate_supervised_feed_validity(report.inputs);
@@ -202,6 +204,7 @@ public:
         in.depth_feed_state = depth_sup_.state();
         in.kline_sync_live = kline_sync_.live();
         in.depth_tracking = depth_mgr_->state() == DepthState::Tracking;
+        in.depth_stale = depth_driver_.stale();
         return in;
     }
 
@@ -231,6 +234,14 @@ private:
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         }
         return s;
+    }
+
+    // The driver's overdue detection needs the interval's span, which the pipeline already knows. A span the
+    // caller set explicitly is kept; a zero is filled in from the interval (the detection is switched off with
+    // overdue_grace_ms = 0, and is off by itself for "1M", whose span is 0).
+    static KlineFeedDriverConfig with_interval_span(KlineFeedDriverConfig c, std::int64_t span_ms) {
+        if (c.interval_span_ms == 0) c.interval_span_ms = span_ms;
+        return c;
     }
 
     static KlineWsSessionConfig make_kline_ws_config(const PublicFeedPipelineConfig& c) {
@@ -280,7 +291,7 @@ private:
               })
         , kline_driver_(kline_sync_, *kline_gate_, kline_sup_, kline_ring_,
                         KlinesBackfillRequest{config_.symbol, config_.interval, 0, config_.symbol_id},
-                        config_.kline_driver)
+                        with_interval_span(config_.kline_driver, interval_span_ms_))
         , depth_ring_(std::make_unique<DepthRing>())
         , depth_mgr_(std::make_unique<DepthManager>())
         , snapshot_gate_(std::make_unique<SnapshotRefreshGate>(std::move(snapshot_fetcher)))

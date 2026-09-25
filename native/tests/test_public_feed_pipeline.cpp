@@ -245,6 +245,10 @@ hy::PublicFeedPipelineConfig make_config(unsigned short port) {
     c.qty_multiplier = 100'000'000;
     c.kline_policy = fast_policy();
     c.depth_policy = fast_policy();
+    // Overdue-bar detection is judged against the exchange clock, and these tests' bars are dated 1970 while
+    // the default epoch clock below is the real one: off unless a test supplies a consistent clock and turns
+    // it on (see the overdue test at the end).
+    c.kline_driver.overdue_grace_ms = 0;
     return c;
 }
 
@@ -264,6 +268,9 @@ struct Seen {
     bool depth_disconnected{false};
     bool kline_not_synced{false};
     bool depth_not_tracking{false};
+    bool depth_stale{false};
+    bool bar_overdue{false};
+    bool overdue_restarted{false};
     bool ever_valid{false};
 };
 
@@ -345,11 +352,14 @@ struct Rig {
         if (r.kline.resume_posted) seen.resume_posted = true;
         if (r.kline.gap_detected) seen.consumer_gap = true;
         if (r.kline.backfill_applied) ++seen.backfills_applied;
+        if (r.kline.bar_overdue) seen.bar_overdue = true;
+        if (r.kline.overdue_session_restarted) seen.overdue_restarted = true;
         switch (r.validity) {
             case Invalid::KlineDisconnected: seen.kline_disconnected = true; break;
             case Invalid::DepthDisconnected: seen.depth_disconnected = true; break;
             case Invalid::KlineNotSynced: seen.kline_not_synced = true; break;
             case Invalid::DepthNotTracking: seen.depth_not_tracking = true; break;
+            case Invalid::DepthStale: seen.depth_stale = true; break;
             default: break;
         }
     }
@@ -775,4 +785,106 @@ TEST(PublicFeedPipeline, ShutdownEndsBothFeedsAndIsIdempotent) {
     EXPECT_TRUE(rep.terminal());
     EXPECT_EQ(r.pipeline->kline_supervisor_stats().terminal_reason, hy::FeedTerminalReason::Shutdown);
     EXPECT_EQ(r.pipeline->depth_supervisor_stats().terminal_reason, hy::FeedTerminalReason::Shutdown);
+}
+
+// --- data-level staleness (6b-0f-9) ------------------------------------------------------------------------
+//
+// The websocket idle timeout is satisfied by Binance's pings, so a feed whose DATA stopped looks connected.
+// Both sessions here are real; the "silence" is the loopback server simply not sending.
+
+TEST(PublicFeedPipeline, ADepthFeedThatStopsDeliveringIsRestartedAndTheBookRebuilt) {
+    Rig r([](hy::PublicFeedPipelineConfig& c) { c.depth_driver.stale_after_ms = 1000; });
+    ASSERT_NE(r.pipeline, nullptr);
+    ASSERT_NO_FATAL_FAILURE(bring_up(r));
+
+    // Generation 1 delivers once; then the connection stays up and nothing more arrives.
+    r.server->send_text(depth_json(101, 101), kDepthTarget);
+    ASSERT_TRUE(wait_until([&] {
+        (void)r.tick();
+        return r.pipeline->depth_driver_stats().events_applied >= 2;
+    }));
+    EXPECT_FALSE(r.seen.depth_stale);
+
+    ASSERT_TRUE(r.tick_until([&](const Report&) { return r.seen.depth_stale; })) << "a frozen book must be reported";
+    EXPECT_GE(r.pipeline->depth_driver_stats().stale_restarts, 1U);
+    EXPECT_FALSE(r.seen.kline_disconnected) << "the kline connection was never touched";
+
+    ASSERT_TRUE(r.tick_until([&](const Report& rep) { return rep.feed_valid() && r.exchange.snapshot_fetches.load() >= 2; }))
+        << "restart + a fresh snapshot: the feed is valid again";
+    EXPECT_GE(r.pipeline->depth_supervisor_stats().generation, 2U);
+    EXPECT_GE(r.pipeline->depth_supervisor_stats().total_failures, 1U) << "a stale restart is a failure, not a rollover";
+    EXPECT_EQ(r.pipeline->depth_supervisor_stats().rollovers, 0U);
+    EXPECT_EQ(r.pipeline->kline_supervisor_stats().generation, 1U);
+
+    // And the new connection really delivers.
+    const std::uint64_t applied_before = r.pipeline->depth_driver_stats().events_applied;
+    r.server->send_text(depth_json(101, 101), kDepthTarget);
+    ASSERT_TRUE(wait_until([&] {
+        (void)r.tick();
+        return r.pipeline->depth_driver_stats().events_applied >= applied_before + 2;
+    }));
+}
+
+// Binance testnet is reset from time to time and update ids then restart low. A new generation must forget
+// the old sequence, or the validator rejects the whole new connection as a rollback and the book freezes.
+TEST(PublicFeedPipeline, AnExchangeSideResetToLowUpdateIdsIsAcceptedAfterAReconnect) {
+    Rig r([](hy::PublicFeedPipelineConfig& c) { c.depth_policy.initial_backoff_ms = 30; c.depth_policy.max_backoff_ms = 30; });
+    ASSERT_NE(r.pipeline, nullptr);
+    r.exchange.depth_last_update_id = 5000;
+    ASSERT_NO_FATAL_FAILURE(bring_up(r));
+
+    r.server->send_text(depth_json(5001, 5001), kDepthTarget);
+    ASSERT_TRUE(wait_until([&] {
+        (void)r.tick();
+        return r.pipeline->depth_driver_stats().events_applied >= 2;
+    }));
+    const std::uint64_t applied_before = r.pipeline->depth_driver_stats().events_applied;
+
+    r.exchange.depth_last_update_id = 40;  // the exchange came back reset
+    r.server->drop_all(kDepthTarget);
+    ASSERT_TRUE(r.tick_until([&](const Report&) { return r.pipeline->depth_driver_stats().generation_resets >= 2; }));
+    ASSERT_TRUE(r.tick_until([](const Report& rep) { return rep.feed_valid(); }));
+
+    r.server->send_text(depth_json(41, 41), kDepthTarget);
+    ASSERT_TRUE(wait_until([&] {
+        (void)r.tick();
+        return r.pipeline->depth_driver_stats().events_applied >= applied_before + 2;
+    })) << "the reset ids must not be rejected as a rollback";
+    EXPECT_EQ(r.pipeline->depth_driver_stats().events_rejected, 0U);
+}
+
+// The kline stream goes silent while staying connected: bar 60 closes and never arrives. Overdue detection
+// (judged on the exchange clock) repairs it from REST -- which needs nothing from the websocket -- and
+// replaces the connection, because it was up when the bar was due.
+TEST(PublicFeedPipeline, AKlineBarThatNeverArrivesIsRepairedByABackfillAndTheSilentConnectionIsReplaced) {
+    std::atomic<std::int64_t> epoch{60 * kHour + 1'000};  // shortly after bar 59 closed: nothing is due yet
+    Rig r([](hy::PublicFeedPipelineConfig& c) { c.kline_driver.overdue_grace_ms = 200; },
+          [&epoch] { return epoch.load(); });
+    ASSERT_NE(r.pipeline, nullptr);
+    ASSERT_NO_FATAL_FAILURE(bring_up(r));  // valid, last close = 60 * kHour - 1
+    r.tick_for(1200);  // the connection is now older than the lateness that comes next
+    EXPECT_FALSE(r.seen.bar_overdue) << "bar 60 is not due yet";
+    EXPECT_TRUE(r.last.feed_valid());
+
+    // Bar 60 closes -- the stream stays silent. REST has it.
+    r.exchange.closed_bars = 61;
+    epoch = 61 * kHour + 1'000;  // 1 s after it closed: past the 200 ms grace
+    ASSERT_TRUE(r.tick_until([&](const Report&) { return r.seen.bar_overdue; }));
+    EXPECT_TRUE(r.seen.overdue_restarted) << "the connection was up when the bar was due: it is the suspect";
+
+    ASSERT_TRUE(r.tick_until([](const Report& rep) { return rep.feed_valid(); }))
+        << "backfill + a fresh connection: valid again";
+    EXPECT_EQ(r.pipeline->kline_sync().last_close_time_ms(), 61 * kHour - 1)
+        << "REST supplied the bar the stream never delivered";
+    EXPECT_EQ(r.pipeline->kline_driver_stats().overdue_invalidations, 1U);
+    EXPECT_EQ(r.pipeline->kline_driver_stats().overdue_session_restarts, 1U);
+    EXPECT_EQ(r.pipeline->kline_supervisor_stats().generation, 2U);
+    EXPECT_EQ(r.pipeline->kline_supervisor_stats().total_failures, 1U);
+    EXPECT_EQ(r.pipeline->depth_supervisor_stats().generation, 1U) << "the depth feed was not touched";
+
+    // The new connection continues the sequence.
+    r.server->send_text(kline_json(61), kKlineTarget);
+    ASSERT_TRUE(r.tick_until([&](const Report&) { return !r.delivered.empty(); }));
+    EXPECT_EQ(r.delivered.back().bar.open_time_ms, 61 * kHour);
+    EXPECT_TRUE(r.last.feed_valid());
 }

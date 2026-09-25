@@ -240,3 +240,59 @@ TEST(InputValidatorClock, RealBackwardsJumpOnOneSymbolIsStillDetected) {
     EXPECT_EQ(v.validate(e), hy::ValidationResult::AcceptClockAnomaly);
     EXPECT_EQ(v.counters().clock_anomalies, 1u);
 }
+
+// --- reset_sequences(): a new feed generation's ids need not continue the previous one's ---
+//
+// An exchange-side reset (Binance testnet does this) restarts update ids from a low number. Without the
+// reset the validator would judge the whole new sequence against the old one and reject all of it as a
+// rollback -- the book frozen while everything upstream looks healthy.
+
+TEST(InputValidatorReset, ANewSequenceThatRestartsLowIsAcceptedAfterTheReset) {
+    InputValidator v;
+    EXPECT_EQ(v.validate(make_event(5000, 67890, 100, 1700000000000, EventType::DepthDelta)), ValidationResult::Accept);
+    EXPECT_EQ(v.validate(make_event(40, 67890, 100, 1700000000100, EventType::DepthDelta)),
+              ValidationResult::RejectSeqRollback)
+        << "without a reset the restarted sequence is a rollback";
+
+    v.reset_sequences();
+    EXPECT_EQ(v.validate(make_event(40, 67890, 100, 1700000000200, EventType::DepthDelta)), ValidationResult::Accept);
+    EXPECT_EQ(v.validate(make_event(39, 67890, 100, 1700000000300, EventType::DepthDelta)),
+              ValidationResult::RejectSeqRollback)
+        << "the NEW sequence is judged from its own first event on";
+}
+
+TEST(InputValidatorReset, EverySymbolAndEventTypeIsForgotten) {
+    InputValidator v;
+    for (std::uint32_t sym : {0U, 1U, 63U}) {
+        EXPECT_EQ(v.validate(make_event(1000, 100, 1, 1700000000000, EventType::Trade, sym)), ValidationResult::Accept);
+        EXPECT_EQ(v.validate(make_event(1000, 100, 1, 1700000000000, EventType::DepthDelta, sym)),
+                  ValidationResult::Accept);
+    }
+    v.reset_sequences();
+    for (std::uint32_t sym : {0U, 1U, 63U}) {
+        // the same ids again: a duplicate (trade) or a rollback (lower) would be reported if anything were kept
+        EXPECT_EQ(v.validate(make_event(1000, 100, 1, 1700000000000, EventType::Trade, sym)), ValidationResult::Accept)
+            << "symbol " << sym;
+        EXPECT_EQ(v.validate(make_event(3, 100, 1, 1700000000000, EventType::DepthDelta, sym)),
+                  ValidationResult::Accept)
+            << "symbol " << sym;
+    }
+}
+
+TEST(InputValidatorReset, TheClockBaselineIsForgottenToo) {
+    InputValidator v;
+    EXPECT_EQ(v.validate(make_event(1, 100, 1, 1700000000000)), ValidationResult::Accept);
+    v.reset_sequences();
+    // 5 s "behind" the pre-reset event: a clock anomaly only if the old baseline survived
+    EXPECT_EQ(v.validate(make_event(2, 100, 1, 1700000000000 - 5000)), ValidationResult::Accept);
+    EXPECT_EQ(v.counters().clock_anomalies, 0u);
+}
+
+TEST(InputValidatorReset, TheCountersSurviveTheReset) {
+    InputValidator v;
+    EXPECT_EQ(v.validate(make_event(1, 100, 1, 1700000000000)), ValidationResult::Accept);
+    EXPECT_EQ(v.validate(make_event(1, 100, 1, 1700000000001)), ValidationResult::DropDuplicate);
+    v.reset_sequences();
+    EXPECT_EQ(v.counters().accepted, 1u);
+    EXPECT_EQ(v.counters().dropped_duplicate, 1u);
+}
