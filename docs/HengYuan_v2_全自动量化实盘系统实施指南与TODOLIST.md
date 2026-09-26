@@ -7,9 +7,9 @@
 | 元数据项 | 取值 |
 | :--- | :--- |
 | 文档版本 | **v2.6.1**（整合升级版；上一版 v2.6.0，冻结原文 v2.5.6） |
-| 最后代码同步哈希 | 远端主干 **`8d81fda`**（PR #108，6b-0b 代码已合入） |
-| 同步时间（本地快照） | 2026-09-25（以本地工作树、远端 PR 记录与 GitHub API 实测为准） |
-| 在制验证补录时间 | 2026-09-26（PR #108 合并后，follow-up 仅收尾 CI 与路线图） |
+| 最后代码同步哈希 | 远端主干 **`5aa4242`**（PR #110，6b-0b 代码与验证收尾均已合入） |
+| 同步时间（本地快照） | 2026-09-26（以本地工作树、远端 PR 记录与 GitHub API 实测为准） |
+| 在制验证补录时间 | 2026-09-26（PR #108/#110 合并后最终快照） |
 | 本地主干对照 | 本地 `master` = `3278180`（PR #92），落后远端主干 **15 个提交** |
 | 并行工作树 | 3 个 `git worktree`：`hengyuan_v2`（6b-0b）、`hengyuan_v2_6b0e`（6b-0e）、`hengyuan_v2_6c`（6c），基点均为 `f4ee620` |
 | 文档效力层级 | 本文件是**受控工程实施蓝图**；其代码状态断言受 `0.3` 节证据分级约束，其规划条目受各 Stage 章的门禁条件约束 |
@@ -19,8 +19,8 @@
 
 | 维度 | 状态 | 说明 |
 | :--- | :--- | :--- |
-| 主干代码演进 | **活跃** | `#70`–`#108` 已进入主干；当前 6b-0b follow-up 待合并 |
-| 自动化门禁 | **不可信** | 分支保护在当前私有仓库计划下不可配置；ASan+UBSan 周更作业连续三周未跑完；CodeQL 为短路空绿。详见 `2.2.3` |
+| 主干代码演进 | **活跃** | `#70`–`#110` 已进入主干；6b-0b 已完成，后续 6b-0e/6c 仍并行在制 |
+| 自动化门禁 | **不可信** | 分支保护在当前私有仓库计划下不可配置；CodeQL 仍为短路空绿；ASan+UBSan 已通过最新成功运行，但 required-check 能力仍不可配置。详见 `2.2.3` |
 | 现货实盘闭环 | **未验收** | 真实 POST 已合入但无可运行调用者；终态持久化缺失；私网流协议待迁移 |
 | 合约（USD-M / COIN-M） | **未开工** | 全部为设计目标 |
 | 数据与投研 | **未开工** | 无 L2 录制、无点时特征、无实验治理 |
@@ -280,7 +280,7 @@ graph LR
 
 基线事实如下：
 
-1. 远端主干 `origin/master` 指向 `8d81fda`，即 PR #108 的合并提交；该提交包含 6b-0b 代码，是当前唯一的代码真值基线。
+1. 远端主干 `origin/master` 指向 `5aa4242`，即 PR #110 的合并提交；该提交包含 6b-0b 代码、验证收尾与 ASan 门禁修复，是当前唯一的代码真值基线。
 2. 本地 `master` 指向 `3278180`（PR #92），落后远端主干恰好 15 个提交。**不得以本地 `master` 的源码或测试数量代表当前云端状态。**
 3. 仓库本地存在 3 个 `git worktree`：`hengyuan_v2`、`hengyuan_v2_6b0e`、`hengyuan_v2_6c`，基点均为 `f4ee620`。“工作树”与“分支”是不同概念——本地分支数量为数十个，其中大部分已合并或已废弃，不得以分支存在推断工作在进行。
 4. 6b-0b 代码 PR #108 已合并；当前 follow-up 分支仅收尾 ASan workflow 与路线图，6b-0e/6c 两个并行工作树仍无远端分支、无 PR。
@@ -290,7 +290,7 @@ graph LR
 
 #### 2.2.1 主干提交与 PR 区间
 
-已进入远端主干的 PR 区间为 **#70 至 #108**。按功能域归类如下：
+已进入远端主干的 PR 区间为 **#70 至 #110**。按功能域归类如下：
 
 | 功能域 | 合并内容 |
 | :--- | :--- |
@@ -301,19 +301,19 @@ graph LR
 | 网络与配置 | #81 可配置 REST 超时、#82 环境绑定新增 `ws_host()` 与 `ws_port()`、#84 复合 `SubmitPort` 将标的注册表接入门禁 1 |
 | 凭据与演示 | #85 冷启动 harness 接入真实 Testnet 凭据 |
 | 策略与行情 | #86 策略规范 TOML 解析与校验门、#87 流式算子与求值器、#88 跨语言一致性夹具、#89 公共 K 线 WS 会话、#90 K 线至求值器链路、#91 预检 harness、#92 满环失效门禁与行情有效性门、#95 至 #107 公共行情监督、回补、代次与有效性链 |
-| 证据与演练 | #108 6b-0b `VerifiedDryRunEvidence` 四路径真实演练与预检 harness 接线 |
+| 证据与演练 | #108 6b-0b `VerifiedDryRunEvidence` 四路径真实演练与预检 harness 接线；#110 验证收尾与 ASan 构建门禁修复 |
 | 工程与流程 | #73 依赖升级（`actions/setup-java` 主版本 5 至 6）、#74 CI 规格校验路径过滤器补齐头文件通配、#78 清除过时状态断言并固化 WSL2 回退规则 |
 
 #### 2.2.2 门禁通道的真实状态
 
-PR #108 及 follow-up 的远端验证已取得可定位终态：CI Native run `36229428754`、CI Spec Verification run `36229428777`、CI Native Sanitizers run `36229665532` 均 `completed/success`；后者的 ASan+UBSan、TSan/负控、ARM64 jobs 均成功。CodeQL 仍为空绿，CI Python 与本次原生切片无路径交集。
+PR #108 及最终 follow-up PR #110 的远端验证已取得可定位终态：最终 follow-up head `c7270bc` 的 CI Native run `36238442566`、CI Spec Verification run `36238444607`、CI Native Sanitizers run `36238447723` 均 `completed/success`；后者的 ASan+UBSan、TSan/负控、ARM64 jobs 均成功。最终主干 follow-up run `36242510677`（Spec）与 Main Merge Guard `36242510653` 也成功。CodeQL 仍为空绿，CI Python 与本次原生切片无路径交集。
 
 三条通道各自的真实状态：
 
 | 通道 | 触发器 | 当前真实状态 |
 | :--- | :--- | :--- |
 | CI Native | `push` 与 `pull_request` 到主干，路径过滤 `native/**` | 唯一作业运行于 `ubuntu-24.04`，GCC-14 Release 构建并执行全量 `ctest`。**不存在任何 MSVC 或 Windows 作业。** |
-| CI Native Sanitizers | 仅定时（每周一 03:00 UTC）与手动派发 | 三个作业：ASan+UBSan（当前上限 90 分钟并缓存构建树）、TSan 并发与两个负控（上限 25 分钟）、ARM64 Release 硬件弱内存裁决（上限 20 分钟）。run `36229665532` 三个作业均 `success`；ASan+UBSan 在 61 分钟完成构建与测试。 |
+| CI Native Sanitizers | 仅定时（每周一 03:00 UTC）与手动派发 | 三个作业：ASan+UBSan（当前上限 90 分钟并缓存构建树）、TSan 并发与两个负控（上限 25 分钟）、ARM64 Release 硬件弱内存裁决（上限 20 分钟）。最终 follow-up run `36238447723` 三个作业均 `success`；ASan+UBSan 在约 59 分钟完成构建与测试。 |
 | CodeQL | 仅定时与手动派发 | **空绿**：仓库为私有且未启用 GitHub Advanced Security，workflow 内所有实质步骤均以私有仓库条件短路，仅剩一条打印跳过原因的 shell；代码扫描 API 直接返回“未为此仓库启用代码扫描”。定时作业的 `success` 结论**不代表任何代码被分析**。 |
 
 CI Native Sanitizers 的触发策略是**有意**的：其文件头注释明确说明，在私有仓库每月 2000 分钟的 Actions 预算下，把完整 ASan 套件改为每次提交运行将消耗约三分之一的月预算。因此“把 Sanitizer 改为每次 PR 触发”不是免费的流程改动，而是预算与覆盖度的取舍，必须先解决时长问题。
@@ -352,7 +352,7 @@ CI Native Sanitizers 的触发策略是**有意**的：其文件头注释明确�
 
 | 工作树 | 分支 | 可见改动 | 状态判定 |
 | :--- | :--- | :--- | :--- |
-| `hengyuan_v2`（6b-0b follow-up） | `chore/batch6-0b-remote-validation` | PR #108 已将 6b-0b 代码合入主干；当前 follow-up 仅修改 Sanitizer 超时/缓存与路线图验证记录 | 代码已合入；本地变异/跨平台与远端 CI/ARM64 已有证据；路线图 B2 已完成，follow-up PR 仅用于善后 |
+| `hengyuan_v2`（6b-0b follow-up） | `docs/batch6-0b-postmerge-metadata` | PR #108/#110 已将 6b-0b 代码、ASan 门禁修复与验证记录合入主干；当前分支仅同步最终主干哈希与快照日期 | 6b-0b 已完成；后续 6b-0e/6c 仍独立推进 |
 | `hengyuan_v2_6b0e`（6b-0e） | `feat/batch6-6b0e-operator-gate` | 新增操作员确认门、操作员输入、输入读取三个头文件与阻塞输入流测试辅助件及两个测试；修改 Sanitizer workflow、`native/CMakeLists.txt` 与 WSL 验证脚本 | 实施中；尚未接入 harness |
 | `hengyuan_v2_6c`（6c） | `feat/batch6-6c-audit-export` | **仅有一个未跟踪头文件**；构建配置未改、无测试、无命令行入口 | 实施中；导出契约与互斥保证均未验证 |
 
@@ -365,7 +365,7 @@ CI Native Sanitizers 的触发策略是**有意**的：其文件头注释明确�
 
 | 风险 / 等级 | 当前证据 | 约束与处置 |
 | :--- | :--- | :--- |
-| **门禁绿标空转 / CRITICAL** | ① CodeQL 在私有仓库下仍被短路，空跑仍报成功；② 计划限制使必需检查不可配置；③ ASan+UBSan 原 45 分钟瓶颈已由 follow-up 调整为 90 分钟并缓存构建，run `36229665532` 已真实执行测试并成功 | CodeQL 与必需检查仍需 Owner 决策；本地与本切片适用 CI 结果可作为运行证据，但不等同于平台 required check |
+| **门禁绿标空转 / CRITICAL** | ① CodeQL 在私有仓库下仍被短路，空跑仍报成功；② 计划限制使必需检查不可配置；③ ASan+UBSan 原 45 分钟瓶颈已由 follow-up 调整为 90 分钟并缓存构建，最终 run `36238447723` 已真实执行测试并成功 | CodeQL 与必需检查仍需 Owner 决策；本地与本切片适用 CI 结果可作为运行证据，但不等同于平台 required check |
 | **Spot 私网协议失效 / CRITICAL** | 官方已宣布停用 REST 用户数据流端点；主干仍含旧 listenKey 创建与订阅路径，且刚为其增加主动续期调度器 | 私网流迁移须在对应验收前完成；不得以旧用例绿标替代新协议联调。已合入的续期调度器属将被退役的旧协议栈，迁移时须明确其退役方式 |
 | **终态真值不在持久日志 / CRITICAL** | 对账确认与升级两条终态记录在整个原生代码中只被构造一次，仅写入内存环形缓冲；用户数据流的排空函数存在同形缺口 | 终态持久化需先解决记录类型问题（复用审计事件类型或新增帧），再讨论确认顺序；恢复扫描因此看不到“已对账为成交或已撤销” |
 | **实盘状态真值断链 / CRITICAL** | 真实 POST 已合入，但终态持久化、并发熔断与新协议迁移均未关闭 | 实盘验收阻塞。任何超时、5xx 或截断响应均保持未知状态并按同一客户端订单号做权威查询，禁止盲重试 |
@@ -802,7 +802,7 @@ graph TD
 
 - [x] **子批次 NOW-01（6b-0b）四路径可验证演练证据** `[DONE: 2026-09-26]`
   - **实装位置**：`native/include/hengyuan/verified_dry_run_evidence.hpp:VerifiedDryRunEvidence::run_all` 与 `native/src/live_submit_preflight_harness.cpp:main`；演练在读取凭据及网络连接之前运行，真实编排门禁与临时持久审计日志参与判定，仅订单提交与对账查询端口使用脚本模拟。启动时钟为零的边界经 `drill_startup_now_ms` 修复，不再误判四路径均未运行。
-  - **验证（2026-09-26，含 G3 新测试的当前版本）**：MSVC 全量构建与 CTest 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 CTest 2033/2033（`CTEST_PARALLEL_LEVEL=8`，24.44 秒）；GCC-14 ASan+UBSan 定向 CTest 40/40；GCC `none` 新测试随机顺序 ×30 轮（每轮 40 项），ASan+UBSan 新测试随机顺序 ×10 轮（每轮 40 项），均通过且无 sanitizer 报告。无 `.env` 的预检进程四路径均输出 `PASSED`，之后在凭据加载处按预期退出，未进入网络阶段。最终 follow-up head `30b7c4c` 的远端 CI Native run `36233252654`、CI Spec Verification run `36233254780`、CI Native Sanitizers run `36233256459` 均为 `success`；Sanitizers 的 ASan+UBSan、TSan/负控、ARM64 hardware weak-memory 三个 job 均成功。
+  - **验证（2026-09-26，含 G3 新测试的当前版本）**：MSVC 全量构建与 CTest 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 CTest 2033/2033（`CTEST_PARALLEL_LEVEL=8`，24.44 秒）；GCC-14 ASan+UBSan 定向 CTest 40/40；GCC `none` 新测试随机顺序 ×30 轮（每轮 40 项），ASan+UBSan 新测试随机顺序 ×10 轮（每轮 40 项），均通过且无 sanitizer 报告。无 `.env` 的预检进程四路径均输出 `PASSED`，之后在凭据加载处按预期退出，未进入网络阶段。最终 follow-up head `c7270bc` 的远端 CI Native run `36238442566`、CI Spec Verification run `36238444607`、CI Native Sanitizers run `36238447723` 均为 `success`；Sanitizers 的 ASan+UBSan、TSan/负控、ARM64 hardware weak-memory 三个 job 均成功。
   - **变异复核（2026-09-26）**：当前版本完整 162 项变异已重跑，152 项被捕获、10 项存活、0 项编译失败；V11/V12 已改为可编译变异并各被 2 项绑定测试捕获。G3 已由 `VerifiedDrillHelpers.AConfiguredOrderBudgetExhaustsAndStopsTheRealOrchestrator` 捕获：删除限流配置会使第 73 笔订单错误放行；当前配置耗尽则为 `RateLimitExhausted`、零端口调用、零在途槽位。变异脚本最终 `identical=True`，头文件哈希恢复为 `7687b43a4236e273db216b58e9b445fe46146baf`，无 `MUTATION-CHECK` 残留。逐项日志与存活项处置见 `docs/archive/HengYuan_v2_6b0b_validation_2026-09-26.md`；10 项存活项仍为等价/防御性冗余，未被误记为捕获。
   - **其余 11 项存活变异的逐项处置**：O33/O34/O35 为现有 `latch()` 与 Gate 2 顺序下无法由合法 rig 构造另一终态的常量观察，判定谓词本身已以篡改观察值负控；G1/G2 与 `AuditRingSink` 默认 Available、`KillSwitch` 默认 Normal 同值；G12 在每条演练的 Gate 3 控制组内重新 seed 脚手架；G22 对本演练显式 `poll_once()` + `drain_reconcile_events()` 无影响，**只在本演练范围冗余**，不证明生产编排可删除该接线；V2/V13/V14/V16 均为私有链复位与 `ran_ok_` / `live_ready()` 双重检查之间的冗余变更，保留原实现的防御性检查。上述分类仅对该变异集与当前代码路径成立，不把测试幸存误记为成功捕获。
   - **完成证据**：PR #108 合并提交 `8d81fda`；合并前后本地与远端验证证据见 `docs/archive/HengYuan_v2_6b0b_validation_2026-09-26.md`。本批次的模拟订单执行不构成真实订单写入授权。
@@ -1105,7 +1105,7 @@ graph TD
 
 **2026-09-26 当前版本完整变异终态补验**：MSVC 全量 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 2033/2033；ASan+UBSan 定向 40/40；GCC `none` 随机顺序 30 轮与 ASan+UBSan 随机顺序 10 轮，均每轮 40 项通过；当前版本 162 项变异 152 捕获、10 存活、0 编译失败，原件恢复哈希一致。ARM64 与远端 CI 已取得成功终态，PR #108 合并证据见下一条。
 
-**2026-09-26 远端门禁终态补录**：PR #108 合并提交 `8d81fda` 及其后续验证提交均取得 CI Native、CI Spec Verification、CI Native Sanitizers 的成功结果；run `36229428754`、`36229428777`、`36229665532` 可定位，Sanitizers 的 ASan+UBSan、TSan/负控与 ARM64 job 均成功。
+**2026-09-26 远端门禁终态补录**：PR #108 合并提交 `8d81fda` 与最终 follow-up PR #110 均取得 CI Native、CI Spec Verification、CI Native Sanitizers 的成功结果；最终 follow-up run `36238442566`、`36238444607`、`36238447723` 可定位，Sanitizers 的 ASan+UBSan、TSan/负控与 ARM64 job 均成功；合并后 Spec run `36242510677` 与 Main Merge Guard `36242510653` 亦成功。
 
 **2026-09-26 B2/NOW-01 合并收尾**：PR #108 已合入远端主干，merge commit 为 `8d81fda`；合并后主干包含 `VerifiedDryRunEvidence`、测试注册与 harness 接线。基于代码、合并、运行和平台四类证据，B2 站点、NOW-01 子批次与 `1.2`/`1.3`/`6.1.3`/附录 B 已同步标为 `[DONE]`。后续 follow-up 分支仅保留 Sanitizer workflow 缓存/时限改进与路线图收尾，不改变已合入的 6b-0b 代码。
 

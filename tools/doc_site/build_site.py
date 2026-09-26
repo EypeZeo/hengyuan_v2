@@ -28,7 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 SRC = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md")
 OUT = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.html")
 
-BASELINE_DATE = datetime.date(2026, 9, 25)      # 与 0.1 节同步时间一致
+BASELINE_DATE = datetime.date(2026, 9, 26)      # 与 0.1 节同步时间一致
 EXTERNAL_REF = re.compile(r'(?:src|href)\s*=\s*"(?:https?:)?//', re.I)
 
 
