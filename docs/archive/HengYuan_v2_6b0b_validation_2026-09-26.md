@@ -46,8 +46,8 @@
 - 远端 CI Native：run `36229428754`，`success`；作业 `native-build-test`，`success`。
 - 远端 CI Spec Verification：run `36229428777`，`success`；L1 与 L3 作业均 `success`。
 - 远端 CI Native Sanitizers：run `36229665532`，`success`；ASan+UBSan、TSan/负控、ARM64 hardware weak-memory 三个 job 均 `success`。
-- follow-up head `30b7c4c` 的复验：CI Native run `36233252654`、CI Spec Verification run `36233254780`、CI Native Sanitizers run `36233256459` 均 `success`；三个 Sanitizer jobs 均 `success`。
-- 代码合并证据：PR #108，merge commit `8d81fda`；PR #109 为重复 head，已关闭，不作为合并证据。
+- follow-up head `c7270bc` 的最终复验：CI Native run `36238442566`、CI Spec Verification run `36238444607`、CI Native Sanitizers run `36238447723` 均 `success`；三个 Sanitizer jobs 均 `success`。
+- 代码合并证据：PR #108，merge commit `8d81fda`；验证/文档收尾 PR #110，merge commit `5aa4242`；PR #109 为重复 head，已关闭，不作为合并证据。
 
 ## 限制
 
