@@ -350,7 +350,7 @@ CI Native Sanitizers 的触发策略是**有意**的：其文件头注释明确�
 
 | 工作树 | 分支 | 可见改动 | 状态判定 |
 | :--- | :--- | :--- | :--- |
-| `hengyuan_v2`（6b-0b） | `feat/batch6-6b0b-verified-dry-run-evidence` | 修改 `native/CMakeLists.txt` 与预检 harness 源文件；新增演练证据头文件与其测试（**均为未跟踪文件**）；另有一个构建产物对象文件未跟踪 | 实施中；2026-09-26 修复启动时钟边界并补 G3 限流预算负控（默认预算会误放第 73 笔）；V11/V12/G3 有效变异均在 MSVC 编译通过、被测试抓到且原件哈希恢复；当前版 MSVC 全量 2036 通过、1 跳过（共 2037 项），WSL/GCC-14 `none` 全量 2033/2033，ASan+UBSan 定向 40/40，新测试在 GCC `none` 随机顺序 ×30 与 ASan+UBSan ×10 轮均通过。无主干合并与当前版本全套变异终态，仍非验收 |
+| `hengyuan_v2`（6b-0b） | `feat/batch6-6b0b-verified-dry-run-evidence` | 修改 `native/CMakeLists.txt` 与预检 harness 源文件；新增演练证据头文件与其测试（**均为未跟踪文件**）；另有一个构建产物对象文件未跟踪 | 实施中；当前版 162 项变异 152 捕获、10 项等价/防御冗余存活、0 编译失败且原件恢复；本地 MSVC/GCC/ASan 全绿；远端 CI Native run `36229428754`、Spec run `36229428777`、Sanitizers run `36229665532` 均成功（含 ARM64）；无主干合并，仍非验收 |
 | `hengyuan_v2_6b0e`（6b-0e） | `feat/batch6-6b0e-operator-gate` | 新增操作员确认门、操作员输入、输入读取三个头文件与阻塞输入流测试辅助件及两个测试；修改 Sanitizer workflow、`native/CMakeLists.txt` 与 WSL 验证脚本 | 实施中；尚未接入 harness |
 | `hengyuan_v2_6c`（6c） | `feat/batch6-6c-audit-export` | **仅有一个未跟踪头文件**；构建配置未改、无测试、无命令行入口 | 实施中；导出契约与互斥保证均未验证 |
 
@@ -800,10 +800,10 @@ graph TD
 
 - [ ] **子批次 NOW-01（6b-0b）四路径可验证演练证据** `[WIP: 执行者@2026-09-26]`
   - **实装位置**：`native/include/hengyuan/verified_dry_run_evidence.hpp:VerifiedDryRunEvidence::run_all` 与 `native/src/live_submit_preflight_harness.cpp:main`；演练在读取凭据及网络连接之前运行，真实编排门禁与临时持久审计日志参与判定，仅订单提交与对账查询端口使用脚本模拟。启动时钟为零的边界经 `drill_startup_now_ms` 修复，不再误判四路径均未运行。
-  - **本地验证（2026-09-26，含 G3 新测试的当前版本）**：MSVC 全量构建与 CTest 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 CTest 2033/2033（`CTEST_PARALLEL_LEVEL=8`，24.44 秒）；GCC-14 ASan+UBSan 定向 CTest 40/40；GCC `none` 新测试随机顺序 ×30 轮（每轮 40 项），ASan+UBSan 新测试随机顺序 ×10 轮（每轮 40 项），均通过且无 sanitizer 报告。无 `.env` 的预检进程四路径均输出 `PASSED`，之后在凭据加载处按预期退出，未进入网络阶段。上述本地结果仍不代表远端 CI 通过。
+  - **验证（2026-09-26，含 G3 新测试的当前版本）**：MSVC 全量构建与 CTest 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 CTest 2033/2033（`CTEST_PARALLEL_LEVEL=8`，24.44 秒）；GCC-14 ASan+UBSan 定向 CTest 40/40；GCC `none` 新测试随机顺序 ×30 轮（每轮 40 项），ASan+UBSan 新测试随机顺序 ×10 轮（每轮 40 项），均通过且无 sanitizer 报告。无 `.env` 的预检进程四路径均输出 `PASSED`，之后在凭据加载处按预期退出，未进入网络阶段。远端 CI Native run `36229428754`、CI Spec Verification run `36229428777`、CI Native Sanitizers run `36229665532` 均为 `success`；Sanitizers 的 ASan+UBSan、TSan/负控、ARM64 hardware weak-memory 三个 job 均成功。
   - **变异复核（2026-09-26）**：当前版本完整 162 项变异已重跑，152 项被捕获、10 项存活、0 项编译失败；V11/V12 已改为可编译变异并各被 2 项绑定测试捕获。G3 已由 `VerifiedDrillHelpers.AConfiguredOrderBudgetExhaustsAndStopsTheRealOrchestrator` 捕获：删除限流配置会使第 73 笔订单错误放行；当前配置耗尽则为 `RateLimitExhausted`、零端口调用、零在途槽位。变异脚本最终 `identical=True`，头文件哈希恢复为 `7687b43a4236e273db216b58e9b445fe46146baf`，无 `MUTATION-CHECK` 残留。逐项日志与存活项处置见 `docs/archive/HengYuan_v2_6b0b_validation_2026-09-26.md`；10 项存活项仍为等价/防御性冗余，未被误记为捕获。
   - **其余 11 项存活变异的逐项处置**：O33/O34/O35 为现有 `latch()` 与 Gate 2 顺序下无法由合法 rig 构造另一终态的常量观察，判定谓词本身已以篡改观察值负控；G1/G2 与 `AuditRingSink` 默认 Available、`KillSwitch` 默认 Normal 同值；G12 在每条演练的 Gate 3 控制组内重新 seed 脚手架；G22 对本演练显式 `poll_once()` + `drain_reconcile_events()` 无影响，**只在本演练范围冗余**，不证明生产编排可删除该接线；V2/V13/V14/V16 均为私有链复位与 `ran_ok_` / `live_ready()` 双重检查之间的冗余变更，保留原实现的防御性检查。上述分类仅对该变异集与当前代码路径成立，不把测试幸存误记为成功捕获。
-  - **待关闭证据**：当前版本的完整 162 项变异终态日志、其余 11 项存活变异的独立复核、ARM64 与远端 CI 结果、PR 合并提交；在这些证据取得之前，B2 保持 `[WIP]`，不得标为 `[DONE]`。本批次的模拟订单执行不构成真实订单写入授权。
+  - **待关闭证据**：PR 合并提交及合并后主干状态回读；在合并提交取得之前，B2 保持 `[WIP]`，不得标为 `[DONE]`。本批次的模拟订单执行不构成真实订单写入授权。
 
 #### 6.1.4 私有用户数据流与会话对账
 
@@ -1101,7 +1101,9 @@ graph TD
 
 **2026-09-26 G3 存活项重判**：将原“等价/冗余”改判为可触发的测试缺口；增加限流配置耗尽与真实编排器禁止提交的负控。G3 变异在 MSVC `/WX` 下可编译，导致该负控失败（原默认预算误放第 73 笔），恢复原头文件后相关 47/47 通过；其余 11 项在 `6.1.3` 逐项说明边界。全量 MSVC/GCC 需基于新增负控后的版本再验，B2 仍为 WIP。
 
-**2026-09-26 当前版本完整变异终态补验**：MSVC 全量 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 2033/2033；ASan+UBSan 定向 40/40；GCC `none` 随机顺序 30 轮与 ASan+UBSan 随机顺序 10 轮，均每轮 40 项通过；当前版本 162 项变异 152 捕获、10 存活、0 编译失败，原件恢复哈希一致。ARM64、远端 CI、PR 合并证据仍未取得，B2 保持 WIP。
+**2026-09-26 当前版本完整变异终态补验**：MSVC 全量 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 2033/2033；ASan+UBSan 定向 40/40；GCC `none` 随机顺序 30 轮与 ASan+UBSan 随机顺序 10 轮，均每轮 40 项通过；当前版本 162 项变异 152 捕获、10 存活、0 编译失败，原件恢复哈希一致。ARM64 与远端 CI 已取得成功终态，PR 合并证据待补，B2 保持 WIP。
+
+**2026-09-26 远端门禁终态补录**：PR #109 head `509c9e1` 对应的 CI Native run `36229428754`、CI Spec Verification run `36229428777`、CI Native Sanitizers run `36229665532` 均为 `success`；Sanitizers 的 ASan+UBSan、TSan/负控与 ARM64 job 均成功。当前剩余门禁只有 PR 合并提交及合并后主干回读，B2 继续保持 WIP。
 
 ### B.2 v2.6.0（证据核验修订版）
 
