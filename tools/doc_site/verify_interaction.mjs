@@ -215,10 +215,18 @@ try {
   section("[5] 单击进行中站点：短暂停顿后自动恢复");
   await b.eval(`document.getElementById('btn-anim').click();`);   // 先恢复动画
   await sleep(500);
-  const wipPos = await centerOn('.st[data-station="B2"]');
+  const wipStation = await b.eval(`
+    return document.querySelector('.st[data-status="wip"]')?.getAttribute('data-station') || null;`);
+  const wipSelector = wipStation ? `.st[data-station="${wipStation}"]` : null;
+  const wipSelectorLiteral = JSON.stringify(wipSelector);
+  const wipPos = wipSelector ? await centerOn(wipSelector) : {x: 0, y: 0};
   const wipStatus = await b.eval(`
-    return document.querySelector('.st[data-station="B2"]').getAttribute('data-status');`);
+    const node=document.querySelector(${wipSelectorLiteral});
+    return node?.getAttribute('data-status') || null;`);
   check("被测试站点确为进行中", wipStatus === "wip", wipStatus);
+  if (!wipSelector) {
+    check("存在可用于停顿回归的进行中站点", false, "没有 data-status=\"wip\" 的站点");
+  }
   await b.clickAt(wipPos.x, wipPos.y);
   await sleep(200);
   const held = await b.eval(`
@@ -228,14 +236,15 @@ try {
     return new Promise(res=>setTimeout(()=>res({
       paused:svg.animationsPaused?svg.animationsPaused():null,
       moved:Math.abs(t.getBoundingClientRect().left-a),
-      held:document.querySelector('.st[data-station="B2"]').classList.contains('held'),
+      held:document.querySelector(${wipSelectorLiteral})?.classList.contains('held') || false,
       offscreen:!document.getElementById('metro-panel').getBoundingClientRect().bottom>0,
       note:document.getElementById('status-note').textContent}),900));`);
   check("单击进行中站点后动画停顿", held.paused === true, String(held.paused));
   check("停顿时站点出现锁定环（此前 CSS 有样式但脚本从未加类）", held.held === true);
   const ring = await b.eval(`
-    const c=document.querySelector('.st[data-station="B2"] .held');
-    const pulse=document.querySelector('.st[data-station="B2"] .halo');
+    const c=document.querySelector(${wipSelectorLiteral} + ' .held');
+    const pulse=document.querySelector(${wipSelectorLiteral} + ' .halo');
+    if (!c || !pulse) return {stroke:"none",width:0,opacity:0,halo:"block"};
     const s=getComputedStyle(c);
     return {stroke:s.stroke,width:parseFloat(s.strokeWidth),opacity:parseFloat(s.opacity),
             halo:getComputedStyle(pulse).display};`);
@@ -253,9 +262,9 @@ try {
     const t=svg.querySelector('.train');
     const a=t.getBoundingClientRect().left;
     return new Promise(res=>setTimeout(()=>res({
-      paused:svg.animationsPaused?svg.animationsPaused():null,
-      moved:Math.abs(t.getBoundingClientRect().left-a),
-      held:document.querySelector('.st[data-station="B2"]').classList.contains('held')}),1200));`);
+       paused:svg.animationsPaused?svg.animationsPaused():null,
+       moved:Math.abs(t.getBoundingClientRect().left-a),
+       held:document.querySelector(${wipSelectorLiteral})?.classList.contains('held') || false}),1200));`);
   check("回到站点图后停顿收尾、动画恢复（离开视口期间不会静默过期）",
     resumed.paused === false && resumed.moved > 0.5, `位移=${resumed.moved.toFixed(2)}`);
   check("恢复后锁定环撤下", resumed.held === false);

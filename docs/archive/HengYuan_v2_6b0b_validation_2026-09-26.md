@@ -43,7 +43,12 @@
 - GCC-14 ASan+UBSan 定向：40/40 通过。
 - GCC `none` 新测试随机顺序 30 轮、ASan+UBSan 新测试随机顺序 10 轮：每轮 40/40 通过，无 sanitizer 报告。
 - 无 `.env` 预检进程：四项演练均 `PASSED`，随后在凭据读取处按预期退出，未进入网络路径。
+- 远端 CI Native：run `36229428754`，`success`；作业 `native-build-test`，`success`。
+- 远端 CI Spec Verification：run `36229428777`，`success`；L1 与 L3 作业均 `success`。
+- 远端 CI Native Sanitizers：run `36229665532`，`success`；ASan+UBSan、TSan/负控、ARM64 hardware weak-memory 三个 job 均 `success`。
+- follow-up head `30b7c4c` 的复验：CI Native run `36233252654`、CI Spec Verification run `36233254780`、CI Native Sanitizers run `36233256459` 均 `success`；三个 Sanitizer jobs 均 `success`。
+- 代码合并证据：PR #108，merge commit `8d81fda`；PR #109 为重复 head，已关闭，不作为合并证据。
 
 ## 限制
 
-本记录不包含 ARM64 硬件运行、远端 GitHub Actions 运行、PR 合并证据或真实凭据路径；这些仍需在远端认证恢复后取得。模拟订单演练不构成真实订单写入授权。
+本记录不包含 PR 合并证据或真实凭据路径；模拟订单演练不构成真实订单写入授权。远端 CI 与 ARM64 结果仅证明代码验证作业通过，不替代 Owner 的 L5 授权和真实订单审查。
