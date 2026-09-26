@@ -12,10 +12,13 @@
 //   2. A real public depth stream ("<symbol>@depth@100ms") through DepthManager, so
 //      ctx.depth_synced can genuinely become true (H6 never set this field at all -- confirmed via
 //      grep before this batch's plan was written).
-//   3. A real KillSwitch (Normal) + a DryRunEvidenceChain replayed with all 4 EvidencePath
-//      scenarios at process start (DryRunEvidenceChain::live_ready() is purely in-memory --
+//   3. A real KillSwitch (Normal) + dry-run evidence that is EARNED at process start: the four
+//      EvidencePath scenarios really run through orchestrate_submit() (VerifiedDryRunEvidence,
+//      批次 6 6b-0b) and only a scenario that reached its expected terminal state is recorded.
+//      (An earlier version of this file "replayed" the four paths by looping record() over the
+//      enum -- nothing had run. DryRunEvidenceChain::live_ready() is purely in-memory --
 //      dry_run_evidence.hpp's own reset()/no serialization -- so this must happen fresh every
-//      process start, not "once, ever").
+//      process start, not "once, ever".)
 //
 // Items 1 and 2 are one PublicFeedPipeline (批次 6b-0f, public_feed_pipeline.hpp): each feed is
 // supervised (reconnect with backoff, a planned rollover before Binance's 24 h connection limit), a
@@ -70,6 +73,7 @@
 #include <hengyuan/public_feed_pipeline.hpp>
 #include <hengyuan/strategy_spec_evaluator.hpp>
 #include <hengyuan/strategy_spec_toml_parser.hpp>
+#include <hengyuan/verified_dry_run_evidence.hpp>
 
 #include <array>
 #include <atomic>
@@ -233,11 +237,15 @@ std::string durable_audit_temp_path() {
 #endif
 }
 
+// Every file a DurableAuditSink derives from its path: the log plus the key-rotation and store-identity sidecars,
+// each with its lock file, tip anchor and the tip's temp file. (Only the first four used to be removed here, which
+// left the sidecars behind on every run.)
 void remove_durable_audit_files(const std::string& base_path) {
-    std::remove(base_path.c_str());
-    std::remove((base_path + ".lock").c_str());
-    std::remove((base_path + ".tip").c_str());
-    std::remove((base_path + ".tip.tmp").c_str());
+    for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".keyrotations", ".keyrotations.lock",
+                               ".keyrotations.tip", ".keyrotations.tip.tmp", ".storeid", ".storeid.lock",
+                               ".storeid.tip", ".storeid.tip.tmp"}) {
+        std::remove((base_path + suffix).c_str());
+    }
 }
 
 }  // namespace
@@ -301,6 +309,37 @@ int main(int argc, char* argv[]) {
     // --- H6's cold-start chain, unchanged -----------------------------------------------
     SecureEnvLoader loader;
     EnvironmentBinding binding = EnvironmentBinding::testnet();
+
+    // --- The four dry-run drills, for real (批次 6 6b-0b) ------------------------------------------
+    // Before the process reads a credential or touches the network (and before any io thread or feed
+    // exists): a failure here is a plain `return` with nothing to undo. The verified chain is bound to
+    // this build and this environment, and is the ONLY evidence handle below (ctx.evidence takes its
+    // read-only chain()).
+    const std::uint32_t stamp = build_stamp();
+    VerifiedDryRunEvidence verified_evidence;
+    {
+        const DryRunReport drills = verified_evidence.run_all(stamp, drill_startup_now_ms(get_now_ms()), binding.environment(),
+                                                              durable_audit_temp_path() + "_drill");
+        static constexpr const char* kDrillNames[kEvidencePathCount] = {"SubmitSuccess", "SubmitReject",
+                                                                        "SubmitAmbiguous", "KillSwitch"};
+        for (std::size_t i = 0; i < kEvidencePathCount; ++i) {
+            const DrillOutcome& d = drills.drills[i];
+            std::printf("Dry-run drill %-15s %s  gate=%s order=%s port_calls=%d%s%s\n", kDrillNames[i],
+                        d.passed ? "PASSED" : "FAILED", gate_name(d.gate), order_state_name(d.order_state),
+                        d.port_calls, d.passed ? "" : "  -- ", d.passed ? "" : d.failure);
+        }
+        if (!drills.all_passed() || !verified_evidence.ready_for(binding.environment(), stamp)) {
+            std::fprintf(stderr,
+                         "FATAL: the dry-run drills did not all reach their expected terminal state -- "
+                         "refusing to start.\n");
+            return 1;
+        }
+    }
+    std::printf("Dry-run evidence earned: all_paths_exercised=%s consistent_build=%s live_ready=%s\n",
+                verified_evidence.chain().all_paths_exercised() ? "true" : "false",
+                verified_evidence.chain().consistent_build() ? "true" : "false",
+                verified_evidence.chain().live_ready() ? "true" : "false");
+
     std::array<std::string_view, 2> allowed_keys{binding.api_key_env_key(), binding.secret_env_key()};
     EnvAllowlist allowlist{allowed_keys.data(), allowed_keys.size()};
 
@@ -479,19 +518,9 @@ int main(int argc, char* argv[]) {
     // (public_feed_pipeline.hpp's lifetime contract).
     std::thread io_thread([&ioc]() { ioc.run(); });
 
-    // --- Real KillSwitch (Normal) + DryRunEvidenceChain replay (确认发现 4 的直接修复) --------
+    // --- Real KillSwitch (Normal) --------------------------------------------------------------
     KillSwitch kill_switch;
     kill_switch.operator_reset();
-
-    DryRunEvidenceChain evidence;
-    const std::uint32_t stamp = build_stamp();
-    for (int i = 0; i < static_cast<int>(kEvidencePathCount); ++i) {
-        evidence.record(static_cast<EvidencePath>(i), get_now_ms(), stamp, /*suite_id=*/1);
-    }
-    std::printf("Dry-run evidence replayed: all_paths_exercised=%s consistent_build=%s live_ready=%s\n",
-                evidence.all_paths_exercised() ? "true" : "false",
-                evidence.consistent_build() ? "true" : "false",
-                evidence.live_ready() ? "true" : "false");
 
     SpotRateLimitTracker rate_limiter;
     rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
@@ -620,7 +649,7 @@ int main(int argc, char* argv[]) {
             OrchestratorContext ctx{};
             ctx.audit = &audit;
             ctx.kill_switch = &kill_switch;
-            ctx.evidence = &evidence;
+            ctx.evidence = &verified_evidence.chain();
             ctx.signer_ready = true;
             ctx.depth_synced = (pipeline->depth_manager().state() == DepthState::Tracking);
             ctx.rate_limiter = &rate_limiter;
