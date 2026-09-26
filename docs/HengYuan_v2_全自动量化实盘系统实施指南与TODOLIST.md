@@ -9,8 +9,8 @@
 | 文档版本 | **v2.6.1**（整合升级版；上一版 v2.6.0，冻结原文 v2.5.6） |
 | 最后代码同步哈希 | 远端主干 **`5aa4242`**（PR #110，6b-0b 代码与验证收尾均已合入） |
 | 同步时间（本地快照） | 2026-09-26（以本地工作树、远端 PR 记录与 GitHub API 实测为准） |
-| 在制验证补录时间 | 2026-09-26（PR #108/#110 合并后最终快照） |
-| 本地主干对照 | 本地 `master` = `3278180`（PR #92），落后远端主干 **15 个提交** |
+| 在制验证补录时间 | 2026-09-26（PR #108/#110/#111 合并后最终快照） |
+| 本地主干对照 | 本地 `master` = `3278180`（PR #92），落后远端主干 **21 个提交** |
 | 并行工作树 | 3 个 `git worktree`：`hengyuan_v2`（6b-0b）、`hengyuan_v2_6b0e`（6b-0e）、`hengyuan_v2_6c`（6c），基点均为 `f4ee620` |
 | 文档效力层级 | 本文件是**受控工程实施蓝图**；其代码状态断言受 `0.3` 节证据分级约束，其规划条目受各 Stage 章的门禁条件约束 |
 | 归档副本 | 冻结原文（v2.5.6，SHA256 `9d78643d…93965`）、v2.6.0、核对证据台账，均存于 `docs/archive/` |
@@ -165,7 +165,7 @@ graph LR
 | B0 | `[DONE]` | L4 签名只读底座（#60 / #67 / #69） | 2026-08-30 | — | — | — | — | — | [2.3](#23-已合入主干的执行底座) |
 | B1 | `[DONE]` | 限流预算（#71）与真实 POST（#72） | 2026-08-31 | — | — | — | — | — | [2.3](#23-已合入主干的执行底座) |
 | BD | `[DROPPED]` | 执行流水账组件（原 TODO 1A.5 的一半） | 2026-09-04 | 原生架构负责人 | — | — | 已废弃，不再有依赖 | — | [2.3](#23-已合入主干的执行底座) |
-| B2 | `[DONE]` | 6b-0b 演练证据（NOW-01） | 2026-09-26 | 当前工作树执行者 | — | P0 | PR #108 合并提交 `8d81fda`；本地变异、MSVC/GCC/ASan、远端 CI/ARM64 均有证据 | 2–4 日 | [6.1](#61-stage-1a-现货最小安全垂直闭环) |
+| B2 | `[DONE]` | 6b-0b 演练证据（NOW-01） | 2026-09-26 | 当前工作树执行者 | — | P0 | PR #108 合并提交 `8d81fda`，验证收尾 PR #110 合并为 `5aa4242`；本地变异、MSVC/GCC/ASan、远端 CI/ARM64 均有证据 | 2–4 日 | [6.1](#61-stage-1a-现货最小安全垂直闭环) |
 | B3 | `[WIP: 执行者@2026-09-25]` | 6b-0e 操作员确认门（NOW-02） | — | 独立工作树执行者 | 2026-09-29 | P0 | 接口所有权与顺序约束说明 | 2–4 日 | [6.1](#61-stage-1a-现货最小安全垂直闭环) |
 | B4 | `[WIP: 执行者@2026-09-25]` | 6c 离线审计导出（NOW-03） | — | 独立工作树执行者 | 2026-10-01 | P0 | 导出契约与互斥负例 | 3–6 日 | [6.1](#61-stage-1a-现货最小安全垂直闭环) |
 | B5 | `[TODO: P0]` | 安全债务清零（SAFE-01 至 SAFE-06） | — | Native / Python 分工负责人 | 2026-10-08 | P0 | B2 至 B4 的接口冻结 | 12–20 日 | [6.0](#60-stage-0-安全债务清零) |
@@ -280,17 +280,17 @@ graph LR
 
 基线事实如下：
 
-1. 远端主干 `origin/master` 指向 `5aa4242`，即 PR #110 的合并提交；该提交包含 6b-0b 代码、验证收尾与 ASan 门禁修复，是当前唯一的代码真值基线。
-2. 本地 `master` 指向 `3278180`（PR #92），落后远端主干恰好 15 个提交。**不得以本地 `master` 的源码或测试数量代表当前云端状态。**
+1. 远端主干 `origin/master` 指向 `e7945dc`，即 docs-only PR #111 的合并提交；其前一代码基线为 PR #110 的 `5aa4242`，包含 6b-0b 代码、验证收尾与 ASan 门禁修复。当前代码真值基线仍以 `5aa4242` 为准，`e7945dc` 仅推进路线图元数据。
+2. 本地 `master` 指向 `3278180`（PR #92），落后远端主干恰好 21 个提交。**不得以本地 `master` 的源码或测试数量代表当前云端状态。**
 3. 仓库本地存在 3 个 `git worktree`：`hengyuan_v2`、`hengyuan_v2_6b0e`、`hengyuan_v2_6c`，基点均为 `f4ee620`。“工作树”与“分支”是不同概念——本地分支数量为数十个，其中大部分已合并或已废弃，不得以分支存在推断工作在进行。
-4. 6b-0b 代码 PR #108 已合并；当前 follow-up 分支仅收尾 ASan workflow 与路线图，6b-0e/6c 两个并行工作树仍无远端分支、无 PR。
+4. 6b-0b 代码 PR #108 与验证收尾 PR #110 已合并；当前工作树仅保留路线图元数据同步，6b-0e/6c 两个并行工作树仍无远端分支、无 PR。
 5. `py_core` 当前为 **71 个受跟踪文件、约 16.2 千行**（不含虚拟环境目录）；该数字随每次合并变动，引用时应以仓库实测为准，不得沿用历史引用值。
 
 ### 2.2 云端主干与平台门禁能力
 
 #### 2.2.1 主干提交与 PR 区间
 
-已进入远端主干的 PR 区间为 **#70 至 #110**。按功能域归类如下：
+已进入远端主干的**代码 PR**区间为 **#70 至 #110**；后续 #111 为文档元数据收尾，不改变代码基线。按功能域归类如下：
 
 | 功能域 | 合并内容 |
 | :--- | :--- |
@@ -306,7 +306,7 @@ graph LR
 
 #### 2.2.2 门禁通道的真实状态
 
-PR #108 及最终 follow-up PR #110 的远端验证已取得可定位终态：最终 follow-up head `c7270bc` 的 CI Native run `36238442566`、CI Spec Verification run `36238444607`、CI Native Sanitizers run `36238447723` 均 `completed/success`；后者的 ASan+UBSan、TSan/负控、ARM64 jobs 均成功。最终主干 follow-up run `36242510677`（Spec）与 Main Merge Guard `36242510653` 也成功。CodeQL 仍为空绿，CI Python 与本次原生切片无路径交集。
+PR #108 及最终验证收尾 PR #110 的远端验证已取得可定位终态：收尾 head `c7270bc` 的 CI Native run `36238442566`、CI Spec Verification run `36238444607`、CI Native Sanitizers run `36238447723` 均 `completed/success`；后者的 ASan+UBSan、TSan/负控、ARM64 jobs 均成功。合并后主干 Spec run `36242510677`（PR #110）与 Main Merge Guard `36242510653` 也成功；文档元数据随后由 PR #111 合入。CodeQL 仍为空绿，CI Python 与本次原生切片无路径交集。
 
 三条通道各自的真实状态：
 
@@ -348,11 +348,11 @@ CI Native Sanitizers 的触发策略是**有意**的：其文件头注释明确�
 
 ### 2.4 并行工作树状态
 
-三个 worktree 仍作为并行开发现场保留；6b-0b 代码已合入主干，当前主树仅有 follow-up 文档/CI 收尾，6b-0e 与 6c 仍为在制。表中“可见改动”指工作树内可静态确认的文件与差异。
+三个 worktree 仍作为并行开发现场保留；6b-0b 代码与验证收尾已合入主干，当前主树无新增 6b-0b 实现，6b-0e 与 6c 仍为在制。表中“可见改动”指工作树内可静态确认的文件与差异。
 
 | 工作树 | 分支 | 可见改动 | 状态判定 |
 | :--- | :--- | :--- | :--- |
-| `hengyuan_v2`（6b-0b follow-up） | `docs/batch6-0b-postmerge-metadata` | PR #108/#110 已将 6b-0b 代码、ASan 门禁修复与验证记录合入主干；当前分支仅同步最终主干哈希与快照日期 | 6b-0b 已完成；后续 6b-0e/6c 仍独立推进 |
+| `hengyuan_v2`（6b-0b 文档收尾） | `docs/batch6-0b-postmerge-metadata` | PR #108/#110 已将 6b-0b 代码、ASan 门禁修复与验证记录合入主干；PR #111 已合入最终路线图元数据 | 6b-0b 已完成；后续 6b-0e/6c 仍独立推进 |
 | `hengyuan_v2_6b0e`（6b-0e） | `feat/batch6-6b0e-operator-gate` | 新增操作员确认门、操作员输入、输入读取三个头文件与阻塞输入流测试辅助件及两个测试；修改 Sanitizer workflow、`native/CMakeLists.txt` 与 WSL 验证脚本 | 实施中；尚未接入 harness |
 | `hengyuan_v2_6c`（6c） | `feat/batch6-6c-audit-export` | **仅有一个未跟踪头文件**；构建配置未改、无测试、无命令行入口 | 实施中；导出契约与互斥保证均未验证 |
 
@@ -805,7 +805,7 @@ graph TD
   - **验证（2026-09-26，含 G3 新测试的当前版本）**：MSVC 全量构建与 CTest 2036 通过、1 跳过（共 2037 项）；WSL/GCC-14 `none` 全量 CTest 2033/2033（`CTEST_PARALLEL_LEVEL=8`，24.44 秒）；GCC-14 ASan+UBSan 定向 CTest 40/40；GCC `none` 新测试随机顺序 ×30 轮（每轮 40 项），ASan+UBSan 新测试随机顺序 ×10 轮（每轮 40 项），均通过且无 sanitizer 报告。无 `.env` 的预检进程四路径均输出 `PASSED`，之后在凭据加载处按预期退出，未进入网络阶段。最终 follow-up head `c7270bc` 的远端 CI Native run `36238442566`、CI Spec Verification run `36238444607`、CI Native Sanitizers run `36238447723` 均为 `success`；Sanitizers 的 ASan+UBSan、TSan/负控、ARM64 hardware weak-memory 三个 job 均成功。
   - **变异复核（2026-09-26）**：当前版本完整 162 项变异已重跑，152 项被捕获、10 项存活、0 项编译失败；V11/V12 已改为可编译变异并各被 2 项绑定测试捕获。G3 已由 `VerifiedDrillHelpers.AConfiguredOrderBudgetExhaustsAndStopsTheRealOrchestrator` 捕获：删除限流配置会使第 73 笔订单错误放行；当前配置耗尽则为 `RateLimitExhausted`、零端口调用、零在途槽位。变异脚本最终 `identical=True`，头文件哈希恢复为 `7687b43a4236e273db216b58e9b445fe46146baf`，无 `MUTATION-CHECK` 残留。逐项日志与存活项处置见 `docs/archive/HengYuan_v2_6b0b_validation_2026-09-26.md`；10 项存活项仍为等价/防御性冗余，未被误记为捕获。
   - **其余 11 项存活变异的逐项处置**：O33/O34/O35 为现有 `latch()` 与 Gate 2 顺序下无法由合法 rig 构造另一终态的常量观察，判定谓词本身已以篡改观察值负控；G1/G2 与 `AuditRingSink` 默认 Available、`KillSwitch` 默认 Normal 同值；G12 在每条演练的 Gate 3 控制组内重新 seed 脚手架；G22 对本演练显式 `poll_once()` + `drain_reconcile_events()` 无影响，**只在本演练范围冗余**，不证明生产编排可删除该接线；V2/V13/V14/V16 均为私有链复位与 `ran_ok_` / `live_ready()` 双重检查之间的冗余变更，保留原实现的防御性检查。上述分类仅对该变异集与当前代码路径成立，不把测试幸存误记为成功捕获。
-  - **完成证据**：PR #108 合并提交 `8d81fda`；合并前后本地与远端验证证据见 `docs/archive/HengYuan_v2_6b0b_validation_2026-09-26.md`。本批次的模拟订单执行不构成真实订单写入授权。
+  - **完成证据**：PR #108 合并提交 `8d81fda`，验证收尾 PR #110 合并提交 `5aa4242`；合并前后本地与远端验证证据见 `docs/archive/HengYuan_v2_6b0b_validation_2026-09-26.md`。本批次的模拟订单执行不构成真实订单写入授权。
 
 #### 6.1.4 私有用户数据流与会话对账
 
@@ -1107,7 +1107,7 @@ graph TD
 
 **2026-09-26 远端门禁终态补录**：PR #108 合并提交 `8d81fda` 与最终 follow-up PR #110 均取得 CI Native、CI Spec Verification、CI Native Sanitizers 的成功结果；最终 follow-up run `36238442566`、`36238444607`、`36238447723` 可定位，Sanitizers 的 ASan+UBSan、TSan/负控与 ARM64 job 均成功；合并后 Spec run `36242510677` 与 Main Merge Guard `36242510653` 亦成功。
 
-**2026-09-26 B2/NOW-01 合并收尾**：PR #108 已合入远端主干，merge commit 为 `8d81fda`；合并后主干包含 `VerifiedDryRunEvidence`、测试注册与 harness 接线。基于代码、合并、运行和平台四类证据，B2 站点、NOW-01 子批次与 `1.2`/`1.3`/`6.1.3`/附录 B 已同步标为 `[DONE]`。后续 follow-up 分支仅保留 Sanitizer workflow 缓存/时限改进与路线图收尾，不改变已合入的 6b-0b 代码。
+**2026-09-26 B2/NOW-01 合并收尾**：PR #108 已合入远端主干，merge commit 为 `8d81fda`；验证收尾 PR #110 合并为 `5aa4242`，合并后主干包含 `VerifiedDryRunEvidence`、测试注册与 harness 接线。基于代码、合并、运行和平台四类证据，B2 站点、NOW-01 子批次与 `1.2`/`1.3`/`6.1.3`/附录 B 已同步标为 `[DONE]`。路线图元数据随后由 docs-only PR #111 合入，不改变已合入的 6b-0b 代码。
 
 ### B.2 v2.6.0（证据核验修订版）
 
@@ -1211,7 +1211,7 @@ graph TD
 <!-- EXTENSION_POINT: {id: "MAP-STATION-01", context: "技术路线站点图的线路与站点集合", expected_usage: "新增产品线、数据域或账务域阶段时，先在线路总览中登记新线路，再在站点明细中追加站点行；不得只改其一"} -->
 <!-- MODULE_BOUNDARY: {name: "卷 2 治理基线与执行状态", dependencies: ["卷 1 站点图"], dependents: ["卷 4 审计矩阵", "卷 6 实施路线", "卷 7 故障注册表"]} -->
 <!-- EXTENSION_POINT: {id: "GOV-BASELINE-01", context: "基线与门禁能力的时点快照", expected_usage: "每次同步基线时替换 2.1 与 2.2 的实测值，并在附录 B 记录被替换值；不得在正文中并列保留历史值"} -->
-<!-- RATIONALE: {alternatives_considered: ["引用本地 master 作为基线", "引用最近一次本地构建结果作为基线", "引用远端主干提交作为基线"], tradeoffs: "远端主干可被 CI 与 PR 记录交叉验证，但存在同步延迟；本地 master 已落后 15 个提交，作为基线会系统性低估已落地能力", reversible_via: "替换 2.1 第 1 条的哈希并在附录 B 登记"} -->
+<!-- RATIONALE: {alternatives_considered: ["引用本地 master 作为基线", "引用最近一次本地构建结果作为基线", "引用远端主干提交作为基线"], tradeoffs: "远端主干可被 CI 与 PR 记录交叉验证，但存在同步延迟；本地 master 已落后 21 个提交，作为基线会系统性低估已落地能力", reversible_via: "替换 2.1 第 1 条的哈希并在附录 B 登记"} -->
 <!-- RATIONALE: {alternatives_considered: ["为对账终态新建独立持久台账组件", "扩展现有审计事件类型", "复用非持久记录类型的自定义帧"], tradeoffs: "新建组件会引入第二套持久化语义与两套恢复扫描；扩展审计事件类型可复用既有 165 字节持久管道但受封闭枚举约束；自定义帧容量更大但需自建签名顺序处理", reversible_via: "架构文档专节列出的两条实现路径，可在真实需求出现时按 D10 迁移评审包启动"} -->
 <!-- RATIONALE: {alternatives_considered: ["引用开发进度截图作为阶段证据", "仅接受工作树静态可确认的差异", "接受口头完成声明"], tradeoffs: "截图是时点声明，可能在提交前失效；静态差异可复核但不能证明正确性，故只用于判定 WIP 而非 DONE", reversible_via: "以 PR diff 与 CI 终态替换截图证据后更新本表"} -->
 <!-- MODULE_BOUNDARY: {name: "卷 3 认知基线与资产映射", dependencies: ["卷 2 基线"], dependents: ["卷 5 目标架构", "卷 8 策略实操"]} -->
