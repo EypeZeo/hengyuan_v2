@@ -38,7 +38,10 @@ jobs:
   asan-ubsan:
     name: "ASan+UBSan: full suite"
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # A cold full-suite instrumented build can exceed the old 45-minute cap before
+    # the test step starts. Keep the memory-safety signal, but give the first run
+    # enough room to finish; subsequent runs reuse this build tree.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -47,6 +50,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y g++-14 cmake libboost-dev libboost-system-dev libssl-dev
+
+      - name: Cache ASan+UBSan build tree
+        uses: actions/cache@v6
+        with:
+          path: native/build-asan
+          key: native-build-asan-${{ runner.os }}-gcc14-${{ hashFiles('native/CMakeLists.txt', '.github/workflows/ci-native-sanitizers.yml') }}
+          restore-keys: |
+            native-build-asan-${{ runner.os }}-gcc14-
 
       # RelWithDebInfo, not Release: sanitizer reports without symbols are close
       # to useless, and NDEBUG would also compile out every assert() in the tree.
