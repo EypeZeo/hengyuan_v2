@@ -647,6 +647,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_live_submit_preflight_harness)
     gtest_discover_tests(test_live_submit_preflight_harness)
 
+    # 批次 6 6b-0b: verified dry-run evidence -- the four drills against the REAL orchestrate_submit()
+    # (real gate chain, kill switch, in-flight registry, reconcile loop, a DurableAuditSink scratch log);
+    # only the network and the reconcile query are scripted. hengyuan_core only: the header merely
+    # forward-declares BinanceEnvironment, so no OpenSSL.
+    add_executable(test_verified_dry_run_evidence tests/test_verified_dry_run_evidence.cpp)
+    target_link_libraries(test_verified_dry_run_evidence PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_verified_dry_run_evidence)
+    gtest_discover_tests(test_verified_dry_run_evidence)
+
     # P2-EXEC-LIVE-01 D12-5: order lifecycle state machine + idempotency (L1)
     add_executable(test_order_lifecycle tests/test_order_lifecycle.cpp)
     target_link_libraries(test_order_lifecycle PRIVATE hengyuan_core GTest::gtest_main)
