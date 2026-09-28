@@ -647,6 +647,18 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_live_submit_preflight_harness)
     gtest_discover_tests(test_live_submit_preflight_harness)
 
+    # 6b-0e: one-shot operator input and account-bound confirmation logic.
+    # No live caller is wired until a verified account identity exists.
+    add_executable(test_operator_input_reader tests/test_operator_input_reader.cpp)
+    target_link_libraries(test_operator_input_reader PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_input_reader)
+    gtest_discover_tests(test_operator_input_reader)
+
+    add_executable(test_operator_confirmation_gate tests/test_operator_confirmation_gate.cpp)
+    target_link_libraries(test_operator_confirmation_gate PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_confirmation_gate)
+    gtest_discover_tests(test_operator_confirmation_gate)
+
     # 批次 6 6b-0b: verified dry-run evidence -- the four drills against the REAL orchestrate_submit()
     # (real gate chain, kill switch, in-flight registry, reconcile loop, a DurableAuditSink scratch log);
     # only the network and the reconcile query are scripted. hengyuan_core only: the header merely
