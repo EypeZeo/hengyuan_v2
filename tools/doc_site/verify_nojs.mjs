@@ -35,13 +35,13 @@ try {
   check("无 JS 时仍呈现完整正文", r.headings >= 96 && r.h2 >= 15,
     `标题=${r.headings} h2=${r.h2} 锚点=${r.anchors}`);
   check("无 JS 时站点图已静态绘制",
-    r.stations === 24 && r.lanes === 5 && r.flows === 5 && r.spurs === 1 && r.arcs === 4 && r.trains === 5,
+    r.stations === 25 && r.lanes === 5 && r.flows === 5 && r.spurs === 1 && r.arcs === 5 && r.trains === 5,
     `站点=${r.stations} 线路=${r.lanes} 光流=${r.flows} 支线=${r.spurs} 联络弧=${r.arcs} 列车=${r.trains}`);
   check("无 JS 时五张 Mermaid 图与公式已转换", r.diagrams === 4 && r.math > 0,
     `图解=${r.diagrams} 公式=${r.math}`);
-  check("无 JS 时卡片与任务全部可见", r.cards === 24 && r.tasks === 42 && r.hiddenCards === 0,
+  check("无 JS 时卡片与任务全部可见", r.cards === 25 && r.tasks === 47 && r.hiddenCards === 0,
     `${r.cards}/${r.tasks}/隐藏${r.hiddenCards}`);
-  check("无 JS 时故障表完整", r.fiRows === 41, String(r.fiRows));
+  check("无 JS 时故障表完整", r.fiRows === 45, String(r.fiRows));
   check("无 JS 时无 JS 才创建的残留空态", r.unused === 0, String(r.unused));
   check("无 JS 时悬浮层不可见", r.tipVisible === "hidden", r.tipVisible);
   check("无 JS 时回到顶部按钮不可见", r.topVisible === "0", r.topVisible);

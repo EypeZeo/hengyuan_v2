@@ -28,7 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 SRC = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md")
 OUT = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.html")
 
-BASELINE_DATE = datetime.date(2026, 9, 26)      # 与 0.1 节同步时间一致
+BASELINE_DATE = datetime.date(2026, 9, 29)      # 与 0.1 节同步时间一致
 EXTERNAL_REF = re.compile(r'(?:src|href)\s*=\s*"(?:https?:)?//', re.I)
 
 
@@ -254,8 +254,8 @@ LANE_X0 = {"A": 168.0, "B": 168.0, "C": 372.0, "D": 268.0, "E": 428.0}
 LANE_DX = {"A": 330.0, "B": 146.0, "C": 300.0, "D": 320.0, "E": 360.0}
 SPUR = {"BD": (300.0, 420.0)}
 MAP_W, MAP_H = 1620, 940
-INTERCHANGE = {"A1", "B5", "B8"}
-CROSS_ARCS = [("A1", "B6"), ("B5", "D1"), ("B5", "E0"), ("B8", "E2")]
+INTERCHANGE = {"A1", "B5", "B8", "E0"}
+CROSS_ARCS = [("A1", "B6"), ("B5", "D1"), ("B5", "E0"), ("B8", "E2"), ("E0", "C1")]
 LANE_ORDER = {}
 
 
@@ -962,7 +962,7 @@ def kpi_panel(stations: list, fi: list, tasks: list) -> str:
     done_lanes = sum(1 for v in lanes.values() if v and all(s["status"] == "DONE" for s in v))
     cards = [
         ("done", "已完工站点", cnt["DONE"], "共 %d 站" % len(stations)),
-        ("wip", "进行中站点", cnt["WIP"], "由三个并行工作树推进"),
+        ("wip", "进行中站点", cnt["WIP"], "由并行工作树推进，见 2.4"),
         ("todo", "待实现站点", cnt["TODO"], "其中 P0 %d 站" % todo_p0),
         ("blocked", "被阻断站点", cnt["BLOCKED"], "受实盘授权与门禁约束"),
         ("dropped", "已废弃站点", cnt["DROPPED"], "经评估后终止"),

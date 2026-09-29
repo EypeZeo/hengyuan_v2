@@ -181,24 +181,24 @@ def main() -> int:
     hset = {(s["id"], s["status"], s["due"], s["anchor"]) for s in data["stations"]}
     check("D1 站点逐项一致", mset == hset,
           "Markdown %d / HTML %d / 差集 %s" % (len(mset), len(hset), sorted(mset ^ hset)[:3]))
-    check("D2 站点数量 24", len(stations) == 24, str(len(stations)))
+    check("D2 站点数量 25", len(stations) == 25, str(len(stations)))
     check("D3 图内站点节点齐备",
           all(page.count('data-station="%s"' % s["id"]) >= 2 for s in stations),
           "缺失：" + str([s["id"] for s in stations if page.count('data-station="%s"' % s["id"]) < 2][:4]))
     check("D4 故障用例逐项一致",
           {(f["id"], f["gate"], f["impl"]) for f in fi}
           == {(f["id"], f["gate"], f["impl"]) for f in data["fi"]})
-    check("D5 故障用例 41 条且完备", len(fi) == 41
-          and sorted(int(f["id"][3:]) for f in fi) == list(range(1, 42)), str(len(fi)))
+    check("D5 故障用例 45 条且完备", len(fi) == 45
+          and sorted(int(f["id"][3:]) for f in fi) == list(range(1, 46)), str(len(fi)))
     check("D6 任务清单逐项一致",
           {(t["id"], t["priority"], t["status"]) for t in tasks}
           == {(t["id"], t["priority"], t["status"]) for t in data["tasks"]})
-    check("D7 任务数量 42", len(tasks) == 42, str(len(tasks)))
+    check("D7 任务数量 47", len(tasks) == 47, str(len(tasks)))
     check("D8 任务卡片全部渲染", sum(page.count('class="task ') for _ in [0]) == len(tasks),
           "卡片 %d / 任务 %d" % (page.count('class="task '), len(tasks)))
     check("D9 站点卡片全部渲染", page.count('class="card c-') == len(stations),
           "卡片 %d / 站点 %d" % (page.count('class="card c-'), len(stations)))
-    check("D10 标注副本一致", len(annotations) == 21 and page.count("&lt;!--") == 21,
+    check("D10 标注副本一致", len(annotations) == 25 and page.count("&lt;!--") == 25,
           "Markdown %d / HTML %d" % (len(annotations), page.count("&lt;!--")))
 
     # 1.2 线路总览的类名与节点内联标记，必须与 1.3 明细表的状态列一致
