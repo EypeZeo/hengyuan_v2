@@ -224,6 +224,9 @@ class RestPlan:
 
 
 def build_cfg(tmp_path, **kw):
+    kw.setdefault(
+        "reserve_mb", 1
+    )  # the production default (256 MB) would fill a small CI/VPS disk across tests
     cfg = default_config(tmp_path, **kw)
     conns = []
     for c in cfg.connections:

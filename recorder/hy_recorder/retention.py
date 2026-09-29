@@ -169,9 +169,18 @@ def run_cleanup(
         floor_bytes=floor_bytes,
         retain_hours=retain_hours,
     )
-    for level in plan.stepdowns:
-        emit("RETENTION_STEPDOWN", retain_hours=level, free_bytes=free)
+    announced: set[float] = set()
+
+    def announce(level: float) -> None:
+        if level not in announced:
+            announced.add(level)
+            emit("RETENTION_STEPDOWN", retain_hours=level, free_bytes=free)
+
     for act in plan.actions:
+        if (
+            act.level_h in plan.stepdowns
+        ):  # the step-down is announced right before the first removal it enables
+            announce(act.level_h)
         try:
             os.remove(root / act.name)
         except FileNotFoundError:
@@ -204,6 +213,8 @@ def run_cleanup(
             last_t=act.last_t,
             level_h=act.level_h,
         )
+    for level in plan.stepdowns:  # levels stepped down to that removed nothing (still worth an audit line)
+        announce(level)
     _prune_recovered_originals(root, clock)
     return plan
 

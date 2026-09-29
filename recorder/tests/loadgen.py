@@ -197,7 +197,7 @@ async def run(args) -> dict:
     root = Path(args.root)
     if root.exists():
         shutil.rmtree(root)
-    cfg = default_config(root, zstd_level=args.level, queue_capacity=args.queue)
+    cfg = default_config(root, zstd_level=args.level, queue_capacity=args.queue, reserve_mb=8)
     synth = Synth()
     gens = {
         "/spot_depth": [(RATES["spot_depth"], synth.spot_depth)],

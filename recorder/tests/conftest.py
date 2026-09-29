@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -30,3 +31,14 @@ def load_frames(name: str) -> list[tuple[int, str, bytes]]:
 @pytest.fixture(scope="session")
 def fixtures_dir() -> Path:
     return FIXTURES
+
+
+@pytest.fixture(autouse=True)
+def _stop_stray_writer_threads():
+    """A failing test must not leave a running writer thread behind: it is not a daemon, so it would keep the
+    interpreter from exiting (a CI job would sit there until its timeout instead of reporting the failure)."""
+    yield
+    for t in threading.enumerate():
+        if t.name == "hy-writer" and t.is_alive():
+            t.request_stop()  # type: ignore[attr-defined]
+            t.join(10)

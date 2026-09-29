@@ -145,17 +145,18 @@ def test_a_genuine_enospc_releases_the_reserve_stops_writing_and_still_closes_cl
                     fh.flush()
                 except OSError:
                     break
-        payload = junk_payload(200_000)
         for i in range(200):
             seq = w.seq.next()
-            line, _ = encode_record(
-                run=w.run_no,
-                seq=seq,
-                gen=1,
-                wall_us=SYSTEM_CLOCK.wall_us(),
-                mono_us=i,
-                stream=SPOT_TRADE,
-                payload=payload,
+            line, _ = (
+                encode_record(  # fresh random payload each time: identical copies would compress to nothing
+                    run=w.run_no,
+                    seq=seq,
+                    gen=1,
+                    wall_us=SYSTEM_CLOCK.wall_us(),
+                    mono_us=i,
+                    stream=SPOT_TRADE,
+                    payload=junk_payload(200_000),
+                )
             )
             w.submit_record("spot", "trade", line, seq=seq, wall_us=SYSTEM_CLOCK.wall_us(), stream=SPOT_TRADE)
         deadline = time.monotonic() + 20

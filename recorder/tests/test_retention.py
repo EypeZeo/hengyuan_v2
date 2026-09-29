@@ -186,6 +186,40 @@ def test_run_cleanup_under_pressure_evicts_unacked_with_an_auditable_event(tmp_p
     assert names[0] not in manifest.live_segments()
 
 
+def test_ledger_shows_the_ladder_in_the_order_it_was_climbed(tmp_path):
+    """acked and expired first, then the step-down announced right before the eviction it enables."""
+    b = LakeBuilder(tmp_path)
+    g = b.open_conn("spot_trade", [SPOT_TRADE])
+    for _ in range(3):  # segments 30 hours apart: ages 70 h, 40 h and 10 h at cleanup time
+        write_simple(b, "spot", "trade", SPOT_TRADE, "spot_trade_frames.jsonl", g, limit=10)
+        b.clock.advance(30 * 3600)
+    t_last = b.clock.wall_us() - 30 * US_PER_HOUR
+    b.stop()
+    manifest = Manifest(tmp_path)
+    live = manifest.live_segments()
+    old, mid, young = sorted(live)
+    ack = ack_dir(tmp_path)
+    ack.mkdir()
+    (ack / live[old]["sha256"]).write_bytes(b"")  # only the oldest was pulled
+    free = 1_000_000
+    warn = free + live[old]["bytes"] + live[mid]["bytes"] // 2  # one removal is not enough, two are
+    events: list[tuple[str, dict]] = []
+    run_cleanup(
+        tmp_path,
+        manifest,
+        FakeClock(wall_us=t_last + 10 * US_PER_HOUR),
+        lambda k, **f: events.append((k, f)),
+        warn_bytes=warn,
+        floor_bytes=1,
+        retain_hours=48,
+        free_bytes=free,
+    )
+    assert [k for k, _ in events] == ["PRUNED_ACKED", "RETENTION_STEPDOWN", "EVICTED_UNACKED"]
+    assert events[1][1]["retain_hours"] == 24.0
+    assert events[2][1]["name"] == mid and events[2][1]["level_h"] == 24.0
+    assert set(manifest.live_segments()) == {young}
+
+
 def test_recovered_originals_are_dropped_after_72_hours(tmp_path):
     rec = tmp_path / "recovered"
     rec.mkdir()
