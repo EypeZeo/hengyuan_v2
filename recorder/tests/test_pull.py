@@ -66,6 +66,23 @@ def test_pull_mirrors_verifies_and_acknowledges(tmp_path):
     ).exists() is False  # the fixture source has no status.json: informational only
 
 
+def test_a_live_lake_pulled_mid_hour_verifies_without_failures(tmp_path):
+    """The mirror of a recorder that is still running: sealed hours only, the open hour is just a tail."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    b = make_source(src, hours=2, stop=False)  # the first write of hour 3 seals hour 2
+    gen = b.gens["spot_trade"]
+    for i in range(20):  # hour 3 stays open as a .part file on the host
+        b.record("spot", "trade", SPOT_TRADE, trade(1000 + i), gen)
+    b.event("CLOCK_PROBE", venue="spot", server_ms=1, rtt_us=1, offset_ms=0.0, start_wall_us=1)
+    b.crash()  # no PROC_STOP: as far as the mirror can tell the recorder is still running
+    res = pull(LocalTransport(src), dst)
+    assert res.ok and len(res.fetched) == 2 and not list(dst.rglob("*.part"))
+    rep = verify_lake(dst)
+    codes = {i.code for i in rep.issues}
+    assert rep.exit_code == 0, rep.render_text()
+    assert "SEQ_HOLE" not in codes and "CRASH_TAIL_HOLE" in codes and "RUN_NOT_STOPPED_CLEANLY" in codes
+
+
 def test_a_second_pull_moves_nothing_and_a_later_pull_only_the_new_segments(tmp_path):
     src, dst = tmp_path / "src", tmp_path / "dst"
     make_source(src, hours=2)
