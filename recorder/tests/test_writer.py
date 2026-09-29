@@ -221,6 +221,25 @@ def test_overrun_ranges_are_coalesced_and_bounded(tmp_path):
     assert (last["first_q"], last["last_q"], last["dropped"]) == (5000, 5002, 2)
 
 
+def test_a_quiet_class_is_sealed_by_the_writer_once_its_hour_is_over(tmp_path):
+    """Found on the recording host: hourly snapshot and daily reference segments stayed unsealed .part files
+    across the hour boundary because rollover only happened on the next write."""
+    rig = Rig(tmp_path)
+    rig.event("WS_OPEN", conn="spot_trade", gen=1, streams=[STREAM])
+    rig.rec(tid=1)
+    rig.writer.start()
+    time.sleep(0.4)
+    assert not rig.manifest.live_segments(), "same hour: the segment stays open"
+    rig.clock.advance(3600 + 10)  # the hour is over and nothing new arrives for this class
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline and not rig.manifest.live_segments():
+        time.sleep(0.1)
+    live = rig.manifest.live_segments()
+    assert len(live) == 1 and next(iter(live.values()))["reason"] == "rotate"
+    rig.finish()
+    assert verify_lake(tmp_path).exit_code == 0
+
+
 @pytest.mark.parametrize("n", [3])
 def test_heartbeat_advances_while_idle(tmp_path, n):
     rig = Rig(tmp_path)

@@ -132,6 +132,16 @@ class SegmentWriter:
         self._dirty_since_sync = True
         return sealed
 
+    def roll_if_due(self, now_wall_us: int, grace_us: int = 5_000_000) -> dict[str, Any] | None:
+        """Seal the open segment once its hour is over (plus a grace period for records still in flight).
+
+        Without this a class that is written rarely (hourly snapshot keyframes, daily reference data) would
+        keep its data in an unsealed ``.part`` file until the next record arrives, and unsealed data can be
+        neither pulled nor verified."""
+        if self._fh is not None and now_wall_us >= (self._hour_key + 1) * US_PER_HOUR + grace_us:
+            return self.seal("rotate")
+        return None
+
     def flush_block(self) -> None:
         """Make everything written so far decodable (block boundary) and hand it to the OS."""
         if self._fh is None:

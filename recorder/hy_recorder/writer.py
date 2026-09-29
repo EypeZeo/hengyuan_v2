@@ -331,9 +331,11 @@ class Writer(threading.Thread):
                 self._emit_overruns()
                 last_overrun = now
             if now - last_flush >= FLUSH_INTERVAL_S:
+                wall_us = self.clock.wall_us()
                 for w in self._segments.values():
                     try:
                         w.flush_block()
+                        w.roll_if_due(wall_us)  # seal an hour that is over even if its class went quiet
                     except OSError as exc:
                         self._handle_io_error(exc, ("-", "-"), 0)
                 last_flush = now

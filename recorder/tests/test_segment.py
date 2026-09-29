@@ -74,6 +74,27 @@ def test_seal_produces_single_frame_readable_file_and_manifest(env):
     assert manifest.live_segments()[ev["name"]]["sha256"] == ev["sha256"]
 
 
+def test_a_quiet_class_still_seals_when_its_hour_is_over(env):
+    """Hourly snapshots and daily reference data must not sit in an unsealed .part until the next record."""
+    root, clock, state = env
+    w, manifest = make_writer(root, clock, state)
+    hour_end = ((T0 // 3_600_000_000) + 1) * 3_600_000_000
+    w.write(line(1, T0), run=1, seq=1, wall_us=T0, stream="s")
+    assert w.roll_if_due(T0 + 60_000_000) is None and w.is_open, "the hour is not over yet"
+    assert w.roll_if_due(hour_end + 1_000_000) is None and w.is_open, (
+        "grace period for records still in flight"
+    )
+    ev = w.roll_if_due(hour_end + 6_000_000)
+    assert ev is not None and ev["reason"] == "rotate" and not w.is_open
+    assert ev["name"] in manifest.live_segments() and (root / ev["name"]).exists()
+    assert w.roll_if_due(hour_end + 7_000_000) is None, "nothing is open any more"
+    # the next record of that class simply opens the next segment
+    assert (
+        w.write(line(2, hour_end + 8_000_000), run=1, seq=2, wall_us=hour_end + 8_000_000, stream="s") is None
+    )
+    assert w.is_open
+
+
 def test_hour_rotation_and_unique_names(env):
     root, clock, state = env
     w, manifest = make_writer(root, clock, state)
