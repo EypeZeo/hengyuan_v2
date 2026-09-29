@@ -1,0 +1,31 @@
+[project]
+name = "hy-recorder"
+version = "0.1.0"
+description = "HengYuan v2 D0 read-only market-data recorder (public data only, no credentials)"
+requires-python = ">=3.11"
+dependencies = [
+  "websockets>=15,<18",
+  "zstandard>=0.23,<0.26",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff",
+]
+
+[tool.setuptools]
+packages = ["hy_recorder", "hy_recorder.verify"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
