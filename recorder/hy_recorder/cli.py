@@ -24,6 +24,14 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return report.exit_code
 
 
+def _cmd_report(args: argparse.Namespace) -> int:
+    from .report import build_report, render_text
+
+    report = build_report(Path(args.root), sample_every=args.sample_every)
+    print(json.dumps(report, indent=1, sort_keys=True) if args.json else render_text(report))
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     from .writer import dump_status
 
@@ -88,6 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--json", action="store_true")
     v.add_argument("--no-hash", action="store_true", help="skip SHA-256 of segments (size still checked)")
     v.set_defaults(fn=_cmd_verify)
+    rp = sub.add_parser("report", help="operations report: rates, storage, bridge time, gaps, clock offset")
+    rp.add_argument("--root", required=True)
+    rp.add_argument("--json", action="store_true")
+    rp.add_argument(
+        "--sample-every", type=int, default=20, help="decode every Nth record for clock statistics"
+    )
+    rp.set_defaults(fn=_cmd_report)
     s = sub.add_parser("status", help="print the recorder's status.json")
     s.add_argument("--root", required=True)
     s.set_defaults(fn=_cmd_status)

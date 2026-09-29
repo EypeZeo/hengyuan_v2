@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import os
 import random
@@ -226,6 +227,17 @@ async def run(args) -> dict:
     # instrumentation
     rx_ns, lat_us, wr_ns, fl_ns, lag_us = array("q"), array("q"), array("q"), array("q"), array("q")
     raw_bytes = [0]
+    lag_events: list[tuple[float, float]] = []  # (seconds since the probe started, lag in ms) for lag > 30 ms
+    gc_pauses: dict[int, list[float]] = {0: [], 1: [], 2: []}
+    gc_mark = [0]
+
+    def gc_cb(phase, info):
+        if phase == "start":
+            gc_mark[0] = time.perf_counter_ns()
+        else:
+            gc_pauses[info["generation"]].append((time.perf_counter_ns() - gc_mark[0]) / 1e6)
+
+    gc.callbacks.append(gc_cb)
     orig_msg, orig_one = ConnectionManager._on_message, Writer._write_one
     orig_write, orig_flush = SegmentWriter.write, SegmentWriter.flush_block
 
@@ -267,11 +279,16 @@ async def run(args) -> dict:
         )
         stop = asyncio.Event()
 
+        probe_start = time.perf_counter()
+
         async def lag_probe():
             while not stop.is_set():
                 t0 = time.perf_counter()
                 await asyncio.sleep(0.05)
-                lag_us.append(int((time.perf_counter() - t0 - 0.05) * 1e6))
+                lag = time.perf_counter() - t0 - 0.05
+                lag_us.append(int(lag * 1e6))
+                if lag > 0.03:
+                    lag_events.append((round(t0 - probe_start, 2), round(lag * 1000, 1)))
 
         psi0, cpu0, thr0, wall0 = psi(), time.process_time(), thread_cpu(), time.monotonic()
         probe = asyncio.create_task(lag_probe())
@@ -282,6 +299,7 @@ async def run(args) -> dict:
         await asyncio.wait_for(task, 120)
         await probe
     finally:
+        gc.callbacks.remove(gc_cb)
         ConnectionManager._on_message, Writer._write_one = orig_msg, orig_one
         SegmentWriter.write, SegmentWriter.flush_block = orig_write, orig_flush
     server.close()
@@ -328,6 +346,10 @@ async def run(args) -> dict:
             "p99": pct(lag_us, 99) / 1e3,
             "p99.9": pct(lag_us, 99.9) / 1e3,
             "max": max(lag_us, default=0) / 1e3,
+        },
+        "loop_lag_events_over_30ms": lag_events[:20],
+        "gc_pauses_ms": {
+            f"gen{g}": {"n": len(v), "max": round(max(v, default=0), 1)} for g, v in gc_pauses.items()
         },
         "cpu_pct_of_one_core": round(100 * (cpu1 - cpu0) / dur, 1),
         "cpu_seconds_by_thread": thr,

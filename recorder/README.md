@@ -78,4 +78,14 @@ python -m pytest -q        # 含本地假交易所的端到端测试（真实 so
 ruff check .
 ```
 
+压测与故障注入（在录制宿主上做，数字以实测为准，不要用开发机的数字）：
+
+```bash
+python tests/loadgen.py --mult 3 --seconds 120 --level 9        # 真实接收路径与写入线程，进程内合成交易所
+mount -t tmpfs -o size=64m tmpfs /mnt/hy-tmpfs                   # 真实小文件系统上的保留阶梯与真 ENOSPC
+HY_TEST_TMPFS=/mnt/hy-tmpfs python3 -m pytest tests/test_disk_pressure_tmpfs.py
+```
+
+`loadgen.py` 的合成交易所与录制器同进程，CPU 数字是录制器自身的上界；价格数量为随机数，压缩比是真实（相关性更强的）数据的下界。
+
 CI：`.github/workflows/ci-recorder.yml`（py3.11 加锁定轮子；py3.13 加最新依赖；部署包可复现性）。
