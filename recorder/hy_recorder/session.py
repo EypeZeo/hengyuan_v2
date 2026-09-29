@@ -102,6 +102,7 @@ class ConnectionManager:
         self._watch = {spec.stream_id(s.name): _Watch(s) for s in spec.streams}
         self._reconnect_reason: str | None = None
         self._deferred_reason: str | None = None
+        self._attempt_opened = False  # did the current connection attempt get past the handshake?
         self._last_forced = -1e9
         self._bad_frame_window = deque[float]()
         self._unexpected_seen: set[str] = set()
@@ -133,16 +134,16 @@ class ConnectionManager:
             attempts.append(clock.mono_s())
             started = clock.mono_s()
             self.state = "connecting"
-            opened = False
+            self._attempt_opened = False
             try:
                 reason = await self._connect_and_read()
-                opened = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - every network/protocol failure ends up here
                 reason = "error:%s" % type(exc).__name__
-                self._on_connect_error(exc)
-            healthy = opened and clock.mono_s() - started >= env.healthy_after_s
+                if not self._attempt_opened:  # a failure after the handshake was already recorded by WS_CLOSE
+                    self._on_connect_error(exc)
+            healthy = self._attempt_opened and clock.mono_s() - started >= env.healthy_after_s
             backoff = env.backoff_start_s if healthy else min(backoff * 2, env.backoff_cap_s)
             self.state = "backoff"
             if not env.stop.is_set():
@@ -218,6 +219,7 @@ class ConnectionManager:
             proxy=None,
             user_agent_header=_USER_AGENT,
         ) as ws:
+            self._attempt_opened = True
             connect_ms = (clock.mono_s() - t1) * 1000
             self.gen += 1
             gen = self.gen

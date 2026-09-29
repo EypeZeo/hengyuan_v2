@@ -188,6 +188,9 @@ class Recorder:
             self.emit("RECOVERY_FAILED", error=type(exc).__name__, detail=str(exc)[:200])
             self._log("recovery failed: %s: %s" % (type(exc).__name__, exc))
         self.writer.start()
+        self.loop_hb = (
+            time.monotonic()
+        )  # boot is synchronous on the loop thread; the monitor starts counting now
         if self._enable_monitor:
             self.monitor = Monitor(
                 lambda: self.loop_hb, lambda: self.writer.hb_mono, exit_fn=self._monitor_exit

@@ -24,6 +24,7 @@ pandas、Polars、DuckDB 与 `zstd -dc` 都能直接读取封存段（`scripts/e
 ```bash
 python3 -m hy_recorder run --config /etc/hy-recorder/recorder.toml   # 录制，直到 SIGTERM/SIGINT，然后优雅封存
 python3 -m hy_recorder verify --root <数据目录> [--json] [--no-hash]  # 离线校验；退出码 0 无失败，1 有失败
+python3 -m hy_recorder report --root <数据目录> [--json]               # 运行报告：速率、体量与 MB/天、桥接耗时、缺口、时钟偏差
 python3 -m hy_recorder status --root <数据目录>                        # 读 status.json
 python3 -m hy_recorder config-check --config <配置>                    # 校验配置并列出推导出的连接
 python3 -m hy_recorder pull --host <ssh 别名> --dest <本机目录>        # 操作员侧：拉取、校验、再回执

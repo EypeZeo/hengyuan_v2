@@ -492,6 +492,24 @@ def test_snapshot_view_reports_stream_health(tmp_path):
     assert st["frames"] == 2 and st["healthy"] is True and st["last_frame_age_s"] is not None
 
 
+def test_a_failure_while_closing_a_good_connection_is_not_reported_as_a_connect_failure(tmp_path):
+    class BadExit(FakeWs):
+        async def __aexit__(self, *exc):
+            raise OSError("close failed")
+
+    ws1, ws2 = BadExit(), FakeWs()
+
+    async def scenario(h):
+        ws1.feed(trade_frame(1))
+        assert await wait_until(lambda: h.writer.records)
+        ws1.server_close()
+        assert await wait_until(lambda: len(h.of("WS_OPEN")) == 2, 5)
+
+    h, _ = drive(tmp_path, trade_spec(max_gap=5, first=5), [ws1, ws2], scenario)
+    assert not h.of("WS_CONNECT_FAIL")
+    assert h.of("WS_CLOSE")[0]["reason"].startswith("closed")
+
+
 @pytest.mark.parametrize("mode", ["gap", "no_data_flag"])
 def test_new_generation_resets_liveness_state(tmp_path, mode):
     ws1, ws2 = FakeWs(), FakeWs()

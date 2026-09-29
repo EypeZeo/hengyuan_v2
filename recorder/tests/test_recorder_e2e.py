@@ -350,6 +350,19 @@ def test_full_pipeline_records_bridges_verifies_and_shuts_down_cleanly(tmp_path)
     live = list((tmp_path / "raw").rglob("*.jsonl.zst"))
     classes = {p.parts[-3] for p in live}
     assert classes == {"depth", "trade", "market", "snapshot", "ref"}
+    # the operations report reads the same lake: two bridged generations, clock offsets, no rate limiting
+    from hy_recorder.report import build_report
+
+    rep = build_report(tmp_path, sample_every=1)
+    assert rep["bridge_seconds_from_ws_open"]["n"] == 2 and not rep["slow_bridges_over_10s"]
+    assert rep["streams"]["spot:btcusdt@trade"]["recv_minus_event_ms"]["n"] > 0
+    assert rep["rate_limits"]["http_418_bans"] == 0 and rep["rate_limits"]["http_429_403_451_events"] == 0
+    assert rep["connections"]["opens_per_connection"] == {
+        "spot_depth_btcusdt": 1,
+        "usdm_depth_btcusdt": 1,
+        "spot_trade": 1,
+        "usdm_market": 1,
+    }
     # status.json carries the operator's view
     status = json.loads((tmp_path / "status.json").read_bytes())
     assert status["run"] == 1 and set(status["connections"]) == set(LOCAL_PATH)
