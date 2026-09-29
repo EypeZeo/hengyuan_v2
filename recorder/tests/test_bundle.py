@@ -86,7 +86,8 @@ def test_build_is_reproducible_and_self_verifying(tmp_path, wheels):
         assert all(m.name == rel1 or m.name.startswith(rel1 + "/") for m in members)
         assert all(m.mtime == 0 and m.uid == 0 and m.gid == 0 and not m.name.startswith("/") for m in members)
         assert [m.name for m in members] == sorted(m.name for m in members) or members[0].name == rel1
-        tf.extractall(tmp_path / "x", filter="data")
+        # the extraction filter argument exists from 3.11.4/3.12; the recording host has 3.11.2
+        tf.extractall(tmp_path / "x", **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
     tree = tmp_path / "x" / rel1
     assert verify_bundle(tree, check_name=True) == []
     assert (tree / "hy_recorder" / "__init__.py").exists() and (tree / "alpha" / "__init__.py").exists()

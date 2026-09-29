@@ -17,7 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def run_child(code: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH", "")) if p),
+    }
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code)],
         capture_output=True,
