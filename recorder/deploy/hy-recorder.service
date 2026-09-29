@@ -3,6 +3,9 @@ Description=HengYuan D0 public market data recorder (read-only, no credentials)
 Documentation=file:///opt/hy-recorder/releases/current/hy_recorder/__init__.py
 After=network-online.target time-sync.target
 Wants=network-online.target
+# Never give up restarting: a start-rate limit would leave a crashed recorder dead (this key belongs in
+# [Unit]; in [Service] systemd 252 ignores it with a warning, which `systemd-analyze verify` reported).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -25,7 +28,6 @@ ExecStart=/usr/bin/python3 -m hy_recorder run --config /etc/hy-recorder/recorder
 # when the event loop or the writer stalls). notify + watchdog is a later enhancement.
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=0
 TimeoutStopSec=45
 KillSignal=SIGTERM
 

@@ -48,11 +48,31 @@ def test_unit_runs_the_bundle_from_pythonpath_as_an_unprivileged_user(unit):
 
 def test_unit_restart_policy_survives_forever_without_a_storm(unit):
     svc = unit["Service"]
-    assert (
-        svc["Restart"] == ["always"] and svc["RestartSec"] == ["10"] and svc["StartLimitIntervalSec"] == ["0"]
-    )
+    assert svc["Restart"] == ["always"] and svc["RestartSec"] == ["10"]
+    # StartLimitIntervalSec is a [Unit] key; systemd 252 ignores it in [Service] (analyze verify said so)
+    assert unit["Unit"]["StartLimitIntervalSec"] == ["0"] and "StartLimitIntervalSec" not in svc
     assert svc["TimeoutStopSec"] == ["45"] and svc["KillSignal"] == ["SIGTERM"]
     assert "WatchdogSec" not in svc and "NotifyAccess" not in svc
+
+
+def test_unit_keys_are_in_the_sections_systemd_reads_them_from(unit):
+    unit_only = {"Description", "Documentation", "After", "Before", "Wants", "Requires", "Conflicts"}
+    unit_only |= {"StartLimitIntervalSec", "StartLimitBurst", "StartLimitAction", "OnFailure"}
+    service_only = {
+        "Type",
+        "User",
+        "Group",
+        "ExecStart",
+        "ExecStartPre",
+        "Restart",
+        "RestartSec",
+        "TimeoutStopSec",
+    }
+    service_only |= {"KillSignal", "Environment", "WorkingDirectory", "StateDirectory", "UMask", "CPUWeight"}
+    service_only |= {"MemoryMax", "NoNewPrivileges", "ProtectSystem", "RestrictAddressFamilies", "Nice"}
+    assert not (set(unit["Service"]) & unit_only), set(unit["Service"]) & unit_only
+    assert not (set(unit["Unit"]) & service_only), set(unit["Unit"]) & service_only
+    assert set(unit) == {"Unit", "Service", "Install"}
 
 
 def test_unit_resource_limits_yield_to_the_co_tenant_without_a_hard_cpu_cap(unit):
