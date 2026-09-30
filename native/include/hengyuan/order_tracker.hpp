@@ -498,6 +498,14 @@ inline void poll_once(OrderTracker& tracker,
                 ev.handle = handle;
                 ev.coid = escalated.client_order_id;
                 ev.resulting_state = OrderState::EscalatedToOperator;
+                // Identity only, like the resolution branch below. drain_reconcile_events() writes the
+                // OrderEscalated audit record -- and through it the durable recovery checkpoint --
+                // from these fields; left at their defaults they recorded symbol 0 / Buy for exactly
+                // the orders a human has to resolve by hand. No fill fields: nothing new was observed
+                // here, and filled_qty_ticks would be fed to OrderFillContext::consume_delta().
+                ev.symbol_id = escalated.symbol_id;
+                ev.side = escalated.side;
+                ev.exchange_order_id = escalated.exchange_order_id;
                 if (outbound.try_push(ev)) {
                     tracker.untrack(coid);
                 }

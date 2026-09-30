@@ -793,6 +793,53 @@ TEST_F(OrderTrackerTest, TheInFlightSlotIsHeldThroughTheWholeWindowAndAfterQuara
     EXPECT_EQ(in_flight.count(), 1u);
 }
 
+// AUDIT ORDER-RECONCILED-SYMBOL-014's sibling: the escalation branch of poll_once() built its
+// ReconcileEvent from the handle, the coid and the resulting state only, so every OrderEscalated
+// audit record -- and the durable recovery checkpoint built from it -- carried symbol 0 / Buy,
+// for exactly the orders a human has to resolve by hand.
+TEST_F(OrderTrackerTest, EscalationEventCarriesTheOrdersIdentityButNoFillFields) {
+    auto rec = make_ambiguous_record("HY-ESC");
+    rec.symbol_id = 7;
+    rec.side = OrderSide::Sell;
+    rec.exchange_order_id = 4242;
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 5}, rec, 0));
+
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.quarantine.hard_cap_ms);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
+    EXPECT_EQ(ev.symbol_id, 7u);
+    EXPECT_EQ(ev.side, OrderSide::Sell);
+    EXPECT_EQ(ev.exchange_order_id, 4242);
+    // Nothing new was observed by an escalation: no fill may reach OrderFillContext/PositionTruth.
+    EXPECT_EQ(ev.filled_qty_ticks, 0);
+    EXPECT_EQ(ev.avg_fill_price_ticks, 0);
+    EXPECT_EQ(ev.fill_delta_qty_ticks, 0);
+}
+
+TEST_F(OrderTrackerTest, EscalatedAuditRecordCarriesSymbolSideAndExchangeOrderId) {
+    InFlightRegistry in_flight;
+    AuditRingSink audit;
+    auto rec = make_ambiguous_record("HY-ESC");
+    rec.symbol_id = 7;
+    rec.side = OrderSide::Sell;
+    rec.exchange_order_id = 4242;
+    auto handle = in_flight.register_submit_handle(rec.client_order_id.view());
+    ASSERT_TRUE(handle.valid());
+    ASSERT_TRUE(tracker_.track(handle, rec, 0));
+
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.quarantine.hard_cap_ms);
+    drain_reconcile_events(in_flight, &audit, outbound_, policy_.quarantine.hard_cap_ms);
+
+    ASSERT_NE(audit.count(), 0u);
+    EXPECT_EQ(audit.last()->event_type, AuditEventType::OrderEscalated);
+    EXPECT_EQ(audit.last()->symbol_id, 7u);
+    EXPECT_EQ(audit.last()->side, OrderSide::Sell);
+    EXPECT_EQ(audit.last()->exchange_order_id, 4242);
+    EXPECT_TRUE(in_flight.is_in_flight("HY-ESC")) << "an escalated order keeps its slot";
+}
+
 // --- poll_once: backoff and throttling ---
 
 TEST_F(OrderTrackerTest, BackoffDelaysNextQueryForSameOrder) {
