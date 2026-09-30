@@ -189,11 +189,16 @@ struct RecoveryApplyResult {
 // SymbolRules (SymbolRegistry::current_rules()); rules_version == 0 means "unknown symbol" and
 // stops the application (fail-closed: the order cannot be scaled). Stops at the first failure;
 // the caller's StartupRecovery then degrades on applied < recovered.
+//
+// `now_wall_ms` (R-10 / L-30) is the wall clock in ms, or OrderRecord::kClockUnset when the caller has
+// none. It lets an Ambiguous order keep the durable time it first became uncertain as its wall anchor
+// (see checkpoint_to_order_record()), so the restart does not reset the unresolved time.
 template <typename RulesLookup>
 inline RecoveryApplyResult apply_recovery(std::span<const OrderRecoveryCheckpoint> checkpoints,
                                            InFlightRegistry& in_flight, ToReconcileRing& to_reconcile,
                                            PositionTruth& position_truth, OrderFillContext& fill_context,
-                                           RulesLookup&& rules_for) noexcept {
+                                           RulesLookup&& rules_for,
+                                           std::int64_t now_wall_ms = OrderRecord::kClockUnset) noexcept {
     RecoveryApplyResult r;
     r.recovered = checkpoints.size();
     for (const OrderRecoveryCheckpoint& cp : checkpoints) {
@@ -218,7 +223,7 @@ inline RecoveryApplyResult apply_recovery(std::span<const OrderRecoveryCheckpoin
         seed_position_truth(position_truth, std::span<const OrderRecoveryCheckpoint>(&cp, 1));
         if (cp.filled_qty_ticks > 0) (void)fill_context.consume_delta(coid, cp.filled_qty_ticks);
 
-        if (!to_reconcile.try_push(ReconcileIngress{handle, checkpoint_to_order_record(cp)})) break;
+        if (!to_reconcile.try_push(ReconcileIngress{handle, checkpoint_to_order_record(cp, now_wall_ms)})) break;
         ++r.applied;
     }
     return r;

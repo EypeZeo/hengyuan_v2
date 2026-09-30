@@ -410,6 +410,95 @@ TEST(StampUnknownSince, RecordStaysTriviallyCopyableForTheSpscRingBoundary) {
     EXPECT_TRUE(std::is_trivially_copyable_v<OrderRecord>);
 }
 
+// --- L-30: the wall anchor of an order recovered from the durable log ---
+
+TEST(RecoveredWallAnchor, AcceptsAPlausibleWallTime) {
+    EXPECT_EQ(hy::recovered_wall_anchor(1'790'000'000'000, 1'790'000'100'000), 1'790'000'000'000);
+    EXPECT_EQ(hy::recovered_wall_anchor(1'790'000'000'000, kUnset), 1'790'000'000'000)
+        << "no wall clock to compare with: only the lower bound applies";
+}
+
+TEST(RecoveredWallAnchor, RejectsAReadingThatIsNotAWallTime) {
+    // The demo harnesses stamp their frames with a monotonic reading; 0 means "no anchor".
+    EXPECT_EQ(hy::recovered_wall_anchor(0, 1'790'000'000'000), kUnset);
+    EXPECT_EQ(hy::recovered_wall_anchor(-5, kUnset), kUnset);
+    EXPECT_EQ(hy::recovered_wall_anchor(1'000, 1'790'000'000'000), kUnset);
+    EXPECT_EQ(hy::recovered_wall_anchor(999'999'999'999, kUnset), kUnset);
+    EXPECT_EQ(hy::recovered_wall_anchor(1'000'000'000'000, kUnset), 1'000'000'000'000)
+        << "the lower bound itself (2001-09-09) is a plausible wall time";
+    EXPECT_EQ(hy::recovered_wall_anchor(kUnset, 1'790'000'000'000), kUnset);
+}
+
+TEST(RecoveredWallAnchor, RejectsAReadingFromTheFutureButToleratesSmallClockSkew) {
+    constexpr std::int64_t now = 1'790'000'000'000;
+    EXPECT_EQ(hy::recovered_wall_anchor(now + 60'000, now), now + 60'000);
+    EXPECT_EQ(hy::recovered_wall_anchor(now + 60'001, now), kUnset)
+        << "an anchor ahead of the wall clock would otherwise sit there and silence it";
+}
+
+// --- L-30: the recovered wall anchor and the "one query first" rule ---
+//
+// A wall anchor restored from the durable log also counts the time the process was DOWN. Held against
+// an order this process has not asked about yet, that would quarantine every order a planned restart
+// left unresolved before its first query. So such a reading may trigger only once the order has been
+// sent at least one query; until then only the (fresh) monotonic reading counts.
+
+namespace {
+constexpr std::int64_t kWall = 1'790'000'000'000;
+
+// An Ambiguous order as checkpoint_to_order_record() + OrderTracker::track() leave it after a restart:
+// the wall anchor is the durable one, the monotonic anchor is this process's own first sight (1000).
+OrderRecord recovered_ambiguous(std::int64_t wall_anchor) {
+    OrderRecord rec = ambiguous_since(1000, wall_anchor);
+    rec.wall_anchor_recovered = true;
+    return rec;
+}
+}  // namespace
+
+TEST(RecoveredOrder, TheDowntimeIsNotHeldAgainstAnOrderThisProcessHasNotAskedAboutYet) {
+    auto rec = recovered_ambiguous(kWall);
+    // The durable anchor is an hour old; this process saw the order 100 ms ago and has sent no query.
+    EXPECT_EQ(determine_reconcile_action(rec, 1100, kWall + 3'600'000, kDefaultPolicy), ReconcileAction::QueryOrder);
+    // One query sent and still unanswered: the whole unresolved time counts, quarantine.
+    rec.query_attempts = 1;
+    EXPECT_EQ(determine_reconcile_action(rec, 1100, kWall + 3'600'000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(RecoveredOrder, ARestartMidWindowKeepsTheUnresolvedTimeAccumulating) {
+    auto rec = recovered_ambiguous(kWall);
+    rec.query_attempts = 1;
+    // Only 100 ms of THIS process's life, but 15 s since the durable anchor.
+    EXPECT_EQ(determine_reconcile_action(rec, 1100, kWall + 14'999, kDefaultPolicy), ReconcileAction::QueryOrder);
+    EXPECT_EQ(determine_reconcile_action(rec, 1100, kWall + 15'000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(RecoveredOrder, TheMonotonicClockStillBoundsAnOrderWhoseQueriesCannotBeSent) {
+    auto rec = recovered_ambiguous(kWall);  // query_attempts stays 0: every query dies locally
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 14'999, kWall + 3'600'000, kDefaultPolicy),
+              ReconcileAction::QueryOrder);
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 15'000, kWall + 3'600'000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(RecoveredOrder, TheFiveQueryCriterionAppliesToARecoveredOrderToo) {
+    auto rec = recovered_ambiguous(kWall);
+    rec.query_attempts = 5;
+    EXPECT_EQ(determine_reconcile_action(rec, 1100, kWall + 4'999, kDefaultPolicy), ReconcileAction::QueryOrder);
+    EXPECT_EQ(determine_reconcile_action(rec, 1100, kWall + 5'000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(RecoveredOrder, AnOrderWhoseAnchorWasNotRecoveredIsUnaffected) {
+    // The wall anchor was stamped by this process itself: no downtime in it, so it counts at once
+    // (R-10's hard cap must still bound an order whose queries cannot even be sent).
+    auto rec = ambiguous_since(1000, kWall);
+    rec.query_attempts = 0;
+    EXPECT_EQ(determine_reconcile_action(rec, 1100, kWall + 15'000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
 // ===========================================================================
 // EXHAUSTIVE TRANSITION RELATION — all 12 x 12 = 144 (from, to) pairs
 // ===========================================================================

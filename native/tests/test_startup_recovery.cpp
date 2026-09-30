@@ -344,15 +344,16 @@ protected:
 
     QueryPort port() { return QueryPort{&fake_query, &exchange_}; }
 
-    // One reconcile-loop tick, exactly as a main loop runs it.
-    void tick(std::int64_t now_ms) {
-        poll_once(tracker_, to_reconcile_, reconcile_events_, port(), policy_, now_ms);
+    // One reconcile-loop tick, exactly as a main loop runs it. `wall_ms` is the wall clock (R-10),
+    // or OrderRecord::kClockUnset for a loop that has none.
+    void tick(std::int64_t now_ms, std::int64_t wall_ms = OrderRecord::kClockUnset) {
+        poll_once(tracker_, to_reconcile_, reconcile_events_, port(), policy_, now_ms, wall_ms);
         drain_reconcile_events(in_flight_, nullptr, reconcile_events_, now_ms, &truth_, &fill_context_);
     }
 
-    RecoveryApplyResult apply(const DurableAuditSink& sink) {
+    RecoveryApplyResult apply(const DurableAuditSink& sink, std::int64_t now_wall_ms = OrderRecord::kClockUnset) {
         return apply_recovery(sink.recovered_checkpoints(), in_flight_, to_reconcile_, truth_, fill_context_,
-                              &rules_for_test);
+                              &rules_for_test, now_wall_ms);
     }
 
     RecoveryObservation observe(const DurableAuditSink& sink, const RecoveryApplyResult& applied) {
@@ -402,6 +403,125 @@ TEST_F(StartupRecoveryLogTest, AmbiguousRecoveredOrderBlocksReadyUntilTheExchang
     EXPECT_EQ(truth_.net_qty_ticks(1), 10);          // and the fill is now in PositionTruth
     EXPECT_EQ(sm.update(observe(restarted, applied), 1'000), RunState::Ready);
     EXPECT_TRUE(sm.submit_enabled(observe(restarted, applied)));
+}
+
+// --- R-10 / L-30: the unresolved time survives a restart ---
+//
+// With frames stamped by a real wall time, the durable "first became uncertain" time seeds the order's
+// wall anchor: the unresolved time is measured from the log, not from this process's own first sight
+// of the order. Lenient rule (Owner's default): the time the process was DOWN does not count until the
+// order has been sent one query in this life -- every recovered order gets one authoritative look.
+
+namespace {
+constexpr std::int64_t kT0 = 1'790'000'000'000;  // a plausible wall time (2026-09)
+}
+
+// A planned restart, an hour of downtime, an exchange that answers: the order must get its first
+// query BEFORE any quarantine. Held against it unseen, that hour would put every restart that leaves
+// an order unresolved into Degraded for want of a single GET.
+TEST_F(StartupRecoveryLogTest, AnOrderLeftUnresolvedByAPlannedRestartGetsItsFirstQueryBeforeAnyQuarantine) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 100).acked());
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 1u);
+    constexpr std::int64_t kRestartWall = kT0 + 3'600'000;  // an hour of downtime
+    ASSERT_TRUE(apply(restarted, kRestartWall).ok());
+
+    exchange_.outcome = QueryOutcome::Found;
+    exchange_.state = OrderState::Filled;
+    exchange_.filled_qty = 10;
+    tick(0, kRestartWall);
+
+    EXPECT_EQ(exchange_.calls, 1) << "the order was asked about first";
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A")) << "and it resolved: it was not quarantined unseen";
+    EXPECT_EQ(truth_.net_qty_ticks(1), 10) << "the fill reached PositionTruth, which an escalation would not do";
+}
+
+TEST_F(StartupRecoveryLogTest, AnOrderStillUnansweredAfterItsFirstQueryIsQuarantinedAtOnce) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 100).acked());
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    constexpr std::int64_t kRestartWall = kT0 + 3'600'000;
+    ASSERT_TRUE(apply(restarted, kRestartWall).ok());
+    exchange_.outcome = QueryOutcome::Inconclusive;  // the exchange is not answering
+
+    tick(0, kRestartWall);
+    EXPECT_EQ(exchange_.calls, 1);
+    EXPECT_EQ(tracker_.count(), 1u) << "the first look comes before the quarantine";
+
+    tick(100, kRestartWall + 100);
+    EXPECT_EQ(tracker_.count(), 0u) << "the hour of unresolved time now counts: quarantined";
+    EXPECT_EQ(exchange_.calls, 1) << "escalation fires no further query";
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A")) << "a quarantined order keeps its slot";
+}
+
+// L-30's point: a process that keeps crashing and restarting does not keep starting the clock over.
+TEST_F(StartupRecoveryLogTest, ACrashLoopDoesNotResetTheUnresolvedTime) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 100).acked());
+    }  // the first process dies with the order Submitting
+    exchange_.outcome = QueryOutcome::Inconclusive;  // the exchange never answers
+
+    // One "life" of the process: a fresh registry, tracker and rings (a restart forgets all of memory),
+    // recovery from the SAME durable log, and a reconcile loop ticking every 100 ms of its own monotonic
+    // clock (which starts at 0) against a wall clock that read `wall_start` at that moment. Returns the
+    // wall time of the tick at which the order was quarantined, or -1.
+    auto live = [&](std::int64_t wall_start, std::int64_t lifetime_ms) -> std::int64_t {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        InFlightRegistry in_flight;
+        OrderTracker tracker;
+        ToReconcileRing to_reconcile;
+        ReconcileEventRing events;
+        PositionTruth truth;
+        OrderFillContext fill_context;
+        const RecoveryApplyResult applied = apply_recovery(sink.recovered_checkpoints(), in_flight, to_reconcile,
+                                                            truth, fill_context, &rules_for_test, wall_start);
+        EXPECT_TRUE(applied.ok());
+        for (std::int64_t mono = 0; mono <= lifetime_ms; mono += 100) {
+            poll_once(tracker, to_reconcile, events, port(), policy_, mono, wall_start + mono);
+            drain_reconcile_events(in_flight, nullptr, events, mono, &truth, &fill_context);
+            if (tracker.count() == 0) return wall_start + mono;  // only an escalation empties it here
+        }
+        return -1;
+    };
+
+    EXPECT_EQ(live(kT0 + 3'000, 4'000), -1) << "life 1 ends 7 s after the order became uncertain";
+    EXPECT_EQ(live(kT0 + 9'000, 3'000), -1) << "life 2 ends 12 s after it";
+    // Life 3 lives 2 s. Counted from its own start it could never reach 15 s; counted from the durable
+    // log it is quarantined the moment 15 s have passed since the order became uncertain (the
+    // Submitting frame, kT0 + 100), one query into its life.
+    EXPECT_EQ(live(kT0 + 14'500, 2'000), kT0 + 15'100);
+}
+
+// A frame time ahead of the wall clock this process reads is not trusted: it would sit in the anchor
+// (nothing moves a set anchor) and silence the wall clock for that order. apply_recovery() must hand
+// the wall clock down so the check can see it.
+TEST_F(StartupRecoveryLogTest, AFrameTimeAheadOfTheWallClockIsNotTrustedAndSeedsNoAnchor) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0 + 3'600'000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 3'600'100).acked());
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_TRUE(apply(restarted, /*now_wall_ms=*/kT0).ok());
+    exchange_.outcome = QueryOutcome::Inconclusive;
+    tick(0, kT0);
+
+    bool found = false;
+    tracker_.for_each_active([&](InFlightHandle, OrderRecord& record, std::int64_t) {
+        found = true;
+        EXPECT_FALSE(record.wall_anchor_recovered);
+        EXPECT_EQ(record.unknown_since_wall_ms, kT0) << "stamped by this process at first sight instead";
+    });
+    EXPECT_TRUE(found);
 }
 
 // THE double-count regression. The order was already 4/10 filled when we crashed, so seeding puts

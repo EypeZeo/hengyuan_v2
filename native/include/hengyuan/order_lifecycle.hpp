@@ -288,13 +288,21 @@ struct OrderRecord {
     // off the two clocks the reconcile loop has -- the monotonic one it already uses for backoff,
     // and the wall clock -- both in milliseconds. kClockUnset until stamp_unknown_since() sets
     // them, and stamped exactly once (never moved afterwards), so the unresolved time only ever
-    // accumulates within this process. Appended LAST, like every other additive field here.
-    // NOT durable: a restart re-stamps them (known limitation L-30 -- the durable anchor is
-    // R-06/R-14 work), so a crash loop can still postpone escalation; that sub-criterion of
-    // FI-042 stays NOT_TESTABLE_YET.
+    // accumulates. Appended LAST, like every other additive field here.
+    //
+    // Limitation L-30, and how far it is closed: the MONOTONIC anchor cannot survive a restart (that
+    // clock starts over), so a recovered order gets a fresh one. The WALL anchor can: recovery seeds
+    // it from the MAC-verified header time of the durable frame that first made the order uncertain
+    // (recovered_wall_anchor(), below), so the unresolved time keeps accumulating across restarts
+    // and crash loops -- the wall clock is what carries it, which is exactly the job R-10 gave it.
     static constexpr std::int64_t kClockUnset = std::numeric_limits<std::int64_t>::min();
     std::int64_t unknown_since_mono_ms{kClockUnset};
     std::int64_t unknown_since_wall_ms{kClockUnset};
+    // True when unknown_since_wall_ms came out of the durable log rather than from this process's
+    // own first sight of the order. Such an anchor also counts the time the process was DOWN, so
+    // unknown_quarantine_due() lets it trigger only after this process has sent the order at least
+    // one query (see there).
+    bool wall_anchor_recovered{false};
 
     TransitionResult transition_to(OrderState next) noexcept {
         auto result = validate_transition(state, next);
@@ -353,13 +361,42 @@ inline std::int64_t elapsed_since_ms(std::int64_t now_ms, std::int64_t since_ms)
     return now_ms - since_ms;
 }
 
+// The wall anchor of an order recovered from the durable log (limitation L-30). `utc_ms` is the
+// MAC-verified header time of the frame that first made the order uncertain
+// (OrderRecoveryCheckpoint::unknown_since_utc_ms; 0 = none). Returns OrderRecord::kClockUnset -- "no
+// anchor: stamp at first sight, as before" -- unless the value can be a wall time at all. A reading
+// before 2001-09-09 is a relative or monotonic clock (the demo harnesses stamp their frames with
+// one); one more than a minute ahead of `now_wall_ms` is a clock that does not agree with ours.
+// Either would otherwise sit in the anchor for good (stamp_unknown_since() never moves a set
+// anchor) and silence the wall clock for that order.
+inline std::int64_t recovered_wall_anchor(std::int64_t utc_ms, std::int64_t now_wall_ms) noexcept {
+    constexpr std::int64_t kMinPlausibleWallMs = 1'000'000'000'000;
+    constexpr std::int64_t kFutureSlackMs = 60'000;
+    if (utc_ms < kMinPlausibleWallMs) return OrderRecord::kClockUnset;
+    // utc_ms >= kMinPlausibleWallMs, so the subtraction cannot underflow.
+    if (now_wall_ms != OrderRecord::kClockUnset && utc_ms - kFutureSlackMs > now_wall_ms) {
+        return OrderRecord::kClockUnset;
+    }
+    return utc_ms;
+}
+
 // True iff the R-10 criterion holds for `rec` at the given readings of the two clocks
 // (`now_wall_ms` may be OrderRecord::kClockUnset when the caller has no wall clock).
+//
+// A wall anchor recovered from the durable log counts the time this process was down. Held against
+// an order this process has not asked about yet, that would quarantine every order left unresolved
+// by a planned restart before its first query -- and put the run into Degraded for want of one
+// GET. So such a reading may only trigger once the order has been sent at least one query in this
+// process; until then only the (fresh) monotonic reading counts, which still bounds an order whose
+// queries cannot be sent at all. A crash loop that never gets as far as one query is not
+// quarantined either, but a process in that state cannot trade (startup recovery gates on it), so
+// it opens no new exposure.
 inline bool unknown_quarantine_due(const OrderRecord& rec, std::int64_t now_mono_ms,
                                    std::int64_t now_wall_ms,
                                    const UnknownQuarantinePolicy& policy) noexcept {
     const std::int64_t mono = elapsed_since_ms(now_mono_ms, rec.unknown_since_mono_ms);
-    const std::int64_t wall = elapsed_since_ms(now_wall_ms, rec.unknown_since_wall_ms);
+    std::int64_t wall = elapsed_since_ms(now_wall_ms, rec.unknown_since_wall_ms);
+    if (rec.wall_anchor_recovered && rec.query_attempts == 0) wall = 0;
     const std::int64_t elapsed = mono > wall ? mono : wall;
     // (2) The hard cap. `elapsed` is never negative, so a non-positive cap is reached by
     // definition -- that is how a degenerate policy fails closed to "escalate" with no special case.

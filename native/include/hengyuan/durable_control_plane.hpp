@@ -224,6 +224,14 @@ enum class FrameTimeKind : std::uint8_t {
     UnknownBootstrap = 1,    // recorded_utc_ms MUST be 0
 };
 
+// A frame's recorded time read as a WALL time: `recorded_utc_ms` for a ServerCorrectedUtc frame, and 0
+// ("no wall time") for anything else. An UnknownBootstrap frame means there was no trustworthy clock when
+// it was written; whatever its recorded_utc_ms says (the spec requires 0), it must never seed a clock --
+// R-10 / L-30's recovered wall anchor is the consumer (durable_audit_sink.hpp's recovery scan).
+inline std::int64_t frame_wall_time_ms(FrameTimeKind kind, std::int64_t recorded_utc_ms) noexcept {
+    return kind == FrameTimeKind::ServerCorrectedUtc ? recorded_utc_ms : 0;
+}
+
 // =============================================================================
 // Freeze-episode payload types (docs/SPEC_INVARIANTS.md's "durable 审计日志" /
 // "崩溃恢复 / Freeze 子系统" entries). These are the durable ABI backing the
@@ -1865,6 +1873,16 @@ struct OrderRecoveryCheckpoint {
     // now. order_type/the SymbolRules join/escalated-ledger array remain out of
     // scope, unchanged.
     OrderSide side{OrderSide::Buy};
+
+    // R-10 / limitation L-30: when this order FIRST became uncertain, as the MAC-verified
+    // recorded_utc_ms of the durable frame that made it so -- the frame that took it to Ambiguous,
+    // or, for an order whose last durable state is Submitting (remapped to Ambiguous by the scan),
+    // the Submitting frame: the earliest moment its fate could have become unknown. 0 = none: the
+    // order is not recovered as Ambiguous, or that frame's time was not a ServerCorrectedUtc
+    // reading. IN MEMORY ONLY, like the rest of this struct: recovery_scan() rebuilds it from
+    // frames already on disk, so no on-disk format changes. checkpoint_to_order_record() turns it
+    // into OrderRecord::unknown_since_wall_ms after a plausibility check (recovered_wall_anchor()).
+    std::int64_t unknown_since_utc_ms{0};
 };
 static_assert(std::is_trivially_copyable_v<OrderRecoveryCheckpoint>);
 static_assert(std::is_standard_layout_v<OrderRecoveryCheckpoint>);

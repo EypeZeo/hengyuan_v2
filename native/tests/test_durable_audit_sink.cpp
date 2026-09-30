@@ -609,6 +609,139 @@ TEST_F(DurableAuditSinkTest, CheckpointToOrderRecordDefaultsBuySideWhenNeverSet)
     EXPECT_EQ(cps[0].side, OrderSide::Buy);
 }
 
+// --- R-10 / L-30: the durable time an order first became uncertain ---
+//
+// The frame header's recorded_utc_ms is MAC-verified and already on disk, so recovery can hand the
+// reconcile loop a wall anchor for an order left Ambiguous (or Submitting, which the scan remaps to
+// Ambiguous) without any change to the on-disk format.
+
+namespace {
+constexpr std::int64_t kT0 = 1'790'000'000'000;  // a plausible wall time (2026-09)
+
+AuditRecord make_ambiguous(const char* coid, std::uint32_t symbol_id) {
+    AuditRecord rec{};
+    rec.timestamp_ms = 1002;
+    rec.event_type = AuditEventType::OrderAmbiguous;
+    rec.mode = ExecutionMode::Live;
+    rec.symbol_id = symbol_id;
+    rec.set_client_order_id(coid);
+    rec.resulting_state = OrderState::Ambiguous;
+    return rec;
+}
+}  // namespace
+
+TEST_F(DurableAuditSinkTest, RecoveredAmbiguousOrderCarriesTheTimeItFirstBecameUncertain) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 100).acked());
+        ASSERT_TRUE(sink.append_durable(make_ambiguous("HY-A", 1), kT0 + 10'000).acked());  // the POST timed out
+        // A repeated Ambiguous record (same state) must not move the anchor.
+        ASSERT_TRUE(sink.append_durable(make_ambiguous("HY-A", 1), kT0 + 20'000).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(cps[0].unknown_since_utc_ms, kT0 + 10'000) << "the FIRST Ambiguous frame, not the later repeat";
+}
+
+TEST_F(DurableAuditSinkTest, ARecoveredSubmittingOrderUsesTheSubmittingFrameTime) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 1'500).acked());
+    }  // the process died before any outcome was written
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous) << "Submitting is remapped to Ambiguous";
+    EXPECT_EQ(cps[0].unknown_since_utc_ms, kT0 + 1'500)
+        << "the earliest moment its fate could have become unknown: errs toward quarantining sooner";
+}
+
+TEST_F(DurableAuditSinkTest, ARecoveredLiveOrderHasNoUnknownAnchor) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 100).acked());
+        ASSERT_TRUE(sink.append_durable(make_ambiguous("HY-A", 1), kT0 + 10'000).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), kT0 + 11'000).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Accepted);
+    EXPECT_EQ(cps[0].unknown_since_utc_ms, 0) << "no longer uncertain: nothing to seed";
+    OrderRecord rec = checkpoint_to_order_record(cps[0], kT0 + 60'000);
+    EXPECT_EQ(rec.unknown_since_wall_ms, OrderRecord::kClockUnset);
+    EXPECT_FALSE(rec.wall_anchor_recovered);
+}
+
+TEST_F(DurableAuditSinkTest, CheckpointToOrderRecordSeedsTheWallAnchorAndMarksItRecovered) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 1'500).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+
+    OrderRecord rec = checkpoint_to_order_record(cps[0], kT0 + 60'000);
+    EXPECT_EQ(rec.unknown_since_wall_ms, kT0 + 1'500);
+    EXPECT_TRUE(rec.wall_anchor_recovered);
+    EXPECT_EQ(rec.unknown_since_mono_ms, OrderRecord::kClockUnset)
+        << "the monotonic clock starts over with the process: the tracker stamps that one";
+
+    // No wall clock at the call site: only the lower bound is checked, the anchor is still seeded.
+    OrderRecord no_clock = checkpoint_to_order_record(cps[0]);
+    EXPECT_EQ(no_clock.unknown_since_wall_ms, kT0 + 1'500);
+    EXPECT_TRUE(no_clock.wall_anchor_recovered);
+}
+
+TEST_F(DurableAuditSinkTest, FrameTimesThatAreNotWallTimesSeedNoAnchor) {
+    {
+        // The demo harnesses stamp their frames with a monotonic reading (small numbers).
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].unknown_since_utc_ms, 1001) << "the scan reports what the frame says ...";
+    OrderRecord rec = checkpoint_to_order_record(cps[0], kT0);
+    EXPECT_EQ(rec.unknown_since_wall_ms, OrderRecord::kClockUnset) << "... but it is not a wall time, so it seeds nothing";
+    EXPECT_FALSE(rec.wall_anchor_recovered);
+}
+
+TEST_F(DurableAuditSinkTest, AFrameTimeFromTheFutureSeedsNoAnchor) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), kT0 + 3'600'000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), kT0 + 3'600'100).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    OrderRecord rec = checkpoint_to_order_record(cps[0], kT0);  // our wall clock says an hour earlier
+    EXPECT_EQ(rec.unknown_since_wall_ms, OrderRecord::kClockUnset);
+    EXPECT_FALSE(rec.wall_anchor_recovered);
+}
+
+// The recovery scan reads a frame's time through frame_wall_time_ms(). append_durable() only ever writes
+// ServerCorrectedUtc frames, so the UnknownBootstrap branch cannot be reached end to end from here and is
+// pinned on the function itself: a frame written while there was no trustworthy clock never seeds one.
+TEST(FrameWallTimeTest, OnlyAServerCorrectedUtcFrameCarriesAWallTime) {
+    EXPECT_EQ(frame_wall_time_ms(FrameTimeKind::ServerCorrectedUtc, kT0), kT0);
+    EXPECT_EQ(frame_wall_time_ms(FrameTimeKind::UnknownBootstrap, kT0), 0)
+        << "whatever an UnknownBootstrap frame's recorded time says, it is not a wall time";
+    EXPECT_EQ(frame_wall_time_ms(FrameTimeKind::UnknownBootstrap, 0), 0);
+}
+
 // --- seed_position_truth() ---
 
 // PartialFill, not Filled -- Filled is exchange-final, and
