@@ -1,0 +1,11 @@
+# Deployment lock: CPython 3.11, linux x86_64 (manylinux, glibc >= 2.28). Neither package has runtime
+# dependencies. One hash per package on purpose: only the binary wheel for the recording host (and the
+# CI runner) is acceptable; the pure-python fallback wheel of websockets is deliberately NOT listed so a
+# missing C speedup can never be installed silently. Refresh from the PyPI JSON API and rebuild the bundle;
+# scripts/build_bundle.py re-checks every wheel against these hashes.
+#   websockets-17.1-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
+#   zstandard-0.25.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+websockets==17.1 \
+    --hash=sha256:0c84bdef916556cbe1d5a43b423398be4dd3cba6522b463e53d848578b920695
+zstandard==0.25.0 \
+    --hash=sha256:9300d02ea7c6506f00e627e287e0492a5eb0371ec1670ae852fefffa6164b072

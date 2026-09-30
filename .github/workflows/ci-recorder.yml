@@ -1,0 +1,123 @@
+name: CI Recorder
+
+# recorder/ is the D0 read-only public-data recorder (Python). Same reasoning as ci-python.yml (AUDIT
+# CI-PY-013): main-merge-guard.yml treats "no workflow matched the changed paths" as a PASS, so without a
+# workflow of its own a recorder-only PR would merge with zero verification. Independent of the other
+# workflows on purpose: a failure in one must not mask or block another.
+#
+# Three legs:
+#   * lock-311  -- CPython 3.11 (the recording host's interpreter) with the exact hash-pinned wheels that
+#                  get deployed (requirements.lock, --require-hashes), full tests + ruff.
+#   * latest    -- CPython 3.13 with unpinned dependencies: early warning for upstream API drift.
+#   * bundle    -- builds the deployment bundle twice and requires byte-identical output, then re-verifies
+#                  the unpacked tree against its own manifest.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'recorder/**'
+      - '.github/workflows/ci-recorder.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'recorder/**'
+      - '.github/workflows/ci-recorder.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  lock-311:
+    name: "recorder: py3.11 + locked wheels"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: recorder/requirements.lock
+
+      - name: Install locked runtime dependencies and dev tools
+        working-directory: recorder
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          pip install "pytest>=8" ruff
+          pip install -e . --no-deps
+
+      - name: Run tests
+        working-directory: recorder
+        run: python -m pytest -q
+
+      - name: Lint
+        working-directory: recorder
+        run: ruff check .
+
+  latest:
+    name: "recorder: py3.13 + latest dependencies"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: recorder/pyproject.toml
+
+      - name: Install
+        working-directory: recorder
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        working-directory: recorder
+        run: python -m pytest -q
+
+  bundle:
+    name: "recorder: deployment bundle is reproducible"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Build twice, compare, verify
+        working-directory: recorder
+        run: |
+          python scripts/build_bundle.py --out dist-a
+          python scripts/build_bundle.py --out dist-b
+          A=$(cat dist-a/*.sha256)
+          B=$(cat dist-b/*.sha256)
+          echo "a: $A"
+          echo "b: $B"
+          test "$A" = "$B"
+          ( cd dist-a && sha256sum -c ./*.sha256 )
+          mkdir unpacked
+          tar -xzf dist-a/*.tar.gz -C unpacked
+          REL=$(ls unpacked)
+          PYTHONPATH="unpacked/$REL" python -B -m hy_recorder.bundle verify "unpacked/$REL" --check-name
+          PYTHONPATH="unpacked/$REL" python -B -c "import websockets, zstandard, hy_recorder; print('imports ok', websockets.__version__, zstandard.__version__)"
