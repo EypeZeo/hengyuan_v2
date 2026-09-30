@@ -324,7 +324,7 @@ try {
       q:document.getElementById('q').value,
       cards:document.querySelectorAll('.card:not(.hidden)').length,
       marks:document.querySelectorAll('mark').length}),250));`);
-  check("一键清除恢复全部结果", cleared.cards === 24 && cleared.q === "", JSON.stringify(cleared));
+  check("一键清除恢复全部结果", cleared.cards === 25 && cleared.q === "", JSON.stringify(cleared));
   check("清除后命中高亮一并撤下", cleared.marks === 0, String(cleared.marks));
 
   // ---------- 7 浅色主题 ----------
@@ -458,8 +458,8 @@ try {
             rows:boxes.reduce((n,b)=>n+b.querySelectorAll('tbody tr').length,0),
             scrollable:document.querySelector('.tw.tall').scrollHeight
                        >document.querySelector('.tw.tall').clientHeight};`);
-  check("三张故障用例表均启用容器内滚动，合计 41 行",
-    sticky0.boxes === 3 && sticky0.rows === 41 && sticky0.scrollable, JSON.stringify(sticky0));
+  check("三张故障用例表均启用容器内滚动，合计 45 行",
+    sticky0.boxes === 3 && sticky0.rows === 45 && sticky0.scrollable, JSON.stringify(sticky0));
   const sticky1 = await b.eval(`
     const box=document.querySelector('.tw.tall');
     box.scrollTop=900;
