@@ -41,6 +41,27 @@ def _dist(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _probe_view(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """REST ``/time`` probes: the offset estimate is only as good as half the round trip, so besides the
+    plain distributions report the median offset of the fastest tenth with its uncertainty."""
+    pairs = [
+        (p["rtt_us"] / 1000.0, float(p["offset_ms"]))
+        for p in items
+        if isinstance(p.get("rtt_us"), (int, float)) and isinstance(p.get("offset_ms"), (int, float))
+    ]
+    best = sorted(pairs)[: max(1, len(pairs) // 10)] if pairs else []
+    return {
+        "n": len(items),
+        "offset_ms": _dist([o for _, o in pairs]),
+        "rtt_ms": _dist([r for r, _ in pairs]),
+        "fastest_tenth": {
+            "n": len(best),
+            "offset_ms_median": _pct([o for _, o in best], 50),
+            "uncertainty_ms": round(max(r for r, _ in best) / 2.0, 3) if best else None,
+        },
+    }
+
+
 def _event_time_ms(payload: bytes) -> int | None:
     try:
         obj = json.loads(payload)
@@ -194,13 +215,11 @@ def build_report(root: Path, *, sample_every: int = 20) -> dict[str, Any]:
             "status_counters": status.get("rest", {}).get("counters"),
         },
         "clock_probe": {
-            "n": len(probes),
-            "offset_ms": _dist(
-                [p["offset_ms"] for p in probes if isinstance(p.get("offset_ms"), (int, float))]
-            ),
-            "rtt_ms": _dist(
-                [p["rtt_us"] / 1000.0 for p in probes if isinstance(p.get("rtt_us"), (int, float))]
-            ),
+            **_probe_view(probes),
+            "by_venue": {
+                v: _probe_view([p for p in probes if p.get("venue") == v])
+                for v in sorted({p.get("venue") for p in probes if p.get("venue")})
+            },
         },
         "queues": {
             "high_water": {k: v.get("high_water") for k, v in queues.items()},
@@ -264,7 +283,19 @@ def render_text(rep: dict[str, Any]) -> str:
         "gaps: %d %s" % (len(rep["gaps"]), [g["rule"] for g in rep["gaps"]][:10]),
         "snapshots: %s" % rep["snapshots"],
         "rate limits: %s" % rep["rate_limits"],
-        "clock probes: %s" % rep["clock_probe"],
+        "clock probes (server minus host, ms):",
+        *[
+            "  %-5s n=%d rtt p50 %s min %s | fastest tenth: offset %s +/- %s"
+            % (
+                venue,
+                v["n"],
+                v["rtt_ms"].get("p50"),
+                v["rtt_ms"].get("min"),
+                v["fastest_tenth"]["offset_ms_median"],
+                v["fastest_tenth"]["uncertainty_ms"],
+            )
+            for venue, v in rep["clock_probe"]["by_venue"].items()
+        ],
         "queues: high-water %s dropped %s overrun events %d loop max lag %s s write errors %s"
         % (
             rep["queues"]["high_water"],

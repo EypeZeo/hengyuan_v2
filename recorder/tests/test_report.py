@@ -67,6 +67,38 @@ def test_report_summarises_a_lake(lake):
     assert rep["storage"]["mb_per_day"] is None, "a few seconds of data must not be extrapolated to a day"
 
 
+def test_clock_probes_are_reported_per_venue_with_the_uncertainty_of_the_fastest_tenth(tmp_path):
+    b = LakeBuilder(tmp_path)
+    b.open_conn("spot_trade", [SPOT_TRADE])
+    for i in range(20):  # spot REST goes through a CDN: about 300 ms round trip, so the offset is fuzzy
+        b.event(
+            "CLOCK_PROBE",
+            venue="spot",
+            server_ms=1,
+            rtt_us=(300 + i) * 1000,
+            offset_ms=40.0 - i,
+            start_wall_us=1,
+        )
+    for i in range(20):  # USD-M answers in a few ms: a tight estimate
+        b.event(
+            "CLOCK_PROBE",
+            venue="usdm",
+            server_ms=1,
+            rtt_us=(3 + i % 3) * 1000,
+            offset_ms=1.5 + (i % 3) * 0.1,
+            start_wall_us=1,
+        )
+    b.stop()
+    probes = build_report(tmp_path)["clock_probe"]
+    assert probes["n"] == 40 and set(probes["by_venue"]) == {"spot", "usdm"}
+    usdm, spot = probes["by_venue"]["usdm"], probes["by_venue"]["spot"]
+    assert usdm["fastest_tenth"]["uncertainty_ms"] == pytest.approx(1.5)
+    assert usdm["fastest_tenth"]["offset_ms_median"] == pytest.approx(1.5, abs=0.15)
+    assert spot["fastest_tenth"]["uncertainty_ms"] > 100 and spot["rtt_ms"]["min"] == 300.0
+    text = render_text(build_report(tmp_path))
+    assert "usdm" in text and "fastest tenth" in text
+
+
 def test_slow_bridges_are_listed(tmp_path):
     b = LakeBuilder(tmp_path)
     gen = b.open_conn("usdm_depth_btcusdt", ["usdm:btcusdt@depth@100ms"])
