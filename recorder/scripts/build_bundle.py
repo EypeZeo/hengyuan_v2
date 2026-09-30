@@ -140,7 +140,10 @@ def git_info() -> dict[str, object]:
         ).stdout.strip()
 
     try:
-        return {"sha": run("rev-parse", "HEAD"), "dirty": bool(run("status", "--porcelain", "--", "."))}
+        # tracked files only: an earlier build's output directory sitting untracked next to the sources must
+        # not change the manifest, or building twice in one checkout would give two different tarballs
+        dirty = bool(run("status", "--porcelain", "--untracked-files=no", "--", "."))
+        return {"sha": run("rev-parse", "HEAD"), "dirty": dirty}
     except (OSError, subprocess.CalledProcessError):
         return {"sha": "unknown", "dirty": None}
 

@@ -101,6 +101,37 @@ def test_build_is_reproducible_and_self_verifying(tmp_path, wheels):
     assert tar1.read_bytes()[4:8] == b"\0\0\0\0"
 
 
+def test_building_twice_in_one_checkout_is_reproducible_even_with_untracked_output(
+    tmp_path, wheels, monkeypatch
+):
+    """Found by CI: the first build's output directory sat untracked next to the sources and flipped the
+    manifest's dirty flag, so the second build produced a different tarball."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("no git on PATH")
+    wd, _ws, lock = wheels
+    repo = tmp_path / "repo"
+    (repo / "hy_recorder").mkdir(parents=True)
+    (repo / "hy_recorder" / "__init__.py").write_text("__version__ = 'x'\n")
+
+    def git(*args):
+        cfg = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        subprocess.run(["git", *cfg, *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("add", ".")
+    git("commit", "-q", "-m", "init")
+    monkeypatch.setattr(bb, "ROOT", repo)
+    _, t1 = bb.build(repo / "dist-a", lock, wd)  # output lands inside the checkout, untracked
+    _, t2 = bb.build(repo / "dist-b", lock, wd)
+    assert t1.read_bytes() == t2.read_bytes()
+    assert bb.git_info()["dirty"] is False
+    (repo / "hy_recorder" / "__init__.py").write_text("__version__ = 'y'\n")  # a TRACKED file changes
+    assert bb.git_info()["dirty"] is True
+
+
 def test_the_release_id_changes_when_the_application_changes(tmp_path, wheels, monkeypatch):
     wd, _ws, lock = wheels
     rel1, _ = bb.build(tmp_path / "o1", lock, wd)
