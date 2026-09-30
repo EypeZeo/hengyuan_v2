@@ -186,7 +186,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     成交/撤单——那是 spec L4 §6.6 的独立机制，不在这次范围内，见 `order_tracker.hpp` 文件头的
     "明确排除的范围"。`OrderTracker` 本身仍是纯内存态，进程崩溃后其查询次数/退避进度归零，效率损失
     而非正确性问题（`InFlightRegistry` 现状同等级别，不是新引入的回归）。
-  - **[R-10 进程内部分已落地，持久锚点未做]**：未知隔离判据（Owner 决策 2026-09-29）取代了原先的
+  - **[R-10 已落地；L-30 的挂钟部分已闭合，见本条末尾]**：未知隔离判据（Owner 决策 2026-09-29）取代了原先的
     "第 3 次不可判定即升级"——常量 kMaxQueryAttempts 与成员函数 should_escalate 已从 `OrderRecord`
     删除（此处刻意不加反引号：账本对反引号内的符号要求在被搜索文件里至少出现一次，已删除的符号会让
     检查器误报账本过期）。`determine_reconcile_action(rec, now_mono_ms, now_wall_ms, UnknownQuarantinePolicy)` 在
@@ -199,9 +199,23 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     `binance_private_rest.hpp` 里登记过的 KNOWN COUPLING），但耗掉的时间仍走 ② 的上限。锚点
     `OrderRecord::unknown_since_mono_ms/_wall_ms` 由 `OrderTracker::track()`（`poll_once()` 兜底）在
     对账线程上首次见到 `Ambiguous` 时盖一次戳，此后不再移动。`query_attempts` 饱和于 255，不回绕。
-    **未做**：锚点不持久，重启或崩溃循环会重新盖戳，未决累计时间因此可被重置（已知限制 L-30；FI-042
-    的崩溃循环子判据仍为 `NOT_TESTABLE_YET`；持久载体归 R-06、R-14）。因此上一条"纯内存态只是效率损失"
-    对**升级时点**不再成立：它现在是与正确性相关的已登记限制。
+    **L-30（“首次进入未知”没有持久锚点）——挂钟部分已闭合**：不新增任何持久字段，复用持久帧头里
+    已被 MAC 覆盖的 `recorded_utc_ms`。`recovery_scan` 在重放中记下订单首次进入 `Ambiguous` 的那一帧的
+    时间（`Submitting` 被重映射成 `Ambiguous` 的订单取其 `Submitting` 帧，即“命运可能变得未知”的最早
+    时刻，偏向更早隔离），仅当帧时间类型是 `ServerCorrectedUtc` 时才记；结果放进内存里的
+    `OrderRecoveryCheckpoint::unknown_since_utc_ms`（盘上格式不变）。`checkpoint_to_order_record()` 经
+    `recovered_wall_anchor()` 的合理性检查（不早于 2001-09-09，不晚于当前挂钟加 60 秒）后种入
+    `OrderRecord::unknown_since_wall_ms` 并置 `wall_anchor_recovered`；不合理就当未设，回落到“首次见到时
+    盖戳”。于是未决累计时间的**挂钟部分**跨重启与崩溃循环持续累计（含停机时间）；单调锚点仍随进程重来，
+    由 `OrderTracker::track()` 盖戳。**宽松版规则（Owner 默认选择）**：来自持久日志的挂钟读数含停机时间，
+    所以它只有在这个进程已对该订单实发至少一次查询之后才可触发升级——每个恢复出来的订单先得到一次权威
+    查询再谈隔离，否则每次计划内重启遇到一笔未决订单都会在第一次查询之前隔离并让本次运行进入
+    `Degraded`；在此之前只有（全新的）单调读数计数，所以永远发不出查询的订单仍被 15 s 上限约束。
+    **仍然成立的限制**：① `query_attempts` 与单调锚点不持久；一个每次都活不到发出一次查询的崩溃循环
+    不会被隔离，但这样的进程无法下单（启动恢复以此为门），不产生新敞口；② 帧头时间的时钟域取决于
+    调用方传给 `append_durable()` 的 `now_ms`——现有 harness 传的是单调读数，会被合理性检查拒绝、不产生
+    挂钟锚点，生产接线必须先把这个时钟域定为服务器校正后的 UTC；③ 对账线程的升级与解决事件尚未持久化
+    （SAFE-03），所以升级本身不跨重启，而是靠重新恢复后再次触发。FI-042 的崩溃循环子判据由此可测。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
