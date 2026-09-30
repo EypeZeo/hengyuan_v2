@@ -1183,8 +1183,9 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
 TEST_F(BoundCredentialsFixture, QueryOrderFailsClosedWithoutPriorClockSync) {
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     const auto expected = make_btcusdt_expectation("coid-no-clock");
-    // No sync_clock() call -- must never attempt to sign or send anything.
-    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::Inconclusive);
+    // No sync_clock() call -- must never attempt to sign or send anything, and (R-10) that
+    // must be visible to the reconcile loop as NotSent, not as a counted inconclusive query.
+    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::NotSent);
 }
 
 TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
@@ -1249,7 +1250,10 @@ TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
 // two tests are the only ones that actually wire a SpotRateLimitTracker in, covering both
 // directions of the guard added to query_order().
 
-TEST_F(BoundCredentialsFixture, QueryOrderExhaustedRateLimiterReturnsInconclusiveWithoutNetworkAttempt) {
+// R-10: a locally refused reservation is NotSent, not Inconclusive. poll_once() counts every
+// non-NotSent answer toward the UNKNOWN quarantine criterion, so under the old behaviour a
+// throttled reconcile loop could quarantine an order it never even asked about.
+TEST_F(BoundCredentialsFixture, QueryOrderExhaustedRateLimiterReturnsNotSentWithoutNetworkAttempt) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
@@ -1267,7 +1271,7 @@ TEST_F(BoundCredentialsFixture, QueryOrderExhaustedRateLimiterReturnsInconclusiv
     // call despite the exhausted budget, it would have nothing to connect to and this
     // test's own setup would be wrong, not just the assertion below.
     const auto expected = make_btcusdt_expectation("coid-rate-limited");
-    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::Inconclusive);
+    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::NotSent);
 }
 
 TEST_F(BoundCredentialsFixture, QueryOrderRateLimiterWithBudgetStillSendsRealRequest) {
@@ -1324,7 +1328,8 @@ TEST_F(BoundCredentialsFixture, QueryOrderHttpErrorStatusIsInconclusiveNotFailur
 
     const auto expected = make_btcusdt_expectation("coid-http-error");
     // Never Rejected/"does not exist" -- collapses to the same Inconclusive as every other
-    // untrustworthy outcome (L4 §6.1.2's exhaustive list).
+    // untrustworthy outcome (L4 §6.1.2's exhaustive list). The request WAS sent (R-10): an
+    // Inconclusive answer, unlike NotSent, counts toward the UNKNOWN quarantine criterion.
     EXPECT_EQ(client.query_order(expected, fetch_cfg).outcome, QueryOutcome::Inconclusive);
 }
 
@@ -1352,17 +1357,27 @@ TEST_F(BoundCredentialsFixture, QueryOrderMalformedJsonIsInconclusive) {
     EXPECT_EQ(client.query_order(expected, fetch_cfg).outcome, QueryOutcome::Inconclusive);
 }
 
-TEST(QueryOrderEntryGuards, NullCredentialsFoldsIntoInconclusiveWithoutNetworkAttempt) {
+TEST(QueryOrderEntryGuards, NullCredentialsFoldsIntoNotSentWithoutNetworkAttempt) {
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), nullptr);
     const auto expected = make_btcusdt_expectation("coid-null-creds");
-    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::Inconclusive);
+    EXPECT_EQ(client.query_order(expected).outcome, QueryOutcome::NotSent);
+}
+
+TEST_F(BoundCredentialsFixture, QueryOrderEmptyClientOrderIdAndEmptySymbolAreNotSentEither) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    auto no_coid = make_btcusdt_expectation("x");
+    no_coid.client_order_id = {};
+    EXPECT_EQ(client.query_order(no_coid).outcome, QueryOutcome::NotSent);
+    auto no_symbol = make_btcusdt_expectation("coid-no-symbol");
+    no_symbol.rules_snapshot_at_submit.symbol[0] = '\0';
+    EXPECT_EQ(client.query_order(no_symbol).outcome, QueryOutcome::NotSent);
 }
 
 // --- query_order_adapter() -- production QueryPort::QueryFn wiring ---
 
-TEST(QueryOrderAdapter, NullUserDataFoldsIntoInconclusive) {
+TEST(QueryOrderAdapter, NullUserDataFoldsIntoNotSent) {
     OrderExpectation expected{};
-    EXPECT_EQ(query_order_adapter(expected, nullptr).outcome, QueryOutcome::Inconclusive);
+    EXPECT_EQ(query_order_adapter(expected, nullptr).outcome, QueryOutcome::NotSent);
 }
 
 // --- BinancePrivateRestClient::submit_order() -- TODO 1A.3, network-layer ---

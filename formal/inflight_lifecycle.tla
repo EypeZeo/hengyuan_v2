@@ -33,7 +33,14 @@ EXTENDS Naturals, FiniteSets, Sequences
 CONSTANTS
     COIDs,          \* the client-order-ids this run may submit
     MaxSlots,       \* InFlightRegistry capacity (kMaxInFlight)
-    MaxQueryAttempts,   \* OrderRecord::kMaxQueryAttempts, the escalation cap
+    MaxQueryAttempts,   \* abstracts the UNKNOWN quarantine criterion: the number of SENT
+                        \* queries after which an Ambiguous order escalates. The code used
+                        \* to hard-code 3 (OrderRecord::kMaxQueryAttempts); since R-10
+                        \* (Owner decision 2026-09-29) the criterion is "5 sent queries and
+                        \* 5000 ms, or a 15000 ms hard cap" (UnknownQuarantinePolicy in
+                        \* order_lifecycle.hpp). This model has no time, so it keeps only
+                        \* the count guard; the hard cap can escalate an order with fewer
+                        \* sent queries, a path this model does not explore.
     TrackAcceptedOrders \* MODEL SWITCH, see inflight_lifecycle_prefix_bug.cfg:
                         \*   TRUE  = current design (Accepted enters the reconcile loop)
                         \*   FALSE = the pre-fix behaviour, which MUST violate
@@ -45,7 +52,7 @@ VARIABLES
     inbound,     \* Seq(COIDs)  -- ToReconcileRing, hot thread -> reconcile thread
     tracked,     \* SUBSET COIDs currently in OrderTracker
     outbound,    \* Seq(COIDs)  -- ReconcileEventRing, reconcile thread -> hot thread
-    attempts     \* [COIDs -> Nat] -- OrderRecord::query_attempts
+    attempts     \* [COIDs -> Nat] -- OrderRecord::query_attempts (SENT queries only since R-10)
 
 vars == <<state, slots, inbound, tracked, outbound, attempts>>
 

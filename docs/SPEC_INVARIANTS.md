@@ -186,6 +186,22 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     成交/撤单——那是 spec L4 §6.6 的独立机制，不在这次范围内，见 `order_tracker.hpp` 文件头的
     "明确排除的范围"。`OrderTracker` 本身仍是纯内存态，进程崩溃后其查询次数/退避进度归零，效率损失
     而非正确性问题（`InFlightRegistry` 现状同等级别，不是新引入的回归）。
+  - **[R-10 进程内部分已落地，持久锚点未做]**：未知隔离判据（Owner 决策 2026-09-29）取代了原先的
+    "第 3 次不可判定即升级"——常量 kMaxQueryAttempts 与成员函数 should_escalate 已从 `OrderRecord`
+    删除（此处刻意不加反引号：账本对反引号内的符号要求在被搜索文件里至少出现一次，已删除的符号会让
+    检查器误报账本过期）。`determine_reconcile_action(rec, now_mono_ms, now_wall_ms, UnknownQuarantinePolicy)` 在
+    ① 实发查询不少于 5 次且自首次进入 `Ambiguous` 起不少于 5000 ms，或 ② 该时长不少于 15000 ms
+    （绝对上限，与查询次数无关）时返回 `EscalateToOperator`；三个参数在 `ReconcilePollPolicy` 的
+    `quarantine` 成员中可配置，退化配置（`hard_cap_ms <= 0`）失败关闭为升级。经过时间
+    取单调时钟与挂钟两个读数中较大者：挂钟只提前、不延后（蓝图 V-07 的唯一例外）。"实发"用
+    `QueryOutcome::NotSent` 区分——本地限流拒绝、签名时钟不新鲜、凭据或参数缺失、未接线的
+    `QueryPort` 都不计入 `OrderRecord::query_attempts`（原先它们与真实的不可判定同等计数，是
+    `binance_private_rest.hpp` 里登记过的 KNOWN COUPLING），但耗掉的时间仍走 ② 的上限。锚点
+    `OrderRecord::unknown_since_mono_ms/_wall_ms` 由 `OrderTracker::track()`（`poll_once()` 兜底）在
+    对账线程上首次见到 `Ambiguous` 时盖一次戳，此后不再移动。`query_attempts` 饱和于 255，不回绕。
+    **未做**：锚点不持久，重启或崩溃循环会重新盖戳，未决累计时间因此可被重置（已知限制 L-30；FI-042
+    的崩溃循环子判据仍为 `NOT_TESTABLE_YET`；持久载体归 R-06、R-14）。因此上一条"纯内存态只是效率损失"
+    对**升级时点**不再成立：它现在是与正确性相关的已登记限制。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 

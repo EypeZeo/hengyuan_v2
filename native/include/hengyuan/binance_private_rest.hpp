@@ -1418,16 +1418,23 @@ public:
         return query_order(expected, default_cfg_);
     }
 
+    // R-10: every early return BEFORE the network section below returns QueryResult::not_sent()
+    // (QueryOutcome::NotSent), not a bare Inconclusive: nothing was sent, so poll_once() must not
+    // count it toward the UNKNOWN quarantine criterion. From the network section on -- a
+    // transport failure, an HTTP error status, an unparseable or non-matching body -- the query
+    // WAS sent, and those stay Inconclusive (and counted), exactly as before. An exception caught
+    // at the end is ambiguous about whether the request went out, so it also stays Inconclusive:
+    // the fail-closed direction is the one that counts.
     QueryResult query_order(const OrderExpectation& expected,
                              const PrivateRestConfig& cfg) noexcept {
-        if (!creds_) return {};
-        if (expected.client_order_id.empty()) return {};
-        if (expected.rules_snapshot_at_submit.symbol[0] == '\0') return {};
+        if (!creds_) return QueryResult::not_sent();
+        if (expected.client_order_id.empty()) return QueryResult::not_sent();
+        if (expected.rules_snapshot_at_submit.symbol[0] == '\0') return QueryResult::not_sent();
 
         try {
             std::int64_t fresh_ts_ms = 0;
             if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
-                return {};  // ClockNotFresh -> Inconclusive
+                return QueryResult::not_sent();  // ClockNotFresh: nothing signed, nothing sent
             }
 
             // docs/BINANCE_PRIVATE_REST_L4_SPEC.md §7.4 (P0): every signed/public REST send
@@ -1436,31 +1443,26 @@ public:
             // == nullptr means no tracker was wired in (this class's pre-H1 default,
             // preserved for every existing caller/test) -- skip the check entirely rather
             // than fail closed on an absent tracker; a caller that wants the limit enforced
-            // must opt in by supplying one. KNOWN COUPLING, deliberately not addressed here
-            // (see Batch H plan's own H1 note): order_tracker.hpp's poll_once() increments
-            // an Ambiguous order's query_attempts on every call to this function regardless
-            // of whether a real network round trip happened, so a rate-limit-induced early
-            // return here counts the same as a real Inconclusive query toward
-            // kMaxQueryAttempts (3) -- three ticks blocked by local rate limiting would
-            // prematurely escalate an order to EscalatedToOperator, which never releases its
-            // InFlightRegistry slot. The safe line this batch relies on instead: the default
-            // RateLimitLane::Reconciliation budget (10% of REQUEST_WEIGHT/RAW_REQUESTS,
-            // spot_rate_limit_budget.hpp) comfortably covers ordinary reconcile-loop query
-            // volume, so this path is not expected to trigger under normal polling cadence.
-            // Threading QueryResult::retry_after_present through so order_tracker.hpp can
-            // distinguish "locally throttled" from "genuinely inconclusive" is a real,
-            // separate follow-up, not attempted in this slice.
+            // must opt in by supplying one.
+            //
+            // A refused reservation returns NotSent (R-10). It used to look exactly like a
+            // real Inconclusive query, so poll_once() counted it toward the old three-attempt
+            // cap and three ticks blocked by local rate limiting could quarantine an order
+            // that was never even asked about -- an EscalatedToOperator that never releases
+            // its InFlightRegistry slot. Now the refused call costs no attempt; the time it
+            // burns still counts toward the quarantine hard cap, so a permanently throttled
+            // order is still bounded.
             if (rate_limiter_ && !rate_limiter_->try_reserve_weight_only(
                                       RateLimitLane::Reconciliation, PrivateRestEndpoint::GetOrder,
                                       weight_table_)) {
-                return {};  // Inconclusive, same fail-closed shape as every other early return here
+                return QueryResult::not_sent();
             }
 
             char recv_window_buf[24];
             const int n = std::snprintf(recv_window_buf, sizeof(recv_window_buf), "%lld",
                                          static_cast<long long>(cfg.recv_window_ms));
             if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(recv_window_buf)) {
-                return {};
+                return QueryResult::not_sent();
             }
             const std::pair<std::string_view, std::string_view> params[] = {
                 {"origClientOrderId", expected.client_order_id.view()},
@@ -1468,15 +1470,15 @@ public:
                 {"symbol", expected.rules_snapshot_at_submit.symbol_name()},
             };
             auto [qerr, unsigned_query] = build_canonical_query(params);
-            if (qerr != QuerySigningError::Ok) return {};
+            if (qerr != QuerySigningError::Ok) return QueryResult::not_sent();
 
             auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, fresh_ts_ms);
-            if (serr != QuerySigningError::Ok) return {};
+            if (serr != QuerySigningError::Ok) return QueryResult::not_sent();
 
             std::array<char, kApiKeyLen> key_buf{};
             std::size_t key_len = 0;
             if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
-                return {};
+                return QueryResult::not_sent();
             }
 
             const std::string target = "/api/v3/order?" + std::string(signed_query.wire_bytes());
@@ -1678,7 +1680,7 @@ private:
 // (explicitly no network dependency, per its own header comment) never has to #include
 // Boost/Beast/OpenSSL/simdjson.
 inline QueryResult query_order_adapter(const OrderExpectation& expected, void* user_data) noexcept {
-    if (!user_data) return {};
+    if (!user_data) return QueryResult::not_sent();  // nothing wired, nothing sent (R-10)
     return static_cast<BinancePrivateRestClient*>(user_data)->query_order(expected);
 }
 

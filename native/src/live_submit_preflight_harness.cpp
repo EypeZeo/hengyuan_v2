@@ -604,7 +604,8 @@ int main(int argc, char* argv[]) {
 
         keepalive_scheduler.poll(now_ms);
         drain_user_data_events(in_flight, &audit, user_data_events, now_ms, &position_truth, &fill_context);
-        poll_once(order_tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms);
+        poll_once(order_tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms,
+                  reconcile_wall_now_ms());
         drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth, &fill_context);
         ws_supervisor.poll(now_ms);
 
