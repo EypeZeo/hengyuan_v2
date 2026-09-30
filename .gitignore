@@ -6,6 +6,9 @@ native/build-msvc/
 *.vcxproj*
 *.sln
 .vs/
+# Compiler object files (a stray MSVC .obj in the repo root showed up as untracked)
+*.obj
+*.o
 
 # Secrets — never commit real credentials
 .env

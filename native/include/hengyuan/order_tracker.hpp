@@ -48,6 +48,7 @@
 #include <hengyuan/spsc_ring.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -56,12 +57,28 @@
 
 namespace hy {
 
+// Wall clock in milliseconds since the Unix epoch, for poll_once()'s `wall_now_ms` (R-10).
+// system_clock on purpose: the second clock earns its keep by still counting through a host
+// suspend (which stops the monotonic clock) -- and by being able to step, which can only
+// bring the quarantine forward, never postpone it (see UnknownQuarantinePolicy).
+inline std::int64_t reconcile_wall_now_ms() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 // --- Reconciliation query result ---
 
 enum class QueryOutcome : std::uint8_t {
     Found = 0,         // query positively identified the order's current state
     Inconclusive = 1,  // network/schema/timeout/validation uncertainty -- NOT
                        // "not found"; never treated as evidence of anything
+    // R-10: the request never left this process -- the local rate-limit reservation was refused,
+    // the signing clock was not fresh, credentials or parameters were missing, no query port was
+    // wired. It is no evidence about the order, exactly like Inconclusive, but it is NOT one of the
+    // "actually sent" queries the quarantine criterion counts: poll_once() does not add it to
+    // OrderRecord::query_attempts (the time it burns still counts, through the hard cap).
+    NotSent = 2,
 };
 
 struct QueryResult {
@@ -82,11 +99,20 @@ struct QueryResult {
     // that batch won't need a second breaking change to this struct.
     bool retry_after_present{false};
     std::int64_t retry_after_deadline_ms{0};
+
+    // The result of a query that never left this process (QueryOutcome::NotSent). A static
+    // factory, not a field, so aggregate initialization of QueryResult is untouched.
+    static QueryResult not_sent() noexcept {
+        QueryResult r{};
+        r.outcome = QueryOutcome::NotSent;
+        return r;
+    }
 };
 
 // --- QueryPort: same injection pattern and signature style as SubmitPort ---
-// (live_submit_orchestrator.hpp) -- a null fn folds into Inconclusive rather
-// than a dedicated error value, matching SubmitPort::call()'s own precedent.
+// (live_submit_orchestrator.hpp) -- a null fn folds into an outcome rather than a
+// dedicated error value, matching SubmitPort::call()'s own precedent; since nothing
+// can have been sent through a port that is not wired, that outcome is NotSent (R-10).
 // A real network implementation lives in binance_private_rest.hpp's
 // query_order_adapter() (L4 §6).
 //
@@ -104,7 +130,7 @@ struct QueryPort {
     void* user_data{nullptr};
 
     QueryResult call(const OrderExpectation& expected) const noexcept {
-        if (!fn) return {};  // Inconclusive by default-construction
+        if (!fn) return QueryResult::not_sent();
         return fn(expected, user_data);
     }
 
@@ -132,6 +158,11 @@ struct ReconcilePollPolicy {
     // and staying there is the right shape for it, and a flat interval says so
     // directly instead of arriving there by accident.
     std::int64_t live_poll_interval_ms{2000};
+
+    // R-10: when an Ambiguous order stops being retried and goes to the operator (see
+    // UnknownQuarantinePolicy in order_lifecycle.hpp). Defaults are the Owner's 2026-09-29 numbers:
+    // 5 sent queries AND 5000 ms, or a 15000 ms absolute cap.
+    UnknownQuarantinePolicy quarantine{};
 };
 
 // base * multiplier^attempt, saturating at max_interval_ms and never
@@ -178,8 +209,20 @@ public:
     // Begin tracking a record for reconciliation. Returns false (fail-closed)
     // if the table is full or this coid is already tracked -- mirrors
     // InFlightRegistry::register_submit_handle()'s own contract deliberately.
-    bool track(InFlightHandle handle, const OrderRecord& record, std::int64_t now_ms) noexcept {
-        (void)now_ms;
+    //
+    // R-10: an Ambiguous record is stamped here with the moment the reconcile loop first sees
+    // it, on `now_ms` (the monotonic clock this loop runs its backoff on) and `wall_now_ms` (the
+    // wall clock; OrderRecord::kClockUnset when the caller has none). This is the single choke
+    // point every Ambiguous record passes through, on the reconcile thread and in that thread's
+    // own clock domain by construction, so the elapsed time the quarantine criterion compares is
+    // always measured against readings of the same clocks (stamping on the hot thread would
+    // trust its clock to share a domain with this loop's). The price is a lag: the stamp is
+    // later than the moment the hot thread saw the timeout by however long the loop took to get
+    // back to draining its ring -- one poll_once() iteration, which can include blocking
+    // queries (up to max_queries_per_tick times the REST timeout in the worst case). The lag can
+    // only postpone escalation, never advance it. An anchor already set on the record is kept.
+    bool track(InFlightHandle handle, const OrderRecord& record, std::int64_t now_ms,
+               std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
         auto coid = record.client_order_id.view();
         if (coid.empty()) return false;
         if (find_index(coid) != kNotFound) return false;
@@ -188,6 +231,9 @@ public:
                 slots_[i].active = true;
                 slots_[i].handle = handle;
                 slots_[i].record = record;
+                if (record.state == OrderState::Ambiguous) {
+                    stamp_unknown_since(slots_[i].record, now_ms, wall_now_ms);
+                }
                 slots_[i].last_poll_ms = kNeverPolled;
                 ++count_;
                 return true;
@@ -377,7 +423,9 @@ inline bool is_valid_query_result(const QueryResult& r, const OrderRecord& rec) 
 // TWO KINDS OF TRACKED ORDER (audit EXEC-INFLIGHT-003):
 //   * Ambiguous -- an unresolved uncertainty. Driven by
 //     determine_reconcile_action() with exponential backoff, and escalated to the
-//     operator after kMaxQueryAttempts. Unchanged from before.
+//     operator by the R-10 quarantine criterion (policy.quarantine: enough SENT
+//     queries AND enough time since it first became Ambiguous, or an absolute
+//     time cap -- see UnknownQuarantinePolicy in order_lifecycle.hpp).
 //   * Accepted / PartialFill -- LIVE and resting on the exchange. Polled at a flat
 //     live_poll_interval_ms cadence and NEVER escalated: a resting order is a
 //     normal steady state, not an anomaly, and its query_attempts must not count
@@ -395,15 +443,23 @@ inline bool is_valid_query_result(const QueryResult& r, const OrderRecord& rec) 
 // successfully pushed. If `outbound` is momentarily full, the record keeps its
 // pre-transition state and stays tracked -- retried on a later call -- rather than
 // silently dropping a resolution that already cost a real query.
+//
+// CLOCKS (R-10): `now_ms` is the monotonic reading the backoff runs on, as before.
+// `wall_now_ms` is the wall clock in milliseconds, or OrderRecord::kClockUnset when the
+// caller has none (every pre-R-10 call site keeps compiling and then decides on the
+// monotonic reading alone). The two anchors stamped at first sight of an Ambiguous
+// order are compared against these two readings; the larger elapsed time counts, so
+// the wall clock can only bring escalation forward (see UnknownQuarantinePolicy).
 inline void poll_once(OrderTracker& tracker,
                        ToReconcileRing& inbound,
                        ReconcileEventRing& outbound,
                        const QueryPort& query_port,
                        const ReconcilePollPolicy& policy,
-                       std::int64_t now_ms) noexcept {
+                       std::int64_t now_ms,
+                       std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
     ReconcileIngress in{};
     while (inbound.try_pop(in)) {
-        (void)tracker.track(in.handle, in.record, now_ms);
+        (void)tracker.track(in.handle, in.record, now_ms, wall_now_ms);
         // A false return (capacity exhausted / duplicate coid) is silently
         // dropped here rather than asserted: ToReconcileRing's capacity already
         // equals kMaxInFlight, matching InFlightRegistry's own cap, so under
@@ -427,7 +483,12 @@ inline void poll_once(OrderTracker& tracker,
         auto coid = record.client_order_id.view();
 
         if (ambiguous) {
-            const ReconcileAction action = determine_reconcile_action(record);
+            // Every Ambiguous record was stamped by track(); stamping again here is a no-op
+            // for those and closes the door on an unstamped one (which would read as "no time
+            // has passed" and could never escalate).
+            stamp_unknown_since(record, now_ms, wall_now_ms);
+            const ReconcileAction action =
+                determine_reconcile_action(record, now_ms, wall_now_ms, policy.quarantine);
             if (action == ReconcileAction::NoAction) return;
 
             if (action == ReconcileAction::EscalateToOperator) {
@@ -437,6 +498,14 @@ inline void poll_once(OrderTracker& tracker,
                 ev.handle = handle;
                 ev.coid = escalated.client_order_id;
                 ev.resulting_state = OrderState::EscalatedToOperator;
+                // Identity only, like the resolution branch below. drain_reconcile_events() writes the
+                // OrderEscalated audit record -- and through it the durable recovery checkpoint --
+                // from these fields; left at their defaults they recorded symbol 0 / Buy for exactly
+                // the orders a human has to resolve by hand. No fill fields: nothing new was observed
+                // here, and filled_qty_ticks would be fed to OrderFillContext::consume_delta().
+                ev.symbol_id = escalated.symbol_id;
+                ev.side = escalated.side;
+                ev.exchange_order_id = escalated.exchange_order_id;
                 if (outbound.try_push(ev)) {
                     tracker.untrack(coid);
                 }
@@ -447,14 +516,18 @@ inline void poll_once(OrderTracker& tracker,
             // action == QueryOrder
             if (queries_this_tick >= policy.max_queries_per_tick) return;
             if (last_poll_ms != OrderTracker::kNeverPolled) {
-                // last_poll_ms != kNeverPolled implies at least one attempt has
-                // already been made, so query_attempts >= 1 here. The delay before
-                // the NEXT attempt is indexed by retries already elapsed
-                // (query_attempts - 1: 0 after the first attempt, 1 after the
-                // second, ...), not by query_attempts itself -- reconcile_backoff_delay_ms's
-                // attempt=0 case is the base interval, meant for the first retry.
+                // last_poll_ms != kNeverPolled means a poll was already made -- but since R-10 a
+                // poll that never left the process (QueryOutcome::NotSent) is not counted in
+                // query_attempts, so query_attempts may still be 0 here. The delay before the
+                // NEXT attempt is indexed by retries already elapsed (query_attempts - 1: 0
+                // after the first counted attempt, 1 after the second, ...), not by
+                // query_attempts itself -- reconcile_backoff_delay_ms's attempt=0 case is the
+                // base interval, meant for the first retry; with nothing counted yet the base
+                // interval applies too.
                 const std::uint8_t retries_elapsed =
-                    static_cast<std::uint8_t>(record.query_attempts - 1);
+                    record.query_attempts == 0
+                        ? std::uint8_t{0}
+                        : static_cast<std::uint8_t>(record.query_attempts - 1);
                 if (now_ms - last_poll_ms < reconcile_backoff_delay_ms(policy, retries_elapsed)) return;
             }
         } else {
@@ -472,15 +545,21 @@ inline void poll_once(OrderTracker& tracker,
 
         QueryResult result = query_port.call(OrderExpectation::from(record));
 
-        // query_attempts is incremented on every genuine attempt (Inconclusive
-        // included), matching determine_reconcile_action()'s existing contract
-        // (it escalates once query_attempts reaches kMaxQueryAttempts) -- this must
-        // happen whether or not the result turns out usable below. ONLY for
-        // Ambiguous orders: that counter IS the escalation cap, and a live order
-        // polled every live_poll_interval_ms would otherwise "escalate" itself after
-        // three routine liveness checks.
+        // query_attempts is incremented on every query that was actually SENT (Inconclusive
+        // included) -- this must happen whether or not the result turns out usable below,
+        // because an unusable answer is exactly what the quarantine criterion counts. A query
+        // that never left the process (QueryOutcome::NotSent: the local rate-limit reservation
+        // was refused, the signing clock was not fresh, nothing was wired) is NOT counted: R-10
+        // requires that a throttled reconcile loop must not talk itself into quarantining an
+        // order it never even asked about. The time such polls burn still counts, through the
+        // hard cap. ONLY for Ambiguous orders: a live order polled every
+        // live_poll_interval_ms is a normal steady state and must never accumulate toward
+        // quarantine. Saturating, not wrapping: at 255 the count stays 255.
         OrderRecord attempted = record;
-        if (ambiguous) ++attempted.query_attempts;
+        if (ambiguous && result.outcome != QueryOutcome::NotSent &&
+            attempted.query_attempts < std::numeric_limits<std::uint8_t>::max()) {
+            ++attempted.query_attempts;
+        }
 
         if (result.outcome != QueryOutcome::Found || !detail::is_valid_query_result(result, attempted) ||
             !detail::is_legal_query_target(attempted.state, result.confirmed_state)) {

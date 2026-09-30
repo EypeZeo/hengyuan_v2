@@ -648,6 +648,14 @@ private:
         // same treatment as symbol_id -- direction is fixed at order-intent time
         // and never changes across an order's lifetime.
         OrderSide side{OrderSide::Buy};
+        // R-10 / L-30: the header time of the FIRST frame that put this order in Submitting and in
+        // Ambiguous, kept only when that frame's time is a ServerCorrectedUtc reading (anything
+        // else is no wall time). The `*_seen` flags say "first frame already seen", so a later
+        // frame in the same state -- or a frame whose time is 0 -- can never move the anchor.
+        bool submitting_seen{false};
+        std::int64_t submitting_utc_ms{0};
+        bool ambiguous_seen{false};
+        std::int64_t ambiguous_utc_ms{0};
     };
 
     // AUDIT REC-NOEXCEPT-006: the scan below allocates in several places (the whole
@@ -758,6 +766,18 @@ private:
             }
             if (frame.record.exchange_order_id != 0) rs.exchange_order_id = frame.record.exchange_order_id;
 
+            // R-10 / L-30: remember when the order first entered Submitting and Ambiguous -- the
+            // MAC-verified header time, and only if it is a wall time (frame_wall_time_ms(): any
+            // kind but ServerCorrectedUtc is not, and must not seed the wall clock).
+            if (rs.state == OrderState::Submitting && !rs.submitting_seen) {
+                rs.submitting_seen = true;
+                rs.submitting_utc_ms = frame_wall_time_ms(frame.time_kind, frame.recorded_utc_ms);
+            }
+            if (rs.state == OrderState::Ambiguous && !rs.ambiguous_seen) {
+                rs.ambiguous_seen = true;
+                rs.ambiguous_utc_ms = frame_wall_time_ms(frame.time_kind, frame.recorded_utc_ms);
+            }
+
             macs_by_sequence.push_back(frame.mac);
             running_prev_mac = frame.mac;
             ++expected_seq;
@@ -814,6 +834,14 @@ private:
             cp.symbol_id = rs.symbol_id;
             cp.exchange_order_id = rs.exchange_order_id;
             cp.side = rs.side;
+            if (cp.resulting_state == OrderState::Ambiguous) {
+                // R-10 / L-30: the durable "first became uncertain" time. A genuine Ambiguous uses
+                // the frame that made it so; the Submitting -> Ambiguous remap above uses the
+                // Submitting frame -- the earliest moment its fate could have become unknown, which
+                // errs toward an earlier quarantine, the safe direction.
+                cp.unknown_since_utc_ms =
+                    (rs.state == OrderState::Submitting) ? rs.submitting_utc_ms : rs.ambiguous_utc_ms;
+            }
             checkpoints_[checkpoint_count_++] = cp;
         }
 
@@ -1228,7 +1256,15 @@ private:
 // transition-legality gate doesn't apply here (the checkpoint's state was
 // already proven reachable by recovery_scan()'s own per-COID replay, which
 // DID run every intermediate step through validate_transition()).
-inline OrderRecord checkpoint_to_order_record(const OrderRecoveryCheckpoint& cp) noexcept {
+//
+// R-10 / L-30: a checkpoint recovered as Ambiguous carries the durable time it first became
+// uncertain (unknown_since_utc_ms). It seeds the record's WALL anchor -- so the unresolved time
+// keeps accumulating across a restart or a crash loop -- unless recovered_wall_anchor() rejects it
+// (not a plausible wall time, or ahead of `now_wall_ms`; pass OrderRecord::kClockUnset when the
+// caller has no wall clock, and only the lower bound is checked). The monotonic anchor cannot be
+// restored, that clock starts over; the tracker stamps it when it first sees the record.
+inline OrderRecord checkpoint_to_order_record(const OrderRecoveryCheckpoint& cp,
+                                              std::int64_t now_wall_ms = OrderRecord::kClockUnset) noexcept {
     OrderRecord rec{};
     rec.client_order_id = cp.client_order_id;
     rec.exchange_order_id = cp.exchange_order_id;
@@ -1243,6 +1279,10 @@ inline OrderRecord checkpoint_to_order_record(const OrderRecoveryCheckpoint& cp)
     // regardless of the real side -- a minimal PositionTruth folding recovered
     // orders (seed_position_truth(), below) needs the real direction.
     rec.side = cp.side;
+    if (cp.resulting_state == OrderState::Ambiguous) {
+        rec.unknown_since_wall_ms = recovered_wall_anchor(cp.unknown_since_utc_ms, now_wall_ms);
+        rec.wall_anchor_recovered = (rec.unknown_since_wall_ms != OrderRecord::kClockUnset);
+    }
     return rec;
 }
 

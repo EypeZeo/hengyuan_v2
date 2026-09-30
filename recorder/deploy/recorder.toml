@@ -1,0 +1,15 @@
+# /etc/hy-recorder/recorder.toml
+# Only numbers, the symbol list and the data root can be set here; unknown keys are rejected. The
+# connection layout and every URL are derived by the program from the symbol list (see `python3 -m
+# hy_recorder config-check --config <this file>`), so this file cannot point the recorder at another host.
+[recorder]
+root = "/var/lib/hy-recorder"
+symbols = ["BTCUSDT"]
+
+# Rolling retention: segments already acknowledged by `hy_recorder pull` are reclaimed after this many
+# hours; when free space still falls below disk_warn_gb, unacknowledged segments are evicted oldest
+# first (audited as EVICTED_UNACKED) and the window steps down 48 -> 24 -> 12 -> 6 hours. Writing stops
+# only if free space is still below disk_floor_gb at the 6 hour window.
+retain_hours = 48
+disk_warn_gb = 5
+disk_floor_gb = 2

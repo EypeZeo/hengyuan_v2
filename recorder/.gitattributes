@@ -1,0 +1,4 @@
+# LF everywhere under recorder/: the sources, fixtures, unit templates and shell scripts are
+# read byte-for-byte by tests and run on Linux (CI and the recording host), whatever
+# core.autocrlf the committing machine has.
+* text=auto eol=lf

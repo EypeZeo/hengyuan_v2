@@ -1130,6 +1130,8 @@ void reconcile_ambiguous_order(OrderRecord& rec, BinancePrivateRestClient& clien
                                 RequestWeightTrackerSet& weight,
                                 RawRequestsTrackerSet& raw,
                                 const EndpointWeightConfig& weight_cfg) noexcept {
+    // R-10 (Owner decision 2026-09-29): the decision also reads the first-Ambiguous anchors and both clocks --
+    //   determine_reconcile_action(rec, now_mono_ms, now_wall_ms, quarantine_policy)  (order_lifecycle.hpp)
     auto action = determine_reconcile_action(rec);  // reads rec.query_attempts
     if (action == ReconcileAction::NoAction) {
         return;  // not Ambiguous — wrong task enqueued; do nothing
@@ -1252,7 +1254,7 @@ If an attempt's `Inconclusive` was caused by `429`/`418`, `ReconcileQueryResult:
 
 ### 6.4 Exhaustion
 
-If `determine_reconcile_action()` returns `EscalateToOperator` (i.e. `query_attempts` has reached `kMaxQueryAttempts` = 3, all `Inconclusive`), §6.2's loop transitions to `EscalatedToOperator` — **this is "we don't know, a human decides," never "the order was confirmed absent."** No new logic is needed in `order_lifecycle.hpp`'s decision function for this; it already resolves correctly given a correctly-incremented, durably-persisted `query_attempts`.
+If `determine_reconcile_action()` returns `EscalateToOperator`, §6.2's loop transitions to `EscalatedToOperator` — **this is "we don't know, a human decides," never "the order was confirmed absent."** **R-10 (Owner decision 2026-09-29, implemented in-process) replaced the former trigger (`query_attempts` reached `kMaxQueryAttempts` = 3, all `Inconclusive`, i.e. quarantine about a second in)**: the order escalates when at least 5 *sent* queries came back without an answer **and** at least 5000 ms have passed since it first became `Ambiguous`, **or** at least 15000 ms have passed since then whatever the count. Elapsed time is the larger of a monotonic and a wall-clock reading (the wall clock can only bring escalation forward), and a query that never left the process (`QueryOutcome::NotSent`: local rate-limit refusal, stale signing clock, missing credentials) is not counted. The decision function needs a correctly-incremented `query_attempts` (sent queries only, saturating) and the first-Ambiguous anchors `OrderRecord::unknown_since_mono_ms/_wall_ms`; **the wall anchor survives a restart** (limitation L-30, wall-clock part closed): recovery seeds it from the MAC-verified header time of the durable frame that first made the order uncertain (`OrderRecoveryCheckpoint::unknown_since_utc_ms`, no on-disk change), so the unresolved time keeps accumulating across restarts and crash loops. Because that reading also counts the time the process was down, it may trigger an escalation only after this process has sent the recovered order at least one query (every recovered order gets one authoritative look first); the monotonic anchor still restarts with the process. See `docs/SPEC_INVARIANTS.md`'s `InFlightRegistry` entry.
 
 ### 6.5 Transition on `Found` — fixes round-3 P0 (a real safety bug, not just missing detail)
 

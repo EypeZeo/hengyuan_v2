@@ -1,0 +1,66 @@
+[Unit]
+Description=HengYuan D0 public market data recorder (read-only, no credentials)
+Documentation=file:///opt/hy-recorder/releases/current/hy_recorder/__init__.py
+After=network-online.target time-sync.target
+Wants=network-online.target
+# Never give up restarting: a start-rate limit would leave a crashed recorder dead (this key belongs in
+# [Unit]; in [Service] systemd 252 ignores it with a warning, which `systemd-analyze verify` reported).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hyrec
+Group=hyrec
+WorkingDirectory=/var/lib/hy-recorder
+StateDirectory=hy-recorder
+StateDirectoryMode=0750
+UMask=0027
+
+# The release directory is flat (application package next to the vendored wheels), so PYTHONPATH is
+# all the interpreter needs; there is no virtualenv on the host. `current` is a symlink swapped by install.sh.
+Environment="PYTHONPATH=/opt/hy-recorder/releases/current"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="TZ=UTC"
+ExecStartPre=/usr/bin/python3 -c "import websockets, zstandard, hy_recorder"
+ExecStart=/usr/bin/python3 -m hy_recorder run --config /etc/hy-recorder/recorder.toml
+
+# Type=simple on purpose: liveness is checked inside the process (monitor thread exits with code 70/71
+# when the event loop or the writer stalls). notify + watchdog is a later enhancement.
+Restart=always
+RestartSec=10
+TimeoutStopSec=45
+KillSignal=SIGTERM
+
+# Sacrificial load on a shared host: yield to the co-tenant proxy under pressure, never fight it.
+# No CPUQuota: a hard cap would add scheduling delay to receive timestamps (data quality).
+CPUWeight=20
+Nice=10
+IOWeight=20
+OOMScoreAdjust=500
+MemoryHigh=400M
+MemoryMax=600M
+TasksMax=64
+
+# Sandbox. No SocketBindDeny on purpose: the recorder opens no listening socket (checked with
+# `ss -ltnup` at acceptance), and blocking bind() could interfere with resolver client sockets.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

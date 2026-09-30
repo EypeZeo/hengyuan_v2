@@ -1,0 +1,11 @@
+# Local-only artifacts of the recorder package (the repo root .gitignore is owned by another PR)
+/.venv/
+/.var/
+/wheelhouse/
+/dist/
+/build/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.part

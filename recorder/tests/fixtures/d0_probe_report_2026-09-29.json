@@ -1,0 +1,316 @@
+{
+ "spot_depth": {
+  "frames": 3000,
+  "chain_violations": 0,
+  "first_violation": null,
+  "spot_overlaps": 0,
+  "bridge": {
+   "idx": 136,
+   "U": 100824517074,
+   "u": 100824517089,
+   "pu": null,
+   "L": 100824517073,
+   "ok": true
+  },
+  "latency_ms": {
+   "min": 1.4,
+   "p50": 1.9,
+   "p99": 14.1,
+   "n": 3000
+  },
+  "first_event": [
+   100824505715,
+   100824505741,
+   null
+  ],
+  "snapshot_keys": [
+   "asks",
+   "bids",
+   "lastUpdateId"
+  ]
+ },
+ "usdm_depth": {
+  "frames": 2942,
+  "chain_violations": 0,
+  "first_violation": null,
+  "spot_overlaps": null,
+  "bridge": {
+   "idx": 156,
+   "U": 11690167655417,
+   "u": 11690167667578,
+   "pu": 11690167655381,
+   "L": 11690167663025,
+   "ok": true
+  },
+  "latency_ms": {
+   "min": 1.4,
+   "p50": 1.9,
+   "p99": 11.9,
+   "n": 2942
+  },
+  "first_event": [
+   11690165149255,
+   11690165160322,
+   11690165149243
+  ],
+  "snapshot_keys": [
+   "E",
+   "T",
+   "asks",
+   "bids",
+   "lastUpdateId"
+  ]
+ },
+ "spot_trade": {
+  "frames": 10699,
+  "id_gaps": 0,
+  "non_increasing": 0,
+  "latency_ms": {
+   "min": 2.0,
+   "p50": 2.7,
+   "p99": 115.5,
+   "n": 10699
+  },
+  "keys": [
+   "E",
+   "M",
+   "T",
+   "e",
+   "m",
+   "p",
+   "q",
+   "s",
+   "t"
+  ]
+ },
+ "usdm_market_streams": {
+  "btcusdt@aggTrade": 4550,
+  "btcusdt@markPrice@1s": 300,
+  "!forceOrder@arr": 66
+ },
+ "usdm_aggTrade": {
+  "frames": 4550,
+  "a_gaps": 0,
+  "f_l_gaps": 32,
+  "latency_ms": {
+   "min": 1.2,
+   "p50": 2.3,
+   "p99": 6.8,
+   "n": 4550
+  },
+  "keys": [
+   "E",
+   "T",
+   "a",
+   "e",
+   "f",
+   "l",
+   "m",
+   "nq",
+   "p",
+   "q",
+   "s",
+   "st"
+  ]
+ },
+ "usdm_markPrice": {
+  "frames": 300,
+  "delta_ms_min": 995,
+  "delta_ms_p50": 1000,
+  "delta_ms_max": 1005,
+  "latency_ms": {
+   "min": 48.3,
+   "p50": 57.4,
+   "p99": 165.9,
+   "n": 300
+  },
+  "keys": [
+   "E",
+   "P",
+   "T",
+   "ap",
+   "e",
+   "i",
+   "p",
+   "r",
+   "s",
+   "st"
+  ]
+ },
+ "usdm_forceOrder": {
+  "frames": 66,
+  "event_time_monotonic": true,
+  "latency_ms": {
+   "min": 1.6,
+   "p50": 2.5,
+   "p99": 10.4,
+   "n": 66
+  },
+  "keys": [
+   "E",
+   "e",
+   "o"
+  ]
+ },
+ "sizing": {
+  "spot_depth.jsonl": {
+   "raw_bytes": 3950650,
+   "zstd3_bytes": 578965,
+   "zstd3_ratio": 6.82,
+   "zstd9_bytes": 482076,
+   "zstd9_ratio": 8.2,
+   "zstd12_bytes": 472643,
+   "zstd12_ratio": 8.36
+  },
+  "spot_trade.jsonl": {
+   "raw_bytes": 2283786,
+   "zstd3_bytes": 113815,
+   "zstd3_ratio": 20.07,
+   "zstd9_bytes": 79627,
+   "zstd9_ratio": 28.68,
+   "zstd12_bytes": 79617,
+   "zstd12_ratio": 28.68
+  },
+  "usdm_depth.jsonl": {
+   "raw_bytes": 10184377,
+   "zstd3_bytes": 2053479,
+   "zstd3_ratio": 4.96,
+   "zstd9_bytes": 1765847,
+   "zstd9_ratio": 5.77,
+   "zstd12_bytes": 1720981,
+   "zstd12_ratio": 5.92
+  },
+  "usdm_market.jsonl": {
+   "raw_bytes": 1239435,
+   "zstd3_bytes": 117249,
+   "zstd3_ratio": 10.57,
+   "zstd9_bytes": 90528,
+   "zstd9_ratio": 13.69,
+   "zstd12_bytes": 90509,
+   "zstd12_ratio": 13.69
+  }
+ },
+ "snapshots": {
+  "spot_snap1000": {
+   "bytes": 64047,
+   "headers": [
+    "HTTP/2 200",
+    "date: Tue, 29 Sep 2026 14:26:32 GMT",
+    "x-mbx-used-weight: 50",
+    "x-mbx-used-weight-1m: 50"
+   ]
+  },
+  "spot_snap100": {
+   "bytes": 6447,
+   "headers": [
+    "HTTP/2 200",
+    "date: Tue, 29 Sep 2026 14:26:34 GMT",
+    "x-mbx-used-weight: 55",
+    "x-mbx-used-weight-1m: 55"
+   ]
+  },
+  "usdm_snap1000": {
+   "bytes": 42090,
+   "headers": [
+    "HTTP/2 200",
+    "date: Tue, 29 Sep 2026 14:26:35 GMT",
+    "x-mbx-used-weight-1m: 20"
+   ]
+  },
+  "usdm_snap100": {
+   "bytes": 4285,
+   "headers": [
+    "HTTP/2 200",
+    "date: Tue, 29 Sep 2026 14:26:36 GMT",
+    "x-mbx-used-weight-1m: 25"
+   ]
+  },
+  "spot_exchinfo": {
+   "bytes": 5335,
+   "headers": [
+    "HTTP/2 200",
+    "date: Tue, 29 Sep 2026 14:26:37 GMT",
+    "x-mbx-used-weight: 75",
+    "x-mbx-used-weight-1m: 75"
+   ]
+  },
+  "usdm_exchinfo": {
+   "bytes": 1141820,
+   "headers": [
+    "HTTP/2 200",
+    "date: Tue, 29 Sep 2026 14:26:38 GMT",
+    "x-mbx-used-weight-1m: 26"
+   ]
+  }
+ },
+ "capture_summaries": {
+  "spot_depth": {
+   "label": "spot_depth",
+   "status": "HTTP/1.1 101 Switching Protocols",
+   "handshake_ms": 385.4,
+   "frames": 3000,
+   "bytes": 3815650,
+   "span_s": 299.9,
+   "msgs_per_s": 10.003,
+   "bytes_per_s": 12723.1,
+   "size_min": 170,
+   "size_p50": 682,
+   "size_p99": 9481,
+   "size_max": 22217,
+   "pings": 15,
+   "bad_json": 0,
+   "closed": null
+  },
+  "spot_trade": {
+   "label": "spot_trade",
+   "status": "HTTP/1.1 101 Switching Protocols",
+   "handshake_ms": 391.3,
+   "frames": 10699,
+   "bytes": 1802331,
+   "span_s": 299.3,
+   "msgs_per_s": 35.746,
+   "bytes_per_s": 6021.7,
+   "size_min": 168,
+   "size_p50": 168,
+   "size_p99": 169,
+   "size_max": 169,
+   "pings": 15,
+   "bad_json": 0,
+   "closed": null
+  },
+  "usdm_depth": {
+   "label": "usdm_depth",
+   "status": "HTTP/1.1 101 Switching Protocols",
+   "handshake_ms": 457.1,
+   "frames": 2942,
+   "bytes": 10051987,
+   "span_s": 299.98,
+   "msgs_per_s": 9.807,
+   "bytes_per_s": 33508.3,
+   "size_min": 601,
+   "size_p50": 2095,
+   "size_p99": 21435,
+   "size_max": 35444,
+   "pings": 1,
+   "bad_json": 0,
+   "closed": null
+  },
+  "usdm_market": {
+   "label": "usdm_market",
+   "status": "HTTP/1.1 101 Switching Protocols",
+   "handshake_ms": 463.6,
+   "frames": 4916,
+   "bytes": 1013299,
+   "span_s": 299.78,
+   "msgs_per_s": 16.399,
+   "bytes_per_s": 3380.2,
+   "size_min": 204,
+   "size_p50": 204,
+   "size_p99": 240,
+   "size_max": 258,
+   "pings": 1,
+   "bad_json": 0,
+   "closed": null
+  }
+ }
+}
