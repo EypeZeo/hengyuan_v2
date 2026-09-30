@@ -2,6 +2,10 @@
 #include <gtest/gtest.h>
 #include <hengyuan/order_lifecycle.hpp>
 
+#include <cstdint>
+#include <limits>
+#include <type_traits>
+
 using hy::ClientOrderId;
 using hy::OrderRecord;
 using hy::OrderState;
@@ -224,31 +228,186 @@ TEST(ClientOrderId, EmptyByDefault) {
 
 // --- Reconciliation action ---
 
+namespace {
+
+constexpr std::int64_t kUnset = OrderRecord::kClockUnset;
+
+// An Ambiguous record whose "first became Ambiguous" anchors are already stamped (order_tracker.hpp
+// stamps them; this is the pure-logic side of that contract).
+OrderRecord ambiguous_since(std::int64_t mono_ms, std::int64_t wall_ms = kUnset) {
+    OrderRecord rec{};
+    rec.state = OrderState::Ambiguous;
+    rec.unknown_since_mono_ms = mono_ms;
+    rec.unknown_since_wall_ms = wall_ms;
+    return rec;
+}
+
+const hy::UnknownQuarantinePolicy kDefaultPolicy{};  // 5 sent queries AND 5000 ms, or a 15000 ms cap
+
+}  // namespace
+
 TEST(Reconcile, AmbiguousQueriesOrder) {
-    OrderRecord rec{};
-    rec.state = OrderState::Ambiguous;
-    rec.query_attempts = 0;
-    EXPECT_EQ(determine_reconcile_action(rec), ReconcileAction::QueryOrder);
-}
-
-TEST(Reconcile, MaxQueriesEscalates) {
-    OrderRecord rec{};
-    rec.state = OrderState::Ambiguous;
-    rec.query_attempts = OrderRecord::kMaxQueryAttempts;
-    EXPECT_EQ(determine_reconcile_action(rec), ReconcileAction::EscalateToOperator);
-}
-
-TEST(Reconcile, ShouldEscalateFlag) {
-    OrderRecord rec{};
-    rec.state = OrderState::Ambiguous;
-    rec.query_attempts = OrderRecord::kMaxQueryAttempts;
-    EXPECT_TRUE(rec.should_escalate());
+    auto rec = ambiguous_since(1000);
+    EXPECT_EQ(determine_reconcile_action(rec, 1000, kUnset, kDefaultPolicy), ReconcileAction::QueryOrder);
 }
 
 TEST(Reconcile, NonAmbiguousNoAction) {
     OrderRecord rec{};
     rec.state = OrderState::Accepted;
-    EXPECT_EQ(determine_reconcile_action(rec), ReconcileAction::NoAction);
+    EXPECT_EQ(determine_reconcile_action(rec, 1'000'000, kUnset, kDefaultPolicy), ReconcileAction::NoAction);
+}
+
+// --- R-10: the UNKNOWN quarantine criterion (Owner decision 2026-09-29) ---
+
+TEST(QuarantineCriterion, DefaultsAreTheOwnersNumbers) {
+    const hy::UnknownQuarantinePolicy p{};
+    EXPECT_EQ(p.min_sent_queries, 5);
+    EXPECT_EQ(p.min_elapsed_ms, 5000);
+    EXPECT_EQ(p.hard_cap_ms, 15000);
+}
+
+TEST(QuarantineCriterion, EnoughSentQueriesButTooEarlyDoesNotEscalate) {
+    auto rec = ambiguous_since(1000);
+    rec.query_attempts = 5;
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 4999, kUnset, kDefaultPolicy), ReconcileAction::QueryOrder);
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 5000, kUnset, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(QuarantineCriterion, EnoughTimeButTooFewQueriesDoesNotEscalateBelowTheCap) {
+    auto rec = ambiguous_since(1000);
+    rec.query_attempts = 4;
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 14'999, kUnset, kDefaultPolicy), ReconcileAction::QueryOrder);
+    rec.query_attempts = 5;
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 14'999, kUnset, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(QuarantineCriterion, HardCapEscalatesWhateverTheQueryCount) {
+    auto rec = ambiguous_since(1000);
+    rec.query_attempts = 0;  // not one query was ever sent
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 14'999, kUnset, kDefaultPolicy), ReconcileAction::QueryOrder);
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 15'000, kUnset, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(QuarantineCriterion, TheThirdInconclusiveQueryNoLongerEscalates) {
+    // The pre-R-10 rule quarantined on the third inconclusive query, about a second in. It must not.
+    auto rec = ambiguous_since(1000);
+    rec.query_attempts = 3;
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 1000, kUnset, kDefaultPolicy), ReconcileAction::QueryOrder);
+    rec.query_attempts = 255;  // even a huge count cannot escalate before the elapsed floor
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 4999, kUnset, kDefaultPolicy), ReconcileAction::QueryOrder);
+}
+
+TEST(QuarantineCriterion, EitherClockAloneCanTrigger) {
+    // Monotonic alone (no wall clock supplied).
+    EXPECT_EQ(determine_reconcile_action(ambiguous_since(0), 15'000, kUnset, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+    // Wall clock alone: the monotonic clock stood still (a suspended host) but the wall clock did not.
+    EXPECT_EQ(determine_reconcile_action(ambiguous_since(1000, 1'700'000'000'000), 1000,
+                                         1'700'000'000'000 + 15'000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+    // The larger of the two elapsed times counts against the 5 s floor of criterion (1) as well.
+    auto rec = ambiguous_since(1000, 1'700'000'000'000);
+    rec.query_attempts = 5;
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 100, 1'700'000'000'000 + 5000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(QuarantineCriterion, WallClockCanOnlyBringEscalationForwardNeverPostponeIt) {
+    // A wall clock that steps BACKWARDS reads as "no time passed" on that clock; the monotonic
+    // clock keeps counting and still escalates on time.
+    auto rec = ambiguous_since(1000, 1'700'000'000'000);
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 15'000, 1'700'000'000'000 - 3'600'000, kDefaultPolicy),
+              ReconcileAction::EscalateToOperator);
+    // ...and the backwards wall clock alone never escalates anything early.
+    EXPECT_EQ(determine_reconcile_action(rec, 1000 + 100, 1'700'000'000'000 - 3'600'000, kDefaultPolicy),
+              ReconcileAction::QueryOrder);
+}
+
+TEST(QuarantineCriterion, UnstampedRecordReadsAsNoTimePassed) {
+    // Pins the documented contract: the criterion needs the anchors. poll_once()/track() always stamp
+    // an Ambiguous record; an unstamped one must not be mistaken for "unresolved for ever".
+    OrderRecord rec{};
+    rec.state = OrderState::Ambiguous;
+    rec.query_attempts = 255;
+    EXPECT_EQ(determine_reconcile_action(rec, 1'000'000, 1'700'000'000'000, kDefaultPolicy),
+              ReconcileAction::QueryOrder);
+}
+
+TEST(QuarantineCriterion, ParametersAreConfigurable) {
+    hy::UnknownQuarantinePolicy p{};
+    p.min_sent_queries = 2;
+    p.min_elapsed_ms = 100;
+    p.hard_cap_ms = 1000;
+    auto rec = ambiguous_since(0);
+    rec.query_attempts = 2;
+    EXPECT_EQ(determine_reconcile_action(rec, 99, kUnset, p), ReconcileAction::QueryOrder);
+    EXPECT_EQ(determine_reconcile_action(rec, 100, kUnset, p), ReconcileAction::EscalateToOperator);
+    rec.query_attempts = 0;
+    EXPECT_EQ(determine_reconcile_action(rec, 999, kUnset, p), ReconcileAction::QueryOrder);
+    EXPECT_EQ(determine_reconcile_action(rec, 1000, kUnset, p), ReconcileAction::EscalateToOperator);
+}
+
+TEST(QuarantineCriterion, DegeneratePolicyFailsClosedToEscalate) {
+    // An order that can never be resolved goes to a human; a nonsense cap must not mean "retry for ever".
+    hy::UnknownQuarantinePolicy zero{};
+    zero.hard_cap_ms = 0;
+    EXPECT_EQ(determine_reconcile_action(ambiguous_since(1000), 1000, kUnset, zero),
+              ReconcileAction::EscalateToOperator);
+    hy::UnknownQuarantinePolicy negative{};
+    negative.hard_cap_ms = -1;
+    EXPECT_EQ(determine_reconcile_action(ambiguous_since(1000), 1000, kUnset, negative),
+              ReconcileAction::EscalateToOperator);
+}
+
+TEST(ElapsedSince, ZeroWhenEitherReadingIsUnsetOrTimeDidNotAdvance) {
+    EXPECT_EQ(hy::elapsed_since_ms(1000, kUnset), 0);
+    EXPECT_EQ(hy::elapsed_since_ms(kUnset, 1000), 0);
+    EXPECT_EQ(hy::elapsed_since_ms(kUnset, kUnset), 0);
+    EXPECT_EQ(hy::elapsed_since_ms(1000, 1000), 0);
+    EXPECT_EQ(hy::elapsed_since_ms(999, 1000), 0) << "a clock that stepped backwards is no evidence of elapsed time";
+}
+
+TEST(ElapsedSince, PlainDifferenceAndSaturationAtTheExtremes) {
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+    EXPECT_EQ(hy::elapsed_since_ms(1500, 1000), 500);
+    EXPECT_EQ(hy::elapsed_since_ms(kMax, kMax - 1), 1);
+    EXPECT_EQ(hy::elapsed_since_ms(kMax, 0), kMax);
+    // A negative anchor with a huge reading would overflow a plain subtraction: it saturates instead.
+    EXPECT_EQ(hy::elapsed_since_ms(kMax, -1), kMax);
+    EXPECT_EQ(hy::elapsed_since_ms(kMax - 5, -10), kMax);
+    EXPECT_EQ(hy::elapsed_since_ms(10, -10), 20);
+}
+
+TEST(StampUnknownSince, StampsOnceAndNeverMovesAnAnchor) {
+    OrderRecord rec{};
+    EXPECT_EQ(rec.unknown_since_mono_ms, kUnset);
+    EXPECT_EQ(rec.unknown_since_wall_ms, kUnset);
+
+    hy::stamp_unknown_since(rec, 100, 5000);
+    EXPECT_EQ(rec.unknown_since_mono_ms, 100);
+    EXPECT_EQ(rec.unknown_since_wall_ms, 5000);
+
+    hy::stamp_unknown_since(rec, 999, 9999);  // a later look must not restart the clock
+    EXPECT_EQ(rec.unknown_since_mono_ms, 100);
+    EXPECT_EQ(rec.unknown_since_wall_ms, 5000);
+}
+
+TEST(StampUnknownSince, ACallerWithoutAWallClockLeavesThatAnchorUnsetUntilItHasOne) {
+    OrderRecord rec{};
+    hy::stamp_unknown_since(rec, 100, kUnset);
+    EXPECT_EQ(rec.unknown_since_mono_ms, 100);
+    EXPECT_EQ(rec.unknown_since_wall_ms, kUnset);
+
+    hy::stamp_unknown_since(rec, 200, 7000);  // mono anchor kept, wall anchor filled in for the first time
+    EXPECT_EQ(rec.unknown_since_mono_ms, 100);
+    EXPECT_EQ(rec.unknown_since_wall_ms, 7000);
+}
+
+TEST(StampUnknownSince, RecordStaysTriviallyCopyableForTheSpscRingBoundary) {
+    EXPECT_TRUE(std::is_trivially_copyable_v<OrderRecord>);
 }
 
 // ===========================================================================

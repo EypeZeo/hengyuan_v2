@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include <type_traits>
 
@@ -268,8 +269,11 @@ struct OrderRecord {
     std::int64_t filled_qty_ticks{0};
     std::int64_t avg_fill_price_ticks{0};
 
-    std::uint8_t query_attempts{0};       // reconciliation query count
-    static constexpr std::uint8_t kMaxQueryAttempts = 3;
+    // Reconciliation queries actually SENT while this order was Ambiguous and answered without a
+    // usable result (R-10: a query that never left the process -- QueryOutcome::NotSent -- is not
+    // counted here). Saturates at 255 rather than wrapping. It feeds the quarantine criterion
+    // (unknown_quarantine_due() below); there is no fixed attempt cap any more.
+    std::uint8_t query_attempts{0};
 
     // L4 §6.1.2: captured once at submit time, never mutated afterward — the
     // basis for OrderExpectation::from(), which a reconciliation query
@@ -280,6 +284,18 @@ struct OrderRecord {
     OrderType order_type{OrderType::Limit};
     SymbolRules rules_snapshot_at_submit{};
 
+    // R-10 (Owner decision 2026-09-29): when this order FIRST became Ambiguous ("UNKNOWN"), read
+    // off the two clocks the reconcile loop has -- the monotonic one it already uses for backoff,
+    // and the wall clock -- both in milliseconds. kClockUnset until stamp_unknown_since() sets
+    // them, and stamped exactly once (never moved afterwards), so the unresolved time only ever
+    // accumulates within this process. Appended LAST, like every other additive field here.
+    // NOT durable: a restart re-stamps them (known limitation L-30 -- the durable anchor is
+    // R-06/R-14 work), so a crash loop can still postpone escalation; that sub-criterion of
+    // FI-042 stays NOT_TESTABLE_YET.
+    static constexpr std::int64_t kClockUnset = std::numeric_limits<std::int64_t>::min();
+    std::int64_t unknown_since_mono_ms{kClockUnset};
+    std::int64_t unknown_since_wall_ms{kClockUnset};
+
     TransitionResult transition_to(OrderState next) noexcept {
         auto result = validate_transition(state, next);
         if (result == TransitionResult::Ok) {
@@ -287,12 +303,69 @@ struct OrderRecord {
         }
         return result;
     }
-
-    bool should_escalate() const noexcept {
-        return state == OrderState::Ambiguous &&
-               query_attempts >= kMaxQueryAttempts;
-    }
 };
+
+// --- R-10: the UNKNOWN quarantine criterion ---
+//
+// An Ambiguous order is escalated to the operator (EscalatedToOperator, which carries
+// UNKNOWN_QUARANTINE) when EITHER
+//   (1) at least `min_sent_queries` reconciliation queries were actually sent and came back
+//       without an answer AND at least `min_elapsed_ms` have passed since it first became
+//       Ambiguous, OR
+//   (2) at least `hard_cap_ms` have passed since then, however many queries went out (the
+//       absolute cap: it is what still bounds an order whose queries cannot even be sent).
+// Replaces the old "third inconclusive query" rule, which quarantined within about a second.
+//
+// Elapsed time is read on two clocks and the LARGER reading counts. The monotonic clock is the
+// one deadlines and backoff live on (blueprint V-07); the wall clock is the single documented
+// exception and may only bring escalation FORWARD -- a suspended host stops the monotonic clock
+// but not the wall clock, and a wall clock that steps backwards reads as "no time has passed" on
+// that clock while the other one keeps counting. Either clock alone is enough to trigger.
+//
+// Every value is configurable. A degenerate policy fails closed to "escalate": a non-positive
+// hard_cap_ms means the cap is already reached (an order that cannot be resolved goes to a human
+// rather than being retried forever).
+struct UnknownQuarantinePolicy {
+    std::uint8_t min_sent_queries{5};
+    std::int64_t min_elapsed_ms{5'000};
+    std::int64_t hard_cap_ms{15'000};
+};
+
+// Records that `rec` first became Ambiguous, on whichever clocks the caller has. Idempotent: an
+// anchor that is already set is never moved, and a clock the caller does not have
+// (OrderRecord::kClockUnset) leaves its anchor unset.
+inline void stamp_unknown_since(OrderRecord& rec, std::int64_t now_mono_ms,
+                                std::int64_t now_wall_ms) noexcept {
+    if (rec.unknown_since_mono_ms == OrderRecord::kClockUnset) rec.unknown_since_mono_ms = now_mono_ms;
+    if (rec.unknown_since_wall_ms == OrderRecord::kClockUnset) rec.unknown_since_wall_ms = now_wall_ms;
+}
+
+// Milliseconds from `since_ms` to `now_ms`: never negative, saturating instead of overflowing, and
+// 0 whenever either reading is unset or `now_ms` is not later than `since_ms` -- a clock that stood
+// still or stepped backwards is no evidence that time has passed.
+inline std::int64_t elapsed_since_ms(std::int64_t now_ms, std::int64_t since_ms) noexcept {
+    if (now_ms == OrderRecord::kClockUnset || since_ms == OrderRecord::kClockUnset) return 0;
+    if (now_ms <= since_ms) return 0;
+    // now > since, so the difference is positive; it can only overflow when `since` is negative.
+    if (since_ms < 0 && now_ms > std::numeric_limits<std::int64_t>::max() + since_ms) {
+        return std::numeric_limits<std::int64_t>::max();
+    }
+    return now_ms - since_ms;
+}
+
+// True iff the R-10 criterion holds for `rec` at the given readings of the two clocks
+// (`now_wall_ms` may be OrderRecord::kClockUnset when the caller has no wall clock).
+inline bool unknown_quarantine_due(const OrderRecord& rec, std::int64_t now_mono_ms,
+                                   std::int64_t now_wall_ms,
+                                   const UnknownQuarantinePolicy& policy) noexcept {
+    const std::int64_t mono = elapsed_since_ms(now_mono_ms, rec.unknown_since_mono_ms);
+    const std::int64_t wall = elapsed_since_ms(now_wall_ms, rec.unknown_since_wall_ms);
+    const std::int64_t elapsed = mono > wall ? mono : wall;
+    // (2) The hard cap. `elapsed` is never negative, so a non-positive cap is reached by
+    // definition -- that is how a degenerate policy fails closed to "escalate" with no special case.
+    if (elapsed >= policy.hard_cap_ms) return true;
+    return rec.query_attempts >= policy.min_sent_queries && elapsed >= policy.min_elapsed_ms;  // (1)
+}
 
 // L4 §6.1.2: everything a reconciliation query needs to validate a GET
 // /api/v3/order response against — captured once at submit time (via
@@ -329,15 +402,20 @@ static_assert(std::is_standard_layout_v<OrderExpectation>);
 
 enum class ReconcileAction : std::uint8_t {
     QueryOrder = 0,       // GET /api/v3/order with same clientOrderId
-    EscalateToOperator = 1, // Max queries exhausted → human takeover
+    EscalateToOperator = 1, // R-10 quarantine criterion met → human takeover
     NoAction = 2,         // Not in ambiguous state
 };
 
-inline ReconcileAction determine_reconcile_action(const OrderRecord& rec) noexcept {
+// `now_wall_ms` may be OrderRecord::kClockUnset when the caller has no wall clock; the monotonic
+// reading alone then decides (see UnknownQuarantinePolicy). The caller must have stamped
+// rec.unknown_since_* (stamp_unknown_since()) -- an unstamped record reads as "no time has passed".
+inline ReconcileAction determine_reconcile_action(const OrderRecord& rec, std::int64_t now_mono_ms,
+                                                  std::int64_t now_wall_ms,
+                                                  const UnknownQuarantinePolicy& policy) noexcept {
     if (rec.state != OrderState::Ambiguous) {
         return ReconcileAction::NoAction;
     }
-    if (rec.query_attempts >= OrderRecord::kMaxQueryAttempts) {
+    if (unknown_quarantine_due(rec, now_mono_ms, now_wall_ms, policy)) {
         return ReconcileAction::EscalateToOperator;
     }
     return ReconcileAction::QueryOrder;
