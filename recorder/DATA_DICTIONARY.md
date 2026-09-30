@@ -101,8 +101,23 @@ D0-0 边界冻结产物。每条协议断言都给出官方来源与核验日期
 
 | 流 | 状态 |
 | :--- | :--- |
-| USD-M RPI 深度 `@rpiDepth@500ms`（属 `/public`） | `EXTERNAL_PROTOCOL_VERIFICATION_REQUIRED`：官方接口目录只给出流名与“含 RPI 订单、500 ms”，无序号语义与真实样本，首轮不录 |
+| USD-M RPI 深度 `@rpiDepth@500ms`（属 `/public`）与 REST `GET /fapi/v1/rpiDepth` | `EXTERNAL_PROTOCOL_VERIFICATION_REQUIRED`：官方接口目录只给出流名与“含 RPI 订单、500 ms”，无序号语义。2026-09-30 已在录制宿主取得真实样本（见 2.8），与 USD-M 深度桥接规则一致，但仍不录（D0-5） |
 | ETH 与更多标的、bookTicker、COIN-M | 不在首轮范围 |
+
+### 2.8 RPI 深度实测（2026-09-30，D0-5 准备，未录制）
+
+证据：`tests/fixtures/d0_rpi_probe_report_2026-09-30.json`。官方来源：衍生品变更日志 2025-11-25 条目（新增 `GET /fapi/v1/rpiDepth` 与 `<symbol>@rpiDepth@500ms`）、订单时效枚举（RPI）、接口目录（`rpiOrderBook`、`rpiDiffBookDepthStreams`），2026-09-30 拉取。方法：录制宿主上的一次性只读探针（`nice 19`、经 ssh 管道运行、不在宿主留存），在 `/public` 路由上同时订阅 `<symbol>@rpiDepth@500ms` 与 `<symbol>@depth@500ms`，按更新号 `u` 逐帧对齐；两份 REST 快照（`/fapi/v1/rpiDepth` 与 `/fapi/v1/depth`，limit 1000，权重各 20）并发获取。
+
+| 项 | 观察 |
+| :--- | :--- |
+| 载荷字段 | 与普通深度相同：`e` `E` `T` `s` `ps` `U` `u` `pu` `b` `a` `st`；外层同为 `{"stream":…,"data":…}`；快照为 `lastUpdateId` `E` `T` `bids` `asks` |
+| 序号 | RPI 流自成一条 `pu` 链：三次探针共 2772 帧，`pu` 链 0 处违规。RPI 快照的 `lastUpdateId` 与流的更新号处于同一序号空间；用 RPI 快照桥接 RPI 差分流，按 USD-M 规则（首个 `u ≥ L` 的帧满足 `U ≤ L`）在 BTCUSDT、ETHUSDT、LINKUSDT、1000PEPEUSDT 上均成功 |
+| 与普通深度的关系 | 六个标的（BTCUSDT、ETHUSDT、SOLUSDT、XRPUSDT、ADAUSDT、SUIUSDT）在 90 至 150 秒窗口内，序号、时间戳与买卖盘载荷逐帧完全相同（除外层流名外无差别）。四个标的（BNBUSDT、DOGEUSDT、LINKUSDT、1000PEPEUSDT）出现差异：RPI 档位数量更大，并有 RPI 独有的档位，帧边界不再一一对应（LINKUSDT 仅 71/114 帧的 `u` 相同，1000PEPEUSDT 仅 71/116）。同一 `lastUpdateId` 的两份 LINKUSDT 快照中，RPI 版有 41 个买档与 36 个卖档数量更大，没有更小的 |
+| 含义 | RPI 深度是独立的订单簿视图，不是普通深度的超集流：在有 RPI 挂单的标的上两条流各有自己的 `u` 序列，不能用普通深度的流或快照替代 RPI 流做桥接，也不能互相补缺；RPI 快照须与 RPI 流配对 |
+| 体量 | BTCUSDT 150 秒共 2.04 MB（约 13.6 KB/秒，未压缩约 1.2 GB/天）。对没有 RPI 挂单的标的，它与普通深度逐帧相同，只会增加体量 |
+| 可成交性（推断，非实测） | 官方订单时效枚举写明 RPI 订单“只与来自 App 或 Web 的订单撮合”，据此 API 吃单方吃不到 RPI 流动性：对本项目的执行，普通深度才是可成交的深度，RPI 深度是信息性数据 |
+| 限制 | 每个标的只有 60 至 150 秒、一个时段的窗口，不是协议保证；哪些标的有 RPI 挂单会随时间变化 |
+| D0-5 待定 | 是否录制、录制哪些标的：先做定期探测（每标的 RPI 与普通深度是否出现差异），只对有差异的标的录制；RPI 快照与 RPI 流复用 USD-M 桥接状态机；须给 `guard.REST_ENDPOINTS` 新增只读端点 `("usdm","rpiDepth")` |
 
 ## 3. REST（仅公开、仅 GET）
 
