@@ -340,6 +340,14 @@ def verify_lake(root: Path, *, check_hashes: bool = True) -> Report:
         if not clean and info and info["tail"]:
             cutoff = info["last_t"] - CRASH_TAIL_US
             tail_zone = next((q for q, t in info["tail"] if t >= cutoff), None)
+        elif not clean and not info:
+            # An unclean run none of whose data is in this lake: still being recorded when the lake was
+            # pulled (its first hourly seal can be up to an hour away -- seen on the real host right after
+            # a reboot), or crashed before its first seal. There is no sealed record to measure a crash
+            # window from, and whatever data it wrote is in the host's live segments or lost with the
+            # crash, so all of its holes are the unsealed tail: INFO, with RUN_NOT_STOPPED_CLEANLY still
+            # raised. A run that stopped cleanly sealed everything, so for it the same holes stay FAIL.
+            tail_zone = q_min
         run_overruns = [(lo, hi) for r, lo, hi in overruns if r == run]
         for hole in _zero_runs(b, q_min, q_max):
             for a, z in _subtract(hole, run_overruns):

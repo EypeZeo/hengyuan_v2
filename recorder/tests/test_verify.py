@@ -279,6 +279,78 @@ def test_crash_tail_is_tolerated_but_flagged(tmp_path):
     assert "RUN_NOT_STOPPED_CLEANLY" in codes(rep, "WARN")
 
 
+def _second_run_with_no_sealed_data(root: Path, *, stop: bool) -> LakeBuilder:
+    """Run 1 is a complete, cleanly stopped lake. Run 2 has ledger events but none of its data is in the lake:
+    what a pull taken between a restart and the new run's first hourly seal sees (the data is still in the
+    host's live segments). The sequence numbers the data used are consumed but nothing was written."""
+    build_clean(root)
+    b2 = LakeBuilder(root)
+    assert b2.run == 2
+    b2.open_conn("spot_trade", [SPOT_TRADE])
+    for _ in range(40):
+        b2.next_q()
+    b2.event("CLOCK_PROBE", venue="spot", server_ms=1, rtt_us=292000, offset_ms=0.4, start_wall_us=1)
+    for _ in range(25):
+        b2.next_q()
+    b2.event("CLOCK_PROBE", venue="usdm", server_ms=1, rtt_us=288000, offset_ms=0.3, start_wall_us=1)
+    if stop:
+        b2.stop()
+    else:
+        b2.ledger.close()
+    return b2
+
+
+def test_a_live_run_with_no_sealed_data_yet_is_a_tail_not_a_failure(tmp_path):
+    """Found on the real host: a pull taken right after a reboot (the new run had a ledger but no sealed
+    segment yet) made verify report SEQ_HOLE FAIL for a healthy lake, because with no sealed record there was
+    no crash window to measure and every missing sequence number counted as lost."""
+    _second_run_with_no_sealed_data(tmp_path, stop=False)
+    rep = verify_lake(tmp_path)
+    assert rep.exit_code == 0, rep.render_text()
+    assert "SEQ_HOLE" not in codes(rep, "FAIL")
+    assert "CRASH_TAIL_HOLE" in codes(rep, "INFO")
+    assert "RUN_NOT_STOPPED_CLEANLY" in codes(rep, "WARN")
+    assert rep.runs[1]["clean"] is True and rep.runs[2]["clean"] is False
+
+
+def test_the_same_holes_fail_once_the_run_claims_a_clean_stop(tmp_path):
+    """A run that stopped cleanly sealed everything, so the same missing sequence numbers are real losses."""
+    _second_run_with_no_sealed_data(tmp_path, stop=True)
+    rep = verify_lake(tmp_path)
+    assert rep.exit_code == 1 and "SEQ_HOLE" in codes(rep, "FAIL")
+    assert "CRASH_TAIL_HOLE" not in codes(rep)
+
+
+def test_a_hole_in_the_middle_of_an_unclean_run_with_sealed_data_still_fails(tmp_path):
+    """Only the last CRASH_TAIL_US before the end of the sealed data is forgiven, never an earlier hole."""
+    from conftest import load_frames
+
+    from hy_recorder.segment import recover
+
+    b = LakeBuilder(tmp_path)
+    g = b.open_conn("spot_trade", [SPOT_TRADE])
+    frames = [p for _, _, p in load_frames("spot_trade_frames.jsonl")]
+    for payload in frames[:8]:
+        b.record("spot", "trade", SPOT_TRADE, payload, g)
+    for _ in range(3):
+        b.next_q()  # three records never written: a real hole
+    b.clock.advance(30.0)  # well beyond the crash window, so the hole is not at the tail
+    for payload in frames[8:16]:
+        b.record("spot", "trade", SPOT_TRADE, payload, g)
+    b.crash()
+    recover(
+        tmp_path,
+        manifest=Manifest(tmp_path),
+        level=3,
+        next_segseq=b.state.next_segseq,
+        clock=b.clock,
+        emit=lambda *a, **k: None,
+    )
+    rep = verify_lake(tmp_path)
+    assert rep.exit_code == 1 and "SEQ_HOLE" in codes(rep, "FAIL")
+    assert "RUN_NOT_STOPPED_CLEANLY" in codes(rep, "WARN")
+
+
 def test_multi_frame_segment_is_rejected(tmp_path):
     build_clean(tmp_path)
     seg = next(p for p in (tmp_path / "raw" / "spot" / "trade").rglob("*.jsonl.zst"))
