@@ -34,6 +34,7 @@
 #include <hengyuan/secure_wipe.hpp>
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -136,9 +137,36 @@ public:
 private:
 #ifdef __linux__
     KekLoadStatus load_linux(const char* path) noexcept {
+        // The path is resolved exactly once, here; type, permission and size are
+        // then checked on the descriptor (load_from_fd), never on the path again.
+        // An lstat(path) followed by open(path) leaves a window in which the file
+        // can be swapped between "checked" and "read" -- the same fix, and the same
+        // flag rationale, as env_loader.hpp's load_linux:
+        //   O_NOFOLLOW trailing symlink -> ELOOP; O_NONBLOCK a swapped-in FIFO
+        //   cannot park open(); O_NOCTTY / O_CLOEXEC no controlling tty, no leak
+        //   into a child process.
+        const int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+        if (fd < 0) {
+            const int err = errno;
+            if (err == ELOOP) return KekLoadStatus::IsSymlink;
+            if (err == ENOENT || err == ENOTDIR || err == ENAMETOOLONG) {
+                return KekLoadStatus::FileNotFound;
+            }
+            return KekLoadStatus::ReadError;
+        }
+
+        const KekLoadStatus status = load_from_fd(fd);
+        close(fd);
+        return status;
+    }
+
+    // Every gate runs on `fd`, so the file that is checked is by construction the
+    // file that is read.
+    KekLoadStatus load_from_fd(int fd) noexcept {
         struct stat st{};
-        if (lstat(path, &st) != 0) return KekLoadStatus::FileNotFound;
-        if (S_ISLNK(st.st_mode)) return KekLoadStatus::IsSymlink;
+        if (fstat(fd, &st) != 0) return KekLoadStatus::ReadError;
+        // Directory, FIFO, device or socket (a trailing symlink never gets this
+        // far: O_NOFOLLOW already failed the open).
         if (!S_ISREG(st.st_mode)) return KekLoadStatus::FileNotFound;
 
         // Owner-only: reject if group or other have any permission bits.
@@ -155,12 +183,7 @@ private:
             return KekLoadStatus::LockFailed;
         }
 
-        const int fd = open(path, O_RDONLY | O_NOFOLLOW);
-        if (fd < 0) return KekLoadStatus::ReadError;
-
         const ssize_t n = read(fd, kek_.data(), kek_.size());
-        close(fd);
-
         if (n < 0 || static_cast<std::size_t>(n) != kKekSize) {
             return KekLoadStatus::ReadError;
         }
