@@ -37,8 +37,28 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 # 一条从不失败的闸门等于没有闸门，因此这些判定必须与主流程共用同一份实现。
 # --------------------------------------------------------------------------- #
 
+# 无属性的 <script> 元素就是页面的内联脚本；带属性的 JSON 数据岛不是，刻意不取。
+# 匹配的容忍度与 HTML 本身一致：标签名不分大小写，结束标签里可以有空白或属性（</script >），
+# 因此不会被 <SCRIPT> 或 </script > 这类写法绕过。
+_SCRIPT_ELEMENT = re.compile(r"<script\b([^>]*)>(.*?)</script[^>]*>", re.I | re.S)
+
+
+def _inline_script_matches(page: str) -> list:
+    return [m for m in _SCRIPT_ELEMENT.finditer(page) if not m.group(1).strip()]
+
+
 def extract_scripts(page: str) -> list:
-    return re.findall(r"<script>(.*?)</script>", page, re.S)
+    return [m.group(2) for m in _inline_script_matches(page)]
+
+
+def strip_inline_scripts(page: str) -> str:
+    """去掉全部内联脚本元素后的页面文本（F2 用它判断正文里有没有字面的 \\n 转义）。"""
+    kept, last = [], 0
+    for m in _inline_script_matches(page):
+        kept.append(page[last:m.start()])
+        last = m.end()
+    kept.append(page[last:])
+    return "".join(kept)
 
 
 def css_style_block(page: str) -> str:
@@ -234,7 +254,7 @@ def main() -> int:
 
     # ---- F 脚本 ----
     check("F1 数据岛可解析", isinstance(data, dict) and "meta" in data)
-    check("F2 无字面换行转义", "\\n" not in re.sub(r'<script>.*?</script>', "", page, flags=re.S))
+    check("F2 无字面换行转义", "\\n" not in strip_inline_scripts(page))
     check("F3 页面无生成时间戳", not re.search(r"生成(于|时间)[：:]\s*20\d\d", page))
 
     # ---- G 溯源 ----

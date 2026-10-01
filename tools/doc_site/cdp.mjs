@@ -103,13 +103,33 @@ export class Browser {
     this._loaded = null;
   }
 
-  /** 在页面里求值，返回 JSON 可序列化结果。 */
+  /** 在页面里求值，返回 JSON 可序列化结果。`expression` 只能是调用方写死的代码文本。 */
   async eval(expression) {
     const r = await this.send("Runtime.evaluate", {
       expression: `(() => { ${expression} })()`,
       returnByValue: true,
       awaitPromise: true,
     }, this.sessionId);
+    return this.#unwrap(r);
+  }
+
+  /**
+   * 同 eval，但数据不拼进代码：`args`（JSON 可序列化）作为参数交给页面里的函数，函数体 `body`
+   * 里以 `args` 引用。凡是要把页面或数据里读出来的值带进求值，都用这个，不要做字符串拼接。
+   */
+  async evalWith(args, body) {
+    const g = await this.send("Runtime.evaluate", { expression: "globalThis", returnByValue: false }, this.sessionId);
+    const r = await this.send("Runtime.callFunctionOn", {
+      objectId: g.result.objectId,
+      functionDeclaration: `function (args) { ${body} }`,
+      arguments: [{ value: args }],
+      returnByValue: true,
+      awaitPromise: true,
+    }, this.sessionId);
+    return this.#unwrap(r);
+  }
+
+  #unwrap(r) {
     if (r.exceptionDetails) {
       throw new Error("页面求值异常：" + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
     }
