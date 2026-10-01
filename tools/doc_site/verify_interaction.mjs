@@ -62,11 +62,11 @@ try {
       });`);
   }
   async function centerOn(sel) {
-    await b.eval(`document.querySelector('${sel}').scrollIntoView({block:'center'});`);
+    await b.evalWith({ sel }, `document.querySelector(args.sel).scrollIntoView({block:'center'});`);
     await sleep(120);
     await settle();
-    return b.eval(`
-      const r=document.querySelector('${sel}').getBoundingClientRect();
+    return b.evalWith({ sel }, `
+      const r=document.querySelector(args.sel).getBoundingClientRect();
       return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};`);
   }
   const pos = await centerOn('.st[data-station="B2"]');
@@ -218,10 +218,10 @@ try {
   const wipStation = await b.eval(`
     return document.querySelector('.st[data-status="wip"]')?.getAttribute('data-station') || null;`);
   const wipSelector = wipStation ? `.st[data-station="${wipStation}"]` : null;
-  const wipSelectorLiteral = JSON.stringify(wipSelector);
   const wipPos = wipSelector ? await centerOn(wipSelector) : {x: 0, y: 0};
-  const wipStatus = await b.eval(`
-    const node=document.querySelector(${wipSelectorLiteral});
+  // 站点编号是从页面里读出来的值：作为参数传进页面，不拼进代码字符串。
+  const wipStatus = await b.evalWith({ selector: wipSelector }, `
+    const node=args.selector?document.querySelector(args.selector):null;
     return node?.getAttribute('data-status') || null;`);
   check("被测试站点确为进行中", wipStatus === "wip", wipStatus);
   if (!wipSelector) {
@@ -229,21 +229,21 @@ try {
   }
   await b.clickAt(wipPos.x, wipPos.y);
   await sleep(200);
-  const held = await b.eval(`
+  const held = await b.evalWith({ selector: wipSelector }, `
     const svg=document.getElementById('metro-svg');
     const t=svg.querySelector('.train');
     const a=t.getBoundingClientRect().left;
     return new Promise(res=>setTimeout(()=>res({
       paused:svg.animationsPaused?svg.animationsPaused():null,
       moved:Math.abs(t.getBoundingClientRect().left-a),
-      held:document.querySelector(${wipSelectorLiteral})?.classList.contains('held') || false,
+      held:(args.selector?document.querySelector(args.selector):null)?.classList.contains('held') || false,
       offscreen:!document.getElementById('metro-panel').getBoundingClientRect().bottom>0,
       note:document.getElementById('status-note').textContent}),900));`);
   check("单击进行中站点后动画停顿", held.paused === true, String(held.paused));
   check("停顿时站点出现锁定环（此前 CSS 有样式但脚本从未加类）", held.held === true);
-  const ring = await b.eval(`
-    const c=document.querySelector(${wipSelectorLiteral} + ' .held');
-    const pulse=document.querySelector(${wipSelectorLiteral} + ' .halo');
+  const ring = await b.evalWith({ selector: wipSelector }, `
+    const c=args.selector?document.querySelector(args.selector + ' .held'):null;
+    const pulse=args.selector?document.querySelector(args.selector + ' .halo'):null;
     if (!c || !pulse) return {stroke:"none",width:0,opacity:0,halo:"block"};
     const s=getComputedStyle(c);
     return {stroke:s.stroke,width:parseFloat(s.strokeWidth),opacity:parseFloat(s.opacity),
@@ -257,14 +257,14 @@ try {
   await sleep(2600);
   await b.eval(`document.getElementById('metro-panel').scrollIntoView({block:'center'});`);
   await sleep(900);
-  const resumed = await b.eval(`
+  const resumed = await b.evalWith({ selector: wipSelector }, `
     const svg=document.getElementById('metro-svg');
     const t=svg.querySelector('.train');
     const a=t.getBoundingClientRect().left;
     return new Promise(res=>setTimeout(()=>res({
        paused:svg.animationsPaused?svg.animationsPaused():null,
        moved:Math.abs(t.getBoundingClientRect().left-a),
-       held:document.querySelector(${wipSelectorLiteral})?.classList.contains('held') || false}),1200));`);
+       held:(args.selector?document.querySelector(args.selector):null)?.classList.contains('held') || false}),1200));`);
   check("回到站点图后停顿收尾、动画恢复（离开视口期间不会静默过期）",
     resumed.paused === false && resumed.moved > 0.5, `位移=${resumed.moved.toFixed(2)}`);
   check("恢复后锁定环撤下", resumed.held === false);
