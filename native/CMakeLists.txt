@@ -117,6 +117,15 @@ add_executable(seal_journal_store_dump src/seal_journal_store_dump.cpp)
 target_link_libraries(seal_journal_store_dump PRIVATE hengyuan_core)
 hengyuan_set_warnings(seal_journal_store_dump)
 
+# --- 批次 6 6c: offline durable audit log export (diagnostic; deliberately NOT a production code path -- read-only
+# on the source directory, the writer's lock is only probed, never acquired). Verifies a DurableAuditSink log's
+# HMAC chain + tip anchor + store identity end to end and, only if that holds, writes it as NDJSON. No self-check
+# mode, so no ctest registration (test_durable_audit_export.cpp above is the real coverage, over the library code
+# this CLI is a thin wrapper around).
+add_executable(durable_audit_log_export src/durable_audit_log_export.cpp)
+target_link_libraries(durable_audit_log_export PRIVATE hengyuan_core)
+hengyuan_set_warnings(durable_audit_log_export)
+
 # --- Binance feed demo (optional, requires Boost + OpenSSL) ---
 option(HY_BUILD_DEMO "Build binance_feed_demo (requires Boost + OpenSSL)" OFF)
 
@@ -604,6 +613,15 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_durable_audit_sink PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_durable_audit_sink)
     gtest_discover_tests(test_durable_audit_sink)
+
+    # 批次 6 6c: offline export of a durable audit log to NDJSON (verify-then-write; a torn tail is reported and
+    # exported up to it, everything else -- bad MAC, sequence gap, chain break, anchor rollback/mismatch, unknown
+    # key/version -- is a hard error with no output file). Real DurableAuditSink writes the fixture logs this
+    # test corrupts, so it is proven against the actual writer, not this file's own assumptions.
+    add_executable(test_durable_audit_export tests/test_durable_audit_export.cpp)
+    target_link_libraries(test_durable_audit_export PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_audit_export)
+    gtest_discover_tests(test_durable_audit_export)
 
     # Phase 5 (docs/SPEC_INVARIANTS.md): export-worker best-effort telemetry
     # consumer for ExportOutboxRing (L2, real file I/O for LastRemoteAckedTip
