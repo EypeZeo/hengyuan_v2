@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,12 @@ ACK_BATCH = 100
 _SEG_RE = re.compile(r"^raw/[a-z]+/[a-z]+/\d{8}/\d{2}-\d{6,}\.jsonl\.zst$")
 _DATED_RE = re.compile(r"^(manifest|ledger)/\d{8}\.jsonl$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+# ssh exits 255 when the connection itself failed (refused, closed during the handshake, timed out); a
+# remote command's own failure keeps its own exit code. Every command the transport runs is idempotent
+# (cat, ls, mkdir/touch), so a connection-level failure is retried after a short pause instead of costing
+# the pull an error. The pull opens one connection per segment, and the host's sshd now and then closes one.
+_SSH_CONNECTION_FAILED = 255
+_RETRY_DELAYS_S = (2.0, 5.0, 10.0)
 
 
 class PullError(RuntimeError):
@@ -95,9 +102,12 @@ class SshTransport:
         options: tuple[str, ...] = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=15"),
         run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
         popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_delays_s: tuple[float, ...] = _RETRY_DELAYS_S,
     ) -> None:
         self.host, self.root = host, remote_root.rstrip("/")
         self._ssh, self._options, self._run, self._popen = ssh, options, run, popen
+        self._sleep, self._retry_delays_s = sleep, retry_delays_s
 
     def _argv(self, remote_cmd: str) -> list[str]:
         return [self._ssh, *self._options, self.host, remote_cmd]
@@ -105,8 +115,19 @@ class SshTransport:
     def _path(self, rel: str) -> str:
         return shlex.quote("%s/%s" % (self.root, _check_rel(rel)))
 
+    def _run_retrying(self, remote_cmd: str, **kw) -> subprocess.CompletedProcess[bytes]:
+        """Run one remote command; a connection-level failure (ssh exit 255) is retried after each of the
+        configured pauses, anything else (success or the remote command's own failure) is returned as is."""
+        proc = self._run(self._argv(remote_cmd), **kw)
+        for delay in self._retry_delays_s:
+            if proc.returncode != _SSH_CONNECTION_FAILED:
+                break
+            self._sleep(delay)
+            proc = self._run(self._argv(remote_cmd), **kw)
+        return proc
+
     def read_file(self, rel: str) -> bytes:
-        proc = self._run(self._argv("cat -- " + self._path(rel)), capture_output=True, timeout=120)
+        proc = self._run_retrying("cat -- " + self._path(rel), capture_output=True, timeout=120)
         if proc.returncode != 0:
             raise PullError(
                 "cat %s failed (%d): %s" % (rel, proc.returncode, proc.stderr.decode(errors="replace")[:200])
@@ -114,26 +135,34 @@ class SshTransport:
         return proc.stdout
 
     def list_dir(self, rel: str) -> list[str]:
-        proc = self._run(
-            self._argv("ls -1 -- %s 2>/dev/null || true" % self._path(rel)), capture_output=True, timeout=60
+        proc = self._run_retrying(
+            "ls -1 -- %s 2>/dev/null || true" % self._path(rel), capture_output=True, timeout=60
         )
         if proc.returncode != 0:
             raise PullError("ls %s failed (%d)" % (rel, proc.returncode))
         return sorted(line for line in proc.stdout.decode().splitlines() if line and "/" not in line)
 
     def stream_file(self, rel: str) -> Iterator[bytes]:
-        proc = self._popen(
-            self._argv("cat -- " + self._path(rel)), stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        assert proc.stdout is not None
-        try:
-            while chunk := proc.stdout.read(CHUNK):
-                yield chunk
-        finally:
-            proc.stdout.close()
-            err = proc.stderr.read() if proc.stderr is not None else b""
-            code = proc.wait()
-        if code != 0:
+        remote_cmd = "cat -- " + self._path(rel)
+        for attempt in range(len(self._retry_delays_s) + 1):
+            proc = self._popen(self._argv(remote_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert proc.stdout is not None
+            yielded = False
+            try:
+                while chunk := proc.stdout.read(CHUNK):
+                    yielded = True
+                    yield chunk
+            finally:
+                proc.stdout.close()
+                err = proc.stderr.read() if proc.stderr is not None else b""
+                code = proc.wait()
+            if code == 0:
+                return
+            # Only a connection that failed before the first byte reached the caller is retried: bytes the
+            # caller has already consumed cannot be taken back (the next pull re-fetches such a segment).
+            if code == _SSH_CONNECTION_FAILED and not yielded and attempt < len(self._retry_delays_s):
+                self._sleep(self._retry_delays_s[attempt])
+                continue
             raise PullError("cat %s failed (%d): %s" % (rel, code, err.decode(errors="replace")[:200]))
 
     def write_acks(self, shas: list[str]) -> None:
@@ -144,7 +173,7 @@ class SshTransport:
                 raise PullError("bad sha %r" % sha)
         acks = shlex.quote(self.root + "/acks")
         cmd = "mkdir -p %s && cd %s && touch -- %s" % (acks, acks, " ".join(shas))
-        proc = self._run(self._argv(cmd), capture_output=True, timeout=60)
+        proc = self._run_retrying(cmd, capture_output=True, timeout=60)
         if proc.returncode != 0:
             raise PullError(
                 "writing acks failed (%d): %s" % (proc.returncode, proc.stderr.decode(errors="replace")[:200])

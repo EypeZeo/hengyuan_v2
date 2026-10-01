@@ -323,15 +323,84 @@ def test_ssh_commands_are_fixed_quoted_and_use_the_operator_s_own_ssh(tmp_path):
 
 def test_ssh_stream_yields_chunks_and_surfaces_a_failed_remote_command():
     rec = Recorded()
-    t = SshTransport("h", "/r", run=rec.run, popen=rec.popen)
+    slept: list[float] = []
+    t = SshTransport("h", "/r", run=rec.run, popen=rec.popen, sleep=slept.append)
     rec.responses = [(b"x" * 3_000_000, b"", 0)]
     assert sum(len(c) for c in t.stream_file("raw/spot/trade/20260929/10-000001.jsonl.zst")) == 3_000_000
     rec.responses = [(b"partial", b"cat: nope: Permission denied", 1)]
     with pytest.raises(PullError, match="Permission denied"):
         list(t.stream_file("raw/spot/trade/20260929/10-000001.jsonl.zst"))
-    rec.responses = [(b"", b"boom", 255)]
+    rec.responses = [(b"", b"boom", 255)] * 4  # the connection never comes up: the initial try and 3 retries
+    with pytest.raises(PullError, match="boom"):
+        t.read_file("status.json")
+    assert slept == [2.0, 5.0, 10.0]
+
+
+# -- a connection the host closes is retried, a command that ran and failed is not ------------------
+SEG = "raw/spot/trade/20260929/10-000001.jsonl.zst"
+
+
+def ssh_with_recorder(responses):
+    rec, slept = Recorded(), []
+    rec.responses = list(responses)
+    return SshTransport("h", "/r", run=rec.run, popen=rec.popen, sleep=slept.append), rec, slept
+
+
+def test_a_closed_ssh_connection_is_retried_for_every_command_the_transport_runs():
+    closed = (b"", b"Connection closed by the host port 22", 255)
+    t, rec, slept = ssh_with_recorder([closed, (b'{"ev":"seal"}\n', b"", 0)])
+    assert t.read_file("manifest/20260929.jsonl") == b'{"ev":"seal"}\n'
+    assert slept == [2.0] and len(rec.argvs) == 2 and rec.argvs[0] == rec.argvs[1]
+
+    t, rec, slept = ssh_with_recorder([closed, closed, closed, (b"a.jsonl\nb.jsonl\n", b"", 0)])
+    assert t.list_dir("ledger") == ["a.jsonl", "b.jsonl"]
+    assert slept == [2.0, 5.0, 10.0] and len(rec.argvs) == 4
+
+    t, rec, slept = ssh_with_recorder([closed, (b"", b"", 0)])
+    t.write_acks(["a" * 64])
+    assert slept == [2.0] and len(rec.argvs) == 2
+
+
+def test_a_stream_is_retried_only_while_no_byte_has_reached_the_caller():
+    closed = (b"", b"Connection closed by the host port 22", 255)
+    t, rec, slept = ssh_with_recorder([closed, closed, (b"payload", b"", 0)])
+    assert b"".join(t.stream_file(SEG)) == b"payload"
+    assert slept == [2.0, 5.0] and len(rec.argvs) == 3
+
+    # bytes already handed out cannot be taken back: the failure surfaces, and the next pull fetches it again
+    t, rec, slept = ssh_with_recorder([(b"part", b"Connection reset", 255), (b"payload", b"", 0)])
+    got = []
+    with pytest.raises(PullError, match="Connection reset"):
+        for chunk in t.stream_file(SEG):
+            got.append(chunk)
+    assert got == [b"part"] and slept == [] and len(rec.argvs) == 1
+
+    t, rec, slept = ssh_with_recorder([closed] * 4)
+    with pytest.raises(PullError, match="Connection closed"):
+        list(t.stream_file(SEG))
+    assert slept == [2.0, 5.0, 10.0] and len(rec.argvs) == 4
+
+
+def test_a_remote_command_that_ran_and_failed_is_not_retried():
+    denied = (b"", b"cat: nope: Permission denied", 1)
+    t, rec, slept = ssh_with_recorder([denied, (b"data", b"", 0)])
+    with pytest.raises(PullError, match="Permission denied"):
+        t.read_file("status.json")
+    assert slept == [] and len(rec.argvs) == 1
+
+    t, rec, slept = ssh_with_recorder([denied, (b"data", b"", 0)])
+    with pytest.raises(PullError, match="Permission denied"):
+        list(t.stream_file(SEG))
+    assert slept == [] and len(rec.argvs) == 1
+
+
+def test_no_retry_pauses_means_a_single_attempt():
+    rec = Recorded()
+    rec.responses = [(b"", b"boom", 255), (b"data", b"", 0)]
+    t = SshTransport("h", "/r", run=rec.run, popen=rec.popen, retry_delays_s=())
     with pytest.raises(PullError):
         t.read_file("status.json")
+    assert len(rec.argvs) == 1
 
 
 def test_unchanged_local_segments_are_not_hashed_again_but_a_changed_one_is_refetched(tmp_path, monkeypatch):
