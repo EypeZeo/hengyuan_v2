@@ -7,7 +7,9 @@
 // ADR-019 D4 checklist enforced by this loader:
 //   ✅ Variable-name allowlist (delegated to env_parser.hpp)
 //   ✅ File permission check (Linux: must be 0600 or 0400, reject if group/other readable)
-//   ✅ Anti-symlink (lstat → reject if S_ISLNK; Windows: GetFileAttributesW reject reparse point)
+//   ✅ Anti-symlink (Linux: open O_NOFOLLOW → ELOOP; Windows: GetFileAttributesW reject reparse point)
+//   ✅ No check-then-use window (Linux: the path is opened once, and type / permission / size are
+//      checked on that descriptor via fstat; Windows: re-checked on the opened handle)
 //   ✅ Fixed absolute path (compiled-in or caller-provided, never from env var or CLI arg)
 //   ✅ Memory lock (mlock on Linux to prevent swap)
 //   ✅ Secure wipe on destruction and on error
@@ -24,6 +26,7 @@
 #include <hengyuan/secure_wipe.hpp>
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -143,18 +146,47 @@ private:
     EnvLoadResult load_linux(const char* path, const EnvAllowlist& allowlist) noexcept {
         EnvLoadResult result{};
 
-        // Anti-symlink: use lstat (does NOT follow symlinks)
+        // The path is resolved exactly once, here. Type, permission and size are
+        // then checked on the descriptor (load_from_fd), never on the path again:
+        // an lstat(path) followed by open(path) leaves a window in which the file
+        // can be swapped (symlink, FIFO, wider mode) between "checked" and "read"
+        // (CodeQL cpp/toctou-race-condition).
+        //   O_NOFOLLOW  trailing symlink -> ELOOP, atomically with the open
+        //   O_NONBLOCK  a FIFO swapped in at `path` must not park open() until a
+        //               writer shows up (no effect on reads of a regular file)
+        //   O_NOCTTY    a tty at `path` must not become the controlling terminal
+        //   O_CLOEXEC   the descriptor must not survive into a child process
+        const int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+        if (fd < 0) {
+            const int err = errno;
+            if (err == ELOOP) {
+                result.status = EnvLoadStatus::IsSymlink;
+            } else if (err == ENOENT || err == ENOTDIR || err == ENAMETOOLONG) {
+                result.status = EnvLoadStatus::FileNotFound;
+            } else {
+                result.status = EnvLoadStatus::ReadError;
+            }
+            return result;
+        }
+
+        result = load_from_fd(fd, allowlist);
+        close(fd);
+        return result;
+    }
+
+    // Every gate runs on `fd`, so the file that is checked is by construction the
+    // file that is read.
+    EnvLoadResult load_from_fd(int fd, const EnvAllowlist& allowlist) noexcept {
+        EnvLoadResult result{};
+
         struct stat st{};
-        if (lstat(path, &st) != 0) {
-            result.status = EnvLoadStatus::FileNotFound;
+        if (fstat(fd, &st) != 0) {
+            result.status = EnvLoadStatus::ReadError;
             return result;
         }
 
-        if (S_ISLNK(st.st_mode)) {
-            result.status = EnvLoadStatus::IsSymlink;
-            return result;
-        }
-
+        // Directory, FIFO, device or socket. (A trailing symlink never gets this
+        // far: O_NOFOLLOW already failed the open.)
         if (!S_ISREG(st.st_mode)) {
             result.status = EnvLoadStatus::FileNotFound;
             return result;
@@ -182,16 +214,7 @@ private:
             return result;
         }
 
-        // Open with O_NOFOLLOW as additional symlink protection
-        int fd = open(path, O_RDONLY | O_NOFOLLOW);
-        if (fd < 0) {
-            result.status = EnvLoadStatus::ReadError;
-            return result;
-        }
-
         ssize_t n = read(fd, file_buf_.data(), file_buf_.size());
-        close(fd);
-
         if (n < 0) {
             result.status = EnvLoadStatus::ReadError;
             return result;

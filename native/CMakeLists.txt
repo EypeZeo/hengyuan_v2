@@ -428,8 +428,10 @@ if(HY_BUILD_TESTS)
 
     # Phase 0 (密钥轮换共享基础设施): KEK 文件加载器 (L3, 镜像 env_loader.hpp
     # 的权限检查/反符号链接/mlock/安全擦除模式，见 kek_loader.hpp)
+    # Threads: the FIFO case runs the load on a std::async thread so a regression to
+    # a blocking open() fails the test instead of hanging it.
     add_executable(test_kek_loader tests/test_kek_loader.cpp)
-    target_link_libraries(test_kek_loader PRIVATE hengyuan_core GTest::gtest_main)
+    target_link_libraries(test_kek_loader PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_kek_loader)
     gtest_discover_tests(test_kek_loader)
 
@@ -851,8 +853,10 @@ if(HY_BUILD_TESTS)
     gtest_discover_tests(test_order_fill_context)
 
     # P2-EXEC-LIVE-01 D12-2: secure env loader (L3, file I/O + permission check)
+    # Threads: the FIFO case runs the load on a std::async thread so a regression to
+    # a blocking open() fails the test instead of hanging it.
     add_executable(test_env_loader tests/test_env_loader.cpp)
-    target_link_libraries(test_env_loader PRIVATE hengyuan_core GTest::gtest_main)
+    target_link_libraries(test_env_loader PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_env_loader)
     gtest_discover_tests(test_env_loader)
 
