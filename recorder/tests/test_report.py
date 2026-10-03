@@ -109,6 +109,70 @@ def test_slow_bridges_are_listed(tmp_path):
     assert rep["slow_bridges_over_10s"] == [{"stream": "usdm:btcusdt@depth@100ms", "gen": 1, "seconds": 42.0}]
 
 
+def _probe(b: LakeBuilder, offset_ms: float) -> None:
+    b.event("CLOCK_PROBE", venue="usdm", server_ms=1, rtt_us=4_000, offset_ms=offset_ms, start_wall_us=1)
+
+
+def test_unsynchronised_clock_intervals_are_listed_with_the_probes_that_fall_inside(tmp_path):
+    b = LakeBuilder(tmp_path)
+    b.event(
+        "CLOCK_STATE", initial=True, synced=False, source="timesyncd", marker_age_s=None, reason="no_marker"
+    )
+    b.clock.advance(10.0)
+    _probe(b, 180.0)  # inside the unsynchronised interval
+    b.clock.advance(26.0)
+    b.event(
+        "CLOCK_STATE",
+        initial=False,
+        synced=True,
+        source="timesyncd",
+        marker_age_s=0.0,
+        reason=None,
+        unsynced_s=36.0,
+    )
+    b.clock.advance(10.0)
+    _probe(b, -2.0)  # after the sync
+    b.stop()
+    rep = build_report(tmp_path)
+    cs = rep["clock_state"]
+    assert cs["events"] == 2 and cs["unknown_state_runs"] == []
+    assert cs["unsynced_total_s"] == pytest.approx(36.0, abs=0.1) and cs["probes_in_unsynced"] == 1
+    (iv,) = cs["unsynced_intervals"]
+    assert iv["run"] == 1 and iv["ended"] is True and iv["seconds"] == pytest.approx(36.0, abs=0.1)
+    text = render_text(rep)
+    assert "unsynchronised 36.0 s in total" in text and "1 clock probes fall inside" in text
+
+
+def test_a_run_that_never_synced_is_reported_as_unsynchronised_until_its_last_event(tmp_path):
+    b = LakeBuilder(tmp_path)
+    b.event(
+        "CLOCK_STATE", initial=True, synced=False, source="timesyncd", marker_age_s=None, reason="no_marker"
+    )
+    b.clock.advance(120.0)
+    _probe(b, 150.0)
+    b.stop()
+    cs = build_report(tmp_path)["clock_state"]
+    (iv,) = cs["unsynced_intervals"]
+    assert iv["ended"] is False and iv["seconds"] >= 120.0 and cs["probes_in_unsynced"] == 1
+    assert "never synced" in render_text(build_report(tmp_path))
+
+
+def test_a_lake_without_clock_state_events_says_so_and_an_unknown_state_is_not_unsynced(tmp_path):
+    b = LakeBuilder(tmp_path)
+    b.event("CLOCK_PROBE", venue="spot", server_ms=1, rtt_us=100_000, offset_ms=1.0, start_wall_us=1)
+    b.stop()
+    rep = build_report(tmp_path)
+    assert rep["clock_state"]["events"] == 0 and "predates" in render_text(rep)
+
+    (tmp_path / "unknown").mkdir()
+    b2 = LakeBuilder(tmp_path / "unknown")
+    b2.event("CLOCK_STATE", initial=True, synced=None, source="unknown", marker_age_s=None, reason=None)
+    b2.stop()
+    cs = build_report(tmp_path / "unknown")["clock_state"]
+    assert cs["unsynced_intervals"] == [] and cs["unknown_state_runs"] == [1]
+    assert "state unknown in runs [1]" in render_text(build_report(tmp_path / "unknown"))
+
+
 def test_generations_restart_each_run_and_must_not_be_mixed_up(tmp_path):
     b1 = LakeBuilder(tmp_path)
     g = b1.open_conn("spot_depth_btcusdt", [SPOT_DEPTH])

@@ -62,6 +62,47 @@ def _probe_view(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _clock_state_view(ledger: list[dict[str, Any]], probes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Intervals during which the host clock was reported unsynchronised (``CLOCK_STATE``), per run: from
+    a ``synced=false`` event to the next ``synced=true`` one, or to the run's last event if it never synced.
+    Receive times and ``CLOCK_PROBE`` offsets inside such an interval carry the unsynchronised clock."""
+    last_t: dict[int, int] = {}
+    for e in ledger:
+        run, t = e.get("run"), e.get("t")
+        if isinstance(run, int) and isinstance(t, int):
+            last_t[run] = max(last_t.get(run, t), t)
+    states = sorted(
+        (e for e in ledger if e.get("k") == "CLOCK_STATE" and isinstance(e.get("run"), int)),
+        key=lambda e: (e["run"], e.get("q", 0)),
+    )
+    open_since: dict[int, int] = {}
+    intervals: list[dict[str, Any]] = []
+    for e in states:
+        run, t = e["run"], e["t"]
+        if e.get("synced") is False and run not in open_since:
+            open_since[run] = t
+        elif e.get("synced") is not False and run in open_since:
+            intervals.append({"run": run, "from_t": open_since.pop(run), "to_t": t, "ended": True})
+    for run, t0 in open_since.items():
+        intervals.append({"run": run, "from_t": t0, "to_t": last_t.get(run, t0), "ended": False})
+    for iv in intervals:
+        iv["seconds"] = round((iv["to_t"] - iv["from_t"]) / US, 1)
+    in_window = 0
+    for p in probes:
+        t = p.get("t")
+        if isinstance(t, int) and any(
+            iv["run"] == p.get("run") and iv["from_t"] <= t <= iv["to_t"] for iv in intervals
+        ):
+            in_window += 1
+    return {
+        "events": len(states),
+        "unknown_state_runs": sorted({e["run"] for e in states if e.get("synced") is None}),
+        "unsynced_intervals": sorted(intervals, key=lambda iv: (iv["run"], iv["from_t"])),
+        "unsynced_total_s": round(sum(iv["seconds"] for iv in intervals), 1),
+        "probes_in_unsynced": in_window,
+    }
+
+
 def _event_time_ms(payload: bytes) -> int | None:
     try:
         obj = json.loads(payload)
@@ -221,6 +262,7 @@ def build_report(root: Path, *, sample_every: int = 20) -> dict[str, Any]:
                 for v in sorted({p.get("venue") for p in probes if p.get("venue")})
             },
         },
+        "clock_state": _clock_state_view(ledger, probes),
         "queues": {
             "high_water": {k: v.get("high_water") for k, v in queues.items()},
             "dropped": {k: v.get("dropped") for k, v in queues.items() if v.get("dropped")},
@@ -243,6 +285,23 @@ def build_report(root: Path, *, sample_every: int = 20) -> dict[str, Any]:
         "task_crashes": kinds["TASK_CRASH"],
         "loop_lag_events": kinds["LOOP_LAG"],
     }
+
+
+def _clock_state_line(cs: dict[str, Any]) -> str:
+    if not cs["events"]:
+        return "clock sync: no CLOCK_STATE events (this lake predates them)"
+    if cs["unsynced_intervals"]:
+        parts = [
+            "run %d %.1f s%s" % (iv["run"], iv["seconds"], "" if iv["ended"] else " (never synced)")
+            for iv in cs["unsynced_intervals"]
+        ]
+        return "clock sync: unsynchronised %.1f s in total (%s); %d clock probes fall inside" % (
+            cs["unsynced_total_s"],
+            "; ".join(parts),
+            cs["probes_in_unsynced"],
+        )
+    unknown = " (state unknown in runs %s)" % cs["unknown_state_runs"] if cs["unknown_state_runs"] else ""
+    return "clock sync: no unsynchronised interval recorded" + unknown
 
 
 def render_text(rep: dict[str, Any]) -> str:
@@ -296,6 +355,7 @@ def render_text(rep: dict[str, Any]) -> str:
             )
             for venue, v in rep["clock_probe"]["by_venue"].items()
         ],
+        _clock_state_line(rep["clock_state"]),
         "queues: high-water %s dropped %s overrun events %d loop max lag %s s write errors %s"
         % (
             rep["queues"]["high_water"],
