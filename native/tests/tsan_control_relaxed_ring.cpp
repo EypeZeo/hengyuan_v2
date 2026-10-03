@@ -24,6 +24,26 @@
 // control while looking like it was working. Same discipline as the
 // expected-to-fail TLA+ configs in ci-spec-verification.yml.
 //
+// DETERMINISTIC SCHEDULE
+// ----------------------
+// Exactly ONE item crosses the ring, in a fixed order, so the verdict does not
+// depend on scheduling. (An earlier version let a producer and a consumer
+// free-run over 100000 items and relied on the scheduler to make the consumer
+// read a slot while TSan's shadow memory still held the producer's unordered
+// write; pinned to a single CPU it reported in only 28-34 of 50 runs and exited
+// 0 silently in the rest. A control whose verdict depends on scheduling proves
+// nothing when it stays quiet.)
+//
+// The producer try_push()es the item (a plain write of slot 0, then a RELAXED
+// head publication) and only then raises `phase` with a RELAXED store; the
+// consumer waits for `phase` with RELAXED loads and only then try_pop()s (a
+// RELAXED head load, a plain read of slot 0). Relaxed atomics fix the ORDER of
+// the two slot accesses in real time but create no happens-before edge in TSan's
+// model, so TSan always holds a write and a later, unordered read of the same
+// slot -- and it is exactly the ring's relaxed head publication that leaves them
+// unordered. Do NOT "tidy" `phase` into release/acquire: that adds the very edge
+// this control must not have, and TSan goes quiet.
+//
 // This is a standalone main(), not a GTest target: it must be runnable and
 // judged on its own exit code, and it must never be swept into the normal
 // ctest run where a deliberate race would look like a failure.
@@ -83,30 +103,33 @@ struct Payload {
     std::uint64_t d{0};
 };
 
-constexpr std::uint64_t kItems = 100'000;
 constexpr std::size_t kSlots = 64;
 
 }  // namespace
 
 int main() {
     static RelaxedRing<Payload, kSlots> ring;
-    std::uint64_t consumed = 0;
+    // RELAXED on purpose (see the header): it orders the two slot accesses in
+    // real time without synchronising them.
+    std::atomic<int> phase{0};
+    bool popped = false;
 
-    std::thread producer([] {
-        for (std::uint64_t i = 0; i < kItems; ++i) {
-            Payload p{i, i * 2u, i * 3u, i * 4u};
-            while (!ring.try_push(p)) {
-            }
+    std::thread producer([&phase] {
+        const Payload p{1, 2, 3, 4};
+        while (!ring.try_push(p)) {
         }
+        phase.store(1, std::memory_order_relaxed);
     });
 
-    std::thread consumer([&consumed] {
-        Payload out{};
-        while (consumed < kItems) {
-            if (ring.try_pop(out)) {
-                ++consumed;
-            }
+    std::thread consumer([&phase, &popped] {
+        while (phase.load(std::memory_order_relaxed) != 1) {
+            std::this_thread::yield();
         }
+        Payload out{};
+        while (!ring.try_pop(out)) {
+            std::this_thread::yield();
+        }
+        popped = true;
     });
 
     producer.join();
@@ -116,9 +139,9 @@ int main() {
     // setup with halt_on_error=1 this line is unreachable. Print loudly so a CI
     // log makes the failure mode obvious rather than looking like a clean pass.
     std::printf(
-        "tsan_control_relaxed_ring: completed %llu items WITHOUT a ThreadSanitizer report.\n"
+        "tsan_control_relaxed_ring: crossed %d item WITHOUT a ThreadSanitizer report.\n"
         "If this was built with -DHY_SANITIZER=thread, the TSan gate is NOT working and every\n"
         "\"no data races found\" result from the real concurrency tests is unsubstantiated.\n",
-        static_cast<unsigned long long>(consumed));
+        popped ? 1 : 0);
     return 0;
 }
