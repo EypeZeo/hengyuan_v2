@@ -28,6 +28,7 @@ python3 -m hy_recorder report --root <数据目录> [--json]               # 运
 python3 -m hy_recorder status --root <数据目录>                        # 读 status.json
 python3 -m hy_recorder config-check --config <配置>                    # 校验配置并列出推导出的连接
 python3 -m hy_recorder pull --host <ssh 别名> --dest <本机目录>        # 操作员侧：拉取、校验、再回执
+python3 -m hy_recorder maint --config <maint.json> [--force]           # 操作员侧：一次维保（pull、探测宿主机、检查、写状态；退出码 0/1/2 = 正常/WARN/CRIT）
 ```
 
 ## 不可协商的运行规则
@@ -59,7 +60,9 @@ python -m hy_recorder pull --host tokyo-vps-8t --dest D:\data\hy-lake      # 本
 python -m hy_recorder verify --root D:\data\hy-lake
 ```
 
-`pull` 逐段流式取回、核对大小与 SHA-256、fsync 后原子落地，**之后**才在主机写 `acks/<sha256>`；校验失败的段不回执、不落地。本地清单描述"本地归档持有什么"：主机事后清理的段，本地照常保留。可手动或由你的定时任务自动化。
+`pull` 逐段流式取回、核对大小与 SHA-256、fsync 后原子落地，**之后**才在主机写 `acks/<sha256>`；校验失败的段不回执、不落地。本地清单描述"本地归档持有什么"：主机事后清理的段，本地照常保留。
+
+定期维保（每日 pull、只读探测宿主机、阈值检查、每周完整 `verify`）由 `python -m hy_recorder maint --config maint.json` 完成，用 `tools/install_maint_task.ps1` 注册成 Windows 计划任务；布局、告警含义与处置见 [MAINTENANCE.md](MAINTENANCE.md)。
 
 ## 已知限制与残留风险
 

@@ -1,4 +1,4 @@
-"""Command line: ``python -m hy_recorder <run|verify|status|config-check|pull>``."""
+"""Command line: ``python -m hy_recorder <run|verify|report|status|config-check|pull|maint>``."""
 
 from __future__ import annotations
 
@@ -83,6 +83,13 @@ def _cmd_pull(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _cmd_maint(args: argparse.Namespace) -> int:
+    from .maint import load_config as load_maint_config
+    from .maint import run_maintenance
+
+    return run_maintenance(load_maint_config(args.config), force=args.force)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hy_recorder", description="Read-only public market data recorder and verifier"
@@ -119,6 +126,16 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--dry-run", action="store_true")
     pl.add_argument("--no-ack", action="store_true")
     pl.set_defaults(fn=_cmd_pull)
+    mt = sub.add_parser(
+        "maint",
+        help="operator side: one maintenance run (pull, probe the host, check, write status);"
+        " exit code 0/1/2 = ok/WARN/CRIT",
+    )
+    mt.add_argument("--config", required=True, help="maint.json (host, lake, logs, thresholds)")
+    mt.add_argument(
+        "--force", action="store_true", help="run even if the last success is more recent than min_interval_h"
+    )
+    mt.set_defaults(fn=_cmd_maint)
     return p
 
 
