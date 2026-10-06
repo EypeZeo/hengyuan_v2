@@ -64,6 +64,11 @@ class SessionEnv:
     forced_reconnect_cooldown_s: float = 60.0
     idle_poll_s: float = 1.0
     open_timeout_s: float = 15.0
+    # How long leaving a connection waits for the server to close the TCP stream after our close frame.
+    # Binance does not close it promptly: with the former 5 s every rotation showed WS_CLOSE -> WS_OPEN
+    # = 5.15-5.53 s (5.0 of it this wait; the new connection itself needed 30-50 ms plus <= 320 ms DNS), and
+    # the new connection could not start until the old one was gone. We have stopped reading it anyway.
+    close_timeout_s: float = 0.25
     measure_dns: bool = True  # resolve once before connecting, only to report slow DNS (tests switch it off)
     healthy_after_s: float = (
         60.0  # a connection that lived this long reconnects at once; a shorter one backs off
@@ -147,10 +152,13 @@ class ConnectionManager:
             backoff = env.backoff_start_s if healthy else min(backoff * 2, env.backoff_cap_s)
             self.state = "backoff"
             if not env.stop.is_set():
-                # a connection that lived a while reconnects at once (the data hole is already there);
-                # one that failed quickly backs off exponentially so a broken path cannot become a storm
-                delay = 0.2 if healthy or reason == "rotation" else backoff
-                await self._sleep(delay * (0.5 + env.rng.random()))
+                # a planned rotation reconnects at once: the hole is only what the handshake costs. A
+                # connection that lived a while reconnects almost at once (the data hole is already
+                # there); one that failed quickly backs off exponentially so a broken path cannot
+                # become a storm
+                if reason != "rotation":
+                    delay = 0.2 if healthy else backoff
+                    await self._sleep(delay * (0.5 + env.rng.random()))
         self.state = "stopped"
 
     async def _sleep(self, seconds: float) -> None:
@@ -211,7 +219,7 @@ class ConnectionManager:
         async with env.connect(
             spec.url,
             open_timeout=env.open_timeout_s,
-            close_timeout=5,
+            close_timeout=env.close_timeout_s,
             ping_interval=None,
             ping_timeout=None,
             max_size=8 * 1024 * 1024,
