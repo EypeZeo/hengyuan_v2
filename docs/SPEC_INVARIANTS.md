@@ -1,8 +1,8 @@
 # SPEC_INVARIANTS.md — 机械可核查的规格不变量清单
 
 来源：`docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md`（当前 Revision 73 / Architect review round 72）+
-`docs/BINANCE_PRIVATE_REST_L4_SPEC.md`（当前 Revision 19 / round 19；注意 L4 文件内部的 round 计数与
-SUBMITPORT 文件不是同一套编号，两者靠 changelog 里的 "see L4 revision N" 互相交叉引用）。
+`docs/BINANCE_PRIVATE_REST_L4_SPEC.md`（当前 Revision 72；其 Revision N 对应 round N 至 Revision 67，68–72 的 changelog 不再标 round；注意 L4 文件内部的 round 计数与
+SUBMITPORT 文件不是同一套编号（SUBMITPORT 的 Revision N 对应 round N-1），两者靠 changelog 里的 "see L4 revision N" 互相交叉引用）。
 
 > **方向更新（2026-08，owner 决策）**：真实自动下单已成为明确开发目标——L4 spec（rev 72）是下一
 > 实现里程碑，L5 spec（rev 73）紧随其后，两份均为已接受的实现蓝图（见 `CLAUDE.md`）。本清单历史条目
