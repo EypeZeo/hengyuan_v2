@@ -39,6 +39,8 @@ D:\My_Projects\hengyuan_ops\d0\
 
 日志只保留 60 天，维保不会删除任何数据。
 
+计划任务用 `pythonw.exe`（无控制台）运行。无控制台的进程每启动一个控制台子进程（`ssh.exe`），系统就给它新开一个黑窗口，一次 pull 逐段一个 `ssh` 就是几百个窗口闪现又关闭。所以本机所有 `ssh` 子进程都必须经 `hy_recorder/winproc.py` 的 `run_hidden` / `popen_hidden` 启动（`CREATE_NO_WINDOW`，非 Windows 上无副作用）；新增 `ssh` 调用点不要直接用 `subprocess.run`。
+
 ## 告警与处置
 
 | 代码 | 级别 | 含义 | 该做什么 |

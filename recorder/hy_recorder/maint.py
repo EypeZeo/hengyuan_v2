@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import hostprobe
+from .winproc import run_hidden
 
 OK, INFO, WARN, CRIT = "OK", "INFO", "WARN", "CRIT"
 _RANK = {OK: 0, INFO: 0, WARN: 1, CRIT: 2}
@@ -290,7 +291,7 @@ def do_pull(cfg: MaintConfig, log: Callable[[str], None]) -> dict[str, Any]:
 
 def do_probe(
     cfg: MaintConfig,
-    run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[bytes]] = run_hidden,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Pipe ``hostprobe.py`` to the host; ssh exit 255 (the connection itself failed) is retried."""
