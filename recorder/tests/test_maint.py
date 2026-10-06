@@ -81,6 +81,10 @@ def codes(findings) -> list[tuple[str, str]]:
     return [(f.level, f.code) for f in findings]
 
 
+def _gap(reason: str, gap_s: float) -> dict:
+    return {"run": 2, "conn": "spot_trade", "reason": reason, "t": NOW_US - 3600 * 10**6, "gap_s": gap_s}
+
+
 def with_probe(**sections):
     p = copy.deepcopy(good_probe())
     for key, patch in sections.items():
@@ -132,6 +136,10 @@ def test_a_healthy_run_has_no_findings(tmp_path):
         ({"probe": with_probe(ledger={"events_24h": {"RATE_LIMIT": 1}})}, [(WARN, "RATE_LIMIT")]),
         ({"probe": with_probe(ledger={"events_24h": {"TASK_CRASH": 1}})}, [(WARN, "TASK_CRASH")]),
         ({"probe": with_probe(ledger={"events_24h": {"OVERRUN": 5}})}, [(WARN, "OVERRUN")]),
+        (
+            {"probe": with_probe(ledger={"reconnect_gaps": [_gap("rotation", 5.3), _gap("rotation", 0.4)]})},
+            [(WARN, "ROTATION_HOLE")],
+        ),
         ({"probe": with_probe(clock={"marker_age_s": 4 * 3600.0})}, [(WARN, "CLOCK_STALE")]),
         ({"probe": with_probe(memory={"anon_bytes": 350 * MB})}, [(WARN, "MEMORY_HIGH")]),
         ({"probe": with_probe(memory={"events": {"oom_kill": 1}})}, [(CRIT, "OOM_KILL")]),
@@ -167,6 +175,27 @@ def test_a_clock_that_has_been_unsynchronised_for_a_while_is_flagged_but_a_fresh
         }
     )
     assert ev(tmp_path, probe=fresh) == []
+
+
+def test_short_rotation_holes_and_slow_unplanned_reconnects_are_not_a_rotation_finding(tmp_path):
+    fine = with_probe(ledger={"reconnect_gaps": [_gap("rotation", 0.45), _gap("rotation", 0.5)]})
+    assert ev(tmp_path, probe=fine) == []
+    # a stall or a depth gap reconnects on its own schedule: only planned rotations are held to the 2 s line
+    unplanned = with_probe(ledger={"reconnect_gaps": [_gap("stall", 12.0), _gap("gap", 40.0)]})
+    assert ev(tmp_path, probe=unplanned) == []
+
+
+def test_the_report_shows_how_long_the_rotations_of_the_running_recorder_took(tmp_path):
+    fakes = Fakes()
+    fakes.probe_result = with_probe(
+        ledger={"reconnect_gaps": [_gap("rotation", 0.41), _gap("rotation", 0.52)]}
+    )
+    cfg, code = run(tmp_path, fakes)
+    assert code == 0
+    assert (
+        "rotations (running recorder, last 24 h): 2, hole 0.41-0.52 s"
+        in (cfg.logs / "latest.txt").read_text()
+    )
 
 
 def test_partial_probe_failures_are_only_an_info(tmp_path):

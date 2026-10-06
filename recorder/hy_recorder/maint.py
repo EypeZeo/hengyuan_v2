@@ -50,6 +50,9 @@ class Thresholds:
     journal_warn_mb: float = 250.0  # the drop-in caps it at 200 MB
     clock_unsynced_warn_s: float = 600.0
     clock_marker_stale_s: float = 3 * 3600.0
+    rotation_hole_warn_s: float = (
+        2.0  # a planned rotation should cost well under a second (it cost 5.3 s once)
+    )
     no_success_crit_h: float = 48.0
     log_keep_days: int = 60
 
@@ -94,6 +97,14 @@ def _parse_utc(text: str | None) -> datetime | None:
         return datetime.fromisoformat(text).astimezone(UTC) if text else None
     except ValueError:
         return None
+
+
+def _rotation_gaps(probe: dict[str, Any]) -> list[float]:
+    """WS_CLOSE -> next WS_OPEN seconds of the planned rotations of the running recorder (last 24 h)."""
+    gaps = (probe.get("ledger") or {}).get("reconnect_gaps") or []
+    return [
+        g["gap_s"] for g in gaps if g.get("reason") == "rotation" and isinstance(g.get("gap_s"), (int, float))
+    ]
 
 
 def evaluate(
@@ -193,6 +204,14 @@ def evaluate(
         ):
             if ev.get(kind):
                 add(level, kind, "%d x %s in 24 h (%s)" % (ev[kind], kind, why))
+        rotation_gaps = _rotation_gaps(probe)
+        if rotation_gaps and max(rotation_gaps) > th.rotation_hole_warn_s:
+            add(
+                WARN,
+                "ROTATION_HOLE",
+                "a planned rotation left a %.1f s hole (expected under %.1f s): the close timeout regressed?"
+                % (max(rotation_gaps), th.rotation_hole_warn_s),
+            )
         clk, last = probe.get("clock") or {}, (probe.get("ledger") or {}).get("last_clock_state") or {}
         if last.get("synced") is False and isinstance(last.get("t"), int):
             since = (now.timestamp() * 1e6 - last["t"]) / 1e6
@@ -369,6 +388,12 @@ def _facts(
                 lake.get("oldest_unacked_age_h"),
             )
         )
+        rotations = _rotation_gaps(probe)
+        if rotations:
+            facts.append(
+                "rotations (running recorder, last 24 h): %d, hole %.2f-%.2f s"
+                % (len(rotations), min(rotations), max(rotations))
+            )
     if verify is not None:
         facts.append("verify: " + verify["result"])
     if free is not None:

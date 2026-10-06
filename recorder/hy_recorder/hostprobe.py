@@ -151,6 +151,10 @@ def _ledger(root: str, now_s: float) -> dict[str, Any]:
     last_clock_state: dict[str, Any] | None = None
     last_start: dict[str, Any] | None = None
     last_stop: dict[str, Any] | None = None
+    closed: dict[
+        tuple[Any, Any], tuple[int, str]
+    ] = {}  # (run, connection) -> (time, reason) of its last close
+    gaps: list[dict[str, Any]] = []
     for fp in files:
         for ev in _jsonl(fp):
             k, t = ev.get("k"), ev.get("t")
@@ -160,14 +164,31 @@ def _ledger(root: str, now_s: float) -> dict[str, Any]:
                 last_start = ev
             elif k == "PROC_STOP":
                 last_stop = ev
+            elif k == "WS_CLOSE" and isinstance(t, int):
+                closed[(ev.get("run"), ev.get("conn"))] = (t, str(ev.get("reason", "?")).split(":")[0])
+            elif k == "WS_OPEN" and isinstance(t, int) and (ev.get("run"), ev.get("conn")) in closed:
+                t0, why = closed.pop((ev.get("run"), ev.get("conn")))
+                gaps.append(
+                    {
+                        "run": ev.get("run"),
+                        "conn": ev.get("conn"),
+                        "reason": why,
+                        "t": t,
+                        "gap_s": round((t - t0) / US, 3),
+                    }
+                )
             if not isinstance(t, int) or t < cutoff_us or k not in INTEREST:
                 continue
             counts[k] += 1
             if k == "WS_CLOSE":
                 close_reasons[str(ev.get("reason", "?")).split(":")[0]] += 1
+    current_run = (last_start or {}).get("run")
     return {
         "events_24h": dict(counts),
         "ws_close_reasons_24h": dict(close_reasons),
+        # WS_CLOSE -> next WS_OPEN of the same connection, this run only (an earlier release's rotations are
+        # not evidence about the running one), last 24 h
+        "reconnect_gaps": [g for g in gaps if g["run"] == current_run and g["t"] >= cutoff_us],
         "last_clock_state": _brief(last_clock_state, "synced", "reason", "unsynced_s", "initial"),
         "last_proc_start": _brief(last_start, "version", "prev_clean"),
         "last_proc_stop": _brief(last_stop, "reason"),

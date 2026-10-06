@@ -57,6 +57,7 @@ D:\My_Projects\hengyuan_ops\d0\
 | `DISK_STOP` / `DISK_WARN` | CRIT / WARN | 录制因磁盘停写 / 磁盘告警 | 同 `HOST_DISK` |
 | `BAN` / `RATE_LIMIT` | CRIT / WARN | 币安 418 封禁 / 429 限流 | 与同机代理共用出口：查 `RATE_LIMIT` 账本上下文，别手动加 REST 调用 |
 | `TASK_CRASH` / `OVERRUN` | WARN | 录制器内部任务崩溃后重启 / 队列溢出丢记录 | 看账本事件的 `error`/区间；`verify` 会把丢失的序号对上 `OVERRUN` |
+| `ROTATION_HOLE` | WARN | 正在运行的录制器某次**计划轮换**的 `WS_CLOSE` → `WS_OPEN` 超过 2 秒（修复后预期 0.3 至 0.6 秒；旧版是 5.3 秒） | 多半是关闭超时又被改回去了或服务端行为变了：对照 `session.py` 的 `close_timeout_s` 与账本里那次轮换 |
 | `CLOCK_UNSYNCED` / `CLOCK_STALE` | WARN | 时钟长时间未同步 / 超过 3 小时没有 NTP 交换 | 宿主机 `timedatectl`、`systemctl status systemd-timesyncd`；期间的 `t` 与 `CLOCK_PROBE` 偏移不可信 |
 | `MEMORY_HIGH` / `OOM_KILL` | WARN ≥300 MB / CRIT | 录制器内存（单元 `MemoryHigh=400M`） | 看趋势：anon 在 138 至 163 MB 之间浮动属正常；持续上涨再查 |
 | `JOURNAL_VOLATILE` / `JOURNAL_BIG` | WARN | journal 又不持久了 / 超过 250 MB（上限 200 MB） | 检查 `/etc/systemd/journald.conf.d/50-hy-persistent.conf` 与 `/var/log/journal` |

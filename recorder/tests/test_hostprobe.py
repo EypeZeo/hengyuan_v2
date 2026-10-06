@@ -92,6 +92,45 @@ def test_an_empty_lake_has_no_unacked_age(tmp_path):
     assert lake["live_segments"] == 0 and lake["oldest_unacked_age_h"] is None
 
 
+def test_reconnect_gaps_are_close_to_open_per_connection_for_the_running_recorder_only(tmp_path):
+    def close(run, q, hours_ago, conn, reason):
+        return {"run": run, "q": q, "t": _us(hours_ago), "k": "WS_CLOSE", "conn": conn, "reason": reason}
+
+    def opened(run, q, hours_ago, conn, plus_s):
+        return {
+            "run": run,
+            "q": q,
+            "t": _us(hours_ago) + int(plus_s * 1_000_000),
+            "k": "WS_OPEN",
+            "conn": conn,
+        }
+
+    events = [
+        # run 1 (an earlier release): its 5.3 s rotation is no evidence about the running recorder
+        close(1, 1, 20, "spot_trade", "rotation"),
+        opened(1, 2, 20, "spot_trade", 5.3),
+        {"run": 2, "q": 1, "t": _us(10), "k": "PROC_START", "version": "0.1.0", "prev_clean": True},
+        # run 2: two connections rotate, interleaved: each is paired with ITS OWN next open
+        close(2, 2, 6, "spot_trade", "rotation"),
+        close(2, 3, 6, "usdm_market", "rotation"),
+        opened(2, 4, 6, "usdm_market", 0.52),
+        opened(2, 5, 6, "spot_trade", 0.41),
+        close(2, 6, 3, "spot_trade", "stall:spot:btcusdt@trade"),
+        opened(2, 7, 3, "spot_trade", 12.0),
+        close(2, 8, 30, "spot_trade", "rotation"),  # more than 24 h ago: outside the window
+        opened(2, 9, 30, "spot_trade", 0.3),
+        close(2, 10, 1, "usdm_market", "rotation"),  # closed, not reopened yet: no gap to report
+    ]
+    _write_jsonl(tmp_path / "ledger" / "20261003.jsonl", events)
+    gaps = hostprobe._ledger(str(tmp_path), NOW_S)["reconnect_gaps"]
+    got = sorted((g["conn"], g["reason"], g["gap_s"]) for g in gaps)
+    assert got == [
+        ("spot_trade", "rotation", 0.41),
+        ("spot_trade", "stall", 12.0),
+        ("usdm_market", "rotation", 0.52),
+    ]
+
+
 def test_ledger_summary_counts_only_the_last_24_hours_and_keeps_the_latest_clock_state(tmp_path):
     events = [
         {"run": 1, "q": 1, "t": _us(30), "k": "RATE_LIMIT"},  # too old
