@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import random
 import time
 from collections import deque
 
 import pytest
+from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosedError
 
 import hy_recorder.session as session_mod
@@ -190,6 +193,9 @@ def test_records_are_stamped_encoded_and_submitted_in_order(tmp_path):
     assert h.kinds().index("WS_OPEN") == 0
     kw = connect.calls[0][1]
     assert kw["proxy"] is None and kw["ping_interval"] is None and kw["compression"] is None
+    assert kw["close_timeout"] <= 0.5, (
+        "a long close timeout holds up every reconnect (the 5.3 s rotation hole)"
+    )
 
 
 def test_server_close_starts_a_new_generation_and_records_the_reason(tmp_path):
@@ -282,6 +288,107 @@ def test_rotation_reconnects_after_the_configured_age(tmp_path):
 
     h, _ = drive(tmp_path, trade_spec(max_gap=5, first=5), [ws1, ws2], scenario, rotation_age_s=0.3)
     assert h.of("WS_CLOSE")[0]["reason"] == "rotation"
+
+
+class TimedHarness(Harness):
+    """A Harness whose ledger events carry the monotonic time they were emitted at."""
+
+    def emit(self, kind, **fields):
+        self.events.append({"k": kind, "mono": time.monotonic(), **fields})
+
+
+def test_a_planned_rotation_reconnects_without_sleeping_first(tmp_path):
+    ws1, ws2 = FakeWs(), FakeWs()
+    connect = scripted_connect([ws1, ws2])
+
+    async def main():
+        h = TimedHarness(tmp_path, trade_spec(max_gap=5, first=5), connect, rotation_age_s=0.3)
+        task = asyncio.create_task(h.mgr.run())
+        try:
+            for i in range(60):  # keep the stream healthy while the connection ages
+                ws1.feed(trade_frame(i))
+                await asyncio.sleep(0.01)
+            assert await wait_until(lambda: len(h.of("WS_OPEN")) == 2, 3)
+        finally:
+            h.stop.set()
+            await asyncio.wait_for(task, 10)
+        return h
+
+    h = asyncio.run(main())
+    gap = h.of("WS_OPEN")[1]["mono"] - h.of("WS_CLOSE")[0]["mono"]
+    # the former jittered sleep (0.2 s x 0.5..1.5) alone made this at least 0.1 s
+    assert gap < 0.08, "a planned rotation slept %.3f s between WS_CLOSE and the next WS_OPEN" % gap
+
+
+_WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+async def _serve_trades_and_ignore_close(writers):
+    """A WebSocket server that, like Binance, never closes the TCP stream after the client's close
+    frame: it keeps streaming trade frames and never reads again, so only the client's own close
+    timeout ends the wait."""
+
+    async def handle(reader, writer):
+        writers.append(writer)
+        request = await reader.readuntil(b"\r\n\r\n")
+        key = next(
+            line.split(b":", 1)[1].strip()
+            for line in request.split(b"\r\n")
+            if line.lower().startswith(b"sec-websocket-key:")
+        )
+        accept = base64.b64encode(hashlib.sha1(key + _WS_GUID).digest())
+        writer.write(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+        )
+        t = 0
+        try:
+            while True:
+                payload = trade_frame(t).encode()
+                writer.write(
+                    bytes([0x81, len(payload)]) + payload
+                )  # one unmasked text frame, payload < 126 bytes
+                await writer.drain()
+                t += 1
+                await asyncio.sleep(0.01)
+        except OSError:
+            pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+def test_rotation_does_not_wait_for_a_server_that_ignores_our_close_frame(tmp_path):
+    """The D0 host showed WS_CLOSE -> WS_OPEN = 5.15-5.53 s at every rotation: 5.0 s of it was the
+    close timeout (the server never closed the TCP stream), during which the new connection could
+    not start."""
+    writers: list = []
+
+    async def main():
+        server, port = await _serve_trades_and_ignore_close(writers)
+        spec = ConnectionSpec(
+            "spot_trade",
+            "spot",
+            "trade",
+            "ws://127.0.0.1:%d/stream?streams=btcusdt@trade" % port,
+            (StreamSpec("btcusdt@trade", "trade", "BTCUSDT", 5.0, 5.0),),
+        )
+        h = TimedHarness(tmp_path, spec, ws_connect, rotation_age_s=0.4)
+        task = asyncio.create_task(h.mgr.run())
+        try:
+            assert await wait_until(lambda: len(h.of("WS_OPEN")) == 2, 15)
+        finally:
+            h.stop.set()
+            await asyncio.wait_for(task, 20)
+            for w in writers:
+                w.close()
+            server.close()
+        return h
+
+    h = asyncio.run(main())
+    assert h.of("WS_CLOSE")[0]["reason"] == "rotation"
+    gap = h.of("WS_OPEN")[1]["mono"] - h.of("WS_CLOSE")[0]["mono"]
+    assert gap < 1.5, "rotation took %.2f s from WS_CLOSE to the next WS_OPEN" % gap
 
 
 def test_forced_reconnect_requests_are_rate_limited_then_applied_when_the_cooldown_ends(tmp_path):

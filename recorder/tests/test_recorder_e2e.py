@@ -256,7 +256,7 @@ LOCAL_PATH = {
 }
 
 
-def run_recorder(tmp_path, market, plan, until, *, timeout=40.0, cfg_kw=None, overrides=None):
+def run_recorder(tmp_path, market, plan, until, *, timeout=40.0, cfg_kw=None, overrides=None, rec_kw=None):
     """Run a Recorder against the fake exchange until ``until(recorder)`` holds (or timeout), then stop it."""
     cfg = build_cfg(tmp_path, **(cfg_kw or {}))
     by_url = {c.url: LOCAL_PATH[c.name] for c in cfg.connections}
@@ -285,6 +285,7 @@ def run_recorder(tmp_path, market, plan, until, *, timeout=40.0, cfg_kw=None, ov
                 "backoff_cap_s": 1.0,
                 **(overrides or {}),
             },
+            **(rec_kw or {}),
         )
         stop = asyncio.Event()
         task = asyncio.create_task(rec.run(stop))
@@ -535,3 +536,38 @@ def test_restart_recovers_a_crashed_run_and_numbers_continue(tmp_path):
     assert rec_ev and rec_ev[0]["truncated"] is True
     assert not list((tmp_path / "raw").rglob("*.part"))
     assert (tmp_path / "recovered" / "10-777777.jsonl.zst.part").exists()
+
+
+def test_recording_continues_through_an_unsynchronised_clock_and_the_ledger_says_so(tmp_path):
+    """L-32: after a boot the clock is off until timesyncd's first exchange. The recorder must not wait for it
+    (that would cost the first minute of data on every reboot): it records and writes CLOCK_STATE."""
+    market, plan = FakeMarket(), RestPlan()
+    marker_dir = tmp_path / "x_timesync"
+    marker_dir.mkdir()
+    marker = marker_dir / "synchronized"
+
+    def done(rec):
+        events = Ledger.read_all(tmp_path)
+        kinds = [e["k"] for e in events]
+        if "CLOCK_STATE" in kinds and "WS_OPEN" in kinds and not marker.exists():
+            marker.write_bytes(b"")  # the first NTP exchange happens while the recorder is already recording
+        return kinds.count("CLOCK_STATE") >= 2
+
+    _, code = run_recorder(
+        tmp_path,
+        market,
+        plan,
+        done,
+        rec_kw={"clock_sync_marker": marker, "clock_state_poll_s": (0.02, 0.02)},
+    )
+    assert code == 0
+    events = Ledger.read_all(tmp_path)
+    states = [e for e in events if e["k"] == "CLOCK_STATE"]
+    assert (
+        states[0]["initial"] is True and states[0]["synced"] is False and states[0]["reason"] == "no_marker"
+    )
+    assert states[1]["initial"] is False and states[1]["synced"] is True and states[1]["unsynced_s"] >= 0
+    first_open = next(e for e in events if e["k"] == "WS_OPEN")
+    # the unsynchronised state was written before any connection opened (so before any record), and
+    # the connections opened while the clock was still unsynchronised
+    assert states[0]["q"] < first_open["q"] < states[1]["q"]

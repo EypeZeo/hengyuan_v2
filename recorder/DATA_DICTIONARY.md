@@ -139,12 +139,13 @@ D0-0 边界冻结产物。每条协议断言都给出官方来源与核验日期
 | USD-M | 24 小时 | 每 3 分钟 ping，10 分钟内须回 pong | 10 条/秒 |
 
 - 库自动回复 pong；采集器不发客户端 ping，也不发订阅消息（用 URL 订阅）。
-- 24 小时前主动轮换连接（约 23.5 小时），新代次重新桥接。
+- 24 小时前主动轮换连接（约 23.5 小时），新代次重新桥接。轮换时发出 close 帧后最多等服务端关闭 TCP 0.25 秒（`close_timeout_s`），随即重连、不再随机睡眠。Binance 不会及时关闭连接：旧的 5 秒关闭超时曾使每次轮换的 `WS_CLOSE` → 下一个 `WS_OPEN` 恒为 5.15 至 5.53 秒（新连接自身只要 30 至 50 ms 加不超过 320 ms 的 DNS）。
 
 ## 5. 时间口径
 
 - `t` 为录制宿主接收时间，仅代表宿主视角，不代表交易节点。录制宿主到流服务器约 3 ms，`t_recv − E` p50 约 2 ms；`E` 为交易所事件时间。
 - 时钟偏移以流的 `t_recv − E` 分钟级最小值与分位数为主证据；REST `/time` 每分钟一次为辅（REST 路径往返约 140 ms，不足以单独证明偏移）。
+- 开机后到 timesyncd 首次同步之间（D0 宿主约 36 秒），宿主时钟可能偏差数百毫秒。采集器不等同步（等了会在每次重启后丢掉第一分钟的数据），照常录制并写 `CLOCK_STATE` 事件；该区间内的 `t` 与 `CLOCK_PROBE` 偏移带着未同步的时钟，`report` 单独列出这些区间。同步状态读自 `/run/systemd/timesync/synchronized`（`ProtectClock=yes` 禁掉了 `adjtimex`）。
 - 全序由 `(r, q)` 给出，不依赖墙钟。
 
 ## 6. 校验规则（`hy_recorder verify`）
@@ -165,6 +166,7 @@ D0-0 边界冻结产物。每条协议断言都给出官方来源与核验日期
 | 进程 | `PROC_START`（`version` `pid` `prev_clean` `state_recovered` `fingerprint` `config`）、`HOST_PROFILE`（内核、CPU 数、内存、库版本；不含主机名与地址）、`PROC_STOP`（`reason` `write_errors` `dropped`）、`SEGMENT_RECOVERED`、`RECOVERY_FAILED`、`STATE_RECOVERED`、`TASK_CRASH`（`task` `error`） |
 | 连接 | `WS_OPEN`（`conn` `gen` `streams` `url_path` `connect_ms` `dns_ms`）、`WS_CLOSE`（`conn` `gen` `reason` `frames` `duration_s`）、`WS_CONNECT_FAIL`（`conn` `error` `status`）、`DNS_SLOW`、`SUBSCRIBED_NO_DATA`（订阅后首帧期限内无数据）、`STREAM_STALL`（有过数据后静默超限）、`UNEXPECTED_STREAM`、`BAD_FRAME`（`reason` `bad_q`，限频） |
 | 深度桥接 | `SNAPSHOT`（`stream` `gen` `trigger` `status` `weight` `last_update_id` `rec_q` `sha256` 及请求起止单调时钟）、`SNAPSHOT_FAIL`（`backoff_s` `reason`）、`SNAPSHOT_STALE`、`SNAPSHOT_DEFERRED`、`SNAPSHOT_DISCARDED`（代次已变）、`BRIDGE_OK`（`gen` `bridge_q` `L` `U` `u`）、`GAP_DETECTED`（`stream` `gen` `bad_q` `rule` `expected` `got`） |
+| 时钟 | `CLOCK_STATE`（`initial` `synced` `source` `marker_age_s` `reason` `unsynced_s`）：宿主时钟是否被 timesyncd 校准。启动时写一条（`initial=true`，先于任何记录），之后只在 `synced` 变化时写。`synced` 为 `true`/`false`/`null`（`null` = 没有 timesyncd 运行目录，无从判断，不当作未同步）；`false` 时 `reason` 为 `no_marker`（标记文件还没出现）或 `marker_stale`（标记文件超过 3 小时未更新，NTP 交换已停）；变为 `true` 时附 `unsynced_s`（本进程观察到的未同步时长） |
 | REST 与限流 | `CLOCK_PROBE`（`venue` `server_ms` `rtt_us` `offset_ms`）、`REFDATA`（`stream` `bytes` `rec_q`）、`REST_FAIL`（`endpoint` `reason` `status`）、`RATE_LIMIT`（`status` `sleep_s` `level` `during_sleep`）、`BAN`（418）、`GEO_BLOCK_SUSPECT`（451） |
 | 队列与磁盘 | `OVERRUN`（`cls` `dropped` `first_q` `last_q`，合并区间）、`WRITE_ERROR`、`DISK_WARN`、`DISK_STOP`、`DISK_RESUMED`、`RESERVE_RELEASED`、`PRUNED_ACKED`、`EVICTED_UNACKED`（未回执即被驱逐，附时间范围与哈希）、`RETENTION_STEPDOWN`、`RETENTION_EXHAUSTED`、`RETENTION_FAILED`、`PRUNE_FAILED`、`LOOP_LAG` |
 

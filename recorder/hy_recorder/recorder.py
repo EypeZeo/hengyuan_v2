@@ -28,6 +28,7 @@ import zstandard
 
 from . import __version__
 from .clock import SYSTEM_CLOCK, Clock
+from .clocksync import SYNC_MARKER, ClockStateWatcher, read_sync_state
 from .config import RecorderConfig
 from .depthtrack import DepthTracker
 from .envelope import KIND_SNAPSHOT, encode_record
@@ -87,6 +88,8 @@ class Recorder:
         exchange_info_delay_s: float = 90.0,
         enable_monitor: bool = True,
         monitor_exit: Callable[[int], None] = os._exit,
+        clock_sync_marker: Path = SYNC_MARKER,
+        clock_state_poll_s: tuple[float, float] = (1.0, 30.0),
     ) -> None:
         self.cfg = cfg
         self.clock = clock
@@ -98,6 +101,8 @@ class Recorder:
         self._exchange_info_delay_s = exchange_info_delay_s
         self._enable_monitor = enable_monitor
         self._monitor_exit = monitor_exit
+        self._clock_sync_marker = clock_sync_marker
+        self._clock_state_poll_s = clock_state_poll_s
         # populated by run()
         self.state: StateFile
         self.run_no = 0
@@ -107,6 +112,7 @@ class Recorder:
         self.writer: Writer
         self.governor: RestGovernor
         self.scheduler: SnapshotScheduler
+        self.clock_watcher: ClockStateWatcher
         self.managers: dict[str, ConnectionManager] = {}
         self.trackers: dict[str, DepthTracker] = {}
         self._tracker_by_target: dict[tuple[str, str], DepthTracker] = {}
@@ -175,6 +181,13 @@ class Recorder:
             },
         )
         self.emit("HOST_PROFILE", **host_profile())
+        self.clock_watcher = ClockStateWatcher(
+            self.emit,
+            read=lambda: read_sync_state(self._clock_sync_marker),
+            unsynced_poll_s=self._clock_state_poll_s[0],
+            synced_poll_s=self._clock_state_poll_s[1],
+        )
+        self.clock_watcher.start()  # before any record exists: the first event precedes all data of this run
         try:
             recover(
                 root,
@@ -422,6 +435,9 @@ class Recorder:
             loop.create_task(self._guarded("snapshots", self.scheduler.run, stop), name="snapshots"),
             loop.create_task(
                 self._guarded("time_probes", lambda: self._time_probes(stop), stop), name="time_probes"
+            ),
+            loop.create_task(
+                self._guarded("clock_state", lambda: self.clock_watcher.run(stop), stop), name="clock_state"
             ),
             loop.create_task(self._guarded("refdata", lambda: self._refdata(stop), stop), name="refdata"),
         ]
