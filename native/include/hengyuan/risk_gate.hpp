@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: proprietary
 // risk_gate.hpp — P2-EXEC-SIM-01: pre-trade hard risk checks (simulated).
 // Mirrors the execution-plane design note: kill-switch state, max position,
-// max exposure. int64 fixed-point, __int128 for notional overflow safety.
+// max exposure. int64 fixed-point; notional cap is a portable divide-based check (no __int128).
 // Governance: L2, simulation. No network/token/order.
 
 #pragma once
