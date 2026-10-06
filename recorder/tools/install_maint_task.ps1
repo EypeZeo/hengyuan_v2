@@ -27,13 +27,14 @@ foreach ($p in @($py, $tool, $cfg)) {
     if (-not (Test-Path $p)) { throw "missing: $p" }
 }
 
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction -Execute $py -Argument "-m hy_recorder maint --config `"$cfg`"" -WorkingDirectory $tool
 $daily = New-ScheduledTaskTrigger -Daily -At $At
-$logon = New-ScheduledTaskTrigger -AtLogOn
+# -User matters: a logon trigger for "any user" needs administrator rights to register, one for this user does not
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $user
 $logon.Delay = 'PT5M'
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 3) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($daily, $logon) -Settings $settings `
