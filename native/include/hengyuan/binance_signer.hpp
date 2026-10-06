@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: proprietary
 // binance_signer.hpp — HMAC-SHA256 signing for Binance Private API.
 //
-// SIMULATION INFRASTRUCTURE — NOT LIVE READY.
+// NOT LIVE READY: no process in native/src/ submits a real order with it (see
+// docs/NATIVE_ARCHITECTURE.md, "Live-readiness status"). It is not simulation-only,
+// though: its HMACs ride on the real signed requests of binance_private_rest.hpp
+// (through binance_environment.hpp / binance_query_signing.hpp).
 // D3-LIVE prerequisites ⑧(heartbeat)✅ ⑨(this) ⑩(manual confirm + regression).
 // This code implements the cryptographic layer only. Actual private API
 // submission requires explicit L5 authorization + D3-LIVE completion.
@@ -14,8 +17,8 @@
 //     any signing failure
 //   - IO-thread bound: signer lives on the I/O thread, not hot path
 //
-// Governance: L5 code artifact (no network call, no real order).
-// The signer produces HMAC signatures but does NOT submit them.
+// Governance: L5 code artifact. This class itself makes no network call and submits no
+// order: it only produces HMAC signatures; its callers put them on the wire.
 
 #pragma once
 
