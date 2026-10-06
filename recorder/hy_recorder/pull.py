@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .fsutil import fsync_dir
+from .winproc import popen_hidden, run_hidden
 
 CHUNK = 1 << 20
 ACK_BATCH = 100
@@ -100,8 +101,8 @@ class SshTransport:
         *,
         ssh: str = "ssh",
         options: tuple[str, ...] = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=15"),
-        run: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
-        popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        run: Callable[..., subprocess.CompletedProcess[bytes]] = run_hidden,
+        popen: Callable[..., subprocess.Popen[bytes]] = popen_hidden,
         sleep: Callable[[float], None] = time.sleep,
         retry_delays_s: tuple[float, ...] = _RETRY_DELAYS_S,
     ) -> None:
