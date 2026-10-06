@@ -35,6 +35,11 @@ name: CI Spec Verification
 # run sequentially within one job instead of in parallel across 7 runners,
 # worst case sums each model's timeout instead of taking the max) while billed
 # minutes go DOWN, which is the actual constraint being optimized against here.
+#
+# Model count (2026-10 note): the paragraphs above describe the 7 models that existed when
+# this was consolidated. The job now runs 9 (one "Model:" step each). formal/ holds 10 .tla
+# files: RoundEFDesignReceiptVerified.tla is a research fork whose own header says its
+# placement is deliberately unset until a design freeze, so it is intentionally not run here.
 
 permissions:
   contents: read
@@ -118,7 +123,7 @@ jobs:
   tla-model-check-all:
     name: "L3: TLA+ model checking (all models)"
     runs-on: ubuntu-24.04
-    # Sum-ceiling across 7 sequential models, was 7 x independent 20-min caps
+    # Sum-ceiling across 9 sequential models (7 when consolidated), was 7 x independent 20-min caps
     # possible in parallel before this consolidation -- see this file's header
     # comment for why billed minutes (not wall-clock) is the thing being
     # optimized here.
@@ -135,7 +140,7 @@ jobs:
 
       # tla2tools.jar is gitignored (a 2MB binary does not belong in the tree),
       # so CI fetches the pinned release the same way the local setup does.
-      # ONE fetch for all 7 models below, not 7.
+      # ONE fetch for all 9 models below, not 9.
       - name: Cache TLA+ tools
         id: cache-tla
         uses: actions/cache@v6
