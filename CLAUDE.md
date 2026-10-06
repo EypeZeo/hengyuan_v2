@@ -104,9 +104,11 @@ caught one of those in this repo, and the reverse is also true (GCC's `-Wconvers
 before trusting a change; treat one green build as half a signal, not a full one.
 
 The repo has 6 CI workflows total; the other 4 (`ci-python.yml`, `ci-spec-verification.yml`,
-`codeql.yml`, `main-merge-guard.yml`) are each independently path-filtered, deliberately so a
+`ci-recorder.yml`, `main-merge-guard.yml`) are each independently path-filtered, deliberately so a
 failure in one can't mask or block another (`ci-python.yml`'s own AUDIT CI-PY-013 comment
-states this reasoning explicitly). `ci-native-sanitizers.yml` also runs a third job,
+states this reasoning explicitly). CodeQL is GitHub's *default setup* (Settings → Code security),
+not a workflow file here: an advanced `codeql.yml` cannot upload its results while the default
+setup is on, and failed every Monday once the owner enabled it. `ci-native-sanitizers.yml` also runs a third job,
 `arm64-weak-memory`, on `ubuntu-24.04-arm` — this is **not TSan**: its configure step is
 literally named "Release, no sanitizer" (`HY_SANITIZER` is unset). It's the only *hardware*
 verification in the matrix: an uninstrumented Release build run 10x
