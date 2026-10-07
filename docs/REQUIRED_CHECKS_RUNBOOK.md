@@ -132,6 +132,7 @@ gh api -X PUT repos/EypeZeo/hengyuan_v2/rulesets/<id> --input ruleset-active.jso
 | 规则生效（只读） | — | `rules/branches/master` 列出 4 条规则，来源都是规则集 24635472；规则集读回与 `ruleset-active.json` 逐项一致（`bypass_actors` 为空，`current_user_can_bypass` 为 `never`，`require_extra_approval_for_unattributed_changes` 为 `false`） |
 | 红色 PR | #140（故意失败的 `py_core` 测试，不合并，已关闭） | `py_core: pytest` 失败，`py_core: gate` 失败，`mergeStateStatus` = `BLOCKED`；`gh pr merge` 被拒：`the base branch policy prohibits the merge`；`master` 不变。没有试 `--admin` |
 | 绿色纯文档 PR | #141（只加 `docs/PROBE_REQUIRED_CHECKS.md`，不合并） | 四个 gate 绿（被守护的 7 个 job 为 skipped），`CodeQL` 与四个 `Analyze` 绿，`mergeStateStatus` = `CLEAN` |
+| 落后于 master 的 PR | #141（#142 合并后，探针，不合并） | `mergeStateStatus` = `BEHIND`；`gh pr merge` 被拒：`the head branch is not up to date with the base branch`；#142（纯文档，同样的检查形态）本身在规则集下合并成功（合并提交 `ff55fd6`，合并守卫判 ok） |
 
 ## 5. 日常合并流程（strict 模式）
 
