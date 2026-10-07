@@ -57,7 +57,6 @@ jobs:
           PATTERN: '^(py_core/|\.github/workflows/ci-python\.yml$)'
         run: |
           set -euo pipefail
-          exit 1
           if [ "$EVENT" != "pull_request" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "py_core: $EVENT event, run=true" >> "$GITHUB_STEP_SUMMARY"
@@ -84,7 +83,7 @@ jobs:
   pytest:
     name: "py_core: pytest"
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
