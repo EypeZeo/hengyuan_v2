@@ -54,7 +54,7 @@ Applies when: shared state, gate order, lifetime, or a spec/code contradiction c
 
 - One file, one concern per edit. Stay inside the assigned slice.
 - Each client works in its own git worktree: `git status` clean at start, commit per task (message carries the slice name), never touch main or another client's worktree.
-- **`master` only accepts merge commits from a merged PR — treat your local `master` as read-only.** `main-merge-guard.yml` checks every push to `master` against GitHub's PR records (`pr.merge_commit_sha === <pushed sha>`); a commit that doesn't resolve to a merged PR — or whose PR's required checks weren't green — is auto-reverted (`git revert` + force-push back to `master` under a `revert(main-merge-guard): ...` commit). This is a hard technical gate, independent of this file's no-task-packet-ceremony stance: do the actual work in your worktree or a named branch, but land it on `master` only through a merged PR, never a direct `git push origin HEAD:master`.
+- **`master` only accepts merge commits from a merged PR — treat your local `master` as read-only.** Since 2026-10-07 the platform enforces this too: repository ruleset `master-gate` (owner-managed; no AI session changes it — see `docs/REQUIRED_CHECKS_RUNBOOK.md`) requires a PR (0 approvals, merge commits only), nine required checks (`native: gate`, `spec: gate`, `recorder: gate`, `py_core: gate` plus CodeQL's `Analyze (actions)`, `Analyze (c-cpp)`, `Analyze (javascript-typescript)`, `Analyze (python)` and `CodeQL`), and a branch that is up to date with `master`, with no bypass list. A direct `git push origin HEAD:master` is rejected by the pull-request rule (by design never tested with a real push), and `gh pr merge` refuses a red PR and a stale one (both observed on probe PRs #140 and #141). The routine merge is `gh pr update-branch N`, wait for the checks, then `gh pr merge N --merge --match-head-commit <head sha>`; an emergency bypass is the owner's call alone (set the ruleset to Disabled in Settings, merge, set it back to Active). `main-merge-guard.yml` stays as defense in depth: it checks every push to `master` against GitHub's PR records (`pr.merge_commit_sha === <pushed sha>` and a `SUCCESS` check rollup on the PR head) and, on a mismatch, reverts with a plain `git revert` push under a `revert(main-merge-guard): ...` commit. Under the ruleset that push is expected to be blocked (no bypass list; inferred from the rule semantics, not exercised), so a red guard is an alarm to answer with a revert PR, not a self-healing mechanism. Do the actual work in your worktree or a named branch, and land it on `master` only through a merged PR — never a direct `git push origin HEAD:master`.
 - Report `file:symbol` only. No code dumps, no tutorials, no "可以考虑"-style advice.
 
 ## Local Validation Runbook (Windows + MSVC)
@@ -104,9 +104,15 @@ caught one of those in this repo, and the reverse is also true (GCC's `-Wconvers
 before trusting a change; treat one green build as half a signal, not a full one.
 
 The repo has 6 CI workflows total; the other 4 (`ci-python.yml`, `ci-spec-verification.yml`,
-`ci-recorder.yml`, `main-merge-guard.yml`) are each independently path-filtered, deliberately so a
+`ci-recorder.yml`, `main-merge-guard.yml`) stay independent of each other, deliberately so a
 failure in one can't mask or block another (`ci-python.yml`'s own AUDIT CI-PY-013 comment
-states this reasoning explicitly). CodeQL is GitHub's *default setup* (Settings → Code security),
+states this reasoning explicitly). Since PR #137 the four CI workflows (`ci-native.yml` included)
+run on every PR: a `changes` job compares the PR's changed files with that workflow's own path
+regex (`push.paths` carries the same list and must stay in step), the heavy jobs run only on a
+match, and an always-running `gate` job (`native: gate`, `spec: gate`, `recorder: gate`,
+`py_core: gate`) passes only if the heavy jobs succeeded when they had to run or were skipped
+when they did not. The gates are the checks the ruleset requires, so a PR that touches nothing
+of a channel is not blocked by that channel. CodeQL is GitHub's *default setup* (Settings → Code security),
 not a workflow file here: an advanced `codeql.yml` cannot upload its results while the default
 setup is on, and failed every Monday once the owner enabled it. `ci-native-sanitizers.yml` also runs a third job,
 `arm64-weak-memory`, on `ubuntu-24.04-arm` — this is **not TSan**: its configure step is
@@ -190,9 +196,10 @@ count drifts with every batch of work and is not kept in sync by hand; run
 `git ls-files py_core | grep -v .venv | wc -l` / `... | xargs cat | wc -l` for the current
 number rather than trusting this one) is the quantitative research stack running
 parallel to the native execution stack (the 2026-08 dual-track roadmap's other half). It has
-its own CI channel, `ci-python.yml`, path-filtered to `py_core/**` and deliberately kept
-independent of `ci-native.yml`/`ci-spec-verification.yml` — same "a failure in one channel
-must not mask or block another" reasoning as the arm64 job above.
+its own CI channel, `ci-python.yml` (the `py_core: changes` job gates `pytest` on `py_core/**`;
+`py_core: gate` is the required check) and deliberately kept independent of
+`ci-native.yml`/`ci-spec-verification.yml` — same "a failure in one channel must not mask or
+block another" reasoning as the arm64 job above.
 
 **Local validation**:
 ```bash
@@ -216,10 +223,12 @@ native side above, just in Python.
 
 **The lesson `ci-python.yml`'s own AUDIT CI-PY-013 comment records, worth not re-learning**:
 `main-merge-guard.yml` treats "no workflow matched the changed paths" as a PASS (by design, so
-a docs-only PR isn't blocked forever). That means a change touching `py_core` behavior through
-files outside `py_core/**` — or a `py_core` change whose paths get misjudged — can merge with
-zero verification even though the merge guard shows green. If a change affects `py_core`
-behavior, confirm `ci-python.yml` actually ran; a green merge guard alone doesn't mean it did.
+a docs-only PR isn't blocked forever). Since PR #137 every PR gets a `py_core: gate`, but the
+gate also passes with `pytest` skipped whenever the `py_core: changes` regex does not match, so
+the same blind spot now lives in that regex: a change touching `py_core` behavior through files
+outside it can merge with zero verification even though the gate and the merge guard are green.
+If a change affects `py_core` behavior, confirm `py_core: pytest` actually ran (not skipped); a
+green gate or a green merge guard alone doesn't mean it did.
 
 ## Live-trading direction & boundary
 
