@@ -70,14 +70,7 @@ on:
       - '.github/workflows/ci-spec-verification.yml'
   pull_request:
     branches: [master]
-    paths:
-      - 'docs/SPEC_INVARIANTS.md'
-      - 'docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md'
-      - 'docs/BINANCE_PRIVATE_REST_L4_SPEC.md'
-      - 'tools/**'
-      - 'formal/**'
-      - 'native/include/hengyuan/*.hpp'
-      - '.github/workflows/ci-spec-verification.yml'
+    # no `paths:` on purpose: the `changes` job below decides, so the `gate` job always reports
   workflow_dispatch:
 
 concurrency:
@@ -90,8 +83,57 @@ env:
   TLA_TOOLS_VERSION: v1.7.4
 
 jobs:
+  # Required-check plumbing. This workflow runs on every pull request (the pull_request trigger has no
+  # workflow-level `paths:`) so that its `gate` job always reports: GitHub leaves the checks of a path-filtered
+  # workflow that did not run "Pending" forever, which would block every unrelated PR once the gate is a
+  # required status check. The path decision therefore lives here, at job level, where a skipped job counts
+  # as success. Keep the pattern below in step with `push.paths` above.
+  changes:
+    name: "spec: changes"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Checkout (a pull request checks out its merge commit; depth 2 brings both parents)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether the paths of this workflow changed
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PATTERN: '^(docs/SPEC_INVARIANTS\.md$|docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC\.md$|docs/BINANCE_PRIVATE_REST_L4_SPEC\.md$|tools/|formal/|native/include/hengyuan/[^/]+\.hpp$|\.github/workflows/ci-spec-verification\.yml$)'
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "spec: $EVENT event, run=true" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Fail closed: the diff below is only the pull request's own change set when HEAD is the merge commit.
+          if ! git rev-parse --verify --quiet "HEAD^2" > /dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "spec: HEAD is not a merge commit, run=true" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # -z: NUL-separated raw names (no quoting of non-ASCII paths). A file rather than a pipe, so that
+          # grep -q closing early cannot turn a match into a SIGPIPE failure under pipefail.
+          git diff --name-only --no-renames -z HEAD^1 HEAD > "$RUNNER_TEMP/changed.z"
+          if grep -zEq "$PATTERN" "$RUNNER_TEMP/changed.z"; then run=true; else run=false; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          {
+            echo "### spec: changes -> run=$run"
+            echo '```'
+            tr '\0' '\n' < "$RUNNER_TEMP/changed.z"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   spec-invariant-xref:
     name: "L1: invariant ledger cross-reference"
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -122,6 +164,8 @@ jobs:
 
   tla-model-check-all:
     name: "L3: TLA+ model checking (all models)"
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
     # Sum-ceiling across 9 sequential models (7 when consolidated), was 7 x independent 20-min caps
     # possible in parallel before this consolidation -- see this file's header
@@ -482,3 +526,35 @@ jobs:
           [ "${{ steps.m_retryidempotency.outcome }}" = "failure" ] && { echo "::error::RoundERetryIdempotency failed"; fail=1; }
           [ "${{ steps.m_depthsnapshot.outcome }}" = "failure" ] && { echo "::error::depth_snapshot_bootstrap failed"; fail=1; }
           exit $fail
+
+  # Always runs and is the only check of this workflow meant to be a required status check: it passes only if
+  # the path decision succeeded and every guarded job ended exactly as that decision calls for (success when
+  # run=true, skipped when run=false). Any other combination, including a failed or cancelled `changes` job,
+  # fails it.
+  gate:
+    name: "spec: gate"
+    needs: [changes, spec-invariant-xref, tla-model-check-all]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require exactly the outcome the path decision calls for
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUN: ${{ needs.changes.outputs.run }}
+          XREF: ${{ needs.spec-invariant-xref.result }}
+          TLA: ${{ needs.tla-model-check-all.result }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$CHANGES" = "success" ] || fail "the changes job ended as '$CHANGES', not 'success'"
+          case "$RUN" in
+            true)  want=success ;;
+            false) want=skipped ;;
+            *)     fail "the changes job gave no run decision ('$RUN')" ;;
+          esac
+          for pair in "spec-invariant-xref=$XREF" "tla-model-check-all=$TLA"; do
+            name="${pair%%=*}"; got="${pair#*=}"
+            [ "$got" = "$want" ] || fail "$name ended as '$got', expected '$want' (run=$RUN)"
+          done
+          echo "gate ok: run=$RUN, every guarded job is '$want'"
