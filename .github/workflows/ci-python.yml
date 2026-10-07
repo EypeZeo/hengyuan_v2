@@ -54,9 +54,10 @@ jobs:
         id: decide
         env:
           EVENT: ${{ github.event_name }}
-          PATTERN: '^NEVER-MATCHES$'
+          PATTERN: '^(py_core/|\.github/workflows/ci-python\.yml$)'
         run: |
           set -euo pipefail
+          exit 1
           if [ "$EVENT" != "pull_request" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "py_core: $EVENT event, run=true" >> "$GITHUB_STEP_SUMMARY"
