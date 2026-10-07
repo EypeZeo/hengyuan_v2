@@ -54,8 +54,16 @@ O(window) 的状态增量推进，并且必须声明自己的 warm-up 长度。
 算子只能引用**当前及更早**的 bar。`lag(n)` 只能往回移；**刻意不提供 `lead`**。
 这使得「这个策略偷看了未来」在 v1 里不是一个需要靠测试去抓的 bug，而是一个表达不出来的状态。
 
-（`py_core/strategies/base.py:97` 的 `assert_no_lookahead()` 仍然保留，用于核查手写的
-`Strategy` 子类——那条路径不受 spec 约束。）
+`lag.n < 1` 在**解析期**即被拒绝（Python 侧抛 `LookaheadBiasError`，同时是 `StrategySpecError`）：
+负的 `n` 会引用未来的 bar，`n = 0` 没有意义。C++ 解析器本来就按算子最小值在解析期拒绝
+（`lag` 为 1），两侧口径一致。
+
+手写的 `Strategy` 子类不受 spec 约束。所有生产入口（回测 CLI、walk-forward、CPCV、PBO、
+验证扫描）取信号都经过 `py_core/strategies/base.py` 的 `checked_signals()`：它在预热之后的
+若干 bar 上做前缀截断差分，不通过即抛 `LookaheadBiasError`，不会进入回测（SAFE-05）。
+**覆盖边界**：差分只在被采样的 bar 上生效，不能证明手写策略没有任何隐藏的数据依赖，也
+不覆盖未采样的 bar；预计算的信号文件只能做索引与时间戳检查，在报告里记为 `index_only`，
+不是“因果通过”。`assert_no_lookahead()` 保留，用于测试里在指定位置做单点断言。
 
 ---
 
