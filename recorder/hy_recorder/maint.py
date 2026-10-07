@@ -38,6 +38,31 @@ _IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 LOCK_STALE_S = 3 * 3600.0
 _GC_PATTERNS = ("maint-*.log", "verify-*.txt", "report-*.txt")
 
+# Every ledger kind the host probe counts over the last 24 h (``hostprobe.INTEREST``) either raises a
+# finding here or is declared routine below; a test pins that the two together are exactly INTEREST. A
+# kind that is counted but judged by nobody is how a stall of all four connections (2026-10-05, 31 to
+# 53 s of lost data per connection) once went unreported while the run said ``findings: none``.
+EVENT_FINDINGS: tuple[tuple[str, str, str], ...] = (
+    ("DISK_STOP", CRIT, "recording stopped to protect the disk"),
+    ("BAN", CRIT, "HTTP 418 ban"),
+    ("DISK_WARN", WARN, "host disk pressure"),
+    ("RATE_LIMIT", WARN, "REST rate limit"),
+    ("TASK_CRASH", WARN, "a recorder task crashed and was restarted"),
+    ("OVERRUN", WARN, "queue overrun: records dropped"),
+    ("STREAM_STALL", WARN, "a live stream went silent and its connection was recycled: a data gap"),
+    ("WS_CONNECT_FAIL", WARN, "a connection attempt failed (it is retried)"),
+    ("GAP_DETECTED", WARN, "the recorder itself saw a sequence gap"),
+    ("SUBSCRIBED_NO_DATA", WARN, "a subscribed stream never delivered data"),
+    ("BAD_FRAME", WARN, "a frame went to the fallback record"),
+    ("LOOP_LAG", WARN, "the event loop stalled: timestamps of that moment are late"),
+    ("REST_FROZEN", WARN, "REST traffic was frozen"),
+    ("RETENTION_STEPDOWN", WARN, "the retention ladder stepped down under disk pressure"),
+)
+# the normal heartbeat of a healthy recorder; EVICTED_UNACKED is judged from the lake section (CRIT)
+ROUTINE_EVENTS = frozenset(
+    {"WS_OPEN", "WS_CLOSE", "PRUNED_ACKED", "PROC_START", "PROC_STOP", "EVICTED_UNACKED"}
+)
+
 
 @dataclass(frozen=True)
 class Thresholds:
@@ -195,14 +220,7 @@ def evaluate(
         elif age is not None and age >= th.unacked_warn_h:
             add(WARN, "UNACKED_BACKLOG", "oldest unacknowledged segment is %.1f h old" % age)
         ev = (probe.get("ledger") or {}).get("events_24h") or {}
-        for kind, level, why in (
-            ("DISK_STOP", CRIT, "recording stopped to protect the disk"),
-            ("BAN", CRIT, "HTTP 418 ban"),
-            ("DISK_WARN", WARN, "host disk pressure"),
-            ("RATE_LIMIT", WARN, "REST rate limit"),
-            ("TASK_CRASH", WARN, "a recorder task crashed and was restarted"),
-            ("OVERRUN", WARN, "queue overrun: records dropped"),
-        ):
+        for kind, level, why in EVENT_FINDINGS:
             if ev.get(kind):
                 add(level, kind, "%d x %s in 24 h (%s)" % (ev[kind], kind, why))
         rotation_gaps = _rotation_gaps(probe)

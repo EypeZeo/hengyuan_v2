@@ -59,6 +59,9 @@ D:\My_Projects\hengyuan_ops\d0\
 | `DISK_STOP` / `DISK_WARN` | CRIT / WARN | 录制因磁盘停写 / 磁盘告警 | 同 `HOST_DISK` |
 | `BAN` / `RATE_LIMIT` | CRIT / WARN | 币安 418 封禁 / 429 限流 | 与同机代理共用出口：查 `RATE_LIMIT` 账本上下文，别手动加 REST 调用 |
 | `TASK_CRASH` / `OVERRUN` | WARN | 录制器内部任务崩溃后重启 / 队列溢出丢记录 | 看账本事件的 `error`/区间；`verify` 会把丢失的序号对上 `OVERRUN` |
+| `STREAM_STALL` / `WS_CONNECT_FAIL` | WARN | 24 小时内有流静默被重连（**数据空洞**）/ 连接尝试失败（会重试） | 看账本里这两类事件的时间与连接：多条连接同时停顿而宿主机日志干净，多半是出口网络的短暂抖动（2026-10-05 16:54 UTC 那次：四条连接同时静默被重连、重连握手超时，各连接约 31 至 53 秒无数据（含静默检测期），宿主机 journal 该窗口只有防火墙与 ssh 扫描噪声）；`verify` 会把空洞标出来，不用补救 |
+| `GAP_DETECTED` / `SUBSCRIBED_NO_DATA` / `BAD_FRAME` | WARN | 录制器自己看到序号缺口 / 订阅后始终没数据（路径错？）/ 有帧走了回退记录 | 看账本事件的流名与区间；`SUBSCRIBED_NO_DATA` 不应该出现，出现就是订阅路径或交易所行为变了 |
+| `LOOP_LAG` / `REST_FROZEN` / `RETENTION_STEPDOWN` | WARN | 事件循环停顿（那一刻的 `t_recv` 偏晚）/ REST 被冻结 / 保留期因磁盘紧而降档 | 看账本事件；降档说明磁盘紧而 pull 没跟上，同 `HOST_DISK` |
 | `ROTATION_HOLE` | WARN | 正在运行的录制器某次**计划轮换**的 `WS_CLOSE` → `WS_OPEN` 超过 2 秒（修复后预期 0.3 至 0.6 秒；旧版是 5.3 秒） | 多半是关闭超时又被改回去了或服务端行为变了：对照 `session.py` 的 `close_timeout_s` 与账本里那次轮换 |
 | `CLOCK_UNSYNCED` / `CLOCK_STALE` | WARN | 时钟长时间未同步 / 超过 3 小时没有 NTP 交换 | 宿主机 `timedatectl`、`systemctl status systemd-timesyncd`；期间的 `t` 与 `CLOCK_PROBE` 偏移不可信 |
 | `MEMORY_HIGH` / `OOM_KILL` | WARN ≥300 MB / CRIT | 录制器内存（单元 `MemoryHigh=400M`） | 看趋势：anon 在 138 至 163 MB 之间浮动属正常；持续上涨再查 |
@@ -70,7 +73,8 @@ D:\My_Projects\hengyuan_ops\d0\
 
 ## 例行维保清单
 
-- **每天（自动）**：上面的任务。我（或你）每次回到工作时先读 `logs\latest.txt`；`status.json` 的 `generated_utc` 超过 36 小时就说明任务没在跑。
+- **每天（自动）**：上面的任务。我（或你）每次回到工作时先读 `logs\latest.txt`；`status.json` 的 `generated_utc` 超过 36 小时就说明任务没在跑。账本事件只看最近 24 小时：电脑关机超过一天时，那段时间里的告警不会出现在 findings 里，用 `hy_recorder report --lake <数据湖>` 看账本汇总，周验证也会列出空洞。
+- **新增账本事件种类时**：先决定它是告警（加进 `maint.EVENT_FINDINGS`）还是常规心跳（加进 `ROUTINE_EVENTS`），`test_maint.py` 会拦住“探针在数、没人判”的种类。
 - **每周**：读 `report-*.txt`（速率、体量、空洞、时钟）和 `verify-*.txt`。
 - **每月**：宿主机磁盘与 `journalctl --disk-usage`；录制器内存与磁盘增长有没有偏离上个月；本机数据湖大小与剩余空间；计划任务仍在（`Get-ScheduledTask HengYuan-D0-Maintenance`）。
 - **录制器代码有改动时**：先部署（`deploy/install.sh`，重启一次），再**刷新 `tool\` 快照**：
