@@ -25,9 +25,7 @@ on:
       - '.github/workflows/ci-python.yml'
   pull_request:
     branches: [master]
-    paths:
-      - 'py_core/**'
-      - '.github/workflows/ci-python.yml'
+    # no `paths:` on purpose: the `changes` job below decides, so the `gate` job always reports
   workflow_dispatch:
 
 concurrency:
@@ -35,8 +33,57 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
+  # Required-check plumbing. This workflow runs on every pull request (the pull_request trigger has no
+  # workflow-level `paths:`) so that its `gate` job always reports: GitHub leaves the checks of a path-filtered
+  # workflow that did not run "Pending" forever, which would block every unrelated PR once the gate is a
+  # required status check. The path decision therefore lives here, at job level, where a skipped job counts
+  # as success. Keep the pattern below in step with `push.paths` above.
+  changes:
+    name: "py_core: changes"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Checkout (a pull request checks out its merge commit; depth 2 brings both parents)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether the paths of this workflow changed
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PATTERN: '^(py_core/|\.github/workflows/ci-python\.yml$)'
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "py_core: $EVENT event, run=true" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Fail closed: the diff below is only the pull request's own change set when HEAD is the merge commit.
+          if ! git rev-parse --verify --quiet "HEAD^2" > /dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "py_core: HEAD is not a merge commit, run=true" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # -z: NUL-separated raw names (no quoting of non-ASCII paths). A file rather than a pipe, so that
+          # grep -q closing early cannot turn a match into a SIGPIPE failure under pipefail.
+          git diff --name-only --no-renames -z HEAD^1 HEAD > "$RUNNER_TEMP/changed.z"
+          if grep -zEq "$PATTERN" "$RUNNER_TEMP/changed.z"; then run=true; else run=false; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          {
+            echo "### py_core: changes -> run=$run"
+            echo '```'
+            tr '\0' '\n' < "$RUNNER_TEMP/changed.z"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   pytest:
     name: "py_core: pytest"
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -75,3 +122,34 @@ jobs:
         run: |
           pip install ruff
           ruff check .
+
+  # Always runs and is the only check of this workflow meant to be a required status check: it passes only if
+  # the path decision succeeded and every guarded job ended exactly as that decision calls for (success when
+  # run=true, skipped when run=false). Any other combination, including a failed or cancelled `changes` job,
+  # fails it.
+  gate:
+    name: "py_core: gate"
+    needs: [changes, pytest]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require exactly the outcome the path decision calls for
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUN: ${{ needs.changes.outputs.run }}
+          PYTEST: ${{ needs.pytest.result }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$CHANGES" = "success" ] || fail "the changes job ended as '$CHANGES', not 'success'"
+          case "$RUN" in
+            true)  want=success ;;
+            false) want=skipped ;;
+            *)     fail "the changes job gave no run decision ('$RUN')" ;;
+          esac
+          for pair in "pytest=$PYTEST"; do
+            name="${pair%%=*}"; got="${pair#*=}"
+            [ "$got" = "$want" ] || fail "$name ended as '$got', expected '$want' (run=$RUN)"
+          done
+          echo "gate ok: run=$RUN, every guarded job is '$want'"
