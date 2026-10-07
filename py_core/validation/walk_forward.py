@@ -37,7 +37,12 @@ from py_core.backtests.vectorized_engine import (
     resolve_annualization_factor,
 )
 from py_core.manual_ohlcv import NormalizedOhlcvRecord
-from py_core.strategies.base import load_strategy
+from py_core.strategies.base import (
+    CausalEvidence,
+    causal_gate,
+    checked_signals,
+    load_strategy,
+)
 from py_core.validation.splits import Split
 
 
@@ -115,6 +120,13 @@ def run_walk_forward_analysis(
     df = records_to_dataframe(records)
     annualization_factor = resolve_annualization_factor(config, records)
 
+    # SAFE-05：每组候选参数先在全量数据上做一次因果核验；各 fold 的训练/合并窗口都是这份数据的
+    # 切片，复用同一份证据，不按 fold 重复做差分。
+    gates: list[CausalEvidence] = []
+    for params in param_grid:
+        gate_strategy = load_strategy(strategy_spec, allow_external=allow_external_strategy, **params)
+        gates.append(causal_gate(gate_strategy, df))
+
     fold_results: list[FoldResult] = []
     oos_timestamps: list[datetime] = []
     oos_returns: list[float] = []
@@ -128,10 +140,11 @@ def run_walk_forward_analysis(
         train_df = df.iloc[split.train_indices[0] : split.train_indices[-1] + 1]
 
         best_params: dict[str, Any] | None = None
+        best_gate: CausalEvidence | None = None
         best_score = -math.inf
-        for params in param_grid:
+        for params, gate in zip(param_grid, gates, strict=True):
             strategy = load_strategy(strategy_spec, allow_external=allow_external_strategy, **params)
-            train_signal = strategy.generate_signals(train_df)
+            train_signal, _ = checked_signals(strategy, train_df, evidence=gate)
             train_result = _run_vectorized_backtest_on_df(
                 config, train_df, train_signal, annualization_factor=annualization_factor
             )
@@ -139,13 +152,15 @@ def run_walk_forward_analysis(
             if best_params is None or score > best_score:
                 best_score = score
                 best_params = params
+                best_gate = gate
 
         assert best_params is not None  # param_grid is non-empty, so a winner always exists
+        assert best_gate is not None
 
         combined_df = df.iloc[split.train_indices[0] : split.test_indices[-1] + 1]
         test_df = df.iloc[split.test_indices[0] : split.test_indices[-1] + 1]
         frozen_strategy = load_strategy(strategy_spec, allow_external=allow_external_strategy, **best_params)
-        combined_signal = frozen_strategy.generate_signals(combined_df)
+        combined_signal, _ = checked_signals(frozen_strategy, combined_df, evidence=best_gate)
         test_signal = combined_signal.reindex(test_df.index)
 
         test_result = _run_vectorized_backtest_on_df(

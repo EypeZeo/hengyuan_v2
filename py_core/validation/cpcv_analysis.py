@@ -67,7 +67,7 @@ from py_core.backtests.vectorized_engine import (
     resolve_annualization_factor,
 )
 from py_core.manual_ohlcv import NormalizedOhlcvRecord
-from py_core.strategies.base import load_strategy
+from py_core.strategies.base import checked_signals, load_strategy
 from py_core.validation.cpcv import cpcv_combinations, cpcv_paths
 
 
@@ -217,7 +217,8 @@ def run_cpcv_analysis(
     signals_by_param_index: list[pd.Series[Any]] = []
     for params in param_grid:
         strategy = load_strategy(strategy_spec, allow_external=allow_external_strategy, **params)
-        signals_by_param_index.append(strategy.generate_signals(df))
+        signal, _ = checked_signals(strategy, df)  # SAFE-05：每组参数在全量数据上过一次因果门禁
+        signals_by_param_index.append(signal)
 
     combination_results: list[CombinationResult] = []
     test_result_by_combo_and_group: dict[tuple[int, int], _SubsetEvalResult] = {}

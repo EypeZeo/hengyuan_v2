@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -23,6 +23,9 @@ from py_core.backtests.models import (
     ValidationReport,
 )
 from py_core.manual_ohlcv import NormalizedOhlcvRecord
+
+if TYPE_CHECKING:
+    from py_core.strategies.base import CausalEvidence
 
 
 def records_to_dataframe(records: list[NormalizedOhlcvRecord]) -> pd.DataFrame:
@@ -73,17 +76,26 @@ def records_to_dataframe(records: list[NormalizedOhlcvRecord]) -> pd.DataFrame:
 def validate_inputs(
     df: pd.DataFrame,
     signals: pd.Series[Any],
+    *,
+    causal_evidence: CausalEvidence | None = None,
 ) -> ValidationReport:
     """执行数据完整性与反 lookahead 校验。
 
     校验规则：
     1. timestamp 单调递增（无重复、无乱序）。
     2. close 列无 NaN。
-    3. signal index 与 OHLCV index 对齐（若偏移则疑似 lookahead）。
+    3. signal 的**原始**索引无重复，且每个时间戳都在 OHLCV index 内（整体偏移、时区不一致、
+       引用 df 之外的时间戳都会因此被拒绝）。稀疏子集（只给了部分 bar 的信号）允许，其余 bar
+       视为空仓。**必须在 reindex 之前调用**：SAFE-05 之前两个引擎都先 reindex 再调用本函数，
+       比较的是已被对齐到 df.index 的索引，该项恒为真。
+
+    本函数只做索引/时间戳层面的检查，所以报告里的 causal_check 为 "index_only"；只有调用方
+    传入 causal_evidence（信号来自 checked_signals()）时才记为 "prefix_differential"。
 
     Args:
         df: OHLCV DataFrame（DatetimeIndex）。
-        signals: 与 df 对齐的 signal Series。
+        signals: signal Series，**未经 reindex 的原始索引**。
+        causal_evidence: checked_signals() 返回的因果证据；None 表示信号没有经过因果门禁。
 
     Returns:
         ValidationReport，is_valid=False 时 issues 包含具体问题。
@@ -100,11 +112,29 @@ def validate_inputs(
     if not no_nan_close:
         issues.append("close 列存在 NaN 值")
 
-    # 3. 反 lookahead：signal index 是否与 df index 对齐
+    # 3. 反 lookahead：signal 的原始索引不得含重复，也不得含 df 之外的时间戳
     no_future_shift_detected = True
-    if len(signals) > 0 and not signals.index.equals(df.index):
-        issues.append("signal index 与 OHLCV index 不对齐，可能存在 shift(-1) lookahead 或时间偏移")
-        no_future_shift_detected = False
+    if len(signals) > 0:
+        if signals.index.has_duplicates:
+            issues.append("signal index 含重复时间戳")
+            no_future_shift_detected = False
+        else:
+            orphans = int((~signals.index.isin(df.index)).sum())
+            if orphans:
+                issues.append(
+                    f"signal index 有 {orphans} 个时间戳不在 OHLCV index 中"
+                    "（整体偏移、时区不一致或引用了 df 之外的时间戳，可能是 lookahead 或时间偏移）"
+                )
+                no_future_shift_detected = False
+
+    if causal_evidence is not None:
+        causal_check = "prefix_differential"
+        causal_points = causal_evidence.points_compared
+        causal_context = causal_evidence.to_context()
+    else:
+        causal_check = "index_only"
+        causal_points = 0
+        causal_context = {}
 
     return ValidationReport(
         timestamp_monotonic=timestamp_monotonic,
@@ -112,6 +142,9 @@ def validate_inputs(
         no_future_shift_detected=no_future_shift_detected,
         bar_count=len(df),
         issues=issues,
+        causal_check=causal_check,
+        causal_points=causal_points,
+        causal_context=causal_context,
     )
 
 
@@ -119,6 +152,8 @@ def run_vectorized_backtest(
     config: BacktestConfig,
     records: list[NormalizedOhlcvRecord],
     signals: pd.Series[Any],
+    *,
+    causal_evidence: CausalEvidence | None = None,
 ) -> BacktestResult:
     """运行单资产向量化回测。
 
@@ -135,6 +170,8 @@ def run_vectorized_backtest(
         config: 回测配置（资本、费率等）。
         records: NormalizedOhlcvRecord 列表（已排好时序）。
         signals: pandas Series，索引与 records 时间轴对齐，值 ∈ {0, 1} 或实数仓位。
+        causal_evidence: 信号来自 checked_signals() 时传入它返回的证据，报告里的 causal_check
+            才会是 "prefix_differential"；不传则只是 "index_only"（只做了索引检查）。
 
     Returns:
         BacktestResult，含 equity_curve、returns、positions、fills_approx、metrics。
@@ -147,7 +184,11 @@ def run_vectorized_backtest(
 
     df = records_to_dataframe(records)
     return _run_vectorized_backtest_on_df(
-        config, df, signals, annualization_factor=resolve_annualization_factor(config, records)
+        config,
+        df,
+        signals,
+        annualization_factor=resolve_annualization_factor(config, records),
+        causal_evidence=causal_evidence,
     )
 
 
@@ -171,6 +212,7 @@ def _run_vectorized_backtest_on_df(
     signals: pd.Series[Any],
     *,
     annualization_factor: float,
+    causal_evidence: CausalEvidence | None = None,
 ) -> BacktestResult:
     """run_vectorized_backtest() 的内部实现，接收已经构建好的 OHLCV DataFrame。
 
@@ -185,19 +227,22 @@ def _run_vectorized_backtest_on_df(
         annualization_factor: 一年多少根 bar。**keyword-only 且必填**——这个函数只拿得到
             df，拿不到 records，没法自己推导；强制调用方传值可以确保
             resolve_annualization_factor() 在上游被真正调用过，而不是悄悄退回一个默认魔数。
+        causal_evidence: 同 run_vectorized_backtest()。
     """
     # 确保 signals 拥有 DatetimeIndex
     signals_work = signals.copy()
     if not isinstance(signals_work.index, pd.DatetimeIndex):
         signals_work.index = pd.DatetimeIndex(signals_work.index)
 
-    # 将 signals 对齐到 df index（重新索引，NaN 填 0）
-    signals_aligned: pd.Series[Any] = signals_work.reindex(df.index).fillna(0.0)
-
     # --- 输入校验 ---
-    validation_report = validate_inputs(df, signals_aligned)
+    # SAFE-05：必须在 reindex 之前，比较信号的**原始**索引。此前先 reindex 再校验，校验比较的
+    # 是已被对齐到 df.index 的索引，no_future_shift_detected 因此恒为 True。
+    validation_report = validate_inputs(df, signals_work, causal_evidence=causal_evidence)
     if not validation_report.is_valid:
         raise ValueError(f"输入校验失败：{validation_report.issues}")
+
+    # 将 signals 对齐到 df index（重新索引，NaN 填 0）
+    signals_aligned: pd.Series[Any] = signals_work.reindex(df.index).fillna(0.0)
 
     # --- 核心向量化模拟 ---
     #

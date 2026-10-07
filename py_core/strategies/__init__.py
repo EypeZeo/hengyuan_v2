@@ -5,8 +5,13 @@ Non-authorizing. 策略只产出研究/回测用途的 signal/目标仓位序列
 """
 
 from py_core.strategies.base import (
+    DEFAULT_CAUSAL_POINTS,
+    CausalEvidence,
+    LookaheadBiasError,
     Strategy,
     assert_no_lookahead,
+    causal_gate,
+    checked_signals,
     load_strategy,
     validate_signal_output,
 )
@@ -14,10 +19,15 @@ from py_core.strategies.momentum import MomentumStrategy
 from py_core.strategies.sma_crossover import SmaCrossoverStrategy
 
 __all__ = [
+    "DEFAULT_CAUSAL_POINTS",
+    "CausalEvidence",
+    "LookaheadBiasError",
     "MomentumStrategy",
     "SmaCrossoverStrategy",
     "Strategy",
     "assert_no_lookahead",
+    "causal_gate",
+    "checked_signals",
     "load_strategy",
     "validate_signal_output",
 ]

@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
@@ -37,6 +37,9 @@ from py_core.manual_ohlcv import NormalizedOhlcvRecord
 from py_core.risk.risk_calculator import RiskCalculator
 from py_core.risk.risk_config import RiskConfig
 from py_core.risk.risk_decision_artifact import RiskDecisionArtifact, RiskDecisionStatus
+
+if TYPE_CHECKING:
+    from py_core.strategies.base import CausalEvidence
 
 _RISK_INTEGRATION_LABEL = "risk-aware backtest estimates only — NON-AUTHORIZING RESEARCH USE ONLY"
 
@@ -107,6 +110,8 @@ def run_risk_aware_backtest(
     signals: pd.Series[Any],
     risk_config: RiskConfig,
     stop_distance_fraction: Decimal | None = None,
+    *,
+    causal_evidence: CausalEvidence | None = None,
 ) -> RiskAwareBacktestResult:
     """运行风险感知回测，将 RiskCalculator 集成到逐 bar 仿真中。
 
@@ -139,6 +144,8 @@ def run_risk_aware_backtest(
                      max_risk_per_trade 等）。
         stop_distance_fraction: 可选止损距离（Decimal），传入后激活 max_risk_per_trade 上限。
                        若为 None，该上限不生效。
+        causal_evidence: 信号来自 checked_signals() 时传入它返回的证据（见
+                       run_vectorized_backtest()）；不传则报告里只是 "index_only"。
 
     Returns:
         :class:`RiskAwareBacktestResult`，含风险调整净值曲线、逐 bar RiskDecisionArtifact
@@ -158,12 +165,13 @@ def run_risk_aware_backtest(
     if not isinstance(signals_work.index, pd.DatetimeIndex):
         signals_work.index = pd.DatetimeIndex(signals_work.index)
 
-    signals_aligned: pd.Series[Any] = signals_work.reindex(df.index).fillna(0.0)
-
     # ── 输入校验 ───────────────────────────────────────────────────────────
-    validation_report = validate_inputs(df, signals_aligned)
+    # SAFE-05：必须在 reindex 之前，比较信号的原始索引（见 validate_inputs()）。
+    validation_report = validate_inputs(df, signals_work, causal_evidence=causal_evidence)
     if not validation_report.is_valid:
         raise ValueError(f"输入校验失败：{validation_report.issues}")
+
+    signals_aligned: pd.Series[Any] = signals_work.reindex(df.index).fillna(0.0)
 
     # ── 年化因子：显式配置优先，否则从数据的 market+timeframe 推导 ────────
     # 基础回测与风险调整回测必须用同一个因子，否则两份 metrics 不可比。
@@ -173,7 +181,11 @@ def run_risk_aware_backtest(
     # 复用上面已经构建好的 df，不再让 _run_vectorized_backtest_on_df 内部重新调用
     # records_to_dataframe(records) 构建第二份一样的 DataFrame。
     base_result = _run_vectorized_backtest_on_df(
-        config, df, signals, annualization_factor=annualization_factor
+        config,
+        df,
+        signals,
+        annualization_factor=annualization_factor,
+        causal_evidence=causal_evidence,
     )
 
     # ── next-bar 仓位（与 P2-BT-01 shift 语义相同）───────────────────────
