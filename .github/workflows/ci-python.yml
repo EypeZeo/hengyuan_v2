@@ -83,11 +83,14 @@ jobs:
   pytest:
     name: "py_core: pytest"
     needs: changes
-    if: false
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
+      - name: Deliberate failure (probe)
+        run: exit 1
+
       - name: Checkout
         uses: actions/checkout@v7
 
