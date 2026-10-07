@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -51,8 +53,9 @@ class Strategy(ABC):
             reindex().fillna(0.0) 会把 NaN 当成空仓处理，不需要策略自己填充。
 
         不做反 lookahead 校验——那是实现者的责任（用 .rolling()/.shift() 而不是直接访问
-        未来的 index）。本模块的 assert_no_lookahead() 是一个可选的事后核验工具，不是
-        generate_signals() 自动享有的保护。
+        未来的 index）。直接调用 generate_signals() 不享有任何保护；所有生产入口（回测
+        CLI、walk-forward、CPCV、PBO、验证扫描）一律经本模块的 checked_signals() 取信号，
+        它做前缀截断差分核验，不通过即抛 LookaheadBiasError（SAFE-05）。
         """
         raise NotImplementedError
 
@@ -95,7 +98,7 @@ def validate_signal_output(signal: pd.Series[Any], df: pd.DataFrame) -> None:
 
 
 def assert_no_lookahead(strategy: Strategy, df: pd.DataFrame, sample_points: list[int]) -> None:
-    """可选的因果性（反 lookahead）核验工具，不是框架强制的关卡。
+    """因果性（反 lookahead）的单点断言；**不是**框架的关卡——强制的关卡是 checked_signals()（SAFE-05）。
 
     在 sample_points 给定的若干整数位置上，用「只截到该点为止的历史前缀」（df.iloc[:point+1]）
     重新跑一遍 generate_signals()，对比该点的信号是否跟用全量 df 算出来的一致——如果不一致，
@@ -135,6 +138,193 @@ def assert_no_lookahead(strategy: Strategy, df: pd.DataFrame, sample_points: lis
                 f"（{full_value!r}）跟只用历史前缀算出的信号（{truncated_value!r}）不一致——"
                 "策略的 generate_signals() 可能用到了截断点之后才存在的数据。"
             )
+
+
+# ---------------------------------------------------------------------------
+# SAFE-05：因果门禁——生产入口取策略信号的唯一通道
+# ---------------------------------------------------------------------------
+
+DEFAULT_CAUSAL_POINTS = 8
+_METHOD_PREFIX_DIFFERENTIAL = "prefix_differential"
+
+
+class LookaheadBiasError(ValueError):
+    """信号依赖了本 bar 之后才存在的数据，或所给的因果证据不覆盖当前数据。
+
+    是 ValueError 的子类：调用方已有的 ``except ValueError`` 仍会接住它，但它不会被
+    悄悄当成普通的输入格式错误。
+    """
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class CausalEvidence:
+    """因果门禁实际做了什么——只陈述事实，不夸大。
+
+    ``method`` 目前只有 ``prefix_differential``：在 ``sample_positions`` 列出的 bar 上，用只含
+    历史前缀的数据重算信号，与全量数据算出的信号做精确比较。**只在被采样的 bar 上生效**：
+    它不能证明策略没有任何隐藏的数据依赖，也不覆盖未采样的 bar。
+
+    ``point_in_time`` / ``experiment_id`` / ``blind_set_hash`` 是为 D1（点时特征、实验登记、
+    不可变盲测）预留的槽位：本项只记录、不使用。
+
+    ``row_hashes`` 是被核验数据帧逐行的哈希，供 :meth:`covers` 判断另一个数据帧是否是它的
+    切片（同样的行、同样的值）。
+    """
+
+    method: str
+    points_requested: int
+    sample_positions: tuple[int, ...]
+    bar_count: int
+    data_digest: str
+    note: str = ""
+    point_in_time: dict[str, Any] | None = None
+    experiment_id: str | None = None
+    blind_set_hash: str | None = None
+    row_hashes: pd.Series[Any] | None = field(default=None, repr=False)
+
+    @property
+    def points_compared(self) -> int:
+        return len(self.sample_positions)
+
+    def covers(self, df: pd.DataFrame) -> bool:
+        """``df`` 的每一行（索引与取值）都出现在被核验的数据帧里。"""
+        if self.row_hashes is None:
+            return False
+        if not df.index.isin(self.row_hashes.index).all():
+            return False
+        mine = pd.util.hash_pandas_object(df, index=True).to_numpy()
+        return bool((mine == self.row_hashes.reindex(df.index).to_numpy()).all())
+
+    def to_context(self) -> dict[str, Any]:
+        """JSON 可序列化的摘要（写进 ValidationReport.causal_context 与产物）。"""
+        return {
+            "method": self.method,
+            "points_requested": self.points_requested,
+            "sample_positions": list(self.sample_positions),
+            "bar_count": self.bar_count,
+            "data_digest": self.data_digest,
+            "note": self.note,
+            "reserved": {
+                "point_in_time": self.point_in_time,
+                "experiment_id": self.experiment_id,
+                "blind_set_hash": self.blind_set_hash,
+            },
+        }
+
+
+def _sample_positions(full_signal: pd.Series[Any], points: int) -> tuple[int, ...]:
+    """预热结束之后、倒数第二根 bar 之前，均匀取至多 ``points`` 个位置。
+
+    最后一根 bar 之后没有"未来"，核验它没有信息量；倒数第二根最锐利（只差一根未来 bar）。
+    没有任何非 NaN 信号、或预热一直持续到最后一根 bar 时，没有可比较的位置，返回空元组。
+    """
+    valid = full_signal.notna().to_numpy()
+    if not valid.any():
+        return ()
+    first = int(np.argmax(valid))
+    last = len(full_signal) - 2
+    if last < first:
+        return ()
+    count = min(points, last - first + 1)
+    if count == 1:
+        return (last,)
+    return tuple(sorted({round(float(x)) for x in np.linspace(first, last, num=count)}))
+
+
+def _prefix_differential(
+    strategy: Strategy, df: pd.DataFrame, points: int
+) -> tuple[pd.Series[Any], tuple[int, ...]]:
+    if points < 1:
+        raise ValueError(f"points 必须 >= 1，收到 {points}")
+    if df.empty:
+        raise ValueError("df 不能为空")
+
+    full_signal = strategy.generate_signals(df)
+    validate_signal_output(full_signal, df)
+    positions = _sample_positions(full_signal, points)
+
+    for point in positions:
+        truncated_df = df.iloc[: point + 1]
+        truncated_signal = strategy.generate_signals(truncated_df)
+        validate_signal_output(truncated_signal, truncated_df)
+
+        full_value = full_signal.iloc[point]
+        truncated_value = truncated_signal.iloc[-1]
+        both_nan = pd.isna(full_value) and pd.isna(truncated_value)
+        if not both_nan and full_value != truncated_value:
+            raise LookaheadBiasError(
+                f"因果核验失败：位置 {point}（{df.index[point]}）用全量数据算出的信号"
+                f"（{full_value!r}）跟只用历史前缀算出的信号（{truncated_value!r}）不一致——"
+                f"{type(strategy).__name__}.generate_signals() 用到了该 bar 之后才存在的数据。"
+            )
+    return full_signal, positions
+
+
+def checked_signals(
+    strategy: Strategy,
+    df: pd.DataFrame,
+    *,
+    evidence: CausalEvidence | None = None,
+    points: int = DEFAULT_CAUSAL_POINTS,
+    point_in_time: dict[str, Any] | None = None,
+    experiment_id: str | None = None,
+    blind_set_hash: str | None = None,
+) -> tuple[pd.Series[Any], CausalEvidence]:
+    """生产入口取策略信号的唯一通道（SAFE-05）：形状校验加前缀截断差分，返回信号与证据。
+
+    不带 ``evidence`` 时，对 ``df`` 本身做一次完整核验：用全量数据算信号，再在 ``points`` 个
+    位置上用只含历史前缀的数据重算，要求该位置的信号与全量结果精确相等（NaN 对 NaN 视为
+    相等）；不相等就抛 :class:`LookaheadBiasError`。代价约为单次求值的 ``points + 1`` 倍。
+
+    带 ``evidence`` 时，调用方声明 ``df`` 是此前已核验过的数据帧的切片（例如 walk-forward 的
+    各个 fold 窗口）：只验证证据确实覆盖 ``df``，然后直接取信号，不再重复做差分。
+
+    **覆盖边界**：差分只在被采样的 bar 上生效，不能证明策略没有任何隐藏的数据依赖。
+    """
+    if evidence is not None:
+        if not evidence.covers(df):
+            raise LookaheadBiasError(
+                "因果证据不覆盖这份数据：证据对应的是另一份（或已被改动的）数据帧，"
+                "必须对当前数据重新做因果核验"
+            )
+        signal = strategy.generate_signals(df)
+        validate_signal_output(signal, df)
+        return signal, evidence
+
+    signal, positions = _prefix_differential(strategy, df, points)
+    row_hashes = pd.util.hash_pandas_object(df, index=True)
+    return signal, CausalEvidence(
+        method=_METHOD_PREFIX_DIFFERENTIAL,
+        points_requested=points,
+        sample_positions=positions,
+        bar_count=len(df),
+        data_digest=hashlib.sha256(row_hashes.to_numpy().tobytes()).hexdigest()[:16],
+        note="" if positions else "没有可比较的位置：最后一根 bar 之前没有非 NaN 的信号",
+        point_in_time=point_in_time,
+        experiment_id=experiment_id,
+        blind_set_hash=blind_set_hash,
+        row_hashes=row_hashes,
+    )
+
+
+def causal_gate(
+    strategy: Strategy,
+    df: pd.DataFrame,
+    *,
+    points: int = DEFAULT_CAUSAL_POINTS,
+    point_in_time: dict[str, Any] | None = None,
+    experiment_id: str | None = None,
+    blind_set_hash: str | None = None,
+) -> CausalEvidence:
+    """只要因果证据、不要信号：调用方随后会在 ``df`` 的切片上反复用同一策略取信号。"""
+    return checked_signals(
+        strategy,
+        df,
+        points=points,
+        point_in_time=point_in_time,
+        experiment_id=experiment_id,
+        blind_set_hash=blind_set_hash,
+    )[1]
 
 
 def load_strategy(spec: str, *, allow_external: bool = False, **params: Any) -> Strategy:
