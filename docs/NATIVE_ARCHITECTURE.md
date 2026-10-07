@@ -13,7 +13,7 @@ Single living reference for `native/`, replacing v1's scattered P2-CORE-*/P2-EXE
 | **Order truth chain (D12 series)** | `account_truth.hpp`, `order_lifecycle.hpp`, `exit_safety.hpp`, `audit_trail.hpp`, `dry_run_evidence.hpp`, `live_submit_orchestrator.hpp`, `order_tracker.hpp` (reconciliation poll loop), `position_truth.hpp` (net-position truth), `order_fill_context.hpp` (dedup-safe cumulative-fill deltas) | The gate chain gating real order submission, plus TODO 1A.4's reconciliation/position-truth additions. Not pure-in-memory-only: Gate 12d/13 durably append via `ctx.durable_audit.append_durable()` — see the Durable persistence / WAL row below. |
 | **Durable persistence / WAL** | `durable_audit_sink.hpp`, `durable_log_store.hpp`, `durable_frame_codec.hpp`, `durable_control_plane.hpp` | fsync-forced, MAC-chained write-ahead log the order truth chain's Gate 12d/13 durably append into (`ctx.durable_audit.append_durable()`); backs crash-recovery reconciliation. `durable_control_plane.hpp`'s `DurableRecordType` wire enum is closed/spec-transcribed (see `docs/BINANCE_PRIVATE_REST_L4_SPEC.md` §10) and CI-enforced via `tools/spec_enum_diff.py` — no new enumerator may be added without a NAME_CONFLICT. |
 | **Liveness / control** | `kill_switch.hpp`, `shm_heartbeat.hpp`, `intent_channel.hpp`, `preflight_gate.hpp` (renamed to `CODE-PREFLIGHT` internally — see naming note below) | Process-liveness watchdog + the 7-item code-layer preflight (distinct from the operational D3-LIVE checklist). |
-| **Demos / harnesses** | `src/binance_feed_demo.cpp`, `src/binance_dry_run_demo.cpp`, `src/latency_bench.cpp`, `src/watchdog_daemon.cpp`, `src/live_submit_evidence_harness.cpp`, `src/binance_connectivity_smoke.cpp`, `src/live_submit_reconcile_harness_demo.cpp` | Operator-facing entry points. `live_submit_evidence_harness` runs `orchestrate_submit()` end-to-end for all 4 dry-run paths (mock `SubmitPort`, no network). `live_submit_reconcile_harness_demo` (TODO 1A.4) is the newest — genuinely real WS thread + reconciliation poll loop + reconnect supervisor running as a process, but `SubmitPort`/`QueryPort` are still mock and the WS session uses a synthetic placeholder listenKey (no real `create_listen_key()` call site exists yet). |
+| **Demos / harnesses** | `src/binance_feed_demo.cpp`, `src/binance_dry_run_demo.cpp`, `src/latency_bench.cpp`, `src/watchdog_daemon.cpp`, `src/live_submit_evidence_harness.cpp`, `src/binance_connectivity_smoke.cpp`, `src/live_submit_reconcile_harness_demo.cpp`, `src/live_submit_real_credentials_demo.cpp`, `src/live_submit_preflight_harness.cpp` | Operator-facing entry points. `live_submit_evidence_harness` runs `orchestrate_submit()` end-to-end for all 4 dry-run paths (mock `SubmitPort`, no network). `live_submit_reconcile_harness_demo` (TODO 1A.4) runs a genuinely real WS thread + reconciliation poll loop + reconnect supervisor as a process, but with mock `SubmitPort`/`QueryPort` and a synthetic placeholder listenKey. The two testnet-only cold-start harnesses (owner-supplied `.env`, no `--production` flag) are the newer ones and the only processes that wire real components: `live_submit_real_credentials_demo` (real clock sync, `exchangeInfo`, `create_listen_key()`, user-data WS, a real `QueryPort` reconcile loop, and the real composite `SubmitPort` assembled but never called) and `live_submit_preflight_harness` (the same cold start plus real public kline and depth feeds; `ctx.submit_port` stays a mock for the whole process, so `orchestrate_submit()` can reach at most `OperatorNotConfirmed`). |
 
 ## Gate levels (from ADR-019 D2, reference only — carried over verbatim in `docs/adr/`)
 
@@ -21,8 +21,8 @@ Single living reference for `native/`, replacing v1's scattered P2-CORE-*/P2-EXE
 |---|---|---|
 | Synthetic env parsing | L1 | Implemented, tested |
 | Real `.env` credential load | L3 | Implemented, tested — never independently reviewed |
-| Signed read-only request (`GET /api/v3/account`) | L4 | **Adapter implemented and unit-tested** (spec rev 72, `binance_private_rest.hpp`) — not yet wired into any running process with real credentials |
-| Signed order submission (`POST /api/v3/order`) | L5 | **Adapter implemented and unit-tested** (spec rev 73, `binance_private_rest.hpp`) — `SubmitPort`/`QueryPort` remain mock DI seams in every runnable harness; real adapter not yet wired in |
+| Signed read-only request (`GET /api/v3/account`) | L4 | **Adapter implemented and unit-tested** (spec rev 72, `binance_private_rest.hpp`) — wired only into the testnet-only cold-start harnesses (owner-supplied `.env`; per `CLAUDE.md` no AI session loads or uses a real credential) |
+| Signed order submission (`POST /api/v3/order`) | L5 | **Adapter implemented and unit-tested** (spec rev 73, `binance_private_rest.hpp`, `binance_submit_adapter.hpp`) — `SubmitPort`/`QueryPort` are mock DI seams in every harness that reaches `orchestrate_submit()`; the cold-start harnesses assemble the real `SubmitPort` but never call it |
 
 ## Scope decisions
 
@@ -51,10 +51,12 @@ value is not an option — that enum is closed/spec-transcribed and CI-enforced 
 (owner decision, 2026-08): real auto order submission — L4 signed read-only client first, then
 the L5 POST adapter. Specifically:
 
-- The L4/L5 adapters (`binance_private_rest.hpp`) are implemented and unit-tested against real
-  success/failure response paths, but `live_submit_orchestrator.hpp`'s `SubmitPort`/
-  `QueryPort` remain mock DI seams in every runnable harness — nothing in `native/src/` has
-  wired the real adapters up and run them as a live process. `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`
+- The L4/L5 adapters (`binance_private_rest.hpp`, `binance_submit_adapter.hpp`) are implemented and
+  unit-tested against real success/failure response paths, but every harness that reaches
+  `orchestrate_submit()` injects mock `SubmitPort`/`QueryPort` seams. Only the two testnet-only
+  cold-start harnesses (`live_submit_real_credentials_demo.cpp`, `live_submit_preflight_harness.cpp`)
+  wire real components, and neither ever calls the real `SubmitPort` — nothing in `native/src/`
+  runs the real adapters as a live order path. `docs/BINANCE_PRIVATE_REST_L4_SPEC.md`
   (rev 72, signed read-only foundation: environment binding, signing discipline,
   reconciliation, symbol registry, rate-limit accounting) and
   `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (rev 73, the L5 POST adapter, depends on the
