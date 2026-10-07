@@ -14,6 +14,14 @@ Ported from `hengyuan/research/backtests/`, `hengyuan/research/risk/`, and `heng
 - `app/infrastructure/exchanges/` — live exchange adapters.
 - `research/paper_trading/` — the Python-side paper-trading engine. Left in v1 because it's an execution-adjacent simulation of order lifecycle/reconciliation that overlaps conceptually with the native C++ orchestrator's job; porting it here would blur which repo owns "order lifecycle," not simplify anything.
 
+## Causal gate (SAFE-05)
+
+Every production path that turns a strategy into signals — the backtest CLI (`run`, `run-risk-aware`), `run_walk_forward_analysis`, `run_cpcv_analysis`, `compute_pbo` and `run_validation_sweep` — goes through `strategies.base.checked_signals()`. It validates the output shape and then runs a prefix-truncation differential: at up to `--causal-points` (default 8) positions after the warm-up it recomputes the signal from the history prefix only and requires it to equal the full-data signal exactly. A mismatch raises `LookaheadBiasError` and nothing is backtested. An AST test pins that no other production module calls `generate_signals()`.
+
+What the report says: `validation_report.json` carries `causal_check` (`prefix_differential` for strategy signals that passed the gate, `index_only` for precomputed signals, `not_run` only for hand-built reports), `causal_points` and `causal_context` (sampled positions, bar count, data digest, and three reserved empty slots for the point-in-time quadruple, the experiment id and the blind-set hash that D1 will fill). The engines check the **raw** signal index *before* reindexing: duplicate timestamps and timestamps outside the OHLCV index (a shifted or time-zone-mismatched index) are rejected.
+
+**Coverage boundary — what this does not prove.** The differential only has force at the sampled bars. It does not prove that a hand-written strategy has no hidden data dependency and says nothing about unsampled bars; a signal file (`--signals`) can only get index and timestamp checks and is reported as `index_only`, never as a causal pass. The remaining risk goes to the experiment audit (D1). `lag.n < 1` in a StrategySpec is rejected at parse time (`LookaheadBiasError`, also a `StrategySpecError`).
+
 ## Setup (independent of v1)
 
 ```powershell

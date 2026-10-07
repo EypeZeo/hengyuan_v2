@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from py_core.manual_ohlcv import CanonicalMarketSymbol, ManualMarket, OhlcvTimeframe
+from py_core.strategies.base import LookaheadBiasError
 
 RAW_FIELDS = frozenset({"open", "high", "low", "close", "volume"})
 
@@ -44,6 +45,13 @@ OperandValue = str | float
 class StrategySpecError(ValueError):
     """Raised for any structurally invalid spec -- malformed TOML, unknown operator,
     missing/mis-typed field, forward-reference violation, duplicate id, etc."""
+
+
+class SpecLookaheadError(LookaheadBiasError, StrategySpecError):
+    """A spec operator references a bar that is not strictly in the past (SAFE-05).
+
+    Both a ``LookaheadBiasError`` (the research gate's error) and a ``StrategySpecError`` (so every
+    existing handler of structurally invalid specs still applies)."""
 
 
 def _operand_field_names(op: str) -> tuple[str, ...]:
@@ -213,6 +221,12 @@ def _parse_indicators(doc: dict[str, Any]) -> tuple[IndicatorNode, ...]:
                 isinstance(raw_param, int) and not isinstance(raw_param, bool),
                 f"indicator {node_id!r} 字段 {param_field!r} 必须是整数，收到 {raw_param!r}",
             )
+            if op == _LAG_OP and raw_param < 1:
+                raise SpecLookaheadError(
+                    f"indicator {node_id!r} 字段 {param_field!r} 必须 >= 1，收到 {raw_param!r}："
+                    "lag 只能向过去移位（n < 0 会引用未来的 bar，是前视偏差；n = 0 没有意义），"
+                    "规格刻意不提供 lead，见 STRATEGY_SPEC.md §2.2"
+                )
             param = raw_param
 
         nodes.append(IndicatorNode(id=node_id, op=op, operands=operands, param=param))

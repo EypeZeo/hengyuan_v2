@@ -46,6 +46,7 @@ from py_core.backtests.artifact_export import (
     _dumps_line,
     _write_completion_marker,
     export_risk_aware_backtest_artifacts,
+    serialize_causal_fields,
 )
 from py_core.backtests.models import BacktestConfig, BacktestResult
 from py_core.backtests.risk_integration import run_risk_aware_backtest
@@ -61,7 +62,13 @@ from py_core.manual_ohlcv import (
     OhlcvTimeframe,
 )
 from py_core.risk.risk_config import RiskConfig
-from py_core.strategies.base import load_strategy
+from py_core.strategies.base import (
+    DEFAULT_CAUSAL_POINTS,
+    CausalEvidence,
+    LookaheadBiasError,
+    checked_signals,
+    load_strategy,
+)
 
 NON_AUTH_NOTICE = (
     "\n[NOTICE] All outputs are BACKTESTING ESTIMATES ONLY.\n"
@@ -242,14 +249,18 @@ def load_signals_from_strategy(
     df: pd.DataFrame,
     *,
     allow_external: bool,
-) -> pd.Series[Any]:
-    """用策略框架在已经构建好的 df 上生成 signal Series。
+    causal_points: int = DEFAULT_CAUSAL_POINTS,
+) -> tuple[pd.Series[Any], CausalEvidence]:
+    """用策略框架在已经构建好的 df 上生成 signal Series，并先过因果门禁（SAFE-05）。
 
     df 由调用方构建一次并传入（不在这里再调用 records_to_dataframe()）——避免策略生成和
     回测执行各自独立构建一次同样的 DataFrame。
+
+    Raises:
+        LookaheadBiasError: 前缀截断差分发现信号依赖了该 bar 之后才存在的数据。
     """
     strategy = load_strategy(strategy_spec, allow_external=allow_external, **strategy_params)
-    return strategy.generate_signals(df)
+    return checked_signals(strategy, df, points=causal_points)
 
 
 def save_results(
@@ -316,6 +327,7 @@ def save_results(
             "bar_count": result.validation_report.bar_count,
             "is_valid": result.validation_report.is_valid,
             "issues": result.validation_report.issues,
+            **serialize_causal_fields(result.validation_report),
         }
         (tmp_dir / "validation_report.json").write_text(_dumps(vr_dict), encoding="utf-8")
 
@@ -407,13 +419,26 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
 
     strategy_params: dict[str, Any] = {}
     signals_path_str: str | None = None
+    causal_evidence: CausalEvidence | None = None
     if args.strategy:
         strategy_params = _parse_strategy_params(args.strategy_params)
         df = records_to_dataframe(records)
-        signals = load_signals_from_strategy(
-            args.strategy, strategy_params, df, allow_external=args.allow_external_strategy
-        )
+        try:
+            signals, causal_evidence = load_signals_from_strategy(
+                args.strategy,
+                strategy_params,
+                df,
+                allow_external=args.allow_external_strategy,
+                causal_points=getattr(args, "causal_points", DEFAULT_CAUSAL_POINTS),
+            )
+        except LookaheadBiasError as exc:
+            print(f"[ERROR] 因果核验失败: {exc}", file=sys.stderr)
+            return 1
         print(f"[INFO] 使用策略生成 Signals: {args.strategy}")
+        print(
+            "[INFO] causal_check: prefix_differential"
+            f"（采样 {causal_evidence.points_compared} 个 bar，数据摘要 {causal_evidence.data_digest}）"
+        )
     else:
         signals_path = Path(args.signals).resolve()
         if not signals_path.exists():
@@ -423,6 +448,7 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
         print(f"[INFO] 加载 Signals: {signals_path}")
         signals = load_signals_csv(signals_path, records)
         print(f"[INFO] 已加载 {len(signals)} 条 Signal")
+        print("[WARN] 预计算 Signals 只做索引/时间戳检查（causal_check=index_only），不构成因果核验通过")
 
     config = BacktestConfig(
         initial_capital=args.initial_capital,
@@ -455,7 +481,9 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
             return 2
 
     print("[INFO] 运行风险感知回测...")
-    result = run_risk_aware_backtest(config, records, signals, risk_config, stop_distance_fraction)
+    result = run_risk_aware_backtest(
+        config, records, signals, risk_config, stop_distance_fraction, causal_evidence=causal_evidence
+    )
 
     # 输出绩效摘要
     bm = result.base_result.metrics
@@ -542,12 +570,25 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     strategy_params: dict[str, Any] = {}
     signals_path_str: str | None = None
+    causal_evidence: CausalEvidence | None = None
     if args.strategy:
         strategy_params = _parse_strategy_params(args.strategy_params)
-        signals = load_signals_from_strategy(
-            args.strategy, strategy_params, df, allow_external=args.allow_external_strategy
-        )
+        try:
+            signals, causal_evidence = load_signals_from_strategy(
+                args.strategy,
+                strategy_params,
+                df,
+                allow_external=args.allow_external_strategy,
+                causal_points=getattr(args, "causal_points", DEFAULT_CAUSAL_POINTS),
+            )
+        except LookaheadBiasError as exc:
+            print(f"[ERROR] 因果核验失败: {exc}", file=sys.stderr)
+            return 1
         print(f"[INFO] 使用策略生成 Signals: {args.strategy}")
+        print(
+            "[INFO] causal_check: prefix_differential"
+            f"（采样 {causal_evidence.points_compared} 个 bar，数据摘要 {causal_evidence.data_digest}）"
+        )
     else:
         signals_path = Path(args.signals).resolve()
         if not signals_path.exists():
@@ -557,6 +598,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[INFO] 加载 Signals: {signals_path}")
         signals = load_signals_csv(signals_path, records)
         print(f"[INFO] 已加载 {len(signals)} 条 Signal")
+        print("[WARN] 预计算 Signals 只做索引/时间戳检查（causal_check=index_only），不构成因果核验通过")
 
     config = BacktestConfig(
         initial_capital=args.initial_capital,
@@ -577,7 +619,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     print("[INFO] 运行回测...")
     result = _run_vectorized_backtest_on_df(
-        config, df, signals, annualization_factor=annualization_factor
+        config, df, signals, annualization_factor=annualization_factor, causal_evidence=causal_evidence
     )
 
     # 输出绩效摘要
@@ -646,6 +688,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="允许加载 py_core.strategies 命名空间之外的策略模块（默认不允许）",
     )
     run_parser.add_argument(
+        "--causal-points",
+        type=int,
+        default=DEFAULT_CAUSAL_POINTS,
+        help="因果核验（前缀截断差分）的采样点数（默认 8，只对 --strategy 生效）；预计算的 --signals 只做索引检查",
+    )
+    run_parser.add_argument(
         "--initial-capital", type=float, default=100000.0, help="初始资本（默认 100000）"
     )
     run_parser.add_argument("--fee-bps", type=float, default=10.0, help="手续费 bps（默认 10）")
@@ -686,6 +734,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-external-strategy",
         action="store_true",
         help="允许加载 py_core.strategies 命名空间之外的策略模块（默认不允许）",
+    )
+    rra_parser.add_argument(
+        "--causal-points",
+        type=int,
+        default=DEFAULT_CAUSAL_POINTS,
+        help="因果核验（前缀截断差分）的采样点数（默认 8，只对 --strategy 生效）；预计算的 --signals 只做索引检查",
     )
     rra_parser.add_argument(
         "--initial-capital", type=float, default=100000.0, help="初始资本（默认 100000）"

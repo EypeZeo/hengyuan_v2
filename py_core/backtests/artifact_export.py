@@ -182,6 +182,15 @@ def serialize_metrics(metrics: BacktestMetrics, *, non_authorizing: bool = True)
     }
 
 
+def serialize_causal_fields(report: ValidationReport) -> dict[str, Any]:
+    """因果核验字段（SAFE-05）。validation_report.json 的两个写出点共用这一份，避免漂移。"""
+    return {
+        "causal_check": report.causal_check,
+        "causal_points": report.causal_points,
+        "causal_context": report.causal_context,
+    }
+
+
 def serialize_validation_report(report: ValidationReport) -> dict[str, Any]:
     """序列化 ValidationReport 到 JSON 可序列化 dict。"""
     return {
@@ -192,6 +201,7 @@ def serialize_validation_report(report: ValidationReport) -> dict[str, Any]:
         "bar_count": report.bar_count,
         "is_valid": report.is_valid,
         "issues": report.issues,
+        **serialize_causal_fields(report),
     }
 
 

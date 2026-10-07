@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 BACKTEST_ESTIMATES_LABEL = "backtesting estimates only"
 NON_AUTH_ASSERTION = (
@@ -88,6 +89,12 @@ class ValidationReport:
     no_future_shift_detected: bool
     bar_count: int
     issues: list[str] = field(default_factory=list)
+    # SAFE-05：因果核验的实际强度，只陈述事实。"not_run"＝调用方没经过引擎的校验入口；
+    # "index_only"＝只做了索引/时间戳检查（预计算信号文件、直接传入的 Series）；
+    # "prefix_differential"＝信号来自 checked_signals()，前缀截断差分在 causal_points 个 bar 上通过。
+    causal_check: str = "not_run"
+    causal_points: int = 0
+    causal_context: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_valid(self) -> bool:

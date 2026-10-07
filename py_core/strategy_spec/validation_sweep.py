@@ -48,6 +48,7 @@ from py_core.backtests.vectorized_engine import (
     resolve_annualization_factor,
 )
 from py_core.manual_ohlcv import NormalizedOhlcvRecord
+from py_core.strategies.base import checked_signals
 from py_core.strategies.spec_strategy import SpecStrategy
 from py_core.strategy_spec.schema import StrategySpecDoc, ValidationRecord
 from py_core.validation.deflated_sharpe import compute_deflated_sharpe_ratio
@@ -180,7 +181,7 @@ def run_validation_sweep(
     best_index: int | None = None
     best_score = -math.inf
     for i, variant in enumerate(variants):
-        signal = SpecStrategy(parsed_spec=variant).generate_signals(df)
+        signal, _ = checked_signals(SpecStrategy(parsed_spec=variant), df)
         result = _run_vectorized_backtest_on_df(config, df, signal, annualization_factor=annualization_factor)
         score = selection_metric(result.metrics)
         if best_index is None or score > best_score:
