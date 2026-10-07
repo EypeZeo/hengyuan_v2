@@ -13,7 +13,21 @@ import pytest
 
 from hy_recorder import maint
 from hy_recorder.cli import build_parser
-from hy_recorder.maint import CRIT, GB, INFO, MB, OK, WARN, MaintConfig, Thresholds, evaluate, overall
+from hy_recorder.hostprobe import INTEREST
+from hy_recorder.maint import (
+    CRIT,
+    EVENT_FINDINGS,
+    GB,
+    INFO,
+    MB,
+    OK,
+    ROUTINE_EVENTS,
+    WARN,
+    MaintConfig,
+    Thresholds,
+    evaluate,
+    overall,
+)
 
 NOW = datetime(2026, 10, 3, 22, 0, tzinfo=UTC)
 NOW_US = int(NOW.timestamp() * 1e6)
@@ -136,6 +150,20 @@ def test_a_healthy_run_has_no_findings(tmp_path):
         ({"probe": with_probe(ledger={"events_24h": {"RATE_LIMIT": 1}})}, [(WARN, "RATE_LIMIT")]),
         ({"probe": with_probe(ledger={"events_24h": {"TASK_CRASH": 1}})}, [(WARN, "TASK_CRASH")]),
         ({"probe": with_probe(ledger={"events_24h": {"OVERRUN": 5}})}, [(WARN, "OVERRUN")]),
+        ({"probe": with_probe(ledger={"events_24h": {"STREAM_STALL": 4}})}, [(WARN, "STREAM_STALL")]),
+        ({"probe": with_probe(ledger={"events_24h": {"WS_CONNECT_FAIL": 1}})}, [(WARN, "WS_CONNECT_FAIL")]),
+        ({"probe": with_probe(ledger={"events_24h": {"GAP_DETECTED": 1}})}, [(WARN, "GAP_DETECTED")]),
+        (
+            {"probe": with_probe(ledger={"events_24h": {"SUBSCRIBED_NO_DATA": 1}})},
+            [(WARN, "SUBSCRIBED_NO_DATA")],
+        ),
+        ({"probe": with_probe(ledger={"events_24h": {"BAD_FRAME": 3}})}, [(WARN, "BAD_FRAME")]),
+        ({"probe": with_probe(ledger={"events_24h": {"LOOP_LAG": 2}})}, [(WARN, "LOOP_LAG")]),
+        ({"probe": with_probe(ledger={"events_24h": {"REST_FROZEN": 1}})}, [(WARN, "REST_FROZEN")]),
+        (
+            {"probe": with_probe(ledger={"events_24h": {"RETENTION_STEPDOWN": 1}})},
+            [(WARN, "RETENTION_STEPDOWN")],
+        ),
         (
             {"probe": with_probe(ledger={"reconnect_gaps": [_gap("rotation", 5.3), _gap("rotation", 0.4)]})},
             [(WARN, "ROTATION_HOLE")],
@@ -183,6 +211,30 @@ def test_short_rotation_holes_and_slow_unplanned_reconnects_are_not_a_rotation_f
     # a stall or a depth gap reconnects on its own schedule: only planned rotations are held to the 2 s line
     unplanned = with_probe(ledger={"reconnect_gaps": [_gap("stall", 12.0), _gap("gap", 40.0)]})
     assert ev(tmp_path, probe=unplanned) == []
+
+
+def test_every_event_kind_the_probe_counts_is_either_judged_or_declared_routine():
+    judged = {kind for kind, _level, _why in EVENT_FINDINGS}
+    assert len(judged) == len(EVENT_FINDINGS), "a kind is listed twice"
+    assert not judged & ROUTINE_EVENTS, "a kind cannot be both judged and routine"
+    assert judged | ROUTINE_EVENTS == set(INTEREST), (
+        "hostprobe.INTEREST and maint.EVENT_FINDINGS/ROUTINE_EVENTS drifted apart: "
+        "unjudged %s, judged but never counted %s"
+        % (sorted(set(INTEREST) - judged - ROUTINE_EVENTS), sorted((judged | ROUTINE_EVENTS) - set(INTEREST)))
+    )
+
+
+def test_the_stall_of_every_connection_on_2026_10_05_would_have_been_reported(tmp_path):
+    # the real 24 h counts of that day: four connections stalled together and could not reconnect for ~30 s
+    counts = {"STREAM_STALL": 4, "WS_CONNECT_FAIL": 4, "WS_CLOSE": 8, "WS_OPEN": 8, "PRUNED_ACKED": 48}
+    findings = ev(tmp_path, probe=with_probe(ledger={"events_24h": counts}))
+    assert codes(findings) == [(WARN, "STREAM_STALL"), (WARN, "WS_CONNECT_FAIL")]
+    assert overall(findings) == WARN
+
+
+def test_the_routine_heartbeat_of_a_healthy_recorder_is_not_a_finding(tmp_path):
+    routine = {"WS_OPEN": 4, "WS_CLOSE": 4, "PRUNED_ACKED": 184, "PROC_START": 1, "PROC_STOP": 1}
+    assert ev(tmp_path, probe=with_probe(ledger={"events_24h": routine})) == []
 
 
 def test_the_report_shows_how_long_the_rotations_of_the_running_recorder_took(tmp_path):
