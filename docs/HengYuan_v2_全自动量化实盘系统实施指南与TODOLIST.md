@@ -388,7 +388,7 @@ CI Native Sanitizers 的触发策略是**有意**的：其文件头注释明确�
 | 底座 | 现状 | 关键限制 |
 | :--- | :--- | :--- |
 | 签名只读客户端 | `binance_private_rest.hpp` 实现并单测了 `/time`、`/account`、`/exchangeInfo` 等签名请求 | 仅单一 HMAC-SHA256 后端；端点白名单策略未接线；账户解析丢弃账户 UID，致操作员确认门无法装配 |
-| 真实下单客户端 | 同一文件的 `submit_order()` 已实现真实 `POST /api/v3/order`，并具备本地 TLS 夹具单测 | **全仓没有任何可运行进程调用它**：会调用 `SubmitPort` 的 harness 均注入模拟实现；`live_submit_real_credentials_demo`（Owner 自备的 testnet `.env`，仅 testnet）装配真实的复合 `SubmitPort` 并接上真实 `QueryPort` 的对账循环，但从不调用 `SubmitPort::call()`；适配器已实现但未被驱动 |
+| 真实下单客户端 | 同一文件的 `submit_order()` 已实现真实 `POST /api/v3/order`，并具备本地 TLS 夹具单测 | **全仓没有任何可运行进程调用它**：会调用 `SubmitPort` 的 harness 均注入模拟实现；`live_submit_real_credentials_demo` 与 `live_submit_preflight_harness`（Owner 自备的 testnet `.env`，仅 testnet）都装配真实的复合 `SubmitPort`，前者另接真实 `QueryPort` 的对账循环，但两者都从不调用它（后者把 `ctx.submit_port` 始终留在模拟实现上）；适配器已实现但未被驱动 |
 | 限流预算 | 现货限流预算具备 80/10/10 三分账与三维（权重、原始请求数、订单数）× 三通道共 9 桶结构 | 已接线的是编排层的 POST 门与客户端查询订单门（仅当注入限流器时）；账户查询、交易所信息、时钟同步与 listenKey 三方法**完全未归账**；且**没有任何 `native/src/` 进程为客户端注入限流器**，故该套限流在测试之外是惰性的；交易所用量响应头未用于校正 |
 | 对账查询与未知隔离 | `order_tracker.hpp:poll_once` 对未知状态订单按 200 ms 起、倍率 4、上限 5000 ms 的无抖动退避定向查询；满足 R-10 判据（实发查询未决不少于 5 次且自首次进入未知起不少于 5000 ms，或不少于 15 s）即转入 `OrderState::EscalatedToOperator` 并永久占用在途槽位；存活订单按 2000 ms 定频轮询且不升级 | 查询返回“订单不存在”（`-2013`）与传输失败、字段校验不符仍同归不可判定；本地限流早退等未发出的查询已以 `QueryOutcome::NotSent` 区分且不计次；升级事件尚未持久化（SAFE-03）；资金预留概念不存在 |
 | 用户数据流 | WS 会话、重连状态机、持仓真值折入与 listenKey 主动续期调度器均已合入 | 依赖的 REST listenKey 端点已于 2026-02-20 07:00 UTC 在现货下线（`5.7` 的 P-07），树内路径对现货生产环境不可用；解析仅覆盖执行报告、账户余额变动与 listenKey 过期三类事件，执行报告未解析佣金 `n`、佣金资产 `N` 与成交标识 `t` |
@@ -915,7 +915,7 @@ graph TD
 - [ ] **任务 REM-0.9 仓库文档漂移校准、忽略规则与台账维护** `[TODO: P2]`
   - **已由既有 PR 完成、本节不再列为待办的部分**：架构文档已不再声称“未实现认证 REST”，现表述为“真实客户端已实现但未接线”，该表述准确。
   - **仍然有效、需校准的具体位置**：
-    - 工程规则文件中的边界章节：仍写着“提交端口是模拟接缝、尚无认证 REST 客户端、从未有真实凭据用于本代码”，该描述已被真实客户端、真实 POST 与冷启动演示三项推翻；应改为“真实客户端已实现且单测通过，但没有任何可运行进程把它接上并运行”。**2026-10-07 复核**：这句替换文本本身也不准确——`native/src/live_submit_real_credentials_demo.cpp` 会用 Owner 自备的 testnet `.env` 装配真实的复合 `SubmitPort`（从不调用）并接上真实 `QueryPort` 的对账循环；`NATIVE_ARCHITECTURE.md` 的“每个可运行 harness 里 `SubmitPort`/`QueryPort` 仍是 mock”同样有此偏差。边界声明的措辞待 Owner 确认后统一改写（`CLAUDE.md` 与 `NATIVE_ARCHITECTURE.md` 一并）。
+    - 工程规则文件中的边界章节：仍写着“提交端口是模拟接缝、尚无认证 REST 客户端、从未有真实凭据用于本代码”，该描述已被真实客户端、真实 POST 与冷启动演示三项推翻；应改为“真实客户端已实现且单测通过，但没有任何可运行进程把它接上并运行”。**2026-10-07 复核**：这句替换文本本身也不准确——`native/src/live_submit_real_credentials_demo.cpp` 与 `live_submit_preflight_harness.cpp` 会用 Owner 自备的 testnet `.env` 装配真实的复合 `SubmitPort`（都从不调用，后者把 `ctx.submit_port` 始终留在模拟实现上），前者还接上真实 `QueryPort` 的对账循环；`NATIVE_ARCHITECTURE.md` 的“每个可运行 harness 里 `SubmitPort`/`QueryPort` 仍是 mock”同样有此偏差。边界声明的措辞待 Owner 确认后统一改写（`CLAUDE.md` 与 `NATIVE_ARCHITECTURE.md` 一并）。
     - 签名器头文件的注释：写着“仿真基础设施、未就绪、无网络调用、无真实订单”，但该文件的 HMAC 输出已实际进入真实签名请求的查询串，注释口径应更正。**已完成（PR #133）**。
     - 风控门头文件第四行关于 128 位整型的描述：与同文件后文“可移植的溢出安全校验（不使用 128 位整型）”自相矛盾，且该类型在 MSVC 上不可用。**已完成（PR #133）**。
     - 规格校验 workflow 的模型计数注释：实际有 **9 个**模型运行步骤，而注释仍写 7 个；**另有 1 个模型文件未纳入 CI，实际模型文件总数为 10**。**已完成（PR #133）**：注释改为 9 个模型运行步骤；第 10 个模型文件 `RoundEFDesignReceiptVerified.tla` 是研究分叉（其头注释写明放置位置在设计冻结前有意不定），有意不纳入 CI。
