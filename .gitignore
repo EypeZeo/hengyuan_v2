@@ -14,6 +14,14 @@ native/build-msvc/
 .env
 .env.*
 !.env.example
+# Key material by name. The test-only certificates and keys under native/tests/fixtures are tracked on purpose
+# (no production or demo code references them); anything else with these names must never be committed.
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+secrets.*
+!native/tests/fixtures/*.pem
 
 # IDE
 .vscode/
