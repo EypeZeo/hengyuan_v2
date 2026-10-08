@@ -99,7 +99,7 @@ def test_unit_sandbox_and_state_directory(unit):
 def test_example_config_loads_and_derives_the_expected_connections():
     cfg = load_config(DEPLOY / "recorder.toml")
     assert str(cfg.root).replace("\\", "/") == "/var/lib/hy-recorder"
-    assert cfg.symbols == ("BTCUSDT",) and len(cfg.connections) == 4
+    assert cfg.symbols == ("BTCUSDT", "ETHUSDT") and len(cfg.connections) == 6
     assert cfg.retain_hours == 48 and cfg.disk_warn_gb == 5 and cfg.disk_floor_gb == 2
 
 
