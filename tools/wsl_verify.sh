@@ -115,6 +115,9 @@ run_address() {
 
 run_thread() {
     echo "=== thread: mirrors ci-native-sanitizers.yml tsan-concurrency job ==="
+    # A target labelled `concurrency` that is not in the --target list below is never built, so
+    # `ctest -L concurrency` never runs it. Fail fast, before a TSan build, if the lists drifted.
+    python3 ../tools/concurrency_targets_check.py
     cmake -B build-linux-tsan \
         -DCMAKE_CXX_COMPILER=g++-14 \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -124,11 +127,13 @@ run_thread() {
         "${EXTRA_CMAKE_ARGS[@]}"
     cmake --build build-linux-tsan -j"${BUILD_JOBS}" --target \
         test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
-        test_snapshot_refresh_gate test_public_feed_supervisor_concurrency test_single_flight_fetch_gate \
-        test_kline_feed_driver test_depth_feed_driver tsan_control_relaxed_ring \
-        tsan_control_export_worker_dual_consumer \
+        test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
+        test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
+        test_user_data_ws_concurrency test_symbol_registry_concurrency \
         compaction_lease_holder test_compaction_lease test_compaction_intent_store \
-        test_migrated_v2_started_publisher
+        test_seal_journal_store_lease test_intent_phase_advancer \
+        test_migrated_v2_started_publisher \
+        tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
     echo "--- concurrency tests (must pass) ---"
     (
