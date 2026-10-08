@@ -75,7 +75,28 @@ KIND_NA: dict[str, frozenset[str]] = {
 # not block its gate; REMEDIATING and PARTIAL do.
 GATE_RESULT = {"CLOSED": "CLEARED", "DEFERRED": "DEFERRED", "REMEDIATING": "BLOCKED", "PARTIAL": "BLOCKED"}
 
-TOKEN_KINDS = ("code", "open", "absent", "test", "doc", "bp", "frozen", "ignored", "pr", "run", "fi", "log")
+# Fault-injection cases (blueprint volume 7). A case passes its gate only as IMPLEMENTED with result PASS
+# and a real successful CI run behind it; NOT_TESTABLE_YET and PARTIAL are the blueprint's own words.
+FI_STATUSES = ("NOT_TESTABLE_YET", "PARTIAL", "IMPLEMENTED")
+FI_RESULTS = ("NOT_RUN", "PASS", "FAIL")
+FI_TAGS = ("PRE_D3", "PRE_OWNER_LIVE", "CANARY")
+FI_SECTIONS = {"7.2": "PRE_D3", "7.3": "PRE_OWNER_LIVE", "7.4": "CANARY"}
+
+TOKEN_KINDS = (
+    "code",
+    "open",
+    "absent",
+    "nofile",
+    "test",
+    "doc",
+    "bp",
+    "frozen",
+    "ignored",
+    "pr",
+    "run",
+    "fi",
+    "log",
+)
 # `countN:path#needle` declares that needle occurs exactly N times in the file.
 _KINDS_ALT = "|".join(TOKEN_KINDS)
 TOKEN_RE = re.compile(
@@ -230,7 +251,7 @@ def _parse_block(block: list[str], first_line: int) -> Item:
         if key in ("open", "refs"):
             tokens.extend(parse_tokens(value))
     item_id = (fields.get("id") or [""])[0]
-    if not re.fullmatch(r"(P\d-\d{3}|SUPP-\d{3})", item_id):
+    if not re.fullmatch(r"(P\d-\d{3}|SUPP-\d{3}|FI-\d{3})", item_id):
         raise LedgerFormatError(f"line {first_line}: bad or missing id {item_id!r}")
     return Item(item_id, first_line, fields, segments, tokens)
 
@@ -249,12 +270,24 @@ def _parse_segment(value: str, line: int) -> Segment:
 # --------------------------------------------------------------------------------------
 # blueprint model
 # --------------------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class FiRow:
+    tag: str  # PRE_D3 / PRE_OWNER_LIVE / CANARY, from the section the row sits in
+    level: str
+    status: str
+    baseline: str
+
+
 @dataclasses.dataclass
 class Blueprint:
     text: str
     audit_status: dict[str, str]  # P*-nnn and SUPP-nnn -> status word
     bkl: dict[str, tuple[str, str]]  # BKL-nnn -> (source id, status)
-    fi_status: dict[str, str]  # FI-nnn -> implementation status
+    fi_rows: dict[str, FiRow]  # FI-nnn -> its row in volume 7
+
+    @property
+    def fi_status(self) -> dict[str, str]:
+        return {k: v.status for k, v in self.fi_rows.items()}
 
 
 def find_blueprint() -> Path:
@@ -275,9 +308,20 @@ def parse_blueprint(text: str) -> Blueprint:
     bkl: dict[str, tuple[str, str]] = {}
     for m in re.finditer(r"^\|\s*\*\*(BKL-\d{3})\*\*\s*\|\s*(P\d-\d{3})\s*\|\s*([A-Z]+)\s*\|", text, re.M):
         bkl[m.group(1)] = (m.group(2), m.group(3))
-    fi: dict[str, str] = {}
-    for m in re.finditer(r"^\|\s*\*\*(FI-\d{3})\*\*\s*\|[^|]*\|[^|]*\|[^|]*\|\s*([A-Z_]+)\s*\|", text, re.M):
-        fi[m.group(1)] = m.group(2)
+    fi: dict[str, FiRow] = {}
+    tag = ""
+    for line in text.split("\n"):
+        head = re.match(r"^###\s+(7\.[234])\s", line)
+        if head:
+            tag = FI_SECTIONS[head.group(1)]
+            continue
+        m = re.match(r"^\|\s*\*\*(FI-\d{3})\*\*\s*\|", line)
+        if not m:
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        # cells: '', id, scope, stage, level, status, scenario, invariant, artifact, baseline, ''
+        if len(cells) >= 11 and tag:
+            fi[m.group(1)] = FiRow(tag, cells[4], cells[5], cells[9].strip("`* "))
     return Blueprint(text, audit, bkl, fi)
 
 
@@ -480,6 +524,17 @@ def check_path_token(tok: Token, item: str, files: Files, report: Report) -> Non
         if files.text(tok.path) is None:
             report.add(Finding("E-FILE", item, f"log artifact {tok.path} does not exist"))
         return
+    if tok.kind == "nofile":
+        hits = files.glob(tok.path)
+        if hits:
+            report.add(
+                Finding(
+                    "E-NOFILE-HIT",
+                    item,
+                    f"{tok.path} matches {hits[:3]} -- the ledger says no such file exists",
+                )
+            )
+        return
     if tok.kind == "absent":
         paths = (
             files.glob(tok.path)
@@ -529,6 +584,9 @@ def check_path_token(tok: Token, item: str, files: Files, report: Report) -> Non
 
 
 def check_item(item: Item, bp: Blueprint, files: Files, report: Report, *, strict_fault: bool) -> None:
+    if item.id.startswith("FI-"):
+        check_fi_item(item, bp, files, report)
+        return
     iid = item.id
     status, kind = item.status, item.kind
     for key in ("title", "severity", "kind", "status", "gate", "gate_result", "legacy"):
@@ -637,6 +695,8 @@ def check_item(item: Item, bp: Blueprint, files: Files, report: Report, *, stric
                     report.add(Finding("E-TASK", iid, f"task {ref} does not appear in the blueprint"))
     if status == "DEFERRED" and not item.one("trigger"):
         report.add(Finding("E-BKL", iid, "DEFERRED item states no unfreeze trigger"))
+    if status == "DEFERRED" and not item.fields.get("bkl"):
+        report.add(Finding("E-BKL", iid, "DEFERRED item names no BKL row"))
 
     # blueprint agreement
     if bp.audit_status.get(iid) != status:
@@ -658,6 +718,71 @@ def check_item(item: Item, bp: Blueprint, files: Files, report: Report, *, stric
                         Finding("E-BKL", iid, f"{ref} is {src[1]} in the blueprint, ledger says {status}")
                     )
 
+    check_item_tokens(item, bp, files, report)
+
+
+def check_fi_item(item: Item, bp: Blueprint, files: Files, report: Report) -> None:
+    """A fault-injection case: status equals the blueprint row; a 'not yet' claim must be falsifiable."""
+    iid = item.id
+    for key in ("title", "gate_tag", "level", "status", "result", "gate_result", "baseline"):
+        if not item.one(key):
+            report.add(Finding("E-FORMAT", iid, f"missing field {key}"))
+    status, result, tag = item.status, item.one("result"), item.one("gate_tag")
+    if status not in FI_STATUSES or result not in FI_RESULTS or tag not in FI_TAGS:
+        report.add(Finding("E-FORMAT", iid, f"bad status {status!r}, result {result!r} or gate_tag {tag!r}"))
+        return
+    tokens = item.all_tokens
+    passes = status == "IMPLEMENTED" and result == "PASS" and any(t.kind == "run" for t in tokens)
+    want = "PASS" if passes else "BLOCKED"
+    if item.one("gate_result") != want:
+        report.add(
+            Finding("E-GATE", iid, f"gate_result {item.one('gate_result')!r}, the rules give {want!r}")
+        )
+    if result == "PASS" and status != "IMPLEMENTED":
+        report.add(Finding("E-STATUS", iid, "a PASS result needs status IMPLEMENTED"))
+    not_yet = [t for t in item.tokens if t.kind in ("open", "absent", "nofile") or t.kind.startswith("count")]
+    if status == "IMPLEMENTED":
+        if any(t.kind == "open" for t in tokens):
+            report.add(Finding("E-STATUS", iid, "IMPLEMENTED case still carries an open: token"))
+    elif not not_yet:
+        report.add(
+            Finding("E-STATUS", iid, f"{status} needs at least one open:/absent:/nofile:/countN: token")
+        )
+    if status == "PARTIAL" and not any(t.kind in ("test", "code", "doc", "bp", "pr", "fi") for t in tokens):
+        report.add(Finding("E-STATUS", iid, "PARTIAL needs at least one reference to what already exists"))
+    row = bp.fi_rows.get(iid)
+    if row is None:
+        report.add(Finding("E-BP-STATUS", iid, "the blueprint has no such row in 7.2 to 7.4"))
+    else:
+        if row.status != status:
+            report.add(Finding("E-BP-STATUS", iid, f"blueprint says {row.status!r}, ledger says {status!r}"))
+        if row.tag != tag:
+            report.add(Finding("E-FI-TAG", iid, f"blueprint section is {row.tag}, ledger says {tag}"))
+        if row.level != item.one("level"):
+            report.add(
+                Finding("E-FI-LEVEL", iid, f"blueprint level {row.level!r}, ledger {item.one('level')!r}")
+            )
+        if row.baseline != item.one("baseline"):
+            report.add(
+                Finding(
+                    "E-FI-BASELINE",
+                    iid,
+                    f"blueprint baseline {row.baseline!r}, ledger {item.one('baseline')!r}",
+                )
+            )
+    base = item.one("baseline")
+    if base != "Pending":
+        if not git_ok("cat-file", "-e", f"{base}^{{commit}}"):
+            report.skip("fi-baseline (commit not in this clone)")
+        elif not git_ok("merge-base", "--is-ancestor", base, "HEAD"):
+            report.add(Finding("E-PR-HISTORY", iid, f"baseline {base} is not an ancestor of HEAD"))
+    check_item_tokens(item, bp, files, report)
+
+
+def check_item_tokens(item: Item, bp: Blueprint, files: Files, report: Report) -> None:
+    """Legacy-id check and the offline part of every reference an item carries."""
+    iid = item.id
+    tokens = item.all_tokens
     frozen = files.text(str(FROZEN_PATH.relative_to(REPO_ROOT)).replace("\\", "/")) or ""
     for legacy in item.fields.get("legacy", []):
         for ref in legacy.split():
@@ -730,12 +855,22 @@ def check_coverage(items: list[Item], bp: Blueprint, report: Report) -> None:
     ids = [i.id for i in items]
     if len(ids) != len(set(ids)):
         report.add(Finding("E-COVERAGE", "-", "duplicate ledger ids"))
+    audit_ids = [i for i in ids if not i.startswith("FI-")]
+    fi_ids = [i for i in ids if i.startswith("FI-")]
     for audit_id in bp.audit_status:
-        if audit_id not in ids:
+        if audit_id not in audit_ids:
             report.add(Finding("E-COVERAGE", audit_id, "blueprint lists it, the ledger has no block for it"))
-    for i in ids:
+    for i in audit_ids:
         if i not in bp.audit_status:
             report.add(Finding("E-COVERAGE", i, "ledger block without a row in the blueprint's 4.2/4.3"))
+    for fid in bp.fi_rows:
+        if fid not in fi_ids:
+            report.add(
+                Finding("E-COVERAGE", fid, "blueprint lists it in 7.2 to 7.4, the ledger has no block for it")
+            )
+    for fid in fi_ids:
+        if fid not in bp.fi_rows:
+            report.add(Finding("E-COVERAGE", fid, "ledger block without a row in the blueprint's 7.2 to 7.4"))
     claimed = [r for it in items for b in it.fields.get("bkl", []) for r in b.split()]
     for bkl in bp.bkl:
         if claimed.count(bkl) != 1:
@@ -751,7 +886,9 @@ def check_coverage(items: list[Item], bp: Blueprint, report: Report) -> None:
 # --------------------------------------------------------------------------------------
 # overview (generated, then compared with the document)
 # --------------------------------------------------------------------------------------
-def render_overview(items: list[Item]) -> str:
+def render_overview(all_items: list[Item]) -> str:
+    items = [i for i in all_items if not i.id.startswith("FI-")]
+    fis = [i for i in all_items if i.id.startswith("FI-")]
     out = [
         "| 审计 ID | 等级 | 类别 | 状态 | 阻塞门禁 | 门禁结果 | 缺失段 |",
         "| :---: | :---: | :---: | :---: | :--- | :---: | :--- |",
@@ -782,6 +919,37 @@ def render_overview(items: list[Item]) -> str:
         "",
         "状态计数：" + "，".join(f"{s} {counts.get(s, 0)}" for s in STATUSES) + f"，合计 {len(items)}。",
     ]
+    if fis:
+        out += [
+            "",
+            "| 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |",
+            "| :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+        for it in fis:
+            cells = [it.one(k) for k in ("gate_tag", "level")] + [it.status]
+            cells += [it.one(k) for k in ("result", "gate_result", "baseline")]
+            out.append(f"| **{it.id}** | " + " | ".join(cells) + " |")
+        out += [
+            "",
+            "| 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: |",
+        ]
+        for tag in FI_TAGS:
+            group = [i for i in fis if i.one("gate_tag") == tag]
+            if not group:
+                continue
+            n = {s: sum(1 for i in group if i.status == s) for s in FI_STATUSES}
+            result = "PASS" if all(i.one("gate_result") == "PASS" for i in group) else "BLOCKED"
+            counts = " | ".join(str(n[s]) for s in FI_STATUSES[::-1])
+            out.append(f"| {tag} | {len(group)} | {counts} | {result} |")
+        total = {s: sum(1 for i in fis if i.status == s) for s in FI_STATUSES}
+        passing = sum(1 for i in fis if i.one("gate_result") == "PASS")
+        out += [
+            "",
+            "故障用例计数："
+            + "，".join(f"{s} {total[s]}" for s in FI_STATUSES)
+            + f"，合计 {len(fis)}，其中门禁 PASS {passing} 条。",
+        ]
     return "\n".join(out)
 
 
@@ -826,6 +994,14 @@ def run_checks(
         "merge-base", "--is-ancestor", baseline, "HEAD"
     ):
         report.add(Finding("E-PR-HISTORY", "-", f"baseline {baseline} is not an ancestor of HEAD"))
+    if any(i.id.startswith("FI-") for i in items):
+        fi_base = front.get("fi_baseline", "")
+        if not fi_base:
+            report.add(Finding("E-FORMAT", "-", "ledger-meta fi_baseline is missing"))
+        elif git_ok("cat-file", "-e", f"{fi_base}^{{commit}}") and not git_ok(
+            "merge-base", "--is-ancestor", fi_base, "HEAD"
+        ):
+            report.add(Finding("E-PR-HISTORY", "-", f"fi_baseline {fi_base} is not an ancestor of HEAD"))
     check_history(items, report)
     if online:
         check_online(items, backend, report)
@@ -891,7 +1067,11 @@ def self_test(ledger_path: Path) -> int:
 
     def control(name, mutate, expect, *, bp_mutate=None, backend_mutate=None, strict=False) -> None:
         its = copy.deepcopy(items)
-        mutate(its)
+        try:
+            mutate(its)
+        except LookupError as exc:
+            verdict(name, False, f"账本里没有适用于该对照的项：{exc}")
+            return
         blueprint = bp
         if bp_mutate:
             blueprint = copy.deepcopy(bp)
@@ -1135,7 +1315,7 @@ def self_test(ledger_path: Path) -> int:
     control("BKL 台账状态与来源项不一致", lambda its: None, "E-BKL", bp_mutate=bp_bkl)
 
     def bp_fi(b):
-        b.fi_status["FI-001"] = "CHANGED_BY_CONTROL"
+        b.fi_rows["FI-001"] = dataclasses.replace(b.fi_rows["FI-001"], status="CHANGED_BY_CONTROL")
 
     control("FI 状态与蓝图注册表不一致", lambda its: None, "E-FI-STATUS", bp_mutate=bp_fi)
 
@@ -1235,6 +1415,94 @@ def self_test(ledger_path: Path) -> int:
         ),
     )
 
+    print("-- 故障用例（第 7 卷） --")
+
+    def fi_of(its, **want) -> Item:
+        for it in its:
+            if it.id.startswith("FI-") and all(it.one(k) == v for k, v in want.items()):
+                return it
+        raise LookupError(want)
+
+    def not_yet(tok: Token) -> bool:
+        return tok.kind in ("open", "absent", "nofile") or tok.kind.startswith("count")
+
+    def bp_fi_status(b):
+        b.fi_rows["FI-001"] = dataclasses.replace(b.fi_rows["FI-001"], status="NOT_TESTABLE_YET")
+
+    control("FI: 蓝图状态与账本不一致", lambda its: None, "E-BP-STATUS", bp_mutate=bp_fi_status)
+
+    def m_fi_tag(its):
+        fi_of(its, status="PARTIAL").fields["gate_tag"] = ["CANARY"]
+
+    control("FI: 门禁标签与蓝图所在节不一致", m_fi_tag, "E-FI-TAG")
+
+    def m_fi_level(its):
+        fi_of(its, status="PARTIAL").fields["level"] = ["L9"]
+
+    control("FI: 验证级别与蓝图不一致", m_fi_level, "E-FI-LEVEL")
+
+    def m_fi_base(its):
+        fi_of(its, status="PARTIAL").fields["baseline"] = ["deadbee"]
+
+    control("FI: 基线与蓝图不一致", m_fi_base, "E-FI-BASELINE")
+
+    def m_fi_no_open(its):
+        it = fi_of(its, status="PARTIAL")
+        it.tokens = [tok for tok in it.tokens if not not_yet(tok)]
+
+    control("FI: 未实装却没有任何“尚未”断言", m_fi_no_open, "E-STATUS")
+
+    def m_fi_no_refs(its):
+        it = fi_of(its, status="PARTIAL")
+        it.tokens = [tok for tok in it.tokens if not_yet(tok)]
+
+    control("FI: PARTIAL 不引用任何已经存在的东西", m_fi_no_refs, "E-STATUS")
+
+    def m_fi_pass(its):
+        fi_of(its, status="PARTIAL").fields["result"] = ["PASS"]
+
+    control("FI: 结果 PASS 却不是 IMPLEMENTED", m_fi_pass, "E-STATUS")
+
+    def m_fi_gate(its):
+        fi_of(its, status="PARTIAL").fields["gate_result"] = ["PASS"]
+
+    control("FI: 不具备条件却记门禁 PASS", m_fi_gate, "E-GATE")
+
+    def m_fi_no_run(its):
+        it = fi_of(its, status="PARTIAL")
+        it.fields["status"], it.fields["result"], it.fields["gate_result"] = (
+            ["IMPLEMENTED"],
+            ["PASS"],
+            ["PASS"],
+        )
+        it.tokens = [tok for tok in it.tokens if tok.kind != "open"]
+
+    control("FI: IMPLEMENTED 与 PASS 没有成功 run 就记门禁 PASS", m_fi_no_run, "E-GATE")
+
+    def m_fi_dropped(its):
+        its.remove(fi_of(its, status="NOT_TESTABLE_YET"))
+
+    control("FI: 账本漏掉一条故障用例", m_fi_dropped, "E-COVERAGE")
+
+    def m_fi_extra(its):
+        extra = copy.deepcopy(fi_of(its, status="PARTIAL"))
+        extra.fields["id"] = ["FI-999"]
+        extra.id = "FI-999"
+        its.append(extra)
+
+    control("FI: 账本多出蓝图没有的故障用例", m_fi_extra, "E-COVERAGE")
+
+    def m_nofile(its):
+        it, tok = token_of(its, "nofile")
+        swap(it, tok, dataclasses.replace(tok, path="README.md"))
+
+    control("nofile: 声称不存在的文件其实存在", m_nofile, "E-NOFILE-HIT")
+
+    def m_deferred_bkl(its):
+        item_of(its, status="DEFERRED").fields["bkl"] = []
+
+    control("DEFERRED 项没有 bkl:", m_deferred_bkl, "E-BKL")
+
     print("-- 账本语法 --")
     for name, mutate, fragment in (
         ("语法: 未知的判定词", lambda s: s.replace("seg.code: PRESENT", "seg.code: MAYBE", 1), "bad verdict"),
@@ -1325,8 +1593,18 @@ def main(argv: list[str] | None = None) -> int:
     for finding in report.findings:
         print(finding.render())
     if not args.quiet or report.findings:
-        counts = {s: sum(1 for i in items if i.status == s) for s in STATUSES}
-        print(f"items: {len(items)}  " + "  ".join(f"{s}={n}" for s, n in counts.items()))
+        audit = [i for i in items if not i.id.startswith("FI-")]
+        fis = [i for i in items if i.id.startswith("FI-")]
+        counts = {s: sum(1 for i in audit if i.status == s) for s in STATUSES}
+        print(f"audit items: {len(audit)}  " + "  ".join(f"{s}={n}" for s, n in counts.items()))
+        if fis:
+            fc = {s: sum(1 for i in fis if i.status == s) for s in FI_STATUSES}
+            gate_pass = sum(1 for i in fis if i.one("gate_result") == "PASS")
+            print(
+                f"fault cases: {len(fis)}  "
+                + "  ".join(f"{s}={n}" for s, n in fc.items())
+                + f"  gate PASS={gate_pass}"
+            )
         print("checked: " + ", ".join(f"{k}={v}" for k, v in sorted(report.checked.items())))
         if report.skipped:
             print("skipped: " + ", ".join(f"{k}={v}" for k, v in sorted(report.skipped.items())))
