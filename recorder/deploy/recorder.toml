@@ -4,7 +4,7 @@
 # hy_recorder config-check --config <this file>`), so this file cannot point the recorder at another host.
 [recorder]
 root = "/var/lib/hy-recorder"
-symbols = ["BTCUSDT"]
+symbols = ["BTCUSDT", "ETHUSDT"]
 
 # Rolling retention: segments already acknowledged by `hy_recorder pull` are reclaimed after this many
 # hours; when free space still falls below disk_warn_gb, unacknowledged segments are evicted oldest
