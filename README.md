@@ -15,28 +15,52 @@ without v1's task-packet/ADR process. See `CLAUDE.md` for why and for the engine
 - `py_core/` — Python research/backtest utilities: vectorized backtest engine, risk-sizing
   simulator, a pluggable strategy framework (`py_core/strategies/`), and a read-only public-REST
   historical OHLCV fetcher (`py_core/market_data/`, Binance only). See `py_core/README.md`.
+- `recorder/` — the D0 market-data recorder: public Binance streams only (depth, trades, mark price,
+  liquidations) recorded to sealed, hashed segments on a dedicated host, plus an offline verifier,
+  maintenance tooling and its own CI. It is a data-asset line that runs in parallel to the execution
+  work and never trades. See `recorder/README.md`, `recorder/MAINTENANCE.md` and
+  `recorder/DATA_DICTIONARY.md`.
 - `formal/` — TLA+ specification models verifying crash-recovery invariants for the durable
   control plane. See `formal/README.md` and `docs/SPEC_INVARIANTS.md`.
+- `tools/` — spec cross-reference and enum-diff checks (run by CI), the WSL2 validation scripts
+  (`wsl_sync.sh`, `wsl_verify.sh`), the blueprint site builder and its verifiers
+  (`tools/doc_site/`), and `closure_ledger_check.py`, which checks the audit closure ledger.
 - `docs/adr/` — architecture decision records, carried over as engineering reference.
 - `docs/NATIVE_ARCHITECTURE.md`, `docs/NATIVE_EXIT_SAFETY_RUNBOOK.md` — consolidated native
   reference and the operator manual-takeover runbook.
+- `docs/HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md` (and its generated `.html` view) — the
+  controlled implementation blueprint: stations, tasks and their order, the defect matrix, the
+  fault-injection registry and the evidence rules. `docs/AUDIT_CLOSURE_LEDGER.md` is its per-defect
+  closure record, checked mechanically by `tools/closure_ledger_check.py`.
+- `docs/REQUIRED_CHECKS_RUNBOOK.md` — how the ruleset that protects `master` is set up, verified and
+  rolled back. `docs/STRATEGY_SPEC.md` — the strategy TOML format and the research causal gate.
 - `docs/BINANCE_PRIVATE_REST_L4_SPEC.md` + `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` —
   implementation-blueprint specs for signed private REST (L4, rev 72) and real order
   submission (L5, rev 73 — depends on L4). Both adapters are implemented in
   `binance_private_rest.hpp`; next milestone is wiring them into a real running process with
   real credentials, not implementing the adapters themselves.
-- `.github/workflows/` — CI: build+test, sanitizers, spec verification, CodeQL, dependency
-  updates.
+- `.github/workflows/` — CI: `ci-native.yml` (GCC-14 build + tests), `ci-native-sanitizers.yml`
+  (weekly ASan+UBSan, TSan and an ARM64 weak-memory job), `ci-python.yml` (`py_core`),
+  `ci-recorder.yml`, `ci-spec-verification.yml` (invariant cross-reference, enum diff, TLA+ models)
+  and `main-merge-guard.yml`. `ci-native.yml`, `ci-python.yml`, `ci-recorder.yml` and
+  `ci-spec-verification.yml` run on every pull request and end in a `gate` job; `master` is
+  protected by the ruleset `master-gate` (pull request, nine required
+  checks, up to date with `master`, no bypass). CodeQL is GitHub's default setup and dependency
+  updates come from `.github/dependabot.yml`.
 
 ## Build (native)
 
 ```powershell
 # initialize your MSVC 64-bit dev environment first, e.g.:
 # & "<path-to-your-Visual-Studio-install>\VC\Auxiliary\Build\vcvarsall.bat" x64
-cmake -B native/build-msvc -S native
+cmake -B native/build-msvc -S native -DCMAKE_BUILD_TYPE=Release -DHY_BUILD_DEMO=ON
 cmake --build native/build-msvc --config Release
 cd native/build-msvc && ctest -C Release --output-on-failure
 ```
+
+`-DHY_BUILD_DEMO=ON` matches CI; without it the Binance L4/L5 targets (and everything that needs
+Boost or OpenSSL) are not built at all. `CLAUDE.md` has the full validation runbook: MSVC, WSL2/GCC
+and the sanitizer tiers.
 
 ## Test (py_core)
 
