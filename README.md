@@ -24,7 +24,9 @@ without v1's task-packet/ADR process. See `CLAUDE.md` for why and for the engine
   control plane. See `formal/README.md` and `docs/SPEC_INVARIANTS.md`.
 - `tools/` — spec cross-reference and enum-diff checks (run by CI), the WSL2 validation scripts
   (`wsl_sync.sh`, `wsl_verify.sh`), the blueprint site builder and its verifiers
-  (`tools/doc_site/`), and `closure_ledger_check.py`, which checks the audit closure ledger.
+  (`tools/doc_site/`), `closure_ledger_check.py`, which checks the audit closure ledger, and
+  `concurrency_targets_check.py`, which checks that every `concurrency`-labelled test is built by the
+  sanitizer jobs (it runs first in `wsl_verify.sh thread`; it is not wired into CI).
 - `docs/adr/` — architecture decision records, carried over as engineering reference.
 - `docs/NATIVE_ARCHITECTURE.md`, `docs/NATIVE_EXIT_SAFETY_RUNBOOK.md` — consolidated native
   reference and the operator manual-takeover runbook.
