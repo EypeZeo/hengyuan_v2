@@ -135,9 +135,22 @@ jobs:
       # test_depth_feed_driver is the seventh (批次 6 6b-0f-6): the depth-side mirror of
       # test_kline_feed_driver -- SnapshotRefreshGate's real worker thread under a real
       # PublicFeedSupervisor/DepthManager/InputValidator/ring.
+      # test_user_data_ws_concurrency is the eighth (TODO 1A.4): UserDataWsEventRing (WS I/O thread ->
+      # hot thread, an SpscRing with self-checking payloads) and ListenKeyPublisher (the other way).
+      # test_symbol_registry_concurrency is the ninth (L4 5.3): SymbolRegistry's multi-reader /
+      # single-writer std::shared_mutex snapshot publication.
+      # test_compaction_lease, test_compaction_intent_store, test_seal_journal_store_lease,
+      # test_intent_phase_advancer and test_migrated_v2_started_publisher are the file-lease family
+      # (the seal-journal subsystem, frozen): CandidateLease / SealJournalStoreLease
+      # driven from real threads and, for test_compaction_lease, a real second process --
+      # compaction_lease_holder is that process's binary and must be built next to the test or
+      # CrossProcessMutualExclusion cannot spawn it.
       # NOTE this job builds an explicit target list: a test that merely carries the `concurrency`
       # label but is not named here is never built, so `ctest -L concurrency` below silently never
-      # runs it.
+      # runs it. That is how the last seven entries above went unobserved until the 2026-10-08 audit
+      # (blueprint appendix D L-33); each was run 15x under TSan with zero reports before it was
+      # added. tools/concurrency_targets_check.py compares the label set with this list, the ARM64
+      # job's and tools/wsl_verify.sh's; it is not wired into CI, so run it when a test gains the label.
       - name: Build concurrency targets only
         working-directory: native
         run: |
@@ -145,6 +158,10 @@ jobs:
             --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
             test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
             test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
+            test_user_data_ws_concurrency test_symbol_registry_concurrency \
+            compaction_lease_holder test_compaction_lease test_compaction_intent_store \
+            test_seal_journal_store_lease test_intent_phase_advancer \
+            test_migrated_v2_started_publisher \
             tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
@@ -236,13 +253,22 @@ jobs:
       # test_shm_heartbeat's seqlock -- never got a hardware verdict on weak
       # memory, only TSan's model verdict on x86. The `ctest -L concurrency`
       # selection below already expected all of them.
+      # The hardware verdict is for targets that hand data across threads through a lock-free
+      # protocol (acquire/release mailbox, seqlock, SpscRing payload checksums). Not listed, with the
+      # reason kept in tools/concurrency_targets_check.py (ARM64_EXEMPT): the mutex-guarded
+      # test_symbol_registry_concurrency and the file-lease family -- their ordering is a lock's or the
+      # OS's, which a weak-memory run observes no differently from x86. test_snapshot_refresh_gate,
+      # test_depth_feed_driver and test_user_data_ws_concurrency joined on 2026-10-08: the first two
+      # share SingleFlightFetchGate's mailbox_ready_ release/acquire handoff, the third drives an
+      # SpscRing with self-checking payloads like test_spsc_concurrency.
       - name: Build concurrency targets only
         working-directory: native
         run: |
           cmake --build build-arm -j$(nproc) \
             --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
-            test_public_feed_supervisor_concurrency test_single_flight_fetch_gate \
-            test_kline_feed_driver
+            test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
+            test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
+            test_user_data_ws_concurrency
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the
