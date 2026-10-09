@@ -34,8 +34,12 @@ struct EndpointAllowlist {
     std::array<std::string_view, kMaxEndpoints> hosts{};
     std::size_t count{0};
 
+    // `count` is a public, unchecked field. A value above kMaxEndpoints must never turn into a
+    // read past `hosts` (audit P2-001): the walk is clamped to the array, and validate_policy() /
+    // check_endpoint() below refuse such an allowlist outright instead of trusting the clamp.
     bool contains(std::string_view host) const noexcept {
-        for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t n = count < hosts.size() ? count : hosts.size();
+        for (std::size_t i = 0; i < n; ++i) {
             if (hosts[i] == host) return true;
         }
         return false;
@@ -92,7 +96,10 @@ enum class TransportCheck : std::uint8_t {
 
 // Validate policy configuration before first use (compile-time-like check).
 inline TransportCheck validate_policy(const TransportPolicy& p) noexcept {
-    if (p.endpoint_allowlist.count == 0) return TransportCheck::EndpointNotAllowed;
+    // An empty list, or a count the array cannot hold, is not an allowlist (audit P2-001).
+    if (p.endpoint_allowlist.count == 0 || p.endpoint_allowlist.count > kMaxEndpoints) {
+        return TransportCheck::EndpointNotAllowed;
+    }
     if (!p.tls_verify_peer) return TransportCheck::TlsVerifyDisabled;
     if (!p.tls_verify_hostname) return TransportCheck::TlsVerifyDisabled;
     if (p.follow_redirects) return TransportCheck::RedirectsEnabled;
@@ -105,6 +112,9 @@ inline TransportCheck validate_policy(const TransportPolicy& p) noexcept {
 // Validate that a target host is in the allowlist.
 inline TransportCheck check_endpoint(const TransportPolicy& p,
                                       std::string_view host) noexcept {
+    // Fail closed on an allowlist that claims more entries than the array holds: whatever the
+    // clamp in contains() would still match, the list itself is corrupt (audit P2-001).
+    if (p.endpoint_allowlist.count > kMaxEndpoints) return TransportCheck::EndpointNotAllowed;
     if (!p.endpoint_allowlist.contains(host)) {
         return TransportCheck::EndpointNotAllowed;
     }

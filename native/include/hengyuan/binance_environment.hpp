@@ -141,6 +141,10 @@ public:
     std::string_view ws_port() const noexcept { return ws_port_; }
 
 private:
+    // Test-only (tests/binance_environment_test_hooks.hpp): builds a binding whose allowlist does
+    // not contain its own host, the one state a client's endpoint check can be proven against.
+    friend class EnvironmentBindingTestHooks;
+
     EnvironmentBinding(BinanceEnvironment env, std::string_view host,
                        TransportPolicy policy, std::string_view api_key_env,
                        std::string_view secret_env, std::string_view ws_host,

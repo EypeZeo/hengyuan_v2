@@ -1172,6 +1172,7 @@ public:
     // clock_publisher(), closing the previously-offline-only clock-sync loop. Never signs
     // anything and never touches creds_.
     PrivateRestError sync_clock(const PrivateRestConfig& cfg) {
+        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
         net::io_context ioc;
         std::variant<detail::ServerTimeFetchResult, PrivateRestError> outcome =
             PrivateRestError::None;
@@ -1215,6 +1216,12 @@ public:
     // assigns to `out` once, on total success, exactly mirroring parse_account_response()'s own
     // build-then-assign discipline.
     PrivateRestError fetch_account(AccountSnapshot& out, const PrivateRestConfig& cfg) {
+        // The same entry guards as every sibling method. fetch_account() used to be the one public
+        // method that went straight to `*creds_` (audit P2-002); the endpoint policy is checked
+        // before anything is signed (audit P2-001).
+        if (!creds_) return PrivateRestError::SigningFailed;
+        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
+
         std::int64_t fresh_ts_ms = 0;
         if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
             return PrivateRestError::ClockNotFresh;
@@ -1290,6 +1297,7 @@ public:
     PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len,
                                         const PrivateRestConfig& cfg) {
         if (!creds_) return PrivateRestError::SigningFailed;
+        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
 
         std::array<char, kApiKeyLen> key_buf{};
         std::size_t key_len = 0;
@@ -1366,6 +1374,8 @@ public:
     PrivateRestError fetch_exchange_info(ParsedExchangeInfo& out,
                                           std::span<const std::string_view> symbols,
                                           const PrivateRestConfig& cfg) {
+        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
+
         std::string target;
         if (!build_exchange_info_target(symbols, target)) {
             return PrivateRestError::InvalidConfig;
@@ -1405,9 +1415,9 @@ public:
     //      routes even a genuinely unexpected internal fault through the same retry/backoff/
     //      eventual-EscalateToOperator path every other Inconclusive already uses, rather than
     //      crashing the reconcile thread.
-    //   2. Explicit entry guards (`creds_`/`expected` non-empty) that fetch_account() also
-    //      lacks today (a known, separately-tracked gap) -- no reason for this new method to
-    //      replicate it.
+    //   2. Explicit entry guards (`creds_`/`expected` non-empty). fetch_account() used to lack
+    //      the `creds_` one (audit P2-002, closed in SAFE-01 slice 1) -- no reason for this
+    //      method to repeat that gap.
     // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above).
     // query_order_adapter() below is the intended real caller: QueryPort::QueryFn's fixed
     // C-ABI signature (order_tracker.hpp) has no PrivateRestConfig parameter at all, so
@@ -1428,6 +1438,7 @@ public:
     QueryResult query_order(const OrderExpectation& expected,
                              const PrivateRestConfig& cfg) noexcept {
         if (!creds_) return QueryResult::not_sent();
+        if (!endpoint_permitted()) return QueryResult::not_sent();  // nothing sent (R-10)
         if (expected.client_order_id.empty()) return QueryResult::not_sent();
         if (expected.rules_snapshot_at_submit.symbol[0] == '\0') return QueryResult::not_sent();
 
@@ -1552,6 +1563,7 @@ public:
         // re-derive" pattern) -- this parameter is genuinely unused by this implementation.
         (void)symbol_id;
         if (!creds_) return {SubmitOutcome::NetworkError, 0, -1};
+        if (!endpoint_permitted()) return {SubmitOutcome::NetworkError, 0, -1};  // provably pre-send
         if (client_order_id.empty()) return {SubmitOutcome::NetworkError, 0, -1};
         if (rules_snapshot.symbol[0] == '\0') return {SubmitOutcome::NetworkError, 0, -1};
         if (price_ticks <= 0 || qty_ticks <= 0) return {SubmitOutcome::NetworkError, 0, -1};
@@ -1631,12 +1643,24 @@ public:
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }
 
 private:
+    // Audit P2-001 (SAFE-01): the bound environment's transport policy decides which host this
+    // client may resolve and connect to at all. Called at the top of every network method, before
+    // anything is signed, resolved or connected; a refusal is a configuration error, not a
+    // transport failure. The check is on the logical host (binding_.base_host()), never on
+    // PrivateRestConfig::connect_host_override: the override only redirects the TCP connection of
+    // the test fixtures, while TLS still verifies the certificate against the logical host.
+    bool endpoint_permitted() const noexcept {
+        return check_endpoint(binding_.transport_policy(), binding_.base_host()) ==
+               TransportCheck::Ok;
+    }
+
     // Shared by keepalive_listen_key()/close_listen_key() -- identical shape (percent-encode the
     // listenKey into the query string, copy_api_key(), fetch_signed_body_coro(), no body to
     // parse on success), differing only in HTTP verb.
     PrivateRestError call_listen_key_endpoint(std::string_view listen_key, http::verb verb,
                                                const PrivateRestConfig& cfg) {
         if (!creds_) return PrivateRestError::SigningFailed;
+        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
         if (listen_key.empty()) return PrivateRestError::InvalidConfig;
 
         std::array<char, kApiKeyLen> key_buf{};
@@ -1665,6 +1689,10 @@ private:
         }
         return PrivateRestError::None;
     }
+
+    // Test-only (tests/binance_private_rest_test_hooks.hpp): publishes a snapshot that is fresh right
+    // now, so a test can reach the code that sits behind the clock gate without a network round trip.
+    friend class BinancePrivateRestClientTestHooks;
 
     EnvironmentBinding binding_;
     std::unique_ptr<BoundHmacCredentials> creds_;
