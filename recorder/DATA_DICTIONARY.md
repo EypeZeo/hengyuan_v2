@@ -3,6 +3,8 @@
 D0-0 边界冻结产物。每条协议断言都给出官方来源与核验日期，并有真实样本：`tests/fixtures/`（2026-09-29 于录制宿主抓取，UTC 14:25 至 14:31，每流约 5 分钟）。
 状态取值：`VERIFIED_BY_FIXTURE`（官方文档与真实样本一致）、`EXTERNAL_PROTOCOL_VERIFICATION_REQUIRED`（无真实样本或与文档不一致，不得据此验证）。
 
+**标的范围**：夹具与样本只来自 BTCUSDT，下文的流名以它为例。ETHUSDT 自 2026-10-07T12:14Z（D0-5a）起在录制宿主上按同一布局录制：每个标的各有一条现货深度连接与一条 USD-M 深度连接，成交连接与 USD-M 市场连接由所有标的共用，连接数 = 2 × 标的数 + 2；流名把 `btcusdt` 换成 `ethusdt`，字段与序号语义相同（两标的的端到端演练见 `tests/test_recorder_multisymbol_e2e.py`）。
+
 ## 1. 记录封装与文件
 
 - 路径：`<root>/raw/<场所>/<类别>/<YYYYMMDD>/<HH>-<段序号>.jsonl.zst`（封存前带 `.part` 后缀）。类别：`depth`、`trade`、`market`（WebSocket 数据），`snapshot`（深度快照响应），`ref`（参考数据，每日 `exchangeInfo`；流名 `场所:exchangeInfo[:标的]`，`g` 恒为 0，不属任何连接代次）。
@@ -102,7 +104,7 @@ D0-0 边界冻结产物。每条协议断言都给出官方来源与核验日期
 | 流 | 状态 |
 | :--- | :--- |
 | USD-M RPI 深度 `@rpiDepth@500ms`（属 `/public`）与 REST `GET /fapi/v1/rpiDepth` | `EXTERNAL_PROTOCOL_VERIFICATION_REQUIRED`：官方接口目录只给出流名与“含 RPI 订单、500 ms”，无序号语义。2026-09-30 已在录制宿主取得真实样本（见 2.8），与 USD-M 深度桥接规则一致，但仍不录（D0-5） |
-| ETH 与更多标的、bookTicker、COIN-M | 不在首轮范围 |
+| BTCUSDT 与 ETHUSDT 之外的标的、bookTicker、COIN-M | 不在范围（D0-5 的其余项） |
 
 ### 2.8 RPI 深度实测（2026-09-30，D0-5 准备，未录制）
 
