@@ -1,10 +1,11 @@
-# 审计缺陷关闭清单（GATE-01 批 1）
+# 审计缺陷与故障用例关闭清单（GATE-01）
 
 <!-- ledger-meta baseline=f5ce782 -->
+<!-- ledger-meta fi_baseline=6cb56bd -->
 <!-- ledger-meta adjudicated=2026-10-07 -->
 
-**范围**：蓝图 `4.2` 的 17 项上游审计缺陷与 `4.3` 的 9 项补充审计（共 26 项）。`4.4` 的 5 项暂缓台账是其中 P2-006、P2-007、P2-008、P3-001、P3-002 的解冻条件视图，随来源项裁定。蓝图第 7 卷的 45 条故障用例属批 2。
-**基线**：主干 `f5ce782`（2026-10-07，GATE-01 批 1 开工时的主干）。
+**范围**：批 1——蓝图 `4.2` 的 17 项上游审计缺陷与 `4.3` 的 9 项补充审计（共 26 项）；`4.4` 的 5 项暂缓台账是其中 P2-006、P2-007、P2-008、P3-001、P3-002 的解冻条件视图，随来源项裁定。批 2——蓝图第 7 卷的 45 条故障用例。
+**基线**：批 1 为主干 `f5ce782`（2026-10-07），批 2 为主干 `6cb56bd`（2026-10-08）。
 **权威性**：本文件是蓝图 `4.2`、`4.3`、`4.4` 状态词的逐项复验记录。蓝图表中的状态词、BKL 台账状态与 FI 状态必须与本文件一致，由 `tools/closure_ledger_check.py` 机械核对；二者不一致时先改本文件的证据，再改蓝图。
 
 核对命令（Windows PowerShell 与 bash 均可）：
@@ -53,7 +54,22 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 `CLOSED` → `CLEARED`；`DEFERRED` → `DEFERRED`（带解冻条件的显式暂缓，不阻塞其门禁）；`REMEDIATING` 与 `PARTIAL` → `BLOCKED`。
 
-### 1.5 引用记法
+### 1.5 故障用例（第 7 卷）的裁定规则
+
+故障用例本身就是 `4.1.2` 里的 Fault 段，所以不再套六段判定，而按蓝图 `7.1` 的门禁准则逐条裁定“实装路径存在、验证级别满足、执行结果为通过”三件事：
+
+| 字段 | 取值与规则 |
+| :--- | :--- |
+| `status` | 沿用蓝图第 7 卷的词：`NOT_TESTABLE_YET`（还没有可执行的注入手段或被测实现）、`PARTIAL`（至少有一个单测直接断言了该用例的一部分不变量）。再加 `IMPLEMENTED`：实装路径存在、级别满足并取得成功运行证据；目前没有任何一条 |
+| `result` | `NOT_RUN`、`PASS`、`FAIL`；`PASS` 只允许配 `IMPLEMENTED` |
+| `gate_result` | `PASS` 当且仅当 `status` 为 `IMPLEMENTED`、`result` 为 `PASS` 且引用了真实成功的 `run:`；其余一律 `BLOCKED`（`7.1`：`PARTIAL`、缺失或未执行直接阻塞） |
+| `open` | 未 `IMPLEMENTED` 的用例必须带至少一个可失败的“尚未”断言（`open:`、`absent:`、`nofile:`、`countN:`），实现落地的那天它会失败，迫使状态前移 |
+| `refs` | `PARTIAL` 必须引用已经存在的东西（`test:`、`code:` 等）；`NOT_TESTABLE_YET` 可以为空 |
+| `gate_tag`、`level`、`baseline` | 必须与蓝图 `7.2` 至 `7.4` 里该行的所在节、验证级别、基线列逐项相同；`baseline` 是复验该行所依据的主干提交 |
+
+判为 `PARTIAL` 的标准是**有单测直接断言了该用例要保证的结果的一部分**；只是周边机制存在（例如只有常量或数据结构的预留）不够。
+
+### 1.6 引用记法
 
 引用以 `种类:路径#内容` 书写，由工具逐条解析。符号引用按整词匹配，`A::B` 要求 B 出现在 A 之后；带引号的内容按字面匹配。
 
@@ -62,6 +78,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | `code:` `test:` | 现行代码符号、测试用例 | 文件存在，符号存在 |
 | `open:` | 缺陷位置，声明“仍在” | 文件存在，内容仍在；消失即失败 |
 | `absent:` | 声明“不存在”的东西（路径可用通配符） | 内容不得出现 |
+| `nofile:` | 声明没有任何文件匹配这个路径或通配符 | 匹配到文件即失败 |
 | `countN:` | 声明某内容在文件中恰好出现 N 次 | 次数必须相等 |
 | `doc:` `bp:` `frozen:` | 规格文字、蓝图文字、冻结原文（v2.5.6）里的旧标识 | 文字存在 |
 | `ignored:` | `.gitignore` 必须忽略的路径 | `git check-ignore` |
@@ -125,6 +142,62 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
 状态计数：REMEDIATING 11，DEFERRED 3，PARTIAL 3，CLOSED 9，合计 26。
+
+| 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **FI-001** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-002** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-003** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-004** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-005** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-006** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-007** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-008** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-009** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-010** | PRE_OWNER_LIVE | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-011** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-012** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-013** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-014** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-015** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-016** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-017** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-018** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-019** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-020** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-021** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-022** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-023** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-024** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-025** | CANARY | L4 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-026** | CANARY | L4 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-027** | CANARY | L4 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-028** | CANARY | L4 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-029** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-030** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-031** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-032** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-033** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-035** | PRE_OWNER_LIVE | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-036** | PRE_D3 | L0 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-037** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-038** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-039** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-040** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-041** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-042** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-043** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-044** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-045** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+
+| 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| PRE_D3 | 28 | 0 | 19 | 9 | BLOCKED |
+| PRE_OWNER_LIVE | 13 | 0 | 1 | 12 | BLOCKED |
+| CANARY | 4 | 0 | 0 | 4 | BLOCKED |
+
+故障用例计数：NOT_TESTABLE_YET 25，PARTIAL 20，IMPLEMENTED 0，合计 45，其中门禁 PASS 0 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -137,6 +210,10 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 6. **P3-002 的描述更正（状态不变）。** `py_core/requirements.txt` 是 `==` 精确钉死，只是没有哈希；浮动区间在 `py_core/pyproject.toml` 与 `recorder/pyproject.toml` 的声明里。GitHub Actions 全部按主版本标签引用，Dependabot 只监控 `github-actions`。
 7. **P0-001 的现状。** 真实 POST 适配器只被两个不调用它的程序装配：`live_submit_real_credentials_demo.cpp` 装配后“刻意从不 `.call()`”，`live_submit_preflight_harness.cpp` 装配后不使用；`orchestrate_submit` 没有任何可运行的调用者。
 8. **Sanitizer 凭据。** run `37258555091`（`CI Native Sanitizers`，定时触发，提交 `d401ed78e`）三个作业全部成功：ASan+UBSan 28.5 分钟（上限 90）；TSan 1.0 分钟（上限 25，只构建十个并发目标，构建 25 秒、并发测试 3 秒，随后两个负控步骤均成功，即 TSan 报出了被注入的竞争）；ARM64 1.4 分钟。同一 workflow 的 run `35556436339`、`34801501343`、`34078573391` 是被取消的，`36810545639` 是失败的（TSan 负控当时依赖调度）；它们不是证据，`--online` 会先用这四个真实 run 证明核对工具拒收它们。
+9. **批 2：45 条故障用例没有一条能通过门禁。** 复验后 `PARTIAL` 20、`NOT_TESTABLE_YET` 25、`IMPLEMENTED` 0；三个门禁标签（`PRE_D3` 28 条、`PRE_OWNER_LIVE` 13 条、`CANARY` 4 条）全部 `BLOCKED`。
+10. **批 2 改判六条（`NOT_TESTABLE_YET` → `PARTIAL`）**，每条都有直接断言其不变量一部分的单测：FI-005（`/dev/full` 真实写入失败被分类为 DiskFull 且接收器栅栏）、FI-008（重复成交事件不重复累计）、FI-010（序号缺口检出并重同步）、FI-016（非 TRADING 标的拒绝新订单；撤单一半不存在）、FI-034（撤单中直接转成交、非法回退被拒）、FI-038（容量耗尽后失败关闭、持续接受的订单不耗尽注册表）。其余 39 条状态不变，但“尚未”的断言都改成了可失败的引用。
+11. **FI-041 不关闭。** 出路已落地并实测（纯文档 PR 都得到四个 gate；探针 #140 证明红色 PR 被平台拒绝合并），缺的是闸门判定表的入库回归测试：PR #137 时的 304 种输入自测只在一次性本地脚本里，仓库里没有对应文件。
+12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机没有被任何程序引用（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 零生产调用点（FI-015、FI-040）；全树没有“对账屏障”（FI-002、FI-003、FI-009、FI-043 共同的缺口）。
 
 ## 4 明细
 
@@ -158,7 +235,7 @@ open: open:native/src/live_submit_real_credentials_demo.cpp#"deliberately never 
 refs: pr:71@8ea914030 pr:72@24dd06f24 pr:119@ee97a59ff pr:120@3e2bd8da0 pr:121@8fa47bab2
 seg.code: MISSING code:native/include/hengyuan/binance_private_rest.hpp#submit_order code:native/include/hengyuan/binance_submit_adapter.hpp#make_binance_submit_port code:native/include/hengyuan/live_submit_orchestrator.hpp#orchestrate_submit code:native/include/hengyuan/spot_rate_limit_budget.hpp#PartitionedRateBudget -- 真实 POST（PR #72）、限流分道（PR #71）、未知状态隔离判据（PR #119 至 #121）均已合入；缺口是没有任何可运行进程调用 orchestrate_submit，真实端口只被装配、从不调用
 seg.contract: PRESENT doc:docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md#SubmitPort doc:docs/SPEC_INVARIANTS.md#orchestrate_submit -- 规格 rev 73 与不变量台账已定义
-seg.fault: MISSING fi:FI-001=PARTIAL fi:FI-002=NOT_TESTABLE_YET fi:FI-003=NOT_TESTABLE_YET fi:FI-004=PARTIAL fi:FI-005=NOT_TESTABLE_YET fi:FI-006=PARTIAL fi:FI-007=PARTIAL -- FI-001 至 007 无一项执行通过，其中 3 项尚不可测
+seg.fault: MISSING fi:FI-001=PARTIAL fi:FI-002=NOT_TESTABLE_YET fi:FI-003=NOT_TESTABLE_YET fi:FI-004=PARTIAL fi:FI-005=PARTIAL fi:FI-006=PARTIAL fi:FI-007=PARTIAL -- FI-001 至 007 无一项执行通过，其中 2 项尚不可测（FI-005 已于批 2 改判 PARTIAL）
 seg.test: MISSING test:native/tests/test_live_submit_orchestrator.cpp#SubmitTimeoutAmbiguous test:native/tests/test_binance_submit_adapter.cpp#RealSubmitDispatchThroughCompositeAdapterSignsAndParses test:native/tests/test_spot_rate_limit_budget.cpp#LaneIsolationStrategyExhaustionDoesNotAffectOthers -- 现有单元与桩测试只覆盖 mock 与注入路径，不覆盖 FI-002、FI-003、FI-005 的场景
 seg.runtime: MISSING -- 仓库内没有任何真实或测试网提交的运行日志，也没有崩溃恢复实验日志
 seg.budget: MISSING -- 没有对真实 POST 路径的时延与请求配额的量化测量，限流分道只有单元级验证
@@ -664,4 +741,709 @@ seg.fault: PRESENT:UT test:native/tests/test_binance_signer.cpp#EmptyPayloadRefu
 seg.test: PRESENT test:native/tests/test_binance_query_signing.cpp#PercentEncodesReservedCharacters test:native/tests/test_binance_query_signing.cpp#MaxLengthBoundarySucceeds test:native/tests/test_binance_signer.cpp#EmptySecretFails -- 极值与特殊字符的边界向量
 seg.runtime: PRESENT run:37586509738@e75316caf/ci-native.yml -- GCC-14 Release 全量 ctest
 seg.budget: NA -- 测试补全，不改变运行期代码路径
+```
+
+### 4.3 故障用例（蓝图第 7 卷）
+
+全部 `result: NOT_RUN`、`gate_result: BLOCKED`，`baseline` 为主干 `6cb56bd`。`note` 行是裁定的一句话理由。
+
+```ledger
+id: FI-001
+title: 网络发送前进程被强杀
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery
+refs: test:native/tests/test_live_submit_orchestrator.cpp#AuditWriteNotAckedAtIntentGate test:native/tests/test_live_submit_orchestrator.cpp#HappyPathDurableAuditSequence test:native/tests/test_live_submit_orchestrator.cpp#DurableAuditPortNotWiredFailsClosedAtIntentGate
+note: 发送前的意图落盘、写不进就不发单已有单测；没有任何测试强杀进程，启动恢复也未接入任何程序，所以“重启回放保持干净”无从执行。
+```
+
+```ledger
+id: FI-002
+title: 网络发送后、收到确认前崩溃
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/include/hengyuan/order_tracker.hpp#barrier
+note: 无崩溃注入，启动恢复未接线，代码里不存在“对账屏障”；发送后的歧义态分类（Ambiguous）只在进程内存在。
+```
+
+```ledger
+id: FI-003
+title: 收到确认后、状态迁移持久化前崩溃
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/include/hengyuan/order_tracker.hpp#barrier
+note: 同 FI-002：无崩溃注入、无重启对账屏障，客户端订单号补全本地状态的路径无从执行。
+```
+
+```ledger
+id: FI-004
+title: 预写日志尾部损坏
+gate_tag: PRE_D3
+scope: 全部
+stage: 0 与 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/src/*.cpp#StartupRecovery
+refs: test:native/tests/test_durable_audit_sink.cpp#TornTailWriteDiscardsOnlyTheIncompleteRecord test:native/tests/test_durable_audit_sink.cpp#TornTailUnderSixBytesIsRecoveredNotCorrupt test:native/tests/test_durable_audit_sink.cpp#AnchorAheadOfTruncatedLogIsCorruptTailDeletion test:native/tests/test_startup_recovery.cpp#EachUnhealthyDurableLogConditionDegradesWithItsOwnReason
+note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；缺口是“拒绝启动并禁止增仓”要由启动恢复接入进程才成立，且没有恢复报告产物。
+```
+
+```ledger
+id: FI-005
+title: 常规磁盘满或同步失败
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/durable_log_store.hpp#reserve
+refs: test:native/tests/test_durable_log_store.cpp#AppendAndFsyncOnDevFullIsClassifiedDiskFull code:native/include/hengyuan/durable_audit_sink.hpp#"FenceReason::DiskFull"
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：真实的 /dev/full 写入失败被分类为 DiskFull，持久审计接收器据此失败即关闭（栅栏）；“保留空间只给应急退出与应急撤单”不存在。
+```
+
+```ledger
+id: FI-006
+title: 交易所返回 5xx 或超时码
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/binance_private_rest.hpp#-1007
+refs: test:native/tests/test_live_submit_orchestrator.cpp#SubmitTimeoutAmbiguous test:native/tests/test_live_submit_orchestrator.cpp#TimeoutPushesToReconcileRing test:native/tests/test_binance_private_rest.cpp#MalformedJsonIsNetworkError code:native/include/hengyuan/binance_private_rest.hpp#"Any non-2xx HTTP status collapses to SubmitOutcome::NetworkError"
+note: 任何非 2xx 与解析失败都折叠为 NetworkError，进入 Ambiguous 并推入对账环，不会重发——偏保守；代码里没有对 5xx 与 -1007 的显式区分，也没有“定向查询调度”的端到端测试。
+```
+
+```ledger
+id: FI-007
+title: 网络重置或掉线
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/kill_switch.hpp#disconnect
+refs: test:native/tests/test_live_submit_orchestrator.cpp#SubmitNetworkErrorAmbiguous test:native/tests/test_live_submit_orchestrator.cpp#NetworkErrorPushesToReconcileRing
+note: 网络错误被标记为可能已发送并推入对账环有单测；“进入断网熔断状态”不存在（熔断开关里没有断网相关的状态）。
+```
+
+```ledger
+id: FI-008
+title: WebSocket 重复事件
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A 与 5
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/tests/test_ws_loopback_sessions.cpp#executionReport
+refs: test:native/tests/test_binance_user_data_event.cpp#DuplicateFillEventDoesNotDoubleApply test:native/tests/test_order_fill_context.cpp#DedupSafetyWorkedNumericScenario
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：去重由累计成交差分承担（OrderFillContext），重复成交事件不会重复累计的单测已存在；还没有让真实会话重复投递同一事件的回环测试，也没有“去重轨迹”产物。
+```
+
+```ledger
+id: FI-009
+title: 旧连接迟到事件
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/binance_user_data_ws_supervisor.hpp#barrier
+refs: test:native/tests/test_durable_control_plane_abi.cpp#StaleGenerationDoesNotReleaseReusedSlot
+note: 现有“代次”测试说的是在途槽位的代次，不是连接代次；“对账屏障完成后按连接代次过滤迟到事件”不存在。
+```
+
+```ledger
+id: FI-010
+title: 增量深度发生序号跳跃或乱序
+gate_tag: PRE_OWNER_LIVE
+scope: 全部
+stage: 4
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/depth_manager.hpp#trace
+refs: test:native/tests/test_depth_manager.cpp#TrackingDetectsGap test:native/tests/test_depth_manager.cpp#ResyncOnGapInBufferedEvents test:native/tests/test_depth_manager.cpp#OverflowedBufferForcesResyncInsteadOfTracking
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：序号缺口检出、丢弃本地簿并重新拉快照重放缓冲的行为已有单测；“深度重同步轨迹”产物不存在。
+```
+
+```ledger
+id: FI-011
+title: 收到服务端关闭文本事件
+gate_tag: PRE_OWNER_LIVE
+scope: 现货
+stage: 1A
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/binance_user_data_ws_session.hpp#serverShutdown absent:native/include/hengyuan/binance_ws_session.hpp#serverShutdown
+note: 代码里没有处理服务端关闭事件，也没有“平滑迁移代次”。
+```
+
+```ledger
+id: FI-012
+title: 触发 429 且带重试等待
+gate_tag: PRE_OWNER_LIVE
+scope: 按产品
+stage: 1A
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/order_tracker.hpp#"no parse_retry_after() yet"
+refs: code:native/include/hengyuan/durable_control_plane.hpp#"unknown-time-429"
+note: 冻结记录的数据结构已预留（含缺 Retry-After 的 429），但响应头不解析、没有冻结驱动。
+```
+
+```ledger
+id: FI-013
+title: 触发 418 地址封禁
+gate_tag: PRE_OWNER_LIVE
+scope: 按产品
+stage: 1A
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/binance_private_rest.hpp#418
+refs: code:native/include/hengyuan/durable_control_plane.hpp#"1=418 timed"
+note: 同 FI-012：418 只有预留的记录字段，没有封禁处理与探活恢复。
+```
+
+```ledger
+id: FI-014
+title: 收到合约系统级过载码
+gate_tag: PRE_OWNER_LIVE
+scope: 合约
+stage: 1B
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#-1008
+note: 合约线未开工。
+```
+
+```ledger
+id: FI-015
+title: 本地与交易所时钟偏差超限
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/src/*.cpp#check_clock_skew absent:native/include/hengyuan/binance_private_rest.hpp#check_clock_skew
+refs: test:native/tests/test_binance_clock_sync.cpp#DriftBeyondToleranceIsNotFresh test:native/tests/test_binance_clock_sync.cpp#StaleSnapshotFails test:native/tests/test_transport_policy.cpp#BeyondWindowFails
+note: 新鲜度、漂移与偏移幅度函数都有单测；check_clock_skew 在 native/src 与私有 REST 客户端里没有任何调用点，偏移幅度对发布路径没有上界。
+```
+
+```ledger
+id: FI-016
+title: 标的状态变为仅可撤单
+gate_tag: PRE_D3
+scope: 现货
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/binance_private_rest.hpp#'rules.is_trading = (status_sv == "TRADING");' absent:native/include/hengyuan/binance_private_rest.hpp#cancel_order
+refs: test:native/tests/test_account_truth.cpp#SymbolNotTrading
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：非 TRADING 的标的一律不是 is_trading，预检拒绝任何新订单（含平仓新单）已有单测；“允许撤单与改单”一半无从测试——全树没有撤单路径，CANCEL_ONLY 也没有被单独区分。
+```
+
+```ledger
+id: FI-017
+title: 合约状态变为交割中、结算中或关闭
+gate_tag: PRE_OWNER_LIVE
+scope: 合约
+stage: 1B
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#DELIVERING
+note: 合约线未开工。
+```
+
+```ledger
+id: FI-018
+title: 未知过滤器类型或标的状态
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/binance_private_rest.hpp#'rules.is_trading = (status_sv == "TRADING");'
+refs: test:native/tests/test_binance_private_rest.cpp#ValidResponseWithMultipleSymbolsAndUnknownFilterSkipped
+note: 未知标的状态按“非 TRADING”失败关闭；未知过滤器类型按当前兼容原则跳过，待策略明确后裁决。
+```
+
+```ledger
+id: FI-019
+title: 密钥权限失效或被后台吊销
+gate_tag: PRE_OWNER_LIVE
+scope: 全部
+stage: 1A
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#revoked
+note: 没有权限状态与派生权限的重算，也没有移动端告警；-2015 只出现在测试用的响应样本里。
+```
+
+```ledger
+id: FI-020
+title: 私有数据流心跳假死
+gate_tag: PRE_OWNER_LIVE
+scope: 全部
+stage: 1A
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/binance_user_data_ws_supervisor.hpp#data_stale
+note: 会话有空闲超时旋钮、监督器有重连退避，但没有“数据状态陈旧”标志，也没有对应测试。
+```
+
+```ledger
+id: FI-021
+title: 套利两腿中第一腿成交而第二腿未知
+gate_tag: PRE_OWNER_LIVE
+scope: 全部
+stage: 1C
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#second_leg
+note: 两腿套利线未开工。
+```
+
+```ledger
+id: FI-022
+title: 策略主进程崩溃退出
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/src/*.cpp#StartupRecovery
+refs: test:native/tests/test_startup_recovery.cpp#BootstrapsUntilClockAndExchangeInfoAreReady test:native/tests/test_durable_audit_sink.cpp#RepopulateInFlightRegistryHelperRegistersEveryCheckpoint test:native/tests/test_durable_audit_sink.cpp#SeedPositionTruthFoldsEachRecoveredCheckpointsFilledAmount
+note: 恢复状态机与日志回放辅助函数有单测；启动恢复没有被任何程序引用，预检 harness 自述“不是恢复路径”。
+```
+
+```ledger
+id: FI-023
+title: 触发熔断（持久化锁存）
+gate_tag: PRE_D3
+scope: 全部
+stage: 0 与 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/kill_switch.hpp#"KillState state_{KillState::Normal};" absent:native/include/hengyuan/kill_switch.hpp#std::atomic
+note: 内存锁存已具备（见 P2-004），持久化与线性化次序都不存在。
+```
+
+```ledger
+id: FI-024
+title: 证书失效、握手降级或帧畸形
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/tests/*.cpp#Downgrade
+refs: test:native/tests/test_binance_klines_rest.cpp#AnUntrustedCertificateIsRejected test:native/tests/test_binance_klines_rest.cpp#TlsHandshakeStageTimeout test:native/tests/test_binance_private_rest.cpp#TrueAfterLoadingAKnownGoodCertFile
+note: 不受信任的证书被拒、握手阶段超时有单测；没有握手降级的测试（所有上下文固定为 TLS 1.2 客户端），帧畸形只在解析器层面计数。
+```
+
+```ledger
+id: FI-025
+title: 外部在移动端或网页端手动下单
+gate_tag: CANARY
+scope: 全部
+stage: 6
+level: L4
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: nofile:docs/drills/*
+note: L4 演练尚未开始，没有演练日志。
+```
+
+```ledger
+id: FI-026
+title: 外部手动撤单
+gate_tag: CANARY
+scope: 全部
+stage: 6
+level: L4
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: nofile:docs/drills/*
+note: L4 演练尚未开始，没有演练日志。
+```
+
+```ledger
+id: FI-027
+title: 外部账户资金划转
+gate_tag: CANARY
+scope: 全部
+stage: 6
+level: L4
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: nofile:docs/drills/*
+note: L4 演练尚未开始，没有演练日志。
+```
+
+```ledger
+id: FI-028
+title: 外部修改持仓模式或杠杆
+gate_tag: CANARY
+scope: 全部
+stage: 6
+level: L4
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: nofile:docs/drills/*
+note: L4 演练尚未开始，没有演练日志。
+```
+
+```ledger
+id: FI-029
+title: 租约续期失败或到期失效
+gate_tag: PRE_OWNER_LIVE
+scope: 合约
+stage: 1B
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: nofile:native/include/hengyuan/*futures*
+note: 合约线未开工。
+```
+
+```ledger
+id: FI-030
+title: 预检校验中途元数据变更
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/live_submit_orchestrator.hpp#refresh_from_exchange_info
+refs: test:native/tests/test_live_submit_orchestrator.cpp#StaleRulesVersionBlocksBeforePreTrade test:native/tests/test_binance_submit_adapter.cpp#RegistryRefreshMakesSnapshotStaleAndBlocksBeforeSubmit
+note: 规则版本失效会在预检前拦截发单；拦截之后“触发元数据重新对账”由谁驱动没有实现。
+```
+
+```ledger
+id: FI-031
+title: 对账确认终态后、终态持久确认前崩溃
+gate_tag: PRE_D3
+scope: 全部
+stage: 0 与 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/order_tracker.hpp#"AuditRingSink* audit," absent:native/include/hengyuan/order_tracker.hpp#DurableAuditSink
+note: 前置阻塞未变（P1-002）：终态记录从未进入持久 sink，所以也谈不上崩溃后补全。
+```
+
+```ledger
+id: FI-032
+title: 生产构建传入可注入主机或自签 CA
+gate_tag: PRE_D3
+scope: 全部
+stage: 0
+level: L0
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/binance_private_rest.hpp#PrivateRestConfig::extra_trusted_ca_pem_path open:native/include/hengyuan/binance_private_rest.hpp#PrivateRestConfig::connect_host_override open:native/include/hengyuan/binance_klines_rest.hpp#PublicRestConfig::extra_trusted_ca_pem_path open:native/include/hengyuan/binance_rest_snapshot.hpp#RestSnapshotConfig::extra_trusted_ca_pem_path
+refs: code:native/include/hengyuan/binance_environment.hpp#EnvironmentBinding
+note: 字段仍在三个结构体里（P1-001）；生产主机由 EnvironmentBinding 决定，但类型层面没有阻止注入。
+```
+
+```ledger
+id: FI-033
+title: 传入畸形或越界账户快照
+gate_tag: PRE_D3
+scope: 全部
+stage: 0
+level: L0
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/account_truth.hpp#"std::size_t asset_count{0};" open:native/include/hengyuan/account_truth.hpp#"for (std::size_t i = 0; i < asset_count; ++i)" open:native/include/hengyuan/account_truth.hpp#"std::int64_t total() const noexcept { return free_ticks + locked_ticks; }"
+refs: test:native/tests/test_account_truth.cpp#AddDetectsOverflow code:native/include/hengyuan/account_truth.hpp#checked_add
+note: 预检算术有溢出检查，快照构造没有安全工厂（P1-003）。
+```
+
+```ledger
+id: FI-034
+title: 撤单与成交并发竞争
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/binance_private_rest.hpp#cancel_order
+refs: test:native/tests/test_order_lifecycle.cpp#CancelRequestedToFilled test:native/tests/test_order_lifecycle.cpp#InvalidTransitionDoesNotChangeState test:native/tests/test_order_tracker.cpp#AcceptedOrderDiscoversCancelRequestedViaLivePoll
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：生命周期允许撤单中直接转为成交且禁止非法回退，对账轮询能发现撤单中状态的单测已存在；撤单路径本身不存在，所以“并发竞争”只能在状态机层面验证。
+```
+
+```ledger
+id: FI-035
+title: 支付手续费的资产余额耗尽
+gate_tag: PRE_OWNER_LIVE
+scope: 现货
+stage: 1A 与 5
+level: L1 与 L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#ommission
+note: 成交回报里的佣金与佣金资产没有被解析，也没有费率预估。
+```
+
+```ledger
+id: FI-036
+title: 跨线程高并发读写熔断开关
+gate_tag: PRE_D3
+scope: 全部
+stage: 0
+level: L0
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/kill_switch.hpp#"KillState state_{KillState::Normal};" absent:native/include/hengyuan/kill_switch.hpp#std::atomic
+note: 没有线程检测压力用例；熔断状态仍是普通字段（P2-004）。
+```
+
+```ledger
+id: FI-037
+title: 传输策略未接线导致绕过白名单与尺寸检查
+gate_tag: PRE_D3
+scope: 全部
+stage: 0
+level: L0
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/transport_policy.hpp#"if (p.endpoint_allowlist.count == 0) return TransportCheck::EndpointNotAllowed;" absent:native/include/hengyuan/transport_policy.hpp#"count > kMaxEndpoints" absent:native/src/*.cpp#check_endpoint absent:native/include/hengyuan/binance_private_rest.hpp#check_endpoint
+refs: test:native/tests/test_transport_policy.cpp#EndpointCheckRejectsInvalidHost
+note: 端点校验函数本身有单测，非测试调用点为零，白名单计数没有上界（P2-001）。
+```
+
+```ledger
+id: FI-038
+title: 在途注册表 64 槽被未对账订单占满
+gate_tag: PRE_D3
+scope: 现货
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/order_tracker.hpp#quarantine_count
+refs: test:native/tests/test_durable_control_plane_abi.cpp#ExhaustsAtKMaxInFlightAndThenFailsClosed test:native/tests/test_durable_control_plane_abi.cpp#OnlyExplicitResolutionReturnsCapacity test:native/tests/test_durable_control_plane_abi.cpp#InvalidOnEmptyCoidOrDuplicateOrCapacityExhausted test:native/tests/test_order_tracker.cpp#SustainedAcceptedOrdersDoNotExhaustInFlightRegistry
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：容量耗尽后失败关闭、只有显式终态才归还容量、持续接受的订单不会耗尽注册表的单测已存在；容量耗尽与重复客户端订单号仍返回同一种无效句柄，隔离计数不可观测。
+```
+
+```ledger
+id: FI-039
+title: 交易所信息刷新导致标的序号漂移
+gate_tag: PRE_D3
+scope: 现货
+stage: 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: open:native/include/hengyuan/symbol_registry.hpp#"positionally keyed by symbol_id"
+refs: test:native/tests/test_symbol_registry.cpp#SecondSuccessfulRefreshIncrementsVersionAndReplacesTable
+note: 注册表按位置给标的编号，保持顺序一致由调用方负责；刷新时没有按外部标的身份核对，也就没有“无法保真则拒绝发布”。
+```
+
+```ledger
+id: FI-040
+title: 恶意时钟接口返回合理时延与巨幅偏移
+gate_tag: PRE_D3
+scope: 全部
+stage: 0 与 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/src/*.cpp#check_clock_skew absent:native/include/hengyuan/binance_private_rest.hpp#check_clock_skew
+refs: test:native/tests/test_transport_policy.cpp#BeyondWindowFails
+note: 偏移幅度函数有单测、零生产调用点，同 FI-015。
+```
+
+```ledger
+id: FI-041
+title: PR 触及路径过滤并集之外导致零检查合并
+gate_tag: PRE_D3
+scope: 全部
+stage: 0
+level: L0
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: nofile:tools/*gate*
+refs: code:.github/workflows/ci-native.yml#"native: gate" code:.github/workflows/ci-python.yml#"py_core: gate" code:.github/workflows/ci-recorder.yml#"recorder: gate" code:.github/workflows/ci-spec-verification.yml#"spec: gate" pr:137@e75316caf pr:139@37226fe48 doc:docs/REQUIRED_CHECKS_RUNBOOK.md#gate
+note: 出路已落地并实测：纯文档 PR（#139、#141、#142、#150）都得到四个 gate 与五项 CodeQL，被守护作业为 skipped；探针 #140 证明红色 PR 被平台拒绝合并。未关闭是因为闸门的判定表只有一次性本地自测（304 种输入只有两种通过），没有入库的回归测试。
+```
+
+```ledger
+id: FI-042
+title: 提交遭遇 5xx 或超时，随后查询返回订单不存在
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#reserved_funds
+refs: test:native/tests/test_order_lifecycle.cpp#DefaultsAreTheOwnersNumbers test:native/tests/test_order_lifecycle.cpp#HardCapEscalatesWhateverTheQueryCount test:native/tests/test_startup_recovery.cpp#ACrashLoopDoesNotResetTheUnresolvedTime pr:119@ee97a59ff pr:121@8fa47bab2
+note: R-10 判据与崩溃循环不重置累计时间（挂钟部分）已有单测；仍缺订单不存在与传输失败的区分、退避抖动、资金预留、出隔离流程与升级事件持久化。
+```
+
+```ledger
+id: FI-043
+title: 用户数据流连接代次由 N 跳至 N+1
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/binance_user_data_ws_supervisor.hpp#barrier open:native/include/hengyuan/binance_private_rest.hpp#create_listen_key
+note: 树内私网流仍走已下线的 listenKey 路径，没有订阅式会话，也没有重连屏障。
+```
+
+```ledger
+id: FI-044
+title: 两腿套利在共同步长未求解时发起第一腿
+gate_tag: PRE_OWNER_LIVE
+scope: 全部
+stage: 1C
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#INFEASIBLE_CAPITAL
+note: 两腿套利线未开工。
+```
+
+```ledger
+id: FI-045
+title: Ed25519 签名后端的签名与后端故障
+gate_tag: PRE_OWNER_LIVE
+scope: 现货
+stage: 1A
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 6cb56bd
+open: absent:native/include/hengyuan/*.hpp#Ed25519
+refs: bp:"任务 SPOT-03"
+note: 仓库只有 HMAC 后端，任务 SPOT-03 为 P1 可选；本用例仅在签名后端为 Ed25519 时适用。
 ```
