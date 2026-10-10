@@ -7,12 +7,14 @@
 //
 // The fixture certificate is the dedicated one whose SAN is testnet.binance.vision, so every test
 // below verifies and sends the REAL testnet host name while the connection itself is routed to the
-// local fixture via connect_host_override -- the same shape production has, minus the network.
+// local fixture via a RestTestSeam (rest_test_seam.hpp) -- the same shape production has, minus the
+// network.
 
 #include <gtest/gtest.h>
 #include <hengyuan/binance_klines_rest.hpp>
 
 #include "test_helpers/blackhole_acceptor.hpp"
+#include "test_helpers/rest_test_seam_builder.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
 
 #include <chrono>
@@ -73,15 +75,18 @@ KlineBackfill& shared_out() {
     return *out;
 }
 
-// The real testnet host (verified against the fixture cert's SAN, sent as Host:) with the socket
-// routed to the local fixture.
+// The real testnet host (verified against the fixture cert's SAN, sent as Host:) ...
 PublicRestConfig testnet_cfg(unsigned short port) {
     PublicRestConfig cfg;
     cfg.host = "testnet.binance.vision";
     cfg.port = std::to_string(port);
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
     return cfg;
+}
+
+// ... with the socket routed to the local fixture and the fixture's certificate trusted. EVERY test that
+// reaches the network passes this: without it the request would go to the real testnet host.
+hy::RestTestSeam testnet_seam() {
+    return hy::RestTestSeamBuilder::loopback(fixture_path("test_leaf_cert_testnet_host.pem"));
 }
 
 std::unique_ptr<TlsResponseAcceptor> make_server(int status, std::string body) {
@@ -95,7 +100,8 @@ std::function<std::int64_t()> clock_at(std::int64_t now) {
 }
 
 hy::KlinesFetchResult fetch_1h(const PublicRestConfig& cfg, std::int64_t now, int limit = 6) {
-    return fetch_klines_backfill("BTCUSDT", "1h", limit, /*symbol_id=*/7, cfg, clock_at(now), shared_out());
+    return fetch_klines_backfill("BTCUSDT", "1h", limit, /*symbol_id=*/7, cfg, clock_at(now), shared_out(),
+                                 testnet_seam());
 }
 
 }  // namespace
@@ -111,8 +117,6 @@ TEST(BinanceKlinesRestTarget, ThereIsNoDefaultHostSoProductionCannotBeReachedByO
     const PublicRestConfig cfg;
     EXPECT_TRUE(cfg.host.empty());
     EXPECT_EQ(cfg.port, "443");
-    EXPECT_TRUE(cfg.extra_trusted_ca_pem_path.empty());
-    EXPECT_TRUE(cfg.connect_host_override.empty());
 }
 
 TEST(BinanceKlinesRestTarget, BuildsTheExactDocumentedQuery) {
@@ -243,7 +247,7 @@ TEST(BinanceKlinesRestFetch, ForwardsTheRequestedSymbolIntervalAndLimit) {
     constexpr std::int64_t k15m = 900'000;
     auto server = make_server(200, bars(1000, k15m));
     const auto r = fetch_klines_backfill("ETHUSDT", "15m", 1000, 9, testnet_cfg(server->port()),
-                                          clock_at(kFarFuture), shared_out());
+                                          clock_at(kFarFuture), shared_out(), testnet_seam());
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(shared_out().count, 1000u);
     const auto reqs = server->requests();
@@ -309,7 +313,8 @@ TEST(BinanceKlinesRestClosedBars, TheClockIsReadExactlyOnceAndBeforeTheRequestGo
         return kFarFuture;
     };
 
-    const auto r = fetch_klines_backfill("BTCUSDT", "1h", 4, 7, testnet_cfg(server->port()), clock, shared_out());
+    const auto r = fetch_klines_backfill("BTCUSDT", "1h", 4, 7, testnet_cfg(server->port()), clock, shared_out(),
+                                          testnet_seam());
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(calls, 1);
     EXPECT_EQ(requests_seen_at_call, 0u) << "the clock was read after the request had already been served";
@@ -352,13 +357,13 @@ TEST(BinanceKlinesRestHttp, AnyNon200IsRefusedWithItsCodeAndTheBodyIsNeverParsed
 
 TEST(BinanceKlinesRestHttp, FetchPublicBodyReturnsTheBodyOnlyOnSuccess) {
     auto ok_server = make_server(200, R"({"hello":"world"})");
-    const auto ok = fetch_public_body("/x", testnet_cfg(ok_server->port()));
+    const auto ok = fetch_public_body("/x", testnet_cfg(ok_server->port()), testnet_seam());
     EXPECT_EQ(ok.error, PublicRestError::None);
     EXPECT_EQ(ok.http_status, 200);
     EXPECT_EQ(ok.body, R"({"hello":"world"})");
 
     auto bad_server = make_server(429, R"({"code":-1003,"msg":"Too many requests"})");
-    const auto bad = fetch_public_body("/x", testnet_cfg(bad_server->port()));
+    const auto bad = fetch_public_body("/x", testnet_cfg(bad_server->port()), testnet_seam());
     EXPECT_EQ(bad.error, PublicRestError::HttpStatus);
     EXPECT_EQ(bad.http_status, 429);
     EXPECT_TRUE(bad.body.empty());  // an error body is not returned as if it were data
@@ -410,12 +415,12 @@ TEST(BinanceKlinesRestLimits, ABodyOverOneMiBIsRefusedAtTheReadStageAndExactlyOn
     constexpr std::size_t kMiB = 1024 * 1024;
 
     auto at_cap = make_server(200, std::string(kMiB, ' '));
-    const auto ok = fetch_public_body("/x", testnet_cfg(at_cap->port()));
+    const auto ok = fetch_public_body("/x", testnet_cfg(at_cap->port()), testnet_seam());
     EXPECT_EQ(ok.error, PublicRestError::None);
     EXPECT_EQ(ok.body.size(), kMiB);
 
     auto over_cap = make_server(200, std::string(kMiB + 1, ' '));
-    const auto over = fetch_public_body("/x", testnet_cfg(over_cap->port()));
+    const auto over = fetch_public_body("/x", testnet_cfg(over_cap->port()), testnet_seam());
     EXPECT_EQ(over.error, PublicRestError::Read);
     EXPECT_TRUE(over.body.empty());
 }
@@ -429,7 +434,7 @@ TEST(BinanceKlinesRestConnectivity, MismatchedHostIsRejectedEvenThoughTheChainIs
     PublicRestConfig cfg = testnet_cfg(server->port());
     cfg.host = "api.binance.com";
 
-    const auto r = fetch_public_body("/x", cfg);
+    const auto r = fetch_public_body("/x", cfg, testnet_seam());
     EXPECT_EQ(r.error, PublicRestError::TlsHandshake);
     EXPECT_EQ(server->requests().size(), 0u) << "no HTTP request may be sent over an unverified channel";
 }
@@ -438,10 +443,10 @@ TEST(BinanceKlinesRestConnectivity, AnUntrustedCertificateIsRejected) {
     // Same server, but WITHOUT the extra trusted CA: the self-signed fixture cert must not verify
     // against the system store. (The matching-host success path above is the positive control.)
     auto server = make_server(200, bars(3));
-    PublicRestConfig cfg = testnet_cfg(server->port());
-    cfg.extra_trusted_ca_pem_path.clear();
+    const PublicRestConfig cfg = testnet_cfg(server->port());
 
-    const auto r = fetch_public_body("/x", cfg);
+    // Same loopback routing, but no extra trust anchor.
+    const auto r = fetch_public_body("/x", cfg, hy::RestTestSeamBuilder::loopback());
     EXPECT_EQ(r.error, PublicRestError::TlsHandshake);
     EXPECT_EQ(server->requests().size(), 0u);
 }
@@ -454,7 +459,7 @@ TEST(BinanceKlinesRestConnectivity, ConnectionRefusedIsTheConnectStage) {
     }
     PublicRestConfig cfg = testnet_cfg(dead_port);
     const auto start = std::chrono::steady_clock::now();
-    const auto r = fetch_public_body("/x", cfg);
+    const auto r = fetch_public_body("/x", cfg, testnet_seam());
     EXPECT_EQ(r.error, PublicRestError::Connect);
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(15));
 }
@@ -478,7 +483,7 @@ TEST(BinanceKlinesRestConnectivity, ReadStageTimeoutAfterASuccessfulHandshake) {
     const PublicRestConfig cfg = testnet_cfg(tls_blackhole.port());
 
     const auto start = std::chrono::steady_clock::now();
-    const auto r = fetch_public_body("/x", cfg);
+    const auto r = fetch_public_body("/x", cfg, testnet_seam());
     // If this regresses to TlsHandshake the trust/hostname wiring broke, not the read deadline.
     EXPECT_EQ(r.error, PublicRestError::Read);
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(20));
@@ -489,7 +494,8 @@ TEST(BinanceKlinesRestConnectivity, ReadStageTimeoutAfterASuccessfulHandshake) {
 TEST(BinanceKlinesRestOutcome, TheFetcherBodyCarriesStatusAndBarsInOneValue) {
     auto server = make_server(200, bars(5));
     const hy::KlinesBackfillRequest request{"BTCUSDT", "1h", 7, 3};
-    const auto out = hy::fetch_klines_backfill_outcome(request, testnet_cfg(server->port()), clock_at(kFarFuture));
+    const auto out = hy::fetch_klines_backfill_outcome(request, testnet_cfg(server->port()), clock_at(kFarFuture),
+                                                        testnet_seam());
 
     ASSERT_TRUE(out.ok());
     ASSERT_EQ(out.bars().size(), 5U);
@@ -504,7 +510,8 @@ TEST(BinanceKlinesRestOutcome, TheFetcherBodyCarriesStatusAndBarsInOneValue) {
 TEST(BinanceKlinesRestOutcome, AFailedFetchIsAnOutcomeWithNoBarsNotAnException) {
     auto server = make_server(503, bars(5));  // a perfectly valid body behind a failing status
     const auto out = hy::fetch_klines_backfill_outcome(hy::KlinesBackfillRequest{"BTCUSDT", "1h", 7, 3},
-                                                        testnet_cfg(server->port()), clock_at(kFarFuture));
+                                                        testnet_cfg(server->port()), clock_at(kFarFuture),
+                                                        testnet_seam());
     EXPECT_FALSE(out.ok());
     EXPECT_EQ(out.status.transport, PublicRestError::HttpStatus);
     EXPECT_EQ(out.status.http_status, 503);

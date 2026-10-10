@@ -7,6 +7,12 @@
 #pragma once
 
 #include <hengyuan/binance_private_rest.hpp>
+#include <hengyuan/rest_test_seam.hpp>
+
+#include <string>
+#include <utility>
+
+#include "test_helpers/rest_test_seam_builder.hpp"
 
 namespace hy {
 
@@ -24,6 +30,17 @@ public:
         s.system_at_fetch_ms = now.system_ms();
         s.steady_at_fetch_ms = now.steady_ms();
         (void)c.clock_pub_.publish(s);
+    }
+
+    // Points the client at a test fixture (rest_test_seam.hpp): every network call it makes from now
+    // on resolves and connects where the seam says. Same threading rule as above.
+    static void set_seam(BinancePrivateRestClient& c, RestTestSeam seam) {
+        c.test_seam_ = std::move(seam);
+    }
+
+    // The common case: a loopback fixture, trusting `trusted_ca_pem_path` (empty = no extra CA).
+    static void use_loopback(BinancePrivateRestClient& c, std::string trusted_ca_pem_path = {}) {
+        set_seam(c, RestTestSeamBuilder::loopback(std::move(trusted_ca_pem_path)));
     }
 };
 

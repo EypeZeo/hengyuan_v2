@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_submit_adapter.hpp>
 
+#include "binance_private_rest_test_hooks.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
 #include "test_symbol_registry_fakes.hpp"
 
@@ -366,19 +367,18 @@ TEST_F(BoundCredentialsFixture, RealSubmitDispatchThroughCompositeAdapterSignsAn
 
     PrivateRestConfig order_cfg;
     order_cfg.port = std::to_string(order_server.port());
-    order_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    order_cfg.connect_host_override = "127.0.0.1";
 
     // 5-parameter constructor (H1/H2): rate_limiter/weight_table left at their nullptr/{}
     // defaults, order_cfg supplied as default_cfg so the no-cfg submit_order() overload the
     // composite adapter actually calls picks it up automatically.
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), nullptr, {},
                                      order_cfg);
+    // Loopback RestTestSeam: both fixtures are reached on 127.0.0.1, the fixture certificate is trusted.
+    hy::BinancePrivateRestClientTestHooks::use_loopback(client,
+                                                        fixture_path("test_leaf_cert_testnet_host.pem"));
 
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     SymbolRegistry registry;

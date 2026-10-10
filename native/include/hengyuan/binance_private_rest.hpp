@@ -58,6 +58,7 @@
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
+#include <hengyuan/rest_test_seam.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
 
 #include <boost/asio.hpp>
@@ -85,6 +86,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -116,10 +118,10 @@ struct PrivateRestConfig {
     // invariant -- validating it would need its own design (e.g. what to do when violated).
     std::int64_t recv_window_ms = 5000;
 
-    // Test-only escape hatches, matching RestSnapshotConfig's own (binance_rest_snapshot.hpp)
-    // — empty by default, production callers never set either.
-    std::string extra_trusted_ca_pem_path;
-    std::string connect_host_override;
+    // Deliberately no connect-target override and no extra trust anchor in here (audit P1-001, fault
+    // case FI-032): a configuration must not be able to redirect a signed request or add a CA. A test
+    // that has to point the client at a loopback fixture does it through a RestTestSeam
+    // (rest_test_seam.hpp), which no *Config can carry.
 
     // Batch H, H2: per-stage network timeouts for the three coroutines below
     // (fetch_server_time_coro/fetch_signed_body_coro/fetch_public_body_coro), one field per
@@ -816,17 +818,20 @@ struct ServerTimeFetchResult {
 };
 
 inline net::awaitable<std::variant<ServerTimeFetchResult, PrivateRestError>>
-fetch_server_time_coro(std::string host, PrivateRestConfig cfg) {
+fetch_server_time_coro(EndpointPermit permit, PrivateRestConfig cfg, RestTestSeam seam) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     PrivateRestError current_stage = PrivateRestError::Resolve;
     try {
+        // The host is the permit's and nobody else's: SNI, hostname verification, the Host header and
+        // (unless a test seam redirects the TCP connection) the connect target all use it.
+        const std::string host(permit.host());
         auto executor = co_await net::this_coro::executor;
 
         ssl::context ssl_ctx(ssl::context::tlsv12_client);
         hy::configure_binance_ssl_context(ssl_ctx);
-        if (!cfg.extra_trusted_ca_pem_path.empty()) {
-            ssl_ctx.load_verify_file(cfg.extra_trusted_ca_pem_path);
+        if (!seam.extra_trusted_ca_pem_path().empty()) {
+            ssl_ctx.load_verify_file(seam.extra_trusted_ca_pem_path());
         }
 
         tcp::resolver resolver(executor);
@@ -845,7 +850,7 @@ fetch_server_time_coro(std::string host, PrivateRestConfig cfg) {
         hy::configure_binance_hostname_verification(stream, host);
 
         const std::string& connect_host =
-            cfg.connect_host_override.empty() ? host : cfg.connect_host_override;
+            seam.connect_host_override().empty() ? host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
         resolve_timer.expires_after(std::chrono::milliseconds(cfg.effective_resolve_timeout_ms()));
         auto resolve_result =
@@ -921,18 +926,21 @@ fetch_server_time_coro(std::string host, PrivateRestConfig cfg) {
 // string exactly like GET does (no request body needed), so this is the only change a POST
 // caller needs; the body stays http::empty_body for both verbs.
 inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_body_coro(
-    std::string host, std::string target, std::string api_key, PrivateRestConfig cfg,
-    http::verb verb = http::verb::get) {
+    EndpointPermit permit, std::string target, std::string api_key, PrivateRestConfig cfg,
+    RestTestSeam seam, http::verb verb = http::verb::get) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     PrivateRestError current_stage = PrivateRestError::Resolve;
     try {
+        // The host is the permit's and nobody else's: SNI, hostname verification, the Host header and
+        // (unless a test seam redirects the TCP connection) the connect target all use it.
+        const std::string host(permit.host());
         auto executor = co_await net::this_coro::executor;
 
         ssl::context ssl_ctx(ssl::context::tlsv12_client);
         hy::configure_binance_ssl_context(ssl_ctx);
-        if (!cfg.extra_trusted_ca_pem_path.empty()) {
-            ssl_ctx.load_verify_file(cfg.extra_trusted_ca_pem_path);
+        if (!seam.extra_trusted_ca_pem_path().empty()) {
+            ssl_ctx.load_verify_file(seam.extra_trusted_ca_pem_path());
         }
 
         tcp::resolver resolver(executor);
@@ -951,7 +959,7 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         hy::configure_binance_hostname_verification(stream, host);
 
         const std::string& connect_host =
-            cfg.connect_host_override.empty() ? host : cfg.connect_host_override;
+            seam.connect_host_override().empty() ? host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
         resolve_timer.expires_after(std::chrono::milliseconds(cfg.effective_resolve_timeout_ms()));
         auto resolve_result =
@@ -1014,17 +1022,20 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
 // invariant, with no conditional to accidentally weaken for a genuinely signed call later, is
 // simpler to verify by inspection than a shared coroutine with a signed/unsigned branch.
 inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_body_coro(
-    std::string host, std::string target, PrivateRestConfig cfg) {
+    EndpointPermit permit, std::string target, PrivateRestConfig cfg, RestTestSeam seam) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     PrivateRestError current_stage = PrivateRestError::Resolve;
     try {
+        // The host is the permit's and nobody else's: SNI, hostname verification, the Host header and
+        // (unless a test seam redirects the TCP connection) the connect target all use it.
+        const std::string host(permit.host());
         auto executor = co_await net::this_coro::executor;
 
         ssl::context ssl_ctx(ssl::context::tlsv12_client);
         hy::configure_binance_ssl_context(ssl_ctx);
-        if (!cfg.extra_trusted_ca_pem_path.empty()) {
-            ssl_ctx.load_verify_file(cfg.extra_trusted_ca_pem_path);
+        if (!seam.extra_trusted_ca_pem_path().empty()) {
+            ssl_ctx.load_verify_file(seam.extra_trusted_ca_pem_path());
         }
 
         tcp::resolver resolver(executor);
@@ -1043,7 +1054,7 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_
         hy::configure_binance_hostname_verification(stream, host);
 
         const std::string& connect_host =
-            cfg.connect_host_override.empty() ? host : cfg.connect_host_override;
+            seam.connect_host_override().empty() ? host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
         resolve_timer.expires_after(std::chrono::milliseconds(cfg.effective_resolve_timeout_ms()));
         auto resolve_result =
@@ -1124,11 +1135,10 @@ public:
     // default_cfg: Batch H, H2 -- the config every below-8-method no-cfg-arg overload
     // forwards to (see e.g. query_order(const OrderExpectation&) further down). Passed by
     // value and moved into default_cfg_ deliberately: this constructor is noexcept, and
-    // PrivateRestConfig holds std::string members (port/extra_trusted_ca_pem_path/
-    // connect_host_override) -- a copy-construction from a const& could theoretically throw
-    // (bad_alloc), which inside a noexcept constructor would call std::terminate(). Taking
-    // it by value pushes any such copy to the caller's side of this function's boundary;
-    // std::string's move constructor itself never throws.
+    // PrivateRestConfig holds a std::string member (port) -- a copy-construction from a const&
+    // could theoretically throw (bad_alloc), which inside a noexcept constructor would call
+    // std::terminate(). Taking it by value pushes any such copy to the caller's side of this
+    // function's boundary; std::string's move constructor itself never throws.
     BinancePrivateRestClient(EnvironmentBinding binding,
                               std::unique_ptr<BoundHmacCredentials> creds,
                               SpotRateLimitTracker* rate_limiter = nullptr,
@@ -1172,12 +1182,13 @@ public:
     // clock_publisher(), closing the previously-offline-only clock-sync loop. Never signs
     // anything and never touches creds_.
     PrivateRestError sync_clock(const PrivateRestConfig& cfg) {
-        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
+        const auto permit = endpoint_permit();
+        if (!permit) return PrivateRestError::InvalidConfig;
         net::io_context ioc;
         std::variant<detail::ServerTimeFetchResult, PrivateRestError> outcome =
             PrivateRestError::None;
         net::co_spawn(
-            ioc, detail::fetch_server_time_coro(std::string(binding_.base_host()), cfg),
+            ioc, detail::fetch_server_time_coro(*permit, cfg, test_seam_),
             [&outcome](std::exception_ptr eptr,
                        std::variant<detail::ServerTimeFetchResult, PrivateRestError> r) {
                 if (eptr) {
@@ -1220,7 +1231,8 @@ public:
         // method that went straight to `*creds_` (audit P2-002); the endpoint policy is checked
         // before anything is signed (audit P2-001).
         if (!creds_) return PrivateRestError::SigningFailed;
-        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
+        const auto permit = endpoint_permit();
+        if (!permit) return PrivateRestError::InvalidConfig;
 
         std::int64_t fresh_ts_ms = 0;
         if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
@@ -1254,8 +1266,8 @@ public:
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
             ioc,
-            detail::fetch_signed_body_coro(std::string(binding_.base_host()), target,
-                                            std::string(key_buf.data(), key_len), cfg),
+            detail::fetch_signed_body_coro(*permit, target,
+                                            std::string(key_buf.data(), key_len), cfg, test_seam_),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                 if (eptr) std::rethrow_exception(eptr);
                 outcome = std::move(r);
@@ -1297,7 +1309,8 @@ public:
     PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len,
                                         const PrivateRestConfig& cfg) {
         if (!creds_) return PrivateRestError::SigningFailed;
-        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
+        const auto permit = endpoint_permit();
+        if (!permit) return PrivateRestError::InvalidConfig;
 
         std::array<char, kApiKeyLen> key_buf{};
         std::size_t key_len = 0;
@@ -1309,9 +1322,8 @@ public:
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
             ioc,
-            detail::fetch_signed_body_coro(std::string(binding_.base_host()),
-                                            "/api/v3/userDataStream",
-                                            std::string(key_buf.data(), key_len), cfg,
+            detail::fetch_signed_body_coro(*permit, "/api/v3/userDataStream",
+                                            std::string(key_buf.data(), key_len), cfg, test_seam_,
                                             http::verb::post),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                 if (eptr) std::rethrow_exception(eptr);
@@ -1374,7 +1386,8 @@ public:
     PrivateRestError fetch_exchange_info(ParsedExchangeInfo& out,
                                           std::span<const std::string_view> symbols,
                                           const PrivateRestConfig& cfg) {
-        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
+        const auto permit = endpoint_permit();
+        if (!permit) return PrivateRestError::InvalidConfig;
 
         std::string target;
         if (!build_exchange_info_target(symbols, target)) {
@@ -1384,7 +1397,7 @@ public:
         net::io_context ioc;
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
-            ioc, detail::fetch_public_body_coro(std::string(binding_.base_host()), target, cfg),
+            ioc, detail::fetch_public_body_coro(*permit, target, cfg, test_seam_),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                 if (eptr) std::rethrow_exception(eptr);
                 outcome = std::move(r);
@@ -1438,7 +1451,8 @@ public:
     QueryResult query_order(const OrderExpectation& expected,
                              const PrivateRestConfig& cfg) noexcept {
         if (!creds_) return QueryResult::not_sent();
-        if (!endpoint_permitted()) return QueryResult::not_sent();  // nothing sent (R-10)
+        const auto permit = endpoint_permit();
+        if (!permit) return QueryResult::not_sent();  // nothing sent (R-10)
         if (expected.client_order_id.empty()) return QueryResult::not_sent();
         if (expected.rules_snapshot_at_submit.symbol[0] == '\0') return QueryResult::not_sent();
 
@@ -1498,8 +1512,9 @@ public:
             std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
             net::co_spawn(
                 ioc,
-                detail::fetch_signed_body_coro(std::string(binding_.base_host()), target,
-                                                std::string(key_buf.data(), key_len), cfg),
+                detail::fetch_signed_body_coro(*permit, target,
+                                                std::string(key_buf.data(), key_len), cfg,
+                                                test_seam_),
                 [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                     if (eptr) std::rethrow_exception(eptr);
                     outcome = std::move(r);
@@ -1563,7 +1578,8 @@ public:
         // re-derive" pattern) -- this parameter is genuinely unused by this implementation.
         (void)symbol_id;
         if (!creds_) return {SubmitOutcome::NetworkError, 0, -1};
-        if (!endpoint_permitted()) return {SubmitOutcome::NetworkError, 0, -1};  // provably pre-send
+        const auto permit = endpoint_permit();
+        if (!permit) return {SubmitOutcome::NetworkError, 0, -1};  // provably pre-send
         if (client_order_id.empty()) return {SubmitOutcome::NetworkError, 0, -1};
         if (rules_snapshot.symbol[0] == '\0') return {SubmitOutcome::NetworkError, 0, -1};
         if (price_ticks <= 0 || qty_ticks <= 0) return {SubmitOutcome::NetworkError, 0, -1};
@@ -1620,9 +1636,9 @@ public:
             std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
             net::co_spawn(
                 ioc,
-                detail::fetch_signed_body_coro(std::string(binding_.base_host()), target,
+                detail::fetch_signed_body_coro(*permit, target,
                                                 std::string(key_buf.data(), key_len), cfg,
-                                                http::verb::post),
+                                                test_seam_, http::verb::post),
                 [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                     if (eptr) std::rethrow_exception(eptr);
                     outcome = std::move(r);
@@ -1643,15 +1659,16 @@ public:
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }
 
 private:
-    // Audit P2-001 (SAFE-01): the bound environment's transport policy decides which host this
-    // client may resolve and connect to at all. Called at the top of every network method, before
-    // anything is signed, resolved or connected; a refusal is a configuration error, not a
-    // transport failure. The check is on the logical host (binding_.base_host()), never on
-    // PrivateRestConfig::connect_host_override: the override only redirects the TCP connection of
-    // the test fixtures, while TLS still verifies the certificate against the logical host.
-    bool endpoint_permitted() const noexcept {
-        return check_endpoint(binding_.transport_policy(), binding_.base_host()) ==
-               TransportCheck::Ok;
+    // Audit P2-001 / P1-001 (SAFE-01): the bound environment's transport policy decides which host
+    // this client may resolve and connect to at all. Called at the top of every network method,
+    // before anything is signed, resolved or connected, and the permit it returns is what the
+    // coroutines in namespace detail connect with -- they take no separate host -- so a new request
+    // method that skipped the check would not compile. A refusal is a configuration error, not a
+    // transport failure. The check is on the logical host (binding_.base_host()), never on a test
+    // seam's connect target: the seam only redirects the TCP connection of the test fixtures, while
+    // TLS still verifies the certificate against the logical host.
+    std::optional<EndpointPermit> endpoint_permit() const noexcept {
+        return issue_endpoint_permit(binding_.transport_policy(), binding_.base_host());
     }
 
     // Shared by keepalive_listen_key()/close_listen_key() -- identical shape (percent-encode the
@@ -1660,7 +1677,8 @@ private:
     PrivateRestError call_listen_key_endpoint(std::string_view listen_key, http::verb verb,
                                                const PrivateRestConfig& cfg) {
         if (!creds_) return PrivateRestError::SigningFailed;
-        if (!endpoint_permitted()) return PrivateRestError::InvalidConfig;
+        const auto permit = endpoint_permit();
+        if (!permit) return PrivateRestError::InvalidConfig;
         if (listen_key.empty()) return PrivateRestError::InvalidConfig;
 
         std::array<char, kApiKeyLen> key_buf{};
@@ -1676,8 +1694,9 @@ private:
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
             ioc,
-            detail::fetch_signed_body_coro(std::string(binding_.base_host()), target,
-                                            std::string(key_buf.data(), key_len), cfg, verb),
+            detail::fetch_signed_body_coro(*permit, target,
+                                            std::string(key_buf.data(), key_len), cfg, test_seam_,
+                                            verb),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                 if (eptr) std::rethrow_exception(eptr);
                 outcome = std::move(r);
@@ -1691,7 +1710,8 @@ private:
     }
 
     // Test-only (tests/binance_private_rest_test_hooks.hpp): publishes a snapshot that is fresh right
-    // now, so a test can reach the code that sits behind the clock gate without a network round trip.
+    // now, so a test can reach the code that sits behind the clock gate without a network round trip,
+    // and installs the RestTestSeam that points the client at a loopback fixture.
     friend class BinancePrivateRestClientTestHooks;
 
     EnvironmentBinding binding_;
@@ -1700,6 +1720,8 @@ private:
     SpotRateLimitTracker* rate_limiter_{nullptr};
     EndpointWeightTable weight_table_{};
     PrivateRestConfig default_cfg_{};
+    // Empty in production: nothing but the friend hook above can fill it (rest_test_seam.hpp).
+    RestTestSeam test_seam_{};
 };
 
 // Bridges BinancePrivateRestClient::query_order() to QueryPort::QueryFn's plain

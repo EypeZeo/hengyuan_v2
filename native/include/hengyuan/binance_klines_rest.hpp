@@ -38,6 +38,7 @@
 #include <hengyuan/binance_rest_snapshot.hpp>  // detail::is_valid_rest_host / _symbol; net/beast/http/ssl/tcp aliases
 #include <hengyuan/binance_tls.hpp>
 #include <hengyuan/kline_bar.hpp>
+#include <hengyuan/rest_test_seam.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -54,10 +55,9 @@ struct PublicRestConfig {
     std::string host;  // REQUIRED, no default (see the file header): EnvironmentBinding::base_host()
     std::string port = "443";
 
-    // Test-only escape hatches, identical in meaning to RestSnapshotConfig's: an extra trusted CA,
-    // and a connect target that differs from the SNI/verification host. Empty in production.
-    std::string extra_trusted_ca_pem_path;
-    std::string connect_host_override;
+    // Deliberately no connect-target override and no extra trust anchor in here (audit P1-001, fault
+    // case FI-032), same as RestSnapshotConfig: a test passes a RestTestSeam (rest_test_seam.hpp) as the
+    // separate, defaulted last argument of the fetch functions below.
 };
 
 enum class PublicRestError : std::uint8_t {
@@ -116,7 +116,8 @@ inline bool is_valid_public_rest_target(std::string_view target) {
     return true;
 }
 
-inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string target, PublicRestConfig cfg) {
+inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string target, PublicRestConfig cfg,
+                                                                  RestTestSeam seam) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     PublicRestError current_stage = PublicRestError::Resolve;
@@ -126,8 +127,8 @@ inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string tar
         current_stage = PublicRestError::TlsHandshake;  // covers ssl_ctx setup below too
         ssl::context ssl_ctx(ssl::context::tlsv12_client);
         hy::configure_binance_ssl_context(ssl_ctx);
-        if (!cfg.extra_trusted_ca_pem_path.empty()) {
-            ssl_ctx.load_verify_file(cfg.extra_trusted_ca_pem_path);
+        if (!seam.extra_trusted_ca_pem_path().empty()) {
+            ssl_ctx.load_verify_file(seam.extra_trusted_ca_pem_path());
         }
 
         tcp::resolver resolver(executor);
@@ -149,7 +150,7 @@ inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string tar
         // tcp::resolver, so this one stage needs its own race (same as the depth fetcher).
         current_stage = PublicRestError::Resolve;
         const std::string& connect_host =
-            cfg.connect_host_override.empty() ? cfg.host : cfg.connect_host_override;
+            seam.connect_host_override().empty() ? cfg.host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
         resolve_timer.expires_after(std::chrono::seconds(5));
         auto resolve_result =
@@ -203,7 +204,8 @@ inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string tar
 
 // Fetches `target` (origin-form path + query) over TLS from cfg.host. Never throws for network or
 // protocol failures; the failing stage is in `error`, and `body` is only set on success.
-inline PublicRestResponse fetch_public_body(const std::string& target, const PublicRestConfig& cfg) {
+inline PublicRestResponse fetch_public_body(const std::string& target, const PublicRestConfig& cfg,
+                                            const RestTestSeam& seam = {}) {
     if (!detail::is_valid_rest_host(cfg.host) || cfg.port.empty() ||
         !detail::is_valid_public_rest_target(target)) {
         return detail::public_rest_failure(PublicRestError::InvalidConfig);
@@ -212,7 +214,7 @@ inline PublicRestResponse fetch_public_body(const std::string& target, const Pub
     net::io_context ioc;
     bool completed = false;
     PublicRestResponse outcome;
-    net::co_spawn(ioc, detail::fetch_public_body_coro(target, cfg),
+    net::co_spawn(ioc, detail::fetch_public_body_coro(target, cfg, seam),
                   [&](std::exception_ptr eptr, PublicRestResponse r) {
                       // The coroutine catches boost::system::system_error itself; anything that
                       // escapes here (e.g. std::bad_alloc) is genuinely exceptional and propagates.
@@ -256,7 +258,7 @@ struct KlinesFetchResult {
 inline KlinesFetchResult fetch_klines_backfill(std::string_view symbol, std::string_view interval, int limit,
                                                 std::uint32_t symbol_id, const PublicRestConfig& cfg,
                                                 const std::function<std::int64_t()>& now_ms,
-                                                KlineBackfill& out) {
+                                                KlineBackfill& out, const RestTestSeam& seam = {}) {
     KlinesFetchResult result;
     out.count = 0;
     out.dropped_unclosed_tail = false;
@@ -274,7 +276,7 @@ inline KlinesFetchResult fetch_klines_backfill(std::string_view symbol, std::str
     }
     const std::int64_t closed_before_ms = now - kKlinesClosedBarMarginMs;
 
-    const PublicRestResponse response = fetch_public_body(target, cfg);
+    const PublicRestResponse response = fetch_public_body(target, cfg, seam);
     result.transport = response.error;
     result.http_status = response.http_status;
     if (response.error != PublicRestError::None) return result;
@@ -301,10 +303,11 @@ struct KlinesBackfillOutcome {
 // the hot thread mutates.
 inline KlinesBackfillOutcome fetch_klines_backfill_outcome(const KlinesBackfillRequest& request,
                                                             const PublicRestConfig& cfg,
-                                                            const std::function<std::int64_t()>& now_ms) {
+                                                            const std::function<std::int64_t()>& now_ms,
+                                                            const RestTestSeam& seam = {}) {
     KlinesBackfillOutcome outcome;
     outcome.status = fetch_klines_backfill(request.symbol, request.interval, static_cast<int>(request.limit),
-                                            request.symbol_id, cfg, now_ms, outcome.data);
+                                            request.symbol_id, cfg, now_ms, outcome.data, seam);
     return outcome;
 }
 
