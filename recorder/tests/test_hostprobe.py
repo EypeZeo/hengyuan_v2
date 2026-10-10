@@ -131,6 +131,54 @@ def test_reconnect_gaps_are_close_to_open_per_connection_for_the_running_recorde
     ]
 
 
+def test_reconnect_gaps_survive_a_run_older_than_the_newest_three_ledger_files(tmp_path):
+    # The probe reads the newest three daily files. A recorder that has been up for days no longer has its
+    # PROC_START among them, so the running run must be told from the events themselves (the highest run
+    # number seen), not from the start event: otherwise every gap is dropped and the rotation hole of a
+    # long-running recorder is never measured (run 4 of 2026-10-07 reached this on 2026-10-10).
+    def close(q, hours_ago, conn, reason):
+        return {"run": 4, "q": q, "t": _us(hours_ago), "k": "WS_CLOSE", "conn": conn, "reason": reason}
+
+    def opened(q, hours_ago, conn, plus_s):
+        t = _us(hours_ago) + int(plus_s * 1_000_000)
+        return {"run": 4, "q": q, "t": t, "k": "WS_OPEN", "conn": conn}
+
+    ledger = tmp_path / "ledger"
+    start = {"run": 4, "q": 1, "t": _us(100), "k": "PROC_START", "version": "0.1.0", "prev_clean": True}
+    _write_jsonl(ledger / "20261001.jsonl", [start])
+    _write_jsonl(
+        ledger / "20261002.jsonl", [close(2, 60, "spot_trade", "rotation"), opened(3, 60, "spot_trade", 0.4)]
+    )
+    _write_jsonl(
+        ledger / "20261003.jsonl", [close(4, 40, "spot_trade", "rotation"), opened(5, 40, "spot_trade", 0.4)]
+    )
+    _write_jsonl(
+        ledger / "20261004.jsonl",
+        [
+            close(6, 5, "usdm_market", "closed:None"),
+            opened(7, 5, "usdm_market", 0.31),
+            close(8, 2, "spot_trade", "rotation"),
+            opened(9, 2, "spot_trade", 0.52),
+        ],
+    )
+    led = hostprobe._ledger(str(tmp_path), NOW_S)
+    assert led["last_proc_start"] is None  # the start event really is outside the files read
+    got = sorted((g["conn"], g["reason"], g["gap_s"]) for g in led["reconnect_gaps"])
+    assert got == [("spot_trade", "rotation", 0.52), ("usdm_market", "closed", 0.31)]
+
+
+def test_reconnect_gaps_of_an_earlier_run_are_dropped_when_a_newer_run_is_in_the_files(tmp_path):
+    events = [
+        {"run": 3, "q": 1, "t": _us(9), "k": "WS_CLOSE", "conn": "spot_trade", "reason": "rotation"},
+        {"run": 3, "q": 2, "t": _us(9) + 5_300_000, "k": "WS_OPEN", "conn": "spot_trade"},
+        {"run": 4, "q": 1, "t": _us(8), "k": "WS_CLOSE", "conn": "spot_trade", "reason": "closed:None"},
+        {"run": 4, "q": 2, "t": _us(8) + 400_000, "k": "WS_OPEN", "conn": "spot_trade"},
+    ]
+    _write_jsonl(tmp_path / "ledger" / "20261003.jsonl", events)
+    gaps = hostprobe._ledger(str(tmp_path), NOW_S)["reconnect_gaps"]
+    assert [(g["run"], g["reason"], g["gap_s"]) for g in gaps] == [(4, "closed", 0.4)]
+
+
 def test_ledger_summary_counts_only_the_last_24_hours_and_keeps_the_latest_clock_state(tmp_path):
     events = [
         {"run": 1, "q": 1, "t": _us(30), "k": "RATE_LIMIT"},  # too old

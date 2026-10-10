@@ -32,7 +32,7 @@ D:\My_Projects\hengyuan_ops\d0\
 计划任务 `HengYuan-D0-Maintenance`（`tools/install_maint_task.ps1` 注册：每天 06:00，另在每次登录后 5 分钟补跑；只在用户已登录时运行；距上次成功不足 6 小时则什么都不做）：
 
 1. `pull`：镜像宿主机上已封存的段，逐段校验大小与 SHA-256，**之后**才回执（宿主机凭回执才清理）。
-2. 只读探测宿主机（`hostprobe.py` 经 ssh 标准输入送过去，不写任何东西）：服务状态与重启数、磁盘、保留与驱逐、未回执积压、最近 24 小时账本事件、时钟同步、内存、journal、同机服务。
+2. 只读探测宿主机（`hostprobe.py` 经 ssh 标准输入送过去，不写任何东西）：服务状态与重启数、磁盘、保留与驱逐、未回执积压、最近 24 小时账本事件（`latest.txt` 里 `rotations …` 与 `unplanned closes …` 两行是计划轮换与非计划断连的次数和重连空洞范围，只是事实，超过阈值才成告警）、时钟同步、内存、journal、同机服务。
 3. 本地空间检查。
 4. **每 7 天**对整个数据湖做一次完整 `verify`（含哈希）并保存 `report`。
 5. 写 `logs\latest.txt`（给人看）、`logs\status.json`（给程序看）、当次完整日志；退出码 0 正常、1 WARN、2 CRIT（计划任务的“上次运行结果”就是它）。
@@ -63,6 +63,8 @@ D:\My_Projects\hengyuan_ops\d0\
 | `GAP_DETECTED` / `SUBSCRIBED_NO_DATA` / `BAD_FRAME` | WARN | 录制器自己看到序号缺口 / 订阅后始终没数据（路径错？）/ 有帧走了回退记录 | 看账本事件的流名与区间；`SUBSCRIBED_NO_DATA` 不应该出现，出现就是订阅路径或交易所行为变了 |
 | `LOOP_LAG` / `REST_FROZEN` / `RETENTION_STEPDOWN` | WARN | 事件循环停顿（那一刻的 `t_recv` 偏晚）/ REST 被冻结 / 保留期因磁盘紧而降档 | 看账本事件；降档说明磁盘紧而 pull 没跟上，同 `HOST_DISK` |
 | `ROTATION_HOLE` | WARN | 正在运行的录制器某次**计划轮换**的 `WS_CLOSE` → `WS_OPEN` 超过 2 秒（修复后预期 0.3 至 0.6 秒；旧版是 5.3 秒） | 多半是关闭超时又被改回去了或服务端行为变了：对照 `session.py` 的 `close_timeout_s` 与账本里那次轮换 |
+| `UNPLANNED_HOLE` | WARN | 正在运行的录制器某次**非计划**断连（原因不是 `rotation`/`stop`：对端或路径主动关闭 `closed`、异常 `error`、静默 `stall`、深度缺口 `gap` 等）的 `WS_CLOSE` → `WS_OPEN` 超过 2 秒（一次快速重连通常 0.3 至 0.9 秒；连接活不过 60 秒会指数退避，空洞可达数十秒） | 这是一段没人计划的数据空洞：看账本里那次关闭的原因、连接与时间；`stall` 同时会有 `STREAM_STALL`，多条连接同一时刻多半是出口网络；`verify` 会把空洞标出来，不用补救 |
+| `UNPLANNED_CLOSES` | WARN | 24 小时内非计划断连累计 ≥ 24 次（约每小时一次；2026-10-09 实测 9 次，都落在整分钟边界上、原因 `closed:None`，对端或路径主动断开，重连只用了 0.25 至 0.63 秒） | 连接在抖：看 `latest.txt` 的 `unplanned closes` 行里的原因分布，再对照账本里的时间规律、出口网络、币安公告与同机 `xray` 的状态；阈值在 `maint.json` 的 `thresholds` 里改（`unplanned_closes_warn`、`unplanned_hole_warn_s`） |
 | `CLOCK_UNSYNCED` / `CLOCK_STALE` | WARN | 时钟长时间未同步 / 超过 3 小时没有 NTP 交换 | 宿主机 `timedatectl`、`systemctl status systemd-timesyncd`；期间的 `t` 与 `CLOCK_PROBE` 偏移不可信 |
 | `MEMORY_HIGH` / `OOM_KILL` | WARN ≥300 MB / CRIT | 录制器内存（单元 `MemoryHigh=400M`） | 看趋势：anon 在 138 至 163 MB 之间浮动属正常；持续上涨再查 |
 | `JOURNAL_VOLATILE` / `JOURNAL_BIG` | WARN | journal 又不持久了 / 超过 250 MB（上限 200 MB） | 检查 `/etc/systemd/journald.conf.d/50-hy-persistent.conf` 与 `/var/log/journal` |

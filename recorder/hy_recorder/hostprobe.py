@@ -155,9 +155,13 @@ def _ledger(root: str, now_s: float) -> dict[str, Any]:
         tuple[Any, Any], tuple[int, str]
     ] = {}  # (run, connection) -> (time, reason) of its last close
     gaps: list[dict[str, Any]] = []
+    newest_run: int | None = None  # the running recorder: the highest run number in the files read
     for fp in files:
         for ev in _jsonl(fp):
             k, t = ev.get("k"), ev.get("t")
+            run = ev.get("run")
+            if isinstance(run, int) and (newest_run is None or run > newest_run):
+                newest_run = run
             if k == "CLOCK_STATE":
                 last_clock_state = ev
             elif k == "PROC_START":
@@ -182,7 +186,9 @@ def _ledger(root: str, now_s: float) -> dict[str, Any]:
             counts[k] += 1
             if k == "WS_CLOSE":
                 close_reasons[str(ev.get("reason", "?")).split(":")[0]] += 1
-    current_run = (last_start or {}).get("run")
+    # not ``last_start["run"]``: a recorder up for days no longer has its PROC_START among the newest three
+    # daily files, and without a run number every gap (the rotation holes above all) would be dropped
+    current_run = newest_run
     return {
         "events_24h": dict(counts),
         "ws_close_reasons_24h": dict(close_reasons),
