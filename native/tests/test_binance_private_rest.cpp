@@ -29,6 +29,8 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_private_rest.hpp>
 
+#include "binance_environment_test_hooks.hpp"
+#include "binance_private_rest_test_hooks.hpp"
 #include "test_helpers/blackhole_acceptor.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
 
@@ -1800,4 +1802,105 @@ TEST_F(BoundCredentialsFixture, KeepaliveListenKeyEmptyKeyIsInvalidConfigWithout
     cfg.connect_host_override = "127.0.0.1";
     EXPECT_EQ(client.keepalive_listen_key("", cfg), PrivateRestError::InvalidConfig);
     EXPECT_EQ(client.close_listen_key("", cfg), PrivateRestError::InvalidConfig);
+}
+
+// --- SAFE-01 slice 1 (audit P2-001 / P2-002) ---
+
+// P2-002: fetch_account() was the one public method that went straight to `*creds_`. With a fresh
+// clock the unguarded code gets past the clock gate and dereferences the null pointer: a crash, not
+// an assertion failure -- which is exactly the point of reaching it.
+TEST(FetchAccountEntryGuards, NullCredentialsFailsClosedEvenWithAFreshClock) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), nullptr);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    AccountSnapshot out{};
+    out.timestamp_ms = 42;
+    EXPECT_EQ(client.fetch_account(out), PrivateRestError::SigningFailed);
+    EXPECT_EQ(out.timestamp_ms, 42) << "out must be left untouched on every failure path";
+}
+
+namespace {
+
+// A binding whose allowlist does not contain the host it is bound to: the only way to show that a
+// client consults the transport policy before it touches the network.
+EnvironmentBinding blocked_testnet_binding() {
+    hy::EndpointAllowlist al{};
+    al.hosts[0] = "not-the-bound-host.example";
+    al.count = 1;
+    return hy::EnvironmentBindingTestHooks::with_allowlist(EnvironmentBinding::testnet(), al);
+}
+
+// A local TLS responder that records every request, plus a client with a fresh clock and real
+// (synthetic) credentials: whatever the policy check lets through shows up as a recorded request,
+// and the clock gate no longer hides a missing check behind a ClockNotFresh result.
+class BlockedEndpointFixture : public BoundCredentialsFixture {
+protected:
+    hy::test_helpers::TlsResponseAcceptor server_{fixture_path("test_leaf_cert_testnet_host.pem"),
+                                                  fixture_path("test_leaf_key_testnet_host.pem"),
+                                                  200, R"({"serverTime":1700000000000})"};
+    PrivateRestConfig cfg_;
+    std::unique_ptr<BinancePrivateRestClient> client_;
+
+    void SetUp() override {
+        BoundCredentialsFixture::SetUp();
+        cfg_.port = std::to_string(server_.port());
+        cfg_.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
+        cfg_.connect_host_override = "127.0.0.1";
+        client_ = std::make_unique<BinancePrivateRestClient>(blocked_testnet_binding(), make_creds());
+        hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(*client_);
+    }
+};
+
+}  // namespace
+
+TEST_F(BlockedEndpointFixture, SyncClockIsRefusedBeforeAnyNetworkAttempt) {
+    EXPECT_EQ(client_->sync_clock(cfg_), PrivateRestError::InvalidConfig);
+    EXPECT_TRUE(server_.requests().empty());
+}
+
+TEST_F(BlockedEndpointFixture, FetchAccountIsRefusedBeforeAnyNetworkAttempt) {
+    AccountSnapshot out{};
+    EXPECT_EQ(client_->fetch_account(out, cfg_), PrivateRestError::InvalidConfig);
+    EXPECT_TRUE(server_.requests().empty());
+}
+
+TEST_F(BlockedEndpointFixture, CreateListenKeyIsRefusedBeforeAnyNetworkAttempt) {
+    char buf[kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_EQ(client_->create_listen_key(buf, len, cfg_), PrivateRestError::InvalidConfig);
+    EXPECT_TRUE(server_.requests().empty());
+}
+
+TEST_F(BlockedEndpointFixture, KeepaliveAndCloseListenKeyAreRefusedBeforeAnyNetworkAttempt) {
+    EXPECT_EQ(client_->keepalive_listen_key("some-key", cfg_), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client_->close_listen_key("some-key", cfg_), PrivateRestError::InvalidConfig);
+    EXPECT_TRUE(server_.requests().empty());
+}
+
+TEST_F(BlockedEndpointFixture, FetchExchangeInfoIsRefusedBeforeAnyNetworkAttempt) {
+    hy::ParsedExchangeInfo info{};
+    const std::string_view symbols[] = {"BTCUSDT"};
+    EXPECT_EQ(client_->fetch_exchange_info(info, symbols, cfg_), PrivateRestError::InvalidConfig);
+    EXPECT_TRUE(server_.requests().empty());
+}
+
+TEST_F(BlockedEndpointFixture, QueryOrderIsNotSentAndNothingReachesTheNetwork) {
+    const auto expected = make_btcusdt_expectation("coid-blocked-endpoint");
+    EXPECT_EQ(client_->query_order(expected, cfg_).outcome, QueryOutcome::NotSent);
+    EXPECT_TRUE(server_.requests().empty());
+}
+
+TEST_F(BlockedEndpointFixture, SubmitOrderIsRefusedAndNothingReachesTheNetwork) {
+    const auto rules = make_btcusdt_rules();
+    const auto resp = client_->submit_order("coid-blocked-endpoint", 1, OrderSide::Buy, OrderType::Limit,
+                                             5'000'012, 100'000, rules, cfg_);
+    EXPECT_EQ(resp.outcome, SubmitOutcome::NetworkError);
+    EXPECT_TRUE(server_.requests().empty());
+}
+
+// The control: the genuine binding passes its own check, so the tests above are not passing
+// because the whole client is broken.
+TEST_F(BlockedEndpointFixture, TheGenuineBindingStillReachesTheNetwork) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    EXPECT_EQ(client.sync_clock(cfg_), PrivateRestError::None);
+    EXPECT_EQ(server_.requests().size(), 1u);
 }

@@ -33,6 +33,26 @@ TEST(EndpointAllowlist, RejectsUnknownHost) {
     EXPECT_FALSE(al.contains(""));
 }
 
+// SAFE-01 slice 1 (audit P2-001): `count` is a public field; a value above the array's capacity
+// must never become a read past `hosts`.
+
+TEST(EndpointAllowlist, CountExactlyAtCapacityIsStillAValidAllowlist) {
+    auto al = binance_default_endpoints();
+    ASSERT_EQ(al.count, hy::kMaxEndpoints);
+    EXPECT_TRUE(al.contains("api3.binance.com"));  // the last slot
+}
+
+TEST(EndpointAllowlist, CountAboveCapacityIsClampedNotWalked) {
+    // An unclamped walk over SIZE_MAX entries runs off the array and reads whatever follows it:
+    // a crash under every toolchain (and a stack-buffer-overflow report under ASan).
+    auto al = binance_default_endpoints();
+    al.count = std::numeric_limits<std::size_t>::max();
+    EXPECT_TRUE(al.contains("api.binance.com"));
+    EXPECT_TRUE(al.contains("api3.binance.com"));
+    EXPECT_FALSE(al.contains("evil.example.com"));
+    EXPECT_FALSE(al.contains(""));
+}
+
 // --- Policy validation ---
 
 TEST(TransportPolicy, DefaultPolicyIsValid) {
@@ -82,6 +102,16 @@ TEST(TransportPolicy, RejectsEmptyEndpointList) {
     EXPECT_EQ(validate_policy(p), TransportCheck::EndpointNotAllowed);
 }
 
+TEST(TransportPolicy, RejectsEndpointCountAboveCapacity) {
+    TransportPolicy p{};
+    p.endpoint_allowlist.count = hy::kMaxEndpoints + 1;
+    EXPECT_EQ(validate_policy(p), TransportCheck::EndpointNotAllowed);
+    p.endpoint_allowlist.count = std::numeric_limits<std::size_t>::max();
+    EXPECT_EQ(validate_policy(p), TransportCheck::EndpointNotAllowed);
+    p.endpoint_allowlist.count = hy::kMaxEndpoints;  // the boundary itself is fine
+    EXPECT_EQ(validate_policy(p), TransportCheck::Ok);
+}
+
 // --- Endpoint check ---
 
 TEST(TransportPolicy, EndpointCheckAllowsValidHost) {
@@ -92,6 +122,13 @@ TEST(TransportPolicy, EndpointCheckAllowsValidHost) {
 TEST(TransportPolicy, EndpointCheckRejectsInvalidHost) {
     TransportPolicy p{};
     EXPECT_EQ(check_endpoint(p, "evil.com"), TransportCheck::EndpointNotAllowed);
+}
+
+TEST(TransportPolicy, EndpointCheckFailsClosedOnACorruptAllowlistEvenForAListedHost) {
+    // contains() would clamp and still match api.binance.com; the check refuses the list itself.
+    TransportPolicy p{};
+    p.endpoint_allowlist.count = hy::kMaxEndpoints + 1;
+    EXPECT_EQ(check_endpoint(p, "api.binance.com"), TransportCheck::EndpointNotAllowed);
 }
 
 // --- HTTP status check ---
