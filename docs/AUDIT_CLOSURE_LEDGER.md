@@ -95,7 +95,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 审计 ID | 等级 | 类别 | 状态 | 阻塞门禁 | 门禁结果 | 缺失段 |
 | :---: | :---: | :---: | :---: | :--- | :---: | :--- |
 | **P0-001** | CRITICAL | live | REMEDIATING | 实盘订单提交 | BLOCKED | code, fault, test, runtime, budget |
-| **P1-001** | HIGH | lib | REMEDIATING | 真实网络调用 | BLOCKED | code, fault, test, runtime |
+| **P1-001** | HIGH | lib | CLOSED | 真实网络调用 | CLEARED | — |
 | **P1-002** | HIGH | live | REMEDIATING | 订单生命周期 | BLOCKED | code, fault, test, runtime, budget |
 | **P1-003** | HIGH | lib | REMEDIATING | 账户数据解析 | BLOCKED | code, fault, test, runtime, budget |
 | **P1-004** | HIGH | lib | PARTIAL | 策略回测准入 | BLOCKED | contract |
@@ -124,7 +124,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 门禁 | 结果 | 未关闭或暂缓的项 |
 | :--- | :---: | :--- |
 | 实盘订单提交 | BLOCKED | P0-001 |
-| 真实网络调用 | BLOCKED | P1-001 |
+| 真实网络调用 | CLEARED | — |
 | 订单生命周期 | BLOCKED | P1-002 |
 | 账户数据解析 | BLOCKED | P1-003 |
 | 策略回测准入 | BLOCKED | P1-004 |
@@ -141,7 +141,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 9，DEFERRED 3，PARTIAL 3，CLOSED 11，合计 26。
+状态计数：REMEDIATING 8，DEFERRED 3，PARTIAL 3，CLOSED 12，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -176,7 +176,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-029** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-030** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-031** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-032** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-032** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 8c616a4 |
 | **FI-033** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-035** | PRE_OWNER_LIVE | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -193,11 +193,11 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 28 | 0 | 19 | 9 | BLOCKED |
+| PRE_D3 | 28 | 1 | 18 | 9 | BLOCKED |
 | PRE_OWNER_LIVE | 13 | 0 | 1 | 12 | BLOCKED |
 | CANARY | 4 | 0 | 0 | 4 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 25，PARTIAL 20，IMPLEMENTED 0，合计 45，其中门禁 PASS 0 条。
+故障用例计数：NOT_TESTABLE_YET 25，PARTIAL 19，IMPLEMENTED 1，合计 45，其中门禁 PASS 1 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -248,18 +248,17 @@ legacy: P1-001
 title: 私有 REST 配置暴露可注入主机与自签 CA（行情快照与 K 线客户端另有同名字段）
 severity: HIGH
 kind: lib
-status: REMEDIATING
+status: CLOSED
 task: SAFE-01
 gate: 真实网络调用
-gate_result: BLOCKED
-open: open:native/include/hengyuan/binance_private_rest.hpp#PrivateRestConfig::extra_trusted_ca_pem_path open:native/include/hengyuan/binance_private_rest.hpp#PrivateRestConfig::connect_host_override open:native/include/hengyuan/binance_klines_rest.hpp#PublicRestConfig::extra_trusted_ca_pem_path open:native/include/hengyuan/binance_rest_snapshot.hpp#RestSnapshotConfig::extra_trusted_ca_pem_path
-seg.code: MISSING -- 三个结构体仍暴露额外信任 CA 路径，私有 REST 配置还暴露连接主机覆盖
+gate_result: CLEARED
+refs: code:native/include/hengyuan/rest_test_seam.hpp#RestTestSeam test:native/tests/test_rest_config_surface.cpp#NoRestConfigTypeCanNameAConnectTargetOverride pr:159@8c616a4
+seg.code: PRESENT absent:native/include/hengyuan/binance_private_rest.hpp#"std::string connect_host_override" absent:native/include/hengyuan/binance_private_rest.hpp#"std::string extra_trusted_ca_pem_path" absent:native/include/hengyuan/binance_rest_snapshot.hpp#"std::string connect_host_override" absent:native/include/hengyuan/binance_rest_snapshot.hpp#"std::string extra_trusted_ca_pem_path" absent:native/include/hengyuan/binance_klines_rest.hpp#"std::string connect_host_override" absent:native/include/hengyuan/binance_klines_rest.hpp#"std::string extra_trusted_ca_pem_path" code:native/include/hengyuan/rest_test_seam.hpp#RestTestSeam pr:159@8c616a4 -- 三个配置结构体都不再有这两个字段；连接目标覆盖与额外信任锚只能经 RestTestSeam 传入，它的字段私有、只有定义在 native/tests/ 的 RestTestSeamBuilder 能填；私有客户端的接缝只能由测试钩子安装，快照与 K 线的 fetch 函数把它作为最后一个带默认值的参数
 seg.contract: PRESENT doc:docs/BINANCE_PRIVATE_REST_L4_SPEC.md#EnvironmentBinding bp:"任务 SAFE-01" -- 环境一次绑定且不可变；SAFE-01 规定三处一并收口为仅测试接缝类型可注入
-seg.fault: MISSING fi:FI-032=PARTIAL -- 用例已登记但无实现，字段仍在
-seg.test: MISSING -- 尚无“生产类型不暴露该字段”的单测
-seg.runtime: MISSING -- 无 CI run 可引：修复尚未落地
+seg.fault: PRESENT:UT test:native/tests/test_rest_config_surface.cpp#NoRestConfigTypeCanNameAConnectTargetOverride test:native/tests/test_rest_config_surface.cpp#NoRestConfigTypeCanNameAnExtraTrustAnchor test:native/tests/test_rest_config_surface.cpp#OnlyTheBuilderCanFillIt fi:FI-032=IMPLEMENTED -- FI-032 的类型性质：三个配置类型没有这两个成员（带旧形状的正对照），接缝不能由生产代码填充
+seg.test: PRESENT test:native/tests/test_rest_freeze_guard.cpp#NoProductionTypeDeclaresAConnectTargetOrATrustAnchorMemberAgain test:native/tests/test_rest_freeze_guard.cpp#TheBuilderIsOnlyEverNamedByTheSeamHeadersFriendDeclaration -- 源码扫描护栏另行断言生产代码不再声明这两类成员、接缝构建器只出现在接缝头文件的友元声明里；23 个变异体（含三个配置各自把字段加回来、接缝字段改公开）全部被预期用例杀死
+seg.runtime: PRESENT run:"38059104630@8c616a4d7/ci-native.yml[native-build-test]" -- 合并后主干上真实成功的 CI Native run（GCC-14 Release 全量构建与测试）
 seg.budget: NA -- 删除字段不增加运行期成本
-closure: SAFE-01 完成，FI-032 的单测通过，且三个结构体同时收口
 ```
 
 ```ledger
@@ -355,8 +354,8 @@ status: CLOSED
 task: SAFE-01
 gate: REST 通信门禁
 gate_result: CLEARED
-refs: code:native/include/hengyuan/transport_policy.hpp#validate_policy code:native/include/hengyuan/transport_policy.hpp#check_endpoint code:native/include/hengyuan/binance_private_rest.hpp#endpoint_permitted pr:156@7a58b68
-seg.code: PRESENT code:native/include/hengyuan/transport_policy.hpp#"count > kMaxEndpoints" code:native/include/hengyuan/binance_private_rest.hpp#endpoint_permitted pr:156@7a58b68 -- contains() 的遍历钳制到数组容量，validate_policy 与 check_endpoint 拒绝超界计数；私有 REST 客户端的 7 个联网入口在签名、解析、连接之前先过 endpoint_permitted()
+refs: code:native/include/hengyuan/transport_policy.hpp#validate_policy code:native/include/hengyuan/transport_policy.hpp#check_endpoint code:native/include/hengyuan/binance_private_rest.hpp#endpoint_permit pr:156@7a58b68
+seg.code: PRESENT code:native/include/hengyuan/transport_policy.hpp#"count > kMaxEndpoints" code:native/include/hengyuan/binance_private_rest.hpp#endpoint_permit pr:156@7a58b68 -- contains() 的遍历钳制到数组容量，validate_policy 与 check_endpoint 拒绝超界计数；私有 REST 客户端的 7 个联网入口在签名、解析、连接之前先过 endpoint_permit()（PR #159 起它签发类型化的 EndpointPermit，联网协程只收许可、不收主机字符串）
 seg.contract: PRESENT doc:docs/BINANCE_PRIVATE_REST_L4_SPEC.md#TransportPolicy bp:"任务 SAFE-01" -- 规格与任务已定义“发起连接前强制检查”
 seg.fault: PRESENT:UT test:native/tests/test_transport_policy.cpp#CountAboveCapacityIsClampedNotWalked test:native/tests/test_transport_policy.cpp#RejectsEndpointCountAboveCapacity test:native/tests/test_binance_private_rest.cpp#SyncClockIsRefusedBeforeAnyNetworkAttempt -- 把“计数超界”与“白名单不含绑定主机”注入进去并断言被拒（FI-037 的端点一半；响应尺寸一半仍属 FI-037）
 seg.test: PRESENT test:native/tests/test_transport_policy.cpp#EndpointCheckFailsClosedOnACorruptAllowlistEvenForAListedHost test:native/tests/test_binance_private_rest.cpp#BlockedEndpointFixture -- 4 个策略用例与 8 个接线用例；14 个突变体（钳制、两处上界、7 个联网入口各一、恒真、恒假、错主机）全部被预期用例杀死
@@ -1231,13 +1230,12 @@ gate_tag: PRE_D3
 scope: 全部
 stage: 0
 level: L0
-status: PARTIAL
-result: NOT_RUN
-gate_result: BLOCKED
-baseline: 6cb56bd
-open: open:native/include/hengyuan/binance_private_rest.hpp#PrivateRestConfig::extra_trusted_ca_pem_path open:native/include/hengyuan/binance_private_rest.hpp#PrivateRestConfig::connect_host_override open:native/include/hengyuan/binance_klines_rest.hpp#PublicRestConfig::extra_trusted_ca_pem_path open:native/include/hengyuan/binance_rest_snapshot.hpp#RestSnapshotConfig::extra_trusted_ca_pem_path
-refs: code:native/include/hengyuan/binance_environment.hpp#EnvironmentBinding
-note: 字段仍在三个结构体里（P1-001）；生产主机由 EnvironmentBinding 决定，但类型层面没有阻止注入。
+status: IMPLEMENTED
+result: PASS
+gate_result: PASS
+baseline: 8c616a4
+refs: test:native/tests/test_rest_config_surface.cpp#NoRestConfigTypeCanNameAConnectTargetOverride test:native/tests/test_rest_config_surface.cpp#NoRestConfigTypeCanNameAnExtraTrustAnchor test:native/tests/test_rest_config_surface.cpp#OnlyTheBuilderCanFillIt code:native/include/hengyuan/rest_test_seam.hpp#RestTestSeam run:"38059104630@8c616a4d7/ci-native.yml[native-build-test]"
+note: PR #159 之后三个结构体（P1-001）都不再暴露可注入主机与自签 CA 字段，只有测试接缝类型能携带它们；判定信号是单元测试失败（类型性质测试），主干 CI Native 的全量构建与测试已成功。这是故障用例中第一条门禁通过的，其余各条与它无关。
 ```
 
 ```ledger

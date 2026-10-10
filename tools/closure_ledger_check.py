@@ -1181,8 +1181,14 @@ def self_test(ledger_path: Path) -> int:
     control("absent: 路径一个文件也匹配不到（写错路径不得空过）", m_absent_path, "E-FILE")
 
     def m_count(its):
-        it, t = token_of(its, "count4")
-        swap(it, t, dataclasses.replace(t, kind="count5", raw=t.raw.replace("count4", "count5")))
+        # No item has to carry a countN assertion at any given time (after PR #158 none did, and this control
+        # went invalid): take any code: token whose file really exists and turn it into a count that is
+        # wrong by one.
+        it, t = token_of(
+            its, "code", where=lambda t: t.needle is not None and files.text(t.path) is not None
+        )
+        wrong = files.text(t.path).count(t.needle) + 1
+        swap(it, t, dataclasses.replace(t, kind=f"count{wrong}", raw=t.raw.replace("code:", f"count{wrong}:", 1)))
 
     control("countN: 出现次数变了（兄弟位置新增了守卫）", m_count, "E-COUNT")
 
