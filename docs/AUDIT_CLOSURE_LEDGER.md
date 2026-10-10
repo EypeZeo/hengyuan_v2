@@ -100,8 +100,8 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P1-003** | HIGH | lib | REMEDIATING | 账户数据解析 | BLOCKED | code, fault, test, runtime, budget |
 | **P1-004** | HIGH | lib | PARTIAL | 策略回测准入 | BLOCKED | contract |
 | **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | code, fault, test, runtime, budget |
-| **P2-001** | MEDIUM | lib | REMEDIATING | REST 通信门禁 | BLOCKED | code, fault, test, runtime, budget |
-| **P2-002** | MEDIUM | lib | REMEDIATING | REST 通信门禁 | BLOCKED | code, fault, test, runtime |
+| **P2-001** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
+| **P2-002** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-003** | MEDIUM | lib | REMEDIATING | 下单状态转换 | BLOCKED | code, fault, test, runtime |
 | **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | code, fault, test, runtime, budget |
 | **P2-005** | MEDIUM | lib | REMEDIATING | 订单跟踪器 | BLOCKED | code, fault, test, runtime |
@@ -129,7 +129,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 账户数据解析 | BLOCKED | P1-003 |
 | 策略回测准入 | BLOCKED | P1-004 |
 | 数据质量门禁 | BLOCKED | P1-005 |
-| REST 通信门禁 | BLOCKED | P2-001, P2-002 |
+| REST 通信门禁 | CLEARED | — |
 | 下单状态转换 | BLOCKED | P2-003 |
 | 实盘发单风控 | BLOCKED | P2-004 |
 | 订单跟踪器 | BLOCKED | P2-005 |
@@ -141,7 +141,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 11，DEFERRED 3，PARTIAL 3，CLOSED 9，合计 26。
+状态计数：REMEDIATING 9，DEFERRED 3，PARTIAL 3，CLOSED 11，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -181,7 +181,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-035** | PRE_OWNER_LIVE | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-036** | PRE_D3 | L0 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-037** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-037** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 7a58b68 |
 | **FI-038** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-039** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-040** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -351,19 +351,17 @@ legacy: P2-001
 title: 传输策略未接线，白名单计数超限可致越界读取
 severity: MEDIUM
 kind: lib
-status: REMEDIATING
+status: CLOSED
 task: SAFE-01
 gate: REST 通信门禁
-gate_result: BLOCKED
-open: open:native/include/hengyuan/transport_policy.hpp#"if (p.endpoint_allowlist.count == 0) return TransportCheck::EndpointNotAllowed;" absent:native/include/hengyuan/transport_policy.hpp#"count > kMaxEndpoints" absent:native/src/*.cpp#check_endpoint absent:native/include/hengyuan/binance_private_rest.hpp#check_endpoint
-refs: code:native/include/hengyuan/transport_policy.hpp#validate_policy code:native/include/hengyuan/transport_policy.hpp#check_endpoint
-seg.code: MISSING -- check_endpoint 在 native/src 与私有 REST 客户端中没有任何调用点；EndpointAllowlist::contains 按 count 循环，validate_policy 只检查 count 为零，不检查上界
+gate_result: CLEARED
+refs: code:native/include/hengyuan/transport_policy.hpp#validate_policy code:native/include/hengyuan/transport_policy.hpp#check_endpoint code:native/include/hengyuan/binance_private_rest.hpp#endpoint_permitted pr:156@7a58b68
+seg.code: PRESENT code:native/include/hengyuan/transport_policy.hpp#"count > kMaxEndpoints" code:native/include/hengyuan/binance_private_rest.hpp#endpoint_permitted pr:156@7a58b68 -- contains() 的遍历钳制到数组容量，validate_policy 与 check_endpoint 拒绝超界计数；私有 REST 客户端的 7 个联网入口在签名、解析、连接之前先过 endpoint_permitted()
 seg.contract: PRESENT doc:docs/BINANCE_PRIVATE_REST_L4_SPEC.md#TransportPolicy bp:"任务 SAFE-01" -- 规格与任务已定义“发起连接前强制检查”
-seg.fault: MISSING fi:FI-037=PARTIAL -- 端点校验函数非测试调用点为零
-seg.test: MISSING test:native/tests/test_transport_policy.cpp#EndpointCheckRejectsInvalidHost test:native/tests/test_transport_policy.cpp#RejectsEmptyEndpointList -- 现有测试只验证函数本身，不验证接线，也没有计数超限的用例
-seg.runtime: MISSING -- 无 CI run 可引：修复尚未落地
-seg.budget: MISSING -- 未测量
-closure: SAFE-01 完成：连接前强制调用 check_endpoint，validate_policy 钳制计数上界，FI-037 的单测通过
+seg.fault: PRESENT:UT test:native/tests/test_transport_policy.cpp#CountAboveCapacityIsClampedNotWalked test:native/tests/test_transport_policy.cpp#RejectsEndpointCountAboveCapacity test:native/tests/test_binance_private_rest.cpp#SyncClockIsRefusedBeforeAnyNetworkAttempt -- 把“计数超界”与“白名单不含绑定主机”注入进去并断言被拒（FI-037 的端点一半；响应尺寸一半仍属 FI-037）
+seg.test: PRESENT test:native/tests/test_transport_policy.cpp#EndpointCheckFailsClosedOnACorruptAllowlistEvenForAListedHost test:native/tests/test_binance_private_rest.cpp#BlockedEndpointFixture -- 4 个策略用例与 8 个接线用例；14 个突变体（钳制、两处上界、7 个联网入口各一、恒真、恒假、错主机）全部被预期用例杀死
+seg.runtime: PRESENT run:"38046172981@7a58b686/ci-native.yml[native-build-test]" -- 合并后主干上真实成功的 CI Native run（GCC-14 Release 全量构建与测试）
+seg.budget: NA -- 每个联网方法多一次最多 4 项的主机名比较，相对一次 TLS 握手可忽略
 ```
 
 ```ledger
@@ -372,19 +370,17 @@ legacy: P2-002
 title: 账户查询在凭据为空时解引用（唯一缺少空凭据守卫的公开 REST 方法）
 severity: MEDIUM
 kind: lib
-status: REMEDIATING
+status: CLOSED
 task: SAFE-01
 gate: REST 通信门禁
-gate_result: BLOCKED
-open: open:native/include/hengyuan/binance_private_rest.hpp#"build_signed_query(*creds_, unsigned_query, fresh_ts_ms)" count4:native/include/hengyuan/binance_private_rest.hpp#"if (!creds_)"
-refs: code:native/include/hengyuan/binance_private_rest.hpp#fetch_account test:native/tests/test_binance_private_rest.cpp#NullCredentialsFoldsIntoNotSentWithoutNetworkAttempt
-seg.code: MISSING -- fetch_account(out, cfg) 直接解引用 *creds_；其余四处使用凭据的位置均有 if (!creds_) 守卫（该字面量在文件中恰好出现 4 次，修复后变为 5 次，核对会提醒）
+gate_result: CLEARED
+refs: code:native/include/hengyuan/binance_private_rest.hpp#fetch_account test:native/tests/test_binance_private_rest.cpp#NullCredentialsFailsClosedEvenWithAFreshClock pr:156@7a58b68
+seg.code: PRESENT code:native/include/hengyuan/binance_private_rest.hpp#fetch_account pr:156@7a58b68 -- fetch_account(out, cfg) 入口先判 creds_，与其余使用凭据的方法一致
 seg.contract: PRESENT doc:docs/BINANCE_PRIVATE_REST_L4_SPEC.md#fetch_account bp:"任务 SAFE-01" -- 兄弟方法的“空凭据折叠为 NotSent”即合同
-seg.fault: MISSING -- 没有对应的 FI 编号
-seg.test: MISSING test:native/tests/test_binance_private_rest.cpp#NullCredentialsFoldsIntoNotSentWithoutNetworkAttempt -- 该测试属于 query_order；fetch_account 没有空凭据用例
-seg.runtime: MISSING -- 无 CI run 可引：修复尚未落地
+seg.fault: PRESENT:UT test:native/tests/test_binance_private_rest.cpp#NullCredentialsFailsClosedEvenWithAFreshClock -- 空凭据加上一份新鲜时钟（让无守卫的代码越过时钟门禁）后返回 SigningFailed，且 out 保持原样；去掉守卫的突变体被它杀死
+seg.test: PRESENT test:native/tests/test_binance_private_rest.cpp#NullCredentialsFailsClosedEvenWithAFreshClock -- 同上，加 14 个突变体里的 M04
+seg.runtime: PRESENT run:"38046172981@7a58b686/ci-native.yml[native-build-test]" -- 合并后主干上真实成功的 CI Native run
 seg.budget: NA -- 一次指针判空，不增加可测的运行期成本
-closure: SAFE-01 完成：fetch_account 加守卫并有空凭据用例
 ```
 
 ```ledger
@@ -1316,10 +1312,10 @@ level: L0
 status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
-open: open:native/include/hengyuan/transport_policy.hpp#"if (p.endpoint_allowlist.count == 0) return TransportCheck::EndpointNotAllowed;" absent:native/include/hengyuan/transport_policy.hpp#"count > kMaxEndpoints" absent:native/src/*.cpp#check_endpoint absent:native/include/hengyuan/binance_private_rest.hpp#check_endpoint
-refs: test:native/tests/test_transport_policy.cpp#EndpointCheckRejectsInvalidHost
-note: 端点校验函数本身有单测，非测试调用点为零，白名单计数没有上界（P2-001）。
+baseline: 7a58b68
+open: absent:native/src/*.cpp#check_response_size absent:native/include/hengyuan/binance_private_rest.hpp#check_response_size
+refs: test:native/tests/test_transport_policy.cpp#EndpointCheckRejectsInvalidHost test:native/tests/test_transport_policy.cpp#RejectsEndpointCountAboveCapacity test:native/tests/test_binance_private_rest.cpp#BlockedEndpointFixture
+note: 端点一半已接线并有单测（P2-001，PR #156）：私有 REST 客户端的 7 个联网入口在解析前先过 check_endpoint，白名单计数有上界。尺寸一半仍未接线——check_response_size 与 max_response_bytes 没有任何生产调用点，客户端用各自写死的 parser.body_limit。
 ```
 
 ```ledger
