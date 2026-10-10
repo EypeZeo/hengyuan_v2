@@ -10,6 +10,7 @@
 #include <hengyuan/snapshot_refresh_gate.hpp>
 
 #include "test_helpers/blackhole_acceptor.hpp"
+#include "test_helpers/rest_test_seam_builder.hpp"
 
 #include <chrono>
 #include <string>
@@ -105,21 +106,20 @@ TEST(BinanceRestSnapshotConnectivity, ReadStageTimeoutAfterSuccessfulHandshake) 
     RestSnapshotConfig cfg;
     cfg.host = "wrong-san.test.invalid";  // matches the fixture cert's CN/SAN
     cfg.port = std::to_string(tls_blackhole.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_ca_cert.pem");
     // A synthetic .invalid hostname cannot be relied on to fail DNS resolution -- confirmed
     // directly in this environment, where it resolved to a synthesized address instead of
-    // NXDOMAIN. Route the actual connection to the local fixture while still verifying
-    // hostname/SNI against cfg.host above.
-    cfg.connect_host_override = "127.0.0.1";
+    // NXDOMAIN. The seam routes the actual connection to the local fixture (and trusts the fixture
+    // CA) while hostname/SNI are still verified against cfg.host above.
+    const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
 
     auto start = std::chrono::steady_clock::now();
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err);
+    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err, seam);
     auto elapsed = std::chrono::steady_clock::now() - start;
 
     EXPECT_FALSE(result.has_value());
     // The handshake itself must have succeeded (matching host + trusted CA) -- if this ever
-    // regresses to TlsHandshake, it means the extra_trusted_ca_pem_path wiring or the
+    // regresses to TlsHandshake, it means the seam's extra-CA wiring or the
     // hostname-verification config broke, not that the read timeout is working.
     EXPECT_EQ(err, FetchError::Read);
     EXPECT_LT(elapsed, std::chrono::seconds(20));
@@ -153,12 +153,12 @@ TEST(BinanceRestSnapshotConnectivity, InvalidConfigFailsWithoutTouchingNetwork) 
 // A self-signed/untrusted-issuer certificate would fail the handshake regardless of whether
 // hostname_verification is wired in at all -- that would prove nothing about hostname checking
 // specifically. Both tests here explicitly trust the fixture's issuing CA via
-// extra_trusted_ca_pem_path, so chain validation always succeeds and the *only* remaining
+// the seam's extra CA, so chain validation always succeeds and the *only* remaining
 // variable is whether the connected host string matches the certificate's CN/SAN
 // (wrong-san.test.invalid). Without the positive control, a bug that made the negative test
 // fail for an unrelated reason (e.g. a broken fixture) would go unnoticed.
 //
-// Both tests also set connect_host_override="127.0.0.1": cfg.host here is deliberately a
+// Both tests also pass a seam that connects to 127.0.0.1: cfg.host here is deliberately a
 // hostname that does NOT match the fixture cert (or, in the positive test, one that does), used
 // purely for SNI/hostname-verification purposes -- it must not also be the DNS resolution
 // target, since neither "api.binance.com" (a real, live hostname) nor a synthetic .invalid name
@@ -172,11 +172,11 @@ TEST(BinanceRestSnapshotTlsHostnameVerification, MismatchedHostIsRejected) {
     RestSnapshotConfig cfg;
     cfg.host = "api.binance.com";  // deliberately does NOT match the fixture cert's CN/SAN
     cfg.port = std::to_string(tls_blackhole.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_ca_cert.pem");  // chain IS trusted
-    cfg.connect_host_override = "127.0.0.1";  // actually connect to the local fixture
+    // chain IS trusted, and the connection actually goes to the local fixture
+    const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
 
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err);
+    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err, seam);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(err, FetchError::TlsHandshake);
 }
@@ -188,11 +188,10 @@ TEST(BinanceRestSnapshotTlsHostnameVerification, MatchingHostWithTrustedCaSuccee
     RestSnapshotConfig cfg;
     cfg.host = "wrong-san.test.invalid";  // matches the fixture cert's CN/SAN
     cfg.port = std::to_string(tls_blackhole.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_ca_cert.pem");
-    cfg.connect_host_override = "127.0.0.1";
+    const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
 
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err);
+    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err, seam);
     // The handshake itself must succeed; the request then fails at the read stage because the
     // fixture never sends an HTTP response (it's a handshake-only fixture, not a full server) --
     // FetchError::Read (not TlsHandshake) is exactly the proof that hostname verification

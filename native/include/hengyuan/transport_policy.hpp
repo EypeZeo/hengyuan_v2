@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string_view>
 
 namespace hy {
@@ -119,6 +120,33 @@ inline TransportCheck check_endpoint(const TransportPolicy& p,
         return TransportCheck::EndpointNotAllowed;
     }
     return TransportCheck::Ok;
+}
+
+// Proof that `host` passed check_endpoint() against a policy. The only way to obtain one is
+// issue_endpoint_permit() below; every routine that opens a connection takes one by value and connects
+// to permit.host() -- no separate host argument -- so a request path that skipped the allowlist cannot
+// be written without the compiler noticing, and a permit for one host cannot be spent on another
+// (SAFE-01 freeze guard; audit P2-001, P1-001).
+//
+// `host` is a view: it must outlive every copy of the permit. The one production issuer
+// (BinancePrivateRestClient) passes EnvironmentBinding::base_host(), a view of a string literal.
+class EndpointPermit {
+public:
+    [[nodiscard]] std::string_view host() const noexcept { return host_; }
+
+private:
+    explicit EndpointPermit(std::string_view host) noexcept : host_(host) {}
+    friend std::optional<EndpointPermit> issue_endpoint_permit(const TransportPolicy&,
+                                                               std::string_view) noexcept;
+
+    std::string_view host_;
+};
+
+// Fails closed: nullopt for a host that is not on the allowlist and for a corrupt allowlist.
+[[nodiscard]] inline std::optional<EndpointPermit> issue_endpoint_permit(
+    const TransportPolicy& p, std::string_view host) noexcept {
+    if (check_endpoint(p, host) != TransportCheck::Ok) return std::nullopt;
+    return EndpointPermit(host);
 }
 
 // Validate HTTP status code: reject redirects (3xx).

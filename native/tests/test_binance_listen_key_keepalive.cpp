@@ -4,11 +4,12 @@
 // (test_helpers/tls_response_acceptor.hpp) stands in for Binance's userDataStream endpoints.
 // BinancePrivateRestClient's no-cfg keepalive_listen_key()/create_listen_key() overloads (Batch
 // H, H2) are what the scheduler actually calls, so every client here is constructed with an
-// explicit default_cfg pointed at the mock server -- there is no other way to route these calls
-// away from the real Binance host in tests.
+// explicit default_cfg pointed at the mock server (the port) and given a loopback RestTestSeam
+// (use_fixture) -- there is no other way to route these calls away from the real Binance host in tests.
 #include <gtest/gtest.h>
 #include <hengyuan/binance_listen_key_keepalive.hpp>
 
+#include "binance_private_rest_test_hooks.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
 
 #include <cstdio>
@@ -89,9 +90,14 @@ protected:
     PrivateRestConfig cfg_for(const hy::test_helpers::TlsResponseAcceptor& server) {
         PrivateRestConfig cfg;
         cfg.port = std::to_string(server.port());
-        cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-        cfg.connect_host_override = "127.0.0.1";
         return cfg;
+    }
+
+    // Routes the client's connections to the loopback fixture and trusts the fixture's certificate
+    // (rest_test_seam.hpp); without it every call would go to the real testnet host.
+    static void use_fixture(BinancePrivateRestClient& client) {
+        hy::BinancePrivateRestClientTestHooks::use_loopback(client,
+                                                            fixture_path("test_leaf_cert_testnet_host.pem"));
     }
 };
 
@@ -103,6 +109,7 @@ TEST_F(BoundCredentialsFixture, NeverPublishedKeyGuardIsSilentNoNetworkRequest) 
         fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), nullptr, {},
                                      cfg_for(server));
+    use_fixture(client);
     ListenKeyPublisher listen_key_pub;  // never published -- seq stays 0
     ListenKeyKeepaliveScheduler scheduler(client, listen_key_pub);
 
@@ -119,6 +126,7 @@ TEST_F(BoundCredentialsFixture, SuccessfulKeepaliveExtendsExpiryAndSchedulesNext
         fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), nullptr, {},
                                      cfg_for(server));
+    use_fixture(client);
     ListenKeyPublisher listen_key_pub;
     ASSERT_TRUE(listen_key_pub.publish("initial-listen-key-0000000000000001", /*issued_at_ms=*/0,
                                         /*expires_at_ms=*/60 * 60 * 1000));
@@ -161,6 +169,7 @@ TEST_F(BoundCredentialsFixture, FailedKeepaliveBacksOffByRetryIntervalNotFullInt
         fixture_path("test_leaf_key_testnet_host.pem"), 500, R"({"code":-1000,"msg":"fail"})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), nullptr, {},
                                      cfg_for(server));
+    use_fixture(client);
     ListenKeyPublisher listen_key_pub;
     ASSERT_TRUE(listen_key_pub.publish("initial-listen-key-0000000000000002", 0, 60 * 60 * 1000));
 
@@ -192,6 +201,7 @@ TEST_F(BoundCredentialsFixture, ExpiredKeyFallsBackToRecreationInsteadOfKeepaliv
         R"({"listenKey":"pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), nullptr, {},
                                      cfg_for(server));
+    use_fixture(client);
     ListenKeyPublisher listen_key_pub;
     // expires_at_ms deliberately in the past relative to the poll() calls below.
     ASSERT_TRUE(listen_key_pub.publish("stale-listen-key-000000000000000001", 0, /*expires_at_ms=*/50));
@@ -227,6 +237,7 @@ TEST_F(BoundCredentialsFixture, PollFromNonOwningThreadFoldsToFailureWithoutCras
         fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), nullptr, {},
                                      cfg_for(server));
+    use_fixture(client);
     ListenKeyPublisher listen_key_pub;
     ASSERT_TRUE(listen_key_pub.publish("initial-listen-key-0000000000000003", 0, 60 * 60 * 1000));
 

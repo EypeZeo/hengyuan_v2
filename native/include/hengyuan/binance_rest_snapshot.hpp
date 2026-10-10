@@ -26,6 +26,7 @@
 #include <hengyuan/binance_depth_snapshot_codec.hpp>
 #include <hengyuan/binance_tls.hpp>
 #include <hengyuan/depth_manager.hpp>
+#include <hengyuan/rest_test_seam.hpp>
 #include <hengyuan/snapshot_refresh_gate.hpp>  // SnapshotFetcher/SnapshotRequest (VERIF-TSAN-016)
 
 #include <boost/asio.hpp>
@@ -60,24 +61,10 @@ struct RestSnapshotConfig {
                         // kAllowedLimits below -- also bounded by DepthSnapshot's 1024-per-side
                         // fixed capacity (depth_manager.hpp), so 5000 is deliberately excluded.
 
-    // Test-only escape hatch: when non-empty, this CA is trusted in ADDITION to the system
-    // trust store (native/tests/test_helpers/blackhole_acceptor.hpp's TlsBlackholeAcceptor
-    // uses it so the wrong-SAN/read-timeout tests can drive the real fetch_depth_snapshot()
-    // pipeline against a local TLS fixture instead of the real Binance endpoint). Empty by
-    // default -- production callers never set this, and setting it does not weaken anything
-    // for them since it only ever *adds* a trust anchor, never removes verify_peer/hostname
-    // checking.
-    std::string extra_trusted_ca_pem_path;
-
-    // Test-only escape hatch: when non-empty, resolve/connect target THIS instead of `host`,
-    // while SNI and hostname verification still use `host`. Needed because a synthetic
-    // `.invalid` test hostname (RFC 2606) cannot be relied on to fail DNS resolution --
-    // observed directly in this repo's own WSL2 environment, where an unresolvable hostname
-    // resolved to a synthesized address instead of NXDOMAIN. Without this override, a test
-    // using a fake hostname for both "where to connect" and "what to verify" would silently
-    // connect to some unrelated real host instead of the intended local test fixture. Empty by
-    // default -- production callers never set this.
-    std::string connect_host_override;
+    // Deliberately no connect-target override and no extra trust anchor in here (audit P1-001, fault
+    // case FI-032): a configuration must not be able to redirect a request or add a CA. A test that
+    // has to drive the real fetch_depth_snapshot() pipeline against a local TLS fixture passes a
+    // RestTestSeam (rest_test_seam.hpp) as the separate, defaulted last argument instead.
 };
 
 // REST transport-layer error type -- distinct from DepthSnapshotParseError (which belongs to
@@ -160,7 +147,7 @@ inline FetchError map_parse_error(DepthSnapshotParseError err) {
 
 inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snapshot_coro(
     std::string symbol, std::int64_t price_multiplier, std::int64_t qty_multiplier,
-    RestSnapshotConfig cfg) {
+    RestSnapshotConfig cfg, RestTestSeam seam) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     FetchError current_stage = FetchError::Resolve;
@@ -170,8 +157,8 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
         current_stage = FetchError::TlsHandshake;  // covers ssl_ctx setup below too
         ssl::context ssl_ctx(ssl::context::tlsv12_client);
         hy::configure_binance_ssl_context(ssl_ctx);
-        if (!cfg.extra_trusted_ca_pem_path.empty()) {
-            ssl_ctx.load_verify_file(cfg.extra_trusted_ca_pem_path);
+        if (!seam.extra_trusted_ca_pem_path().empty()) {
+            ssl_ctx.load_verify_file(seam.extra_trusted_ca_pem_path());
         }
 
         tcp::resolver resolver(executor);
@@ -191,11 +178,11 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
 
         // Resolve, racing a 5s timer -- beast::tcp_stream::expires_after() does not cover
         // tcp::resolver (a separate object), so a dedicated race is needed for this one stage.
-        // connect_host_override (test-only) lets the resolve/connect target differ from the
-        // host used for SNI/hostname verification above -- see its own doc comment.
+        // A test seam (rest_test_seam.hpp) lets the resolve/connect target differ from the host
+        // used for SNI/hostname verification above; empty in production.
         current_stage = FetchError::Resolve;
         const std::string& connect_host =
-            cfg.connect_host_override.empty() ? cfg.host : cfg.connect_host_override;
+            seam.connect_host_override().empty() ? cfg.host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
         resolve_timer.expires_after(std::chrono::seconds(5));
         auto resolve_result =
@@ -257,7 +244,7 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
 
 inline std::optional<DepthSnapshot> fetch_depth_snapshot(
     const std::string& symbol, std::int64_t price_multiplier, std::int64_t qty_multiplier,
-    const RestSnapshotConfig& cfg, FetchError& out_error) {
+    const RestSnapshotConfig& cfg, FetchError& out_error, const RestTestSeam& seam = {}) {
     out_error = FetchError::None;
 
     if (auto invalid = validate_rest_config(symbol, cfg)) {
@@ -268,7 +255,8 @@ inline std::optional<DepthSnapshot> fetch_depth_snapshot(
     net::io_context ioc;
     std::variant<DepthSnapshot, FetchError> outcome = FetchError::None;
     net::co_spawn(
-        ioc, detail::fetch_depth_snapshot_coro(symbol, price_multiplier, qty_multiplier, cfg),
+        ioc,
+        detail::fetch_depth_snapshot_coro(symbol, price_multiplier, qty_multiplier, cfg, seam),
         [&outcome](std::exception_ptr eptr, std::variant<DepthSnapshot, FetchError> r) {
             if (eptr) {
                 // The coroutine itself catches boost::system::system_error; anything that

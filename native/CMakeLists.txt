@@ -797,6 +797,18 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_holding_state_tracker)
     gtest_discover_tests(test_holding_state_tracker)
 
+    # SAFE-01 freeze guard (audit P1-001 / P2-001; fault cases FI-032, FI-037): every place under include/
+    # and src/ that opens a connection is pinned with its exact count, and the builder that can fill a
+    # RestTestSeam may only ever be defined under tests/. It reads the source tree, so the native/ directory
+    # is a compile definition and the target needs nothing else (no Boost/OpenSSL, built in every
+    # configuration). The compile-time half of the guard is test_rest_config_surface (Boost-gated, below).
+    add_executable(test_rest_freeze_guard tests/test_rest_freeze_guard.cpp)
+    target_link_libraries(test_rest_freeze_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_rest_freeze_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_rest_freeze_guard)
+    gtest_discover_tests(test_rest_freeze_guard)
+
     # 批次 6 6b-0f-3b: consumer side of the kline feed -- the only path by which a bar reaches
     # StreamingEvaluator::step() (duplicate filter + continuity guard + rebuild from backfill). Pure
     # logic over the strategy-spec evaluator and kline_bar.hpp; loads its spec via load_strategy_spec(),
@@ -1175,6 +1187,20 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_private_rest)
         hengyuan_allow_third_party_tsan_fences(test_binance_private_rest)
         gtest_discover_tests(test_binance_private_rest)
+
+        # FI-032 (audit P1-001) and the compile-time half of the SAFE-01 freeze guard: properties of the
+        # real REST config types, the test-seam type and the permit-taking coroutines -- it has to include
+        # the Boost-based client headers to name them, but opens no socket and needs no fixture.
+        add_executable(test_rest_config_surface tests/test_rest_config_surface.cpp)
+        target_link_libraries(test_rest_config_surface PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_rest_config_surface SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_rest_config_surface PRIVATE tests)
+        hengyuan_set_warnings(test_rest_config_surface)
+        hengyuan_allow_third_party_tsan_fences(test_rest_config_surface)
+        gtest_discover_tests(test_rest_config_surface)
 
         add_executable(test_binance_ws_session tests/test_binance_ws_session.cpp)
         target_link_libraries(test_binance_ws_session PRIVATE

@@ -92,6 +92,19 @@ std::string fixture_path(const char* filename) {
     return std::string(HY_TEST_FIXTURE_DIR) + "/" + filename;
 }
 
+// Points `client` at the local fixtures: every network call it makes resolves and connects to 127.0.0.1
+// (the logical host is still the testnet host, for SNI, hostname verification and the policy check), and
+// the fixtures' leaf certificate is trusted. Without a seam the call would go to the real testnet host.
+void use_fixtures(BinancePrivateRestClient& client) {
+    hy::BinancePrivateRestClientTestHooks::use_loopback(client,
+                                                        fixture_path("test_leaf_cert_testnet_host.pem"));
+}
+
+// The same routing for a fixture that never completes a TLS handshake: nothing to trust.
+void use_plain_fixtures(BinancePrivateRestClient& client) {
+    hy::BinancePrivateRestClientTestHooks::use_loopback(client);
+}
+
 constexpr std::string_view kSyntheticApiKey =
     "TESTKEYabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234";
 constexpr std::string_view kSyntheticSecret = "synthetic-test-secret-not-real";
@@ -999,11 +1012,11 @@ TEST(BinancePrivateRestClientInit, DoesNotThrowAndReturnsABool) {
 TEST_F(BoundCredentialsFixture, SyncClockTlsHandshakeStageTimeout) {
     hy::test_helpers::PlainBlackholeAcceptor blackhole;
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_plain_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(blackhole.port());
-    cfg.connect_host_override = "127.0.0.1";
-    // No extra_trusted_ca_pem_path / no leaf cert served -- PlainBlackholeAcceptor never
+    // No extra trust anchor / no leaf cert served -- PlainBlackholeAcceptor never
     // completes a TLS handshake at all, so this must fail at that stage regardless of trust.
     EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::TlsHandshake);
 }
@@ -1013,11 +1026,10 @@ TEST_F(BoundCredentialsFixture, SyncClockReadStageTimeoutAfterSuccessfulHandshak
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"));
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(tls_blackhole.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
     // Handshake succeeds (hostname matches, CA is trusted); the fixture never sends an HTTP
     // response, so this proves the read-stage deadline actually fires rather than hanging.
     EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::Read);
@@ -1032,11 +1044,10 @@ TEST_F(BoundCredentialsFixture, SyncClockCustomShortReadTimeoutFiresFast) {
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"));
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(tls_blackhole.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
     cfg.read_timeout_ms = 50;  // far below the 10s default -- proves the field is actually
                                 // wired to the Asio deadline, not just stored and ignored
 
@@ -1083,11 +1094,10 @@ TEST_F(BoundCredentialsFixture, SyncClockRealSuccessPathPublishesOffset) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::None);
 
@@ -1123,10 +1133,9 @@ TEST_F(BoundCredentialsFixture, FetchAccountRealSuccessPathSignsAndParses) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     hy::test_helpers::TlsResponseAcceptor account_server(
@@ -1135,8 +1144,6 @@ TEST_F(BoundCredentialsFixture, FetchAccountRealSuccessPathSignsAndParses) {
         R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1.5","locked":"0.5"}]})");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(account_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     AccountSnapshot out{};
     ASSERT_EQ(client.fetch_account(out, fetch_cfg), PrivateRestError::None);
@@ -1160,10 +1167,9 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     hy::test_helpers::TlsResponseAcceptor error_server(
@@ -1171,8 +1177,6 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
         fixture_path("test_leaf_key_testnet_host.pem"), 401, R"({"code":-2015,"msg":"denied"})");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(error_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     AccountSnapshot out{};
     out.asset_count = 9;  // sentinel
@@ -1196,10 +1200,9 @@ TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     const auto expected = make_btcusdt_expectation("coid-success-001");
@@ -1212,8 +1215,6 @@ TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
         R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(order_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     const auto result = client.query_order(expected, fetch_cfg);
     ASSERT_EQ(result.outcome, QueryOutcome::Found);
@@ -1263,10 +1264,9 @@ TEST_F(BoundCredentialsFixture, QueryOrderExhaustedRateLimiterReturnsNotSentWith
     hy::SpotRateLimitTracker limiter;
     ASSERT_TRUE(limiter.configure(0, 0, 0, 0, 0, 0));  // zero budget in every lane -- exhausted
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     // No order-endpoint server is even started -- if query_order() attempted a network
@@ -1284,10 +1284,9 @@ TEST_F(BoundCredentialsFixture, QueryOrderRateLimiterWithBudgetStillSendsRealReq
     hy::SpotRateLimitTracker limiter;
     ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));  // ample budget every lane
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     const auto expected = make_btcusdt_expectation("coid-rate-ok");
@@ -1300,8 +1299,6 @@ TEST_F(BoundCredentialsFixture, QueryOrderRateLimiterWithBudgetStillSendsRealReq
         R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(order_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     EXPECT_EQ(client.query_order(expected, fetch_cfg).outcome, QueryOutcome::Found);
     EXPECT_EQ(order_server.requests().size(), 1u);  // budget was available -- real request sent
@@ -1313,10 +1310,9 @@ TEST_F(BoundCredentialsFixture, QueryOrderHttpErrorStatusIsInconclusiveNotFailur
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     hy::test_helpers::TlsResponseAcceptor error_server(
@@ -1325,8 +1321,6 @@ TEST_F(BoundCredentialsFixture, QueryOrderHttpErrorStatusIsInconclusiveNotFailur
         R"({"code":-1003,"msg":"Too many requests"})");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(error_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     const auto expected = make_btcusdt_expectation("coid-http-error");
     // Never Rejected/"does not exist" -- collapses to the same Inconclusive as every other
@@ -1341,10 +1335,9 @@ TEST_F(BoundCredentialsFixture, QueryOrderMalformedJsonIsInconclusive) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     hy::test_helpers::TlsResponseAcceptor bad_server(
@@ -1352,8 +1345,6 @@ TEST_F(BoundCredentialsFixture, QueryOrderMalformedJsonIsInconclusive) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200, "not json");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(bad_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     const auto expected = make_btcusdt_expectation("coid-bad-json");
     EXPECT_EQ(client.query_order(expected, fetch_cfg).outcome, QueryOutcome::Inconclusive);
@@ -1399,10 +1390,9 @@ TEST_F(BoundCredentialsFixture, SubmitOrderRealSuccessPathSignsAndParses) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     const auto rules = make_btcusdt_rules();
@@ -1415,8 +1405,6 @@ TEST_F(BoundCredentialsFixture, SubmitOrderRealSuccessPathSignsAndParses) {
         R"("status":"PARTIALLY_FILLED","side":"BUY","type":"LIMIT","timeInForce":"GTC"})");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(order_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     const auto resp = client.submit_order("submit-net-001", 1, OrderSide::Buy, OrderType::Limit,
                                            5'000'012, 100'000, rules, fetch_cfg);
@@ -1444,10 +1432,9 @@ TEST_F(BoundCredentialsFixture, SubmitOrderHttpErrorStatusIsNetworkErrorNotRejec
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     hy::test_helpers::TlsResponseAcceptor error_server(
@@ -1456,8 +1443,6 @@ TEST_F(BoundCredentialsFixture, SubmitOrderHttpErrorStatusIsNetworkErrorNotRejec
         R"({"code":-2010,"msg":"Account has insufficient balance"})");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(error_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     const auto rules = make_btcusdt_rules();
     // Never Rejected directly from a POST error status this batch (no §4.4.1 400-allowlist) --
@@ -1475,10 +1460,9 @@ TEST_F(BoundCredentialsFixture, SubmitOrderMalformedJsonIsNetworkError) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     PrivateRestConfig sync_cfg;
     sync_cfg.port = std::to_string(time_server.port());
-    sync_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    sync_cfg.connect_host_override = "127.0.0.1";
     ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
 
     hy::test_helpers::TlsResponseAcceptor bad_server(
@@ -1486,8 +1470,6 @@ TEST_F(BoundCredentialsFixture, SubmitOrderMalformedJsonIsNetworkError) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200, "not json");
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(bad_server.port());
-    fetch_cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    fetch_cfg.connect_host_override = "127.0.0.1";
 
     const auto rules = make_btcusdt_rules();
     const auto resp = client.submit_order("coid-bad-json", 1, OrderSide::Buy, OrderType::Limit,
@@ -1568,11 +1550,10 @@ TEST_F(BoundCredentialsFixture, FetchExchangeInfoRealSuccessPathParsesAndUsesNoA
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200, std::string(body));
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     hy::ParsedExchangeInfo out{};
     const std::string_view symbols[] = {"BTCUSDT", "ETHUSDT"};
@@ -1598,11 +1579,10 @@ TEST_F(BoundCredentialsFixture, FetchExchangeInfoSingleSymbolUsesShortFormTarget
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"serverTime":1700000000000,"symbols":[]})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     hy::ParsedExchangeInfo out{};
     const std::string_view symbols[] = {"BTCUSDT"};
@@ -1617,8 +1597,8 @@ TEST_F(BoundCredentialsFixture, FetchExchangeInfoInvalidSymbolFailsClosedWithout
     // No TlsResponseAcceptor at all -- build_exchange_info_target() must reject this before any
     // connection is even attempted.
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_plain_fixtures(client);
     PrivateRestConfig cfg;
-    cfg.connect_host_override = "127.0.0.1";
 
     hy::ParsedExchangeInfo out{};
     out.symbol_count = 7;  // sentinel
@@ -1632,11 +1612,10 @@ TEST_F(BoundCredentialsFixture, FetchExchangeInfoHttpErrorStatusRejected) {
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 503, R"({"msg":"unavailable"})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     hy::ParsedExchangeInfo out{};
     out.symbol_count = 7;  // sentinel
@@ -1694,11 +1673,10 @@ TEST_F(BoundCredentialsFixture, CreateListenKeySucceedsWithoutPriorClockSync) {
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
         R"({"listenKey":"pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     char buf[kListenKeyLen]{};
     std::size_t len = 0;
@@ -1721,11 +1699,10 @@ TEST_F(BoundCredentialsFixture, CreateListenKeyHttpErrorIsHttpStatus) {
         fixture_path("test_leaf_key_testnet_host.pem"), 429,
         R"({"code":-1003,"msg":"Too many requests"})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     char buf[kListenKeyLen]{};
     std::size_t len = 7;  // sentinel
@@ -1738,11 +1715,10 @@ TEST_F(BoundCredentialsFixture, CreateListenKeyMalformedJsonIsMalformedResponse)
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200, "not json");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     char buf[kListenKeyLen]{};
     std::size_t len = 0;
@@ -1754,11 +1730,10 @@ TEST_F(BoundCredentialsFixture, KeepaliveListenKeySucceedsAndPercentEncodesTheKe
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     EXPECT_EQ(client.keepalive_listen_key("abc123def456", cfg), PrivateRestError::None);
 
@@ -1772,11 +1747,10 @@ TEST_F(BoundCredentialsFixture, CloseListenKeySucceeds) {
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({})");
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
 
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
-    cfg.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-    cfg.connect_host_override = "127.0.0.1";
 
     EXPECT_EQ(client.close_listen_key("abc123def456", cfg), PrivateRestError::None);
 
@@ -1798,8 +1772,8 @@ TEST_F(BoundCredentialsFixture, KeepaliveListenKeyEmptyKeyIsInvalidConfigWithout
     // No TlsResponseAcceptor at all -- an empty listenKey must be rejected before any
     // connection is even attempted.
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_plain_fixtures(client);
     PrivateRestConfig cfg;
-    cfg.connect_host_override = "127.0.0.1";
     EXPECT_EQ(client.keepalive_listen_key("", cfg), PrivateRestError::InvalidConfig);
     EXPECT_EQ(client.close_listen_key("", cfg), PrivateRestError::InvalidConfig);
 }
@@ -1843,9 +1817,8 @@ protected:
     void SetUp() override {
         BoundCredentialsFixture::SetUp();
         cfg_.port = std::to_string(server_.port());
-        cfg_.extra_trusted_ca_pem_path = fixture_path("test_leaf_cert_testnet_host.pem");
-        cfg_.connect_host_override = "127.0.0.1";
         client_ = std::make_unique<BinancePrivateRestClient>(blocked_testnet_binding(), make_creds());
+        use_fixtures(*client_);
         hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(*client_);
     }
 };
@@ -1901,6 +1874,7 @@ TEST_F(BlockedEndpointFixture, SubmitOrderIsRefusedAndNothingReachesTheNetwork) 
 // because the whole client is broken.
 TEST_F(BlockedEndpointFixture, TheGenuineBindingStillReachesTheNetwork) {
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
     EXPECT_EQ(client.sync_clock(cfg_), PrivateRestError::None);
     EXPECT_EQ(server_.requests().size(), 1u);
 }

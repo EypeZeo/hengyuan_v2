@@ -3,7 +3,11 @@
 #include <gtest/gtest.h>
 #include <hengyuan/transport_policy.hpp>
 
+#include <string_view>
+#include <type_traits>
+
 using hy::EndpointAllowlist;
+using hy::EndpointPermit;
 using hy::RequestWeightTracker;
 using hy::SanitizedError;
 using hy::TransportCheck;
@@ -13,6 +17,7 @@ using hy::check_clock_skew;
 using hy::check_endpoint;
 using hy::check_http_status;
 using hy::check_response_size;
+using hy::issue_endpoint_permit;
 using hy::sanitize_error;
 using hy::validate_policy;
 
@@ -129,6 +134,48 @@ TEST(TransportPolicy, EndpointCheckFailsClosedOnACorruptAllowlistEvenForAListedH
     TransportPolicy p{};
     p.endpoint_allowlist.count = hy::kMaxEndpoints + 1;
     EXPECT_EQ(check_endpoint(p, "api.binance.com"), TransportCheck::EndpointNotAllowed);
+}
+
+// --- Endpoint permit: the proof that check_endpoint() passed (SAFE-01 freeze guard) ---
+
+TEST(EndpointPermit, IsIssuedForAnAllowlistedHostAndNamesThatHost) {
+    const TransportPolicy p{};
+    const auto permit = issue_endpoint_permit(p, "api1.binance.com");
+    ASSERT_TRUE(permit.has_value());
+    EXPECT_EQ(permit->host(), "api1.binance.com");
+}
+
+TEST(EndpointPermit, IsRefusedForAHostThatIsNotOnTheAllowlist) {
+    const TransportPolicy p{};
+    EXPECT_FALSE(issue_endpoint_permit(p, "evil.com").has_value());
+    EXPECT_FALSE(issue_endpoint_permit(p, "").has_value());
+    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com.evil.com").has_value());
+}
+
+TEST(EndpointPermit, IsRefusedOnACorruptAllowlistEvenForAListedHost) {
+    TransportPolicy p{};
+    p.endpoint_allowlist.count = hy::kMaxEndpoints + 1;
+    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com").has_value());
+    p.endpoint_allowlist.count = 0;
+    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com").has_value());
+}
+
+TEST(EndpointPermit, AgreesWithCheckEndpointForEveryHostItIsAskedAbout) {
+    TransportPolicy p{};
+    p.endpoint_allowlist = EndpointAllowlist{};
+    p.endpoint_allowlist.hosts[0] = "testnet.binance.vision";
+    p.endpoint_allowlist.count = 1;
+    for (const char* host : {"testnet.binance.vision", "api.binance.com", "", "TESTNET.BINANCE.VISION"}) {
+        EXPECT_EQ(issue_endpoint_permit(p, host).has_value(), check_endpoint(p, host) == TransportCheck::Ok)
+            << "host=" << host;
+    }
+}
+
+TEST(EndpointPermit, CannotBeBuiltFromAHostWithoutTheCheck) {
+    // Runtime-visible (not static_assert) so that a regression shows up as a failed test, not a broken build.
+    EXPECT_FALSE(std::is_default_constructible_v<EndpointPermit>);
+    EXPECT_FALSE((std::is_constructible_v<EndpointPermit, std::string_view>));
+    EXPECT_FALSE((std::is_convertible_v<std::string_view, EndpointPermit>));
 }
 
 // --- HTTP status check ---
