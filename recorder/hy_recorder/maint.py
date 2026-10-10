@@ -62,6 +62,9 @@ EVENT_FINDINGS: tuple[tuple[str, str, str], ...] = (
 ROUTINE_EVENTS = frozenset(
     {"WS_OPEN", "WS_CLOSE", "PRUNED_ACKED", "PROC_START", "PROC_STOP", "EVICTED_UNACKED"}
 )
+# WS_CLOSE reasons the recorder chose itself: the scheduled rotation, and its own shutdown. Every other
+# reason (the peer or the path closing the stream, an error, a stall, a depth gap) is an unplanned close.
+PLANNED_CLOSES = frozenset({"rotation", "stop"})
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,8 @@ class Thresholds:
     rotation_hole_warn_s: float = (
         2.0  # a planned rotation should cost well under a second (it cost 5.3 s once)
     )
+    unplanned_hole_warn_s: float = 2.0  # the same line for a close nobody asked for: it reconnects at once
+    unplanned_closes_warn: int = 24  # about one an hour over 24 h: a flapping path, not an odd peer close
     no_success_crit_h: float = 48.0
     log_keep_days: int = 60
 
@@ -131,6 +136,28 @@ def _rotation_gaps(probe: dict[str, Any]) -> list[float]:
     return [
         g["gap_s"] for g in gaps if g.get("reason") == "rotation" and isinstance(g.get("gap_s"), (int, float))
     ]
+
+
+def _unplanned_closes(probe: dict[str, Any]) -> tuple[dict[str, int], list[tuple[str, float]]]:
+    """Closes nobody planned (reason categories not in PLANNED_CLOSES): the count per reason over the last
+    24 h, and (reason, WS_CLOSE -> next WS_OPEN seconds) of those the running recorder has reconnected."""
+    led = probe.get("ledger") or {}
+    counts = {
+        reason: n
+        for reason, n in (led.get("ws_close_reasons_24h") or {}).items()
+        if reason not in PLANNED_CLOSES and isinstance(n, int)
+    }
+    holes = [
+        (str(g.get("reason")), float(g["gap_s"]))
+        for g in led.get("reconnect_gaps") or []
+        if g.get("reason") not in PLANNED_CLOSES and isinstance(g.get("gap_s"), (int, float))
+    ]
+    return counts, holes
+
+
+def _by_count(counts: dict[str, int]) -> str:
+    most_first = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join("%s %d" % (reason, n) for reason, n in most_first)
 
 
 def evaluate(
@@ -230,6 +257,25 @@ def evaluate(
                 "ROTATION_HOLE",
                 "a planned rotation left a %.1f s hole (expected under %.1f s): the close timeout regressed?"
                 % (max(rotation_gaps), th.rotation_hole_warn_s),
+            )
+        # closes nobody planned: a peer or path close (``closed``/``error``) raises no ledger event of its own
+        # (a stall, a depth gap or a failed attempt do, above), so it was invisible here until counted
+        unplanned, unplanned_holes = _unplanned_closes(probe)
+        slow = [h for h in unplanned_holes if h[1] > th.unplanned_hole_warn_s]
+        if slow:
+            reason, longest = max(slow, key=lambda h: h[1])
+            add(
+                WARN,
+                "UNPLANNED_HOLE",
+                "%d of %d unplanned reconnects took over %.1f s, the longest %.1f s after '%s': a data gap"
+                % (len(slow), len(unplanned_holes), th.unplanned_hole_warn_s, longest, reason),
+            )
+        if sum(unplanned.values()) >= th.unplanned_closes_warn:
+            add(
+                WARN,
+                "UNPLANNED_CLOSES",
+                "%d unplanned closes in 24 h (%s): the path or the peer keeps dropping connections"
+                % (sum(unplanned.values()), _by_count(unplanned)),
             )
         clk, last = probe.get("clock") or {}, (probe.get("ledger") or {}).get("last_clock_state") or {}
         if last.get("synced") is False and isinstance(last.get("t"), int):
@@ -413,6 +459,15 @@ def _facts(
                 "rotations (running recorder, last 24 h): %d, hole %.2f-%.2f s"
                 % (len(rotations), min(rotations), max(rotations))
             )
+        if "ws_close_reasons_24h" in (probe.get("ledger") or {}):  # a partial probe must not read as "none"
+            unplanned, unplanned_holes = _unplanned_closes(probe)
+            line = "unplanned closes (last 24 h): %s" % (
+                "%d (%s)" % (sum(unplanned.values()), _by_count(unplanned)) if unplanned else "none"
+            )
+            if unplanned_holes:
+                times = [h[1] for h in unplanned_holes]
+                line += ", reconnect hole %.2f-%.2f s" % (min(times), max(times))
+            facts.append(line)
     if verify is not None:
         facts.append("verify: " + verify["result"])
     if free is not None:

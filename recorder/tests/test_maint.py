@@ -205,12 +205,50 @@ def test_a_clock_that_has_been_unsynchronised_for_a_while_is_flagged_but_a_fresh
     assert ev(tmp_path, probe=fresh) == []
 
 
-def test_short_rotation_holes_and_slow_unplanned_reconnects_are_not_a_rotation_finding(tmp_path):
+def test_short_rotation_holes_are_not_a_finding(tmp_path):
     fine = with_probe(ledger={"reconnect_gaps": [_gap("rotation", 0.45), _gap("rotation", 0.5)]})
     assert ev(tmp_path, probe=fine) == []
-    # a stall or a depth gap reconnects on its own schedule: only planned rotations are held to the 2 s line
-    unplanned = with_probe(ledger={"reconnect_gaps": [_gap("stall", 12.0), _gap("gap", 40.0)]})
-    assert ev(tmp_path, probe=unplanned) == []
+
+
+def test_a_slow_unplanned_reconnect_is_its_own_finding_and_never_a_rotation_hole(tmp_path):
+    # a stall or a depth gap reconnects on its own schedule (a quick failure backs off): not the rotation
+    # contract, but a data gap nobody planned, reported under its own code with the worst one named
+    gaps = [_gap("stall", 12.0), _gap("gap", 40.0), _gap("closed", 0.4)]
+    found = ev(tmp_path, probe=with_probe(ledger={"reconnect_gaps": gaps}))
+    assert codes(found) == [(WARN, "UNPLANNED_HOLE")]
+    assert "2 of 3" in found[0].msg and "40.0 s after 'gap'" in found[0].msg
+    # the same long hole after a planned rotation is the rotation finding, not this one
+    rotation = with_probe(ledger={"reconnect_gaps": [_gap("rotation", 5.3)]})
+    assert codes(ev(tmp_path, probe=rotation)) == [(WARN, "ROTATION_HOLE")]
+
+
+def test_quick_unplanned_reconnects_and_a_few_peer_closes_are_only_a_fact(tmp_path):
+    # the 9 minute-boundary ``closed`` closes of 2026-10-09: invisible before, a fact line now, no alarm
+    quiet = with_probe(
+        ledger={
+            "ws_close_reasons_24h": {"rotation": 4, "closed": 9},
+            "reconnect_gaps": [_gap("closed", 0.3 + i / 100) for i in range(9)],
+        }
+    )
+    assert ev(tmp_path, probe=quiet) == []
+
+
+def test_unplanned_closes_are_a_finding_from_the_threshold_on_and_planned_ones_never_count(tmp_path):
+    def with_closes(**reasons: int):
+        return with_probe(ledger={"ws_close_reasons_24h": reasons})
+
+    below = with_closes(closed=20, stall=3)
+    assert ev(tmp_path, probe=below) == []
+    at = ev(tmp_path, probe=with_closes(closed=20, stall=4))
+    assert codes(at) == [(WARN, "UNPLANNED_CLOSES")]
+    assert "24 unplanned closes in 24 h (closed 20, stall 4)" in at[0].msg
+    # planned reasons (a rotation every 23.5 h per connection, the recorder's own stop) are not unplanned
+    assert ev(tmp_path, probe=with_closes(rotation=40, stop=30)) == []
+    # the thresholds are configurable like every other one
+    cfg = cfg_for(tmp_path, thresholds=Thresholds(unplanned_closes_warn=5, unplanned_hole_warn_s=0.2))
+    assert codes(ev(tmp_path, probe=with_closes(closed=5), cfg=cfg)) == [(WARN, "UNPLANNED_CLOSES")]
+    slowish = with_probe(ledger={"reconnect_gaps": [_gap("closed", 0.3)]})
+    assert codes(ev(tmp_path, probe=slowish, cfg=cfg)) == [(WARN, "UNPLANNED_HOLE")]
 
 
 def test_every_event_kind_the_probe_counts_is_either_judged_or_declared_routine():
@@ -248,6 +286,33 @@ def test_the_report_shows_how_long_the_rotations_of_the_running_recorder_took(tm
         "rotations (running recorder, last 24 h): 2, hole 0.41-0.52 s"
         in (cfg.logs / "latest.txt").read_text()
     )
+
+
+def _latest_after_a_run_with(tmp_path: Path, **ledger) -> str:
+    fakes = Fakes()
+    fakes.probe_result = with_probe(ledger=ledger)
+    cfg, code = run(tmp_path, fakes)
+    assert code == 0
+    return (cfg.logs / "latest.txt").read_text()
+
+
+def test_the_report_counts_the_unplanned_closes_by_reason_and_shows_how_long_they_took(tmp_path):
+    gaps = [_gap("closed", 0.31), _gap("closed", 0.52), _gap("stall", 1.4), _gap("rotation", 0.4)]
+    text = _latest_after_a_run_with(
+        tmp_path,
+        ws_close_reasons_24h={"rotation": 4, "closed": 7, "stall": 2, "stop": 1},
+        reconnect_gaps=gaps,
+    )
+    assert "unplanned closes (last 24 h): 9 (closed 7, stall 2), reconnect hole 0.31-1.40 s" in text
+
+
+def test_the_report_says_none_when_every_close_was_planned_and_stays_silent_for_a_partial_probe(tmp_path):
+    planned = _latest_after_a_run_with(tmp_path, ws_close_reasons_24h={"rotation": 4, "stop": 1})
+    assert "unplanned closes (last 24 h): none\n" in planned
+    # the ledger sub-probe did not deliver the close reasons: saying "none" would be a false all-clear
+    (tmp_path / "again").mkdir()
+    silent = _latest_after_a_run_with(tmp_path / "again", events_24h={"WS_CLOSE": 4})
+    assert "unplanned closes" not in silent
 
 
 def test_partial_probe_failures_are_only_an_info(tmp_path):
