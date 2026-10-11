@@ -159,7 +159,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-012** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-013** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-014** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-015** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-015** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | a0a7eed |
 | **FI-016** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-017** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-018** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
@@ -184,7 +184,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-037** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 21154dc |
 | **FI-038** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-039** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-040** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-040** | PRE_D3 | L1 | IMPLEMENTED | PASS | PASS | a0a7eed |
 | **FI-041** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-042** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-043** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -193,11 +193,11 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 28 | 2 | 17 | 9 | BLOCKED |
+| PRE_D3 | 28 | 3 | 17 | 8 | BLOCKED |
 | PRE_OWNER_LIVE | 13 | 0 | 1 | 12 | BLOCKED |
 | CANARY | 4 | 0 | 0 | 4 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 25，PARTIAL 18，IMPLEMENTED 2，合计 45，其中门禁 PASS 2 条。
+故障用例计数：NOT_TESTABLE_YET 24，PARTIAL 18，IMPLEMENTED 3，合计 45，其中门禁 PASS 3 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -213,7 +213,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 9. **批 2：45 条故障用例没有一条能通过门禁。** 复验后 `PARTIAL` 20、`NOT_TESTABLE_YET` 25、`IMPLEMENTED` 0；三个门禁标签（`PRE_D3` 28 条、`PRE_OWNER_LIVE` 13 条、`CANARY` 4 条）全部 `BLOCKED`。
 10. **批 2 改判六条（`NOT_TESTABLE_YET` → `PARTIAL`）**，每条都有直接断言其不变量一部分的单测：FI-005（`/dev/full` 真实写入失败被分类为 DiskFull 且接收器栅栏）、FI-008（重复成交事件不重复累计）、FI-010（序号缺口检出并重同步）、FI-016（非 TRADING 标的拒绝新订单；撤单一半不存在）、FI-034（撤单中直接转成交、非法回退被拒）、FI-038（容量耗尽后失败关闭、持续接受的订单不耗尽注册表）。其余 39 条状态不变，但“尚未”的断言都改成了可失败的引用。
 11. **FI-041 不关闭。** 出路已落地并实测（纯文档 PR 都得到四个 gate；探针 #140 证明红色 PR 被平台拒绝合并），缺的是闸门判定表的入库回归测试：PR #137 时的 304 种输入自测只在一次性本地脚本里，仓库里没有对应文件。
-12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机没有被任何程序引用（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 零生产调用点（FI-015、FI-040）；全树没有“对账屏障”（FI-002、FI-003、FI-009、FI-043 共同的缺口）。
+12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机没有被任何程序引用（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 在复验基线 `6cb56bd` 时零生产调用点（FI-015、FI-040），已于 2026-10-11 随 PR #165 接到 `sync_clock` 的发布路径；全树没有“对账屏障”（FI-002、FI-003、FI-009、FI-043 共同的缺口）。
 
 ## 4 明细
 
@@ -971,10 +971,10 @@ level: L1
 status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
-open: absent:native/src/*.cpp#check_clock_skew absent:native/include/hengyuan/binance_private_rest.hpp#check_clock_skew
-refs: test:native/tests/test_binance_clock_sync.cpp#DriftBeyondToleranceIsNotFresh test:native/tests/test_binance_clock_sync.cpp#StaleSnapshotFails test:native/tests/test_transport_policy.cpp#BeyondWindowFails
-note: 新鲜度、漂移与偏移幅度函数都有单测；check_clock_skew 在 native/src 与私有 REST 客户端里没有任何调用点，偏移幅度对发布路径没有上界。
+baseline: a0a7eed
+open: absent:native/include/hengyuan/live_submit_orchestrator.hpp#is_snapshot_fresh
+refs: test:native/tests/test_binance_clock_sync.cpp#DriftBeyondToleranceIsNotFresh test:native/tests/test_binance_clock_sync.cpp#StaleSnapshotFails test:native/tests/test_binance_private_rest.cpp#ARefusedOffsetLeavesEverySignedCallFailingClosedWithoutANetworkAttempt test:native/tests/test_binance_private_rest.cpp#SyncClockRefusesAnOffsetBeyondTheRecvWindowAndPublishesNothing code:native/include/hengyuan/binance_private_rest.hpp#sync_clock
+note: PR #165 之后偏移幅度校验已接线，被拒的偏移不发布，其后 fetch_account、query_order、submit_order 全部失败关闭且一个请求都不发（全链单测）；仍缺两样：编排器自己没有时钟就绪门（submit_order 在时钟过期时返回 NetworkError，由编排器按既有的不明确路径处理，而不是在持久边界之前就拒绝），以及“时钟告警”这个证据产物；类型化的时钟令牌是 SAFE-01 里缺的那一块。
 ```
 
 ```ledger
@@ -1353,13 +1353,12 @@ gate_tag: PRE_D3
 scope: 全部
 stage: 0 与 1A
 level: L1
-status: NOT_TESTABLE_YET
-result: NOT_RUN
-gate_result: BLOCKED
-baseline: 6cb56bd
-open: absent:native/src/*.cpp#check_clock_skew absent:native/include/hengyuan/binance_private_rest.hpp#check_clock_skew
-refs: test:native/tests/test_transport_policy.cpp#BeyondWindowFails
-note: 偏移幅度函数有单测、零生产调用点，同 FI-015。
+status: IMPLEMENTED
+result: PASS
+gate_result: PASS
+baseline: a0a7eed
+refs: test:native/tests/test_binance_private_rest.cpp#SyncClockRefusesAnOffsetBeyondTheRecvWindowAndPublishesNothing test:native/tests/test_binance_private_rest.cpp#ARefusedSyncLeavesThePreviouslyPublishedSnapshotInPlace test:native/tests/test_transport_policy.cpp#BeyondWindowFails code:native/include/hengyuan/binance_private_rest.hpp#sync_clock code:native/include/hengyuan/transport_policy.hpp#check_clock_skew run:"38135428885@a0a7eed0/ci-native.yml[native-build-test]"
+note: PR #165 之后 sync_clock 在发布前用传输策略的 check_clock_skew（本地请求中点对 serverTime，上界为绑定环境的 recv_window_ms）判偏移幅度，越界返回 ClockSkewTooLarge 且不发布，此前已发布的快照不被覆盖；本地假交易所回答“合理时延加 ±8 s、+1 h、−24 h 的巨幅偏移”，客户端一律拒绝；判定信号是单元测试失败，36 个变异体（含偏移校验永不触发、取反、上界放大千倍、检测到仍发布）全部被预期用例杀死，主干 CI Native 的全量构建与测试已成功。
 ```
 
 ```ledger
