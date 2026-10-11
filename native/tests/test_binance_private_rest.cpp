@@ -2416,13 +2416,18 @@ TEST_F(BudgetedClientFixture, ACallThatFailsClosedBeforeTheNetworkCostsNothing) 
 TEST_F(BoundCredentialsFixture, AClientWithoutATrackerIsNotCountedAndNotRefused) {
     // the pre-H1 default, unchanged: no tracker wired in means no local rate-limit awareness (explicitly
     // Unaccounted in the permit), and the existing success-path tests above are all this shape
-    hy::test_helpers::TlsResponseAcceptor server(
-        fixture_path("test_leaf_cert_testnet_host.pem"),
-        fixture_path("test_leaf_key_testnet_host.pem"), 200, hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
-    PrivateRestConfig cfg;
-    cfg.port = std::to_string(server.port());
-    for (int i = 0; i < 50; ++i) ASSERT_EQ(client.sync_clock(cfg), PrivateRestError::None) << i;
-    EXPECT_EQ(server.requests().size(), 50u);
+    for (int i = 0; i < 50; ++i) {
+        // A fresh responder per call: its body carries the time of its own construction. One responder for all 50
+        // calls would fall further behind the local clock with every (slow, under a sanitizer) TLS round trip and
+        // end up outside the recv window, which sync_clock() now refuses.
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"),
+            fixture_path("test_leaf_key_testnet_host.pem"), 200, hy::test_helpers::current_server_time_body());
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+        ASSERT_EQ(client.sync_clock(cfg), PrivateRestError::None) << i;
+        EXPECT_EQ(server.requests().size(), 1u) << i;
+    }
 }
