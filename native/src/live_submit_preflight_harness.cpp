@@ -356,8 +356,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // One local rate-limit tracker for the whole run, owned by this (the hot) thread: the cold-start REST calls
+    // below (clock sync, exchangeInfo, listenKey) are charged to its Reconciliation lane through the client, and
+    // the orchestrator further down reserves its order flow on the Strategy lane of the very same tracker
+    // (SAFE-01 slice 4). Declared before the client so it outlives it.
+    SpotRateLimitTracker rate_limiter;
+    rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
+
     SymbolRegistry registry;
-    BinancePrivateRestClient client(binding, std::move(creds));
+    BinancePrivateRestClient client(binding, std::move(creds), &rate_limiter);
     SubmitAdapterContext submit_ctx{&client, &registry};
     // Constructed to prove H5's composite adapters still assemble against a real, freshly
     // refreshed SymbolRegistry -- exactly like H6's own diagnostic. NEVER assigned to
@@ -518,9 +525,6 @@ int main(int argc, char* argv[]) {
     // --- Real KillSwitch (Normal) --------------------------------------------------------------
     KillSwitch kill_switch;
     kill_switch.operator_reset();
-
-    SpotRateLimitTracker rate_limiter;
-    rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
 
     // Real DurableAuditSink -- this harness never gets far enough to write an order-lifecycle
     // record worth persisting (confirmation is never bound), so an ephemeral per-run temp file

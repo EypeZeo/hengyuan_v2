@@ -32,6 +32,7 @@
 #include "binance_environment_test_hooks.hpp"
 #include "binance_private_rest_test_hooks.hpp"
 #include "test_helpers/blackhole_acceptor.hpp"
+#include "test_helpers/server_time_body.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
 
 #include <chrono>
@@ -1344,7 +1345,7 @@ TEST_F(BoundCredentialsFixture, SyncClockRealSuccessPathPublishesOffset) {
     hy::test_helpers::TlsResponseAcceptor server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
 
@@ -1382,7 +1383,7 @@ TEST_F(BoundCredentialsFixture, FetchAccountRealSuccessPathSignsAndParses) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -1416,7 +1417,7 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -1448,7 +1449,7 @@ TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -1500,24 +1501,21 @@ TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
 //
 // rate_limiter_ defaults to nullptr on every constructor call in this file that doesn't
 // pass one explicitly (all 30+ of them, including every test above this point) -- these
-// two tests are the only ones that actually wire a SpotRateLimitTracker in, covering both
-// directions of the guard added to query_order().
+// two tests are the ones that first wired a SpotRateLimitTracker in, covering both
+// directions of the guard on query_order(). The budget of every other method (SAFE-01
+// slice 4) is covered by the section at the end of this file.
 
 // R-10: a locally refused reservation is NotSent, not Inconclusive. poll_once() counts every
 // non-NotSent answer toward the UNKNOWN quarantine criterion, so under the old behaviour a
 // throttled reconcile loop could quarantine an order it never even asked about.
 TEST_F(BoundCredentialsFixture, QueryOrderExhaustedRateLimiterReturnsNotSentWithoutNetworkAttempt) {
-    hy::test_helpers::TlsResponseAcceptor time_server(
-        fixture_path("test_leaf_cert_testnet_host.pem"),
-        fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
     hy::SpotRateLimitTracker limiter;
     ASSERT_TRUE(limiter.configure(0, 0, 0, 0, 0, 0));  // zero budget in every lane -- exhausted
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
     use_fixtures(client);
-    PrivateRestConfig sync_cfg;
-    sync_cfg.port = std::to_string(time_server.port());
-    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+    // The clock is made fresh through the test hook, not by sync_clock(): sync_clock() is budgeted too now
+    // (SAFE-01 slice 4), so against an exhausted tracker it would be refused before it could set the scene.
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
 
     // No order-endpoint server is even started -- if query_order() attempted a network
     // call despite the exhausted budget, it would have nothing to connect to and this
@@ -1530,7 +1528,7 @@ TEST_F(BoundCredentialsFixture, QueryOrderRateLimiterWithBudgetStillSendsRealReq
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     hy::SpotRateLimitTracker limiter;
     ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));  // ample budget every lane
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
@@ -1558,7 +1556,7 @@ TEST_F(BoundCredentialsFixture, QueryOrderHttpErrorStatusIsInconclusiveNotFailur
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -1583,7 +1581,7 @@ TEST_F(BoundCredentialsFixture, QueryOrderMalformedJsonIsInconclusive) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -1638,7 +1636,7 @@ TEST_F(BoundCredentialsFixture, SubmitOrderRealSuccessPathSignsAndParses) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -1680,7 +1678,7 @@ TEST_F(BoundCredentialsFixture, SubmitOrderHttpErrorStatusIsNetworkErrorNotRejec
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -1708,7 +1706,7 @@ TEST_F(BoundCredentialsFixture, SubmitOrderMalformedJsonIsNetworkError) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
     use_fixtures(client);
     PrivateRestConfig sync_cfg;
@@ -2059,7 +2057,7 @@ class BlockedEndpointFixture : public BoundCredentialsFixture {
 protected:
     hy::test_helpers::TlsResponseAcceptor server_{fixture_path("test_leaf_cert_testnet_host.pem"),
                                                   fixture_path("test_leaf_key_testnet_host.pem"),
-                                                  200, R"({"serverTime":1700000000000})"};
+                                                  200, hy::test_helpers::current_server_time_body()};
     PrivateRestConfig cfg_;
     std::unique_ptr<BinancePrivateRestClient> client_;
 
@@ -2126,4 +2124,305 @@ TEST_F(BlockedEndpointFixture, TheGenuineBindingStillReachesTheNetwork) {
     use_fixtures(client);
     EXPECT_EQ(client.sync_clock(cfg_), PrivateRestError::None);
     EXPECT_EQ(server_.requests().size(), 1u);
+}
+
+// ============================================================================================================
+// SAFE-01 slice 4 (blueprint SAFE-01: clock-offset magnitude check, rate-limit accounting, typed permits)
+// ============================================================================================================
+
+// --- sync_clock(): an offset beyond the bound environment's recv window is never published ---
+//
+// The fixture answers with serverTime = (local time when it was built) + delta, so the real offset the client
+// measures is delta minus a few milliseconds of build-to-request latency and half the loopback round trip.
+// The testnet and production bindings both carry recv_window_ms = 5000; every delta below keeps at least 2 s of
+// margin to that boundary.
+
+namespace {
+
+using hy::test_helpers::server_time_body_offset_by;
+
+}  // namespace
+
+TEST_F(BoundCredentialsFixture, SyncClockPublishesAnOffsetInsideTheRecvWindowEvenWhenItIsLargish) {
+    for (const std::int64_t delta : {std::int64_t{0}, std::int64_t{3000}, std::int64_t{-3000}}) {
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"),
+            fixture_path("test_leaf_key_testnet_host.pem"), 200, server_time_body_offset_by(delta));
+        BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+        use_fixtures(client);
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+
+        ASSERT_EQ(client.sync_clock(cfg), PrivateRestError::None) << "delta=" << delta;
+        const ClockOffsetSnapshot snap = client.clock_publisher().load();
+        EXPECT_NE(snap.seq, 0u) << delta;
+        EXPECT_TRUE(is_snapshot_fresh(snap, fetch_clock_pair())) << delta;
+        // the measured offset is the injected one, give or take scheduling noise
+        EXPECT_GT(snap.offset_ms, delta - 1500) << delta;
+        EXPECT_LT(snap.offset_ms, delta + 1500) << delta;
+    }
+}
+
+TEST_F(BoundCredentialsFixture, SyncClockRefusesAnOffsetBeyondTheRecvWindowAndPublishesNothing) {
+    for (const std::int64_t delta : {std::int64_t{8000}, std::int64_t{-8000}, std::int64_t{3'600'000},
+                                     std::int64_t{-86'400'000}}) {
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"),
+            fixture_path("test_leaf_key_testnet_host.pem"), 200, server_time_body_offset_by(delta));
+        BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+        use_fixtures(client);
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+
+        EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::ClockSkewTooLarge) << "delta=" << delta;
+        EXPECT_EQ(server.requests().size(), 1u) << "the request itself was made: the refusal is about the answer";
+        const ClockOffsetSnapshot snap = client.clock_publisher().load();
+        EXPECT_EQ(snap.seq, 0u) << "nothing may be published (delta=" << delta << ")";
+        EXPECT_FALSE(is_snapshot_fresh(snap, fetch_clock_pair())) << delta;
+    }
+}
+
+TEST_F(BoundCredentialsFixture, ARefusedSyncLeavesThePreviouslyPublishedSnapshotInPlace) {
+    hy::test_helpers::TlsResponseAcceptor good(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, server_time_body_offset_by(0));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig good_cfg;
+    good_cfg.port = std::to_string(good.port());
+    ASSERT_EQ(client.sync_clock(good_cfg), PrivateRestError::None);
+    const ClockOffsetSnapshot before = client.clock_publisher().load();
+    ASSERT_NE(before.seq, 0u);
+
+    hy::test_helpers::TlsResponseAcceptor wild(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, server_time_body_offset_by(3'600'000));
+    PrivateRestConfig wild_cfg;
+    wild_cfg.port = std::to_string(wild.port());
+    EXPECT_EQ(client.sync_clock(wild_cfg), PrivateRestError::ClockSkewTooLarge);
+
+    const ClockOffsetSnapshot after = client.clock_publisher().load();
+    EXPECT_EQ(after.seq, before.seq) << "a refused offset must not be published over a good one";
+    EXPECT_EQ(after.offset_ms, before.offset_ms);
+    EXPECT_TRUE(is_snapshot_fresh(after, fetch_clock_pair()));
+}
+
+// FI-015 / FI-040 end to end. An exchange clock an hour away from ours is refused at the source and nothing is
+// published, so every signed call that follows finds no fresh clock and is not sent -- the order included. A server
+// that would happily answer anything is listening the whole time; it must not see a single request.
+TEST_F(BoundCredentialsFixture, ARefusedOffsetLeavesEverySignedCallFailingClosedWithoutANetworkAttempt) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, server_time_body_offset_by(3'600'000));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::ClockSkewTooLarge);
+
+    hy::test_helpers::TlsResponseAcceptor signed_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"symbol":"BTCUSDT","orderId":999,"clientOrderId":"coid-skew","transactTime":1700000000000,)"
+        R"("price":"50000.12","origQty":"0.100000","executedQty":"0.000000",)"
+        R"("cummulativeQuoteQty":"0.00000000","status":"NEW","side":"BUY","type":"LIMIT",)"
+        R"("timeInForce":"GTC"})");
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(signed_server.port());
+
+    AccountSnapshot account;
+    EXPECT_EQ(client.fetch_account(account, cfg), PrivateRestError::ClockNotFresh);
+    EXPECT_EQ(client.query_order(make_btcusdt_expectation("coid-skew"), cfg).outcome, QueryOutcome::NotSent);
+    const auto rules = make_btcusdt_rules();
+    EXPECT_EQ(client.submit_order("coid-skew", 1, OrderSide::Buy, OrderType::Limit, 5'000'012, 100'000, rules, cfg)
+                  .outcome,
+              SubmitOutcome::NetworkError);
+    EXPECT_TRUE(signed_server.requests().empty()) << "not one byte may have been sent";
+}
+
+// --- the local rate-limit budget: every network method of the client is counted, on the Reconciliation lane ---
+//
+// The tracker's Reconciliation lane is sized so it holds exactly K calls of the method under test (the lane is
+// floor(weight_limit * 10 / 100) weight; raw requests and ORDERS are ample). The method is called until the lane
+// refuses it: the K successes prove the weight charged, the (K+1)-th call proves the refusal, the server's request
+// count proves the refused call never reached the network, and the Strategy lane staying open proves the lane.
+
+namespace {
+
+class BudgetedClientFixture : public BoundCredentialsFixture {
+protected:
+    hy::SpotRateLimitTracker tracker_;
+    std::unique_ptr<hy::test_helpers::TlsResponseAcceptor> server_;
+    std::unique_ptr<BinancePrivateRestClient> client_;
+    PrivateRestConfig cfg_;
+
+    // The Reconciliation lane holds `lane_weight` of weight. The clock is made fresh through the test hook for
+    // the signed methods (sync_clock() itself is budgeted, and is under test in its own case below).
+    void wire(std::uint32_t lane_weight, std::string body) {
+        EXPECT_TRUE(tracker_.configure(lane_weight * 10, 0, 100'000, 0, 100'000, 0));
+        server_ = std::make_unique<hy::test_helpers::TlsResponseAcceptor>(
+            fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+            std::move(body));
+        cfg_.port = std::to_string(server_->port());
+        client_ = std::make_unique<BinancePrivateRestClient>(EnvironmentBinding::testnet(), make_creds(), &tracker_);
+        use_fixtures(*client_);
+        hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(*client_);
+    }
+
+    bool reconciliation_lane_open() const {
+        return tracker_.can_send_order(hy::RateLimitLane::Reconciliation, 1);
+    }
+    bool strategy_lane_open() const { return tracker_.can_send_order(hy::RateLimitLane::Strategy, 1); }
+    bool emergency_lane_open() const { return tracker_.can_send_order(hy::RateLimitLane::Emergency, 1); }
+};
+
+}  // namespace
+
+TEST_F(BudgetedClientFixture, SyncClockChargesOneWeight) {
+    wire(3, hy::test_helpers::current_server_time_body());
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(client_->sync_clock(cfg_), PrivateRestError::None) << i;
+    EXPECT_EQ(server_->requests().size(), 3u);
+    EXPECT_FALSE(reconciliation_lane_open());
+    EXPECT_EQ(client_->sync_clock(cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(server_->requests().size(), 3u) << "the refused call must not reach the network";
+    EXPECT_TRUE(strategy_lane_open());
+    EXPECT_TRUE(emergency_lane_open());
+}
+
+TEST_F(BudgetedClientFixture, FetchAccountChargesTwentyWeight) {
+    wire(40, R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1.5","locked":"0.5"}]})");
+    hy::AccountSnapshot out;
+    for (int i = 0; i < 2; ++i) EXPECT_EQ(client_->fetch_account(out, cfg_), PrivateRestError::None) << i;
+    EXPECT_EQ(server_->requests().size(), 2u);
+    EXPECT_EQ(client_->fetch_account(out, cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(server_->requests().size(), 2u);
+    EXPECT_TRUE(strategy_lane_open());
+}
+
+TEST_F(BudgetedClientFixture, FetchExchangeInfoChargesTwentyWeight) {
+    // the body need not be a usable exchangeInfo: what is counted is the request, not what it answers
+    wire(40, R"({"serverTime":1700000000000,"symbols":[]})");
+    hy::ParsedExchangeInfo out;
+    const std::string_view syms[] = {"BTCUSDT"};
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_NE(client_->fetch_exchange_info(out, syms, cfg_), PrivateRestError::RateLimitExhausted) << i;
+    }
+    EXPECT_EQ(server_->requests().size(), 2u);
+    EXPECT_EQ(client_->fetch_exchange_info(out, syms, cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(server_->requests().size(), 2u);
+    EXPECT_TRUE(strategy_lane_open());
+}
+
+TEST_F(BudgetedClientFixture, EachListenKeyCallChargesTwoWeight) {
+    wire(6, R"({"listenKey":"abcdefghijklmnopqrstuvwxyz0123456789"})");
+    char buf[hy::kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_NE(client_->create_listen_key(buf, len, cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_NE(client_->keepalive_listen_key("some-key", cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_NE(client_->close_listen_key("some-key", cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(server_->requests().size(), 3u);
+    EXPECT_FALSE(reconciliation_lane_open()) << "three calls of weight 2 fill a lane of 6";
+    EXPECT_EQ(client_->create_listen_key(buf, len, cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->keepalive_listen_key("some-key", cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->close_listen_key("some-key", cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(server_->requests().size(), 3u);
+    EXPECT_TRUE(strategy_lane_open());
+}
+
+TEST_F(BudgetedClientFixture, QueryOrderChargesFourWeightAndIsNotSentWhenRefused) {
+    wire(4, R"({"symbol":"BTCUSDT","orderId":777,"clientOrderId":"coid-budget",)"
+            R"("price":"50000.12","origQty":"0.100000","executedQty":"0.050000",)"
+            R"("cummulativeQuoteQty":"2500.00000000","status":"PARTIALLY_FILLED",)"
+            R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})");
+    const auto expected = make_btcusdt_expectation("coid-budget");
+    EXPECT_EQ(client_->query_order(expected, cfg_).outcome, QueryOutcome::Found);
+    EXPECT_EQ(server_->requests().size(), 1u);
+    EXPECT_EQ(client_->query_order(expected, cfg_).outcome, QueryOutcome::NotSent);
+    EXPECT_EQ(server_->requests().size(), 1u);
+    EXPECT_TRUE(strategy_lane_open());
+}
+
+TEST_F(BudgetedClientFixture, AnExhaustedBudgetRefusesEveryMethodBeforeAnyNetworkAttempt) {
+    wire(0, hy::test_helpers::current_server_time_body());  // no weight in any lane
+    hy::AccountSnapshot account;
+    hy::ParsedExchangeInfo info;
+    const std::string_view syms[] = {"BTCUSDT"};
+    char buf[hy::kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_EQ(client_->sync_clock(cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->fetch_account(account, cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->fetch_exchange_info(info, syms, cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->create_listen_key(buf, len, cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->keepalive_listen_key("some-key", cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->close_listen_key("some-key", cfg_), PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(client_->query_order(make_btcusdt_expectation("coid-none"), cfg_).outcome, QueryOutcome::NotSent);
+    EXPECT_TRUE(server_->requests().empty()) << "not one byte may have been sent";
+}
+
+TEST_F(BudgetedClientFixture, SubmitOrderIsCountedByTheOrchestratorNotByTheClient) {
+    // POST /api/v3/order: the order orchestrator reserves weight, raw request and ORDERS under the Strategy lane at
+    // Gate 12c before it calls the submit port, so the client must not charge it a second time. wire(1) lays the
+    // tracker out as Strategy 8 / Reconciliation 1 / Emergency 1 of weight: any charge the client made, to any lane,
+    // would show as a lane that can no longer take its full capacity.
+    wire(1, R"({"symbol":"BTCUSDT","orderId":888,"clientOrderId":"coid-submit-budget",)"
+            R"("transactTime":1700000000000,"price":"50000.12","origQty":"0.100000",)"
+            R"("executedQty":"0.000000","cummulativeQuoteQty":"0.00000000",)"
+            R"("status":"NEW","side":"BUY","type":"LIMIT","timeInForce":"GTC"})");
+    const auto rules = make_btcusdt_rules();
+    const auto resp = client_->submit_order("coid-submit-budget", 1, OrderSide::Buy, OrderType::Limit, 5'000'012,
+                                            100'000, rules, cfg_);
+    EXPECT_EQ(resp.outcome, SubmitOutcome::Accepted);
+    EXPECT_EQ(server_->requests().size(), 1u);
+    EXPECT_TRUE(tracker_.can_send_order(hy::RateLimitLane::Strategy, 8)) << "the Strategy lane was charged";
+    EXPECT_TRUE(tracker_.can_send_order(hy::RateLimitLane::Reconciliation, 1)) << "the Reconciliation lane was charged";
+    EXPECT_TRUE(tracker_.can_send_order(hy::RateLimitLane::Emergency, 1)) << "the Emergency lane was charged";
+}
+
+// The reservation comes after every local check that can still refuse the call: the endpoint check for all of
+// them, the clock gate for the signed ones. A blocked host or a stale clock, retried in a loop, must not drain the
+// budget of calls that would really go out.
+TEST_F(BudgetedClientFixture, ACallThatFailsClosedBeforeTheNetworkCostsNothing) {
+    wire(20, "{}");  // the Reconciliation lane holds exactly 20 weight; raw requests and ORDERS are ample
+    {
+        BinancePrivateRestClient blocked(blocked_testnet_binding(), make_creds(), &tracker_);
+        use_fixtures(blocked);
+        hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(blocked);
+        hy::AccountSnapshot account;
+        hy::ParsedExchangeInfo info;
+        const std::string_view syms[] = {"BTCUSDT"};
+        char buf[hy::kListenKeyLen]{};
+        std::size_t len = 0;
+        EXPECT_EQ(blocked.sync_clock(cfg_), PrivateRestError::InvalidConfig);
+        EXPECT_EQ(blocked.fetch_account(account, cfg_), PrivateRestError::InvalidConfig);
+        EXPECT_EQ(blocked.fetch_exchange_info(info, syms, cfg_), PrivateRestError::InvalidConfig);
+        EXPECT_EQ(blocked.create_listen_key(buf, len, cfg_), PrivateRestError::InvalidConfig);
+        EXPECT_EQ(blocked.keepalive_listen_key("some-key", cfg_), PrivateRestError::InvalidConfig);
+        EXPECT_EQ(blocked.close_listen_key("some-key", cfg_), PrivateRestError::InvalidConfig);
+        EXPECT_EQ(blocked.query_order(make_btcusdt_expectation("coid-blocked"), cfg_).outcome,
+                  QueryOutcome::NotSent);
+    }
+    {
+        BinancePrivateRestClient stale(EnvironmentBinding::testnet(), make_creds(), &tracker_);
+        use_fixtures(stale);  // no fresh clock was ever published for this one
+        hy::AccountSnapshot account;
+        EXPECT_EQ(stale.fetch_account(account, cfg_), PrivateRestError::ClockNotFresh);
+        EXPECT_EQ(stale.query_order(make_btcusdt_expectation("coid-stale"), cfg_).outcome, QueryOutcome::NotSent);
+    }
+    EXPECT_TRUE(tracker_.can_send_order(hy::RateLimitLane::Reconciliation, 20))
+        << "a call that never left the process was charged to the budget";
+    EXPECT_TRUE(server_->requests().empty());
+}
+
+TEST_F(BoundCredentialsFixture, AClientWithoutATrackerIsNotCountedAndNotRefused) {
+    // the pre-H1 default, unchanged: no tracker wired in means no local rate-limit awareness (explicitly
+    // Unaccounted in the permit), and the existing success-path tests above are all this shape
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, hy::test_helpers::current_server_time_body());
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    for (int i = 0; i < 50; ++i) ASSERT_EQ(client.sync_clock(cfg), PrivateRestError::None) << i;
+    EXPECT_EQ(server.requests().size(), 50u);
 }

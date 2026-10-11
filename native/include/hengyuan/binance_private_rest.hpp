@@ -169,6 +169,9 @@ enum class PrivateRestError : std::uint8_t {
     ClockNotFresh = 11,      // §2.2: no fresh clock-offset snapshot -- fail closed, never signs
                               // with uncalibrated local system time
     SigningFailed = 12,      // build_canonical_query()/build_signed_query()/copy_api_key()
+    ClockSkewTooLarge = 13,  // §2.2: the fetched offset exceeds the transport policy's recv window --
+                              // not published (a broken local clock or a wrong serverTime)
+    RateLimitExhausted = 14, // the local rate-limit budget refused this request: nothing was sent (L4 §7.4)
 };
 
 // §4.2's parse_balance_decimal_to_ticks() moved to binance_decimal.hpp (L4 §5 / PR 5b): the
@@ -280,6 +283,14 @@ inline PrivateRestError parse_account_response(std::string_view body, std::int64
 // TODO 1A.4: listenKey is a ~60-char alphanumeric token; 128 is generous headroom without being
 // unbounded, matching kApiKeyLen's own "fixed, not unbounded" philosophy (binance_environment.hpp).
 inline constexpr std::size_t kListenKeyLen = 128;
+
+// Weight charged to the Reconciliation lane for each of POST/PUT/DELETE /api/v3/userDataStream. There is no
+// spec-pinned weight for them (this repo's accepted specs predate the user-data-stream design, and
+// PrivateRestEndpoint must not gain an enumerator, see try_reserve_weight_only_explicit()); 2 is Binance's
+// long-documented spot weight for all three. The exchange removed these REST endpoints on 2026-02-20, so the
+// three listenKey methods go away with the private-stream migration -- until then they get the same budget
+// gate as every other method.
+inline constexpr std::uint32_t kListenKeyCallWeight = 2;
 
 // POST /api/v3/userDataStream's `{"listenKey": "..."}` response. PUT/DELETE return `{}` on
 // success and need no body parsing at all -- fetch_signed_body_coro()'s own HttpStatus check
@@ -818,7 +829,9 @@ struct ServerTimeFetchResult {
 };
 
 inline net::awaitable<std::variant<ServerTimeFetchResult, PrivateRestError>>
-fetch_server_time_coro(EndpointPermit permit, PrivateRestConfig cfg, RestTestSeam seam) {
+fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRestConfig cfg,
+                       RestTestSeam seam) {
+    static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
     PrivateRestError current_stage = PrivateRestError::Resolve;
@@ -926,8 +939,9 @@ fetch_server_time_coro(EndpointPermit permit, PrivateRestConfig cfg, RestTestSea
 // string exactly like GET does (no request body needed), so this is the only change a POST
 // caller needs; the body stays http::empty_body for both verbs.
 inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_body_coro(
-    EndpointPermit permit, std::string target, std::string api_key, PrivateRestConfig cfg,
-    RestTestSeam seam, http::verb verb = http::verb::get) {
+    EndpointPermit permit, RateLimitPermit budget, std::string target, std::string api_key,
+    PrivateRestConfig cfg, RestTestSeam seam, http::verb verb = http::verb::get) {
+    static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
     PrivateRestError current_stage = PrivateRestError::Resolve;
@@ -1022,7 +1036,9 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
 // invariant, with no conditional to accidentally weaken for a genuinely signed call later, is
 // simpler to verify by inspection than a shared coroutine with a signed/unsigned branch.
 inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_body_coro(
-    EndpointPermit permit, std::string target, PrivateRestConfig cfg, RestTestSeam seam) {
+    EndpointPermit permit, RateLimitPermit budget, std::string target, PrivateRestConfig cfg,
+    RestTestSeam seam) {
+    static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
     PrivateRestError current_stage = PrivateRestError::Resolve;
@@ -1180,15 +1196,22 @@ public:
     // §3: unauthenticated. On success, computes the offset (RTT > kMaxUsableRttMs is silently
     // discarded -- compute_clock_offset()'s own contract, not a bug here) and publishes it via
     // clock_publisher(), closing the previously-offline-only clock-sync loop. Never signs
-    // anything and never touches creds_.
+    // anything and never touches creds_. An offset whose magnitude exceeds the bound environment's
+    // recv window (check_clock_skew(), SAFE-01 slice 4) is NOT published and returns
+    // ClockSkewTooLarge: a local clock that far off, or a serverTime that implausible, is not
+    // something to calibrate against -- a previously published snapshot just ages out on its TTL.
     PrivateRestError sync_clock(const PrivateRestConfig& cfg) {
         const auto permit = endpoint_permit();
         if (!permit) return PrivateRestError::InvalidConfig;
+        // Budget before the network (L4 §7.4): GET /api/v3/time, weight 1, Reconciliation lane. Refused
+        // here, before anything is resolved or connected, when that lane is out of budget.
+        const auto budget = reserve_budget(PrivateRestEndpoint::GetServerTime);
+        if (!budget) return PrivateRestError::RateLimitExhausted;
         net::io_context ioc;
         std::variant<detail::ServerTimeFetchResult, PrivateRestError> outcome =
             PrivateRestError::None;
         net::co_spawn(
-            ioc, detail::fetch_server_time_coro(*permit, cfg, test_seam_),
+            ioc, detail::fetch_server_time_coro(*permit, *budget, cfg, test_seam_),
             [&outcome](std::exception_ptr eptr,
                        std::variant<detail::ServerTimeFetchResult, PrivateRestError> r) {
                 if (eptr) {
@@ -1210,6 +1233,17 @@ public:
                                    r.fetch_sample, snap)) {
             // RTT over kMaxUsableRttMs, or checked-arithmetic overflow on pathological inputs.
             return PrivateRestError::JsonParse;
+        }
+        // The offset's magnitude, judged by the transport policy's own check: the gap between the
+        // request's midpoint on the local clock (the point compute_clock_offset() measured the
+        // offset from) and the exchange's serverTime. Nothing past the window is published.
+        std::int64_t rtt_ms = 0;
+        std::int64_t local_mid_ms = 0;
+        if (!checked_sub_i64(r.local_recv_ms, r.local_send_ms, rtt_ms) ||
+            !checked_add_i64(r.local_send_ms, rtt_ms / 2, local_mid_ms) ||
+            check_clock_skew(local_mid_ms, r.server_time_ms, binding_.transport_policy().recv_window_ms) !=
+                TransportCheck::Ok) {
+            return PrivateRestError::ClockSkewTooLarge;
         }
         clock_pub_.publish(snap);
         return PrivateRestError::None;
@@ -1239,6 +1273,11 @@ public:
             return PrivateRestError::ClockNotFresh;
         }
 
+        // Budget after the clock gate (a stale clock must not burn budget) and before anything is signed:
+        // GET /api/v3/account, weight 20, Reconciliation lane (L4 §7.4).
+        const auto budget = reserve_budget(PrivateRestEndpoint::GetAccount);
+        if (!budget) return PrivateRestError::RateLimitExhausted;
+
         char recv_window_buf[24];
         const int n = std::snprintf(recv_window_buf, sizeof(recv_window_buf), "%lld",
                                      static_cast<long long>(cfg.recv_window_ms));
@@ -1266,7 +1305,7 @@ public:
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
             ioc,
-            detail::fetch_signed_body_coro(*permit, target,
+            detail::fetch_signed_body_coro(*permit, *budget, target,
                                             std::string(key_buf.data(), key_len), cfg, test_seam_),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                 if (eptr) std::rethrow_exception(eptr);
@@ -1310,6 +1349,8 @@ public:
         if (!creds_) return PrivateRestError::SigningFailed;
         const auto permit = endpoint_permit();
         if (!permit) return PrivateRestError::InvalidConfig;
+        const auto budget = reserve_budget_explicit(kListenKeyCallWeight);
+        if (!budget) return PrivateRestError::RateLimitExhausted;
 
         std::array<char, kApiKeyLen> key_buf{};
         std::size_t key_len = 0;
@@ -1321,7 +1362,7 @@ public:
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
             ioc,
-            detail::fetch_signed_body_coro(*permit, "/api/v3/userDataStream",
+            detail::fetch_signed_body_coro(*permit, *budget, "/api/v3/userDataStream",
                                             std::string(key_buf.data(), key_len), cfg, test_seam_,
                                             http::verb::post),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
@@ -1393,10 +1434,14 @@ public:
             return PrivateRestError::InvalidConfig;
         }
 
+        // GET /api/v3/exchangeInfo, weight 20, Reconciliation lane (L4 §7.4).
+        const auto budget = reserve_budget(PrivateRestEndpoint::GetExchangeInfo);
+        if (!budget) return PrivateRestError::RateLimitExhausted;
+
         net::io_context ioc;
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
-            ioc, detail::fetch_public_body_coro(*permit, target, cfg, test_seam_),
+            ioc, detail::fetch_public_body_coro(*permit, *budget, target, cfg, test_seam_),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
                 if (eptr) std::rethrow_exception(eptr);
                 outcome = std::move(r);
@@ -1462,7 +1507,7 @@ public:
             }
 
             // docs/BINANCE_PRIVATE_REST_L4_SPEC.md §7.4 (P0): every signed/public REST send
-            // path must reserve budget via try_reserve_weight_only() before sending --
+            // path must reserve budget (reserve_budget()) before sending --
             // GetOrder was the one confirmed-missing call site (Batch H, H1). rate_limiter_
             // == nullptr means no tracker was wired in (this class's pre-H1 default,
             // preserved for every existing caller/test) -- skip the check entirely rather
@@ -1476,11 +1521,8 @@ public:
             // its InFlightRegistry slot. Now the refused call costs no attempt; the time it
             // burns still counts toward the quarantine hard cap, so a permanently throttled
             // order is still bounded.
-            if (rate_limiter_ && !rate_limiter_->try_reserve_weight_only(
-                                      RateLimitLane::Reconciliation, PrivateRestEndpoint::GetOrder,
-                                      weight_table_)) {
-                return QueryResult::not_sent();
-            }
+            const auto budget = reserve_budget(PrivateRestEndpoint::GetOrder);
+            if (!budget) return QueryResult::not_sent();
 
             char recv_window_buf[24];
             const int n = std::snprintf(recv_window_buf, sizeof(recv_window_buf), "%lld",
@@ -1511,7 +1553,7 @@ public:
             std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
             net::co_spawn(
                 ioc,
-                detail::fetch_signed_body_coro(*permit, target,
+                detail::fetch_signed_body_coro(*permit, *budget, target,
                                                 std::string(key_buf.data(), key_len), cfg,
                                                 test_seam_),
                 [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
@@ -1631,11 +1673,14 @@ public:
 
             const std::string target = "/api/v3/order?" + std::string(signed_query.wire_bytes());
 
+            // POST /api/v3/order is counted by the caller, not here: the order orchestrator reserves weight,
+            // raw request and ORDERS under the Strategy lane at Gate 12c before it calls the submit port
+            // this method sits behind, and a second reservation would count the order twice.
             net::io_context ioc;
             std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
             net::co_spawn(
                 ioc,
-                detail::fetch_signed_body_coro(*permit, target,
+                detail::fetch_signed_body_coro(*permit, RateLimitPermit::reserved_by_caller(), target,
                                                 std::string(key_buf.data(), key_len), cfg,
                                                 test_seam_, http::verb::post),
                 [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
@@ -1670,6 +1715,27 @@ private:
         return issue_endpoint_permit(binding_.transport_policy(), binding_.base_host());
     }
 
+    // SAFE-01 slice 4 (L4 §7.4): the local rate-limit budget for one request, as the RateLimitPermit the
+    // network coroutines require -- so a request path that skipped the accounting does not compile. Every
+    // method below that is not POST /api/v3/order charges the Reconciliation lane, the one
+    // spot_rate_limit_budget.hpp reserves for GetOrder polling and the GetAccount/GetExchangeInfo refreshes
+    // (the clock sync and listenKey calls are rare and tiny, and the Emergency lane stays reachable only
+    // for emergency exits). nullopt = the lane refused: the caller returns RateLimitExhausted/NotSent and
+    // nothing has been resolved or connected. With no tracker wired in (this class's pre-H1 default)
+    // the permit says so explicitly: Unaccounted. The tracker has no internal synchronization and is
+    // owned by the hot/submit thread (see SpotRateLimitTracker): like query_order()/submit_order(), these
+    // methods must be called on that thread when a tracker is supplied.
+    std::optional<RateLimitPermit> reserve_budget(PrivateRestEndpoint ep) noexcept {
+        if (!rate_limiter_) return no_tracker_permit();
+        return rate_limiter_->reserve_weight_only(RateLimitLane::Reconciliation, ep, weight_table_);
+    }
+    std::optional<RateLimitPermit> reserve_budget_explicit(std::uint32_t weight) noexcept {
+        if (!rate_limiter_) return no_tracker_permit();
+        return rate_limiter_->reserve_weight_only_explicit(RateLimitLane::Reconciliation, weight);
+    }
+    // The one place a client without a tracker says so (test_rest_freeze_guard pins the call site).
+    static RateLimitPermit no_tracker_permit() noexcept { return RateLimitPermit::unaccounted(); }
+
     // Shared by keepalive_listen_key()/close_listen_key() -- identical shape (percent-encode the
     // listenKey into the query string, copy_api_key(), fetch_signed_body_coro(), no body to
     // parse on success), differing only in HTTP verb.
@@ -1679,6 +1745,8 @@ private:
         const auto permit = endpoint_permit();
         if (!permit) return PrivateRestError::InvalidConfig;
         if (listen_key.empty()) return PrivateRestError::InvalidConfig;
+        const auto budget = reserve_budget_explicit(kListenKeyCallWeight);
+        if (!budget) return PrivateRestError::RateLimitExhausted;
 
         std::array<char, kApiKeyLen> key_buf{};
         std::size_t key_len = 0;
@@ -1693,7 +1761,7 @@ private:
         std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
         net::co_spawn(
             ioc,
-            detail::fetch_signed_body_coro(*permit, target,
+            detail::fetch_signed_body_coro(*permit, *budget, target,
                                             std::string(key_buf.data(), key_len), cfg, test_seam_,
                                             verb),
             [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {

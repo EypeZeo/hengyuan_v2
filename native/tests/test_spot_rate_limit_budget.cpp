@@ -3,11 +3,16 @@
 #include <gtest/gtest.h>
 #include <hengyuan/spot_rate_limit_budget.hpp>
 
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+
 using hy::EndpointWeightTable;
 using hy::PartitionedRateBudget;
 using hy::PrivateRestEndpoint;
 using hy::RateLimitBudgetSplit;
 using hy::RateLimitLane;
+using hy::RateLimitPermit;
 using hy::SpotRateLimitTracker;
 using hy::endpoint_weight;
 
@@ -237,4 +242,143 @@ TEST(SpotRateLimitTracker, TryReserveWeightOnlyExplicitFailsClosedWhenRawExhaust
     // the weight budget alone would allow this call.
     ASSERT_TRUE(tr.configure(/*weight*/ 100000, 0, /*raw*/ 1, 0, /*orders*/ 100000, 0));
     EXPECT_FALSE(tr.try_reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/2));
+}
+
+// --- RateLimitPermit and the typed reservations (SAFE-01 slice 4) ---
+//
+// reserve_weight_only()/reserve_weight_only_explicit() are try_reserve_weight_only*() that hand back the proof of the
+// reservation: the permit the private REST client's network coroutines require. Same budget arithmetic, same
+// "a refusal consumes nothing", plus the lane and weight the permit stands for.
+
+TEST(RateLimitPermit, AReservationYieldsAReservedPermitNamingTheLaneAndTheWeight) {
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 1000, 0, /*raw*/ 1000, 0, /*orders*/ 1000, 0));
+    EndpointWeightTable table;
+    const auto permit = tr.reserve_weight_only(RateLimitLane::Reconciliation, PrivateRestEndpoint::GetAccount, table);
+    ASSERT_TRUE(permit.has_value());
+    EXPECT_EQ(permit->basis(), RateLimitPermit::Basis::Reserved);
+    EXPECT_EQ(permit->lane(), RateLimitLane::Reconciliation);
+    EXPECT_EQ(permit->weight(), 20u) << "the permit carries the table's weight for the endpoint, not a guess";
+
+    const auto explicit_permit = tr.reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/2);
+    ASSERT_TRUE(explicit_permit.has_value());
+    EXPECT_EQ(explicit_permit->basis(), RateLimitPermit::Basis::Reserved);
+    EXPECT_EQ(explicit_permit->lane(), RateLimitLane::Strategy);
+    EXPECT_EQ(explicit_permit->weight(), 2u);
+}
+
+TEST(RateLimitPermit, AReservationConsumesExactlyWhatTheBooleanVariantDoes) {
+    // weight 250 -> Reconciliation lane = floor(250*10/100) = 25. A permit for GetAccount (20) leaves 5.
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 250, 0, /*raw*/ 1000, 0, /*orders*/ 1000, 0));
+    EndpointWeightTable table;
+    ASSERT_TRUE(tr.reserve_weight_only(RateLimitLane::Reconciliation, PrivateRestEndpoint::GetAccount, table));
+    EXPECT_FALSE(tr.try_reserve_weight_only(RateLimitLane::Reconciliation, PrivateRestEndpoint::GetAccount, table))
+        << "the first permit consumed 20 of 25: a second 20 does not fit, on either API";
+    EXPECT_TRUE(tr.try_reserve_weight_only_explicit(RateLimitLane::Reconciliation, /*weight=*/5))
+        << "...and exactly 5 is still there";
+}
+
+TEST(RateLimitPermit, ARefusedReservationYieldsNoPermitAndConsumesNothing) {
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 250, 0, /*raw*/ 1000, 0, /*orders*/ 1000, 0));
+    EndpointWeightTable table;
+    ASSERT_TRUE(tr.reserve_weight_only(RateLimitLane::Reconciliation, PrivateRestEndpoint::GetAccount, table));
+
+    EXPECT_FALSE(tr.reserve_weight_only(RateLimitLane::Reconciliation, PrivateRestEndpoint::GetAccount, table))
+        << "20 more does not fit into the 5 left";
+    EXPECT_FALSE(tr.reserve_weight_only_explicit(RateLimitLane::Reconciliation, /*weight=*/6));
+    // The two refusals above must not have taken the 5 that are left: exactly 5 still goes through, then nothing.
+    EXPECT_TRUE(tr.reserve_weight_only_explicit(RateLimitLane::Reconciliation, /*weight=*/5).has_value());
+    EXPECT_FALSE(tr.reserve_weight_only_explicit(RateLimitLane::Reconciliation, /*weight=*/1).has_value());
+}
+
+TEST(RateLimitPermit, AReservationChargesTheLaneItNamesAndNoOther) {
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 1000, 0, /*raw*/ 1000, 0, /*orders*/ 1000, 0));
+    // Reconciliation lane = 100: drain it, then it refuses -- while the other two lanes are untouched.
+    ASSERT_TRUE(tr.reserve_weight_only_explicit(RateLimitLane::Reconciliation, /*weight=*/100).has_value());
+    EXPECT_FALSE(tr.reserve_weight_only_explicit(RateLimitLane::Reconciliation, /*weight=*/1).has_value());
+    const auto strategy = tr.reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/1);
+    ASSERT_TRUE(strategy.has_value());
+    EXPECT_EQ(strategy->lane(), RateLimitLane::Strategy);
+    const auto emergency = tr.reserve_weight_only_explicit(RateLimitLane::Emergency, /*weight=*/1);
+    ASSERT_TRUE(emergency.has_value());
+    EXPECT_EQ(emergency->lane(), RateLimitLane::Emergency);
+}
+
+TEST(RateLimitPermit, AnUnknownEndpointYieldsNoPermit) {
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(100000, 0, 100000, 0, 100000, 0));
+    EndpointWeightTable table;
+    const auto bogus = static_cast<PrivateRestEndpoint>(200);
+    EXPECT_FALSE(tr.reserve_weight_only(RateLimitLane::Strategy, bogus, table).has_value());
+}
+
+TEST(RateLimitPermit, AnExhaustedRawRequestBudgetRefusesEvenWhenTheWeightFits) {
+    // raw: Strategy lane = floor(1*80/100) = 0 -- the raw-request stage fails closed, and the typed variants
+    // report it as "no permit", exactly like the boolean ones.
+    SpotRateLimitTracker tr;
+    ASSERT_TRUE(tr.configure(/*weight*/ 100000, 0, /*raw*/ 1, 0, /*orders*/ 100000, 0));
+    EndpointWeightTable table;
+    EXPECT_FALSE(tr.reserve_weight_only(RateLimitLane::Strategy, PrivateRestEndpoint::GetAccount, table).has_value());
+    EXPECT_FALSE(tr.reserve_weight_only_explicit(RateLimitLane::Strategy, /*weight=*/2).has_value());
+}
+
+TEST(RateLimitPermit, TheTwoNamedPermitsSayWhoCountsTheRequest) {
+    const RateLimitPermit by_caller = RateLimitPermit::reserved_by_caller();
+    EXPECT_EQ(by_caller.basis(), RateLimitPermit::Basis::ReservedByCaller);
+    EXPECT_EQ(by_caller.lane(), RateLimitLane::Strategy) << "POST /order is reserved by the orchestrator under Strategy";
+    EXPECT_EQ(by_caller.weight(), 0u) << "nothing is charged by the client for it";
+
+    const RateLimitPermit none = RateLimitPermit::unaccounted();
+    EXPECT_EQ(none.basis(), RateLimitPermit::Basis::Unaccounted);
+    EXPECT_EQ(none.lane(), RateLimitLane::Reconciliation);
+    EXPECT_EQ(none.weight(), 0u);
+}
+
+TEST(RateLimitPermit, ThePermitIsAPlainValue) {
+    static_assert(std::is_trivially_copyable_v<RateLimitPermit>);
+    static_assert(!std::is_default_constructible_v<RateLimitPermit>);
+    static_assert(sizeof(RateLimitPermit) <= 8, "a permit travels by value into a coroutine frame");
+    const RateLimitPermit a = RateLimitPermit::unaccounted();
+    const RateLimitPermit b = a;
+    EXPECT_EQ(b.basis(), a.basis());
+}
+
+// Not part of the normal run (--gtest_also_run_disabled_tests): what one reservation costs, with and without the
+// typed permit around it. The private REST client takes one per call, in front of a TLS round trip of tens of
+// milliseconds, so this only has to show that the permit adds nothing worth looking at.
+TEST(RateLimitPermit, DISABLED_AReservationCostsNanoseconds) {
+    SpotRateLimitTracker tr;
+    // Reconciliation lane = 10% of a window large enough for every call below.
+    ASSERT_TRUE(tr.configure(2'000'000'000u, 0, 2'000'000'000u, 0, 2'000'000'000u, 0));
+    EndpointWeightTable table;
+    constexpr int kRounds = 2'000'000;
+    std::uint64_t sink = 0;
+
+    auto time_it = [&](const char* name, auto&& one_call) {
+        double best = 1e18;
+        for (int rep = 0; rep < 5; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kRounds; ++i) sink += one_call();
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / kRounds;
+            if (ns < best) best = ns;
+        }
+        std::printf("%-44s %7.1f ns/call (best of 5 x %d)\n", name, best, kRounds);
+    };
+
+    time_it("try_reserve_weight_only (bool)", [&] {
+        return tr.try_reserve_weight_only(RateLimitLane::Reconciliation, PrivateRestEndpoint::GetServerTime, table) ? 1u : 0u;
+    });
+    time_it("reserve_weight_only (optional<permit>)", [&] {
+        const auto p = tr.reserve_weight_only(RateLimitLane::Reconciliation, PrivateRestEndpoint::GetServerTime, table);
+        return p ? p->weight() : 0u;
+    });
+    time_it("reserve_weight_only_explicit", [&] {
+        const auto p = tr.reserve_weight_only_explicit(RateLimitLane::Reconciliation, 1);
+        return p ? p->weight() : 0u;
+    });
+    EXPECT_NE(sink, 0u);
 }

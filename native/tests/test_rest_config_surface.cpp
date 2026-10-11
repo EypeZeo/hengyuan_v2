@@ -14,6 +14,7 @@
 #include <hengyuan/binance_private_rest.hpp>
 #include <hengyuan/binance_rest_snapshot.hpp>
 #include <hengyuan/rest_test_seam.hpp>
+#include <hengyuan/spot_rate_limit_budget.hpp>
 
 #include "test_helpers/rest_test_seam_builder.hpp"
 
@@ -28,6 +29,7 @@ using hy::EnvironmentBinding;
 using hy::KlineBackfill;
 using hy::PrivateRestConfig;
 using hy::PublicRestConfig;
+using hy::RateLimitPermit;
 using hy::RestSnapshotConfig;
 using hy::RestTestSeam;
 using hy::RestTestSeamBuilder;
@@ -154,26 +156,67 @@ TEST(RestFreezeGuardTypes, ThePermitCannotBeMadeOutOfAHost) {
 }
 
 TEST(RestFreezeGuardTypes, TheServerTimeCoroutineTakesAPermitAndNoHostString) {
-    EXPECT_TRUE((server_time_coro_callable<EndpointPermit, PrivateRestConfig, RestTestSeam>));
-    EXPECT_FALSE((server_time_coro_callable<std::string, PrivateRestConfig, RestTestSeam>));
-    EXPECT_FALSE((server_time_coro_callable<std::string_view, PrivateRestConfig, RestTestSeam>));
+    EXPECT_TRUE((server_time_coro_callable<EndpointPermit, RateLimitPermit, PrivateRestConfig, RestTestSeam>));
+    EXPECT_FALSE(
+        (server_time_coro_callable<std::string, RateLimitPermit, PrivateRestConfig, RestTestSeam>));
+    EXPECT_FALSE(
+        (server_time_coro_callable<std::string_view, RateLimitPermit, PrivateRestConfig, RestTestSeam>));
     EXPECT_FALSE((server_time_coro_callable<std::string, PrivateRestConfig>)) << "the pre-fix shape";
 }
 
 TEST(RestFreezeGuardTypes, TheSignedBodyCoroutineTakesAPermitAndNoHostString) {
-    EXPECT_TRUE((signed_body_coro_callable<EndpointPermit, std::string, std::string, PrivateRestConfig,
-                                           RestTestSeam>));
-    EXPECT_FALSE((signed_body_coro_callable<std::string, std::string, std::string, PrivateRestConfig,
-                                            RestTestSeam>));
+    EXPECT_TRUE((signed_body_coro_callable<EndpointPermit, RateLimitPermit, std::string, std::string,
+                                           PrivateRestConfig, RestTestSeam>));
+    EXPECT_FALSE((signed_body_coro_callable<std::string, RateLimitPermit, std::string, std::string,
+                                            PrivateRestConfig, RestTestSeam>));
     EXPECT_FALSE((signed_body_coro_callable<std::string, std::string, std::string, PrivateRestConfig>))
         << "the pre-fix shape";
 }
 
 TEST(RestFreezeGuardTypes, ThePublicBodyCoroutineTakesAPermitAndNoHostString) {
-    EXPECT_TRUE((public_body_coro_callable<EndpointPermit, std::string, PrivateRestConfig, RestTestSeam>));
-    EXPECT_FALSE((public_body_coro_callable<std::string, std::string, PrivateRestConfig, RestTestSeam>));
+    EXPECT_TRUE((public_body_coro_callable<EndpointPermit, RateLimitPermit, std::string, PrivateRestConfig,
+                                           RestTestSeam>));
+    EXPECT_FALSE((public_body_coro_callable<std::string, RateLimitPermit, std::string, PrivateRestConfig,
+                                            RestTestSeam>));
     EXPECT_FALSE((public_body_coro_callable<std::string, std::string, PrivateRestConfig>))
         << "the pre-fix shape";
+}
+
+// --- slice 4: no request without a rate-limit permit --------------------------------------------------------
+//
+// The three private-client coroutines are the only places that put a request on the wire. Each takes a
+// RateLimitPermit right after the EndpointPermit, so a new method (or a refactor) that forgets the accounting
+// does not compile. The permit is trivially cheap (a lane, a weight, a basis) and cannot be made from a number.
+
+TEST(RestFreezeGuardTypes, ThePrivateClientCoroutinesCannotBeCalledWithoutABudgetPermit) {
+    EXPECT_FALSE((server_time_coro_callable<EndpointPermit, PrivateRestConfig, RestTestSeam>))
+        << "the pre-slice-4 shape: a request nobody counted";
+    EXPECT_FALSE((signed_body_coro_callable<EndpointPermit, std::string, std::string, PrivateRestConfig,
+                                            RestTestSeam>))
+        << "the pre-slice-4 shape: a request nobody counted";
+    EXPECT_FALSE(
+        (public_body_coro_callable<EndpointPermit, std::string, PrivateRestConfig, RestTestSeam>))
+        << "the pre-slice-4 shape: a request nobody counted";
+}
+
+TEST(RestFreezeGuardTypes, ThePrivateClientCoroutinesCannotBeHandedANumberAsABudget) {
+    EXPECT_FALSE((server_time_coro_callable<EndpointPermit, std::uint32_t, PrivateRestConfig, RestTestSeam>));
+    EXPECT_FALSE((server_time_coro_callable<EndpointPermit, bool, PrivateRestConfig, RestTestSeam>));
+    EXPECT_FALSE((signed_body_coro_callable<EndpointPermit, std::uint32_t, std::string, std::string,
+                                            PrivateRestConfig, RestTestSeam>));
+    EXPECT_FALSE((public_body_coro_callable<EndpointPermit, std::uint32_t, std::string, PrivateRestConfig,
+                                            RestTestSeam>));
+}
+
+TEST(RestFreezeGuardTypes, TheRateLimitPermitCannotBeMadeFromProductionCodeExceptByTheTwoFactories) {
+    EXPECT_FALSE(std::is_default_constructible_v<RateLimitPermit>);
+    EXPECT_FALSE((std::is_constructible_v<RateLimitPermit, std::uint32_t>));
+    EXPECT_FALSE((std::is_constructible_v<RateLimitPermit, RateLimitPermit::Basis, hy::RateLimitLane,
+                                          std::uint32_t>))
+        << "the full constructor is private: only SpotRateLimitTracker may stamp a Reserved permit";
+    EXPECT_FALSE((std::is_convertible_v<std::uint32_t, RateLimitPermit>));
+    EXPECT_FALSE((std::is_convertible_v<bool, RateLimitPermit>));
+    EXPECT_TRUE(std::is_trivially_copyable_v<RateLimitPermit>);
 }
 
 TEST(RestFreezeGuardTypes, TheKlinesBodyCoroutineTakesAPermitAndNoHostString) {

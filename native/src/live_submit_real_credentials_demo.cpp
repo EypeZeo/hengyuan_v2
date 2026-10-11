@@ -26,6 +26,7 @@
 #include <hengyuan/binance_submit_adapter.hpp>
 #include <hengyuan/binance_user_data_ws_supervisor.hpp>
 #include <hengyuan/env_loader.hpp>
+#include <hengyuan/spot_rate_limit_budget.hpp>
 
 #include <array>
 #include <atomic>
@@ -190,8 +191,14 @@ int main(int argc, char* argv[]) {
     // H5's confirmed declaration order (SymbolRegistry outlives client outlives submit_ctx
     // outlives submit_port -- reverse-destruction keeps every pointer valid for as long as
     // submit_port itself exists).
+    // SAFE-01 slice 4: every REST call this client makes (clock sync, exchangeInfo, listenKey, keepalive, order
+    // query) is counted on the Reconciliation lane of this tracker. It lives and is used on this (the hot) thread
+    // only, like the client, and is declared before it so it outlives it.
+    SpotRateLimitTracker rate_limiter;
+    rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
+
     SymbolRegistry registry;
-    BinancePrivateRestClient client(binding, std::move(creds));
+    BinancePrivateRestClient client(binding, std::move(creds), &rate_limiter);
     SubmitAdapterContext submit_ctx{&client, &registry};
     SubmitPort submit_port = make_binance_submit_port(submit_ctx);
 
