@@ -35,11 +35,15 @@
 #include "test_helpers/tls_response_acceptor.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -346,6 +350,41 @@ TEST(ParseServerTimeResponse, MalformedJsonRejected) {
 
 // --- parse_account_response() -- §4.1-§4.4 ---
 
+namespace {
+
+// What fetch_account() stamps: an exchange-calibrated epoch time in ms.
+constexpr std::int64_t kAccountTs = 1'700'000'000'000LL;
+
+// A snapshot with n assets (S0, S1, ...), can_trade set and timestamp 555: the sentinel for §4.4's "left
+// completely UNCHANGED on every failure path". The fields are private (audit P1-003 / SAFE-02), so it is built
+// through the factory like every other snapshot.
+AccountSnapshot sentinel_snapshot(int n) {
+    hy::AccountSnapshotBuilder builder;
+    builder.set_can_trade(true);
+    for (int i = 0; i < n; ++i) {
+        const std::string name = "S" + std::to_string(i);
+        if (builder.add_asset(name, i + 1, 0) != hy::AccountSnapshotError::None) {
+            ADD_FAILURE() << "sentinel asset refused";
+        }
+    }
+    AccountSnapshot out;
+    if (builder.build(555, out) != hy::AccountSnapshotError::None) ADD_FAILURE() << "sentinel refused";
+    return out;
+}
+
+void expect_sentinel_untouched(const AccountSnapshot& out, int n) {
+    EXPECT_EQ(out.timestamp_ms(), 555);
+    EXPECT_TRUE(out.can_trade());
+    ASSERT_EQ(out.asset_count(), static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const AssetBalance* a = out.find("S" + std::to_string(i));
+        ASSERT_NE(a, nullptr);
+        EXPECT_EQ(a->free_ticks(), i + 1);
+    }
+}
+
+}  // namespace
+
 TEST(ParseAccountResponse, ValidResponseWithMultipleAssets) {
     AccountSnapshot out{};
     const auto err = parse_account_response(
@@ -353,18 +392,19 @@ TEST(ParseAccountResponse, ValidResponseWithMultipleAssets) {
             {"asset":"BTC","free":"1.5","locked":"0.5"},
             {"asset":"USDT","free":"1000.12345678","locked":"0"}
         ]})",
-        out);
+        kAccountTs, out);
     ASSERT_EQ(err, PrivateRestError::None);
-    EXPECT_TRUE(out.can_trade);
-    ASSERT_EQ(out.asset_count, 2u);
+    EXPECT_TRUE(out.can_trade());
+    EXPECT_EQ(out.timestamp_ms(), kAccountTs);
+    ASSERT_EQ(out.asset_count(), 2u);
     const AssetBalance* btc = out.find("BTC");
     ASSERT_NE(btc, nullptr);
-    EXPECT_EQ(btc->free_ticks, 150'000'000);
-    EXPECT_EQ(btc->locked_ticks, 50'000'000);
+    EXPECT_EQ(btc->free_ticks(), 150'000'000);
+    EXPECT_EQ(btc->locked_ticks(), 50'000'000);
     const AssetBalance* usdt = out.find("USDT");
     ASSERT_NE(usdt, nullptr);
-    EXPECT_EQ(usdt->free_ticks, 100'012'345'678LL);
-    EXPECT_EQ(usdt->locked_ticks, 0);
+    EXPECT_EQ(usdt->free_ticks(), 100'012'345'678LL);
+    EXPECT_EQ(usdt->locked_ticks(), 0);
 }
 
 TEST(ParseAccountResponse, ZeroBalanceAssetsAreSkippedNotSlotted) {
@@ -374,54 +414,50 @@ TEST(ParseAccountResponse, ZeroBalanceAssetsAreSkippedNotSlotted) {
             {"asset":"BTC","free":"0","locked":"0"},
             {"asset":"ETH","free":"1.0","locked":"0"}
         ]})",
-        out);
+        kAccountTs, out);
     ASSERT_EQ(err, PrivateRestError::None);
-    ASSERT_EQ(out.asset_count, 1u);
+    ASSERT_EQ(out.asset_count(), 1u);
     EXPECT_NE(out.find("ETH"), nullptr);
     EXPECT_EQ(out.find("BTC"), nullptr);
 }
 
 TEST(ParseAccountResponse, MissingCanTradeLeavesOutUnchanged) {
-    AccountSnapshot out{};
-    out.can_trade = true;
-    out.asset_count = 7;  // sentinel -- must survive untouched on failure (§4.4)
-    const auto err = parse_account_response(R"({"balances":[]})", out);
+    AccountSnapshot out = sentinel_snapshot(7);  // must survive untouched on failure (§4.4)
+    const auto err = parse_account_response(R"({"balances":[]})", kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
-    EXPECT_TRUE(out.can_trade);
-    EXPECT_EQ(out.asset_count, 7u);
+    expect_sentinel_untouched(out, 7);
 }
 
 TEST(ParseAccountResponse, MissingBalancesArrayRejected) {
     AccountSnapshot out{};
-    const auto err = parse_account_response(R"({"canTrade":true})", out);
+    const auto err = parse_account_response(R"({"canTrade":true})", kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
 }
 
 TEST(ParseAccountResponse, MissingAssetFieldInBalanceEntryRejected) {
     AccountSnapshot out{};
     const auto err = parse_account_response(
-        R"({"canTrade":true,"balances":[{"free":"1.0","locked":"0"}]})", out);
+        R"({"canTrade":true,"balances":[{"free":"1.0","locked":"0"}]})", kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
 }
 
 TEST(ParseAccountResponse, MalformedDecimalInBalanceRejectsWholeFetch) {
-    AccountSnapshot out{};
-    out.asset_count = 3;  // sentinel
+    AccountSnapshot out = sentinel_snapshot(3);
     const auto err = parse_account_response(
         R"({"canTrade":true,"balances":[
             {"asset":"BTC","free":"1.0","locked":"0"},
             {"asset":"ETH","free":"not-a-number","locked":"0"}
         ]})",
-        out);
+        kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
-    EXPECT_EQ(out.asset_count, 3u);  // unchanged -- BTC's successful parse must not leak through
+    expect_sentinel_untouched(out, 3);  // unchanged -- BTC's successful parse must not leak through
 }
 
 TEST(ParseAccountResponse, TooManyFractionalDigitsInBalanceRejectsWholeFetch) {
     AccountSnapshot out{};
     const auto err = parse_account_response(
         R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1.123456789","locked":"0"}]})",
-        out);
+        kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
 }
 
@@ -433,11 +469,10 @@ TEST(ParseAccountResponse, MoreThanMaxAssetsRejectsWholeFetchNotTruncated) {
     }
     body += "]}";
 
-    AccountSnapshot out{};
-    out.asset_count = 5;  // sentinel
-    const auto err = parse_account_response(body, out);
+    AccountSnapshot out = sentinel_snapshot(5);
+    const auto err = parse_account_response(body, kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::CapacityExceeded);
-    EXPECT_EQ(out.asset_count, 5u);  // unchanged -- not truncated to the first 32
+    expect_sentinel_untouched(out, 5);  // unchanged -- not truncated to the first 32
 }
 
 TEST(ParseAccountResponse, ExactlyMaxAssetsSucceeds) {
@@ -449,9 +484,10 @@ TEST(ParseAccountResponse, ExactlyMaxAssetsSucceeds) {
     body += "]}";
 
     AccountSnapshot out{};
-    const auto err = parse_account_response(body, out);
+    const auto err = parse_account_response(body, kAccountTs, out);
     ASSERT_EQ(err, PrivateRestError::None);
-    EXPECT_EQ(out.asset_count, 32u);
+    EXPECT_EQ(out.asset_count(), 32u);
+    EXPECT_NE(out.find("A31"), nullptr);
 }
 
 TEST(ParseAccountResponse, AssetNameExactlyAtCapacityFits) {
@@ -459,9 +495,9 @@ TEST(ParseAccountResponse, AssetNameExactlyAtCapacityFits) {
     AccountSnapshot out{};
     const auto err = parse_account_response(
         R"({"canTrade":true,"balances":[{"asset":"ELEVENCHARS","free":"1.0","locked":"0"}]})",
-        out);
+        kAccountTs, out);
     ASSERT_EQ(err, PrivateRestError::None);
-    ASSERT_EQ(out.asset_count, 1u);
+    ASSERT_EQ(out.asset_count(), 1u);
     EXPECT_NE(out.find("ELEVENCHARS"), nullptr);
 }
 
@@ -470,8 +506,69 @@ TEST(ParseAccountResponse, OverlongAssetNameRejectedNotTruncated) {
     // kAssetNameLen == 12 (11 chars + NUL) -- a 12-char symbol overruns it.
     const auto err = parse_account_response(
         R"({"canTrade":true,"balances":[{"asset":"TWELVELETTRS","free":"1.0","locked":"0"}]})",
-        out);
+        kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+}
+
+// SAFE-02: the factory refuses what the fixed buffer used to accept silently. Each of these names is a valid JSON
+// string; none may become an asset (a NUL would end the name early, a space or control byte is no asset code).
+TEST(ParseAccountResponse, UnprintableOrEmbeddedNulAssetNamesRejectedWholeFetch) {
+    const char* const bodies[] = {
+        R"({"canTrade":true,"balances":[{"asset":"BT C","free":"1.0","locked":"0"}]})",         // space
+        R"({"canTrade":true,"balances":[{"asset":"BTC\u0001","free":"1.0","locked":"0"}]})",     // control byte
+        R"({"canTrade":true,"balances":[{"asset":"BTC\u0000X","free":"1.0","locked":"0"}]})",     // embedded NUL
+        R"({"canTrade":true,"balances":[{"asset":"BTC\u007f","free":"1.0","locked":"0"}]})",      // DEL
+        R"({"canTrade":true,"balances":[{"asset":"BTC\u00e9","free":"1.0","locked":"0"}]})",      // non-ASCII
+        R"({"canTrade":true,"balances":[{"asset":"","free":"1.0","locked":"0"}]})",               // empty
+    };
+    for (const char* body : bodies) {
+        AccountSnapshot out = sentinel_snapshot(2);
+        EXPECT_EQ(parse_account_response(body, kAccountTs, out), PrivateRestError::MalformedResponse) << body;
+        expect_sentinel_untouched(out, 2);
+    }
+}
+
+TEST(ParseAccountResponse, DuplicateAssetNamesRejectWholeFetch) {
+    // find() returns the first match, so a second BTC entry would hide its balance from the pre-trade check.
+    AccountSnapshot out = sentinel_snapshot(2);
+    const auto err = parse_account_response(
+        R"({"canTrade":true,"balances":[
+            {"asset":"BTC","free":"1.0","locked":"0"},
+            {"asset":"BTC","free":"2.0","locked":"0"}
+        ]})",
+        kAccountTs, out);
+    EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 2);
+}
+
+TEST(ParseAccountResponse, NegativeBalanceRejectedWholeFetch) {
+    AccountSnapshot out = sentinel_snapshot(2);
+    const auto err = parse_account_response(
+        R"({"canTrade":true,"balances":[{"asset":"BTC","free":"-1.0","locked":"0"}]})", kAccountTs, out);
+    EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 2);
+}
+
+TEST(ParseAccountResponse, FreePlusLockedThatOverflowsInt64RejectedWholeFetch) {
+    // Each part converts (5e10 * 1e8 = 5e18 < INT64_MAX = 9.22e18); their sum does not.
+    AccountSnapshot out = sentinel_snapshot(2);
+    const auto err = parse_account_response(
+        R"({"canTrade":true,"balances":[{"asset":"BTC","free":"50000000000","locked":"50000000000"}]})",
+        kAccountTs, out);
+    EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 2);
+}
+
+TEST(ParseAccountResponse, NonPositiveTimestampRefusedBeforeAnythingIsParsed) {
+    const char* const valid = R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1.0","locked":"0"}]})";
+    for (const std::int64_t bad : {std::int64_t{0}, std::int64_t{-1}, std::numeric_limits<std::int64_t>::min()}) {
+        AccountSnapshot out = sentinel_snapshot(2);
+        EXPECT_EQ(parse_account_response(valid, bad, out), PrivateRestError::ClockNotFresh) << bad;
+        expect_sentinel_untouched(out, 2);
+        // the precedence is part of the contract: a bad stamp is reported even when the body is garbage too
+        EXPECT_EQ(parse_account_response("not json", bad, out), PrivateRestError::ClockNotFresh) << bad;
+        expect_sentinel_untouched(out, 2);
+    }
 }
 
 TEST(ParseAccountResponse, EmptyBodyRejectedAtTheIterateStage) {
@@ -482,14 +579,169 @@ TEST(ParseAccountResponse, EmptyBodyRejectedAtTheIterateStage) {
     // test). Both paths are failure returns that leave `out` untouched either way -- the
     // distinction matters for diagnostics, not for correctness.
     AccountSnapshot out{};
-    const auto err = parse_account_response("", out);
+    const auto err = parse_account_response("", kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::JsonParse);
 }
 
 TEST(ParseAccountResponse, SyntacticallyInvalidJsonRejectedAtFieldAccess) {
     AccountSnapshot out{};
-    const auto err = parse_account_response("not json", out);
+    const auto err = parse_account_response("not json", kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+}
+
+// --- FI-033: malformed account data never becomes a malformed snapshot (audit P1-003) ---
+//
+// Deterministic (fixed seed) fuzz over the whole parse path: random asset names (empty, overlong, spaces, NUL and
+// control bytes, invalid UTF-8, repeats), random balances (zero, huge, negative, too many digits, not a number)
+// and random entry counts around the capacity. Whatever comes in, either the snapshot is exactly what the factory
+// promises or the fetch failed with one of the documented errors and `out` is the sentinel it started as.
+
+namespace {
+
+struct Xorshift64 {
+    std::uint64_t s;
+    std::uint64_t next() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        return s;
+    }
+    std::uint64_t below(std::uint64_t n) { return next() % n; }
+};
+
+void append_json_string(std::string& out, std::string_view bytes) {
+    out.push_back('"');
+    for (const char ch : bytes) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c < 0x20 || c == '"' || c == '\\') {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+            out += buf;
+        } else {
+            out.push_back(ch);
+        }
+    }
+    out.push_back('"');
+}
+
+std::string random_decimal(Xorshift64& r) {
+    switch (r.below(9)) {
+        case 0: return "0";
+        case 1: return "0.00000000";
+        case 2: return std::to_string(r.below(1'000'000)) + "." + std::string(r.below(10), '7');  // 0..9 fraction digits
+        case 3: return std::to_string(r.next());                                                  // overflows at scale 8
+        case 4: return "-" + std::to_string(r.below(1000));
+        case 5: return "1e5";
+        case 6: return "";
+        case 7: return std::to_string(r.below(60'000'000'000ULL));  // free + locked can overflow int64 once scaled
+        default: return std::to_string(r.below(10'000'000'000ULL));
+    }
+}
+
+std::string random_name(Xorshift64& r, const std::vector<std::string>& earlier) {
+    if (!earlier.empty() && r.below(6) == 0) return earlier[r.below(earlier.size())];  // a repeat
+    static constexpr std::string_view kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::string name;
+    const std::uint64_t len = r.below(16);  // 0..15: empty, fits (<= 11), too long
+    for (std::uint64_t i = 0; i < len; ++i) {
+        const std::uint64_t k = r.below(60);
+        if (k < 52) {
+            name.push_back(kAlphabet[r.below(kAlphabet.size())]);
+        } else if (k == 52) {
+            name.push_back(' ');
+        } else if (k == 53) {
+            name.push_back('\0');
+        } else if (k == 54) {
+            name.push_back(static_cast<char>(1 + r.below(31)));
+        } else if (k == 55) {
+            name.push_back(static_cast<char>(0x7f));
+        } else {
+            name.push_back(static_cast<char>(0x80 | r.below(0x80)));  // not valid UTF-8 on its own
+        }
+    }
+    return name;
+}
+
+// Every promise an AccountSnapshot carries whatever produced it, plus what the parser adds (no all-zero entries).
+bool parsed_snapshot_is_well_formed(const AccountSnapshot& s, std::int64_t expected_ts) {
+    if (s.timestamp_ms() != expected_ts) return false;
+    const auto assets = s.assets();
+    if (assets.size() != s.asset_count() || assets.size() > hy::kMaxAssets) return false;
+    for (std::size_t i = 0; i < assets.size(); ++i) {
+        const std::string_view name = assets[i].asset_name();
+        if (name.empty() || name.size() >= hy::kAssetNameLen) return false;
+        for (const char ch : name) {
+            const auto c = static_cast<unsigned char>(ch);
+            if (c < 0x21 || c > 0x7E) return false;
+        }
+        std::int64_t total = 0;
+        if (assets[i].free_ticks() < 0 || assets[i].locked_ticks() < 0 || !assets[i].total(total)) return false;
+        if (assets[i].free_ticks() == 0 && assets[i].locked_ticks() == 0) return false;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (assets[j].asset_name() == name) return false;
+        }
+        if (s.find(name) != &assets[i]) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(AccountSnapshotFuzz, FI033MalformedAccountDataNeverBecomesAMalformedSnapshot) {
+    Xorshift64 rng{0x9E3779B97F4A7C15ULL};
+    std::size_t ok = 0, malformed = 0, json_error = 0, capacity = 0;
+    for (int iter = 0; iter < 30'000; ++iter) {
+        std::string body = R"({"canTrade":)";
+        body += rng.below(8) == 0 ? "false" : "true";
+        body += R"(,"balances":[)";
+        // Half the bodies are adversarial throughout; the other half are mostly valid (and run past kMaxAssets)
+        // with an occasional nasty entry, so a body that parses and one that overruns the capacity both occur.
+        const bool adversarial = rng.below(2) == 0;
+        const std::uint64_t entries = adversarial ? rng.below(8) : 26 + rng.below(14);
+        std::vector<std::string> names;
+        for (std::uint64_t e = 0; e < entries; ++e) {
+            if (e > 0) body += ",";
+            const bool nasty = adversarial || rng.below(60) == 0;
+            names.push_back(nasty ? random_name(rng, names) : "Q" + std::to_string(rng.below(1'000'000)));
+            body += R"({"asset":)";
+            append_json_string(body, names.back());
+            body += R"(,"free":)";
+            append_json_string(body, nasty ? random_decimal(rng) : std::string("1.5"));
+            body += R"(,"locked":)";
+            append_json_string(body, nasty ? random_decimal(rng) : std::string("0"));
+            body += "}";
+        }
+        body += "]}";
+
+        AccountSnapshot out = sentinel_snapshot(2);
+        const PrivateRestError err = parse_account_response(body, kAccountTs, out);
+        switch (err) {
+            case PrivateRestError::None:
+                ++ok;
+                ASSERT_TRUE(parsed_snapshot_is_well_formed(out, kAccountTs)) << body;
+                break;
+            case PrivateRestError::MalformedResponse:
+                ++malformed;
+                expect_sentinel_untouched(out, 2);
+                break;
+            case PrivateRestError::JsonParse:
+                ++json_error;
+                expect_sentinel_untouched(out, 2);
+                break;
+            case PrivateRestError::CapacityExceeded:
+                ++capacity;
+                expect_sentinel_untouched(out, 2);
+                break;
+            default:
+                FAIL() << "unexpected error " << static_cast<int>(err) << " for: " << body;
+        }
+        if (::testing::Test::HasFailure()) return;
+    }
+    // The generator must reach every outcome, or the invariants above were checked on nothing.
+    EXPECT_GT(ok, 1000u);
+    EXPECT_GT(malformed, 1000u);
+    EXPECT_GT(json_error, 100u);
+    EXPECT_GT(capacity, 100u);
 }
 
 // --- map_binance_order_status() -- L4 §6.5's status-string table ---
@@ -1115,13 +1367,12 @@ TEST_F(BoundCredentialsFixture, SyncClockRealSuccessPathPublishesOffset) {
 
 TEST_F(BoundCredentialsFixture, FetchAccountFailsClosedWithoutPriorClockSync) {
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
-    AccountSnapshot out{};
-    out.can_trade = true;  // sentinel
+    AccountSnapshot out = sentinel_snapshot(2);
     // No sync_clock() call at all -- clock_publisher() has never published anything (seq==0),
     // so is_snapshot_fresh() must reject it and fetch_account() must never attempt to sign or
     // send anything.
     EXPECT_EQ(client.fetch_account(out), PrivateRestError::ClockNotFresh);
-    EXPECT_TRUE(out.can_trade);  // untouched
+    expect_sentinel_untouched(out, 2);
 }
 
 TEST_F(BoundCredentialsFixture, FetchAccountRealSuccessPathSignsAndParses) {
@@ -1147,10 +1398,10 @@ TEST_F(BoundCredentialsFixture, FetchAccountRealSuccessPathSignsAndParses) {
 
     AccountSnapshot out{};
     ASSERT_EQ(client.fetch_account(out, fetch_cfg), PrivateRestError::None);
-    EXPECT_TRUE(out.can_trade);
-    ASSERT_EQ(out.asset_count, 1u);
-    EXPECT_EQ(out.find("BTC")->free_ticks, 150'000'000);
-    EXPECT_GT(out.timestamp_ms, 0);
+    EXPECT_TRUE(out.can_trade());
+    ASSERT_EQ(out.asset_count(), 1u);
+    EXPECT_EQ(out.find("BTC")->free_ticks(), 150'000'000);
+    EXPECT_GT(out.timestamp_ms(), 0);
 
     const auto reqs = account_server.requests();
     ASSERT_EQ(reqs.size(), 1u);
@@ -1178,10 +1429,9 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
     PrivateRestConfig fetch_cfg;
     fetch_cfg.port = std::to_string(error_server.port());
 
-    AccountSnapshot out{};
-    out.asset_count = 9;  // sentinel
+    AccountSnapshot out = sentinel_snapshot(9);
     EXPECT_EQ(client.fetch_account(out, fetch_cfg), PrivateRestError::HttpStatus);
-    EXPECT_EQ(out.asset_count, 9u);  // untouched
+    expect_sentinel_untouched(out, 9);
 }
 
 // --- BinancePrivateRestClient::query_order() -- L4 §6, network-layer ---
@@ -1786,10 +2036,9 @@ TEST_F(BoundCredentialsFixture, KeepaliveListenKeyEmptyKeyIsInvalidConfigWithout
 TEST(FetchAccountEntryGuards, NullCredentialsFailsClosedEvenWithAFreshClock) {
     BinancePrivateRestClient client(EnvironmentBinding::testnet(), nullptr);
     hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
-    AccountSnapshot out{};
-    out.timestamp_ms = 42;
+    AccountSnapshot out = sentinel_snapshot(1);
     EXPECT_EQ(client.fetch_account(out), PrivateRestError::SigningFailed);
-    EXPECT_EQ(out.timestamp_ms, 42) << "out must be left untouched on every failure path";
+    expect_sentinel_untouched(out, 1);  // out must be left untouched on every failure path
 }
 
 namespace {

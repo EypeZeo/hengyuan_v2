@@ -20,6 +20,8 @@
 // bind_confirmation(), which is the entire point of this test.
 
 #include <gtest/gtest.h>
+
+#include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
 
 #include <array>
@@ -137,11 +139,8 @@ struct Fixture {
 
         // Must cover the rescaled notional: price_ticks(1000) * qty_ticks(10) at native scale
         // (price_scale+qty_scale=4) = 10000, rescaled to kBalanceScale(8) = 10000 * 10^4 = 1e8.
-        std::strncpy(account.assets[0].asset, "USDT", 5);
-        account.assets[0].free_ticks = 1'000'000'000;  // 10x headroom over the 1e8 notional
-        account.asset_count = 1;
-        account.can_trade = true;
-        account.timestamp_ms = 900;
+        account = hy::test_helpers::make_account(900, /*can_trade=*/true,
+                                                 {{"USDT", 1'000'000'000, 0}});  // 10x headroom over the 1e8 notional
 
         g_rules_version_for_test = rules_version;
 
@@ -249,7 +248,8 @@ TEST(LiveSubmitPreflightHarness, IncompleteEvidenceChainStopsBeforeConfirmationG
 
 TEST(LiveSubmitPreflightHarness, StaleAccountSnapshotStopsBeforeConfirmationGate) {
     Fixture fx;
-    fx.account.timestamp_ms = 0;  // now_ms=1000, freshness_max_age_ms=30000 -- still stale enough
+    // "never fetched": no factory output has a zero timestamp, so this one is written through the test hook
+    hy::AccountSnapshotTestHooks::set_raw_timestamp(fx.account, 0);  // now_ms=1000, freshness_max_age_ms=30000
     fx.ctx.now_ms = 1000 + 30001;  // push now_ms past the freshness window instead
     auto result = orchestrate_submit(fx.ctx);
     EXPECT_EQ(result.gate, OrchestratorGate::PreTradeFailed);

@@ -718,6 +718,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_account_truth)
     gtest_discover_tests(test_account_truth)
 
+    # SAFE-02 / audit P1-003 / fault case FI-033: the account snapshot's safe boundary -- type properties, the
+    # AccountSnapshotBuilder factory's refusals, the accessors' clamps, the future-timestamp bound and a
+    # deterministic factory fuzz (L1, no network; the parse-path fuzz is in test_binance_private_rest, Boost)
+    add_executable(test_account_snapshot_boundary tests/test_account_snapshot_boundary.cpp)
+    target_link_libraries(test_account_snapshot_boundary PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_account_snapshot_boundary)
+    gtest_discover_tests(test_account_snapshot_boundary)
+
     # L4 §5.1 (PR 5b): derive_scale_from_decimal_string()/parse_decimal_to_ticks_with_scale()
     # (L1, no network -- binance_decimal.hpp is deliberately independent of the
     # Boost/OpenSSL network stack test_binance_private_rest.cpp requires)

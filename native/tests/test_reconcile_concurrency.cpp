@@ -44,6 +44,8 @@
 // Governance: L1, no network/token/order. GTest only.
 
 #include <gtest/gtest.h>
+
+#include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
 
 #include <array>
@@ -159,11 +161,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     rules.qty_scale = 8;
     rules.rules_version = 1;
 
-    std::strncpy(account.assets[0].asset, "USDT", 5);
-    account.assets[0].free_ticks = 999999999;
-    account.asset_count = 1;
-    account.can_trade = true;
-    account.timestamp_ms = 900;
+    account = hy::test_helpers::make_account(900, /*can_trade=*/true, {{"USDT", 999999999, 0}});
 
     // Phase 3: a single shared real DurableAuditSink for the hot thread's
     // orchestrate_submit() calls -- constructed here, outside the hot loop,

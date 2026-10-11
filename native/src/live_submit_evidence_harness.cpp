@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -174,11 +175,11 @@ struct Fixture {
         rules.step_size_ticks = 10;
         rules.min_notional_ticks = 1000;
 
-        std::strncpy(account.assets[0].asset, "USDT", 5);
-        account.assets[0].free_ticks = 999'999;
-        account.asset_count = 1;
-        account.can_trade = true;
-        account.timestamp_ms = 900;
+        const AssetBalanceInput usdt[] = {{"USDT", 999'999, 0}};
+        if (make_account_snapshot(900, /*can_trade=*/true, usdt, account) != AccountSnapshotError::None) {
+            std::fprintf(stderr, "FATAL: the fixture's account snapshot was refused\n");
+            std::abort();
+        }
 
         ctx.audit = &audit;
         ctx.kill_switch = &kill_switch;
