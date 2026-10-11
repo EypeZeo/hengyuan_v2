@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: proprietary
 // binance_rest_snapshot.hpp — Binance REST depth snapshot fetcher (P2-MD-02 / Track C).
 //
-// GET https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=<one of the allowed values>
+// GET https://<host of the bound environment>/api/v3/depth?symbol=BTCUSDT&limit=<one of the allowed values>
+// The host comes from an EnvironmentBinding (production: api.binance.com) and must pass that binding's
+// endpoint allowlist: fetch_depth_snapshot() issues an EndpointPermit and the coroutine connects to
+// permit.host() and nothing else (SAFE-01; the config no longer has a host field at all).
 // Parses the JSON response into a DepthSnapshot for DepthManager.
 //
 // Governance: L4 (real Binance public REST API, no token/HMAC/Private API).
@@ -24,6 +27,7 @@
 #pragma once
 
 #include <hengyuan/binance_depth_snapshot_codec.hpp>
+#include <hengyuan/binance_environment.hpp>
 #include <hengyuan/binance_tls.hpp>
 #include <hengyuan/depth_manager.hpp>
 #include <hengyuan/rest_test_seam.hpp>
@@ -54,8 +58,9 @@ namespace http = beast::http;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
+// No host in here: it is the bound environment's (EnvironmentBinding::base_host()), so a configuration
+// cannot name one (audit P1-001 / SAFE-01).
 struct RestSnapshotConfig {
-    std::string host = "api.binance.com";
     std::string port = "443";
     int limit = 1000;  // depth levels; must be one of Binance's documented values, see
                         // kAllowedLimits below -- also bounded by DepthSnapshot's 1024-per-side
@@ -122,7 +127,6 @@ inline bool is_allowed_depth_limit(int limit) {
 inline std::optional<FetchError> validate_rest_config(const std::string& symbol,
                                                         const RestSnapshotConfig& cfg) {
     if (!detail::is_valid_rest_symbol(symbol)) return FetchError::InvalidConfig;
-    if (!detail::is_valid_rest_host(cfg.host)) return FetchError::InvalidConfig;
     if (cfg.port.empty()) return FetchError::InvalidConfig;
     if (!detail::is_allowed_depth_limit(cfg.limit)) return FetchError::InvalidConfig;
     return std::nullopt;
@@ -146,12 +150,15 @@ inline FetchError map_parse_error(DepthSnapshotParseError err) {
 }
 
 inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snapshot_coro(
-    std::string symbol, std::int64_t price_multiplier, std::int64_t qty_multiplier,
-    RestSnapshotConfig cfg, RestTestSeam seam) {
+    EndpointPermit permit, std::string symbol, std::int64_t price_multiplier,
+    std::int64_t qty_multiplier, RestSnapshotConfig cfg, RestTestSeam seam) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     FetchError current_stage = FetchError::Resolve;
     try {
+        // The host is the permit's and nobody else's: SNI, hostname verification, the Host header and
+        // (unless a test seam redirects the TCP connection) the connect target all use it.
+        const std::string host(permit.host());
         auto executor = co_await net::this_coro::executor;
 
         current_stage = FetchError::TlsHandshake;  // covers ssl_ctx setup below too
@@ -168,13 +175,13 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 #endif
-        if (!SSL_set_tlsext_host_name(stream.native_handle(), cfg.host.c_str())) {
+        if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
             co_return FetchError::TlsHandshake;
         }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-        hy::configure_binance_hostname_verification(stream, cfg.host);
+        hy::configure_binance_hostname_verification(stream, host);
 
         // Resolve, racing a 5s timer -- beast::tcp_stream::expires_after() does not cover
         // tcp::resolver (a separate object), so a dedicated race is needed for this one stage.
@@ -182,7 +189,7 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
         // used for SNI/hostname verification above; empty in production.
         current_stage = FetchError::Resolve;
         const std::string& connect_host =
-            seam.connect_host_override().empty() ? cfg.host : seam.connect_host_override();
+            seam.connect_host_override().empty() ? host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
         resolve_timer.expires_after(std::chrono::seconds(5));
         auto resolve_result =
@@ -204,7 +211,7 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
         std::string target =
             "/api/v3/depth?symbol=" + symbol + "&limit=" + std::to_string(cfg.limit);
         http::request<http::empty_body> req{http::verb::get, target, 11};
-        req.set(http::field::host, cfg.host);
+        req.set(http::field::host, host);
         req.set(http::field::user_agent, "HengYuan/0.1");
 
         current_stage = FetchError::Write;
@@ -243,10 +250,19 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
 }  // namespace detail
 
 inline std::optional<DepthSnapshot> fetch_depth_snapshot(
-    const std::string& symbol, std::int64_t price_multiplier, std::int64_t qty_multiplier,
-    const RestSnapshotConfig& cfg, FetchError& out_error, const RestTestSeam& seam = {}) {
+    const EnvironmentBinding& binding, const std::string& symbol, std::int64_t price_multiplier,
+    std::int64_t qty_multiplier, const RestSnapshotConfig& cfg, FetchError& out_error,
+    const RestTestSeam& seam = {}) {
     out_error = FetchError::None;
 
+    // The bound environment's transport policy decides which host may be resolved and connected to at all
+    // (SAFE-01); a refusal is a configuration error. The host's syntax is checked as well: the permit proves
+    // allowlist membership, not that a corrupt allowlist did not list something that is no hostname.
+    const auto permit = issue_endpoint_permit(binding.transport_policy(), binding.base_host());
+    if (!permit || !detail::is_valid_rest_host(permit->host())) {
+        out_error = FetchError::InvalidConfig;
+        return std::nullopt;
+    }
     if (auto invalid = validate_rest_config(symbol, cfg)) {
         out_error = *invalid;
         return std::nullopt;
@@ -256,7 +272,7 @@ inline std::optional<DepthSnapshot> fetch_depth_snapshot(
     std::variant<DepthSnapshot, FetchError> outcome = FetchError::None;
     net::co_spawn(
         ioc,
-        detail::fetch_depth_snapshot_coro(symbol, price_multiplier, qty_multiplier, cfg, seam),
+        detail::fetch_depth_snapshot_coro(*permit, symbol, price_multiplier, qty_multiplier, cfg, seam),
         [&outcome](std::exception_ptr eptr, std::variant<DepthSnapshot, FetchError> r) {
             if (eptr) {
                 // The coroutine itself catches boost::system::system_error; anything that
@@ -277,10 +293,10 @@ inline std::optional<DepthSnapshot> fetch_depth_snapshot(
 }
 
 inline std::optional<DepthSnapshot> fetch_depth_snapshot(
-    const std::string& symbol, std::int64_t price_multiplier, std::int64_t qty_multiplier,
-    const RestSnapshotConfig& cfg = {}) {
+    const EnvironmentBinding& binding, const std::string& symbol, std::int64_t price_multiplier,
+    std::int64_t qty_multiplier, const RestSnapshotConfig& cfg = {}) {
     FetchError unused_error;
-    return fetch_depth_snapshot(symbol, price_multiplier, qty_multiplier, cfg, unused_error);
+    return fetch_depth_snapshot(binding, symbol, price_multiplier, qty_multiplier, cfg, unused_error);
 }
 
 // Production SnapshotFetcher for SnapshotRefreshGate.
@@ -291,10 +307,13 @@ inline std::optional<DepthSnapshot> fetch_depth_snapshot(
 // The TSan CI job builds HY_BUILD_DEMO=OFF, so the one class in this codebase that
 // spawns a std::thread and hands a mailbox across it was never tested under
 // ThreadSanitizer. Moving the adapter next to the function it adapts leaves the gate
-// Boost-free; callers who want the real network fetcher ask for it explicitly.
-inline SnapshotFetcher make_default_snapshot_fetcher() {
-    return [](const SnapshotRequest& req) -> std::optional<DepthSnapshot> {
-        return fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier);
+// Boost-free; callers who want the real network fetcher ask for it explicitly. There is no default
+// environment any more: the caller names the binding (production, or the testnet of a testnet-only process),
+// and the fetcher runs on the gate's worker thread, so it captures the binding and the config by value.
+inline SnapshotFetcher make_default_snapshot_fetcher(const EnvironmentBinding& binding,
+                                                     const RestSnapshotConfig& cfg = {}) {
+    return [binding, cfg](const SnapshotRequest& req) -> std::optional<DepthSnapshot> {
+        return fetch_depth_snapshot(binding, req.symbol, req.price_multiplier, req.qty_multiplier, cfg);
     };
 }
 

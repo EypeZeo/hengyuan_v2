@@ -40,6 +40,19 @@ public:
         out.transport_policy_.endpoint_allowlist = allowlist;
         return out;
     }
+
+    // A copy of `b` bound to `host` instead, whose allowlist is exactly that host. The two factories only know
+    // the two real exchange hosts; the public fetchers' tests need a binding for a loopback fixture
+    // ("127.0.0.1"), for the name on a fixture certificate ("wrong-san.test.invalid") and for hosts that are no
+    // hostname at all. `host` must outlive the binding (a string literal in every caller).
+    static EnvironmentBinding with_host(const EnvironmentBinding& b, std::string_view host) noexcept {
+        EnvironmentBinding out = b;
+        out.base_host_ = host;
+        out.transport_policy_.endpoint_allowlist = EndpointAllowlist{};
+        out.transport_policy_.endpoint_allowlist.hosts[0] = host;
+        out.transport_policy_.endpoint_allowlist.count = 1;
+        return out;
+    }
 };
 
 }  // namespace hy

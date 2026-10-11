@@ -9,12 +9,15 @@
 #include <hengyuan/binance_rest_snapshot.hpp>
 #include <hengyuan/snapshot_refresh_gate.hpp>
 
+#include "binance_environment_test_hooks.hpp"
 #include "test_helpers/blackhole_acceptor.hpp"
 #include "test_helpers/rest_test_seam_builder.hpp"
 
 #include <chrono>
 #include <string>
+#include <string_view>
 
+using hy::EnvironmentBinding;
 using hy::FetchError;
 using hy::RestSnapshotConfig;
 using hy::fetch_depth_snapshot;
@@ -24,6 +27,13 @@ namespace {
 
 std::string fixture_path(const char* filename) {
     return std::string(HY_TEST_FIXTURE_DIR) + "/" + filename;
+}
+
+// A binding for a free host name. The two factories only know the exchange hosts; these tests need a loopback
+// fixture ("127.0.0.1") and the name on a fixture certificate, and the allowlist of such a binding is exactly
+// that host. `host` must be a string literal (the binding keeps a view of it).
+EnvironmentBinding binding_for(std::string_view host) {
+    return hy::EnvironmentBindingTestHooks::with_host(EnvironmentBinding::testnet(), host);
 }
 
 }  // namespace
@@ -70,9 +80,9 @@ TEST(BinanceRestSnapshotConfig, RejectsOverlongSymbol) {
     EXPECT_EQ(*err, FetchError::InvalidConfig);
 }
 
-TEST(BinanceRestSnapshotConfig, RejectsEmptyHost) {
+TEST(BinanceRestSnapshotConfig, RejectsAnEmptyPort) {
     RestSnapshotConfig cfg;
-    cfg.host = "";
+    cfg.port = "";
     auto err = validate_rest_config("BTCUSDT", cfg);
     ASSERT_TRUE(err.has_value());
     EXPECT_EQ(*err, FetchError::InvalidConfig);
@@ -84,12 +94,11 @@ TEST(BinanceRestSnapshotConnectivity, TlsHandshakeStageTimeout) {
     hy::test_helpers::PlainBlackholeAcceptor blackhole;
 
     RestSnapshotConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
 
     auto start = std::chrono::steady_clock::now();
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err);
+    auto result = fetch_depth_snapshot(binding_for("127.0.0.1"), "BTCUSDT", 100'000'000, 100'000'000, cfg, err);
     auto elapsed = std::chrono::steady_clock::now() - start;
 
     EXPECT_FALSE(result.has_value());
@@ -104,17 +113,17 @@ TEST(BinanceRestSnapshotConnectivity, ReadStageTimeoutAfterSuccessfulHandshake) 
                                                            fixture_path("test_leaf_key.pem"));
 
     RestSnapshotConfig cfg;
-    cfg.host = "wrong-san.test.invalid";  // matches the fixture cert's CN/SAN
     cfg.port = std::to_string(tls_blackhole.port());
-    // A synthetic .invalid hostname cannot be relied on to fail DNS resolution -- confirmed
-    // directly in this environment, where it resolved to a synthesized address instead of
-    // NXDOMAIN. The seam routes the actual connection to the local fixture (and trusts the fixture
-    // CA) while hostname/SNI are still verified against cfg.host above.
+    // The binding's host matches the fixture cert's CN/SAN. A synthetic .invalid hostname cannot be
+    // relied on to fail DNS resolution -- confirmed directly in this environment, where it resolved to a
+    // synthesized address instead of NXDOMAIN. The seam routes the actual connection to the local fixture
+    // (and trusts the fixture CA) while hostname/SNI are still verified against the binding's host.
     const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
 
     auto start = std::chrono::steady_clock::now();
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err, seam);
+    auto result = fetch_depth_snapshot(binding_for("wrong-san.test.invalid"), "BTCUSDT", 100'000'000,
+                                       100'000'000, cfg, err, seam);
     auto elapsed = std::chrono::steady_clock::now() - start;
 
     EXPECT_FALSE(result.has_value());
@@ -128,24 +137,63 @@ TEST(BinanceRestSnapshotConnectivity, ReadStageTimeoutAfterSuccessfulHandshake) 
 TEST(BinanceRestSnapshotConnectivity, DefaultOverloadWithoutDiagnosticsStillFails) {
     hy::test_helpers::PlainBlackholeAcceptor blackhole;
     RestSnapshotConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
 
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg);
+    auto result = fetch_depth_snapshot(binding_for("127.0.0.1"), "BTCUSDT", 100'000'000, 100'000'000, cfg);
     EXPECT_FALSE(result.has_value());
 }
 
 TEST(BinanceRestSnapshotConnectivity, InvalidConfigFailsWithoutTouchingNetwork) {
     hy::test_helpers::PlainBlackholeAcceptor blackhole;
     RestSnapshotConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
     cfg.limit = 42;  // not in the allowed discrete set
 
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err);
+    auto result = fetch_depth_snapshot(binding_for("127.0.0.1"), "BTCUSDT", 100'000'000, 100'000'000, cfg, err);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(err, FetchError::InvalidConfig);
+    EXPECT_EQ(blackhole.accepted_connections(), 0u);
+}
+
+// --- the endpoint policy of the bound environment decides which host is contacted at all (SAFE-01) ---
+
+namespace {
+// A binding that names `host` but whose allowlist does not contain it: the only state in which the check
+// can be proven to fire before any network attempt.
+EnvironmentBinding binding_refusing(std::string_view host) {
+    hy::EndpointAllowlist al{};
+    al.hosts[0] = "not-the-bound-host.example";
+    al.count = 1;
+    return hy::EnvironmentBindingTestHooks::with_allowlist(binding_for(host), al);
+}
+}  // namespace
+
+TEST(BinanceRestSnapshotEndpoint, AHostOutsideTheBindingsAllowlistIsRefusedBeforeAnyNetworkAttempt) {
+    hy::test_helpers::PlainBlackholeAcceptor blackhole;
+    RestSnapshotConfig cfg;
+    cfg.port = std::to_string(blackhole.port());
+
+    FetchError err{};
+    auto result =
+        fetch_depth_snapshot(binding_refusing("127.0.0.1"), "BTCUSDT", 100'000'000, 100'000'000, cfg, err);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(err, FetchError::InvalidConfig);
+    EXPECT_EQ(blackhole.accepted_connections(), 0u) << "the refusal must come before the connection";
+    // and the overload without diagnostics refuses the same way
+    EXPECT_FALSE(fetch_depth_snapshot(binding_refusing("127.0.0.1"), "BTCUSDT", 100'000'000, 100'000'000, cfg)
+                     .has_value());
+    EXPECT_EQ(blackhole.accepted_connections(), 0u);
+}
+
+TEST(BinanceRestSnapshotEndpoint, AHostThatIsNoHostnameIsRefusedEvenWhenTheAllowlistListsIt) {
+    for (const char* bad_host : {"", "bad host", "a/b", "host\r\nX: y", "testnet.binance.vision:443"}) {
+        RestSnapshotConfig cfg;
+        FetchError err{};
+        auto result = fetch_depth_snapshot(binding_for(bad_host), "BTCUSDT", 100'000'000, 100'000'000, cfg, err);
+        EXPECT_FALSE(result.has_value()) << "host=" << bad_host;
+        EXPECT_EQ(err, FetchError::InvalidConfig) << "host=" << bad_host;
+    }
 }
 
 // --- TLS hostname verification: negative + positive control ---
@@ -158,7 +206,7 @@ TEST(BinanceRestSnapshotConnectivity, InvalidConfigFailsWithoutTouchingNetwork) 
 // (wrong-san.test.invalid). Without the positive control, a bug that made the negative test
 // fail for an unrelated reason (e.g. a broken fixture) would go unnoticed.
 //
-// Both tests also pass a seam that connects to 127.0.0.1: cfg.host here is deliberately a
+// Both tests also pass a seam that connects to 127.0.0.1: the binding's host here is deliberately a
 // hostname that does NOT match the fixture cert (or, in the positive test, one that does), used
 // purely for SNI/hostname-verification purposes -- it must not also be the DNS resolution
 // target, since neither "api.binance.com" (a real, live hostname) nor a synthetic .invalid name
@@ -170,13 +218,14 @@ TEST(BinanceRestSnapshotTlsHostnameVerification, MismatchedHostIsRejected) {
                                                            fixture_path("test_leaf_key.pem"));
 
     RestSnapshotConfig cfg;
-    cfg.host = "api.binance.com";  // deliberately does NOT match the fixture cert's CN/SAN
     cfg.port = std::to_string(tls_blackhole.port());
     // chain IS trusted, and the connection actually goes to the local fixture
     const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
 
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err, seam);
+    // the production binding: api.binance.com deliberately does NOT match the fixture cert's CN/SAN
+    auto result = fetch_depth_snapshot(EnvironmentBinding::production(), "BTCUSDT", 100'000'000, 100'000'000,
+                                       cfg, err, seam);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(err, FetchError::TlsHandshake);
 }
@@ -186,12 +235,13 @@ TEST(BinanceRestSnapshotTlsHostnameVerification, MatchingHostWithTrustedCaSuccee
                                                            fixture_path("test_leaf_key.pem"));
 
     RestSnapshotConfig cfg;
-    cfg.host = "wrong-san.test.invalid";  // matches the fixture cert's CN/SAN
     cfg.port = std::to_string(tls_blackhole.port());
     const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
 
     FetchError err{};
-    auto result = fetch_depth_snapshot("BTCUSDT", 100'000'000, 100'000'000, cfg, err, seam);
+    // wrong-san.test.invalid matches the fixture cert's CN/SAN
+    auto result = fetch_depth_snapshot(binding_for("wrong-san.test.invalid"), "BTCUSDT", 100'000'000,
+                                       100'000'000, cfg, err, seam);
     // The handshake itself must succeed; the request then fails at the read stage because the
     // fixture never sends an HTTP response (it's a handshake-only fixture, not a full server) --
     // FetchError::Read (not TlsHandshake) is exactly the proof that hostname verification
@@ -213,11 +263,11 @@ TEST(SnapshotRefreshGateRealFetch, RealFetchWiringIsNonBlocking) {
     // starting a real fetch through the gate does not itself block the caller.
     hy::test_helpers::PlainBlackholeAcceptor blackhole;
     hy::RestSnapshotConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
+    const EnvironmentBinding binding = binding_for("127.0.0.1");
 
-    hy::SnapshotRefreshGate gate([&cfg](const hy::SnapshotRequest& req) {
-        return hy::fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier,
+    hy::SnapshotRefreshGate gate([&cfg, binding](const hy::SnapshotRequest& req) {
+        return hy::fetch_depth_snapshot(binding, req.symbol, req.price_multiplier, req.qty_multiplier,
                                          cfg);
     });
 
@@ -230,11 +280,30 @@ TEST(SnapshotRefreshGateRealFetch, RealFetchWiringIsNonBlocking) {
 
 TEST(SnapshotRefreshGateRealFetch, DefaultFetcherFactoryIsWired) {
     // make_default_snapshot_fetcher() is what binance_dry_run_demo.cpp now passes
-    // explicitly (audit VERIF-TSAN-016 removed the constructor default). Prove the
-    // factory produces a usable SnapshotFetcher rather than only compiling.
-    auto fetcher = hy::make_default_snapshot_fetcher();
+    // explicitly (audit VERIF-TSAN-016 removed the constructor default), with the environment it reads
+    // (SAFE-01: there is no default environment). Prove the factory produces a usable SnapshotFetcher
+    // rather than only compiling.
+    auto fetcher = hy::make_default_snapshot_fetcher(EnvironmentBinding::production());
     ASSERT_TRUE(static_cast<bool>(fetcher));
     // An invalid symbol is rejected by validate_rest_config() before any network I/O,
     // so this exercises the adapter shape without leaving the machine.
     EXPECT_FALSE(fetcher(hy::SnapshotRequest{"not a symbol", 100'000'000, 100'000'000}).has_value());
+}
+
+TEST(SnapshotRefreshGateRealFetch, FactoryFetcherUsesTheBindingAndTheConfigItWasGiven) {
+    hy::test_helpers::PlainBlackholeAcceptor blackhole;
+    hy::RestSnapshotConfig cfg;
+    cfg.port = std::to_string(blackhole.port());
+    const hy::SnapshotRequest request{"BTCUSDT", 100'000'000, 100'000'000};
+
+    // A binding that refuses its own host: nothing may reach the fixture.
+    auto refused = hy::make_default_snapshot_fetcher(binding_refusing("127.0.0.1"), cfg);
+    EXPECT_FALSE(refused(request).has_value());
+    EXPECT_EQ(blackhole.accepted_connections(), 0u);
+
+    // Positive control: the same factory with a binding that allows the host reaches the fixture, so the
+    // zero above is the policy's doing and not a fetcher that ignores its arguments.
+    auto allowed = hy::make_default_snapshot_fetcher(binding_for("127.0.0.1"), cfg);
+    EXPECT_FALSE(allowed(request).has_value());  // the blackhole never completes a TLS handshake
+    EXPECT_GE(blackhole.accepted_connections(), 1u);
 }

@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_klines_rest.hpp>
 
+#include "binance_environment_test_hooks.hpp"
 #include "test_helpers/blackhole_acceptor.hpp"
 #include "test_helpers/rest_test_seam_builder.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
@@ -24,6 +25,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <string_view>
 
 // Readable failure output: both enums are uint8_t-backed, which gtest would otherwise print as raw
 // bytes. ADL finds these because they live next to the types.
@@ -32,6 +34,7 @@ void PrintTo(PublicRestError e, std::ostream* os) { *os << public_rest_error_nam
 void PrintTo(KlinesParseError e, std::ostream* os) { *os << klines_parse_error_name(e); }
 }  // namespace hy
 
+using hy::EnvironmentBinding;
 using hy::fetch_klines_backfill;
 using hy::fetch_public_body;
 using hy::KlineBackfill;
@@ -75,10 +78,20 @@ KlineBackfill& shared_out() {
     return *out;
 }
 
-// The real testnet host (verified against the fixture cert's SAN, sent as Host:) ...
+// The real testnet binding: its host (testnet.binance.vision) is what the fixture cert's SAN says, what is
+// verified and what is sent as Host: ...
+EnvironmentBinding testnet_binding() { return EnvironmentBinding::testnet(); }
+
+// A binding for a free host name. The two factories only know the exchange hosts; the validation tests need a
+// loopback fixture and hosts that are no hostname at all, and the allowlist of such a binding is exactly that
+// host. `host` must outlive the binding (the binding keeps a view of it).
+EnvironmentBinding binding_for(std::string_view host) {
+    return hy::EnvironmentBindingTestHooks::with_host(EnvironmentBinding::testnet(), host);
+}
+
+// The config has no host (it is the binding's): only the port of the local fixture.
 PublicRestConfig testnet_cfg(unsigned short port) {
     PublicRestConfig cfg;
-    cfg.host = "testnet.binance.vision";
     cfg.port = std::to_string(port);
     return cfg;
 }
@@ -100,8 +113,8 @@ std::function<std::int64_t()> clock_at(std::int64_t now) {
 }
 
 hy::KlinesFetchResult fetch_1h(const PublicRestConfig& cfg, std::int64_t now, int limit = 6) {
-    return fetch_klines_backfill("BTCUSDT", "1h", limit, /*symbol_id=*/7, cfg, clock_at(now), shared_out(),
-                                 testnet_seam());
+    return fetch_klines_backfill(testnet_binding(), "BTCUSDT", "1h", limit, /*symbol_id=*/7, cfg, clock_at(now),
+                                 shared_out(), testnet_seam());
 }
 
 }  // namespace
@@ -113,9 +126,10 @@ static_assert(kKlinesClosedBarMarginMs <= 5000, "a huge margin would discard who
 
 // --- config & target: no network ---------------------------------------------------------------
 
-TEST(BinanceKlinesRestTarget, ThereIsNoDefaultHostSoProductionCannotBeReachedByOmission) {
+// The config has no host field at all (test_rest_config_surface.cpp states that as a type property): the
+// environment is always the caller's EnvironmentBinding, so production cannot be reached by omission.
+TEST(BinanceKlinesRestTarget, TheDefaultConfigNamesOnlyPort443TheHostIsTheBindings) {
     const PublicRestConfig cfg;
-    EXPECT_TRUE(cfg.host.empty());
     EXPECT_EQ(cfg.port, "443");
 }
 
@@ -144,13 +158,12 @@ TEST(BinanceKlinesRestTarget, RejectsEverythingItMustNotSend) {
 TEST(BinanceKlinesRestValidation, MalformedTargetsNeverReachTheWire) {
     PlainBlackholeAcceptor blackhole;
     PublicRestConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
 
     // A CR/LF or space in the target would be serialised verbatim into OUR request line/headers.
     for (const char* bad_target : {"", "api/v3/klines", "/api/v3/klines?symbol=A B", "/x\r\nHost: evil",
                                    "/x\nY: z", "/x\x7f"}) {
-        const auto r = fetch_public_body(bad_target, cfg);
+        const auto r = fetch_public_body(binding_for("127.0.0.1"), bad_target, cfg);
         EXPECT_EQ(r.error, PublicRestError::InvalidConfig) << "target=" << bad_target;
         EXPECT_TRUE(r.body.empty());
     }
@@ -160,22 +173,22 @@ TEST(BinanceKlinesRestValidation, MalformedTargetsNeverReachTheWire) {
 TEST(BinanceKlinesRestValidation, MalformedHostOrPortNeverReachesTheWire) {
     PlainBlackholeAcceptor blackhole;
     for (const char* bad_host : {"", "bad host", "a/b", "host\r\nX: y", "testnet.binance.vision:443"}) {
+        // the (hand-built) allowlist of this binding lists the bad host; the host's syntax is checked as well
         PublicRestConfig cfg;
-        cfg.host = bad_host;
         cfg.port = std::to_string(blackhole.port());
-        EXPECT_EQ(fetch_public_body("/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2", cfg).error,
+        EXPECT_EQ(fetch_public_body(binding_for(bad_host), "/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2", cfg)
+                      .error,
                   PublicRestError::InvalidConfig)
             << "host=" << bad_host;
     }
-    PublicRestConfig too_long;
-    too_long.host = std::string(254, 'a');
-    too_long.port = std::to_string(blackhole.port());
-    EXPECT_EQ(fetch_public_body("/x", too_long).error, PublicRestError::InvalidConfig);
+    PublicRestConfig cfg;
+    cfg.port = std::to_string(blackhole.port());
+    const std::string too_long_host(254, 'a');
+    EXPECT_EQ(fetch_public_body(binding_for(too_long_host), "/x", cfg).error, PublicRestError::InvalidConfig);
 
     PublicRestConfig no_port;
-    no_port.host = "127.0.0.1";
     no_port.port = "";
-    EXPECT_EQ(fetch_public_body("/x", no_port).error, PublicRestError::InvalidConfig);
+    EXPECT_EQ(fetch_public_body(binding_for("127.0.0.1"), "/x", no_port).error, PublicRestError::InvalidConfig);
 
     EXPECT_EQ(blackhole.accepted_connections(), 0u);
 }
@@ -183,17 +196,17 @@ TEST(BinanceKlinesRestValidation, MalformedHostOrPortNeverReachesTheWire) {
 TEST(BinanceKlinesRestValidation, FetchWithABadSymbolIntervalOrLimitNeverReachesTheWire) {
     PlainBlackholeAcceptor blackhole;
     PublicRestConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
+    const EnvironmentBinding binding = binding_for("127.0.0.1");
 
     const auto now = clock_at(kFarFuture);
-    EXPECT_EQ(fetch_klines_backfill("btcusdt", "1h", 5, 1, cfg, now, shared_out()).transport,
+    EXPECT_EQ(fetch_klines_backfill(binding, "btcusdt", "1h", 5, 1, cfg, now, shared_out()).transport,
               PublicRestError::InvalidConfig);
-    EXPECT_EQ(fetch_klines_backfill("BTCUSDT", "7m", 5, 1, cfg, now, shared_out()).transport,
+    EXPECT_EQ(fetch_klines_backfill(binding, "BTCUSDT", "7m", 5, 1, cfg, now, shared_out()).transport,
               PublicRestError::InvalidConfig);
-    EXPECT_EQ(fetch_klines_backfill("BTCUSDT", "1h", 0, 1, cfg, now, shared_out()).transport,
+    EXPECT_EQ(fetch_klines_backfill(binding, "BTCUSDT", "1h", 0, 1, cfg, now, shared_out()).transport,
               PublicRestError::InvalidConfig);
-    EXPECT_EQ(fetch_klines_backfill("BTCUSDT", "1h", 1001, 1, cfg, now, shared_out()).transport,
+    EXPECT_EQ(fetch_klines_backfill(binding, "BTCUSDT", "1h", 1001, 1, cfg, now, shared_out()).transport,
               PublicRestError::InvalidConfig);
     EXPECT_EQ(blackhole.accepted_connections(), 0u);
 }
@@ -201,7 +214,6 @@ TEST(BinanceKlinesRestValidation, FetchWithABadSymbolIntervalOrLimitNeverReaches
 TEST(BinanceKlinesRestValidation, AnUnusableClockIsRefusedNotTreatedAsEverythingIsForming) {
     PlainBlackholeAcceptor blackhole;
     PublicRestConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
 
     // 0 is what an unsynchronised clock reports; the margin itself is the exact boundary (the
@@ -212,8 +224,8 @@ TEST(BinanceKlinesRestValidation, AnUnusableClockIsRefusedNotTreatedAsEverything
         EXPECT_EQ(r.transport, PublicRestError::InvalidConfig) << "now=" << bad_now;
         EXPECT_FALSE(r.ok());
     }
-    const auto no_clock = fetch_klines_backfill("BTCUSDT", "1h", 5, 1, cfg, std::function<std::int64_t()>{},
-                                                 shared_out());
+    const auto no_clock = fetch_klines_backfill(binding_for("127.0.0.1"), "BTCUSDT", "1h", 5, 1, cfg,
+                                                 std::function<std::int64_t()>{}, shared_out());
     EXPECT_EQ(no_clock.transport, PublicRestError::InvalidConfig);
     EXPECT_EQ(blackhole.accepted_connections(), 0u);
 }
@@ -246,7 +258,7 @@ TEST(BinanceKlinesRestFetch, HappyPathParsesBarsAndSendsExactlyTheExpectedPublic
 TEST(BinanceKlinesRestFetch, ForwardsTheRequestedSymbolIntervalAndLimit) {
     constexpr std::int64_t k15m = 900'000;
     auto server = make_server(200, bars(1000, k15m));
-    const auto r = fetch_klines_backfill("ETHUSDT", "15m", 1000, 9, testnet_cfg(server->port()),
+    const auto r = fetch_klines_backfill(testnet_binding(), "ETHUSDT", "15m", 1000, 9, testnet_cfg(server->port()),
                                           clock_at(kFarFuture), shared_out(), testnet_seam());
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(shared_out().count, 1000u);
@@ -313,8 +325,8 @@ TEST(BinanceKlinesRestClosedBars, TheClockIsReadExactlyOnceAndBeforeTheRequestGo
         return kFarFuture;
     };
 
-    const auto r = fetch_klines_backfill("BTCUSDT", "1h", 4, 7, testnet_cfg(server->port()), clock, shared_out(),
-                                          testnet_seam());
+    const auto r = fetch_klines_backfill(testnet_binding(), "BTCUSDT", "1h", 4, 7, testnet_cfg(server->port()), clock,
+                                          shared_out(), testnet_seam());
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(calls, 1);
     EXPECT_EQ(requests_seen_at_call, 0u) << "the clock was read after the request had already been served";
@@ -357,13 +369,13 @@ TEST(BinanceKlinesRestHttp, AnyNon200IsRefusedWithItsCodeAndTheBodyIsNeverParsed
 
 TEST(BinanceKlinesRestHttp, FetchPublicBodyReturnsTheBodyOnlyOnSuccess) {
     auto ok_server = make_server(200, R"({"hello":"world"})");
-    const auto ok = fetch_public_body("/x", testnet_cfg(ok_server->port()), testnet_seam());
+    const auto ok = fetch_public_body(testnet_binding(), "/x", testnet_cfg(ok_server->port()), testnet_seam());
     EXPECT_EQ(ok.error, PublicRestError::None);
     EXPECT_EQ(ok.http_status, 200);
     EXPECT_EQ(ok.body, R"({"hello":"world"})");
 
     auto bad_server = make_server(429, R"({"code":-1003,"msg":"Too many requests"})");
-    const auto bad = fetch_public_body("/x", testnet_cfg(bad_server->port()), testnet_seam());
+    const auto bad = fetch_public_body(testnet_binding(), "/x", testnet_cfg(bad_server->port()), testnet_seam());
     EXPECT_EQ(bad.error, PublicRestError::HttpStatus);
     EXPECT_EQ(bad.http_status, 429);
     EXPECT_TRUE(bad.body.empty());  // an error body is not returned as if it were data
@@ -415,12 +427,12 @@ TEST(BinanceKlinesRestLimits, ABodyOverOneMiBIsRefusedAtTheReadStageAndExactlyOn
     constexpr std::size_t kMiB = 1024 * 1024;
 
     auto at_cap = make_server(200, std::string(kMiB, ' '));
-    const auto ok = fetch_public_body("/x", testnet_cfg(at_cap->port()), testnet_seam());
+    const auto ok = fetch_public_body(testnet_binding(), "/x", testnet_cfg(at_cap->port()), testnet_seam());
     EXPECT_EQ(ok.error, PublicRestError::None);
     EXPECT_EQ(ok.body.size(), kMiB);
 
     auto over_cap = make_server(200, std::string(kMiB + 1, ' '));
-    const auto over = fetch_public_body("/x", testnet_cfg(over_cap->port()), testnet_seam());
+    const auto over = fetch_public_body(testnet_binding(), "/x", testnet_cfg(over_cap->port()), testnet_seam());
     EXPECT_EQ(over.error, PublicRestError::Read);
     EXPECT_TRUE(over.body.empty());
 }
@@ -429,12 +441,12 @@ TEST(BinanceKlinesRestLimits, ABodyOverOneMiBIsRefusedAtTheReadStageAndExactlyOn
 
 TEST(BinanceKlinesRestConnectivity, MismatchedHostIsRejectedEvenThoughTheChainIsTrusted) {
     // Negative control for hostname verification: the CA is trusted, so the ONLY thing wrong is that
-    // the host we claim (api.binance.com) is not the one in the certificate (testnet.binance.vision).
+    // the host we claim (the production binding's api.binance.com) is not the one in the certificate
+    // (testnet.binance.vision).
     auto server = make_server(200, bars(3));
-    PublicRestConfig cfg = testnet_cfg(server->port());
-    cfg.host = "api.binance.com";
+    const PublicRestConfig cfg = testnet_cfg(server->port());
 
-    const auto r = fetch_public_body("/x", cfg, testnet_seam());
+    const auto r = fetch_public_body(EnvironmentBinding::production(), "/x", cfg, testnet_seam());
     EXPECT_EQ(r.error, PublicRestError::TlsHandshake);
     EXPECT_EQ(server->requests().size(), 0u) << "no HTTP request may be sent over an unverified channel";
 }
@@ -446,7 +458,7 @@ TEST(BinanceKlinesRestConnectivity, AnUntrustedCertificateIsRejected) {
     const PublicRestConfig cfg = testnet_cfg(server->port());
 
     // Same loopback routing, but no extra trust anchor.
-    const auto r = fetch_public_body("/x", cfg, hy::RestTestSeamBuilder::loopback());
+    const auto r = fetch_public_body(testnet_binding(), "/x", cfg, hy::RestTestSeamBuilder::loopback());
     EXPECT_EQ(r.error, PublicRestError::TlsHandshake);
     EXPECT_EQ(server->requests().size(), 0u);
 }
@@ -459,7 +471,7 @@ TEST(BinanceKlinesRestConnectivity, ConnectionRefusedIsTheConnectStage) {
     }
     PublicRestConfig cfg = testnet_cfg(dead_port);
     const auto start = std::chrono::steady_clock::now();
-    const auto r = fetch_public_body("/x", cfg, testnet_seam());
+    const auto r = fetch_public_body(testnet_binding(), "/x", cfg, testnet_seam());
     EXPECT_EQ(r.error, PublicRestError::Connect);
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(15));
 }
@@ -467,11 +479,10 @@ TEST(BinanceKlinesRestConnectivity, ConnectionRefusedIsTheConnectStage) {
 TEST(BinanceKlinesRestConnectivity, TlsHandshakeStageTimeout) {
     PlainBlackholeAcceptor blackhole;
     PublicRestConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
 
     const auto start = std::chrono::steady_clock::now();
-    const auto r = fetch_public_body("/x", cfg);
+    const auto r = fetch_public_body(binding_for("127.0.0.1"), "/x", cfg);
     EXPECT_EQ(r.error, PublicRestError::TlsHandshake);
     // Bounded by the ~5s handshake-stage budget, well under the ~30s all-stages worst case.
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(15));
@@ -483,10 +494,35 @@ TEST(BinanceKlinesRestConnectivity, ReadStageTimeoutAfterASuccessfulHandshake) {
     const PublicRestConfig cfg = testnet_cfg(tls_blackhole.port());
 
     const auto start = std::chrono::steady_clock::now();
-    const auto r = fetch_public_body("/x", cfg, testnet_seam());
+    const auto r = fetch_public_body(testnet_binding(), "/x", cfg, testnet_seam());
     // If this regresses to TlsHandshake the trust/hostname wiring broke, not the read deadline.
     EXPECT_EQ(r.error, PublicRestError::Read);
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(20));
+}
+
+// --- the bound environment's endpoint policy decides which host is contacted at all (SAFE-01) ---------------
+
+TEST(BinanceKlinesRestEndpoint, AHostOutsideTheBindingsAllowlistIsRefusedBeforeAnyNetworkAttempt) {
+    PlainBlackholeAcceptor blackhole;
+    PublicRestConfig cfg;
+    cfg.port = std::to_string(blackhole.port());
+    // A binding that names 127.0.0.1 but whose allowlist does not contain it: the only state in which the
+    // check can be proven to fire before any network attempt.
+    hy::EndpointAllowlist al{};
+    al.hosts[0] = "not-the-bound-host.example";
+    al.count = 1;
+    const EnvironmentBinding refusing =
+        hy::EnvironmentBindingTestHooks::with_allowlist(binding_for("127.0.0.1"), al);
+
+    EXPECT_EQ(fetch_public_body(refusing, "/x", cfg).error, PublicRestError::InvalidConfig);
+    EXPECT_EQ(fetch_klines_backfill(refusing, "BTCUSDT", "1h", 6, 7, cfg, clock_at(kFarFuture), shared_out())
+                  .transport,
+              PublicRestError::InvalidConfig);
+    EXPECT_EQ(hy::fetch_klines_backfill_outcome(refusing, hy::KlinesBackfillRequest{"BTCUSDT", "1h", 7, 3}, cfg,
+                                                clock_at(kFarFuture))
+                  .status.transport,
+              PublicRestError::InvalidConfig);
+    EXPECT_EQ(blackhole.accepted_connections(), 0u) << "the refusal must come before the connection";
 }
 
 // --- the outcome type and fetcher body SingleFlightFetchGate runs (6b-0f-3c) -----------------------------------
@@ -494,8 +530,8 @@ TEST(BinanceKlinesRestConnectivity, ReadStageTimeoutAfterASuccessfulHandshake) {
 TEST(BinanceKlinesRestOutcome, TheFetcherBodyCarriesStatusAndBarsInOneValue) {
     auto server = make_server(200, bars(5));
     const hy::KlinesBackfillRequest request{"BTCUSDT", "1h", 7, 3};
-    const auto out = hy::fetch_klines_backfill_outcome(request, testnet_cfg(server->port()), clock_at(kFarFuture),
-                                                        testnet_seam());
+    const auto out = hy::fetch_klines_backfill_outcome(testnet_binding(), request, testnet_cfg(server->port()),
+                                                        clock_at(kFarFuture), testnet_seam());
 
     ASSERT_TRUE(out.ok());
     ASSERT_EQ(out.bars().size(), 5U);
@@ -509,7 +545,8 @@ TEST(BinanceKlinesRestOutcome, TheFetcherBodyCarriesStatusAndBarsInOneValue) {
 
 TEST(BinanceKlinesRestOutcome, AFailedFetchIsAnOutcomeWithNoBarsNotAnException) {
     auto server = make_server(503, bars(5));  // a perfectly valid body behind a failing status
-    const auto out = hy::fetch_klines_backfill_outcome(hy::KlinesBackfillRequest{"BTCUSDT", "1h", 7, 3},
+    const auto out = hy::fetch_klines_backfill_outcome(testnet_binding(),
+                                                        hy::KlinesBackfillRequest{"BTCUSDT", "1h", 7, 3},
                                                         testnet_cfg(server->port()), clock_at(kFarFuture),
                                                         testnet_seam());
     EXPECT_FALSE(out.ok());
@@ -521,15 +558,15 @@ TEST(BinanceKlinesRestOutcome, AFailedFetchIsAnOutcomeWithNoBarsNotAnException) 
 TEST(BinanceKlinesRestOutcome, ARequestTheEndpointWouldRefuseNeverReachesTheWire) {
     PlainBlackholeAcceptor blackhole;
     PublicRestConfig cfg;
-    cfg.host = "127.0.0.1";
     cfg.port = std::to_string(blackhole.port());
+    const EnvironmentBinding binding = binding_for("127.0.0.1");
     for (const hy::KlinesBackfillRequest& bad :
          {hy::KlinesBackfillRequest{"btcusdt", "1h", 7, 3},                                 // lowercase symbol
           hy::KlinesBackfillRequest{"BTCUSDT", "7m", 7, 3},                                 // not an interval
           hy::KlinesBackfillRequest{"BTCUSDT", "1h", 0, 3},                                 // limit 0
           hy::KlinesBackfillRequest{"BTCUSDT", "1h", 1001, 3},                              // over Binance's max
           hy::KlinesBackfillRequest{"BTCUSDT", "1h", std::numeric_limits<std::uint32_t>::max(), 3}}) {
-        const auto out = hy::fetch_klines_backfill_outcome(bad, cfg, clock_at(kFarFuture));
+        const auto out = hy::fetch_klines_backfill_outcome(binding, bad, cfg, clock_at(kFarFuture));
         EXPECT_EQ(out.status.transport, PublicRestError::InvalidConfig) << bad.symbol << " " << bad.interval << " " << bad.limit;
     }
     EXPECT_EQ(blackhole.accepted_connections(), 0U);
