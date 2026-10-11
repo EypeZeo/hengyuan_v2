@@ -97,7 +97,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P0-001** | CRITICAL | live | REMEDIATING | 实盘订单提交 | BLOCKED | code, fault, test, runtime, budget |
 | **P1-001** | HIGH | lib | CLOSED | 真实网络调用 | CLEARED | — |
 | **P1-002** | HIGH | live | REMEDIATING | 订单生命周期 | BLOCKED | code, fault, test, runtime, budget |
-| **P1-003** | HIGH | lib | REMEDIATING | 账户数据解析 | BLOCKED | code, fault, test, runtime, budget |
+| **P1-003** | HIGH | lib | CLOSED | 账户数据解析 | CLEARED | — |
 | **P1-004** | HIGH | lib | PARTIAL | 策略回测准入 | BLOCKED | contract |
 | **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | code, fault, test, runtime, budget |
 | **P2-001** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
@@ -126,7 +126,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 实盘订单提交 | BLOCKED | P0-001 |
 | 真实网络调用 | CLEARED | — |
 | 订单生命周期 | BLOCKED | P1-002 |
-| 账户数据解析 | BLOCKED | P1-003 |
+| 账户数据解析 | CLEARED | — |
 | 策略回测准入 | BLOCKED | P1-004 |
 | 数据质量门禁 | BLOCKED | P1-005 |
 | REST 通信门禁 | CLEARED | — |
@@ -141,7 +141,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 8，DEFERRED 3，PARTIAL 3，CLOSED 12，合计 26。
+状态计数：REMEDIATING 7，DEFERRED 3，PARTIAL 3，CLOSED 13，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -177,7 +177,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-030** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-031** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-032** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 8c616a4 |
-| **FI-033** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-033** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 2a7e383 |
 | **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-035** | PRE_OWNER_LIVE | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-036** | PRE_D3 | L0 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -193,11 +193,11 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 28 | 1 | 18 | 9 | BLOCKED |
+| PRE_D3 | 28 | 2 | 17 | 9 | BLOCKED |
 | PRE_OWNER_LIVE | 13 | 0 | 1 | 12 | BLOCKED |
 | CANARY | 4 | 0 | 0 | 4 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 25，PARTIAL 19，IMPLEMENTED 1，合计 45，其中门禁 PASS 1 条。
+故障用例计数：NOT_TESTABLE_YET 25，PARTIAL 18，IMPLEMENTED 2，合计 45，其中门禁 PASS 2 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -288,18 +288,17 @@ legacy: P1-003
 title: 账户真值快照：资产计数越界、无界字符串长度、余额相加未检查、未来时间戳不被拒绝
 severity: HIGH
 kind: lib
-status: REMEDIATING
+status: CLOSED
 task: SAFE-02
 gate: 账户数据解析
-gate_result: BLOCKED
-open: open:native/include/hengyuan/account_truth.hpp#"std::size_t asset_count{0};" open:native/include/hengyuan/account_truth.hpp#"for (std::size_t i = 0; i < asset_count; ++i)" open:native/include/hengyuan/account_truth.hpp#"std::int64_t total() const noexcept { return free_ticks + locked_ticks; }"
-seg.code: MISSING code:native/include/hengyuan/account_truth.hpp#AccountSnapshot -- 资产计数公开可写，find() 按计数循环而不钳制，total() 直接相加；安全工厂不存在
+gate_result: CLEARED
+refs: code:native/include/hengyuan/account_truth.hpp#AccountSnapshotBuilder test:native/tests/test_account_snapshot_boundary.cpp#NoFieldOfASnapshotOrABalanceCanBeWrittenFromOutside pr:163@2a7e383
+seg.code: PRESENT absent:native/include/hengyuan/account_truth.hpp#"std::size_t asset_count{0};" absent:native/include/hengyuan/account_truth.hpp#"for (std::size_t i = 0; i < asset_count; ++i)" absent:native/include/hengyuan/account_truth.hpp#"std::int64_t total() const noexcept { return free_ticks + locked_ticks; }" code:native/include/hengyuan/account_truth.hpp#AccountSnapshotBuilder code:native/include/hengyuan/account_truth.hpp#check_freshness pr:163@2a7e383 -- AssetBalance 与 AccountSnapshot 的字段全部私有，非空快照只能经 AccountSnapshotBuilder 得到：拒绝空名称、超长名称（不截断）、可见 ASCII 之外的字节、重名、负余额、free + locked 溢出、第 33 个资产与非正时间戳；读取侧再钳一次（asset_count() 钳到容量，asset_name() 按存储长度读、不再 strlen，total() 为检查运算）；check_freshness 对未来时间戳返回 FromTheFuture（容差钳在 0 至 10 s）
 seg.contract: PRESENT doc:docs/BINANCE_PRIVATE_REST_L4_SPEC.md#AccountSnapshot bp:"任务 SAFE-02" -- 任务规定私有化数组与计数、仅经安全工厂构造
-seg.fault: MISSING fi:FI-033=PARTIAL -- 模糊测试用例已登记，工厂不存在故无法执行
-seg.test: MISSING test:native/tests/test_account_truth.cpp#NotionalOverflowFailsClosed test:native/tests/test_account_truth.cpp#AddDetectsOverflow -- 溢出检查只存在于预检算术，不覆盖快照构造
-seg.runtime: MISSING -- 无 CI run 可引：修复尚未落地
-seg.budget: MISSING -- 工厂校验对解析路径的时延未测量
-closure: SAFE-02 完成，FI-033 的模糊测试报告取得
+seg.fault: PRESENT:UT test:native/tests/test_binance_private_rest.cpp#FI033MalformedAccountDataNeverBecomesAMalformedSnapshot test:native/tests/test_account_snapshot_boundary.cpp#FI033NoSequenceOfAssetsMakesABrokenSnapshotOrDisturbsABuilderThatRefused fi:FI-033=IMPLEMENTED -- FI-033 的畸形快照模糊测试：解析路径 3 万个变异请求体、工厂层 3000 轮随机资产序列、读取侧 2 万次随机写坏计数与名称长度，全部固定种子；出来的快照必须满足全部承诺，被拒绝时输出原样不动
+seg.test: PRESENT test:native/tests/test_account_snapshot_boundary.cpp#ThirtyTwoAssetsFitAndTheThirtyThirdIsRefusedWithoutDisturbingTheRest test:native/tests/test_account_snapshot_boundary.cpp#ACountBeyondTheCapacityIsClampedByEveryReader test:native/tests/test_account_snapshot_boundary.cpp#PreTradeNamesItAndHonoursTheLimitsTolerance -- 类型性质（没有任何字段可写，带旧形状的正对照）、工厂逐条规则、读取侧钳制、未来时间戳与极值算术；24 个变异体全部被预期用例杀死
+seg.runtime: PRESENT run:"38123300184@2a7e3833/ci-native.yml[native-build-test]" -- 合并后主干上真实成功的 CI Native run（GCC-14 Release 全量构建与测试）
+seg.budget: PRESENT pr:163@2a7e383 -- 实测开销见 PR #163 正文：13.7 KB 请求体（232 个条目、32 个非零）的解析从 41.4 至 41.6 µs 变为 43.2 至 43.5 µs（多 1.8 µs，+4.3%）；满 32 资产快照经工厂构建约 2.6 至 2.9 µs；账户拉取每 10 至 30 秒一次，前面是一次 HTTPS 往返
 ```
 
 ```ledger
@@ -1245,13 +1244,12 @@ gate_tag: PRE_D3
 scope: 全部
 stage: 0
 level: L0
-status: PARTIAL
-result: NOT_RUN
-gate_result: BLOCKED
-baseline: 6cb56bd
-open: open:native/include/hengyuan/account_truth.hpp#"std::size_t asset_count{0};" open:native/include/hengyuan/account_truth.hpp#"for (std::size_t i = 0; i < asset_count; ++i)" open:native/include/hengyuan/account_truth.hpp#"std::int64_t total() const noexcept { return free_ticks + locked_ticks; }"
-refs: test:native/tests/test_account_truth.cpp#AddDetectsOverflow code:native/include/hengyuan/account_truth.hpp#checked_add
-note: 预检算术有溢出检查，快照构造没有安全工厂（P1-003）。
+status: IMPLEMENTED
+result: PASS
+gate_result: PASS
+baseline: 2a7e383
+refs: test:native/tests/test_binance_private_rest.cpp#FI033MalformedAccountDataNeverBecomesAMalformedSnapshot test:native/tests/test_account_snapshot_boundary.cpp#FI033NoSequenceOfAssetsMakesABrokenSnapshotOrDisturbsABuilderThatRefused code:native/include/hengyuan/account_truth.hpp#AccountSnapshotBuilder run:"38123300184@2a7e3833/ci-native.yml[native-build-test]"
+note: PR #163 之后账户快照的字段全部私有，唯一的构造路径是 AccountSnapshotBuilder，畸形资产（空/超长/不可见字节的名称、重名、负数或溢出的余额、超过 32 个）被拒绝而不是截断，读取侧按容量再钳一次；判定信号是单元测试失败（含固定种子的模糊测试），主干 CI Native 的全量构建与测试已成功。
 ```
 
 ```ledger
