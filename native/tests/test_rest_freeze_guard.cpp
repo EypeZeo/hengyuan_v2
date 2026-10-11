@@ -3,9 +3,10 @@
 //
 // "Adding any REST request method must come with proof that it passes the endpoint check first."
 // Two mechanisms carry that proof:
-//   1. the type system: the network coroutines of BinancePrivateRestClient take an EndpointPermit
-//      (transport_policy.hpp) instead of a host, so a request path without the check does not compile
-//      (tests/test_rest_config_surface.cpp pins those signatures);
+//   1. the type system: the network coroutines of every REST client (the private client, the depth
+//      snapshot fetcher, the klines fetcher) take an EndpointPermit (transport_policy.hpp) instead of a
+//      host, so a request path without the check does not compile (tests/test_rest_config_surface.cpp
+//      pins those signatures, and that no REST config can name a host any more);
 //   2. this test: every place under include/ and src/ that opens a connection is pinned in kPinned.
 //      A new one, or a pinned one that gains or loses a connection, fails the test until a reviewer has
 //      looked at it and updated the table -- and the table says what kind of entry it has to be.
@@ -141,9 +142,6 @@ const SourceFile* find_source(std::string_view rel) {
 enum class Kind {
     // REST path whose coroutines take an EndpointPermit: the check is a compile-time property.
     EndpointPermit,
-    // REST client that still takes its host from its own config and has no transport-policy source.
-    // Known debt, pinned so it cannot grow; SAFE-01 slice 3 moves both onto a binding + permit.
-    KnownUnwired,
     // WebSocket session: connects to the binding's stream host, a separate mechanism from REST policy.
     WebSocket,
 };
@@ -160,8 +158,8 @@ struct Pinned {
 // EndpointPermit (transport_policy.hpp) before it resolves anything.
 constexpr Pinned kPinned[] = {
     {"include/hengyuan/binance_private_rest.hpp", 3, 3, Kind::EndpointPermit},
-    {"include/hengyuan/binance_rest_snapshot.hpp", 1, 1, Kind::KnownUnwired},
-    {"include/hengyuan/binance_klines_rest.hpp", 1, 1, Kind::KnownUnwired},
+    {"include/hengyuan/binance_rest_snapshot.hpp", 1, 1, Kind::EndpointPermit},
+    {"include/hengyuan/binance_klines_rest.hpp", 1, 1, Kind::EndpointPermit},
     {"include/hengyuan/binance_ws_session.hpp", 1, 1, Kind::WebSocket},
     {"include/hengyuan/binance_kline_ws_session.hpp", 1, 1, Kind::WebSocket},
     {"include/hengyuan/binance_user_data_ws_session.hpp", 1, 1, Kind::WebSocket},
@@ -246,7 +244,7 @@ TEST(RestFreezeGuard, EveryPinnedFileStillExists) {
     }
 }
 
-TEST(RestFreezeGuard, ThePrivateRestCoroutinesNameTheirPermit) {
+TEST(RestFreezeGuard, EveryRestCoroutineNamesItsPermit) {
     // The compile-time pin lives in test_rest_config_surface.cpp; this is the textual cross-check that
     // each of the file's connections is opened by a coroutine that takes the permit as its first parameter.
     for (const Pinned& p : kPinned) {
@@ -258,15 +256,17 @@ TEST(RestFreezeGuard, ThePrivateRestCoroutinesNameTheirPermit) {
     }
 }
 
-TEST(RestFreezeGuard, TheTwoPublicClientsThatAreStillUnwiredAreExactlyTheKnownOnes) {
-    // Not a claim that they are fine: a claim that nobody added a third one. Wiring either of them to a
-    // binding + permit (SAFE-01 slice 3) moves its row to Kind::EndpointPermit and shrinks this list.
-    std::vector<std::string> unwired;
+TEST(RestFreezeGuard, TheRestClientsAreExactlyThePermitTakingOnes) {
+    // Every REST client takes its host and policy from an EnvironmentBinding and its coroutines take the
+    // permit. A fourth REST client has to be added here on purpose (and arrive with its permit), and a
+    // client must not drop out of this list while it still opens connections.
+    std::vector<std::string> rest;
     for (const Pinned& p : kPinned) {
-        if (p.kind == Kind::KnownUnwired) unwired.emplace_back(p.file);
+        if (p.kind == Kind::EndpointPermit) rest.emplace_back(p.file);
     }
-    EXPECT_EQ(unwired, (std::vector<std::string>{"include/hengyuan/binance_rest_snapshot.hpp",
-                                                  "include/hengyuan/binance_klines_rest.hpp"}));
+    EXPECT_EQ(rest, (std::vector<std::string>{"include/hengyuan/binance_private_rest.hpp",
+                                               "include/hengyuan/binance_rest_snapshot.hpp",
+                                               "include/hengyuan/binance_klines_rest.hpp"}));
 }
 
 // --- the test seam stays a test seam -----------------------------------------------------------------

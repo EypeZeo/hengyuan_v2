@@ -100,7 +100,9 @@ int main(int argc, char* argv[]) {
 
     std::printf("Fetching REST depth snapshot for %s...\n", symbol.c_str());
     hy::FetchError rest_error{};
-    auto snapshot = hy::fetch_depth_snapshot(symbol, 100'000'000, 100'000'000, {}, rest_error);
+    // Production market data, named explicitly (there is no default environment any more).
+    auto snapshot = hy::fetch_depth_snapshot(hy::EnvironmentBinding::production(), symbol, 100'000'000,
+                                             100'000'000, {}, rest_error);
 
     bool ws_ok = ws_stats.messages_received > 0;
     bool rest_ok = snapshot.has_value();

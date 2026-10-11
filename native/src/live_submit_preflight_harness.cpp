@@ -467,22 +467,19 @@ int main(int argc, char* argv[]) {
         return try_get_pessimistic_server_now_ms(client.clock_publisher(), fetch_clock_pair(), now) ? now : 0;
     };
 
-    // Testnet REST host overrides -- make_default_snapshot_fetcher() (binance_rest_snapshot.hpp)
-    // is hardcoded to api.binance.com (production) and PublicRestConfig has no default host by
-    // design; this batch is testnet-only throughout, so both fetchers are pinned to
-    // binding.base_host(). They run on the gates' worker threads, so they capture values only.
-    const std::string rest_host(binding.base_host());
-    auto testnet_depth_fetcher = [rest_host](const SnapshotRequest& req) -> std::optional<DepthSnapshot> {
+    // Testnet REST: both public fetchers take this process's binding (the testnet one) -- neither config has a
+    // host field any more, and each fetch issues an EndpointPermit for the binding's host before anything is
+    // resolved, so a fetch cannot reach another market. They run on the gates' worker threads, so they capture
+    // values only (an EnvironmentBinding is trivially copyable).
+    auto testnet_depth_fetcher = [binding](const SnapshotRequest& req) -> std::optional<DepthSnapshot> {
         RestSnapshotConfig cfg;
-        cfg.host = rest_host;
         cfg.port = "443";
-        return fetch_depth_snapshot(req.symbol, req.price_multiplier, req.qty_multiplier, cfg);
+        return fetch_depth_snapshot(binding, req.symbol, req.price_multiplier, req.qty_multiplier, cfg);
     };
     PublicRestConfig klines_rest;
-    klines_rest.host = rest_host;
     klines_rest.port = "443";
-    auto testnet_klines_fetcher = [klines_rest, exchange_now_ms](const KlinesBackfillRequest& req) {
-        return fetch_klines_backfill_outcome(req, klines_rest, exchange_now_ms);
+    auto testnet_klines_fetcher = [binding, klines_rest, exchange_now_ms](const KlinesBackfillRequest& req) {
+        return fetch_klines_backfill_outcome(binding, req, klines_rest, exchange_now_ms);
     };
 
     PublicFeedPipelineConfig feed_cfg;

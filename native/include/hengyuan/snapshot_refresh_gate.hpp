@@ -68,7 +68,7 @@ class SnapshotRefreshGate {
 public:
     // No default argument any more (audit VERIF-TSAN-016): naming the production
     // fetcher here is what coupled this header to Boost/OpenSSL. Production callers
-    // pass hy::make_default_snapshot_fetcher() (binance_rest_snapshot.hpp); tests
+    // pass hy::make_default_snapshot_fetcher(binding) (binance_rest_snapshot.hpp); tests
     // inject a fake so the state machine -- single-flight, mailbox reset, cooldown on
     // fetch-failure/apply-rejection -- is exercised deterministically with no network.
     explicit SnapshotRefreshGate(SnapshotFetcher fetcher)

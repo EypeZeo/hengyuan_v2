@@ -123,12 +123,11 @@ inline TransportCheck check_endpoint(const TransportPolicy& p,
 }
 
 // Proof that `host` passed check_endpoint() against a policy. The only way to obtain one is
-// issue_endpoint_permit() below. The network coroutines of BinancePrivateRestClient take one by value and
-// connect to permit.host() -- no separate host argument -- so a request path that skipped the allowlist
-// cannot be written without the compiler noticing, and a permit for one host cannot be spent on another
-// (SAFE-01 freeze guard; audit P2-001, P1-001). The two public market-data clients
-// (binance_rest_snapshot.hpp, binance_klines_rest.hpp) have no TransportPolicy source yet and are NOT
-// wired to it; tests/test_rest_freeze_guard.cpp pins them as such until SAFE-01 slice 3.
+// issue_endpoint_permit() below. The network coroutines of every REST client (BinancePrivateRestClient,
+// the depth-snapshot fetcher and the klines fetcher) take one by value and connect to permit.host() -- no
+// separate host argument -- so a request path that skipped the allowlist cannot be written without the
+// compiler noticing, and a permit for one host cannot be spent on another (SAFE-01 freeze guard; audit
+// P2-001, P1-001). tests/test_rest_freeze_guard.cpp pins every place that opens a connection.
 //
 // `host` is a view: it must outlive every copy of the permit. The one production issuer
 // (BinancePrivateRestClient) passes EnvironmentBinding::base_host(), a view of a string literal.

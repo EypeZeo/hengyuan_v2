@@ -19,8 +19,8 @@
 // TLS fixture note: EnvironmentBinding::testnet()'s base_host() is hardcoded to
 // "testnet.binance.vision" (by design -- see that header's own comment on why host is not a
 // runtime parameter), so hostname verification needs a certificate whose SAN actually says
-// that, unlike test_binance_rest_snapshot.cpp's tests (which use PrivateRestConfig-equivalent
-// RestSnapshotConfig::host as a free parameter and can just point it at the existing
+// that, unlike test_binance_rest_snapshot.cpp's tests (which bind a free host name with
+// EnvironmentBindingTestHooks::with_host and can just point it at the existing
 // wrong-san.test.invalid fixture cert). test_leaf_cert_testnet_host.pem/
 // test_leaf_key_testnet_host.pem are a dedicated self-signed cert+key pair
 // (CN/SAN=testnet.binance.vision) generated for exactly this reason -- not sharing the
