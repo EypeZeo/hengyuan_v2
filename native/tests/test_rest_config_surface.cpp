@@ -17,11 +17,15 @@
 
 #include "test_helpers/rest_test_seam_builder.hpp"
 
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <type_traits>
 
 using hy::EndpointPermit;
+using hy::EnvironmentBinding;
+using hy::KlineBackfill;
 using hy::PrivateRestConfig;
 using hy::PublicRestConfig;
 using hy::RestSnapshotConfig;
@@ -36,6 +40,8 @@ template <class T>
 constexpr bool has_connect_host_override = requires(T t) { t.connect_host_override; };
 template <class T>
 constexpr bool has_extra_trusted_ca_pem_path = requires(T t) { t.extra_trusted_ca_pem_path; };
+template <class T>
+constexpr bool has_host = requires(T t) { t.host; };
 
 template <class T>
 constexpr bool can_write_ca_field = requires(T s) { s.ca_pem_path_ = "x"; };
@@ -48,6 +54,7 @@ constexpr bool can_write_through_connect_accessor = requires(T s) { s.connect_ho
 
 // What a config looked like before the fix: the positive control for the two concepts above.
 struct LegacyConfigShape {
+    std::string host = "api.binance.com";
     std::string port = "443";
     std::string extra_trusted_ca_pem_path;
     std::string connect_host_override;
@@ -59,6 +66,20 @@ template <class... A>
 constexpr bool signed_body_coro_callable = requires(A... a) { hy::detail::fetch_signed_body_coro(a...); };
 template <class... A>
 constexpr bool public_body_coro_callable = requires(A... a) { hy::detail::fetch_public_body_coro(a...); };
+template <class... A>
+constexpr bool depth_snapshot_coro_callable = requires(A... a) { hy::detail::fetch_depth_snapshot_coro(a...); };
+
+// The public entry points of the two market-data clients: callable only with a binding.
+template <class... A>
+constexpr bool fetch_depth_snapshot_callable = requires(A... a) { hy::fetch_depth_snapshot(a...); };
+template <class... A>
+constexpr bool default_snapshot_fetcher_callable = requires(A... a) { hy::make_default_snapshot_fetcher(a...); };
+template <class... A>
+constexpr bool fetch_public_body_callable = requires(A... a) { hy::fetch_public_body(a...); };
+template <class... A>
+constexpr bool fetch_klines_backfill_callable = requires(A... a) { hy::fetch_klines_backfill(a...); };
+template <class... A>
+constexpr bool fetch_klines_outcome_callable = requires(A... a) { hy::fetch_klines_backfill_outcome(a...); };
 
 }  // namespace
 
@@ -79,6 +100,18 @@ TEST(RestConfigSurface, NoRestConfigTypeCanNameAnExtraTrustAnchor) {
     EXPECT_FALSE(has_extra_trusted_ca_pem_path<PrivateRestConfig>);
     EXPECT_FALSE(has_extra_trusted_ca_pem_path<RestSnapshotConfig>);
     EXPECT_FALSE(has_extra_trusted_ca_pem_path<PublicRestConfig>);
+}
+
+// SAFE-01 slice 3: the host is the bound environment's, so no REST config can name one either (the two
+// market-data configs used to carry `host`, one of them defaulting to production).
+TEST(RestConfigSurface, ThePositiveControlSeesTheOldHostField) {
+    EXPECT_TRUE(has_host<LegacyConfigShape>);
+}
+
+TEST(RestConfigSurface, NoRestConfigTypeCanNameAHost) {
+    EXPECT_FALSE(has_host<PrivateRestConfig>);
+    EXPECT_FALSE(has_host<RestSnapshotConfig>);
+    EXPECT_FALSE(has_host<PublicRestConfig>);
 }
 
 // --- the seam is the only carrier, and production code cannot fill it ---------------------------------
@@ -141,4 +174,44 @@ TEST(RestFreezeGuardTypes, ThePublicBodyCoroutineTakesAPermitAndNoHostString) {
     EXPECT_FALSE((public_body_coro_callable<std::string, std::string, PrivateRestConfig, RestTestSeam>));
     EXPECT_FALSE((public_body_coro_callable<std::string, std::string, PrivateRestConfig>))
         << "the pre-fix shape";
+}
+
+TEST(RestFreezeGuardTypes, TheKlinesBodyCoroutineTakesAPermitAndNoHostString) {
+    EXPECT_TRUE((public_body_coro_callable<EndpointPermit, std::string, PublicRestConfig, RestTestSeam>));
+    EXPECT_FALSE((public_body_coro_callable<std::string, std::string, PublicRestConfig, RestTestSeam>));
+    EXPECT_FALSE((public_body_coro_callable<std::string, PublicRestConfig, RestTestSeam>))
+        << "the pre-slice-3 shape: the host came from the config";
+}
+
+TEST(RestFreezeGuardTypes, TheDepthSnapshotCoroutineTakesAPermitAndNoHostString) {
+    EXPECT_TRUE((depth_snapshot_coro_callable<EndpointPermit, std::string, std::int64_t, std::int64_t,
+                                              RestSnapshotConfig, RestTestSeam>));
+    EXPECT_FALSE((depth_snapshot_coro_callable<std::string, std::string, std::int64_t, std::int64_t,
+                                               RestSnapshotConfig, RestTestSeam>));
+    EXPECT_FALSE((depth_snapshot_coro_callable<std::string, std::int64_t, std::int64_t, RestSnapshotConfig,
+                                               RestTestSeam>))
+        << "the pre-slice-3 shape: the host came from the config";
+}
+
+// Slice 3: the two market-data clients cannot be called without naming the environment either; no
+// convenience overload with a built-in default (the old snapshot one defaulted to production) may come back.
+TEST(RestFreezeGuardTypes, TheMarketDataEntryPointsCannotBeCalledWithoutABinding) {
+    EXPECT_TRUE((fetch_depth_snapshot_callable<EnvironmentBinding, std::string, std::int64_t, std::int64_t>));
+    EXPECT_FALSE((fetch_depth_snapshot_callable<std::string, std::int64_t, std::int64_t>));
+    EXPECT_FALSE((fetch_depth_snapshot_callable<std::string, std::int64_t, std::int64_t, RestSnapshotConfig>));
+    EXPECT_TRUE((default_snapshot_fetcher_callable<EnvironmentBinding>));
+    EXPECT_FALSE((default_snapshot_fetcher_callable<>));
+
+    EXPECT_TRUE((fetch_public_body_callable<EnvironmentBinding, std::string, PublicRestConfig>));
+    EXPECT_FALSE((fetch_public_body_callable<std::string, PublicRestConfig>));
+    EXPECT_TRUE((fetch_klines_backfill_callable<EnvironmentBinding, std::string_view, std::string_view, int,
+                                                std::uint32_t, PublicRestConfig,
+                                                std::function<std::int64_t()>, KlineBackfill&>));
+    EXPECT_FALSE((fetch_klines_backfill_callable<std::string_view, std::string_view, int, std::uint32_t,
+                                                 PublicRestConfig, std::function<std::int64_t()>,
+                                                 KlineBackfill&>));
+    EXPECT_TRUE((fetch_klines_outcome_callable<EnvironmentBinding, hy::KlinesBackfillRequest, PublicRestConfig,
+                                               std::function<std::int64_t()>>));
+    EXPECT_FALSE((fetch_klines_outcome_callable<hy::KlinesBackfillRequest, PublicRestConfig,
+                                                std::function<std::int64_t()>>));
 }

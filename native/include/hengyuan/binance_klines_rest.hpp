@@ -7,11 +7,12 @@
 // binance_rest_snapshot.hpp. Structure deliberately mirrors that file: a pure codec
 // (binance_klines_codec.hpp) does the fail-closed validation; this file is only the transport.
 //
-// TESTNET-ONLY BY CONSTRUCTION: PublicRestConfig has NO default host. RestSnapshotConfig defaults
-// to production (api.binance.com); a klines fetch that silently targeted production while the rest
-// of the process is testnet would feed the indicators data from a different market than the one
-// being traded. Callers pass EnvironmentBinding::base_host() explicitly, and an empty host is an
-// InvalidConfig, not a fallback.
+// THE ENVIRONMENT IS ALWAYS NAMED BY THE CALLER: there is no default host, and PublicRestConfig has no
+// host field at all. Every fetch takes the process's EnvironmentBinding; a klines fetch that silently
+// targeted production while the rest of the process is testnet would feed the indicators data from a
+// different market than the one being traded. The binding's host must pass its own endpoint allowlist
+// (an EndpointPermit is issued, and the coroutine connects to permit.host() and nothing else); a
+// refusal is an InvalidConfig, not a fallback.
 //
 // Synchronous signature, driven by a local io_context (same as fetch_depth_snapshot()), with the
 // same per-stage deadlines (resolve/connect/TLS/write 5s, read 10s) and the same hard caps on
@@ -34,6 +35,7 @@
 
 #pragma once
 
+#include <hengyuan/binance_environment.hpp>
 #include <hengyuan/binance_klines_codec.hpp>
 #include <hengyuan/binance_rest_snapshot.hpp>  // detail::is_valid_rest_host / _symbol; net/beast/http/ssl/tcp aliases
 #include <hengyuan/binance_tls.hpp>
@@ -51,8 +53,9 @@
 
 namespace hy {
 
+// No host in here: it is the bound environment's (EnvironmentBinding::base_host()), so a configuration
+// cannot name one (audit P1-001 / SAFE-01).
 struct PublicRestConfig {
-    std::string host;  // REQUIRED, no default (see the file header): EnvironmentBinding::base_host()
     std::string port = "443";
 
     // Deliberately no connect-target override and no extra trust anchor in here (audit P1-001, fault
@@ -116,12 +119,15 @@ inline bool is_valid_public_rest_target(std::string_view target) {
     return true;
 }
 
-inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string target, PublicRestConfig cfg,
-                                                                  RestTestSeam seam) {
+inline net::awaitable<PublicRestResponse> fetch_public_body_coro(EndpointPermit permit, std::string target,
+                                                                  PublicRestConfig cfg, RestTestSeam seam) {
     using namespace boost::asio::experimental::awaitable_operators;
 
     PublicRestError current_stage = PublicRestError::Resolve;
     try {
+        // The host is the permit's and nobody else's: SNI, hostname verification, the Host header and
+        // (unless a test seam redirects the TCP connection) the connect target all use it.
+        const std::string host(permit.host());
         auto executor = co_await net::this_coro::executor;
 
         current_stage = PublicRestError::TlsHandshake;  // covers ssl_ctx setup below too
@@ -138,19 +144,19 @@ inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string tar
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 #endif
-        if (!SSL_set_tlsext_host_name(stream.native_handle(), cfg.host.c_str())) {
+        if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
             co_return public_rest_failure(PublicRestError::TlsHandshake);
         }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-        hy::configure_binance_hostname_verification(stream, cfg.host);
+        hy::configure_binance_hostname_verification(stream, host);
 
         // Resolve, racing a 5s timer -- beast::tcp_stream::expires_after() does not cover
         // tcp::resolver, so this one stage needs its own race (same as the depth fetcher).
         current_stage = PublicRestError::Resolve;
         const std::string& connect_host =
-            seam.connect_host_override().empty() ? cfg.host : seam.connect_host_override();
+            seam.connect_host_override().empty() ? host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
         resolve_timer.expires_after(std::chrono::seconds(5));
         auto resolve_result =
@@ -170,7 +176,7 @@ inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string tar
         co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
 
         http::request<http::empty_body> req{http::verb::get, target, 11};
-        req.set(http::field::host, cfg.host);
+        req.set(http::field::host, host);
         req.set(http::field::user_agent, "HengYuan/0.1");
 
         current_stage = PublicRestError::Write;
@@ -202,11 +208,15 @@ inline net::awaitable<PublicRestResponse> fetch_public_body_coro(std::string tar
 
 }  // namespace detail
 
-// Fetches `target` (origin-form path + query) over TLS from cfg.host. Never throws for network or
-// protocol failures; the failing stage is in `error`, and `body` is only set on success.
-inline PublicRestResponse fetch_public_body(const std::string& target, const PublicRestConfig& cfg,
-                                            const RestTestSeam& seam = {}) {
-    if (!detail::is_valid_rest_host(cfg.host) || cfg.port.empty() ||
+// Fetches `target` (origin-form path + query) over TLS from the host of `binding`, provided that host
+// passes the binding's endpoint allowlist (SAFE-01). Never throws for network or protocol failures; the
+// failing stage is in `error`, and `body` is only set on success.
+inline PublicRestResponse fetch_public_body(const EnvironmentBinding& binding, const std::string& target,
+                                            const PublicRestConfig& cfg, const RestTestSeam& seam = {}) {
+    // The permit proves allowlist membership, not that a corrupt allowlist did not list something that is no
+    // hostname, so the host's syntax is checked as well.
+    const auto permit = issue_endpoint_permit(binding.transport_policy(), binding.base_host());
+    if (!permit || !detail::is_valid_rest_host(permit->host()) || cfg.port.empty() ||
         !detail::is_valid_public_rest_target(target)) {
         return detail::public_rest_failure(PublicRestError::InvalidConfig);
     }
@@ -214,7 +224,7 @@ inline PublicRestResponse fetch_public_body(const std::string& target, const Pub
     net::io_context ioc;
     bool completed = false;
     PublicRestResponse outcome;
-    net::co_spawn(ioc, detail::fetch_public_body_coro(target, cfg, seam),
+    net::co_spawn(ioc, detail::fetch_public_body_coro(*permit, target, cfg, seam),
                   [&](std::exception_ptr eptr, PublicRestResponse r) {
                       // The coroutine catches boost::system::system_error itself; anything that
                       // escapes here (e.g. std::bad_alloc) is genuinely exceptional and propagates.
@@ -255,8 +265,9 @@ struct KlinesFetchResult {
 // called exactly once, BEFORE the request goes out (see "WHICH BARS ARE CLOSED" above), and a
 // non-positive or implausibly small reading is an InvalidConfig rather than a silent "everything is
 // forming". On any failure `out` must not be used.
-inline KlinesFetchResult fetch_klines_backfill(std::string_view symbol, std::string_view interval, int limit,
-                                                std::uint32_t symbol_id, const PublicRestConfig& cfg,
+inline KlinesFetchResult fetch_klines_backfill(const EnvironmentBinding& binding, std::string_view symbol,
+                                                std::string_view interval, int limit, std::uint32_t symbol_id,
+                                                const PublicRestConfig& cfg,
                                                 const std::function<std::int64_t()>& now_ms,
                                                 KlineBackfill& out, const RestTestSeam& seam = {}) {
     KlinesFetchResult result;
@@ -276,7 +287,7 @@ inline KlinesFetchResult fetch_klines_backfill(std::string_view symbol, std::str
     }
     const std::int64_t closed_before_ms = now - kKlinesClosedBarMarginMs;
 
-    const PublicRestResponse response = fetch_public_body(target, cfg, seam);
+    const PublicRestResponse response = fetch_public_body(binding, target, cfg, seam);
     result.transport = response.error;
     result.http_status = response.http_status;
     if (response.error != PublicRestError::None) return result;
@@ -298,16 +309,18 @@ struct KlinesBackfillOutcome {
 };
 
 // The Fetcher body for SingleFlightFetchGate<KlinesBackfillRequest, KlinesBackfillOutcome>. It runs on
-// the gate's WORKER thread, so `cfg` must be a value (copied into the closure) and `now_ms` may read
-// only thread-safe state -- e.g. a ClockOffsetPublisher snapshot plus the wall clock -- never anything
-// the hot thread mutates.
-inline KlinesBackfillOutcome fetch_klines_backfill_outcome(const KlinesBackfillRequest& request,
+// the gate's WORKER thread, so `binding` and `cfg` must be values (copied into the closure; a binding is
+// trivially copyable) and `now_ms` may read only thread-safe state -- e.g. a ClockOffsetPublisher snapshot
+// plus the wall clock -- never anything the hot thread mutates.
+inline KlinesBackfillOutcome fetch_klines_backfill_outcome(const EnvironmentBinding& binding,
+                                                            const KlinesBackfillRequest& request,
                                                             const PublicRestConfig& cfg,
                                                             const std::function<std::int64_t()>& now_ms,
                                                             const RestTestSeam& seam = {}) {
     KlinesBackfillOutcome outcome;
-    outcome.status = fetch_klines_backfill(request.symbol, request.interval, static_cast<int>(request.limit),
-                                            request.symbol_id, cfg, now_ms, outcome.data, seam);
+    outcome.status = fetch_klines_backfill(binding, request.symbol, request.interval,
+                                            static_cast<int>(request.limit), request.symbol_id, cfg, now_ms,
+                                            outcome.data, seam);
     return outcome;
 }
 

@@ -235,7 +235,8 @@ int main(int argc, char* argv[]) {
     // The production fetcher is passed explicitly now (audit VERIF-TSAN-016) -- it
     // used to be a constructor default, which is what coupled the gate's header to
     // Boost/OpenSSL and kept its threaded state machine out of the TSan job.
-    hy::SnapshotRefreshGate depth_gate(hy::make_default_snapshot_fetcher());
+    // This demo reads public PRODUCTION market data, and says so: the fetcher takes its environment explicitly.
+    hy::SnapshotRefreshGate depth_gate(hy::make_default_snapshot_fetcher(hy::EnvironmentBinding::production()));
 
     // D3-LIVE preflight check (informational — this is dry-run, not live). Runs before the book
     // is synced (depth_mgr starts in Buffering), which honestly reflects "not ready yet at
