@@ -181,7 +181,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-035** | PRE_OWNER_LIVE | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-036** | PRE_D3 | L0 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-037** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 7a58b68 |
+| **FI-037** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 21154dc |
 | **FI-038** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-039** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-040** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -1310,10 +1310,10 @@ level: L0
 status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 7a58b68
+baseline: 21154dc
 open: absent:native/src/*.cpp#check_response_size absent:native/include/hengyuan/binance_private_rest.hpp#check_response_size
-refs: test:native/tests/test_transport_policy.cpp#EndpointCheckRejectsInvalidHost test:native/tests/test_transport_policy.cpp#RejectsEndpointCountAboveCapacity test:native/tests/test_binance_private_rest.cpp#BlockedEndpointFixture
-note: 端点一半已接线并有单测（P2-001，PR #156）：私有 REST 客户端的 7 个联网入口在解析前先过 check_endpoint，白名单计数有上界。尺寸一半仍未接线——check_response_size 与 max_response_bytes 没有任何生产调用点，客户端用各自写死的 parser.body_limit。
+refs: test:native/tests/test_transport_policy.cpp#EndpointCheckRejectsInvalidHost test:native/tests/test_transport_policy.cpp#RejectsEndpointCountAboveCapacity test:native/tests/test_binance_private_rest.cpp#BlockedEndpointFixture test:native/tests/test_binance_rest_snapshot.cpp#AHostOutsideTheBindingsAllowlistIsRefusedBeforeAnyNetworkAttempt test:native/tests/test_binance_klines_rest.cpp#AHostOutsideTheBindingsAllowlistIsRefusedBeforeAnyNetworkAttempt
+note: 端点一半已对三个 REST 客户端全部接线并有单测：私有 REST 客户端的 7 个联网入口在解析前先过端点校验（P2-001，PR #156，PR #159 起经类型化的 EndpointPermit），白名单计数有上界；行情快照与 K 线两个公开客户端自 PR #161 起从调用方的 EnvironmentBinding 取主机与策略，每次请求先签发许可，被拒的主机在任何网络尝试之前返回 InvalidConfig。尺寸一半仍未接线——check_response_size 与 max_response_bytes 没有任何生产调用点，客户端用各自写死的 parser.body_limit。
 ```
 
 ```ledger
