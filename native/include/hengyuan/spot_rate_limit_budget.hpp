@@ -23,18 +23,24 @@
 // header parsing (X-MBX-USED-WEIGHT-*/X-MBX-ORDER-COUNT-*), multi-interval sets (this
 // file models exactly one interval per dimension -- Binance's real ORDERS limit has
 // BOTH a 10s and a 1-day window; only the 10s one is tracked here, a named residual
-// risk), EndpointWeightConfig operator-reload, bootstrap/FreezeProbeCredit/
-// TimeResyncCredit/Retry-After handling, and rate-limit awareness for query_order()/
-// fetch_account()/fetch_exchange_info() (those run on threads other than the one this
-// tracker is owned by -- see "THREAD OWNERSHIP" below).
+// risk), EndpointWeightConfig operator-reload, and bootstrap/FreezeProbeCredit/
+// TimeResyncCredit/Retry-After handling. (The private REST client's own calls -- clock
+// sync, account, exchangeInfo, order query, listenKey -- are counted on the
+// Reconciliation lane since SAFE-01 slice 4, through the RateLimitPermit below; with no
+// TimeResyncCredit lane yet, the clock sync shares that lane.)
 //
 // THREAD OWNERSHIP (load-bearing, not a convention comment, mirrors order_tracker.hpp's
 // own wording): SpotRateLimitTracker/PartitionedRateBudget carry NO internal
 // synchronization. In this batch they are owned EXCLUSIVELY by the hot/submit thread
 // (the same thread that already owns InFlightRegistry and calls orchestrate_submit())
-// -- no other thread may touch them. Binance enforces these limits account-and-IP-wide,
-// not per-subsystem, so the *correct* long-term answer once query_order()/
-// fetch_account() need rate-limit awareness too is a shared, cross-thread-reachable
+// -- no other thread may touch them. That includes the private REST client's calls once a
+// tracker is wired into it (BinancePrivateRestClient, SAFE-01 slice 4): the signed ones
+// are meant for the thread the credentials are bound to, which is this one (the signing
+// step refuses any other thread, but only after the reservation was made);
+// sync_clock() and fetch_exchange_info() are unsigned and not pinned at all. For all of
+// them it is a documented contract, not an enforced one. Binance enforces these limits account-and-IP-wide,
+// not per-subsystem, so the *correct* long-term answer once calls from other threads
+// need rate-limit awareness too is a shared, cross-thread-reachable
 // source of truth (this repo already has a precedent for that shape:
 // binance_clock_sync.hpp's ClockOffsetPublisher, mutex + by-value copy/swap) -- that is
 // a real, separate design fork for a future batch, not something this file attempts.
@@ -45,6 +51,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <type_traits>
 
 namespace hy {
@@ -107,6 +114,48 @@ enum class RateLimitLane : std::uint8_t {
                           // yet, so this lane has no real caller this batch either.
 };
 inline constexpr std::size_t kRateLimitLaneCount = 3;
+
+// Proof that a request was counted against the local rate-limit budget -- or that the layer that sends it is
+// deliberately not the one counting it (SAFE-01 slice 4; blueprint "类型化许可"). The private REST client's network
+// coroutines take one, so a request path that skipped the accounting does not compile.
+//   Reserved          issued by SpotRateLimitTracker::reserve_*(): the weight (and one raw request) was consumed
+//                     from `lane` before the permit existed;
+//   ReservedByCaller  POST /api/v3/order: the order orchestrator reserves weight, raw request and ORDERS under the
+//                     Strategy lane at Gate 12c BEFORE it calls the submit port, so the client must not count it
+//                     a second time;
+//   Unaccounted       a client built without a tracker: no local rate-limit awareness, this class's pre-H1
+//                     default, preserved for every caller that has not opted in.
+// The two named factories are the only ways to make a permit without the tracker; test_rest_freeze_guard pins each
+// of them to exactly one call site under include/ and src/, so a new request path cannot opt out unnoticed.
+class RateLimitPermit {
+public:
+    enum class Basis : std::uint8_t {
+        Reserved = 0,
+        ReservedByCaller = 1,
+        Unaccounted = 2,
+    };
+
+    Basis basis() const noexcept { return basis_; }
+    RateLimitLane lane() const noexcept { return lane_; }
+    std::uint32_t weight() const noexcept { return weight_; }
+
+    static RateLimitPermit reserved_by_caller() noexcept {
+        return RateLimitPermit(Basis::ReservedByCaller, RateLimitLane::Strategy, 0);
+    }
+    static RateLimitPermit unaccounted() noexcept {
+        return RateLimitPermit(Basis::Unaccounted, RateLimitLane::Reconciliation, 0);
+    }
+
+private:
+    friend class SpotRateLimitTracker;
+    constexpr RateLimitPermit(Basis basis, RateLimitLane lane, std::uint32_t weight) noexcept
+        : basis_(basis), lane_(lane), weight_(weight) {}
+
+    Basis basis_;
+    RateLimitLane lane_;
+    std::uint32_t weight_;
+};
+static_assert(std::is_trivially_copyable_v<RateLimitPermit>);
 
 struct RateLimitBudgetSplit {
     std::uint32_t strategy_pct{80};
@@ -308,6 +357,22 @@ public:
             return false;
         }
         return true;
+    }
+
+    // Typed variants of try_reserve_weight_only()/try_reserve_weight_only_explicit() above: the same reservation
+    // (nothing else is consumed, a refusal consumes nothing), and the proof of it -- the RateLimitPermit the private
+    // REST client's network coroutines require (SAFE-01 slice 4). nullopt = the lane's budget refused it.
+    std::optional<RateLimitPermit> reserve_weight_only(RateLimitLane lane, PrivateRestEndpoint ep,
+                                                       const EndpointWeightTable& table,
+                                                       TimePoint now = Clock::now()) noexcept {
+        if (!try_reserve_weight_only(lane, ep, table, now)) return std::nullopt;
+        return RateLimitPermit(RateLimitPermit::Basis::Reserved, lane, endpoint_weight(table, ep));
+    }
+
+    std::optional<RateLimitPermit> reserve_weight_only_explicit(RateLimitLane lane, std::uint32_t weight,
+                                                                TimePoint now = Clock::now()) noexcept {
+        if (!try_reserve_weight_only_explicit(lane, weight, now)) return std::nullopt;
+        return RateLimitPermit(RateLimitPermit::Basis::Reserved, lane, weight);
     }
 
 private:

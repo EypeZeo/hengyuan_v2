@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
+#include "test_helpers/server_time_body.hpp"
 #include <hengyuan/binance_submit_adapter.hpp>
 
 #include "binance_private_rest_test_hooks.hpp"
@@ -353,7 +354,7 @@ TEST_F(BoundCredentialsFixture, RealSubmitDispatchThroughCompositeAdapterSignsAn
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
         fixture_path("test_leaf_key_testnet_host.pem"), 200,
-        R"({"serverTime":1700000000000})");
+        hy::test_helpers::current_server_time_body());
 
     hy::test_helpers::TlsResponseAcceptor order_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),

@@ -11,6 +11,12 @@
 //      A new one, or a pinned one that gains or loses a connection, fails the test until a reviewer has
 //      looked at it and updated the table -- and the table says what kind of entry it has to be.
 //
+// Slice 4 adds the same two mechanisms for the local rate-limit budget (spot_rate_limit_budget.hpp): the
+// private client's three network coroutines also take a RateLimitPermit, so a request that nobody counted does
+// not compile either; and the only two ways to make that permit without the tracker -- "the order
+// orchestrator already counted this POST" and "this client has no tracker" -- have exactly one call site
+// each, pinned below.
+//
 // It also pins the containment of the test seam (rest_test_seam.hpp): the builder that can fill a
 // RestTestSeam is named only by that header's friend declaration, and nothing under include/ or src/ may
 // declare a connect-target override or an extra-trust-anchor member again.
@@ -267,6 +273,50 @@ TEST(RestFreezeGuard, TheRestClientsAreExactlyThePermitTakingOnes) {
     EXPECT_EQ(rest, (std::vector<std::string>{"include/hengyuan/binance_private_rest.hpp",
                                                "include/hengyuan/binance_rest_snapshot.hpp",
                                                "include/hengyuan/binance_klines_rest.hpp"}));
+}
+
+// --- slice 4: every request is counted against the budget, or says why it is not -------------------------
+
+TEST(RestFreezeGuardBudget, EveryPrivateRestCoroutineNamesItsBudgetPermit) {
+    // The compile-time pin lives in test_rest_config_surface.cpp; this is the textual cross-check, one budget
+    // permit per connection the private client opens.
+    const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(f, nullptr);
+    const Pinned* pinned = find_pinned(f->rel);
+    ASSERT_NE(pinned, nullptr);
+    EXPECT_GE(count_of(f->code, "RateLimitPermit budget"), pinned->resolves)
+        << f->rel << ": fewer budget-taking coroutines than connections";
+}
+
+TEST(RestFreezeGuardBudget, TheTwoWaysToSkipTheLocalBudgetEachHaveExactlyOneCallSite) {
+    // reserved_by_caller(): POST /api/v3/order, which the order orchestrator reserves under the Strategy lane
+    // at Gate 12c before it reaches the submit port. unaccounted(): a client built without a tracker. A third
+    // request path that reaches for either one is a request the budget never sees.
+    constexpr std::string_view kOwner = "include/hengyuan/binance_private_rest.hpp";
+    std::size_t unaccounted = 0;
+    std::size_t by_caller = 0;
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t u = count_of(f.code, "RateLimitPermit::unaccounted(");
+        const std::size_t b = count_of(f.code, "RateLimitPermit::reserved_by_caller(");
+        unaccounted += u;
+        by_caller += b;
+        if (f.rel != kOwner) {
+            EXPECT_EQ(u, 0u) << f.rel << " makes an unaccounted permit: only " << kOwner << " may";
+            EXPECT_EQ(b, 0u) << f.rel << " makes a reserved-by-caller permit: only " << kOwner << " may";
+        }
+    }
+    EXPECT_EQ(unaccounted, 1u) << "RateLimitPermit::unaccounted( must be called from exactly one place";
+    EXPECT_EQ(by_caller, 1u) << "RateLimitPermit::reserved_by_caller( must be called from exactly one place";
+}
+
+TEST(RestFreezeGuardBudget, TheNoTrackerPermitIsOnlyHandedOutByTheTwoReservationHelpers) {
+    // With a tracker configured, every request is reserved through reserve_budget()/reserve_budget_explicit().
+    // The no-tracker shortcut is reachable only from those two (plus its own definition); a method that calls
+    // it directly would skip the accounting even when a tracker is there.
+    const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(count_of(f->code, "no_tracker_permit("), 3u)
+        << "one definition and the two reservation helpers: a new caller needs a reviewer";
 }
 
 // --- the test seam stays a test seam -----------------------------------------------------------------

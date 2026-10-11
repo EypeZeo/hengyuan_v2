@@ -332,8 +332,9 @@ inline TransportCheck check_clock_skew(
     std::uint32_t recv_window_ms) noexcept {
 
     // AUDIT TIME-SKEW-025: `local_ms - server_ms` on two signed int64s overflows for
-    // far-apart operands, and server_ms is destined to come from an untrusted
-    // serverTime JSON field once the L4 REST client exists. Compute the magnitude in
+    // far-apart operands, and server_ms comes from an untrusted serverTime JSON field
+    // (BinancePrivateRestClient::sync_clock() passes it here before it publishes a
+    // clock offset). Compute the magnitude in
     // unsigned arithmetic, where the subtraction is defined by wraparound, and let
     // any difference beyond the window fall out as ClockSkewTooLarge -- which is the
     // fail-closed answer for a nonsense server time anyway.
