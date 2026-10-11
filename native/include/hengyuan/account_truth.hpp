@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <string_view>
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -37,38 +38,188 @@ static constexpr std::size_t kAssetNameLen = 12;
 // L4 spec §4.2: Binance's GET /api/v3/account response reports every asset's free/locked
 // balance as a decimal string at up to 8 fractional digits, regardless of that asset's own
 // native precision -- unlike price/qty, which are symbol-specific (SymbolRules::price_scale/
-// qty_scale below). AssetBalance::free_ticks/locked_ticks are always at this fixed scale;
-// binance_private_rest.hpp's account-fetch parser is the sole producer of AssetBalance values
-// and enforces this by construction (rejects, rather than truncates, an input with more than
-// 8 fractional digits). See also §5.1.1's rescale_notional_ceil(), which normalizes a
+// qty_scale below). AssetBalance::free_ticks()/locked_ticks() are always at this fixed scale;
+// binance_private_rest.hpp's account-fetch parser is the sole production caller of
+// AccountSnapshotBuilder (below, the only way to make an AssetBalance) and enforces this by
+// construction (rejects, rather than truncates, an input with more than 8 fractional digits). See also §5.1.1's rescale_notional_ceil(), which normalizes a
 // price*qty product to this same scale before comparing it against a balance.
 static constexpr int kBalanceScale = 8;
 
-struct AssetBalance {
-    char asset[kAssetNameLen]{};
-    std::int64_t free_ticks{0};
-    std::int64_t locked_ticks{0};
-
-    std::int64_t total() const noexcept { return free_ticks + locked_ticks; }
-
-    std::string_view asset_name() const noexcept {
-        return {asset, std::strlen(asset)};
-    }
+// Why the safe factory below refused an asset or a snapshot (audit P1-003 / SAFE-02). A refusal leaves the
+// builder and the output exactly as they were -- there is no half-built snapshot to use by accident.
+enum class AccountSnapshotError : std::uint8_t {
+    None = 0,
+    AssetNameEmpty = 1,
+    AssetNameTooLong = 2,      // longer than kAssetNameLen - 1: refused, never truncated into the fixed buffer
+    AssetNameInvalid = 3,      // a byte outside printable ASCII (NUL, space, control, non-ASCII)
+    DuplicateAsset = 4,        // find() returns the first match, so a second entry would hide a balance
+    NegativeBalance = 5,
+    BalanceOverflow = 6,       // free + locked does not fit std::int64_t
+    CapacityExceeded = 7,      // more than kMaxAssets assets
+    TimestampNotPositive = 8,  // 0 means "never fetched" and only a default-constructed snapshot has it
 };
 
-struct AccountSnapshot {
-    std::int64_t timestamp_ms{0};
-    std::size_t asset_count{0};
-    std::array<AssetBalance, kMaxAssets> assets{};
-    bool can_trade{false};
+inline const char* account_snapshot_error_name(AccountSnapshotError e) noexcept {
+    switch (e) {
+        case AccountSnapshotError::None: return "None";
+        case AccountSnapshotError::AssetNameEmpty: return "AssetNameEmpty";
+        case AccountSnapshotError::AssetNameTooLong: return "AssetNameTooLong";
+        case AccountSnapshotError::AssetNameInvalid: return "AssetNameInvalid";
+        case AccountSnapshotError::DuplicateAsset: return "DuplicateAsset";
+        case AccountSnapshotError::NegativeBalance: return "NegativeBalance";
+        case AccountSnapshotError::BalanceOverflow: return "BalanceOverflow";
+        case AccountSnapshotError::CapacityExceeded: return "CapacityExceeded";
+        case AccountSnapshotError::TimestampNotPositive: return "TimestampNotPositive";
+    }
+    return "Unknown";
+}
+
+class AccountSnapshotBuilder;
+
+// One asset's balance. Every field is private: the only way to fill one is AccountSnapshotBuilder::add_asset(),
+// which guarantees a non-empty printable-ASCII name of at most kAssetNameLen - 1 characters, non-negative
+// balances and a free + locked that fits std::int64_t. The accessors do not trust those guarantees blindly --
+// the name is read by its stored length (never strlen) and clamped to the buffer, and total() is checked.
+class AssetBalance {
+public:
+    AssetBalance() noexcept = default;
+
+    std::string_view asset_name() const noexcept {
+        const std::size_t n = name_len_ < kAssetNameLen ? name_len_ : kAssetNameLen - 1;
+        return {asset_, n};
+    }
+    std::int64_t free_ticks() const noexcept { return free_ticks_; }
+    std::int64_t locked_ticks() const noexcept { return locked_ticks_; }
+
+    // free + locked. False (out untouched) if either part is negative or the sum would overflow; the builder
+    // refuses such balances, so for a built value this always succeeds -- it reports instead of wrapping.
+    bool total(std::int64_t& out) const noexcept {
+        if (free_ticks_ < 0 || locked_ticks_ < 0) return false;
+        if (free_ticks_ > std::numeric_limits<std::int64_t>::max() - locked_ticks_) return false;
+        out = free_ticks_ + locked_ticks_;
+        return true;
+    }
+
+private:
+    friend class AccountSnapshotBuilder;
+    friend class AccountSnapshotTestHooks;  // defined only under native/tests/ (corrupts a value to test the clamps)
+
+    char asset_[kAssetNameLen]{};
+    std::uint8_t name_len_{0};
+    std::int64_t free_ticks_{0};
+    std::int64_t locked_ticks_{0};
+};
+
+// The account as last read from the exchange. A default-constructed snapshot is "never fetched" (timestamp 0,
+// cannot trade, no assets); every other one comes out of AccountSnapshotBuilder::build(), so asset_count() <=
+// kMaxAssets holds by construction and find() cannot walk past the array. Copying preserves the invariants.
+class AccountSnapshot {
+public:
+    AccountSnapshot() noexcept = default;
+
+    std::int64_t timestamp_ms() const noexcept { return timestamp_ms_; }
+    bool can_trade() const noexcept { return can_trade_; }
+
+    // Clamped to the capacity again here: a find() or a span built from a count that somehow exceeded the
+    // array would read out of bounds (the same-shape bug the audit named for find()).
+    std::size_t asset_count() const noexcept { return count_ < kMaxAssets ? count_ : kMaxAssets; }
+    std::span<const AssetBalance> assets() const noexcept { return {assets_.data(), asset_count()}; }
 
     const AssetBalance* find(std::string_view name) const noexcept {
-        for (std::size_t i = 0; i < asset_count; ++i) {
-            if (assets[i].asset_name() == name) return &assets[i];
+        const std::size_t n = asset_count();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (assets_[i].asset_name() == name) return &assets_[i];
         }
         return nullptr;
     }
+
+private:
+    friend class AccountSnapshotBuilder;
+    friend class AccountSnapshotTestHooks;  // defined only under native/tests/
+
+    std::int64_t timestamp_ms_{0};
+    std::size_t count_{0};
+    std::array<AssetBalance, kMaxAssets> assets_{};
+    bool can_trade_{false};
 };
+
+// The only way to make a non-empty AccountSnapshot (audit P1-003 / SAFE-02). Assets are validated one by one as
+// they are added; build() stamps the result. Every refusal is reported and changes nothing.
+class AccountSnapshotBuilder {
+public:
+    AccountSnapshotBuilder() noexcept = default;
+
+    // Starts from another snapshot's assets and can_trade flag, WITHOUT its timestamp: a snapshot that has to be
+    // re-stamped into another time base (the preflight harness's steady clock) goes through build() and its
+    // validation again; there is no setter on AccountSnapshot.
+    explicit AccountSnapshotBuilder(const AccountSnapshot& base) noexcept : staged_(base) {
+        staged_.count_ = base.asset_count();
+        staged_.timestamp_ms_ = 0;
+    }
+
+    void set_can_trade(bool can_trade) noexcept { staged_.can_trade_ = can_trade; }
+    std::size_t asset_count() const noexcept { return staged_.count_; }
+
+    [[nodiscard]] AccountSnapshotError add_asset(std::string_view name, std::int64_t free_ticks,
+                                                 std::int64_t locked_ticks = 0) noexcept {
+        if (name.empty()) return AccountSnapshotError::AssetNameEmpty;
+        // Truncating into the fixed buffer would credit the balance to a different, shorter asset name.
+        if (name.size() >= kAssetNameLen) return AccountSnapshotError::AssetNameTooLong;
+        for (const char c : name) {
+            const auto b = static_cast<unsigned char>(c);
+            if (b < 0x21 || b > 0x7E) return AccountSnapshotError::AssetNameInvalid;
+        }
+        if (free_ticks < 0 || locked_ticks < 0) return AccountSnapshotError::NegativeBalance;
+        if (free_ticks > std::numeric_limits<std::int64_t>::max() - locked_ticks) {
+            return AccountSnapshotError::BalanceOverflow;
+        }
+        for (std::size_t i = 0; i < staged_.count_; ++i) {
+            if (staged_.assets_[i].asset_name() == name) return AccountSnapshotError::DuplicateAsset;
+        }
+        if (staged_.count_ >= kMaxAssets) return AccountSnapshotError::CapacityExceeded;
+
+        AssetBalance& slot = staged_.assets_[staged_.count_];
+        std::memcpy(slot.asset_, name.data(), name.size());
+        slot.asset_[name.size()] = '\0';
+        slot.name_len_ = static_cast<std::uint8_t>(name.size());
+        slot.free_ticks_ = free_ticks;
+        slot.locked_ticks_ = locked_ticks;
+        ++staged_.count_;
+        return AccountSnapshotError::None;
+    }
+
+    // `out` is assigned only on success. `timestamp_ms` is the time the data was read, in the same time base the
+    // freshness check will later be given (check_freshness()); it must be positive.
+    [[nodiscard]] AccountSnapshotError build(std::int64_t timestamp_ms, AccountSnapshot& out) const noexcept {
+        if (timestamp_ms <= 0) return AccountSnapshotError::TimestampNotPositive;
+        AccountSnapshot built = staged_;
+        built.timestamp_ms_ = timestamp_ms;
+        out = built;
+        return AccountSnapshotError::None;
+    }
+
+private:
+    AccountSnapshot staged_{};
+};
+
+// A short asset list for callers that know their data up front (fixtures, drills, harnesses).
+struct AssetBalanceInput {
+    std::string_view name;
+    std::int64_t free_ticks{0};
+    std::int64_t locked_ticks{0};
+};
+
+[[nodiscard]] inline AccountSnapshotError make_account_snapshot(std::int64_t timestamp_ms, bool can_trade,
+                                                                std::span<const AssetBalanceInput> assets,
+                                                                AccountSnapshot& out) noexcept {
+    AccountSnapshotBuilder builder;
+    builder.set_can_trade(can_trade);
+    for (const AssetBalanceInput& a : assets) {
+        const AccountSnapshotError e = builder.add_asset(a.name, a.free_ticks, a.locked_ticks);
+        if (e != AccountSnapshotError::None) return e;
+    }
+    return builder.build(timestamp_ms, out);
+}
 
 // --- Freshness gate ---
 
@@ -76,16 +227,44 @@ enum class FreshnessStatus : std::uint8_t {
     Fresh = 0,
     Stale = 1,
     NeverFetched = 2,
+    FromTheFuture = 3,  // dated further ahead of the caller's clock than any clock error can explain
 };
+
+// How far AHEAD of the caller's clock a snapshot's timestamp may be before it is refused (audit P1-003: a
+// future-dated snapshot used to be judged fresh, for as long as the clock needed to catch up). Both stamps come
+// from exchange-calibrated clocks (binance_clock_sync.hpp), each within error_bound_ms (<= kMaxUsableRttMs / 2 +
+// kClockSlopMs = 1100 ms) of the exchange, so two honest readings can differ by up to 2200 ms; 2500 ms is that
+// plus a margin. A caller holding a live ClockOffsetSnapshot sets ExposureLimits::max_future_skew_ms from it
+// (about 2 * error_bound_ms); whatever it passes is clamped to [0, kMaxFutureSkewCapMs], so a misconfiguration
+// cannot reopen the hole.
+static constexpr std::int64_t kDefaultMaxFutureSkewMs = 2'500;
+static constexpr std::int64_t kMaxFutureSkewCapMs = 10'000;
 
 inline FreshnessStatus check_freshness(
     std::int64_t snapshot_ts_ms,
     std::int64_t now_ms,
-    std::int64_t max_age_ms) noexcept {
+    std::int64_t max_age_ms,
+    std::int64_t max_future_skew_ms = kDefaultMaxFutureSkewMs) noexcept {
 
     if (snapshot_ts_ms <= 0) return FreshnessStatus::NeverFetched;
-    if (now_ms - snapshot_ts_ms > max_age_ms) return FreshnessStatus::Stale;
-    return FreshnessStatus::Fresh;
+
+    if (now_ms >= snapshot_ts_ms) {
+        // snapshot_ts_ms >= 1 here, so now_ms - snapshot_ts_ms <= INT64_MAX - 1: no overflow.
+        if (now_ms - snapshot_ts_ms > max_age_ms) return FreshnessStatus::Stale;
+        return FreshnessStatus::Fresh;
+    }
+
+    // The snapshot is dated after the caller's clock. Within the (clamped) tolerance that is clock error; beyond
+    // it, it is not a fresh reading from anywhere, and "negative age" must not be read as "very fresh".
+    const std::int64_t skew = max_future_skew_ms < 0
+                                  ? 0
+                                  : (max_future_skew_ms > kMaxFutureSkewCapMs ? kMaxFutureSkewCapMs
+                                                                              : max_future_skew_ms);
+    // lead = snapshot_ts_ms - now_ms > 0 overflows only when now_ms is negative enough: certainly "from the future".
+    if (now_ms < 0 && snapshot_ts_ms > std::numeric_limits<std::int64_t>::max() + now_ms) {
+        return FreshnessStatus::FromTheFuture;
+    }
+    return (snapshot_ts_ms - now_ms) > skew ? FreshnessStatus::FromTheFuture : FreshnessStatus::Fresh;
 }
 
 // --- Symbol trading rules (from exchangeInfo) ---
@@ -226,6 +405,7 @@ enum class PreTradeCheck : std::uint8_t {
     AccountCannotTrade = 13,
     InvalidInput = 14,      // negative/zero price or qty
     NotionalOverflow = 15,  // price*qty or exposure sum would overflow int64 (fail-closed)
+    BalanceFromFuture = 16, // account snapshot dated further ahead of the clock than the skew bound allows
 };
 
 // Overflow-safe multiply for notional = price_ticks * qty_ticks.
@@ -471,6 +651,9 @@ struct ExposureLimits {
     std::int64_t total_exposure_notional_cap{0};
     std::int64_t current_exposure_notional{0};
     std::int64_t freshness_max_age_ms{30000};  // 30 seconds default
+    // How far ahead of now_ms the account snapshot's own timestamp may be (clamped to
+    // [0, kMaxFutureSkewCapMs]); set it from the live clock error bound when one is at hand.
+    std::int64_t max_future_skew_ms{kDefaultMaxFutureSkewMs};
 };
 
 // Side-aware pre-trade validation (ADR-019 D6 + D7).
@@ -492,10 +675,12 @@ inline PreTradeCheck validate_pre_trade(
     if (price_ticks <= 0 || qty_ticks <= 0) return PreTradeCheck::InvalidInput;
 
     // Account must be trade-enabled
-    if (!account.can_trade) return PreTradeCheck::AccountCannotTrade;
+    if (!account.can_trade()) return PreTradeCheck::AccountCannotTrade;
 
-    // Freshness check
-    auto freshness = check_freshness(account.timestamp_ms, now_ms, limits.freshness_max_age_ms);
+    // Freshness check (a snapshot dated in the future is its own verdict, not "very fresh")
+    const auto freshness = check_freshness(account.timestamp_ms(), now_ms, limits.freshness_max_age_ms,
+                                           limits.max_future_skew_ms);
+    if (freshness == FreshnessStatus::FromTheFuture) return PreTradeCheck::BalanceFromFuture;
     if (freshness != FreshnessStatus::Fresh) return PreTradeCheck::BalanceStale;
 
     // Symbol must be TRADING
@@ -582,7 +767,7 @@ inline PreTradeCheck validate_pre_trade(
     // in the spec text, but the identical class of bug against the same §4.2 invariant).
     if (side == OrderSide::Buy) {
         const auto* bal = account.find(quote_asset);
-        if (!bal || bal->free_ticks < notional) {
+        if (!bal || bal->free_ticks() < notional) {
             return PreTradeCheck::InsufficientBalance;
         }
     } else {  // Sell: must hold enough base asset to deliver
@@ -592,7 +777,7 @@ inline PreTradeCheck validate_pre_trade(
             return PreTradeCheck::NotionalOverflow;
         }
         const auto* bal = account.find(base_asset);
-        if (!bal || bal->free_ticks < qty_at_balance_scale) {
+        if (!bal || bal->free_ticks() < qty_at_balance_scale) {
             return PreTradeCheck::InsufficientBalance;
         }
     }

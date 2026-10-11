@@ -16,6 +16,8 @@
 // Boost-linked test file in this directory.
 
 #include <gtest/gtest.h>
+
+#include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/binance_submit_adapter.hpp>
 
 #include "binance_private_rest_test_hooks.hpp"
@@ -192,11 +194,7 @@ protected:
         rules_.price_scale = 0;
         rules_.qty_scale = 8;
 
-        std::strncpy(account_.assets[0].asset, "USDT", 5);
-        account_.assets[0].free_ticks = 999999;
-        account_.asset_count = 1;
-        account_.can_trade = true;
-        account_.timestamp_ms = 900;
+        account_ = hy::test_helpers::make_account(900, /*can_trade=*/true, {{"USDT", 999999, 0}});
 
         ctx_.audit = &audit_;
         ctx_.kill_switch = &kill_switch_;

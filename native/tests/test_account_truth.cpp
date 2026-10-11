@@ -5,6 +5,8 @@
 
 #include <cstring>
 
+#include "test_helpers/account_snapshot_fixtures.hpp"
+
 using hy::AccountSnapshot;
 using hy::AssetBalance;
 using hy::ExposureLimits;
@@ -14,22 +16,12 @@ using hy::SymbolRules;
 using hy::check_freshness;
 using hy::validate_pre_trade;
 
-static AssetBalance make_balance(const char* name, std::int64_t free, std::int64_t locked) {
-    AssetBalance b{};
-    std::strncpy(b.asset, name, sizeof(b.asset) - 1);
-    b.free_ticks = free;
-    b.locked_ticks = locked;
-    return b;
-}
-
-static AccountSnapshot make_account(std::int64_t ts_ms, bool can_trade) {
-    AccountSnapshot a{};
-    a.timestamp_ms = ts_ms;
-    a.can_trade = can_trade;
-    a.assets[0] = make_balance("USDT", 100000, 0);
-    a.assets[1] = make_balance("BTC", 5000, 500);
-    a.asset_count = 2;
-    return a;
+// USDT 100000 free and BTC 5000 free + 500 locked by default; the two free amounts are the knobs the
+// pre-trade tests turn. Built through AccountSnapshotBuilder (the fields are private).
+static AccountSnapshot make_account(std::int64_t ts_ms, bool can_trade, std::int64_t usdt_free = 100000,
+                                    std::int64_t btc_free = 5000) {
+    return hy::test_helpers::make_account(ts_ms, can_trade,
+                                          {{"USDT", usdt_free, 0}, {"BTC", btc_free, 500}});
 }
 
 static SymbolRules make_btcusdt_rules() {
@@ -88,7 +80,7 @@ TEST(AccountSnapshot, FindExistingAsset) {
     auto a = make_account(1000, true);
     auto* b = a.find("USDT");
     ASSERT_NE(b, nullptr);
-    EXPECT_EQ(b->free_ticks, 100000);
+    EXPECT_EQ(b->free_ticks(), 100000);
 }
 
 TEST(AccountSnapshot, FindMissingAssetReturnsNull) {
@@ -97,8 +89,12 @@ TEST(AccountSnapshot, FindMissingAssetReturnsNull) {
 }
 
 TEST(AccountSnapshot, TotalIsFreePlusLocked) {
-    auto b = make_balance("BTC", 5000, 500);
-    EXPECT_EQ(b.total(), 5500);
+    auto a = make_account(1000, true);
+    const AssetBalance* b = a.find("BTC");
+    ASSERT_NE(b, nullptr);
+    std::int64_t total = 0;
+    ASSERT_TRUE(b->total(total));
+    EXPECT_EQ(total, 5500);
 }
 
 // --- Pre-trade validation ---
@@ -129,7 +125,9 @@ TEST(PreTrade, BalanceStaleRejects) {
 
 TEST(PreTrade, BalanceNeverFetchedRejects) {
     auto rules = make_btcusdt_rules();
-    auto account = make_account(0, true);
+    auto account = make_account(1000, true);
+    // No factory output has a zero timestamp (build() refuses it); the check must still refuse one.
+    hy::AccountSnapshotTestHooks::set_raw_timestamp(account, 0);
     auto limits = make_limits();
     auto r = validate_pre_trade(rules, 1000, 10, account, "USDT", 1000, limits);
     EXPECT_EQ(r, PreTradeCheck::BalanceStale);
@@ -210,8 +208,7 @@ TEST(PreTrade, BelowMinNotional) {
 
 TEST(PreTrade, ExceedsSingleOrderCap) {
     auto rules = make_btcusdt_rules();
-    auto account = make_account(1000, true);
-    account.assets[0].free_ticks = 999999999;  // enough balance
+    auto account = make_account(1000, true, /*usdt_free=*/999999999);  // enough balance
     auto limits = make_limits();
     limits.single_order_notional_cap = 5000;
     auto r = validate_pre_trade(rules, 1000, 10, account, "USDT", 1010, limits);
@@ -221,8 +218,7 @@ TEST(PreTrade, ExceedsSingleOrderCap) {
 
 TEST(PreTrade, ExceedsTotalExposureCap) {
     auto rules = make_btcusdt_rules();
-    auto account = make_account(1000, true);
-    account.assets[0].free_ticks = 999999999;
+    auto account = make_account(1000, true, /*usdt_free=*/999999999);
     auto limits = make_limits();
     limits.total_exposure_notional_cap = 15000;
     limits.current_exposure_notional = 10000;
@@ -233,8 +229,7 @@ TEST(PreTrade, ExceedsTotalExposureCap) {
 
 TEST(PreTrade, InsufficientBalance) {
     auto rules = make_btcusdt_rules();
-    auto account = make_account(1000, true);
-    account.assets[0].free_ticks = 5000;  // only 5000 USDT free
+    auto account = make_account(1000, true, /*usdt_free=*/5000);  // only 5000 USDT free
     auto limits = make_limits();
     // notional = 1000 * 10 = 10000 > 5000 free
     auto r = validate_pre_trade(rules, 1000, 10, account, "USDT", 1010, limits);
@@ -550,8 +545,8 @@ TEST(PreTradeScaleMismatch, SellSideQtyIsRescaledBeforeComparingAgainstBaseBalan
     rules.step_size_ticks = 0;   // are deliberately small and wouldn't clear the fixture's
     rules.max_qty_ticks = 0;     // default min_qty_ticks=10/step_size_ticks=10
     rules.min_notional_ticks = 0;  // isolate the balance check from MIN_NOTIONAL
-    auto account = make_account(1000, true);
-    account.assets[1].free_ticks = 20'000'000;  // 0.2 BTC at kBalanceScale=8
+    auto account = make_account(1000, true, /*usdt_free=*/100000,
+                                /*btc_free=*/20'000'000);  // 0.2 BTC at kBalanceScale=8
     auto limits = make_limits();
     limits.single_order_notional_cap = 0;
     limits.total_exposure_notional_cap = 0;
@@ -588,8 +583,7 @@ TEST(PreTrade, SellChecksBaseBalancePasses) {
 
 TEST(PreTrade, SellInsufficientBaseBalance) {
     auto rules = make_btcusdt_rules();
-    auto account = make_account(1000, true);
-    account.assets[1].free_ticks = 5;  // BTC free only 5 < qty 10
+    auto account = make_account(1000, true, /*usdt_free=*/100000, /*btc_free=*/5);  // BTC free only 5 < qty 10
     auto limits = make_limits();
     auto r = validate_pre_trade(rules, hy::OrderSide::Sell, 1000, 10, account,
                                 "BTC", "USDT", 1010, limits);
@@ -598,8 +592,7 @@ TEST(PreTrade, SellInsufficientBaseBalance) {
 
 TEST(PreTrade, SellIgnoresQuoteBalance) {
     auto rules = make_btcusdt_rules();
-    auto account = make_account(1000, true);
-    account.assets[0].free_ticks = 0;  // no USDT at all — irrelevant for a sell
+    auto account = make_account(1000, true, /*usdt_free=*/0);  // no USDT at all — irrelevant for a sell
     auto limits = make_limits();
     auto r = validate_pre_trade(rules, hy::OrderSide::Sell, 1000, 10, account,
                                 "BTC", "USDT", 1010, limits);

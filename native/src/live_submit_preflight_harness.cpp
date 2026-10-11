@@ -588,8 +588,17 @@ int main(int argc, char* argv[]) {
             try {
                 AccountSnapshot fetched{};
                 if (client.fetch_account(fetched) == PrivateRestError::None) {
-                    fetched.timestamp_ms = now_ms;
-                    account = fetched;
+                    // fetch_account() stamps the snapshot in the exchange-calibrated epoch time base; this
+                    // loop's ctx.now_ms is steady-clock-since-start, so the same assets are re-stamped into
+                    // THIS time base through the builder (it refuses a non-positive stamp: at t=0 the
+                    // previous snapshot stays, which is the fail-closed outcome).
+                    AccountSnapshotBuilder rebuilt(fetched);
+                    AccountSnapshot restamped{};
+                    if (rebuilt.build(now_ms, restamped) == AccountSnapshotError::None) {
+                        account = restamped;
+                    } else {
+                        std::fprintf(stderr, "WARN: account snapshot could not be re-stamped, keeping the previous one\n");
+                    }
                 } else {
                     std::fprintf(stderr, "WARN: fetch_account() failed, keeping stale snapshot\n");
                 }

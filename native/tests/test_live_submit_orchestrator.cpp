@@ -1,6 +1,8 @@
 // P2-EXEC-LIVE-01 D12-9: live submit orchestrator integration tests.
 // All gates tested with mock submit port. No real network. No real money.
 #include <gtest/gtest.h>
+
+#include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
 
 #include <array>
@@ -126,11 +128,7 @@ protected:
         rules_.price_scale = 0;
         rules_.qty_scale = 8;
 
-        std::strncpy(account_.assets[0].asset, "USDT", 5);
-        account_.assets[0].free_ticks = 999999;
-        account_.asset_count = 1;
-        account_.can_trade = true;
-        account_.timestamp_ms = 900;
+        account_ = hy::test_helpers::make_account(900, /*can_trade=*/true, {{"USDT", 999999, 0}});
 
         ctx_.audit = &audit_;
         ctx_.kill_switch = &kill_switch_;
@@ -312,9 +310,8 @@ TEST_F(LiveSubmitTest, ExchangeStatusFilledFoldsIntoPositionTruth) {
 TEST_F(LiveSubmitTest, SellSideFillFoldsAsNegativePosition) {
     PositionTruth truth;
     ctx_.position_truth = &truth;
-    std::strncpy(account_.assets[1].asset, "BTC", 4);
-    account_.assets[1].free_ticks = 999999;  // enough base to deliver
-    account_.asset_count = 2;
+    account_ = hy::test_helpers::make_account(900, /*can_trade=*/true,
+                                              {{"USDT", 999999, 0}, {"BTC", 999999, 0}});  // enough base to deliver
     ctx_.side = OrderSide::Sell;
     bind_confirmation();  // re-bind: side is part of the confirmation binding
 
@@ -496,7 +493,7 @@ TEST_F(LiveSubmitTest, SnapshotCapturedFromSymbolRulesAtCallTime) {
 // --- Gate 6+7: Pre-trade validation ---
 
 TEST_F(LiveSubmitTest, PreTradeInsufficientBalance) {
-    account_.assets[0].free_ticks = 1;
+    account_ = hy::test_helpers::make_account(900, /*can_trade=*/true, {{"USDT", 1, 0}});
     auto r = orchestrate_submit(ctx_);
     EXPECT_EQ(r.gate, OrchestratorGate::PreTradeFailed);
     EXPECT_EQ(r.pre_trade_detail, PreTradeCheck::InsufficientBalance);
@@ -682,9 +679,8 @@ TEST_F(LiveSubmitTest, ConfirmationZeroCeilingBlocks) {
 // --- F1: sell-side end-to-end ---
 
 TEST_F(LiveSubmitTest, SellSideHappyPath) {
-    std::strncpy(account_.assets[1].asset, "BTC", 4);
-    account_.assets[1].free_ticks = 999999;  // enough base to deliver
-    account_.asset_count = 2;
+    account_ = hy::test_helpers::make_account(900, /*can_trade=*/true,
+                                              {{"USDT", 999999, 0}, {"BTC", 999999, 0}});  // enough base to deliver
     ctx_.side = OrderSide::Sell;
     bind_confirmation();  // re-bind confirmation to side=Sell
     auto r = orchestrate_submit(ctx_);

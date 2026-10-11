@@ -337,11 +337,11 @@ struct DrillRig {
         rules.min_notional_ticks = 1000;
 
         // price 1000 * qty 10 at native scale 2+2 = 10000, rescaled to 8 decimals = 1e8; 10x headroom.
-        std::strncpy(account.assets[0].asset, "USDT", 5);
-        account.assets[0].free_ticks = 1'000'000'000;
-        account.asset_count = 1;
-        account.can_trade = true;
-        account.timestamp_ms = now_ms;
+        // The data is constant and now_ms positive, so the factory cannot refuse it; if it ever did, the
+        // account stays "never fetched" and every drill reports a failed balance gate instead of running
+        // on made-up data.
+        const AssetBalanceInput usdt[] = {{"USDT", 1'000'000'000, 0}};
+        static_cast<void>(make_account_snapshot(now_ms, /*can_trade=*/true, usdt, account));
 
         seed_scaffold(now_ms);
         port.answer = SubmitOutcome::Accepted;

@@ -197,12 +197,18 @@ inline bool parse_server_time_response(std::string_view body,
 
 // §4.1-§4.3: schema validation + lossless conversion + capacity, collapsed to the single
 // §4.4 outcome contract -- `out` is left completely UNCHANGED on any failure path (this
-// function builds into a local AccountSnapshot and only assigns to `out` once, at the very
-// end, on total success). `timestamp_ms` is NOT set here -- the caller (fetch_account())
-// stamps it with the same server-calibrated fresh_ts_ms already computed for this request's
-// signature, so the snapshot's timestamp and its own HTTP request's timestamp are the same
-// value, not two independent clock reads.
-inline PrivateRestError parse_account_response(std::string_view body, AccountSnapshot& out) {
+// function builds through an AccountSnapshotBuilder -- the only way to make an AssetBalance,
+// which also refuses empty/overlong/unprintable/duplicate names and negative or overflowing
+// balances -- and only assigns to `out` once, at the very end, on total success).
+// `timestamp_ms` is the server-calibrated time the request was signed with: fetch_account()
+// passes the same fresh_ts_ms already computed for this request's signature, so the
+// snapshot's timestamp and its own HTTP request's timestamp are the same value, not two
+// independent clock reads. A non-positive timestamp is refused as ClockNotFresh before
+// anything is parsed (0 is the "never fetched" value, only a default snapshot has it).
+inline PrivateRestError parse_account_response(std::string_view body, std::int64_t timestamp_ms,
+                                                AccountSnapshot& out) {
+    if (timestamp_ms <= 0) return PrivateRestError::ClockNotFresh;
+
     auto padded = simdjson::padded_string(body);
     simdjson::ondemand::parser parser;
     simdjson::ondemand::document doc;
@@ -218,8 +224,8 @@ inline PrivateRestError parse_account_response(std::string_view body, AccountSna
         return PrivateRestError::MalformedResponse;
     }
 
-    AccountSnapshot built{};
-    built.can_trade = can_trade;
+    AccountSnapshotBuilder builder;
+    builder.set_can_trade(can_trade);
 
     for (auto entry_result : balances) {
         simdjson::ondemand::object entry;
@@ -252,27 +258,21 @@ inline PrivateRestError parse_account_response(std::string_view body, AccountSna
         // happens to use.
         if (free_ticks == 0 && locked_ticks == 0) continue;
 
-        // Truncating an oversized asset symbol into AssetBalance::asset's fixed buffer would
-        // misattribute this balance to an ambiguous/wrong asset -- reject, don't truncate,
-        // same philosophy as every other check in this function.
-        if (asset_sv.empty() || asset_sv.size() >= kAssetNameLen) {
-            return PrivateRestError::MalformedResponse;
-        }
-
-        // §4.3: more nonzero-balance assets than kMaxAssets -> reject the whole fetch, never
-        // silently truncate to the first kMaxAssets entries.
-        if (built.asset_count >= kMaxAssets) {
-            return PrivateRestError::CapacityExceeded;
-        }
-
-        AssetBalance& slot = built.assets[built.asset_count];
-        std::memcpy(slot.asset, asset_sv.data(), asset_sv.size());
-        slot.asset[asset_sv.size()] = '\0';
-        slot.free_ticks = free_ticks;
-        slot.locked_ticks = locked_ticks;
-        ++built.asset_count;
+        // The builder refuses an empty, overlong (it never truncates into the fixed buffer: that
+        // would misattribute this balance to an ambiguous/wrong asset), unprintable or duplicate
+        // name and a negative or overflowing balance -- all of them MalformedResponse, same
+        // philosophy as every other check in this function. §4.3: more nonzero-balance assets than
+        // kMaxAssets -> reject the whole fetch (CapacityExceeded), never silently truncate to the
+        // first kMaxAssets entries.
+        const AccountSnapshotError add_err = builder.add_asset(asset_sv, free_ticks, locked_ticks);
+        if (add_err == AccountSnapshotError::CapacityExceeded) return PrivateRestError::CapacityExceeded;
+        if (add_err != AccountSnapshotError::None) return PrivateRestError::MalformedResponse;
     }
 
+    AccountSnapshot built{};
+    if (builder.build(timestamp_ms, built) != AccountSnapshotError::None) {
+        return PrivateRestError::ClockNotFresh;  // unreachable past the check above; a refusal is never ignored
+    }
     out = built;
     return PrivateRestError::None;
 }
@@ -1280,9 +1280,8 @@ public:
 
         AccountSnapshot parsed{};
         const PrivateRestError perr =
-            parse_account_response(std::get<std::string>(outcome), parsed);
+            parse_account_response(std::get<std::string>(outcome), fresh_ts_ms, parsed);
         if (perr != PrivateRestError::None) return perr;
-        parsed.timestamp_ms = fresh_ts_ms;
         out = parsed;
         return PrivateRestError::None;
     }
