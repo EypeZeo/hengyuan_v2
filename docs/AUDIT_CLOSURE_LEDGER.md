@@ -159,7 +159,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-012** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-013** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-014** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-015** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | a0a7eed |
+| **FI-015** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 8de0dad |
 | **FI-016** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-017** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-018** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
@@ -181,7 +181,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-035** | PRE_OWNER_LIVE | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-036** | PRE_D3 | L0 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-037** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 21154dc |
+| **FI-037** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 8de0dad |
 | **FI-038** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-039** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-040** | PRE_D3 | L1 | IMPLEMENTED | PASS | PASS | a0a7eed |
@@ -193,11 +193,11 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 28 | 3 | 17 | 8 | BLOCKED |
+| PRE_D3 | 28 | 4 | 16 | 8 | BLOCKED |
 | PRE_OWNER_LIVE | 13 | 0 | 1 | 12 | BLOCKED |
 | CANARY | 4 | 0 | 0 | 4 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 24，PARTIAL 18，IMPLEMENTED 3，合计 45，其中门禁 PASS 3 条。
+故障用例计数：NOT_TESTABLE_YET 24，PARTIAL 17，IMPLEMENTED 4，合计 45，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -971,10 +971,10 @@ level: L1
 status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: a0a7eed
+baseline: 8de0dad
 open: absent:native/include/hengyuan/live_submit_orchestrator.hpp#is_snapshot_fresh
-refs: test:native/tests/test_binance_clock_sync.cpp#DriftBeyondToleranceIsNotFresh test:native/tests/test_binance_clock_sync.cpp#StaleSnapshotFails test:native/tests/test_binance_private_rest.cpp#ARefusedOffsetLeavesEverySignedCallFailingClosedWithoutANetworkAttempt test:native/tests/test_binance_private_rest.cpp#SyncClockRefusesAnOffsetBeyondTheRecvWindowAndPublishesNothing code:native/include/hengyuan/binance_private_rest.hpp#sync_clock
-note: PR #165 之后偏移幅度校验已接线，被拒的偏移不发布，其后 fetch_account、query_order、submit_order 全部失败关闭且一个请求都不发（全链单测）；仍缺两样：编排器自己没有时钟就绪门（submit_order 在时钟过期时返回 NetworkError，由编排器按既有的不明确路径处理，而不是在持久边界之前就拒绝），以及“时钟告警”这个证据产物；类型化的时钟令牌是 SAFE-01 里缺的那一块。
+refs: test:native/tests/test_binance_clock_sync.cpp#DriftBeyondToleranceIsNotFresh test:native/tests/test_binance_clock_sync.cpp#StaleSnapshotFails test:native/tests/test_binance_private_rest.cpp#ARefusedOffsetLeavesEverySignedCallFailingClosedWithoutANetworkAttempt test:native/tests/test_binance_private_rest.cpp#SyncClockRefusesAnOffsetBeyondTheRecvWindowAndPublishesNothing code:native/include/hengyuan/binance_private_rest.hpp#sync_clock test:native/tests/test_binance_clock_sync.cpp#AFreshSnapshotIssuesTheTimestampTheRawFunctionComputes code:native/include/hengyuan/binance_clock_sync.hpp#issue_clock_ready_token
+note: PR #167 之后签名时间戳只能来自时钟就绪令牌（ClockReadyToken，私有构造函数，唯一的签发者是 issue_clock_ready_token，快照从未发布、过期、挂钟漂移或溢出都不签发，build_signed_query 不再接受整数），偏移幅度校验与全链失败关闭沿用 PR #165；仍缺两样：编排器自己没有时钟就绪门（submit_order 在时钟过期时返回 NetworkError，由编排器按既有的不明确路径处理，而不是在持久边界之前就拒绝；任务 1A.1 的时钟状态机与 OrchestratorGate 的新取值要先做规格取舍），以及“时钟告警”这个证据产物。
 ```
 
 ```ledger
@@ -1305,13 +1305,12 @@ gate_tag: PRE_D3
 scope: 全部
 stage: 0
 level: L0
-status: PARTIAL
-result: NOT_RUN
-gate_result: BLOCKED
-baseline: 21154dc
-open: absent:native/src/*.cpp#check_response_size absent:native/include/hengyuan/binance_private_rest.hpp#check_response_size
-refs: test:native/tests/test_transport_policy.cpp#EndpointCheckRejectsInvalidHost test:native/tests/test_transport_policy.cpp#RejectsEndpointCountAboveCapacity test:native/tests/test_binance_private_rest.cpp#BlockedEndpointFixture test:native/tests/test_binance_rest_snapshot.cpp#AHostOutsideTheBindingsAllowlistIsRefusedBeforeAnyNetworkAttempt test:native/tests/test_binance_klines_rest.cpp#AHostOutsideTheBindingsAllowlistIsRefusedBeforeAnyNetworkAttempt
-note: 端点一半已对三个 REST 客户端全部接线并有单测：私有 REST 客户端的 7 个联网入口在解析前先过端点校验（P2-001，PR #156，PR #159 起经类型化的 EndpointPermit），白名单计数有上界；行情快照与 K 线两个公开客户端自 PR #161 起从调用方的 EnvironmentBinding 取主机与策略，每次请求先签发许可，被拒的主机在任何网络尝试之前返回 InvalidConfig。尺寸一半仍未接线——check_response_size 与 max_response_bytes 没有任何生产调用点，客户端用各自写死的 parser.body_limit。
+status: IMPLEMENTED
+result: PASS
+gate_result: PASS
+baseline: 8de0dad
+refs: test:native/tests/test_transport_policy.cpp#EachKindGetsItsOwnCapUnderTheDefaultPolicy test:native/tests/test_transport_policy.cpp#ThePolicyCeilingClampsEveryKindAndNeverRaisesOne test:native/tests/test_binance_private_rest.cpp#TheServerTimeAnswerIsReadUpToItsCapAndNotOneByteMore test:native/tests/test_binance_private_rest.cpp#ASignedAnswerIsReadUpToItsCapAndNotOneByteMore test:native/tests/test_binance_private_rest.cpp#TheExchangeInfoAnswerIsReadUpToOneMiBAndNotOneByteMore test:native/tests/test_binance_private_rest.cpp#AZeroPolicyCeilingRefusesEveryNetworkMethodBeforeAnyNetworkAttempt test:native/tests/test_binance_rest_snapshot.cpp#TheAnswerIsReadUpToOneMiBAndNotOneByteMore test:native/tests/test_binance_klines_rest.cpp#ThePolicyCeilingBoundsTheReadBelowTheCapOfTheKind test:native/tests/test_rest_freeze_guard.cpp#EveryParserLimitInTheRestClientsComesOutOfThePermit test:native/tests/test_binance_rest_snapshot.cpp#AHostOutsideTheBindingsAllowlistIsRefusedBeforeAnyNetworkAttempt code:native/include/hengyuan/transport_policy.hpp#issue_endpoint_permit code:native/include/hengyuan/transport_policy.hpp#response_cap_bytes run:"38250100406@8de0dad5/ci-native.yml[native-build-test]"
+note: PR #167 之后两半都已接线并有单测：端点一半（P2-001，PR #156、#159、#161）之外，响应尺寸一半由 EndpointPermit 携带——issue_endpoint_permit(policy, host, kind) 取“种类上限”与“策略的 max_response_bytes”中较小者（白名单不通过、未知种类、零上限都不签发），三个 REST 客户端在读到第一个字节之前把它交给解析器的 header_limit() 与 body_limit()，不再有任何写死的字面量（5 处全部取自许可，冻结护栏钉死）；每个种类“恰好上限能读完、多一个字节在读取阶段被拒”，策略上限低于种类上限时夹住读取，零上限在联网前被拒。check_response_size 仍然没有生产调用点（读取侧由解析器的限额强制，该函数留作可单测的纯判断）；exchangeInfo 的读取上限由 4 MiB 收紧到 1 MiB（过滤后的调用不到 300 KiB）。判定信号是单元测试失败，24 个变异体全部被预期用例杀死，主干 CI Native 的全量构建与测试已成功。
 ```
 
 ```ledger
