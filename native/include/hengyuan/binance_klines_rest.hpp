@@ -187,8 +187,8 @@ inline net::awaitable<PublicRestResponse> fetch_public_body_coro(EndpointPermit 
         beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
-        parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
-        parser.body_limit(static_cast<std::uint64_t>(1 * 1024 * 1024));
+        parser.header_limit(permit.max_header_bytes());
+        parser.body_limit(permit.max_body_bytes());
         co_await http::async_read(stream, buffer, parser, net::use_awaitable);
         auto res = parser.release();
 
@@ -215,7 +215,7 @@ inline PublicRestResponse fetch_public_body(const EnvironmentBinding& binding, c
                                             const PublicRestConfig& cfg, const RestTestSeam& seam = {}) {
     // The permit proves allowlist membership, not that a corrupt allowlist did not list something that is no
     // hostname, so the host's syntax is checked as well.
-    const auto permit = issue_endpoint_permit(binding.transport_policy(), binding.base_host());
+    const auto permit = issue_endpoint_permit(binding.transport_policy(), binding.base_host(), ResponseKind::Klines);
     if (!permit || !detail::is_valid_rest_host(permit->host()) || cfg.port.empty() ||
         !detail::is_valid_public_rest_target(target)) {
         return detail::public_rest_failure(PublicRestError::InvalidConfig);

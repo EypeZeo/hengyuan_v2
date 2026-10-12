@@ -52,6 +52,7 @@ namespace hy {
 // into them itself, so incomplete types are sufficient here.
 class CanonicalUnsignedQuery;
 class SignedQuery;
+class ClockReadyToken;  // binance_clock_sync.hpp
 
 enum class QuerySigningError : std::uint8_t {
     Ok = 0,
@@ -338,7 +339,7 @@ private:
     // below matches build_signed_query's real declaration exactly once
     // that header is visible.
     friend std::pair<QuerySigningError, SignedQuery> build_signed_query(
-        BoundHmacCredentials&, const CanonicalUnsignedQuery&, std::int64_t) noexcept;
+        BoundHmacCredentials&, const CanonicalUnsignedQuery&, ClockReadyToken) noexcept;
 };
 
 }  // namespace hy

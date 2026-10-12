@@ -11,7 +11,8 @@
 //   ✅ Connect + read timeout (seconds, never infinite)
 //   ✅ Rate limit awareness (local request weight counter)
 //   ✅ Clock skew detection (timestamp + recvWindow bound)
-//   ✅ Response size limit + schema validation hooks
+//   ✅ Response size limit (per-ResponseKind caps, clamped by max_response_bytes, carried by EndpointPermit)
+//      + schema validation hooks
 //   ✅ Error message sanitization (no raw Binance error in logs)
 
 #pragma once
@@ -122,32 +123,89 @@ inline TransportCheck check_endpoint(const TransportPolicy& p,
     return TransportCheck::Ok;
 }
 
-// Proof that `host` passed check_endpoint() against a policy. The only way to obtain one is
-// issue_endpoint_permit() below. The network coroutines of every REST client (BinancePrivateRestClient,
-// the depth-snapshot fetcher and the klines fetcher) take one by value and connect to permit.host() -- no
-// separate host argument -- so a request path that skipped the allowlist cannot be written without the
-// compiler noticing, and a permit for one host cannot be spent on another (SAFE-01 freeze guard; audit
-// P2-001, P1-001). tests/test_rest_freeze_guard.cpp pins every place that opens a connection.
+// What a request expects back. Every kind has its own hard cap on the response, and the network coroutines
+// hand it to the HTTP parser BEFORE the first byte is read, so an oversized answer is refused while it streams
+// in instead of after it has been buffered (L4 spec §8). The environment's TransportPolicy::max_response_bytes
+// is the ceiling above all of them: the limit a request gets is the smaller of the two. (SAFE-01 slice 5, audit
+// FI-037: these used to be literals scattered over the REST clients, and the policy ceiling had no caller.)
+enum class ResponseKind : std::uint8_t {
+    ServerTime = 0,     // GET /api/v3/time -- {"serverTime":N}
+    SignedJson = 1,     // signed account / order / user-data-stream answers
+    ExchangeInfo = 2,   // GET /api/v3/exchangeInfo for a symbol filter (fewer than kMaxSymbols symbols)
+    Klines = 3,         // GET /api/v3/klines, one page
+    DepthSnapshot = 4,  // GET /api/v3/depth
+};
+
+// Body cap per kind, in bytes. 0 = not a kind this build knows (no permit is ever issued for it).
+//   ServerTime     the answer is 27 bytes; 64 KiB is slack, not an expected size.
+//   SignedJson     the account answer lists every asset the account has ever held (a few hundred entries,
+//                  tens of KiB); order and listenKey answers are a few hundred bytes.
+//   ExchangeInfo   a filtered call (the only supported production shape, see fetch_exchange_info()) names a
+//                  handful of symbols at about 3 KiB each, and kMaxSymbols bounds the rest; the unfiltered
+//                  answer (several MiB) is not a production shape and is refused here by design.
+//   Klines         up to 1000 bars of about 120 bytes per page.
+//   DepthSnapshot  up to 1000 levels per side at about 40 bytes.
+[[nodiscard]] inline constexpr std::size_t response_cap_bytes(ResponseKind kind) noexcept {
+    switch (kind) {
+        case ResponseKind::ServerTime: return 64 * 1024;
+        case ResponseKind::SignedJson: return 256 * 1024;
+        case ResponseKind::ExchangeInfo: return 1024 * 1024;
+        case ResponseKind::Klines: return 1024 * 1024;
+        case ResponseKind::DepthSnapshot: return 1024 * 1024;
+    }
+    return 0;
+}
+
+// The header section of every answer is a handful of short, well-known fields; anything far beyond that is
+// itself a signal something is wrong (L4 spec §8).
+inline constexpr std::uint32_t kResponseHeaderCapBytes = 8 * 1024;
+
+// The defaults are coherent: no kind asks for more than the default policy ceiling, so a default policy never
+// silently clamps one.
+static_assert(response_cap_bytes(ResponseKind::ServerTime) <= TransportPolicy{}.max_response_bytes);
+static_assert(response_cap_bytes(ResponseKind::SignedJson) <= TransportPolicy{}.max_response_bytes);
+static_assert(response_cap_bytes(ResponseKind::ExchangeInfo) <= TransportPolicy{}.max_response_bytes);
+static_assert(response_cap_bytes(ResponseKind::Klines) <= TransportPolicy{}.max_response_bytes);
+static_assert(response_cap_bytes(ResponseKind::DepthSnapshot) <= TransportPolicy{}.max_response_bytes);
+
+// Proof that `host` passed check_endpoint() against a policy, and of the most the answer may be allowed to
+// carry. The only way to obtain one is issue_endpoint_permit() below. The network coroutines of every REST
+// client (BinancePrivateRestClient, the depth-snapshot fetcher and the klines fetcher) take one by value and
+// connect to permit.host() -- no separate host argument -- and read at most permit.max_header_bytes() /
+// permit.max_body_bytes() -- no literal limits -- so a request path that skipped the allowlist or the size
+// bound cannot be written without the compiler noticing, and a permit for one host cannot be spent on another
+// (SAFE-01 freeze guard; audit P2-001, P1-001, FI-037). tests/test_rest_freeze_guard.cpp pins every place that
+// opens a connection and every place that configures a parser limit.
 //
 // `host` is a view: it must outlive every copy of the permit. The one production issuer
 // (BinancePrivateRestClient) passes EnvironmentBinding::base_host(), a view of a string literal.
 class EndpointPermit {
 public:
     [[nodiscard]] std::string_view host() const noexcept { return host_; }
+    // Handed to the HTTP parser's header_limit()/body_limit() before the first byte is read.
+    [[nodiscard]] std::uint32_t max_header_bytes() const noexcept { return max_header_bytes_; }
+    [[nodiscard]] std::uint64_t max_body_bytes() const noexcept { return max_body_bytes_; }
 
 private:
-    explicit EndpointPermit(std::string_view host) noexcept : host_(host) {}
-    friend std::optional<EndpointPermit> issue_endpoint_permit(const TransportPolicy&,
-                                                               std::string_view) noexcept;
+    EndpointPermit(std::string_view host, std::uint32_t max_header_bytes, std::uint64_t max_body_bytes) noexcept
+        : host_(host), max_header_bytes_(max_header_bytes), max_body_bytes_(max_body_bytes) {}
+    friend std::optional<EndpointPermit> issue_endpoint_permit(const TransportPolicy&, std::string_view,
+                                                               ResponseKind) noexcept;
 
     std::string_view host_;
+    std::uint32_t max_header_bytes_;
+    std::uint64_t max_body_bytes_;
 };
 
-// Fails closed: nullopt for a host that is not on the allowlist and for a corrupt allowlist.
+// Fails closed: nullopt for a host that is not on the allowlist, for a corrupt allowlist, for a kind this build
+// does not know, and for a policy whose response ceiling is zero (it would let nothing through).
 [[nodiscard]] inline std::optional<EndpointPermit> issue_endpoint_permit(
-    const TransportPolicy& p, std::string_view host) noexcept {
+    const TransportPolicy& p, std::string_view host, ResponseKind kind) noexcept {
     if (check_endpoint(p, host) != TransportCheck::Ok) return std::nullopt;
-    return EndpointPermit(host);
+    const std::size_t kind_cap = response_cap_bytes(kind);
+    const std::size_t cap = kind_cap < p.max_response_bytes ? kind_cap : p.max_response_bytes;
+    if (cap == 0) return std::nullopt;
+    return EndpointPermit(host, kResponseHeaderCapBytes, static_cast<std::uint64_t>(cap));
 }
 
 // Validate HTTP status code: reject redirects (3xx).

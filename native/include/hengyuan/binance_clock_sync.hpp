@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <optional>
 
 namespace hy {
 
@@ -205,17 +206,53 @@ inline bool compute_clock_offset(std::int64_t local_send_ms,
     return true;
 }
 
-// Sole call site (in scope for this round) for §2.2's "must be fresh to
-// sign" rule. Does not cache the return value: spec §2.2's own text
+// §2.2's "must be fresh to sign" rule. Does not cache the return value: spec §2.2's own text
 // requires the timestamp to be generated as the last step before signing,
 // never cached earlier — callers call this once per signature, use the
-// value immediately, and discard it.
+// value immediately, and discard it. Production code does not call this
+// directly any more: it goes through issue_clock_ready_token() below, the one
+// caller, so the timestamp reaches build_signed_query() only inside a token.
 inline bool try_get_signing_timestamp_ms(const ClockOffsetPublisher& pub,
                                           ClockPairSample now,
                                           std::int64_t& out) noexcept {
     ClockOffsetSnapshot s = pub.load();
     if (!is_snapshot_fresh(s, now)) return false;
     return server_now_ms_for_signing(s, now.system_ms(), out);
+}
+
+// Proof that a signature timestamp came out of a FRESH clock-offset snapshot (SAFE-01 slice 5; the blueprint's
+// "类型化许可": signed requests hold a clock-ready token issued by the clock gate, bypass is prevented by the type
+// and not by convention). build_signed_query() (binance_query_signing.hpp) takes one in place of the raw
+// std::int64_t it used to accept, so a signed request cannot be assembled from a stale, made-up or cached
+// timestamp without the compiler noticing. The only issuer is issue_clock_ready_token() below; the tests mint
+// fixed timestamps for signature vectors and range checks through ClockReadyTokenTestHooks, a class that is
+// defined only under native/tests/ (tests/test_rest_freeze_guard.cpp pins that production code never names it
+// anywhere but in the friend declaration below).
+//
+// Use it immediately and let it go: it is a value, not a lease, and nothing re-checks it once built. The
+// timestamp is generated as the last step before signing, never cached earlier (§2.2).
+class ClockReadyToken {
+public:
+    // The exchange-corrected wall clock to sign with, in milliseconds since the epoch.
+    [[nodiscard]] std::int64_t server_ms() const noexcept { return server_ms_; }
+
+private:
+    explicit ClockReadyToken(std::int64_t server_ms) noexcept : server_ms_(server_ms) {}
+    friend std::optional<ClockReadyToken> issue_clock_ready_token(const ClockOffsetPublisher&,
+                                                                  ClockPairSample) noexcept;
+    friend class ClockReadyTokenTestHooks;  // unconditional; literal-identical across every TU.
+
+    std::int64_t server_ms_;
+};
+
+// Fails closed: nullopt for a clock that was never published, whose snapshot is older than the TTL, whose wall
+// clock has jumped away from the steady one, or whose arithmetic would overflow -- exactly the cases
+// try_get_signing_timestamp_ms() refuses.
+[[nodiscard]] inline std::optional<ClockReadyToken> issue_clock_ready_token(const ClockOffsetPublisher& pub,
+                                                                            ClockPairSample now) noexcept {
+    std::int64_t ts = 0;
+    if (!try_get_signing_timestamp_ms(pub, now, ts)) return std::nullopt;
+    return ClockReadyToken(ts);
 }
 
 // The exchange-corrected wall clock for a decision that must never run AHEAD of the exchange -- "has this
