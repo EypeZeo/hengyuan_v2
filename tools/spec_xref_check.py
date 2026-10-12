@@ -125,6 +125,11 @@ SEARCH_FILES = [
     # MigratedV2Started (V+M companion write path)"): MigratedV2StartedPublisher and
     # its status enum are new load-bearing symbols, same gap as above.
     REPO_ROOT / "native" / "include" / "hengyuan" / "migrated_v2_started_publisher.hpp",
+    # SAFE-03 slice 1 (docs/SPEC_INVARIANTS.md "SAFE-03 切片 1 已落地"): DurableOrderAuditPort moved out of
+    # live_submit_orchestrator.hpp into this header so that order_tracker.hpp can name it, taking its registered
+    # members (AppendFn/FencedFn) with it -- the same "a symbol can only drift unnoticed in a file nobody looks
+    # at" gap every entry above closes.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "durable_order_audit_port.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

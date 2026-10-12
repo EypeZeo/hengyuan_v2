@@ -344,6 +344,10 @@ int main(int argc, char* argv[]) {
                                 &fill_context);
         poll_once(tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms,
                   reconcile_wall_now_ms());
+        // Memory-only on purpose (no ReconcileDurablePublisher): SubmitPort is assembled here but never
+        // invoked and there is no DurableAuditSink, so the ring is always empty. A demo that submits must
+        // pass a publisher -- test_reconcile_durable_guard pins these call sites so that cannot happen
+        // silently.
         drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth,
                                 &fill_context);
         ws_supervisor.poll(now_ms);

@@ -6,12 +6,16 @@
 #include <gtest/gtest.h>
 #include <hengyuan/order_tracker.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string_view>
+#include <type_traits>
+#include <vector>
 
 using namespace hy;
 
@@ -1219,4 +1223,467 @@ TEST_F(OrderTrackerTest, FullOutboundRingKeepsOrderTrackedForRetry) {
 
     EXPECT_EQ(tracker_.count(), 1u)
         << "publish failed (ring full) -- the resolution must not be lost, order stays tracked";
+}
+
+// --- poll_once: ReconcileEvent::prior_state (SAFE-03 slice 1) ---
+//
+// The durable publisher decides from prior_state whether a resolution needs an Ambiguous frame in front of it
+// (see ReconcileDurablePublisher), so the reconcile loop must report the state it STARTED the poll from --
+// not the one it ended in, and not a default.
+
+TEST(ReconcileEventPriorState, ADefaultEventSaysNothingAboutItsPriorState) {
+    const ReconcileEvent ev{};
+    EXPECT_EQ(ev.prior_state, OrderState::Intent) << "Intent = not provided";
+}
+
+TEST_F(OrderTrackerTest, EventsCarryTheStateThePollStartedFrom) {
+    struct Case {
+        const char* name;
+        OrderRecord record;
+        OrderState found;
+        OrderState expected_prior;
+    };
+    const Case cases[] = {
+        {"Ambiguous -> Filled", make_ambiguous_record("HY-A", 100), OrderState::Filled, OrderState::Ambiguous},
+        {"Ambiguous -> Cancelled", make_ambiguous_record("HY-A", 100), OrderState::Cancelled, OrderState::Ambiguous},
+        {"Ambiguous -> Accepted", make_ambiguous_record("HY-A", 100), OrderState::Accepted, OrderState::Ambiguous},
+        {"Accepted -> Filled", make_live_record("HY-A", OrderState::Accepted), OrderState::Filled,
+         OrderState::Accepted},
+        {"Accepted -> PartialFill", make_live_record("HY-A", OrderState::Accepted), OrderState::PartialFill,
+         OrderState::Accepted},
+        {"PartialFill -> Cancelled", make_live_record("HY-A", OrderState::PartialFill), OrderState::Cancelled,
+         OrderState::PartialFill},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.name);
+        OrderTracker tracker;
+        ToReconcileRing inbound;
+        ReconcileEventRing outbound;
+        ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, c.record, 0));
+        const std::int64_t filled = c.found == OrderState::Filled ? c.record.intended_qty_ticks
+                                    : c.found == OrderState::PartialFill ? 40 : 0;
+        g_mock_query_result = QueryResult{QueryOutcome::Found, c.found, 555, filled, filled > 0 ? 5000 : 0};
+
+        poll_once(tracker, inbound, outbound, query_port_, policy_, 1000);
+
+        ReconcileEvent ev{};
+        ASSERT_TRUE(outbound.try_pop(ev));
+        EXPECT_EQ(ev.resulting_state, c.found);
+        EXPECT_EQ(ev.prior_state, c.expected_prior);
+    }
+}
+
+TEST_F(OrderTrackerTest, AnEscalationEventSaysItsOrderWasAmbiguous) {
+    auto rec = make_ambiguous_record("HY-ESC");
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 5}, rec, 0));
+
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.quarantine.hard_cap_ms);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    ASSERT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
+    EXPECT_EQ(ev.prior_state, OrderState::Ambiguous);
+}
+
+// ================================================================================================
+// SAFE-03 slice 1 (audit P1-002): drain_reconcile_events() publishes durable-first
+//
+//   authoritative remote state -> durable ACK -> audit ring / PositionTruth -> in-flight slot release
+//
+// The fake sink records, INSIDE each append call, what memory looked like -- the ordering is the thing
+// under test, so it has to be observed at the moment of the ACK, not inferred from the end state.
+// ================================================================================================
+
+namespace {
+
+struct DurableProbe {
+    std::vector<int> fail_calls;  // 1-based numbers of the append calls that answer Failed
+    bool fail_all{false};
+    int calls{0};
+    std::vector<AuditRecord> frames;  // the acknowledged frames, in order
+    struct Seen {
+        bool slot_held;
+        std::size_t audit_count;
+        std::int64_t net_qty;
+    };
+    std::vector<Seen> seen;  // memory as seen from inside each append call (acknowledged or not)
+    const InFlightRegistry* in_flight{nullptr};
+    const AuditRingSink* audit{nullptr};
+    const PositionTruth* truth{nullptr};
+};
+
+AuditAppendResult probe_append(void* user_data, const AuditRecord& rec, std::int64_t) noexcept {
+    auto* p = static_cast<DurableProbe*>(user_data);
+    ++p->calls;
+    p->seen.push_back(DurableProbe::Seen{p->in_flight->is_in_flight(rec.client_order_id), p->audit->count(),
+                                         p->truth->net_qty_ticks(rec.symbol_id)});
+    AuditAppendResult r{};  // Failed by default
+    const bool fail = p->fail_all || std::find(p->fail_calls.begin(), p->fail_calls.end(), p->calls) !=
+                                         p->fail_calls.end();
+    if (fail) return r;
+    p->frames.push_back(rec);
+    r.status = AuditAppendResult::Status::Acked;
+    r.sequence = static_cast<std::uint64_t>(p->frames.size());
+    return r;
+}
+
+class DrainDurableTest : public ::testing::Test {
+protected:
+    InFlightRegistry in_flight_;
+    AuditRingSink audit_;
+    ReconcileEventRing events_{};
+    PositionTruth truth_;
+    OrderFillContext fill_context_;
+    DurableProbe probe_;
+    ReconcileDurablePublisher publisher_;
+
+    void SetUp() override {
+        probe_.in_flight = &in_flight_;
+        probe_.audit = &audit_;
+        probe_.truth = &truth_;
+        EXPECT_TRUE(publisher_.set_port(DurableOrderAuditPort{&probe_append, nullptr, &probe_}));
+    }
+
+    // Registers `coid` as in flight (and in the fill table) exactly as orchestrate_submit() does.
+    InFlightHandle admit(const char* coid, std::uint32_t symbol_id = 3, OrderSide side = OrderSide::Buy) {
+        const InFlightHandle h = in_flight_.register_submit_handle(coid);
+        EXPECT_TRUE(h.valid());
+        EXPECT_TRUE(fill_context_.track(coid, symbol_id, side, 0, 0, 0));
+        return h;
+    }
+
+    void push(const char* coid, InFlightHandle h, OrderState result, OrderState prior, std::int64_t filled = 0,
+              std::uint32_t symbol_id = 3, OrderSide side = OrderSide::Buy, std::int64_t exchange_order_id = 555,
+              std::int64_t avg_price = 0) {
+        ReconcileEvent ev{};
+        ev.handle = h;
+        std::snprintf(ev.coid.id, sizeof(ev.coid.id), "%s", coid);
+        ev.resulting_state = result;
+        ev.prior_state = prior;
+        ev.symbol_id = symbol_id;
+        ev.side = side;
+        ev.exchange_order_id = exchange_order_id;
+        ev.filled_qty_ticks = filled;
+        ev.fill_delta_qty_ticks = filled;
+        ev.avg_fill_price_ticks = avg_price;
+        EXPECT_TRUE(events_.try_push(ev));
+    }
+
+    void drain(std::int64_t now_ms = 2000) {
+        drain_reconcile_events(in_flight_, &audit_, events_, now_ms, &truth_, &fill_context_, &publisher_);
+    }
+};
+
+}  // namespace
+
+TEST_F(DrainDurableTest, TheDurableAckComesBeforeEveryMemoryEffect) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, /*filled=*/100);
+
+    drain();
+
+    ASSERT_EQ(probe_.seen.size(), 1u);
+    EXPECT_TRUE(probe_.seen[0].slot_held) << "the slot must still be held when the sink is asked";
+    EXPECT_EQ(probe_.seen[0].audit_count, 0u) << "the audit ring must not know the resolution yet";
+    EXPECT_EQ(probe_.seen[0].net_qty, 0) << "PositionTruth must not have moved yet";
+    // ...and once the ACK is in, all of it happens.
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(audit_.count(), 1u);
+    EXPECT_EQ(truth_.net_qty_ticks(3), 100);
+    EXPECT_EQ(fill_context_.find("HY-A"), nullptr);
+    EXPECT_FALSE(publisher_.blocked());
+    EXPECT_EQ(publisher_.acked_frames(), 1u);
+    EXPECT_EQ(publisher_.failed_appends(), 0u);
+}
+
+TEST_F(DrainDurableTest, AnUnacknowledgedAppendPublishesNothingAndTheNextDrainRetriesTheSameResolution) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, /*filled=*/100);
+    probe_.fail_calls = {1};
+
+    drain();
+
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A")) << "no durable record -> the slot stays held";
+    EXPECT_EQ(truth_.net_qty_ticks(3), 0) << "no durable record -> PositionTruth does not move";
+    EXPECT_EQ(audit_.count(), 0u) << "no durable record -> nothing in the audit ring either";
+    EXPECT_NE(fill_context_.find("HY-A"), nullptr) << "the fill baseline lives as long as the slot";
+    EXPECT_TRUE(publisher_.blocked());
+    EXPECT_EQ(publisher_.failed_appends(), 1u);
+    EXPECT_EQ(publisher_.acked_frames(), 0u);
+    EXPECT_EQ(publisher_.pending().coid.view(), std::string_view("HY-A"));
+    ReconcileEvent leftover{};
+    EXPECT_FALSE(events_.try_pop(leftover)) << "it moved into the publisher: neither lost nor still queued";
+
+    drain();  // the sink answers this time
+
+    EXPECT_FALSE(publisher_.blocked());
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(audit_.count(), 1u) << "published exactly once";
+    EXPECT_EQ(truth_.net_qty_ticks(3), 100)
+        << "applied exactly once: the failed attempt must not have consumed the fill delta";
+    EXPECT_EQ(probe_.frames.size(), 1u);
+    EXPECT_EQ(publisher_.acked_frames(), 1u);
+    EXPECT_EQ(publisher_.failed_appends(), 1u);
+    EXPECT_EQ(fill_context_.find("HY-A"), nullptr);
+}
+
+TEST_F(DrainDurableTest, AResolutionThatStaysUnacknowledgedKeepsBeingRetriedAndNeverPublishesAlone) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, 100);
+    probe_.fail_all = true;
+
+    for (int i = 0; i < 5; ++i) drain();
+
+    EXPECT_EQ(probe_.calls, 5) << "every drain asks the sink again";
+    EXPECT_EQ(publisher_.failed_appends(), 5u);
+    EXPECT_TRUE(publisher_.blocked());
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(audit_.count(), 0u);
+    EXPECT_EQ(truth_.net_qty_ticks(3), 0);
+}
+
+TEST_F(DrainDurableTest, ResolutionsKeepTheOrderTheyWereDiscoveredInAcrossAFailure) {
+    const InFlightHandle ha = admit("HY-A");
+    const InFlightHandle hb = admit("HY-B");
+    push("HY-A", ha, OrderState::Filled, OrderState::Accepted, 100);
+    push("HY-B", hb, OrderState::Cancelled, OrderState::Accepted);
+    probe_.fail_calls = {1};
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 1) << "the sink is not asked about B while A is unacknowledged";
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-B")) << "B waits in the ring behind A, untouched";
+    EXPECT_EQ(audit_.count(), 0u);
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u);
+    EXPECT_STREQ(probe_.frames[0].client_order_id, "HY-A");
+    EXPECT_STREQ(probe_.frames[1].client_order_id, "HY-B");
+    ASSERT_EQ(audit_.count(), 2u);
+    EXPECT_STREQ(audit_.at(0)->client_order_id, "HY-A");
+    EXPECT_STREQ(audit_.at(1)->client_order_id, "HY-B");
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-B"));
+}
+
+TEST_F(DrainDurableTest, LiveAndEscalatedResolutionsAreMadeDurableToo) {
+    struct Case {
+        const char* coid;
+        OrderState state;
+        AuditEventType event;
+        std::int64_t filled;
+        std::size_t frames;  // new durable frames: an escalation of an Ambiguous order brings its Ambiguous re-record
+    };
+    const Case cases[] = {
+        {"HY-ACC", OrderState::Accepted, AuditEventType::OrderReconciled, 0, 1},
+        {"HY-PART", OrderState::PartialFill, AuditEventType::OrderReconciled, 40, 1},
+        {"HY-ESC", OrderState::EscalatedToOperator, AuditEventType::OrderEscalated, 0, 2},
+    };
+    std::size_t expected_frames = 0;
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.coid);
+        const InFlightHandle h = admit(c.coid);
+        push(c.coid, h, c.state, OrderState::Ambiguous, c.filled);
+
+        drain();
+
+        expected_frames += c.frames;
+        ASSERT_EQ(probe_.frames.size(), expected_frames);
+        EXPECT_EQ(probe_.frames.back().resulting_state, c.state);
+        EXPECT_EQ(probe_.frames.back().event_type, c.event);
+        EXPECT_EQ(probe_.frames.back().filled_qty_ticks, c.filled);
+        EXPECT_TRUE(in_flight_.is_in_flight(c.coid)) << "not exchange-final: the slot is still held";
+    }
+    EXPECT_EQ(truth_.net_qty_ticks(3), 40) << "the partial fill reached PositionTruth, after its ACK";
+}
+
+TEST_F(DrainDurableTest, TheDurableFrameAndTheAuditRingRecordCarryTheSameResolution) {
+    const InFlightHandle h = admit("HY-A", /*symbol_id=*/9, OrderSide::Sell);
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, /*filled=*/100, /*symbol_id=*/9, OrderSide::Sell,
+         /*exchange_order_id=*/777, /*avg_price=*/5000);
+
+    drain(/*now_ms=*/4242);
+
+    ASSERT_EQ(probe_.frames.size(), 1u);
+    ASSERT_EQ(audit_.count(), 1u);
+    const AuditRecord& durable = probe_.frames[0];
+    const AuditRecord& ring = *audit_.at(0);
+    EXPECT_EQ(durable.event_type, AuditEventType::OrderReconciled);
+    EXPECT_EQ(durable.resulting_state, OrderState::Filled);
+    EXPECT_EQ(durable.filled_qty_ticks, 100);
+    EXPECT_EQ(durable.avg_fill_price_ticks, 5000);
+    EXPECT_EQ(durable.exchange_order_id, 777);
+    EXPECT_EQ(durable.symbol_id, 9u);
+    EXPECT_EQ(durable.side, OrderSide::Sell);
+    EXPECT_EQ(durable.timestamp_ms, 4242);
+    EXPECT_STREQ(durable.client_order_id, "HY-A");
+    EXPECT_EQ(ring.event_type, durable.event_type);
+    EXPECT_EQ(ring.resulting_state, durable.resulting_state);
+    EXPECT_EQ(ring.filled_qty_ticks, durable.filled_qty_ticks);
+    EXPECT_EQ(ring.avg_fill_price_ticks, durable.avg_fill_price_ticks);
+    EXPECT_EQ(ring.exchange_order_id, durable.exchange_order_id);
+    EXPECT_EQ(ring.symbol_id, durable.symbol_id);
+    EXPECT_EQ(ring.side, durable.side);
+    EXPECT_EQ(ring.timestamp_ms, durable.timestamp_ms);
+    EXPECT_STREQ(ring.client_order_id, durable.client_order_id);
+}
+
+TEST_F(DrainDurableTest, AnAmbiguousOrderResolvedToAStateSubmittingCannotReachGetsAnAmbiguousFrameFirst) {
+    // After a restart the log may still say Submitting for an order the reconcile loop already knows as Ambiguous
+    // (the recovery scan remaps it to an Ambiguous checkpoint in memory only). From Submitting, Cancelled / Expired / CancelRequested /
+    // EscalatedToOperator are illegal transitions -- a frame saying so would make the next recovery scan Corrupt.
+    int n = 0;
+    for (OrderState result : {OrderState::Cancelled, OrderState::Expired, OrderState::CancelRequested,
+                              OrderState::EscalatedToOperator}) {
+        SCOPED_TRACE(order_state_name(result));
+        char coid[32];
+        std::snprintf(coid, sizeof(coid), "HY-%d", n++);
+        const std::size_t frames_before = probe_.frames.size();
+        const std::size_t audit_before = audit_.count();
+        const InFlightHandle h = admit(coid);
+        push(coid, h, result, OrderState::Ambiguous);
+
+        drain();
+
+        ASSERT_EQ(probe_.frames.size(), frames_before + 2);
+        const AuditRecord& remap = probe_.frames[frames_before];
+        const AuditRecord& resolution = probe_.frames[frames_before + 1];
+        EXPECT_EQ(remap.event_type, AuditEventType::OrderAmbiguous);
+        EXPECT_EQ(remap.resulting_state, OrderState::Ambiguous);
+        EXPECT_EQ(remap.filled_qty_ticks, 0);
+        EXPECT_EQ(remap.exchange_order_id, 0);
+        EXPECT_STREQ(remap.client_order_id, coid);
+        EXPECT_EQ(resolution.resulting_state, result);
+        EXPECT_STREQ(resolution.client_order_id, coid);
+        EXPECT_EQ(audit_.count(), audit_before + 1) << "the in-memory ring gets the resolution, not the remap";
+    }
+}
+
+TEST_F(DrainDurableTest, ARetryAfterTheRemapFrameWasAcknowledgedDoesNotWriteItASecondTime) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous);
+    probe_.fail_calls = {2};  // call 1 = the remap frame (acknowledged), call 2 = the resolution (not)
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 1u);
+    EXPECT_EQ(probe_.frames[0].event_type, AuditEventType::OrderAmbiguous);
+    EXPECT_TRUE(publisher_.blocked());
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(audit_.count(), 0u);
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u) << "remap once, resolution once";
+    EXPECT_EQ(probe_.frames[0].event_type, AuditEventType::OrderAmbiguous);
+    EXPECT_EQ(probe_.frames[1].event_type, AuditEventType::OrderReconciled);
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
+    EXPECT_EQ(publisher_.acked_frames(), 2u);
+    EXPECT_EQ(publisher_.failed_appends(), 1u);
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+}
+
+TEST_F(DrainDurableTest, NoAmbiguousFrameWhereTheResolutionIsLegalFromSubmittingOrTheOrderWasLive) {
+    // An Ambiguous frame in front of a LIVE order's resolution would itself be illegal (Accepted -> Ambiguous),
+    // and in front of a resolution Submitting can reach it is simply noise.
+    struct Case {
+        OrderState prior;
+        OrderState result;
+    };
+    const Case cases[] = {
+        {OrderState::Ambiguous, OrderState::Accepted},    {OrderState::Ambiguous, OrderState::PartialFill},
+        {OrderState::Ambiguous, OrderState::Filled},      {OrderState::Ambiguous, OrderState::Rejected},
+        {OrderState::Accepted, OrderState::PartialFill},  {OrderState::Accepted, OrderState::Filled},
+        {OrderState::Accepted, OrderState::Cancelled},    {OrderState::Accepted, OrderState::Expired},
+        {OrderState::Accepted, OrderState::CancelRequested},
+        {OrderState::PartialFill, OrderState::Filled},    {OrderState::PartialFill, OrderState::Cancelled},
+        {OrderState::PartialFill, OrderState::Expired},   {OrderState::PartialFill, OrderState::CancelRequested},
+        {OrderState::Intent, OrderState::Cancelled},  // "prior not provided"
+    };
+    int n = 0;
+    for (const Case& c : cases) {
+        SCOPED_TRACE(std::string(order_state_name(c.prior)) + " -> " + order_state_name(c.result));
+        char coid[32];
+        std::snprintf(coid, sizeof(coid), "HY-%d", n++);
+        const std::size_t before = probe_.frames.size();
+        const InFlightHandle h = admit(coid);
+        push(coid, h, c.result, c.prior);
+
+        drain();
+
+        ASSERT_EQ(probe_.frames.size(), before + 1) << "exactly one frame";
+        EXPECT_EQ(probe_.frames.back().resulting_state, c.result);
+        EXPECT_NE(probe_.frames.back().event_type, AuditEventType::OrderAmbiguous);
+    }
+}
+
+TEST_F(DrainDurableTest, AnUnwiredPortNeverAcknowledgesAndPublishesNothing) {
+    ReconcileDurablePublisher unwired;  // default: no port injected
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, 100);
+
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, &truth_, &fill_context_, &unwired);
+
+    EXPECT_TRUE(unwired.blocked());
+    EXPECT_EQ(unwired.failed_appends(), 1u);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(audit_.count(), 0u);
+    EXPECT_EQ(truth_.net_qty_ticks(3), 0);
+}
+
+TEST_F(DrainDurableTest, ADrainWithNothingQueuedAsksTheSinkNothing) {
+    drain();
+    drain();
+    EXPECT_EQ(probe_.calls, 0);
+    EXPECT_FALSE(publisher_.blocked());
+    EXPECT_EQ(publisher_.acked_frames(), 0u);
+    EXPECT_EQ(publisher_.failed_appends(), 0u);
+}
+
+TEST(ReconcileDurablePublisherSurface, TheOnePendingResolutionHasOneOwner) {
+    EXPECT_FALSE(std::is_copy_constructible_v<ReconcileDurablePublisher>);
+    EXPECT_FALSE(std::is_copy_assignable_v<ReconcileDurablePublisher>);
+    EXPECT_FALSE(std::is_move_constructible_v<ReconcileDurablePublisher>);
+    EXPECT_FALSE(std::is_move_assignable_v<ReconcileDurablePublisher>);
+}
+
+TEST_F(DrainDurableTest, AnIdlePublisherCanBePointedAtAnotherPortButABlockedOneCannot) {
+    DurableProbe other;
+    other.in_flight = &in_flight_;
+    other.audit = &audit_;
+    other.truth = &truth_;
+    const DurableOrderAuditPort other_port{&probe_append, nullptr, &other};
+
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, 100);
+    probe_.fail_calls = {1};
+    drain();  // pops the resolution; the first port does not acknowledge it
+    ASSERT_TRUE(publisher_.blocked());
+
+    EXPECT_FALSE(publisher_.set_port(other_port)) << "a pending resolution stays with the port it started on";
+    drain();  // ...and goes through that port, not the other one
+    EXPECT_EQ(probe_.frames.size(), 1u);
+    EXPECT_EQ(other.calls, 0);
+
+    EXPECT_TRUE(publisher_.set_port(other_port)) << "idle again: it may be rebound";
+    const InFlightHandle h2 = admit("HY-B");
+    push("HY-B", h2, OrderState::Filled, OrderState::Accepted, 100);
+    drain();
+    EXPECT_EQ(other.frames.size(), 1u);
+    EXPECT_EQ(probe_.frames.size(), 1u);
+}
+
+TEST_F(DrainDurableTest, WithoutAPublisherTheDrainStillPublishesToMemoryOnly) {
+    // The documented legacy shape (the two sink-less demos, tests of the memory half): no durable record.
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, 100);
+
+    drain_reconcile_events(in_flight_, &audit_, events_, 2000, &truth_, &fill_context_);
+
+    EXPECT_EQ(probe_.calls, 0);
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(audit_.count(), 1u);
+    EXPECT_EQ(truth_.net_qty_ticks(3), 100);
 }

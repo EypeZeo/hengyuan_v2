@@ -139,6 +139,9 @@ int main(int argc, char* argv[]) {
         // batch's own addition to that same loop.
         poll_once(tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms,
                   reconcile_wall_now_ms());
+        // Memory-only on purpose (no ReconcileDurablePublisher): this demo has no DurableAuditSink and
+        // submits nothing, so the ring is always empty. The day it gets a real submit path it must pass a
+        // publisher here -- test_reconcile_durable_guard pins these call sites so that cannot happen silently.
         drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth,
                                 &fill_context);
         drain_user_data_events(in_flight, &audit, user_data_events, now_ms, &position_truth,
@@ -172,7 +175,7 @@ int main(int argc, char* argv[]) {
     ws_supervisor.shutdown();
     if (io_thread.joinable()) io_thread.join();
 
-    // Final drain, safe now that io_thread has been joined.
+    // Final drain, safe now that io_thread has been joined (memory-only, same reason as the loop above).
     poll_once(tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms,
               reconcile_wall_now_ms());
     drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth,

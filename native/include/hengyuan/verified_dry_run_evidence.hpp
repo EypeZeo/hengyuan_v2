@@ -302,6 +302,9 @@ struct DrillRig {
     OrderTracker tracker;
     ToReconcileRing to_reconcile;
     ReconcileEventRing reconcile_events;
+    // The ambiguity drill's reconcile resolution is made durable on the SAME scratch log as the submit that
+    // produced it, before it reaches the audit ring or releases the slot (SAFE-03 slice 1).
+    ReconcileDurablePublisher reconcile_durable;
     std::string scratch_path;
     std::unique_ptr<KeyRing> key_ring;
     std::unique_ptr<DurableAuditSink> durable_sink;
@@ -356,6 +359,7 @@ struct DrillRig {
         ctx.rate_limiter = &rate_limiter;
         ctx.in_flight = &in_flight;
         ctx.durable_audit = make_durable_order_audit_port(*durable_sink);
+        static_cast<void>(reconcile_durable.set_port(ctx.durable_audit));  // fresh, so never refused
         ctx.symbol_rules = &rules;
         ctx.account = &account;
         ctx.side = OrderSide::Buy;
@@ -375,6 +379,7 @@ struct DrillRig {
         ctx.submit_port = SubmitPort{&drill_submit, &port, &drill_rules_version};
         ctx.to_reconcile = &to_reconcile;
         ctx.reconcile_events = &reconcile_events;
+        ctx.reconcile_durable = &reconcile_durable;
     }
 
     ~DrillRig() {
@@ -493,7 +498,8 @@ inline DrillObservation observe_submit_ambiguous(DrillRig& rig, const DrillMocks
     // The real reconcile loop, with a scripted query.
     const ReconcilePollPolicy policy{};
     poll_once(rig.tracker, rig.to_reconcile, rig.reconcile_events, rig.query_port, policy, rig.ctx.now_ms + 1);
-    drain_reconcile_events(rig.in_flight, &rig.audit, rig.reconcile_events, rig.ctx.now_ms + 2);
+    drain_reconcile_events(rig.in_flight, &rig.audit, rig.reconcile_events, rig.ctx.now_ms + 2, nullptr, nullptr,
+                           &rig.reconcile_durable);
 
     o.query_calls = rig.query.calls;
     o.query_carries_order = query_carries_the_order(rig.query.last, r.order, rig);
