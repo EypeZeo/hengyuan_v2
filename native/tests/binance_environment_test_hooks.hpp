@@ -41,6 +41,15 @@ public:
         return out;
     }
 
+    // A copy of `b` whose transport policy lets at most `bytes` of response through -- the ceiling above every
+    // request kind's own cap (SAFE-01 slice 5). The factories only know the default ceiling; this is the one
+    // way to show that the ceiling, and not just a client's own number, bounds what the parser reads.
+    static EnvironmentBinding with_max_response_bytes(const EnvironmentBinding& b, std::size_t bytes) noexcept {
+        EnvironmentBinding out = b;
+        out.transport_policy_.max_response_bytes = bytes;
+        return out;
+    }
+
     // A copy of `b` bound to `host` instead, whose allowlist is exactly that host. The two factories only know
     // the two real exchange hosts; the public fetchers' tests need a binding for a loopback fixture
     // ("127.0.0.1"), for the name on a fixture certificate ("wrong-san.test.invalid") and for hosts that are no

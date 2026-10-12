@@ -222,8 +222,8 @@ inline net::awaitable<std::variant<DepthSnapshot, FetchError>> fetch_depth_snaps
         beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(10));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
-        parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
-        parser.body_limit(static_cast<std::uint64_t>(1 * 1024 * 1024));
+        parser.header_limit(permit.max_header_bytes());
+        parser.body_limit(permit.max_body_bytes());
         co_await http::async_read(stream, buffer, parser, net::use_awaitable);
         auto res = parser.release();
 
@@ -258,7 +258,8 @@ inline std::optional<DepthSnapshot> fetch_depth_snapshot(
     // The bound environment's transport policy decides which host may be resolved and connected to at all
     // (SAFE-01); a refusal is a configuration error. The host's syntax is checked as well: the permit proves
     // allowlist membership, not that a corrupt allowlist did not list something that is no hostname.
-    const auto permit = issue_endpoint_permit(binding.transport_policy(), binding.base_host());
+    const auto permit =
+        issue_endpoint_permit(binding.transport_policy(), binding.base_host(), ResponseKind::DepthSnapshot);
     if (!permit || !detail::is_valid_rest_host(permit->host())) {
         out_error = FetchError::InvalidConfig;
         return std::nullopt;

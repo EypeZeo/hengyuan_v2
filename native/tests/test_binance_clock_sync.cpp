@@ -15,9 +15,11 @@ using hy::ClockOffsetPublisher;
 using hy::ClockOffsetSnapshot;
 using hy::ClockPairSample;
 using hy::ClockPairSampleTestHooks;
+using hy::ClockReadyToken;
 using hy::compute_clock_offset;
 using hy::fetch_clock_pair;
 using hy::is_snapshot_fresh;
+using hy::issue_clock_ready_token;
 using hy::kMaxClockDriftMs;
 using hy::kMaxUsableRttMs;
 using hy::kOffsetTtlMs;
@@ -235,6 +237,76 @@ TEST(TryGetSigningTimestampMs, StaleSnapshotFails) {
     std::int64_t out = -1;
     EXPECT_FALSE(try_get_signing_timestamp_ms(pub, ClockPairSampleTestHooks::make(1000, 1000), out));
     EXPECT_EQ(out, -1);  // untouched on failure
+}
+
+// --- issue_clock_ready_token (SAFE-01 slice 5) ---
+// The token is the only thing build_signed_query() accepts as a timestamp, and this is the only function that
+// makes one: it must refuse exactly where try_get_signing_timestamp_ms() refuses, and hand out exactly the
+// timestamp that function computes.
+
+namespace {
+ClockOffsetSnapshot token_fixture_fetched_at_1000(std::int64_t offset_ms) {
+    ClockOffsetSnapshot s{};
+    s.offset_ms = offset_ms;
+    s.error_bound_ms = 30;
+    s.system_at_fetch_ms = 1000;
+    s.steady_at_fetch_ms = 1000;
+    return s;
+}
+}  // namespace
+
+TEST(IssueClockReadyToken, AFreshSnapshotIssuesTheTimestampTheRawFunctionComputes) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(token_fixture_fetched_at_1000(77)));
+    const auto now = ClockPairSampleTestHooks::make(1500, 1500);
+
+    const auto token = issue_clock_ready_token(pub, now);
+    ASSERT_TRUE(token.has_value());
+    EXPECT_EQ(token->server_ms(), 1500 + 77);
+
+    std::int64_t raw = 0;
+    ASSERT_TRUE(try_get_signing_timestamp_ms(pub, now, raw));
+    EXPECT_EQ(token->server_ms(), raw) << "the token must carry exactly what the gate computed";
+}
+
+TEST(IssueClockReadyToken, NothingPublishedIssuesNothing) {
+    ClockOffsetPublisher pub;
+    EXPECT_FALSE(issue_clock_ready_token(pub, ClockPairSampleTestHooks::make(1000, 1000)).has_value());
+}
+
+TEST(IssueClockReadyToken, ASnapshotPastItsTtlIssuesNothing) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(token_fixture_fetched_at_1000(77)));
+    EXPECT_TRUE(issue_clock_ready_token(
+                    pub, ClockPairSampleTestHooks::make(1000 + kOffsetTtlMs, 1000 + kOffsetTtlMs))
+                    .has_value())
+        << "the last fresh instant still issues";
+    EXPECT_FALSE(issue_clock_ready_token(
+                     pub, ClockPairSampleTestHooks::make(1000 + kOffsetTtlMs + 1, 1000 + kOffsetTtlMs + 1))
+                     .has_value());
+}
+
+TEST(IssueClockReadyToken, AWallClockJumpSinceTheFetchIssuesNothing) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(token_fixture_fetched_at_1000(77)));
+    EXPECT_FALSE(issue_clock_ready_token(
+                     pub, ClockPairSampleTestHooks::make(1000 + 500 + kMaxClockDriftMs + 1, 1000 + 500))
+                     .has_value());
+}
+
+TEST(IssueClockReadyToken, ArithmeticOverflowIssuesNothing) {
+    ClockOffsetPublisher pub;
+    ASSERT_TRUE(pub.publish(token_fixture_fetched_at_1000(kI64Max)));
+    EXPECT_FALSE(issue_clock_ready_token(pub, ClockPairSampleTestHooks::make(1500, 1500)).has_value());
+}
+
+TEST(IssueClockReadyToken, TheTokenCannotBeMadeOutOfANumber) {
+    // Runtime-visible (not static_assert) so that a regression shows up as a failed test, not a broken build.
+    EXPECT_FALSE(std::is_default_constructible_v<ClockReadyToken>);
+    EXPECT_FALSE((std::is_constructible_v<ClockReadyToken, std::int64_t>));
+    EXPECT_FALSE((std::is_convertible_v<std::int64_t, ClockReadyToken>));
+    EXPECT_FALSE((std::is_convertible_v<int, ClockReadyToken>));
+    EXPECT_TRUE(std::is_trivially_copyable_v<ClockReadyToken>) << "a value that travels into a signing call";
 }
 
 // --- try_get_pessimistic_server_now_ms ---

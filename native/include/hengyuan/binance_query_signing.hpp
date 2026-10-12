@@ -6,11 +6,16 @@
 // QuerySigningError itself is defined in binance_environment.hpp (which
 // this header depends on) — see that header's comment for why.
 //
+// The timestamp a request is signed with is a ClockReadyToken (binance_clock_sync.hpp), not a bare
+// integer: the only way to get one is issue_clock_ready_token(), which refuses unless the clock-offset
+// snapshot is fresh (SAFE-01 slice 5).
+//
 // Governance: L4 (offline logic only — this header performs no network
 // I/O; it only assembles and signs the bytes a caller will later send).
 
 #pragma once
 
+#include <hengyuan/binance_clock_sync.hpp>
 #include <hengyuan/binance_environment.hpp>
 
 #include <algorithm>
@@ -174,16 +179,18 @@ public:
 
 private:
     friend std::pair<QuerySigningError, SignedQuery> build_signed_query(
-        BoundHmacCredentials&, const CanonicalUnsignedQuery&, std::int64_t) noexcept;
+        BoundHmacCredentials&, const CanonicalUnsignedQuery&, ClockReadyToken) noexcept;
     SignedQuery() noexcept = default;
     std::array<char, kMaxQueryLen + kSignatureParamLen> buf_{};
     std::size_t len_{0};
 };
 
-// fresh_ts_ms: the caller must obtain this via try_get_signing_timestamp_ms()
-// at the last possible moment before this call, never an earlier-cached
-// value — "no caching" is enforced by this parameter-passing path itself,
-// there is no cross-call slot for a caller to misuse.
+// clock_token: the timestamp to sign with, as a ClockReadyToken (binance_clock_sync.hpp) -- the only
+// thing this function accepts, and the only way to obtain one is issue_clock_ready_token(), which refuses
+// unless the clock-offset snapshot is fresh. The caller issues it at the last possible moment before this
+// call, never an earlier-cached value — "no caching" is enforced by this parameter-passing path itself, there
+// is no cross-call slot for a caller to misuse (SAFE-01 slice 5: this used to be a bare std::int64_t, so
+// "must be fresh" was a convention).
 //
 // Signature byte contract (must be followed literally):
 //   signing input = unsigned_query.bytes() + "&timestamp=" + <fresh_ts_ms>
@@ -208,7 +215,8 @@ private:
 inline std::pair<QuerySigningError, SignedQuery> build_signed_query(
     BoundHmacCredentials& creds,
     const CanonicalUnsignedQuery& unsigned_query,
-    std::int64_t fresh_ts_ms) noexcept {
+    ClockReadyToken clock_token) noexcept {
+    const std::int64_t fresh_ts_ms = clock_token.server_ms();
     // Defense in depth: unreachable from build_canonical_query()'s normal
     // path (it already rejects empty input), but zero-cost and consistent
     // with this design's fail-closed discipline throughout.

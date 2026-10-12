@@ -30,6 +30,7 @@ using hy::KlineBackfill;
 using hy::PrivateRestConfig;
 using hy::PublicRestConfig;
 using hy::RateLimitPermit;
+using hy::ResponseKind;
 using hy::RestSnapshotConfig;
 using hy::RestTestSeam;
 using hy::RestTestSeamBuilder;
@@ -70,6 +71,9 @@ template <class... A>
 constexpr bool public_body_coro_callable = requires(A... a) { hy::detail::fetch_public_body_coro(a...); };
 template <class... A>
 constexpr bool depth_snapshot_coro_callable = requires(A... a) { hy::detail::fetch_depth_snapshot_coro(a...); };
+
+template <class... A>
+constexpr bool issue_permit_callable = requires(A... a) { hy::issue_endpoint_permit(a...); };
 
 // The public entry points of the two market-data clients: callable only with a binding.
 template <class... A>
@@ -180,6 +184,17 @@ TEST(RestFreezeGuardTypes, ThePublicBodyCoroutineTakesAPermitAndNoHostString) {
                                             RestTestSeam>));
     EXPECT_FALSE((public_body_coro_callable<std::string, std::string, PrivateRestConfig>))
         << "the pre-fix shape";
+}
+
+// --- slice 5: no permit without saying what the answer may be ----------------------------------------------
+
+TEST(RestFreezeGuardTypes, ThePermitCannotBeIssuedWithoutTheKindOfAnswerItIsFor) {
+    EXPECT_TRUE((issue_permit_callable<hy::TransportPolicy, std::string_view, ResponseKind>));
+    EXPECT_FALSE((issue_permit_callable<hy::TransportPolicy, std::string_view>))
+        << "the pre-slice-5 shape: a permit with no bound on what the parser may read";
+    EXPECT_FALSE((issue_permit_callable<hy::TransportPolicy, std::string_view, std::size_t>))
+        << "a number is not a kind of answer";
+    EXPECT_FALSE((issue_permit_callable<hy::TransportPolicy, std::string_view, int>));
 }
 
 // --- slice 4: no request without a rate-limit permit --------------------------------------------------------

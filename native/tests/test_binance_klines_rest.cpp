@@ -604,3 +604,28 @@ TEST(BinanceKlinesRestOutcome, TheCooldownPolicyBacksOffHardestWhereTheExchangeA
     ASSERT_FALSE(parse_failure.ok());
     EXPECT_EQ(hy::klines_backfill_cooldown_ms(parse_failure), hy::kKlinesBackfillFailureCooldownMs);
 }
+
+// --- SAFE-01 slice 5 (FI-037): the policy ceiling bounds the read below the cap of the kind ---
+
+TEST(BinanceKlinesRestLimits, ThePolicyCeilingBoundsTheReadBelowTheCapOfTheKind) {
+    constexpr std::size_t kCeiling = 4096;
+    const EnvironmentBinding tight = hy::EnvironmentBindingTestHooks::with_max_response_bytes(testnet_binding(), kCeiling);
+
+    auto at_ceiling = make_server(200, std::string(kCeiling, ' '));
+    const auto ok = fetch_public_body(tight, "/x", testnet_cfg(at_ceiling->port()), testnet_seam());
+    EXPECT_EQ(ok.error, PublicRestError::None);
+    EXPECT_EQ(ok.body.size(), kCeiling);
+
+    auto over_ceiling = make_server(200, std::string(kCeiling + 1, ' '));
+    const auto over = fetch_public_body(tight, "/x", testnet_cfg(over_ceiling->port()), testnet_seam());
+    EXPECT_EQ(over.error, PublicRestError::Read);
+    EXPECT_TRUE(over.body.empty());
+}
+
+TEST(BinanceKlinesRestLimits, AZeroPolicyCeilingIsRefusedBeforeAnyNetworkAttempt) {
+    auto server = make_server(200, std::string(64, ' '));
+    const auto r = fetch_public_body(hy::EnvironmentBindingTestHooks::with_max_response_bytes(testnet_binding(), 0), "/x",
+                                     testnet_cfg(server->port()), testnet_seam());
+    EXPECT_EQ(r.error, PublicRestError::InvalidConfig);
+    EXPECT_TRUE(server->requests().empty());
+}

@@ -204,7 +204,7 @@ inline bool parse_server_time_response(std::string_view body,
 // which also refuses empty/overlong/unprintable/duplicate names and negative or overflowing
 // balances -- and only assigns to `out` once, at the very end, on total success).
 // `timestamp_ms` is the server-calibrated time the request was signed with: fetch_account()
-// passes the same fresh_ts_ms already computed for this request's signature, so the
+// passes the same timestamp (the clock token's server_ms()) already issued for this request's signature, so the
 // snapshot's timestamp and its own HTTP request's timestamp are the same value, not two
 // independent clock reads. A non-positive timestamp is refused as ClockNotFresh before
 // anything is parsed (0 is the "never fetched" value, only a default snapshot has it).
@@ -898,8 +898,8 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
         beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_read_timeout_ms()));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
-        parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
-        parser.body_limit(static_cast<std::uint64_t>(64 * 1024));
+        parser.header_limit(permit.max_header_bytes());
+        parser.body_limit(permit.max_body_bytes());
         co_await http::async_read(stream, buffer, parser, net::use_awaitable);
         auto res = parser.release();
 
@@ -1007,10 +1007,10 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_read_timeout_ms()));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
-        parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
-        // §4.3's 32-asset cap keeps a real response tiny; 256 KiB is generous headroom, not a
-        // reflection of an expected size.
-        parser.body_limit(static_cast<std::uint64_t>(256 * 1024));
+        parser.header_limit(permit.max_header_bytes());
+        // The cap of the SignedJson kind (transport_policy.hpp::response_cap_bytes): §4.3's 32-asset cap keeps
+        // a real response tiny; the figure is headroom, not a reflection of an expected size.
+        parser.body_limit(permit.max_body_bytes());
         co_await http::async_read(stream, buffer, parser, net::use_awaitable);
         auto res = parser.release();
 
@@ -1104,13 +1104,13 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_public_
         beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_read_timeout_ms()));
         beast::flat_buffer buffer;
         http::response_parser<http::string_body> parser;
-        parser.header_limit(static_cast<std::uint32_t>(8 * 1024));
-        // exchangeInfo's response is far larger than /time or /account: Binance's full,
-        // unfiltered listing runs several MiB. 4 MiB is generous headroom for the `symbols`
-        // -filtered call production code is expected to make (see fetch_exchange_info()'s own
-        // doc comment on why an unfiltered call isn't a supported production shape in the first
-        // place) -- not a reflection of an expected size for the unfiltered case.
-        parser.body_limit(static_cast<std::uint64_t>(4 * 1024 * 1024));
+        parser.header_limit(permit.max_header_bytes());
+        // The cap of the ExchangeInfo kind (transport_policy.hpp::response_cap_bytes): exchangeInfo's answer is
+        // far larger than /time or /account, but the `symbols`-filtered call production code is expected to
+        // make (see fetch_exchange_info()'s own doc comment on why an unfiltered call isn't a supported
+        // production shape) is a few hundred KiB at most. Binance's full, unfiltered listing runs several MiB
+        // and is refused here at the read stage, by design.
+        parser.body_limit(permit.max_body_bytes());
         co_await http::async_read(stream, buffer, parser, net::use_awaitable);
         auto res = parser.release();
 
@@ -1201,7 +1201,7 @@ public:
     // ClockSkewTooLarge: a local clock that far off, or a serverTime that implausible, is not
     // something to calibrate against -- a previously published snapshot just ages out on its TTL.
     PrivateRestError sync_clock(const PrivateRestConfig& cfg) {
-        const auto permit = endpoint_permit();
+        const auto permit = endpoint_permit(ResponseKind::ServerTime);
         if (!permit) return PrivateRestError::InvalidConfig;
         // Budget before the network (L4 §7.4): GET /api/v3/time, weight 1, Reconciliation lane. Refused
         // here, before anything is resolved or connected, when that lane is out of budget.
@@ -1249,7 +1249,7 @@ public:
         return PrivateRestError::None;
     }
 
-    // §4: signed. Fails closed on a stale/never-synced clock -- try_get_signing_timestamp_ms()
+    // §4: signed. Fails closed on a stale/never-synced clock -- issue_clock_ready_token()
     // is the sole call site for that judgment, and this function never falls back to
     // uncalibrated local system time on its own failure (spec §2.2's core invariant). `out` is
     // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above).
@@ -1265,11 +1265,11 @@ public:
         // method that went straight to `*creds_` (audit P2-002); the endpoint policy is checked
         // before anything is signed (audit P2-001).
         if (!creds_) return PrivateRestError::SigningFailed;
-        const auto permit = endpoint_permit();
+        const auto permit = endpoint_permit(ResponseKind::SignedJson);
         if (!permit) return PrivateRestError::InvalidConfig;
 
-        std::int64_t fresh_ts_ms = 0;
-        if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
+        const auto clock_token = issue_clock_ready_token(clock_pub_, fetch_clock_pair());
+        if (!clock_token) {
             return PrivateRestError::ClockNotFresh;
         }
 
@@ -1290,7 +1290,7 @@ public:
         auto [qerr, unsigned_query] = build_canonical_query(params);
         if (qerr != QuerySigningError::Ok) return PrivateRestError::SigningFailed;
 
-        auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, fresh_ts_ms);
+        auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, *clock_token);
         if (serr != QuerySigningError::Ok) return PrivateRestError::SigningFailed;
 
         std::array<char, kApiKeyLen> key_buf{};
@@ -1319,7 +1319,7 @@ public:
 
         AccountSnapshot parsed{};
         const PrivateRestError perr =
-            parse_account_response(std::get<std::string>(outcome), fresh_ts_ms, parsed);
+            parse_account_response(std::get<std::string>(outcome), clock_token->server_ms(), parsed);
         if (perr != PrivateRestError::None) return perr;
         out = parsed;
         return PrivateRestError::None;
@@ -1330,7 +1330,7 @@ public:
     // Binance API behavior (cross-checked, not this repo's own spec; see the 1A.4 plan's own
     // caveat about which specifics still want a final live-docs check): X-MBX-APIKEY header
     // only, NO HMAC signature/timestamp/recvWindow. That means none of the three calls
-    // build_canonical_query()/build_signed_query()/try_get_signing_timestamp_ms() -- there is no
+    // build_canonical_query()/build_signed_query()/issue_clock_ready_token() -- there is no
     // `timestamp` parameter to sign, and gating this on clock freshness would fail-closed a call
     // that was never time-sensitive in the first place. Structurally simpler than
     // fetch_account()/query_order(), not a bigger reuse: just copy_api_key() + a plain target
@@ -1347,7 +1347,7 @@ public:
     PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len,
                                         const PrivateRestConfig& cfg) {
         if (!creds_) return PrivateRestError::SigningFailed;
-        const auto permit = endpoint_permit();
+        const auto permit = endpoint_permit(ResponseKind::SignedJson);
         if (!permit) return PrivateRestError::InvalidConfig;
         const auto budget = reserve_budget_explicit(kListenKeyCallWeight);
         if (!budget) return PrivateRestError::RateLimitExhausted;
@@ -1426,7 +1426,7 @@ public:
     PrivateRestError fetch_exchange_info(ParsedExchangeInfo& out,
                                           std::span<const std::string_view> symbols,
                                           const PrivateRestConfig& cfg) {
-        const auto permit = endpoint_permit();
+        const auto permit = endpoint_permit(ResponseKind::ExchangeInfo);
         if (!permit) return PrivateRestError::InvalidConfig;
 
         std::string target;
@@ -1495,14 +1495,14 @@ public:
     QueryResult query_order(const OrderExpectation& expected,
                              const PrivateRestConfig& cfg) noexcept {
         if (!creds_) return QueryResult::not_sent();
-        const auto permit = endpoint_permit();
+        const auto permit = endpoint_permit(ResponseKind::SignedJson);
         if (!permit) return QueryResult::not_sent();  // nothing sent (R-10)
         if (expected.client_order_id.empty()) return QueryResult::not_sent();
         if (expected.rules_snapshot_at_submit.symbol[0] == '\0') return QueryResult::not_sent();
 
         try {
-            std::int64_t fresh_ts_ms = 0;
-            if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
+            const auto clock_token = issue_clock_ready_token(clock_pub_, fetch_clock_pair());
+            if (!clock_token) {
                 return QueryResult::not_sent();  // ClockNotFresh: nothing signed, nothing sent
             }
 
@@ -1538,7 +1538,7 @@ public:
             auto [qerr, unsigned_query] = build_canonical_query(params);
             if (qerr != QuerySigningError::Ok) return QueryResult::not_sent();
 
-            auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, fresh_ts_ms);
+            auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, *clock_token);
             if (serr != QuerySigningError::Ok) return QueryResult::not_sent();
 
             std::array<char, kApiKeyLen> key_buf{};
@@ -1619,15 +1619,15 @@ public:
         // re-derive" pattern) -- this parameter is genuinely unused by this implementation.
         (void)symbol_id;
         if (!creds_) return {SubmitOutcome::NetworkError, 0, -1};
-        const auto permit = endpoint_permit();
+        const auto permit = endpoint_permit(ResponseKind::SignedJson);
         if (!permit) return {SubmitOutcome::NetworkError, 0, -1};  // provably pre-send
         if (client_order_id.empty()) return {SubmitOutcome::NetworkError, 0, -1};
         if (rules_snapshot.symbol[0] == '\0') return {SubmitOutcome::NetworkError, 0, -1};
         if (price_ticks <= 0 || qty_ticks <= 0) return {SubmitOutcome::NetworkError, 0, -1};
 
         try {
-            std::int64_t fresh_ts_ms = 0;
-            if (!try_get_signing_timestamp_ms(clock_pub_, fetch_clock_pair(), fresh_ts_ms)) {
+            const auto clock_token = issue_clock_ready_token(clock_pub_, fetch_clock_pair());
+            if (!clock_token) {
                 return {SubmitOutcome::NetworkError, 0, -1};  // ClockNotFresh
             }
 
@@ -1662,7 +1662,7 @@ public:
             auto [qerr, unsigned_query] = build_canonical_query(params);
             if (qerr != QuerySigningError::Ok) return {SubmitOutcome::NetworkError, 0, -1};
 
-            auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, fresh_ts_ms);
+            auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, *clock_token);
             if (serr != QuerySigningError::Ok) return {SubmitOutcome::NetworkError, 0, -1};
 
             std::array<char, kApiKeyLen> key_buf{};
@@ -1711,8 +1711,12 @@ private:
     // transport failure. The check is on the logical host (binding_.base_host()), never on a test
     // seam's connect target: the seam only redirects the TCP connection of the test fixtures, while
     // TLS still verifies the certificate against the logical host.
-    std::optional<EndpointPermit> endpoint_permit() const noexcept {
-        return issue_endpoint_permit(binding_.transport_policy(), binding_.base_host());
+    //
+    // SAFE-01 slice 5 (FI-037): the permit also carries the most the answer may be allowed to read, by the
+    // kind of answer the method expects (transport_policy.hpp::ResponseKind) -- the coroutines take their
+    // parser limits from it and have no literal of their own.
+    std::optional<EndpointPermit> endpoint_permit(ResponseKind kind) const noexcept {
+        return issue_endpoint_permit(binding_.transport_policy(), binding_.base_host(), kind);
     }
 
     // SAFE-01 slice 4 (L4 §7.4): the local rate-limit budget for one request, as the RateLimitPermit the
@@ -1742,7 +1746,7 @@ private:
     PrivateRestError call_listen_key_endpoint(std::string_view listen_key, http::verb verb,
                                                const PrivateRestConfig& cfg) {
         if (!creds_) return PrivateRestError::SigningFailed;
-        const auto permit = endpoint_permit();
+        const auto permit = endpoint_permit(ResponseKind::SignedJson);
         if (!permit) return PrivateRestError::InvalidConfig;
         if (listen_key.empty()) return PrivateRestError::InvalidConfig;
         const auto budget = reserve_budget_explicit(kListenKeyCallWeight);

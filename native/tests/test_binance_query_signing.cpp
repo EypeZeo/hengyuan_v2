@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_environment.hpp>
 #include <hengyuan/binance_query_signing.hpp>
+#include "binance_clock_sync_test_hooks.hpp"
 #include "binance_environment_test_hooks.hpp"
 #include "binance_query_signing_test_hooks.hpp"
 
@@ -50,6 +51,12 @@ using hy::build_signed_query;
 using hy::kMaxQueryLen;
 using hy::kMaxQueryParams;
 using hy::kSignatureParamLen;
+
+// A ClockReadyToken for a FIXED timestamp (known-answer vector, range checks): no clock was ever published
+// here, so the only way to a token is the test-only hook (SAFE-01 slice 5).
+namespace {
+hy::ClockReadyToken token_at(std::int64_t server_ms) { return hy::ClockReadyTokenTestHooks::make(server_ms); }
+}  // namespace
 
 namespace {
 
@@ -232,7 +239,7 @@ TEST_F(BuildSignedQueryFixture, KnownAnswerVectorEndToEnd) {
               "price=0.1&quantity=1&recvWindow=5000&side=BUY&symbol=LTCBTC"
               "&timeInForce=GTC&type=LIMIT");
 
-    auto [s_err, signed_query] = build_signed_query(*creds, unsigned_query, 1499827319559LL);
+    auto [s_err, signed_query] = build_signed_query(*creds, unsigned_query, token_at(1499827319559LL));
     ASSERT_EQ(s_err, QuerySigningError::Ok);
 
     const std::string expected =
@@ -248,7 +255,7 @@ TEST_F(BuildSignedQueryFixture, NegativeTimestampRejected) {
     auto [q_err, unsigned_query] = build_canonical_query(params);
     ASSERT_EQ(q_err, QuerySigningError::Ok);
 
-    auto [err, sq] = build_signed_query(*creds, unsigned_query, -1);
+    auto [err, sq] = build_signed_query(*creds, unsigned_query, token_at(-1));
     EXPECT_EQ(err, QuerySigningError::QueryTooLarge);
 }
 
@@ -258,7 +265,7 @@ TEST_F(BuildSignedQueryFixture, TimestampAtUpperBoundaryRejected) {
     auto [q_err, unsigned_query] = build_canonical_query(params);
     ASSERT_EQ(q_err, QuerySigningError::Ok);
 
-    auto [err, sq] = build_signed_query(*creds, unsigned_query, 10'000'000'000'000LL);
+    auto [err, sq] = build_signed_query(*creds, unsigned_query, token_at(10'000'000'000'000LL));
     EXPECT_EQ(err, QuerySigningError::QueryTooLarge);
 }
 
@@ -268,7 +275,7 @@ TEST_F(BuildSignedQueryFixture, TimestampJustBelowUpperBoundarySucceeds) {
     auto [q_err, unsigned_query] = build_canonical_query(params);
     ASSERT_EQ(q_err, QuerySigningError::Ok);
 
-    auto [err, sq] = build_signed_query(*creds, unsigned_query, 9'999'999'999'999LL);
+    auto [err, sq] = build_signed_query(*creds, unsigned_query, token_at(9'999'999'999'999LL));
     EXPECT_EQ(err, QuerySigningError::Ok);
     EXPECT_NE(sq.wire_bytes().find("&timestamp=9999999999999&signature="),
               std::string_view::npos);
@@ -280,7 +287,7 @@ TEST_F(BuildSignedQueryFixture, TimestampZeroSucceeds) {
     auto [q_err, unsigned_query] = build_canonical_query(params);
     ASSERT_EQ(q_err, QuerySigningError::Ok);
 
-    auto [err, sq] = build_signed_query(*creds, unsigned_query, 0);
+    auto [err, sq] = build_signed_query(*creds, unsigned_query, token_at(0));
     EXPECT_EQ(err, QuerySigningError::Ok);
     EXPECT_NE(sq.wire_bytes().find("&timestamp=0&signature="), std::string_view::npos);
 }
@@ -292,7 +299,7 @@ TEST_F(BuildSignedQueryFixture, EmptyCanonicalQueryRejected) {
     CanonicalUnsignedQuery empty = CanonicalUnsignedQueryTestHooks::make_empty_for_test();
     ASSERT_TRUE(empty.bytes().empty());
 
-    auto [err, sq] = build_signed_query(*creds, empty, 1000);
+    auto [err, sq] = build_signed_query(*creds, empty, token_at(1000));
     EXPECT_EQ(err, QuerySigningError::QueryTooLarge);
 }
 
@@ -306,9 +313,27 @@ TEST_F(BuildSignedQueryFixture, MaxLengthCanonicalQueryDoesNotOverflowSignedQuer
     ASSERT_EQ(q_err, QuerySigningError::Ok);
     ASSERT_EQ(unsigned_query.bytes().size(), kMaxQueryLen);
 
-    auto [err, sq] = build_signed_query(*creds, unsigned_query, 9'999'999'999'999LL);
+    auto [err, sq] = build_signed_query(*creds, unsigned_query, token_at(9'999'999'999'999LL));
     ASSERT_EQ(err, QuerySigningError::Ok);
     // canonical (kMaxQueryLen) + "&timestamp=" (11) + 13 digits + "&signature="
     // (11) + 64 hex == kMaxQueryLen + kSignatureParamLen exactly.
     EXPECT_EQ(sq.wire_bytes().size(), kMaxQueryLen + kSignatureParamLen);
+}
+
+// --- SAFE-01 slice 5: a bare timestamp is no longer accepted by the signer ---
+
+namespace {
+template <class... A>
+constexpr bool build_signed_query_callable = requires(A... a) { hy::build_signed_query(a...); };
+}  // namespace
+
+TEST(QuerySigningClockToken, OnlyAClockReadyTokenIsAcceptedAsTheTimestamp) {
+    EXPECT_TRUE((build_signed_query_callable<hy::BoundHmacCredentials&, const hy::CanonicalUnsignedQuery&,
+                                             hy::ClockReadyToken>));
+    EXPECT_FALSE((build_signed_query_callable<hy::BoundHmacCredentials&, const hy::CanonicalUnsignedQuery&,
+                                              std::int64_t>))
+        << "the pre-slice-5 shape: any integer could be signed with";
+    EXPECT_FALSE((build_signed_query_callable<hy::BoundHmacCredentials&, const hy::CanonicalUnsignedQuery&, int>));
+    EXPECT_FALSE((build_signed_query_callable<hy::BoundHmacCredentials&, const hy::CanonicalUnsignedQuery&,
+                                              long long>));
 }

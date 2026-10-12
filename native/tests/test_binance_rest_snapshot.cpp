@@ -12,6 +12,7 @@
 #include "binance_environment_test_hooks.hpp"
 #include "test_helpers/blackhole_acceptor.hpp"
 #include "test_helpers/rest_test_seam_builder.hpp"
+#include "test_helpers/tls_response_acceptor.hpp"
 
 #include <chrono>
 #include <string>
@@ -306,4 +307,73 @@ TEST(SnapshotRefreshGateRealFetch, FactoryFetcherUsesTheBindingAndTheConfigItWas
     auto allowed = hy::make_default_snapshot_fetcher(binding_for("127.0.0.1"), cfg);
     EXPECT_FALSE(allowed(request).has_value());  // the blackhole never completes a TLS handshake
     EXPECT_GE(blackhole.accepted_connections(), 1u);
+}
+
+// --- SAFE-01 slice 5 (FI-037): the answer is read under the permit's cap, not under a number of the client's own ---
+//
+// The body is a valid depth answer padded with blanks to an exact size, so a refusal at the read stage can only be
+// about its size.
+
+namespace {
+
+std::string padded_depth_body(std::size_t total) {
+    std::string body = R"({"lastUpdateId":12345,"bids":[["100.50000000","1.00000000"]],"asks":[["101.00000000","1.50000000"]]})";
+    body.resize(total, ' ');
+    return body;
+}
+
+}  // namespace
+
+TEST(BinanceRestSnapshotLimits, TheAnswerIsReadUpToOneMiBAndNotOneByteMore) {
+    constexpr std::size_t kMiB = 1024 * 1024;
+    for (const std::size_t total : {kMiB, kMiB + 1}) {
+        hy::test_helpers::TlsResponseAcceptor server(fixture_path("test_leaf_cert.pem"),
+                                                     fixture_path("test_leaf_key.pem"), 200, padded_depth_body(total));
+        RestSnapshotConfig cfg;
+        cfg.port = std::to_string(server.port());
+        const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
+        FetchError err{};
+        const auto result = fetch_depth_snapshot(binding_for("wrong-san.test.invalid"), "BTCUSDT", 100'000'000,
+                                                 100'000'000, cfg, err, seam);
+        if (total == kMiB) {
+            ASSERT_TRUE(result.has_value()) << "err=" << static_cast<int>(err);
+            EXPECT_EQ(err, FetchError::None);
+            EXPECT_EQ(result->last_update_id, 12345u);
+        } else {
+            EXPECT_FALSE(result.has_value());
+            EXPECT_EQ(err, FetchError::Read);
+        }
+    }
+}
+
+TEST(BinanceRestSnapshotLimits, ThePolicyCeilingBoundsTheReadBelowTheCapOfTheKind) {
+    constexpr std::size_t kCeiling = 4096;
+    const EnvironmentBinding tight = hy::EnvironmentBindingTestHooks::with_max_response_bytes(
+        binding_for("wrong-san.test.invalid"), kCeiling);
+    for (const std::size_t total : {kCeiling, kCeiling + 1}) {
+        hy::test_helpers::TlsResponseAcceptor server(fixture_path("test_leaf_cert.pem"),
+                                                     fixture_path("test_leaf_key.pem"), 200, padded_depth_body(total));
+        RestSnapshotConfig cfg;
+        cfg.port = std::to_string(server.port());
+        const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
+        FetchError err{};
+        const auto result = fetch_depth_snapshot(tight, "BTCUSDT", 100'000'000, 100'000'000, cfg, err, seam);
+        EXPECT_EQ(result.has_value(), total == kCeiling) << total;
+        EXPECT_EQ(err, total == kCeiling ? FetchError::None : FetchError::Read) << total;
+    }
+}
+
+TEST(BinanceRestSnapshotLimits, AZeroPolicyCeilingIsRefusedBeforeAnyNetworkAttempt) {
+    hy::test_helpers::TlsResponseAcceptor server(fixture_path("test_leaf_cert.pem"), fixture_path("test_leaf_key.pem"),
+                                                 200, padded_depth_body(128));
+    RestSnapshotConfig cfg;
+    cfg.port = std::to_string(server.port());
+    const hy::RestTestSeam seam = hy::RestTestSeamBuilder::loopback(fixture_path("test_ca_cert.pem"));
+    FetchError err{};
+    const auto result = fetch_depth_snapshot(
+        hy::EnvironmentBindingTestHooks::with_max_response_bytes(binding_for("wrong-san.test.invalid"), 0), "BTCUSDT",
+        100'000'000, 100'000'000, cfg, err, seam);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(err, FetchError::InvalidConfig);
+    EXPECT_TRUE(server.requests().empty());
 }

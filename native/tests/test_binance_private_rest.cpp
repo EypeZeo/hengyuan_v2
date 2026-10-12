@@ -2431,3 +2431,137 @@ TEST_F(BoundCredentialsFixture, AClientWithoutATrackerIsNotCountedAndNotRefused)
         EXPECT_EQ(server.requests().size(), 1u) << i;
     }
 }
+
+// ============================================================================================================
+// SAFE-01 slice 5 (audit FI-037): every answer is read under the cap of its kind, and the policy ceiling bounds them all
+// ============================================================================================================
+//
+// The parser limit comes out of the EndpointPermit (transport_policy.hpp::response_cap_bytes, clamped by
+// TransportPolicy::max_response_bytes), so the number is the same wherever a request is made from. Each test serves
+// an answer that is VALID JSON padded with blanks to an exact size: whatever the client makes of the padded answer,
+// a refusal at the read stage can only be about its size. The over-cap answer is one byte more than the cap.
+
+namespace {
+
+std::string padded_to(std::string body, std::size_t total) {
+    body.resize(total, ' ');  // every caller passes a body shorter than `total`
+    return body;
+}
+
+constexpr const char* kPaddedAccountBody =
+    R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1.5","locked":"0.5"}]})";
+constexpr const char* kPaddedExchangeInfoBody = R"({"serverTime":1700000000000,"symbols":[]})";
+
+}  // namespace
+
+TEST_F(BoundCredentialsFixture, TheServerTimeAnswerIsReadUpToItsCapAndNotOneByteMore) {
+    constexpr std::size_t kCap = 64 * 1024;
+    for (const std::size_t total : {kCap, kCap + 1}) {
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+            padded_to(hy::test_helpers::current_server_time_body(), total));
+        BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+        use_fixtures(client);
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+        EXPECT_EQ(client.sync_clock(cfg), total == kCap ? PrivateRestError::None : PrivateRestError::Read) << total;
+    }
+}
+
+TEST_F(BoundCredentialsFixture, ASignedAnswerIsReadUpToItsCapAndNotOneByteMore) {
+    constexpr std::size_t kCap = 256 * 1024;
+    for (const std::size_t total : {kCap, kCap + 1}) {
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+            padded_to(kPaddedAccountBody, total));
+        BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+        use_fixtures(client);
+        hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+        AccountSnapshot out;
+        EXPECT_EQ(client.fetch_account(out, cfg), total == kCap ? PrivateRestError::None : PrivateRestError::Read)
+            << total;
+    }
+}
+
+TEST_F(BoundCredentialsFixture, TheExchangeInfoAnswerIsReadUpToOneMiBAndNotOneByteMore) {
+    // 4 MiB until slice 5; a filtered call (fewer than kMaxSymbols symbols, about 3 KiB each) never gets near it.
+    constexpr std::size_t kCap = 1024 * 1024;
+    const std::string_view symbols[] = {"BTCUSDT"};
+    for (const std::size_t total : {kCap, kCap + 1}) {
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+            padded_to(kPaddedExchangeInfoBody, total));
+        BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+        use_fixtures(client);
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+        hy::ParsedExchangeInfo info;
+        const PrivateRestError err = client.fetch_exchange_info(info, symbols, cfg);
+        if (total == kCap) {
+            EXPECT_NE(err, PrivateRestError::Read) << "the answer was read in full, whatever is made of an empty list";
+            EXPECT_EQ(server.requests().size(), 1u);
+        } else {
+            EXPECT_EQ(err, PrivateRestError::Read);
+        }
+    }
+}
+
+TEST_F(BoundCredentialsFixture, ThePolicyCeilingBoundsTheReadBelowTheCapOfTheKind) {
+    constexpr std::size_t kCeiling = 2048;  // far below the 64 KiB cap of the server-time kind
+    const EnvironmentBinding tight =
+        hy::EnvironmentBindingTestHooks::with_max_response_bytes(EnvironmentBinding::testnet(), kCeiling);
+    for (const std::size_t total : {kCeiling, kCeiling + 1}) {
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+            padded_to(hy::test_helpers::current_server_time_body(), total));
+        BinancePrivateRestClient client(tight, make_creds());
+        use_fixtures(client);
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+        EXPECT_EQ(client.sync_clock(cfg), total == kCeiling ? PrivateRestError::None : PrivateRestError::Read)
+            << total;
+    }
+    // The control: the very answer the tight policy refused is read under the untouched one -- it is the ceiling
+    // that refuses it, not the kind's own cap.
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        padded_to(hy::test_helpers::current_server_time_body(), kCeiling + 1));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+    EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::None);
+}
+
+TEST_F(BoundCredentialsFixture, AZeroPolicyCeilingRefusesEveryNetworkMethodBeforeAnyNetworkAttempt) {
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        hy::test_helpers::current_server_time_body());
+    BinancePrivateRestClient client(
+        hy::EnvironmentBindingTestHooks::with_max_response_bytes(EnvironmentBinding::testnet(), 0), make_creds());
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+
+    AccountSnapshot account;
+    hy::ParsedExchangeInfo info;
+    const std::string_view symbols[] = {"BTCUSDT"};
+    char buf[hy::kListenKeyLen]{};
+    std::size_t len = 0;
+    EXPECT_EQ(client.sync_clock(cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client.fetch_account(account, cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client.fetch_exchange_info(info, symbols, cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client.create_listen_key(buf, len, cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client.keepalive_listen_key("some-key", cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client.close_listen_key("some-key", cfg), PrivateRestError::InvalidConfig);
+    EXPECT_EQ(client.query_order(make_btcusdt_expectation("coid-zero-ceiling"), cfg).outcome, QueryOutcome::NotSent);
+    const auto rules = make_btcusdt_rules();
+    EXPECT_EQ(client.submit_order("coid-zero-ceiling", 1, OrderSide::Buy, OrderType::Limit, 5'000'012, 100'000, rules,
+                                  cfg)
+                  .outcome,
+              SubmitOutcome::NetworkError);
+    EXPECT_TRUE(server.requests().empty()) << "not one byte may have been sent";
+}

@@ -9,6 +9,7 @@
 using hy::EndpointAllowlist;
 using hy::EndpointPermit;
 using hy::RequestWeightTracker;
+using hy::ResponseKind;
 using hy::SanitizedError;
 using hy::TransportCheck;
 using hy::TransportPolicy;
@@ -18,6 +19,7 @@ using hy::check_endpoint;
 using hy::check_http_status;
 using hy::check_response_size;
 using hy::issue_endpoint_permit;
+using hy::response_cap_bytes;
 using hy::sanitize_error;
 using hy::validate_policy;
 
@@ -140,24 +142,24 @@ TEST(TransportPolicy, EndpointCheckFailsClosedOnACorruptAllowlistEvenForAListedH
 
 TEST(EndpointPermit, IsIssuedForAnAllowlistedHostAndNamesThatHost) {
     const TransportPolicy p{};
-    const auto permit = issue_endpoint_permit(p, "api1.binance.com");
+    const auto permit = issue_endpoint_permit(p, "api1.binance.com", ResponseKind::SignedJson);
     ASSERT_TRUE(permit.has_value());
     EXPECT_EQ(permit->host(), "api1.binance.com");
 }
 
 TEST(EndpointPermit, IsRefusedForAHostThatIsNotOnTheAllowlist) {
     const TransportPolicy p{};
-    EXPECT_FALSE(issue_endpoint_permit(p, "evil.com").has_value());
-    EXPECT_FALSE(issue_endpoint_permit(p, "").has_value());
-    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com.evil.com").has_value());
+    EXPECT_FALSE(issue_endpoint_permit(p, "evil.com", ResponseKind::SignedJson).has_value());
+    EXPECT_FALSE(issue_endpoint_permit(p, "", ResponseKind::SignedJson).has_value());
+    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com.evil.com", ResponseKind::SignedJson).has_value());
 }
 
 TEST(EndpointPermit, IsRefusedOnACorruptAllowlistEvenForAListedHost) {
     TransportPolicy p{};
     p.endpoint_allowlist.count = hy::kMaxEndpoints + 1;
-    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com").has_value());
+    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com", ResponseKind::SignedJson).has_value());
     p.endpoint_allowlist.count = 0;
-    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com").has_value());
+    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com", ResponseKind::SignedJson).has_value());
 }
 
 TEST(EndpointPermit, AgreesWithCheckEndpointForEveryHostItIsAskedAbout) {
@@ -166,7 +168,8 @@ TEST(EndpointPermit, AgreesWithCheckEndpointForEveryHostItIsAskedAbout) {
     p.endpoint_allowlist.hosts[0] = "testnet.binance.vision";
     p.endpoint_allowlist.count = 1;
     for (const char* host : {"testnet.binance.vision", "api.binance.com", "", "TESTNET.BINANCE.VISION"}) {
-        EXPECT_EQ(issue_endpoint_permit(p, host).has_value(), check_endpoint(p, host) == TransportCheck::Ok)
+        EXPECT_EQ(issue_endpoint_permit(p, host, ResponseKind::SignedJson).has_value(),
+                  check_endpoint(p, host) == TransportCheck::Ok)
             << "host=" << host;
     }
 }
@@ -176,6 +179,74 @@ TEST(EndpointPermit, CannotBeBuiltFromAHostWithoutTheCheck) {
     EXPECT_FALSE(std::is_default_constructible_v<EndpointPermit>);
     EXPECT_FALSE((std::is_constructible_v<EndpointPermit, std::string_view>));
     EXPECT_FALSE((std::is_convertible_v<std::string_view, EndpointPermit>));
+    // ...nor from a host and two numbers: the bounds come out of issue_endpoint_permit() or nowhere.
+    EXPECT_FALSE((std::is_constructible_v<EndpointPermit, std::string_view, std::uint32_t, std::uint64_t>));
+}
+
+// --- Endpoint permit: the response bounds it carries (SAFE-01 slice 5, FI-037) ---
+
+TEST(EndpointPermitBounds, EachKindGetsItsOwnCapUnderTheDefaultPolicy) {
+    const TransportPolicy p{};
+    struct Row {
+        ResponseKind kind;
+        std::uint64_t body;
+    } const rows[] = {
+        {ResponseKind::ServerTime, 64u * 1024},
+        {ResponseKind::SignedJson, 256u * 1024},
+        {ResponseKind::ExchangeInfo, 1024u * 1024},
+        {ResponseKind::Klines, 1024u * 1024},
+        {ResponseKind::DepthSnapshot, 1024u * 1024},
+    };
+    for (const Row& r : rows) {
+        const auto permit = issue_endpoint_permit(p, "api.binance.com", r.kind);
+        ASSERT_TRUE(permit.has_value()) << static_cast<int>(r.kind);
+        EXPECT_EQ(permit->max_body_bytes(), r.body) << static_cast<int>(r.kind);
+        EXPECT_EQ(permit->max_header_bytes(), 8u * 1024) << static_cast<int>(r.kind);
+        EXPECT_EQ(response_cap_bytes(r.kind), r.body) << "the permit and the table must agree";
+    }
+}
+
+TEST(EndpointPermitBounds, NoKindAsksForMoreThanTheDefaultPolicyCeiling) {
+    const TransportPolicy p{};
+    for (const ResponseKind k : {ResponseKind::ServerTime, ResponseKind::SignedJson, ResponseKind::ExchangeInfo,
+                                 ResponseKind::Klines, ResponseKind::DepthSnapshot}) {
+        EXPECT_LE(response_cap_bytes(k), p.max_response_bytes) << static_cast<int>(k);
+        EXPECT_GT(response_cap_bytes(k), 0u) << static_cast<int>(k);
+    }
+}
+
+TEST(EndpointPermitBounds, ThePolicyCeilingClampsEveryKindAndNeverRaisesOne) {
+    TransportPolicy p{};
+    p.max_response_bytes = 10 * 1024;
+    for (const ResponseKind k : {ResponseKind::ServerTime, ResponseKind::SignedJson, ResponseKind::ExchangeInfo,
+                                 ResponseKind::Klines, ResponseKind::DepthSnapshot}) {
+        const auto permit = issue_endpoint_permit(p, "api.binance.com", k);
+        ASSERT_TRUE(permit.has_value());
+        EXPECT_EQ(permit->max_body_bytes(), 10u * 1024) << "a tighter ceiling wins, kind " << static_cast<int>(k);
+    }
+    // a ceiling above every kind leaves each kind at its own cap
+    p.max_response_bytes = 64 * 1024 * 1024;
+    const auto signed_json = issue_endpoint_permit(p, "api.binance.com", ResponseKind::SignedJson);
+    ASSERT_TRUE(signed_json.has_value());
+    EXPECT_EQ(signed_json->max_body_bytes(), 256u * 1024) << "the ceiling is a ceiling, not a target";
+}
+
+TEST(EndpointPermitBounds, AZeroCeilingOrAnUnknownKindIsRefused) {
+    TransportPolicy p{};
+    p.max_response_bytes = 0;
+    EXPECT_FALSE(issue_endpoint_permit(p, "api.binance.com", ResponseKind::SignedJson).has_value())
+        << "a policy that lets nothing through must not hand out a permit that reads a zero-byte body limit";
+    const TransportPolicy ok{};
+    EXPECT_FALSE(issue_endpoint_permit(ok, "api.binance.com", static_cast<ResponseKind>(200)).has_value());
+    EXPECT_EQ(response_cap_bytes(static_cast<ResponseKind>(200)), 0u);
+}
+
+TEST(EndpointPermitBounds, TheAllowlistIsStillCheckedWhateverTheKind) {
+    const TransportPolicy p{};
+    for (const ResponseKind k : {ResponseKind::ServerTime, ResponseKind::SignedJson, ResponseKind::ExchangeInfo,
+                                 ResponseKind::Klines, ResponseKind::DepthSnapshot}) {
+        EXPECT_FALSE(issue_endpoint_permit(p, "evil.com", k).has_value()) << static_cast<int>(k);
+    }
 }
 
 // --- HTTP status check ---

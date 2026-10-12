@@ -11,6 +11,11 @@
 //      A new one, or a pinned one that gains or loses a connection, fails the test until a reviewer has
 //      looked at it and updated the table -- and the table says what kind of entry it has to be.
 //
+// Slice 5 does the same for two more bounds: the response size (the permit carries the parser limits of the kind
+// of answer a request expects, and no REST client has a literal limit of its own) and the signing timestamp (a
+// ClockReadyToken, issued by one function from a fresh clock snapshot, is the only thing build_signed_query()
+// accepts).
+//
 // Slice 4 adds the same two mechanisms for the local rate-limit budget (spot_rate_limit_budget.hpp): the
 // private client's three network coroutines also take a RateLimitPermit, so a request that nobody counted does
 // not compile either; and the only two ways to make that permit without the tracker -- "the order
@@ -317,6 +322,70 @@ TEST(RestFreezeGuardBudget, TheNoTrackerPermitIsOnlyHandedOutByTheTwoReservation
     ASSERT_NE(f, nullptr);
     EXPECT_EQ(count_of(f->code, "no_tracker_permit("), 3u)
         << "one definition and the two reservation helpers: a new caller needs a reviewer";
+}
+
+// --- slice 5: nothing reads more than its permit allows, nothing signs without a fresh clock -------------
+
+TEST(RestFreezeGuardLimits, EveryParserLimitInTheRestClientsComesOutOfThePermit) {
+    // One parser per connection, each configured from the permit before the first byte is read. A literal here is
+    // the pre-slice-5 shape; a limit anywhere outside the three pinned REST clients is a new HTTP client nobody has
+    // put under the response bound yet.
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t bodies = count_of(f.code, "body_limit(");
+        const std::size_t headers = count_of(f.code, "header_limit(");
+        const Pinned* pinned = find_pinned(f.rel);
+        if (pinned == nullptr || pinned->kind != Kind::EndpointPermit) {
+            EXPECT_EQ(bodies, 0u) << f.rel << " configures a parser body limit but is not a pinned REST client";
+            EXPECT_EQ(headers, 0u) << f.rel << " configures a parser header limit but is not a pinned REST client";
+            continue;
+        }
+        EXPECT_EQ(bodies, pinned->resolves) << f.rel << ": one body limit per connection";
+        EXPECT_EQ(count_of(f.code, "body_limit(permit.max_body_bytes())"), pinned->resolves)
+            << f.rel << ": a body limit that does not come out of the permit";
+        EXPECT_EQ(headers, pinned->resolves) << f.rel << ": one header limit per connection";
+        EXPECT_EQ(count_of(f.code, "header_limit(permit.max_header_bytes())"), pinned->resolves)
+            << f.rel << ": a header limit that does not come out of the permit";
+    }
+}
+
+TEST(RestFreezeGuardClockToken, TheSigningTimestampIsOnlyEverTakenThroughTheTokenIssuer) {
+    // try_get_signing_timestamp_ms() has its definition and its one caller, issue_clock_ready_token(), in the clock
+    // header -- nowhere else may take a raw signing timestamp out of the clock gate.
+    constexpr std::string_view kOwner = "include/hengyuan/binance_clock_sync.hpp";
+    std::size_t total = 0;
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t n = count_of(f.code, "try_get_signing_timestamp_ms(");
+        total += n;
+        if (f.rel != kOwner) {
+            EXPECT_EQ(n, 0u) << f.rel << " takes a raw signing timestamp: go through issue_clock_ready_token()";
+        }
+    }
+    EXPECT_EQ(total, 2u) << "the definition and the one call inside issue_clock_ready_token()";
+}
+
+TEST(RestFreezeGuardClockToken, TheTokenIsMintedOnceAndItsTestHookIsNamedOnlyByTheFriendDeclaration) {
+    constexpr std::string_view kOwner = "include/hengyuan/binance_clock_sync.hpp";
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t minted = count_of(f.code, "ClockReadyToken(");
+        const std::size_t hooks = count_of(f.code, "ClockReadyTokenTestHooks");
+        if (f.rel == kOwner) {
+            EXPECT_EQ(minted, 2u) << f.rel << ": the private constructor and the one mint in issue_clock_ready_token()";
+            EXPECT_EQ(hooks, 1u) << f.rel << ": the friend declaration, and nothing else";
+        } else {
+            EXPECT_EQ(minted, 0u) << f.rel << " constructs a ClockReadyToken";
+            EXPECT_EQ(hooks, 0u) << f.rel << " names ClockReadyTokenTestHooks: it may be defined only under native/tests/";
+        }
+    }
+}
+
+TEST(RestFreezeGuardClockToken, EveryTimestampASignedRequestIsSignedWithWasIssuedByTheClientItself) {
+    // The private client signs in three places (account, order query, order submit); each issues its own token
+    // just before. A fourth signing site that skipped the issue would not compile (build_signed_query() takes only a
+    // token), and this keeps the two counts moving together.
+    const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(count_of(f->code, "build_signed_query("), 3u);
+    EXPECT_EQ(count_of(f->code, "issue_clock_ready_token("), 3u);
 }
 
 // --- the test seam stays a test seam -----------------------------------------------------------------
