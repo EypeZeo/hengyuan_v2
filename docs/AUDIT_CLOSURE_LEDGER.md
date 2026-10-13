@@ -145,7 +145,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **FI-001** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-001** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6a3cd87 |
 | **FI-002** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-003** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-004** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
@@ -751,10 +751,10 @@ level: L1
 status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
+baseline: 6a3cd87
 open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery
-refs: test:native/tests/test_live_submit_orchestrator.cpp#AuditWriteNotAckedAtIntentGate test:native/tests/test_live_submit_orchestrator.cpp#HappyPathDurableAuditSequence test:native/tests/test_live_submit_orchestrator.cpp#DurableAuditPortNotWiredFailsClosedAtIntentGate
-note: 发送前的意图落盘、写不进就不发单已有单测；没有任何测试强杀进程，启动恢复也未接入任何程序，所以“重启回放保持干净”无从执行。
+refs: test:native/tests/test_live_submit_orchestrator.cpp#AuditWriteNotAckedAtIntentGate test:native/tests/test_live_submit_orchestrator.cpp#HappyPathDurableAuditSequence test:native/tests/test_live_submit_orchestrator.cpp#DurableAuditPortNotWiredFailsClosedAtIntentGate test:native/tests/test_durable_audit_sink.cpp#TornTailAfterAnIntentOnlyOrderLeavesAnOrphanNotACheckpoint test:native/tests/test_startup_recovery.cpp#AnIntentOnlyOrderIsNeitherRegisteredNorReconciledAndStartupReachesReady test:native/tests/test_live_submit_orchestrator.cpp#NothingIsSentWhenThePreparedAckFails pr:172@6a3cd87
+note: 发送前的意图落盘、写不进就不发单已有单测；PR #172 起，意图已落盘而 Prepared 帧未落盘的订单（含 Prepared 帧写到一半被撕裂）重启回放为 Clean、不产生检查点、不进在途表、不被询问交易所、启动恢复不等它（真实日志的单元测试），且 Prepared 的 ACK 失败时提交端口一次也不被调用（规则的前提）；没有任何测试强杀进程，启动恢复也未接入任何程序，所以“重启回放保持干净”仍只有单元测试级证据。
 ```
 
 ```ledger
