@@ -1000,6 +1000,111 @@ TEST_F(LiveSubmitReconcileTest, TheDrainAtTheTopMakesEveryResolutionDurableOnThe
     EXPECT_FALSE(in_flight_.is_in_flight(coid.view()));
 }
 
+// --- SAFE-03 path 1 (audit P1-002): the synchronous POST path, branch by branch ---
+//
+// orchestrate_submit() acknowledges every outcome durably BEFORE it transitions the order, appends the outcome to
+// the audit ring, folds a fill into PositionTruth or releases the in-flight slot (Gate 13). Only the Rejected branch
+// had a test for a failed ACK. These pin the other six, each as its own test so that a mutant which drops the ACK
+// check of ONE branch is named by that branch's test -- and they assert every effect the ACK is supposed to guard,
+// not only the gate: the order stays Submitting, the slot stays held, PositionTruth and the fill baseline are
+// untouched, the ring has no outcome record, and nothing is handed to the reconcile loop.
+
+class LiveSubmitOutcomeAckTest : public LiveSubmitReconcileTest {
+protected:
+    PositionTruth truth_;
+    OrderFillContext fill_context_;
+
+    void SetUp() override {
+        LiveSubmitReconcileTest::SetUp();
+        ctx_.position_truth = &truth_;
+        ctx_.fill_context = &fill_context_;
+    }
+
+    static SubmitResponse filled_answer(OrderState status, std::int64_t filled_qty_ticks) {
+        SubmitResponse r{};
+        r.outcome = SubmitOutcome::Accepted;
+        r.exchange_order_id = 555;
+        r.exchange_status = status;
+        r.filled_qty_ticks = filled_qty_ticks;
+        r.avg_fill_price_ticks = 5000;
+        return r;
+    }
+
+    // One submit whose OUTCOME frame (everything after Intent and Prepared) the durable sink does not acknowledge.
+    void expect_an_unacknowledged_outcome_is_published_nowhere(const SubmitResponse& answer) {
+        g_mock_response = answer;
+        const ClientOrderId coid = make_client_order_id(ctx_.now_ms, ctx_.sequence, ctx_.symbol_id);
+        fake_durable_audit_.outcome_should_fail = true;
+
+        const OrchestratorResult r = orchestrate_submit(ctx_);
+
+        EXPECT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
+        EXPECT_EQ(r.order.state, OrderState::Submitting) << "the transition site never ran: still Submitting";
+        EXPECT_EQ(r.order.filled_qty_ticks, 0) << "the fill was not written back to the order";
+        EXPECT_TRUE(in_flight_.is_in_flight(coid.view())) << "no ACK -> the slot is not released";
+        EXPECT_EQ(truth_.net_qty_ticks(ctx_.symbol_id), 0) << "no ACK -> no fill reaches PositionTruth";
+        EXPECT_EQ(truth_.tracked_symbol_count(), 0u);
+        EXPECT_NE(fill_context_.find(coid.view()), nullptr) << "no ACK -> the fill baseline is not removed";
+        EXPECT_EQ(fill_context_.consume_delta(coid.view(), 40), 40) << "...and has not been advanced either";
+        for (std::size_t i = 0; i < audit_.count(); ++i) {
+            const AuditRecord* ar = audit_.at(i);
+            ASSERT_NE(ar, nullptr);
+            const AuditEventType t = ar->event_type;
+            EXPECT_FALSE(t == AuditEventType::OrderAccepted || t == AuditEventType::OrderPartialFill ||
+                         t == AuditEventType::OrderFilled || t == AuditEventType::OrderRejected ||
+                         t == AuditEventType::OrderAmbiguous)
+                << "no ACK -> no outcome record in the audit ring (record " << i << ")";
+        }
+        ReconcileIngress in{};
+        EXPECT_FALSE(to_reconcile_.try_pop(in)) << "no ACK -> nothing is handed to the reconcile loop";
+    }
+};
+
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedAcceptedOutcomeIsPublishedNowhere) {
+    expect_an_unacknowledged_outcome_is_published_nowhere(SubmitResponse{SubmitOutcome::Accepted, 12345, 0});
+}
+
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedPartialFillOutcomeIsPublishedNowhere) {
+    expect_an_unacknowledged_outcome_is_published_nowhere(filled_answer(OrderState::PartialFill, 40));
+}
+
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedFilledOutcomeIsPublishedNowhere) {
+    expect_an_unacknowledged_outcome_is_published_nowhere(filled_answer(OrderState::Filled, 100));
+}
+
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedRejectedOutcomeIsPublishedNowhere) {
+    expect_an_unacknowledged_outcome_is_published_nowhere(SubmitResponse{SubmitOutcome::Rejected, 0, -1013});
+}
+
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedTimeoutOutcomeIsPublishedNowhere) {
+    expect_an_unacknowledged_outcome_is_published_nowhere(SubmitResponse{SubmitOutcome::Timeout, 0, 0});
+}
+
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedNetworkErrorOutcomeIsPublishedNowhere) {
+    expect_an_unacknowledged_outcome_is_published_nowhere(SubmitResponse{SubmitOutcome::NetworkError, 0, 0});
+}
+
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedStaleRulesVersionAnswerIsPublishedNowhere) {
+    // The defensive branch: unreachable through Gate 1, but a SubmitFn may still return it after the send.
+    expect_an_unacknowledged_outcome_is_published_nowhere(SubmitResponse{SubmitOutcome::StaleRulesVersion, 0, 0});
+}
+
+TEST_F(LiveSubmitOutcomeAckTest, AnOrderStuckInSubmittingIsNeverSubmittedAgain) {
+    // The outcome ACK failed, so the order sits in Submitting with its slot held (until a restart recovers it as
+    // Ambiguous). When the sink is back, the very same intent must be refused as in flight -- not sent a second time.
+    g_mock_response = SubmitResponse{SubmitOutcome::Accepted, 12345, 0};
+    fake_durable_audit_.outcome_should_fail = true;
+    const OrchestratorResult first = orchestrate_submit(ctx_);
+    ASSERT_EQ(first.gate, OrchestratorGate::AuditWriteNotAcked);
+
+    fake_durable_audit_.outcome_should_fail = false;
+    const OrchestratorResult again = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(again.gate, OrchestratorGate::DuplicateInFlight);
+    EXPECT_TRUE(in_flight_.is_in_flight(first.order.client_order_id.view()));
+    EXPECT_EQ(in_flight_.count(), 1u);
+}
+
 // --- Phase 3: real-file-I/O integration (durable persistence, not just gate
 // logic -- the fake port above covers gate logic; this proves the port
 // adapter wiring and the actual on-disk frame sequence are correct). ---
