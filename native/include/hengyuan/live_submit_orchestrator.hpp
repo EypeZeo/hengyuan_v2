@@ -504,6 +504,27 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     result.order.order_type = ctx.order_type;
     result.order.rules_snapshot_at_submit = ctx.pre_trade_rules_snapshot;
 
+    // Gate 9b (SAFE-03 slice 2): the in-flight duplicate guard, read-only, BEFORE the durable Intent frame. An
+    // Intent frame may open a COID's history or repeat an earlier one that never got further; for a COID that has
+    // already moved on (Submitting, Accepted, ...) it is an illegal transition for the recovery scan, and it made
+    // the whole log Corrupt on the next start while the duplicate was refused only at Gate 12b -- after the frame
+    // was written. The registration at Gate 12b stays (it is also the capacity check, and the only thing that
+    // claims the slot).
+    if (ctx.in_flight && ctx.in_flight->is_in_flight(coid.view())) {
+        result.gate = OrchestratorGate::DuplicateInFlight;
+        AuditRecord ar{};
+        ar.timestamp_ms = ctx.now_ms;
+        ar.event_type = AuditEventType::PreflightFailed;
+        ar.mode = ctx.mode;
+        ar.symbol_id = ctx.symbol_id;
+        ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
+        ar.side = ctx.side;
+        ar.set_detail("duplicate in-flight - reconcile, do NOT resubmit");
+        ctx.audit->append(ar);
+        return result;
+    }
+
     // Gate 10: Audit intent
     {
         AuditRecord ar{};

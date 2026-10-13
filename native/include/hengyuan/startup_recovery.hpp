@@ -26,6 +26,10 @@
 // the baseline to X right after seeding (consume_delta(coid, X)), so only fills observed AFTER
 // the crash are added.
 //
+// An order whose last durable frame is Intent was never sent (OrderSubmitPrepared is durable before the
+// send), so the scan does not hand it over at all (DurableAuditSink::recovered_intent_orphans(), SUBMITPORT
+// spec round 9): it is not registered in flight, not reconciled, and StartupRecovery never waits for it.
+//
 // What "Ready" does and does not mean: every recovered order is either finished or positively
 // known to be live. A known-live resting order does NOT block Ready but does still count as in
 // flight, so the planner's one-order-at-a-time rule keeps new intents suppressed while it rests.

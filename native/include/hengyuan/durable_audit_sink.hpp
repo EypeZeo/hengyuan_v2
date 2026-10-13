@@ -297,12 +297,18 @@ public:
     // and tip-anchor files are derived from it (path+".lock", path+".tip").
     // key_ring: NOT owned, must outlive this sink. active_key_id: fixed for
     // this instance's lifetime -- see class header's KeyRing note (Phase 2).
-    DurableAuditSink(const std::string& path, KeyRing& key_ring, std::uint32_t active_key_id) noexcept
+    // max_intent_orphans (SAFE-03 slice 2): how many Intent-only COIDs recovery tolerates before it reports
+    // CapacityExceeded (durable_control_plane.hpp's kMaxIntentOrphans). It can only TIGHTEN the budget -- a larger
+    // value is clamped to kMaxIntentOrphans -- so a test can reach the boundary without writing 4096 frames and
+    // no caller can lift the bound. Production passes nothing.
+    DurableAuditSink(const std::string& path, KeyRing& key_ring, std::uint32_t active_key_id,
+                     std::size_t max_intent_orphans = kMaxIntentOrphans) noexcept
         : log_store_(path, path + ".lock", path + ".tip"),
           rotation_log_store_(path + ".keyrotations", path + ".keyrotations.lock", path + ".keyrotations.tip"),
           store_identity_store_(path + ".storeid", path + ".storeid.lock", path + ".storeid.tip"),
           key_ring_(key_ring),
-          active_key_id_(active_key_id) {
+          active_key_id_(active_key_id),
+          max_intent_orphans_(max_intent_orphans < kMaxIntentOrphans ? max_intent_orphans : kMaxIntentOrphans) {
         if (!acquire_lock()) {
             recovery_status_ = RecoveryScanStatus::IoError;
             return;
@@ -385,7 +391,9 @@ public:
     FenceReason fence_reason() const noexcept { return fence_reason_; }
     RecoveryScanStatus recovery_status() const noexcept { return recovery_status_; }
 
-    // Every non-exchange-final order recovery_scan() found, in scan order.
+    // Every non-exchange-final order recovery_scan() found, in scan order --
+    // EXCEPT the Intent-only ones (nothing was ever sent for those; see
+    // recovered_intent_orphans()).
     // Fixed capacity matching InFlightRegistry's own kMaxInFlight -- if more
     // than that were found, recovery_status() is CapacityExceeded and this
     // array's first kMaxInFlight entries are populated (best-effort, but the
@@ -395,6 +403,14 @@ public:
     std::span<const OrderRecoveryCheckpoint> recovered_checkpoints() const noexcept {
         return std::span<const OrderRecoveryCheckpoint>(checkpoints_.data(), checkpoint_count_);
     }
+
+    // SAFE-03 slice 2 (SUBMITPORT spec round 9, "Intent-only orphans"): how many COIDs the scan found whose LAST
+    // durable frame is Intent. They are counted, not recovered -- not in recovered_checkpoints(), so
+    // apply_recovery() never registers them in flight and StartupRecovery never waits for them -- and they stay in
+    // the log for audit. max_intent_orphans() is their budget (kMaxIntentOrphans unless a test tightened it);
+    // one more than that is CapacityExceeded.
+    std::size_t recovered_intent_orphans() const noexcept { return intent_orphan_count_; }
+    std::size_t max_intent_orphans() const noexcept { return max_intent_orphans_; }
 
     // Appends one OrderEvent frame: encode -> write -> fsync log -> write tip
     // anchor -> fsync anchor -> Acked. Any failure at any step permanently
@@ -818,6 +834,15 @@ private:
         for (const auto& coid : coid_scan_order) {
             const ReplayState& rs = per_coid.at(coid);
             if (is_exchange_final(rs.state)) continue;  // nothing to recover
+            if (rs.state == OrderState::Intent) {
+                // SUBMITPORT spec round 9 ("Intent-only orphans"): the last durable frame is Intent, so
+                // OrderSubmitPrepared never landed and nothing was ever sent. Not a checkpoint -- it would be
+                // registered in flight and never resolved (nothing reconciles an Intent) -- only a count, against
+                // its own budget.
+                if (intent_orphan_count_ >= max_intent_orphans_) return RecoveryScanStatus::CapacityExceeded;
+                ++intent_orphan_count_;
+                continue;
+            }
             if (checkpoint_count_ >= checkpoints_.size()) return RecoveryScanStatus::CapacityExceeded;
 
             OrderRecoveryCheckpoint cp{};
@@ -1198,6 +1223,8 @@ private:
 
     std::array<OrderRecoveryCheckpoint, kMaxInFlight> checkpoints_{};
     std::size_t checkpoint_count_{0};
+    std::size_t max_intent_orphans_{kMaxIntentOrphans};
+    std::size_t intent_orphan_count_{0};
 
     ExportOutboxRing* export_outbox_{nullptr};
 

@@ -1830,6 +1830,22 @@ struct SealJournalAppliedView {
                                                         // copies under Ack
 };
 
+// --- kMaxIntentOrphans ---
+// Spec: docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md round 9, "Intent-only orphans" (§6.2).
+//
+// OrderIntentCreated is ACKed before CONFIRM, the port check and the in-flight registration (Gate 10b), so a
+// local refusal after it -- no operator confirmation, a confirmation that does not match, an invalid port, a
+// rate-limit refusal at the real charge, a full registry -- leaves a COID whose LAST durable frame is Intent.
+// Nothing was ever sent for it: OrderSubmitPrepared is durable before the send. Recovery therefore does not
+// hand such a COID to anybody -- it is not entered into InFlightRegistry, not reconciled, and does not count
+// toward kMaxInFlight (treating it as an open order stalled startup recovery in Reconciling until the
+// deadline, and more than kMaxInFlight of them overflowed the checkpoint table). It is only COUNTED, against this
+// separate budget, and stays in the log for audit; more than kMaxIntentOrphans of them is
+// RecoveryScanStatus::CapacityExceeded (the operator cleans up, or the log is compacted -- compaction and the
+// spec's kIntentOrphanRetainMs are not implemented yet, so this is the only bound). 4096 = 1 MiB of 256-byte
+// Intent frames (owner decision, 2026-10-13).
+inline constexpr std::size_t kMaxIntentOrphans = 4096;
+
 // --- OrderRecoveryCheckpoint ---
 // SPEC-STRUCT: docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:1289
 //

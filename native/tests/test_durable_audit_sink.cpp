@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -241,6 +242,8 @@ TEST_F(DurableAuditSinkTest, FreshStoreIsClean) {
     EXPECT_FALSE(sink.fenced());
     EXPECT_EQ(sink.recovery_status(), RecoveryScanStatus::Clean);
     EXPECT_TRUE(sink.recovered_checkpoints().empty());
+    EXPECT_EQ(sink.recovered_intent_orphans(), 0u);
+    EXPECT_EQ(sink.max_intent_orphans(), kMaxIntentOrphans);
 }
 
 TEST_F(DurableAuditSinkTest, AppendSucceedsAndAcksIncrementingSequence) {
@@ -326,29 +329,284 @@ TEST_F(DurableAuditSinkTest, MultipleOrdersRecoveredIndependently) {
     EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
 }
 
+// --- Intent-only orphans (SAFE-03 slice 2; SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md round 9) ---
+//
+// A client order id whose LAST durable frame is Intent was never sent: OrderSubmitPrepared is durable before the
+// send, and every local refusal after the Intent frame (no operator confirmation, a port that is not valid, a
+// rate-limit refusal at the real charge, a full in-flight registry) stops right there. Recovery counts such an id
+// against its own budget (kMaxIntentOrphans) and hands NOBODY a checkpoint for it. As a checkpoint it was
+// registered in flight and never resolved (nothing reconciles an Intent), one of them held startup recovery in
+// Reconciling until the deadline, and kMaxInFlight + 1 of them made the whole log CapacityExceeded.
+
+namespace {
+
+// "HY-0000", "HY-0001", ... -- one distinct fixed-width client order id per index.
+std::string indexed_coid(std::size_t i) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "HY-%04u", static_cast<unsigned>(i));
+    return std::string(buf);
+}
+
+// The comment on kMaxIntentOrphans sizes the budget at 1 MiB of Intent frames: pin the arithmetic it rests on.
+static_assert(kOrderEventFrameSize == 256, "one order-event frame is 256 bytes");
+static_assert(kMaxIntentOrphans == 4096, "owner decision 2026-10-13");
+static_assert(kMaxIntentOrphans * kOrderEventFrameSize == 1024u * 1024u, "the orphan budget is 1 MiB of frames");
+
+}  // namespace
+
+TEST_F(DurableAuditSinkTest, AnIntentOnlyOrderIsAnOrphanNotACheckpoint) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        // The refusal that follows (no confirmation, ...) writes nothing more: the id stays at Intent.
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_FALSE(restarted.fenced());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean)
+        << "an order that was never sent leaves nothing to recover";
+    EXPECT_TRUE(restarted.recovered_checkpoints().empty())
+        << "a checkpoint would be registered in flight and never resolved";
+    EXPECT_EQ(restarted.recovered_intent_orphans(), 1u);
+}
+
+TEST_F(DurableAuditSinkTest, ARepeatedIntentFrameForTheSameOrderIsStillOneOrphan) {
+    // A refused attempt retried under the SAME client order id: two Intent frames, one order.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1001).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(restarted.recovered_checkpoints().empty());
+    EXPECT_EQ(restarted.recovered_intent_orphans(), 1u);
+}
+
+TEST_F(DurableAuditSinkTest, AnOrderThatMovedPastIntentIsNeverAnOrphan) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        // HY-A: a refused attempt and then a retry under the same id that went out -- two Intent frames, then
+        // Submitting. It was sent, so it is an open order, whatever its first frames look like.
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1002).acked());
+        // HY-B: accepted and still open.
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-B", 200, 20, 2), 1003).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-B", 200, 20, 2), 1004).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-B", 2, 777), 1005).acked());
+        // HY-C: filled -- exchange-final, neither a checkpoint nor an orphan.
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-C", 300, 30, 3), 1006).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-C", 300, 30, 3), 1007).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-C", 3, 888), 1008).acked());
+        ASSERT_TRUE(sink.append_durable(make_filled("HY-C", 3, 888, 30, 300), 1009).acked());
+        // HY-D: refused before the send -- the only orphan.
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-D", 400, 40, 4), 1010).acked());
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 2u) << "only the two orders that were actually sent and are not final";
+    EXPECT_STREQ(cps[0].client_order_id.id, "HY-A");
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_STREQ(cps[1].client_order_id.id, "HY-B");
+    EXPECT_EQ(cps[1].resulting_state, OrderState::Accepted);
+    EXPECT_EQ(restarted.recovered_intent_orphans(), 1u) << "HY-D alone";
+}
+
+TEST_F(DurableAuditSinkTest, IntentOrphansDoNotCountTowardTheInFlightCapacity) {
+    // kMaxInFlight + 1 orphans. Before slice 2 each was an open-order checkpoint and this log was CapacityExceeded.
+    constexpr std::size_t kOrphans = kMaxInFlight + 1;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        for (std::size_t i = 0; i < kOrphans; ++i) {
+            const std::string coid = indexed_coid(i);
+            ASSERT_TRUE(
+                sink.append_durable(make_intent(coid.c_str(), 100, 10, 1), 1000 + static_cast<std::int64_t>(i))
+                    .acked());
+        }
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_FALSE(restarted.fenced());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(restarted.recovered_checkpoints().empty());
+    EXPECT_EQ(restarted.recovered_intent_orphans(), kOrphans);
+}
+
+TEST_F(DurableAuditSinkTest, IntentOrphansBesideRealOpenOrdersLeaveOnlyThoseOrdersAsCheckpoints) {
+    constexpr std::size_t kOrphans = kMaxInFlight + 1;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        for (std::size_t i = 0; i < kOrphans; ++i) {
+            const std::string coid = indexed_coid(i);
+            ASSERT_TRUE(
+                sink.append_durable(make_intent(coid.c_str(), 100, 10, 1), 1000 + static_cast<std::int64_t>(i))
+                    .acked());
+            if (i == 10) {  // a real order opens in the middle of the refusals
+                ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 5000).acked());
+                ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 5001).acked());
+            }
+        }
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_STREQ(cps[0].client_order_id.id, "HY-A");
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(restarted.recovered_intent_orphans(), kOrphans);
+}
+
+TEST_F(DurableAuditSinkTest, IntentOrphansAreStillCountedWhenTheCheckpointTableIsFull) {
+    // The registry-full refusal is how most orphans come about: kMaxInFlight orders are open, the next attempt
+    // writes its Intent frame (Gate 10b) and is refused at the in-flight registry (Gate 12b). The log then holds a
+    // FULL checkpoint table with orphans after it -- those must neither be refused for want of a checkpoint slot
+    // nor displace a real order.
+    constexpr std::size_t kOrphans = 3;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        for (std::size_t i = 0; i < kMaxInFlight; ++i) {
+            const std::string coid = indexed_coid(i);
+            const std::int64_t t = 1000 + 2 * static_cast<std::int64_t>(i);
+            ASSERT_TRUE(sink.append_durable(make_intent(coid.c_str(), 100, 10, 1), t).acked());
+            ASSERT_TRUE(sink.append_durable(make_submitted(coid.c_str(), 100, 10, 1), t + 1).acked());
+        }
+        for (std::size_t j = 0; j < kOrphans; ++j) {
+            const std::string coid = indexed_coid(1000 + j);
+            ASSERT_TRUE(
+                sink.append_durable(make_intent(coid.c_str(), 100, 10, 1), 5000 + static_cast<std::int64_t>(j))
+                    .acked());
+        }
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_FALSE(restarted.fenced());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    EXPECT_EQ(restarted.recovered_checkpoints().size(), kMaxInFlight);
+    EXPECT_EQ(restarted.recovered_intent_orphans(), kOrphans);
+}
+
+TEST_F(DurableAuditSinkTest, MoreOpenOrdersThanTheInFlightRegistryHoldsIsStillCapacityExceeded) {
+    // The orphan rule must not loosen the other bound: orders that WERE sent and are still open do land in the
+    // checkpoint table, and kMaxInFlight + 1 of them do not fit.
+    constexpr std::size_t kOpen = kMaxInFlight + 1;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        for (std::size_t i = 0; i < kOpen; ++i) {
+            const std::string coid = indexed_coid(i);
+            const std::int64_t t = 1000 + 2 * static_cast<std::int64_t>(i);
+            ASSERT_TRUE(sink.append_durable(make_intent(coid.c_str(), 100, 10, 1), t).acked());
+            ASSERT_TRUE(sink.append_durable(make_submitted(coid.c_str(), 100, 10, 1), t + 1).acked());
+        }
+    }
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::CapacityExceeded);
+    EXPECT_TRUE(restarted.fenced());
+    EXPECT_EQ(restarted.recovered_checkpoints().size(), kMaxInFlight) << "the first kMaxInFlight, in scan order";
+    EXPECT_EQ(restarted.recovered_intent_orphans(), 0u);
+}
+
+TEST_F(DurableAuditSinkTest, TheIntentOrphanBudgetIsAnExactBound) {
+    // A budget of N holds N orphans and refuses the (N+1)th. One log grows across the boundary for N = 0..3; the
+    // budget is tightened through the constructor so that 4096 frames need not be written.
+    for (std::size_t n = 0; n <= 3; ++n) {
+        {  // the log holds exactly n orphans: a budget of n takes them all
+            DurableAuditSink at_budget(base_path_, *key_ring_, 1, n);
+            ASSERT_TRUE(at_budget.is_open());
+            EXPECT_EQ(at_budget.max_intent_orphans(), n);
+            EXPECT_EQ(at_budget.recovery_status(), RecoveryScanStatus::Clean) << "n=" << n;
+            EXPECT_FALSE(at_budget.fenced()) << "n=" << n;
+            EXPECT_EQ(at_budget.recovered_intent_orphans(), n);
+        }
+        if (n > 0) {  // ...and a budget of n-1 does not
+            DurableAuditSink below(base_path_, *key_ring_, 1, n - 1);
+            ASSERT_TRUE(below.is_open());
+            EXPECT_EQ(below.recovery_status(), RecoveryScanStatus::CapacityExceeded) << "n=" << n;
+            EXPECT_TRUE(below.fenced()) << "a log that cannot be accounted for takes no appends, n=" << n;
+            EXPECT_FALSE(below.append_durable(make_intent("HY-NO", 100, 10, 1), 9000).acked());
+        }
+        {  // one more orphan
+            DurableAuditSink writer(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(writer.is_open());
+            ASSERT_FALSE(writer.fenced()) << "n=" << n;
+            const std::string coid = indexed_coid(n);
+            ASSERT_TRUE(writer.append_durable(make_intent(coid.c_str(), 100, 10, 1), 1000).acked());
+        }
+    }
+}
+
+TEST_F(DurableAuditSinkTest, TheIntentOrphanBudgetCanOnlyBeTightened) {
+    {
+        DurableAuditSink by_default(base_path_, *key_ring_, 1);
+        EXPECT_EQ(by_default.max_intent_orphans(), kMaxIntentOrphans);
+    }
+    {
+        DurableAuditSink exact(base_path_, *key_ring_, 1, kMaxIntentOrphans);
+        EXPECT_EQ(exact.max_intent_orphans(), kMaxIntentOrphans);
+    }
+    {
+        DurableAuditSink above(base_path_, *key_ring_, 1, kMaxIntentOrphans + 1);
+        EXPECT_EQ(above.max_intent_orphans(), kMaxIntentOrphans) << "a larger budget is clamped, never honoured";
+    }
+    {
+        DurableAuditSink huge(base_path_, *key_ring_, 1, std::numeric_limits<std::size_t>::max());
+        EXPECT_EQ(huge.max_intent_orphans(), kMaxIntentOrphans);
+    }
+    {
+        DurableAuditSink none(base_path_, *key_ring_, 1, 0);
+        EXPECT_EQ(none.max_intent_orphans(), 0u) << "a tighter budget is honoured, down to none";
+    }
+}
+
 // --- Torn write vs corruption (the round-6-P0 distinction) ---
 
 TEST_F(DurableAuditSinkTest, TornTailWriteDiscardsOnlyTheIncompleteRecord) {
     {
         DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
-        // Anchor now correctly points at sequence 0. Simulate a crash mid-way
-        // through what would have been the NEXT append (Submitting) -- a
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        // Anchor now correctly points at sequence 1. Simulate a crash mid-way
+        // through what would have been the NEXT append (Accepted) -- a
         // real partial frame prefix lands in the log, but nothing ever
         // touched the anchor for it, exactly like a real crash before that
         // append's own fsync.
+    }
+    append_prefix_of_a_real_frame(make_accepted("HY-A", 1, 555), /*sequence_number=*/2, kZeroMac,
+                                   /*prefix_len=*/30);
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered)
+        << "two complete frames (Intent, Submitting) should remain and recover cleanly";
+    auto cps = restarted.recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous)
+        << "only the first two frames are real (Submitting, remapped to Ambiguous); the trailing garbage must be "
+           "discarded as a torn tail -- Accepted here would mean the partial frame was applied";
+}
+
+TEST_F(DurableAuditSinkTest, TornTailAfterAnIntentOnlyOrderLeavesAnOrphanNotACheckpoint) {
+    // The crash falls between the Intent frame and the Submitting frame: the partial Submitting frame is
+    // discarded, so the order was never sent -- an orphan (SAFE-03 slice 2), nothing to recover.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
     }
     append_prefix_of_a_real_frame(make_submitted("HY-A", 100, 10, 1), /*sequence_number=*/1, kZeroMac,
                                    /*prefix_len=*/30);
 
     DurableAuditSink restarted(base_path_, *key_ring_, 1);
     ASSERT_TRUE(restarted.is_open());
-    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered)
-        << "one complete frame (Intent) should remain and recover cleanly";
-    auto cps = restarted.recovered_checkpoints();
-    ASSERT_EQ(cps.size(), 1u);
-    EXPECT_EQ(cps[0].resulting_state, OrderState::Intent)
-        << "only the first frame (Intent) is real; the trailing garbage must be discarded as a torn tail";
+    EXPECT_FALSE(restarted.fenced());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean)
+        << "one complete frame (Intent) remains, and an Intent-only order has nothing to recover";
+    EXPECT_TRUE(restarted.recovered_checkpoints().empty());
+    EXPECT_EQ(restarted.recovered_intent_orphans(), 1u);
 }
 
 TEST_F(DurableAuditSinkTest, TornTailUnderSixBytesIsRecoveredNotCorrupt) {
@@ -361,8 +619,9 @@ TEST_F(DurableAuditSinkTest, TornTailUnderSixBytesIsRecoveredNotCorrupt) {
     {
         DurableAuditSink sink(base_path_, *key_ring_, 1);
         ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
     }
-    append_prefix_of_a_real_frame(make_submitted("HY-A", 100, 10, 1), /*sequence_number=*/1, kZeroMac,
+    append_prefix_of_a_real_frame(make_accepted("HY-A", 1, 555), /*sequence_number=*/2, kZeroMac,
                                    /*prefix_len=*/3);
 
     DurableAuditSink restarted(base_path_, *key_ring_, 1);
@@ -372,7 +631,7 @@ TEST_F(DurableAuditSinkTest, TornTailUnderSixBytesIsRecoveredNotCorrupt) {
            "never misclassified as Corrupt from the key_id peek alone";
     auto cps = restarted.recovered_checkpoints();
     ASSERT_EQ(cps.size(), 1u);
-    EXPECT_EQ(cps[0].resulting_state, OrderState::Intent);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
 }
 
 TEST_F(DurableAuditSinkTest, AnchorAheadOfTruncatedLogIsCorruptTailDeletion) {
