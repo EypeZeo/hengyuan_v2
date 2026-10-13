@@ -106,11 +106,13 @@ struct FakeExchange {
     std::int64_t filled_qty{0};
     std::int64_t exchange_order_id{555};
     int calls{0};
+    std::vector<std::string> asked;  // the client order id of every query, in order
 };
 
-QueryResult fake_query(const OrderExpectation&, void* user_data) {
+QueryResult fake_query(const OrderExpectation& exp, void* user_data) {
     auto* fx = static_cast<FakeExchange*>(user_data);
     ++fx->calls;
+    fx->asked.emplace_back(exp.client_order_id.id);
     QueryResult r{};
     r.outcome = fx->outcome;
     r.confirmed_state = fx->state;
@@ -708,6 +710,126 @@ TEST_F(StartupRecoveryLogTest, TallyClassifiesResolvedKnownLiveAndUnconfirmed) {
     EXPECT_EQ(after.known_live, 2u);
     EXPECT_EQ(after.unconfirmed, 0u);
     EXPECT_EQ(after.resolved, 0u);
+}
+
+// ================================================================================================
+// SAFE-03 slice 2 (SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md round 9): an Intent-only order was never sent
+//
+// A local refusal after the Intent frame (no operator confirmation, ...) leaves a client order id whose last
+// durable frame is Intent. The recovery scan COUNTS it (DurableAuditSink::recovered_intent_orphans()) and makes
+// no checkpoint for it, so apply_recovery() never registers it in flight and nothing reconciles it. Before slice
+// 2 it was an open-order checkpoint -- registered, queried, never confirmed -- and a single one held
+// StartupRecovery in Reconciling until the deadline made it Degraded.
+// ================================================================================================
+
+TEST_F(StartupRecoveryLogTest, AnIntentOnlyOrderIsNeitherRegisteredNorReconciledAndStartupReachesReady) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }  // refused before the send, then "crash"
+
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean);
+    ASSERT_TRUE(restarted.recovered_checkpoints().empty());
+    ASSERT_EQ(restarted.recovered_intent_orphans(), 1u);
+
+    const RecoveryApplyResult applied = apply(restarted);
+    EXPECT_EQ(applied.recovered, 0u);
+    EXPECT_TRUE(applied.ok());
+    EXPECT_EQ(in_flight_.count(), 0u);
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A")) << "it was never sent: it holds no in-flight slot";
+
+    exchange_.outcome = QueryOutcome::Inconclusive;
+    tick(0);
+    EXPECT_TRUE(exchange_.asked.empty()) << "nothing is asked of the exchange about an order that was never sent";
+    EXPECT_EQ(truth_.tracked_symbol_count(), 0u);
+
+    StartupRecovery sm(10'000);
+    EXPECT_EQ(sm.update(observe(restarted, applied), 0), RunState::Ready);
+    EXPECT_TRUE(sm.submit_enabled(observe(restarted, applied)));
+}
+
+TEST_F(StartupRecoveryLogTest, IntentOnlyOrdersBesideARealOpenOrderDoNotHoldBackItsResolution) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-O1", 100, 10, 1), 1000).acked());  // refused
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1002).acked());  // sent, then "crash"
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-O2", 100, 10, 1), 1003).acked());  // refused
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 1u);
+    ASSERT_EQ(restarted.recovered_intent_orphans(), 2u);
+
+    const RecoveryApplyResult applied = apply(restarted);
+    ASSERT_TRUE(applied.ok());
+    EXPECT_EQ(applied.recovered, 1u);
+    EXPECT_EQ(in_flight_.count(), 1u);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-O1"));
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-O2"));
+
+    StartupRecovery sm(60'000);
+    exchange_.outcome = QueryOutcome::Inconclusive;
+    tick(0);
+    EXPECT_EQ(sm.update(observe(restarted, applied), 0), RunState::Reconciling) << "it waits for HY-A, and for HY-A only";
+
+    exchange_.outcome = QueryOutcome::Found;
+    exchange_.state = OrderState::Filled;
+    exchange_.filled_qty = 10;
+    tick(1'000);
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+    EXPECT_EQ(sm.update(observe(restarted, applied), 1'000), RunState::Ready);
+
+    ASSERT_FALSE(exchange_.asked.empty());
+    for (const std::string& coid : exchange_.asked) {
+        EXPECT_EQ(coid, "HY-A") << "only the order that was sent is ever asked about";
+    }
+}
+
+TEST_F(StartupRecoveryLogTest, MoreIntentOnlyOrdersThanTheInFlightRegistryHoldsStillStartUp) {
+    // Seventy refusals in one life: past kMaxInFlight, which made the log CapacityExceeded and the start Degraded.
+    constexpr std::size_t kRefused = kMaxInFlight + 6;
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        for (std::size_t i = 0; i < kRefused; ++i) {
+            char coid[16];
+            std::snprintf(coid, sizeof(coid), "HY-R%04u", static_cast<unsigned>(i));
+            ASSERT_TRUE(sink.append_durable(make_intent(coid, 100, 10, 1), 1000 + static_cast<std::int64_t>(i)).acked());
+        }
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean);
+    ASSERT_EQ(restarted.recovered_intent_orphans(), kRefused);
+
+    const RecoveryApplyResult applied = apply(restarted);
+    EXPECT_EQ(applied.recovered, 0u);
+    EXPECT_TRUE(applied.ok());
+    EXPECT_EQ(in_flight_.count(), 0u);
+
+    StartupRecovery sm(10'000);
+    EXPECT_EQ(sm.update(observe(restarted, applied), 0), RunState::Ready);
+    EXPECT_TRUE(sm.submit_enabled(observe(restarted, applied)));
+}
+
+TEST_F(StartupRecoveryLogTest, AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan) {
+    // The budget is a real bound: past it the log is CapacityExceeded, the sink is fenced, and startup is Degraded --
+    // the operator cleans up or compacts, exactly as for every other RecoveryScanStatus failure.
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        for (const char* coid : {"HY-O1", "HY-O2", "HY-O3"}) {
+            ASSERT_TRUE(sink.append_durable(make_intent(coid, 100, 10, 1), 1000).acked());
+        }
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1, /*max_intent_orphans=*/2);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::CapacityExceeded);
+    ASSERT_TRUE(restarted.fenced());
+
+    const RecoveryApplyResult applied = apply(restarted);
+    StartupRecovery sm(10'000);
+    EXPECT_EQ(sm.update(observe(restarted, applied), 0), RunState::Degraded);
+    EXPECT_FALSE(sm.submit_enabled(observe(restarted, applied)));
 }
 
 // ================================================================================================

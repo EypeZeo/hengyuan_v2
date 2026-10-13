@@ -258,11 +258,39 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       ACK 到 `apply_fill` 之间的几条指令。
     - **帧头时间**沿用上一条的限制②：排空的 `now_ms` 进入 `append_durable()` 的帧头，与 `ctx.now_ms` 同一
       时钟域，生产接线必须先把它定为服务器校正后的 UTC。
-    - **仍未覆盖**：路径 ③ `drain_user_data_events()`（同样只写内存审计环；下一片，其持久帧同样必须满足回放
-      合法性）；同步 POST 路径本就先持久确认再转移，逐分支复核留待后续；读代码时发现的既有缺口，本片不动：
+    - **仍未覆盖**：路径 ③ `drain_user_data_events()`（同样只写内存审计环；Owner 2026-10-13 决定并入“私网流迁移”
+      一起设计，其持久帧同样必须满足回放合法性）；同步 POST 路径（路径 ①）的逐分支复核已补齐（测试
+      LiveSubmitOutcomeAckTest）；读代码时发现的既有缺口，本片不动：
       `poll_once()` 不再轮询 `CancelRequested` 状态的订单（只轮询 `Ambiguous` 与 `Accepted`/`PartialFill`），
       所以一旦观察到 `PENDING_CANCEL`，该订单的槽位要等重启才会重新被对账（Binance 现货文档把该状态标为
       目前未使用）。
+  - **[SAFE-03 切片 2 已落地：只有 Intent 的孤儿不再是未决订单；重复单在写 Intent 帧之前就被拒]**（SUBMITPORT 规格
+    第 9 轮“Intent-only orphans”——规格里写了、代码里从未实现的那一条）：`orchestrate_submit()` 在 Gate 10b 把
+    `Intent` 帧持久确认**在** CONFIRM、端口校验、在途登记、真实限流扣费**之前**，所以这些本地拒绝
+    （`OperatorNotConfirmed`、`ConfirmationMismatch`、`SubmitPortInvalid`、`InFlightRegistryUnavailable`、Gate 12c 的
+    `RateLimitExhausted`、在途表已满）都会留下一个最后一帧是 `Intent` 的客户端订单号——它从未发出过
+    （`OrderSubmitPrepared` 在发送之前就已落盘）。此前恢复扫描把它当成与任何未决订单一样的检查点：登记进在途表、
+    排进对账，可没有任何东西会去解决一个 `Intent`——一个就足以让启动恢复停在对账阶段直到超时降级，
+    `kMaxInFlight` + 1 个就让整本日志 `CapacityExceeded`（用真实日志的探针验证过）。注意在途表满时的拒绝恰恰
+    是孤儿最常见的来源，所以“64 笔未决订单 + 若干孤儿”必须仍是 `Recovered`。
+    - **扫描**（`DurableAuditSink`）：最后状态为 `Intent` 的订单号不产生 `OrderRecoveryCheckpoint`，只计数
+      （`recovered_intent_orphans`）；预算 `kMaxIntentOrphans` = 4096（Owner 决定，2026-10-13；4096 × 256 字节 =
+      1 MiB 的 Intent 帧）与 `kMaxInFlight` 分开，超过则 `RecoveryScanStatus::CapacityExceeded`（接收器围栏，
+      与其他扫描失败同等对待）；只有孤儿的日志是 `Clean`。构造函数的可选第四参数 `max_intent_orphans` 只能
+      收紧、不能放宽（大于 `kMaxIntentOrphans` 的值被夹回），测试因此不必写 4096 帧就能到达边界。孤儿留在日志里
+      供审计；规格还设想的压实归档（`kIntentOrphanRetainMs`）本片不做，所以压实存在之前，预算是唯一的界。
+    - **重复单**：编排器在 Gate 10 之前加了只读的在途预检（Gate 9b）：同一订单号已在途时，在写任何持久帧之前就
+      以 `DuplicateInFlight` 拒绝。此前第二个 `Intent` 帧先落盘、到 Gate 12b 才被登记表拒绝，而 `Submitting` /
+      `Accepted` 之后的 `Intent` 是非法转移，下次启动整本日志 `Corrupt`。Gate 12b 的登记保留（它同时是容量检查，
+      也是真正占槽的那一步）。预检与登记之间没有别的线程：登记表只属于热线程。
+    - **不变**：回放合法性规则一字未改——首帧必须是 `Intent`，同状态的重复帧只要成交量单调且不超过意图即可，
+      其余转移必须满足 `validate_transition()`；因此“被拒的尝试又用同一个订单号重来并且发出去了”仍是一个正常的
+      未决订单（先两个 `Intent` 帧，再 `Submitting`）。
+    - **仍未覆盖**：孤儿的压实归档；发送前拒绝的持久“关闭帧”；已经终态的订单号被复用（终态之后再来一个
+      `Intent` 仍是 `Corrupt`，Gate 9b 只看在途表，不看日志）。
+    - 旁注（既有，与本片无关，已用探针验证）：日志在崩溃后带着被撕裂的尾巴重新打开时，扫描只在逻辑上丢弃那段尾巴，
+      **不做物理截断**；之后任何一次成功的追加都落在撕裂字节之后，再下一次启动判 `Corrupt`——失败关闭，但恰好发生
+      在崩溃恢复本该救场的场景里。另立一片。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 

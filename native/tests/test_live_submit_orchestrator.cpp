@@ -30,12 +30,16 @@ using namespace hy;
 // --- Mock submit port ---
 
 static SubmitResponse g_mock_response{};
+// How many times the mock port was actually called -- i.e. how many orders "reached the exchange". The recovery rule
+// for Intent-only orphans (SAFE-03 slice 2) is only sound if a refusal that leaves one never sent anything.
+static int g_mock_submit_calls{0};
 
 static SubmitResponse mock_submit(
     const char* /*coid*/, std::uint32_t /*sym*/,
     OrderSide /*side*/, OrderType /*type*/,
     std::int64_t /*price*/, std::int64_t /*qty*/,
     const SymbolRules& /*rules_snapshot*/, void* /*ud*/) {
+    ++g_mock_submit_calls;
     return g_mock_response;
 }
 
@@ -164,6 +168,7 @@ protected:
         g_mock_current_rules_version = 1;
 
         g_mock_response = {SubmitOutcome::Accepted, 12345, 0};
+        g_mock_submit_calls = 0;
         ctx_.submit_port = {mock_submit, nullptr, mock_current_rules_version};
 
         // Phase 3: fake durable-audit port, defaults to "never fails" -- matches
@@ -697,6 +702,24 @@ TEST_F(LiveSubmitTest, DuplicateInFlightBlocked) {
     EXPECT_EQ(r.gate, OrchestratorGate::DuplicateInFlight);
 }
 
+TEST_F(LiveSubmitTest, ADuplicateOfAnInFlightOrderIsRefusedBeforeAnyDurableFrameIsWritten) {
+    // SAFE-03 slice 2: the Intent frame is the FIRST frame of an id's history. A duplicate of an order that is
+    // already in flight used to write a second one -- an Intent after Submitting / Accepted is an illegal
+    // transition for the recovery scan, and made the whole log Corrupt on the next start -- and was refused only
+    // afterwards, at the registry (Gate 12b).
+    auto coid = make_client_order_id(ctx_.now_ms, ctx_.sequence, ctx_.symbol_id);
+    ASSERT_TRUE(in_flight_.register_submit(coid.view()));
+    const std::uint64_t frames_before = fake_durable_audit_.next_sequence;
+    const std::size_t ring_before = audit_.count();
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::DuplicateInFlight);
+    EXPECT_EQ(fake_durable_audit_.next_sequence, frames_before) << "a refused duplicate writes no durable frame";
+    EXPECT_EQ(in_flight_.count(), 1u) << "the order that is in flight still holds its one slot";
+    EXPECT_GT(audit_.count(), ring_before) << "the refusal is still on the memory audit ring";
+}
+
 TEST_F(LiveSubmitTest, InFlightRegistryUnavailableFailsClosed) {
     ctx_.in_flight = nullptr;
     auto r = orchestrate_submit(ctx_);
@@ -740,6 +763,50 @@ TEST_F(LiveSubmitTest, SubmittingNotSetIfPreparedAppendFails) {
     EXPECT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
     // Not Submitting -- the transition site never ran.
     EXPECT_EQ(r.order.state, OrderState::Intent);
+}
+
+TEST_F(LiveSubmitTest, NothingIsSentWhenThePreparedAckFails) {
+    // The premise of the Intent-only orphan rule (SAFE-03 slice 2): OrderSubmitPrepared is durable BEFORE the send, so a
+    // client order id whose last durable frame is Intent was never sent. Pin the premise itself.
+    fake_durable_audit_.prepared_should_fail = true;
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
+    EXPECT_EQ(g_mock_submit_calls, 0) << "the port was called although the Prepared frame was not acknowledged";
+}
+
+TEST_F(LiveSubmitTest, NothingIsSentWhenTheIntentAckFailsEither) {
+    fake_durable_audit_.intent_should_fail = true;
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
+    EXPECT_EQ(g_mock_submit_calls, 0);
+}
+
+TEST_F(LiveSubmitTest, ARefusalAfterTheIntentFrameSendsNothing) {
+    // Every local refusal that leaves an Intent-only order id behind (Gate 11 to Gate 12c) stops before the port.
+    ctx_.confirmation.confirmed = false;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::OperatorNotConfirmed);
+    bind_confirmation();
+
+    ctx_.confirmation.qty_ticks += 10;
+    ctx_.sequence = 2;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::ConfirmationMismatch);
+    bind_confirmation();
+
+    const SubmitPort good_port = ctx_.submit_port;
+    ctx_.submit_port = {nullptr, nullptr, mock_current_rules_version};
+    ctx_.sequence = 3;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitPortInvalid);
+    ctx_.submit_port = good_port;
+
+    for (std::size_t i = 0; i < kMaxInFlight; ++i) {
+        char id[16];
+        std::snprintf(id, sizeof(id), "HY-FULL%02u", static_cast<unsigned>(i));
+        ASSERT_TRUE(in_flight_.register_submit(id));
+    }
+    ctx_.sequence = 4;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::DuplicateInFlight);  // no free slot
+
+    EXPECT_EQ(g_mock_submit_calls, 0) << "none of the four refusals may have reached the exchange";
 }
 
 TEST_F(LiveSubmitTest, InFlightNotReleasedIfOutcomeAppendFailsRejected) {
@@ -1237,4 +1304,146 @@ TEST_F(LiveSubmitDurableIntegrationTest, AReconcileResolutionIsDurableBeforeItsS
     ASSERT_TRUE(restarted->is_open());
     EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Clean);
     EXPECT_TRUE(restarted->recovered_checkpoints().empty());
+}
+
+// --- SAFE-03 slice 2 on a REAL durable log: the Intent frame is a COID's FIRST frame, and a refusal after it is
+// an Intent-only orphan (SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md round 9) ---
+
+TEST_F(LiveSubmitDurableIntegrationTest, ADuplicateOfAnInFlightOrderLeavesALogThatStillReplays) {
+    auto first = orchestrate_submit(ctx_);
+    ASSERT_EQ(first.gate, OrchestratorGate::SubmitAccepted);
+    ASSERT_TRUE(in_flight_.is_in_flight(first.order.client_order_id.view()));
+
+    // The very same intent again (same now_ms / sequence / symbol, so the same client order id) while the first
+    // order is still open.
+    auto again = orchestrate_submit(ctx_);
+    ASSERT_EQ(again.gate, OrchestratorGate::DuplicateInFlight);
+    EXPECT_EQ(in_flight_.count(), 1u);
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    EXPECT_FALSE(restarted->fenced());
+    EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Recovered)
+        << "a second Intent frame after Accepted is an illegal transition: the refused duplicate must not have "
+           "written one";
+    auto cps = restarted->recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Accepted);
+    EXPECT_STREQ(cps[0].client_order_id.id, first.order.client_order_id.id);
+    EXPECT_EQ(restarted->recovered_intent_orphans(), 0u);
+}
+
+TEST_F(LiveSubmitDurableIntegrationTest, EveryLocalRefusalAfterTheIntentFrameLeavesAnOrphanAndNothingElse) {
+    // Gate 10b makes the Intent frame durable BEFORE CONFIRM, the port check and the in-flight registration, so
+    // each of these refusals leaves a client order id whose last durable frame is Intent. Nothing was sent.
+    ctx_.confirmation.confirmed = false;  // 1. the operator never confirmed
+    ctx_.sequence = 11;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::OperatorNotConfirmed);
+    bind_confirmation();
+
+    ctx_.confirmation.qty_ticks += 10;  // 2. the confirmation authorizes another order
+    ctx_.sequence = 12;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::ConfirmationMismatch);
+    bind_confirmation();
+
+    const SubmitPort good_port = ctx_.submit_port;
+    ctx_.submit_port = {nullptr, nullptr, mock_current_rules_version};  // 3. no usable submit port
+    ctx_.sequence = 13;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitPortInvalid);
+    ctx_.submit_port = good_port;
+
+    InFlightRegistry* const registry = ctx_.in_flight;
+    ctx_.in_flight = nullptr;  // 4. no in-flight registry
+    ctx_.sequence = 14;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::InFlightRegistryUnavailable);
+    ctx_.in_flight = registry;
+
+    EXPECT_EQ(in_flight_.count(), 0u) << "none of them held a slot";
+    EXPECT_EQ(g_mock_submit_calls, 0) << "and none of them reached the exchange";
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    EXPECT_FALSE(restarted->fenced());
+    EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Clean) << "four orders that were never sent";
+    EXPECT_TRUE(restarted->recovered_checkpoints().empty());
+    EXPECT_EQ(restarted->recovered_intent_orphans(), 4u);
+}
+
+TEST_F(LiveSubmitDurableIntegrationTest, ARefusalBecauseTheRegistryIsFullLeavesAnOrphanNotAnOpenOrder) {
+    // The commonest way an orphan arises: every in-flight slot is taken (by orders that are not in this log), the
+    // next attempt writes its Intent frame at Gate 10b and finds no free slot at Gate 12b.
+    for (std::size_t i = 0; i < kMaxInFlight; ++i) {
+        char id[16];
+        std::snprintf(id, sizeof(id), "HY-FULL%02u", static_cast<unsigned>(i));
+        ASSERT_TRUE(in_flight_.register_submit(id));
+    }
+    ASSERT_EQ(in_flight_.count(), kMaxInFlight);
+
+    ctx_.sequence = 5;
+    const OrchestratorResult r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::DuplicateInFlight) << "capacity is reported through the same gate";
+    EXPECT_FALSE(in_flight_.is_in_flight(r.order.client_order_id.view()));
+    EXPECT_EQ(g_mock_submit_calls, 0);
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    EXPECT_FALSE(restarted->fenced());
+    EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(restarted->recovered_checkpoints().empty());
+    EXPECT_EQ(restarted->recovered_intent_orphans(), 1u);
+}
+
+TEST_F(LiveSubmitDurableIntegrationTest, ARefusedAttemptRetriedUnderTheSameIdIsOneOpenOrderNotAnOrphan) {
+    ctx_.confirmation.confirmed = false;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::OperatorNotConfirmed);  // Intent frame, nothing sent
+
+    bind_confirmation();  // the retry keeps now_ms / sequence / symbol, so it keeps the client order id
+    const OrchestratorResult sent = orchestrate_submit(ctx_);
+    ASSERT_EQ(sent.gate, OrchestratorGate::SubmitAccepted);
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    EXPECT_FALSE(restarted->fenced());
+    EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Recovered)
+        << "Intent, Intent, Prepared, Accepted: every frame a repeat or a legal transition";
+    auto cps = restarted->recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Accepted);
+    EXPECT_STREQ(cps[0].client_order_id.id, sent.order.client_order_id.id);
+    EXPECT_EQ(restarted->recovered_intent_orphans(), 0u) << "an order that moved past Intent is not an orphan";
+}
+
+TEST_F(LiveSubmitDurableIntegrationTest, RefusalsAfterTheIntentFrameDoNotStopTheNextStartNoMatterHowMany) {
+    // Seventy attempts the operator never confirmed -- more than the in-flight registry holds. Each wrote its
+    // durable Intent frame and was refused at CONFIRM. Then one confirmed order goes out and stays open.
+    constexpr std::size_t kRefused = kMaxInFlight + 6;
+    ctx_.confirmation.confirmed = false;
+    for (std::size_t i = 0; i < kRefused; ++i) {
+        ctx_.sequence = static_cast<std::uint32_t>(100 + i);
+        const OrchestratorResult r = orchestrate_submit(ctx_);
+        ASSERT_EQ(r.gate, OrchestratorGate::OperatorNotConfirmed) << "attempt " << i;
+    }
+    EXPECT_EQ(in_flight_.count(), 0u) << "a refused attempt holds no slot";
+    EXPECT_EQ(g_mock_submit_calls, 0) << "and none of them reached the exchange";
+
+    bind_confirmation();
+    ctx_.sequence = 1;
+    const OrchestratorResult sent = orchestrate_submit(ctx_);
+    ASSERT_EQ(sent.gate, OrchestratorGate::SubmitAccepted);
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    EXPECT_FALSE(restarted->fenced());
+    EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Recovered)
+        << "seventy-one open orders would have been CapacityExceeded";
+    auto cps = restarted->recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u) << "only the order that was actually sent";
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Accepted);
+    EXPECT_STREQ(cps[0].client_order_id.id, sent.order.client_order_id.id);
+    EXPECT_EQ(restarted->recovered_intent_orphans(), kRefused);
 }

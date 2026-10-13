@@ -376,22 +376,18 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
 
     // ...and what two real threads made the hot thread write must replay: reopen the log (the recovery scan
     // rejects any frame that is neither a repeat of an order's state nor a legal transition from it). Every
-    // submitted order is exchange-final by now; the only open ones are the orders refused for capacity, which
-    // stopped after their Intent frame. (A recovery scan holds at most kMaxInFlight open orders: past that
-    // it reports CapacityExceeded, which says nothing about the frames themselves.)
+    // submitted order is exchange-final by now; the only others are the orders refused for capacity, which
+    // stopped after their Intent frame. Those were never sent -- Intent-only orphans (SAFE-03 slice 2): counted
+    // against their own budget, never open orders, so there is not a single checkpoint and the scan is Clean
+    // however many were refused (other_count <= kIterations <= kMaxIntentOrphans).
     {
         DurableAuditSink replayed(durable_audit_path, *key_ring, 1);
         ASSERT_TRUE(replayed.is_open());
-        const RecoveryScanStatus status = replayed.recovery_status();
-        EXPECT_NE(status, RecoveryScanStatus::Corrupt) << "a frame the drain wrote is not replayable";
-        if (static_cast<std::size_t>(other_count) <= kMaxInFlight) {
-            EXPECT_TRUE(status == RecoveryScanStatus::Clean || status == RecoveryScanStatus::Recovered);
-            EXPECT_EQ(replayed.recovered_checkpoints().size(), static_cast<std::size_t>(other_count));
-            for (const OrderRecoveryCheckpoint& cp : replayed.recovered_checkpoints()) {
-                EXPECT_EQ(cp.resulting_state, OrderState::Intent)
-                    << "an order that reached the exchange is still open in the durable log";
-            }
-        }
+        EXPECT_FALSE(replayed.fenced());
+        EXPECT_EQ(replayed.recovery_status(), RecoveryScanStatus::Clean) << "a frame the drain wrote is not replayable";
+        EXPECT_TRUE(replayed.recovered_checkpoints().empty())
+            << "an order that reached the exchange is exchange-final in the durable log";
+        EXPECT_EQ(replayed.recovered_intent_orphans(), static_cast<std::size_t>(other_count));
     }
     key_ring.reset();
     std::remove(durable_audit_path.c_str());
