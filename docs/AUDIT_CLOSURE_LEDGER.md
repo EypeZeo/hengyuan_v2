@@ -96,7 +96,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | :---: | :---: | :---: | :---: | :--- | :---: | :--- |
 | **P0-001** | CRITICAL | live | REMEDIATING | 实盘订单提交 | BLOCKED | code, fault, test, runtime, budget |
 | **P1-001** | HIGH | lib | CLOSED | 真实网络调用 | CLEARED | — |
-| **P1-002** | HIGH | live | REMEDIATING | 订单生命周期 | BLOCKED | code, fault, test, runtime, budget |
+| **P1-002** | HIGH | live | PARTIAL | 订单生命周期 | BLOCKED | code, runtime, budget |
 | **P1-003** | HIGH | lib | CLOSED | 账户数据解析 | CLEARED | — |
 | **P1-004** | HIGH | lib | PARTIAL | 策略回测准入 | BLOCKED | contract |
 | **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | code, fault, test, runtime, budget |
@@ -141,7 +141,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 7，DEFERRED 3，PARTIAL 3，CLOSED 13，合计 26。
+状态计数：REMEDIATING 6，DEFERRED 3，PARTIAL 4，CLOSED 13，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -175,7 +175,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-028** | CANARY | L4 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-029** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-030** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-031** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-031** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 38d59cf |
 | **FI-032** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 8c616a4 |
 | **FI-033** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 2a7e383 |
 | **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
@@ -193,11 +193,11 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 28 | 4 | 16 | 8 | BLOCKED |
+| PRE_D3 | 28 | 4 | 17 | 7 | BLOCKED |
 | PRE_OWNER_LIVE | 13 | 0 | 1 | 12 | BLOCKED |
 | CANARY | 4 | 0 | 0 | 4 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 24，PARTIAL 17，IMPLEMENTED 4，合计 45，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 23，PARTIAL 18，IMPLEMENTED 4，合计 45，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -267,18 +267,18 @@ legacy: P1-002
 title: 订单跟踪器对账终态只写内存环形缓冲即释放槽位（用户数据流排空函数同形）
 severity: HIGH
 kind: live
-status: REMEDIATING
+status: PARTIAL
 task: SAFE-03
 gate: 订单生命周期
 gate_result: BLOCKED
-open: open:native/include/hengyuan/order_tracker.hpp#"AuditRingSink* audit," open:native/include/hengyuan/binance_user_data_event.hpp#"AuditRingSink* audit," absent:native/include/hengyuan/order_tracker.hpp#DurableAuditSink
-refs: code:native/include/hengyuan/order_tracker.hpp#drain_reconcile_events code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events code:native/include/hengyuan/durable_audit_sink.hpp#DurableAuditSink
-seg.code: MISSING -- drain_reconcile_events 把终态记录 append 到内存环形缓冲 AuditRingSink* 后立即释放槽位；drain_user_data_events 同样只写这个内存环形缓冲（它持有的是 const 注册表，不释放槽位）；持久接收器 DurableAuditSink 不在这两条路径上，终态记录从未进入持久 sink
+open: open:native/include/hengyuan/binance_user_data_event.hpp#"AuditRingSink* audit,"
+refs: pr:169@38d59cf code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher code:native/include/hengyuan/order_tracker.hpp#drain_reconcile_events code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_reconcile_durable_guard.cpp#EveryProductionDrainCallIsPinnedWithItsDurableArgument
+seg.code: MISSING -- 对账排空已先持久确认再发布（ReconcileDurablePublisher）；drain_user_data_events 仍只写内存环形缓冲（它持有的是 const 注册表，不释放槽位），其终态观察从未进入持久 sink
 seg.contract: PRESENT doc:docs/SPEC_INVARIANTS.md#drain_reconcile_events bp:"任务 SAFE-03" -- 规格与任务已定义“先持久确认、再释放”
-seg.fault: MISSING fi:FI-031=NOT_TESTABLE_YET -- 前置阻塞是终态记录尚无持久出口
-seg.test: MISSING test:native/tests/test_order_tracker.cpp#ExchangeFinalReleasesSlotAndAudits -- 现有 DrainEventsTest 只验证内存审计与槽位释放，不涉及持久确认与崩溃恢复
-seg.runtime: MISSING -- 无崩溃重启恢复日志
-seg.budget: MISSING -- 持久确认进入对账路径后的时延与 fsync 成本未测量
+seg.fault: PRESENT:UT test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderEscalatedToTheOperatorLeavesALogThatReplaysAndKeepsItOpen -- 对账路径的两个崩溃位置在真实日志上注入（FI-031 的单元测试级证据）；用户数据流路径没有
+seg.test: PRESENT test:native/tests/test_order_tracker.cpp#AResolutionThatStaysUnacknowledgedKeepsBeingRetriedAndNeverPublishesAlone test:native/tests/test_live_submit_orchestrator.cpp#ADurableFailureHoldsTheResolutionAndTheSlotUntilTheSinkAcknowledges test:native/tests/test_reconcile_concurrency.cpp#HotThreadAndReconcileThreadRaceCleanly -- 对账路径：次序在追加调用内部观察、失败不发布且恰好一次地重试、队头阻塞、回放合法性前缀及其边界、编排器失败关闭、两个真实线程之后重放日志；24 个变异体全部被预期用例杀死
+seg.runtime: MISSING -- 对账路径的崩溃恢复只有单元测试级证据（真实 DurableAuditSink 日志上的重启，CI 上随全量测试通过），没有端到端的重启运行日志（启动恢复状态机尚未接入任何运行中的程序）；用户数据流路径两者都没有
+seg.budget: MISSING -- 同步 fsync 进入对账路径后的时延与成本仍未测量（每个事件一帧，需要前缀时两帧）
 closure: SAFE-03 完成；FI-031 的崩溃重启恢复日志取得
 ```
 
@@ -1214,12 +1214,13 @@ gate_tag: PRE_D3
 scope: 全部
 stage: 0 与 1A
 level: L1
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
-open: open:native/include/hengyuan/order_tracker.hpp#"AuditRingSink* audit," absent:native/include/hengyuan/order_tracker.hpp#DurableAuditSink
-note: 前置阻塞未变（P1-002）：终态记录从未进入持久 sink，所以也谈不上崩溃后补全。
+baseline: 38d59cf
+open: open:native/include/hengyuan/binance_user_data_event.hpp#"AuditRingSink* audit,"
+refs: test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderResolvedToCancelledLeavesALogThatReplaysClean test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_order_tracker.cpp#AnUnacknowledgedAppendPublishesNothingAndTheNextDrainRetriesTheSameResolution code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher pr:169@38d59cf
+note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。仍缺：用户数据流排空函数（同形缺口，下一片）、启动恢复状态机尚未接入任何运行中的程序，所以没有端到端的重启运行日志，判定信号是单元测试。
 ```
 
 ```ledger
