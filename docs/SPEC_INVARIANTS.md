@@ -214,8 +214,55 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     **仍然成立的限制**：① `query_attempts` 与单调锚点不持久；一个每次都活不到发出一次查询的崩溃循环
     不会被隔离，但这样的进程无法下单（启动恢复以此为门），不产生新敞口；② 帧头时间的时钟域取决于
     调用方传给 `append_durable()` 的 `now_ms`——现有 harness 传的是单调读数，会被合理性检查拒绝、不产生
-    挂钟锚点，生产接线必须先把这个时钟域定为服务器校正后的 UTC；③ 对账线程的升级与解决事件尚未持久化
-    （SAFE-03），所以升级本身不跨重启，而是靠重新恢复后再次触发。FI-042 的崩溃循环子判据由此可测。
+    挂钟锚点，生产接线必须先把这个时钟域定为服务器校正后的 UTC；③ 对账线程的升级与解决事件曾经没有持久化
+    （SAFE-03），所以升级本身不跨重启，而是靠重新恢复后再次触发——SAFE-03 切片 1 已在排空一侧持久化它们，
+    见下一条。FI-042 的崩溃循环子判据由此可测。
+  - **[SAFE-03 切片 1 已落地：对账排空先持久确认、再发布]**（审计 P1-002 的第一条路径，蓝图 6.0.3）：此前
+    `drain_reconcile_events()` 把解决事件写进内存审计环、折进 `PositionTruth`、释放槽位，整个过程没有任何
+    持久记录——进程若在这之后、下一次恢复之前崩溃，日志仍说“未知”，而它的后果（持仓、已放出的槽位、随后的
+    下一单）早已离开进程。现在固定次序为：权威远端状态 → 持久 ACK → 发布到内存（审计环、
+    `consume_delta`/`PositionTruth`）→ 释放槽位。持久追加是同步的，蓝图明令不得为时延而异步化（这是对账
+    路径，不是行情热路径）。
+    - **`ReconcileDurablePublisher`**（`order_tracker.hpp`，热线程独占，须比每次排空调用都长寿，不可拷贝不可移动——
+      待定事件只能有一个主人；`set_port()` 只在没有待定事件时才允许换端口）持有注入的
+      `DurableOrderAuditPort`（原样搬到 `durable_order_audit_port.hpp`，因为 `order_tracker.hpp` 不能包含
+      编排器头文件）和**一个**待定事件。`next_acked()` 只在 ACK 之后才交出事件；ACK 没到，事件留在发布者里，
+      审计环、`PositionTruth`、`OrderFillContext`（`consume_delta()` 会推进共享基线，所以它只在 ACK 之后
+      才调用，重试不会少记）、槽位全部原样不动，下一次排空重试同一次追加，其后排队的事件不被触碰——
+      队头阻塞是有意的：持久失败是接收器级别的（`DurableAuditSink` 首次 I/O 失败即永久围栏），不是某一条
+      记录的问题，越过卡住的事件发布后面的只会让日志与内存的次序偏离交易所报告的次序。
+    - **每个**事件都先落盘，包括仍活跃的 `Accepted`/`PartialFill` 与 `EscalatedToOperator`，帧用既有的
+      `OrderEvent` 帧类型和 `OrderReconciled`/`OrderEscalated`（帧解码器本就放行，不新增记录类型，
+      `DurableRecordType` 不动）。
+    - **回放合法性（最容易漏的一点）**：`recovery_scan` 对同一订单只接受“重复同一状态”或 `validate_transition()`
+      合法的下一帧，否则**整本日志**判 `Corrupt`；而恢复扫描把日志里最后一帧是 `Submitting` 的订单重映射成
+      `Ambiguous` 检查点、`apply_recovery()` 只在内存里登记它，重映射本身并不落盘。`Submitting` 之后只允许
+      `Accepted`/`Rejected`/`Filled`/`PartialFill`，所以对这类订单的 `Cancelled`/`Expired`/`CancelRequested`/
+      `EscalatedToOperator` 解决帧会让下次启动 `Corrupt`——恰恰发生在恢复机制本该救场的场景里。因此 `ReconcileEvent` 新增 `prior_state`
+      （`poll_once()` 在两个发射点填入本次轮询的起始状态；默认 `Intent` = 未提供），发布者在
+      `prior_state == Ambiguous` 且 `validate_transition(Submitting, 结果) != Ok` 时先落一帧 `OrderAmbiguous`
+      （`resulting_state=Ambiguous`、无成交、无交易所订单号）再落解决帧；已活跃的订单（`prior_state` 为
+      `Accepted`/`PartialFill`）从不加这一帧（`Accepted → Ambiguous` 本身就非法）；重试不重复该帧。
+    - **编排器**：`reconcile_durable` 是 `OrchestratorContext` 的指针字段（并发测试每轮新建 ctx，待定事件不能放在
+      ctx 里）；接了 `reconcile_events` 却没接发布者 → 失败关闭，`orchestrate_submit()` 根本不排空（结果留在
+      环里、槽位保持），因为另一种选择就是不留持久记录地发布到内存。`drain_reconcile_events()` 的尾部默认参数
+      `durable = nullptr` 保留“仅内存”的旧行为，只允许用于没有持久接收器、永远不会有事件的两个演示线束，
+      以及只测内存半边的测试；`test_reconcile_durable_guard.cpp` 钉死每个生产调用点的参数个数（7 = 持久，
+      6 = 仅内存，附理由表）、持久调用第七个参数的确切文本（显式 `nullptr` 也是七个参数）以及 `next_acked()`
+      的唯一调用者。
+    - **崩溃语义**：ACK 之前崩溃 → 日志仍是 `Ambiguous`/`Accepted`/`PartialFill` → 重启按未知恢复并再次权威
+      对账，恰好一次地落定（`DurableReconcileLogTest.ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce`）；
+      ACK 之后、内存发布之前崩溃 → 日志已终态，重启不再对账（`...AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash`）。
+      后者意味着这一笔成交不会经恢复折进 `PositionTruth`——这与任何在崩溃前已完结的订单完全相同
+      （`PositionTruth` 仍是内存态，持仓的权威来源不是日志，审计 F7）；变的是窗口：从“无界”缩成同一线程上
+      ACK 到 `apply_fill` 之间的几条指令。
+    - **帧头时间**沿用上一条的限制②：排空的 `now_ms` 进入 `append_durable()` 的帧头，与 `ctx.now_ms` 同一
+      时钟域，生产接线必须先把它定为服务器校正后的 UTC。
+    - **仍未覆盖**：路径 ③ `drain_user_data_events()`（同样只写内存审计环；下一片，其持久帧同样必须满足回放
+      合法性）；同步 POST 路径本就先持久确认再转移，逐分支复核留待后续；读代码时发现的既有缺口，本片不动：
+      `poll_once()` 不再轮询 `CancelRequested` 状态的订单（只轮询 `Ambiguous` 与 `Accepted`/`PartialFill`），
+      所以一旦观察到 `PENDING_CANCEL`，该订单的槽位要等重启才会重新被对账（Binance 现货文档把该状态标为
+      目前未使用）。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
@@ -2278,8 +2325,9 @@ in-flight 槽位。
   （`SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md:845`），延续 `SubmitStaleRulesVersion = 21` 已经建立
   的先例：18-20（`SubmitPartialFill`/`SubmitFilled`/`SubmitRateLimited`）继续刻意留空，不重新编号
   占用。
-- `DurableOrderAuditPort`（`live_submit_orchestrator.hpp` 新增，函数指针注入结构体，
-  `AppendFn`/`FencedFn`/`user_data`，同文件里 `SubmitPort` 已经建立的风格）+
+- `DurableOrderAuditPort`（`live_submit_orchestrator.hpp` 新增；SAFE-03 切片 1 起原样搬到
+  `durable_order_audit_port.hpp`，好让 `order_tracker.hpp` 命名同一类型；函数指针注入结构体，
+  `AppendFn`/`FencedFn`/`user_data`，`SubmitPort` 已经建立的风格）+
   `OrchestratorContext` 新增的 `durable_audit` 字段（值类型，未接线时 `is_valid()==false`，按 fenced
   处理）——外部评审 + 用户拍板的依赖注入方式：`durable_audit` 是真实文件 I/O，和 `SubmitPort`
   代表的真实网络 I/O 同一类依赖，这个文件"只有 `SubmitPort` 被注入 fake、其余依赖

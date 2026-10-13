@@ -192,6 +192,11 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
     ASSERT_TRUE(durable_audit_sink->is_open());
     DurableOrderAuditPort durable_audit_port = make_durable_order_audit_port(*durable_audit_sink);
+    // SAFE-03 slice 1: reconcile resolutions are made durable on this same sink, from the hot thread (the
+    // sink is single-writer), before they reach the audit ring or release an in-flight slot. One publisher
+    // for the whole run: it holds the pending resolution between orchestrate_submit() calls, so it cannot be
+    // a per-iteration object like ctx.
+    ReconcileDurablePublisher reconcile_durable(durable_audit_port);
 
     std::vector<SubmittedOrder> results;
     results.reserve(kIterations);
@@ -236,6 +241,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
             ctx.order_weight = 1;
             ctx.to_reconcile = &to_reconcile;
             ctx.reconcile_events = &reconcile_events;
+            ctx.reconcile_durable = &reconcile_durable;
             ctx.durable_audit = durable_audit_port;
 
             ctx.confirmation.confirmed = true;
@@ -297,7 +303,8 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     // ReconcileEvent the reconcile thread pushed after the hot thread's last
     // own drain_reconcile_events() call (its own top-of-call drain only runs
     // while the hot thread is still making calls).
-    drain_reconcile_events(in_flight, &audit, reconcile_events, /*now_ms=*/999999);
+    drain_reconcile_events(in_flight, &audit, reconcile_events, /*now_ms=*/999999, nullptr, nullptr,
+                           &reconcile_durable);
 
     ReconcileEvent leftover{};
     EXPECT_FALSE(reconcile_events.try_pop(leftover)) << "reconcile_events ring must be fully drained by now";
@@ -344,6 +351,12 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     RecordProperty("ambiguous_resolved", ambiguous_count);
     RecordProperty("duplicate_or_capacity_exhausted", other_count);
 
+    // SAFE-03 slice 1: every resolution was acknowledged by the REAL sink -- exactly one frame each (a Filled
+    // resolution is reachable from Submitting, so no Ambiguous re-record) -- and nothing is left pending.
+    EXPECT_FALSE(reconcile_durable.blocked());
+    EXPECT_EQ(reconcile_durable.failed_appends(), 0u);
+    EXPECT_EQ(reconcile_durable.acked_frames(), static_cast<std::uint64_t>(accepted_count + ambiguous_count));
+
     // Sanity: this run must actually have exercised the reconcile path, not
     // degenerated into "everything hit capacity exhaustion immediately." The
     // per-order invariants above (is_in_flight matching gate outcome) are the
@@ -360,6 +373,26 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     // opened with zero sharing (durable_log_store.hpp), so deleting while
     // still open would silently no-op on Windows.
     durable_audit_sink.reset();
+
+    // ...and what two real threads made the hot thread write must replay: reopen the log (the recovery scan
+    // rejects any frame that is neither a repeat of an order's state nor a legal transition from it). Every
+    // submitted order is exchange-final by now; the only open ones are the orders refused for capacity, which
+    // stopped after their Intent frame. (A recovery scan holds at most kMaxInFlight open orders: past that
+    // it reports CapacityExceeded, which says nothing about the frames themselves.)
+    {
+        DurableAuditSink replayed(durable_audit_path, *key_ring, 1);
+        ASSERT_TRUE(replayed.is_open());
+        const RecoveryScanStatus status = replayed.recovery_status();
+        EXPECT_NE(status, RecoveryScanStatus::Corrupt) << "a frame the drain wrote is not replayable";
+        if (static_cast<std::size_t>(other_count) <= kMaxInFlight) {
+            EXPECT_TRUE(status == RecoveryScanStatus::Clean || status == RecoveryScanStatus::Recovered);
+            EXPECT_EQ(replayed.recovered_checkpoints().size(), static_cast<std::size_t>(other_count));
+            for (const OrderRecoveryCheckpoint& cp : replayed.recovered_checkpoints()) {
+                EXPECT_EQ(cp.resulting_state, OrderState::Intent)
+                    << "an order that reached the exchange is still open in the durable log";
+            }
+        }
+    }
     key_ring.reset();
     std::remove(durable_audit_path.c_str());
     std::remove((durable_audit_path + ".lock").c_str());

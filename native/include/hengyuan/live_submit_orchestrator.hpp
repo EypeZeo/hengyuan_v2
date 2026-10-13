@@ -31,6 +31,7 @@
 #include <hengyuan/binance_user_data_event.hpp>
 #include <hengyuan/dry_run_evidence.hpp>
 #include <hengyuan/durable_audit_sink.hpp>
+#include <hengyuan/durable_order_audit_port.hpp>
 #include <hengyuan/exit_safety.hpp>
 #include <hengyuan/kill_switch.hpp>
 #include <hengyuan/order_lifecycle.hpp>
@@ -144,37 +145,10 @@ struct SubmitPort {
 
 // --- Durable order-audit port (dependency injection, mirrors SubmitPort) ---
 //
-// Real file I/O, the same class of dependency as SubmitPort's real network I/O --
-// this file's existing "only SubmitPort is mocked, everything else is a real
-// instance" testing philosophy does not apply here: durable_audit is just as slow
-// and just as side-effectful, so it earns the same injectable-fake treatment.
-// make_durable_order_audit_port() below plugs a real DurableAuditSink into this
-// port unchanged, for the small number of tests that need real file persistence.
-struct DurableOrderAuditPort {
-    using AppendFn = AuditAppendResult(*)(void* user_data, const AuditRecord& rec, std::int64_t now_ms);
-    using FencedFn = bool(*)(void* user_data);
-
-    AppendFn append_fn{nullptr};
-    FencedFn fenced_fn{nullptr};
-    void* user_data{nullptr};
-
-    AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) const noexcept {
-        if (!append_fn) {
-            AuditAppendResult r{};
-            r.status = AuditAppendResult::Status::Failed;
-            return r;
-        }
-        return append_fn(user_data, rec, now_ms);
-    }
-
-    // Unwired reads as "already fenced" -- a caller that checks this before ever
-    // calling append_durable() should see the conservative answer, not a
-    // default that looks like "everything is fine".
-    bool fenced() const noexcept { return fenced_fn ? fenced_fn(user_data) : true; }
-
-    bool is_valid() const noexcept { return append_fn != nullptr; }
-};
-
+// DurableOrderAuditPort itself lives in durable_order_audit_port.hpp (moved there verbatim by SAFE-03
+// slice 1, so that order_tracker.hpp's ReconcileDurablePublisher can name the same type). The two
+// adapters below plug a real DurableAuditSink into it, for the small number of tests and harnesses
+// that need real file persistence.
 inline AuditAppendResult durable_audit_sink_append_adapter(void* user_data, const AuditRecord& rec,
                                                             std::int64_t now_ms) noexcept {
     return static_cast<DurableAuditSink*>(user_data)->append_durable(rec, now_ms);
@@ -307,6 +281,18 @@ struct OrchestratorContext {
     // this function Ambiguous, so the reconcile thread has something to poll.
     ToReconcileRing* to_reconcile{nullptr};
     ReconcileEventRing* reconcile_events{nullptr};
+    // SAFE-03 slice 1 (audit P1-002): the durable-first publication state for reconcile_events. Owned by the
+    // same thread that owns in_flight and OUTLIVING every call (it holds the one resolution that was popped
+    // from the ring but not yet durably acknowledged, so it cannot be a per-call object: a caller that builds
+    // a fresh OrchestratorContext per order must still point at one long-lived publisher). A resolution
+    // reaches the audit ring, PositionTruth and the in-flight slot only after this publisher got its durable
+    // ACK -- see ReconcileDurablePublisher (order_tracker.hpp). Bind it to the same sink as durable_audit: two
+    // different sinks would split one order's frames across two logs, and neither would replay.
+    //
+    // Wiring reconcile_events WITHOUT this publisher is fail-closed: orchestrate_submit() does not drain the
+    // ring at all (the resolutions wait in it, their slots stay held), because the only other choice is to
+    // publish them to memory with no durable record -- exactly the ordering this field exists to forbid.
+    ReconcileDurablePublisher* reconcile_durable{nullptr};
 
     // TODO 1A.4: WS user-data-stream event drain, same nullable/backward-compatible-default
     // convention as reconcile_events above -- unset means orchestrate_submit() behaves exactly
@@ -372,10 +358,12 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // thread, per order_tracker.hpp's thread-ownership contract) -- deferring
     // this would let resolved slots sit unreleased for an arbitrarily long time
     // if this thread's gates keep failing closed. Both ctx.in_flight and
-    // ctx.reconcile_events must be wired for there to be anything to drain into.
-    if (ctx.in_flight && ctx.reconcile_events) {
+    // ctx.reconcile_events must be wired for there to be anything to drain into -- and so must
+    // ctx.reconcile_durable (SAFE-03 slice 1): without a durable publisher the ring is left alone rather
+    // than drained memory-first (see that field's comment).
+    if (ctx.in_flight && ctx.reconcile_events && ctx.reconcile_durable) {
         drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms,
-                                ctx.position_truth, ctx.fill_context);
+                                ctx.position_truth, ctx.fill_context, ctx.reconcile_durable);
     }
     // TODO 1A.4: same unconditional-before-gates placement and reasoning as the reconcile drain
     // above -- even a KillSwitch-halted or audit-unavailable call still owns the only writer

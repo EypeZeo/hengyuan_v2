@@ -38,10 +38,14 @@
 //     AuditRingSink::append() directly — both would be a second writer racing
 //     the owning thread's own writes. drain_reconcile_events() is the only
 //     place either is called on the reconcile path.
+//   - The durable audit sink is single-writer too, and it belongs to the hot/submit thread: a
+//     reconcile resolution is made durable by drain_reconcile_events() through that thread's
+//     ReconcileDurablePublisher, never by poll_once() (SAFE-03 slice 1).
 
 #pragma once
 
 #include <hengyuan/audit_trail.hpp>
+#include <hengyuan/durable_order_audit_port.hpp>
 #include <hengyuan/order_fill_context.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/position_truth.hpp>
@@ -333,6 +337,14 @@ struct ReconcileEvent {     // reconcile thread -> hot thread: a discovered resu
     std::uint32_t symbol_id{0};
     OrderSide side{OrderSide::Buy};
     std::int64_t fill_delta_qty_ticks{0};
+
+    // SAFE-03 slice 1 (audit P1-002). The state the reconcile thread's record held BEFORE this event --
+    // Ambiguous for a resolution or escalation of an unresolved order, Accepted / PartialFill for the next step
+    // of a live one. ReconcileDurablePublisher uses it to write a frame the durable log can replay (a
+    // resolution of an order that was Ambiguous may need an Ambiguous frame in front of it, see there).
+    // Appended at the end like the two blocks above. Intent = "not provided": no event poll_once() emits
+    // carries it, and a hand-built event that leaves it gets no extra frame.
+    OrderState prior_state{OrderState::Intent};
 };
 
 static_assert(std::is_trivially_copyable_v<OrderRecord>,
@@ -410,6 +422,67 @@ inline bool is_valid_query_result(const QueryResult& r, const OrderRecord& rec) 
     if (r.confirmed_state == OrderState::Filled && r.filled_qty_ticks != rec.intended_qty_ticks) {
         return false;
     }
+    return true;
+}
+
+// The AuditRecord a reconcile resolution is published as -- to the durable log first (when a
+// ReconcileDurablePublisher is wired) and then to the in-memory audit ring. Built in exactly one place, so the
+// two always carry the same content.
+inline AuditRecord make_reconcile_audit_record(const ReconcileEvent& ev, std::int64_t now_ms) noexcept {
+    AuditRecord ar{};
+    ar.timestamp_ms = now_ms;
+    ar.event_type = (ev.resulting_state == OrderState::EscalatedToOperator)
+                         ? AuditEventType::OrderEscalated
+                         : AuditEventType::OrderReconciled;
+    // AUDIT ORDER-RECONCILED-SYMBOL-014: symbol_id was never assigned
+    // here since OrderReconciled/OrderEscalated were first introduced
+    // (this is the only place either is ever emitted) -- every such
+    // AuditRecord's symbol_id has been the struct's default (0) since
+    // this function landed, unlike orchestrate_submit()'s own
+    // AuditRecord constructions, which do assign ctx.symbol_id. Found
+    // and fixed as part of adding ReconcileEvent::symbol_id/side for
+    // PositionTruth -- not a design change, a historical bug fix.
+    ar.symbol_id = ev.symbol_id;
+    ar.exchange_order_id = ev.exchange_order_id;
+    ar.set_client_order_id(ev.coid.view());
+    ar.resulting_state = ev.resulting_state;
+    ar.filled_qty_ticks = ev.filled_qty_ticks;
+    ar.avg_fill_price_ticks = ev.avg_fill_price_ticks;
+    ar.side = ev.side;
+    return ar;
+}
+
+// True iff the durable log may hold this order's last frame as Submitting while the reconcile thread already
+// knows it as Ambiguous (the recovery scan remaps a last-frame-Submitting order to an Ambiguous checkpoint, which
+// apply_recovery() registers in memory; nothing writes that remap down), AND the
+// resolution is not reachable from Submitting -- so the resolution frame alone would be an illegal transition
+// for DurableAuditSink::run_recovery_scan() and make the whole log Corrupt on the next start. Derived from
+// validate_transition() itself rather than a list of states, so a change to the state machine cannot leave
+// this one behind.
+inline bool needs_ambiguous_remap_frame(const ReconcileEvent& ev) noexcept {
+    return ev.prior_state == OrderState::Ambiguous &&
+           validate_transition(OrderState::Submitting, ev.resulting_state) != TransitionResult::Ok;
+}
+
+// The frame that makes the remap durable: "this order is Ambiguous", nothing observed yet (no fill, no
+// exchange id), written right before its resolution.
+inline AuditRecord make_ambiguous_remap_record(const ReconcileEvent& ev, std::int64_t now_ms) noexcept {
+    AuditRecord ar{};
+    ar.timestamp_ms = now_ms;
+    ar.event_type = AuditEventType::OrderAmbiguous;
+    ar.symbol_id = ev.symbol_id;
+    ar.set_client_order_id(ev.coid.view());
+    ar.resulting_state = OrderState::Ambiguous;
+    ar.side = ev.side;
+    ar.set_detail("reconcile: Ambiguous re-recorded before its resolution");
+    return ar;
+}
+
+// drain_reconcile_events() without a durable publisher: pop and describe, nothing is made durable.
+inline bool next_memory_only(ReconcileEventRing& events, std::int64_t now_ms, ReconcileEvent& ev_out,
+                              AuditRecord& record_out) noexcept {
+    if (!events.try_pop(ev_out)) return false;
+    record_out = make_reconcile_audit_record(ev_out, now_ms);
     return true;
 }
 
@@ -506,6 +579,7 @@ inline void poll_once(OrderTracker& tracker,
                 ev.symbol_id = escalated.symbol_id;
                 ev.side = escalated.side;
                 ev.exchange_order_id = escalated.exchange_order_id;
+                ev.prior_state = record.state;  // Ambiguous: only an unresolved order is ever escalated
                 if (outbound.try_push(ev)) {
                     tracker.untrack(coid);
                 }
@@ -597,6 +671,7 @@ inline void poll_once(OrderTracker& tracker,
         ev.avg_fill_price_ticks = resolved.avg_fill_price_ticks;
         ev.symbol_id = resolved.symbol_id;
         ev.side = resolved.side;
+        ev.prior_state = attempted.state;  // the state this poll started from (resolved is the one after it)
         // Incremental amount filled since the last observation, not the
         // cumulative total -- attempted.filled_qty_ticks is the pre-transition
         // baseline this same poll_once() call started from (either the last
@@ -627,14 +702,136 @@ inline void poll_once(OrderTracker& tracker,
     });
 }
 
-// Runs on the hot/submit thread. Drains `events`; for each, constructs and
-// appends the corresponding AuditRecord (the ONLY place OrderReconciled/
-// OrderEscalated are ever emitted, matching orchestrate_submit()'s own
-// per-transition audit style), then releases the InFlightRegistry slot via
-// mark_resolved_handle() IF AND ONLY IF is_exchange_final(resulting_state) --
-// EscalatedToOperator and the still-live Accepted/PartialFill are audited but
-// do not release (see docs/SPEC_INVARIANTS.md's InFlightRegistry entry: an
-// order that may still be live must keep its slot).
+// --- Durable-first publication of reconcile resolutions (SAFE-03 slice 1, audit P1-002) ---
+//
+// A reconcile resolution (an order found Filled / Cancelled / Rejected / Expired / still live / escalated)
+// is information the rest of the process ACTS on the moment it is published to memory: PositionTruth moves,
+// the InFlightRegistry slot is released and the next intent may go out. If the process dies between that
+// publication and a durable record of it, the restart replays a log that still says "Ambiguous" for an
+// order whose consequences already left the process. The required order is therefore
+//
+//     authoritative remote state -> durable ACK -> publish to memory -> release the in-flight slot
+//
+// and the durable append is deliberately synchronous (blueprint 6.0.3: it must not be moved off the path to
+// shave latency -- this is the reconcile path, not the market-data hot path).
+//
+// If the append is not acknowledged the resolution is NOT lost and NOT published: the publisher keeps it as
+// its one pending event, the audit ring / PositionTruth / OrderFillContext / InFlightRegistry are untouched
+// (the slot stays held, so the order keeps counting as in flight), and the next drain tries the very same
+// append again. Everything queued behind it waits -- head-of-line blocking on purpose: a durable failure is a
+// property of the sink (DurableAuditSink fences itself for good on the first I/O failure), not of one record,
+// and publishing later resolutions past a stuck one would let the log and memory diverge in a different order
+// than the exchange reported. A crash while it waits is the case the durable log already covers: the order's
+// last durable state is still Ambiguous / Accepted / PartialFill, so the restart recovers it as unknown and
+// reconciles it again (startup_recovery.hpp).
+//
+// REPLAY LEGALITY. DurableAuditSink::run_recovery_scan() accepts a frame only if it repeats the order's state
+// or is a legal validate_transition() from it; anything else makes the WHOLE log Corrupt. The reconcile thread
+// knows an order only as Ambiguous after a restart, but the log may still hold its last frame as Submitting
+// (the recovery scan remaps such an order to an Ambiguous checkpoint, apply_recovery() registers that in memory,
+// and nothing writes the remap down). From Submitting only Accepted /
+// Rejected / Filled / PartialFill are legal, so a resolution of Cancelled / Expired / CancelRequested /
+// EscalatedToOperator would be an illegal frame. The publisher therefore writes an OrderAmbiguous frame
+// first for exactly those resolutions of an order whose prior_state was Ambiguous (a repeat of Ambiguous
+// after Ambiguous is a legal same-state frame, so it is harmless when the log already said so). It never does
+// this for a live order (prior Accepted / PartialFill): Ambiguous after Accepted would itself be illegal.
+//
+// Owned by the thread that owns InFlightRegistry and the durable sink (the hot/submit thread) -- the
+// DurableAuditSink is single-writer, so the append MUST come from there. Nothing here is shared between
+// threads (so, unlike the SPSC rings, it is deliberately not cacheline-aligned). It must outlive every drain
+// call that uses it -- it holds the pending resolution between calls -- and so must whatever its port points
+// at (the sink).
+class ReconcileDurablePublisher {
+public:
+    ReconcileDurablePublisher() = default;
+    explicit ReconcileDurablePublisher(const DurableOrderAuditPort& port) noexcept : port_(port) {}
+
+    // The pending resolution has exactly one owner: a copy would be a second holder of the same unacknowledged
+    // resolution, and with it a second way to publish it.
+    ReconcileDurablePublisher(const ReconcileDurablePublisher&) = delete;
+    ReconcileDurablePublisher& operator=(const ReconcileDurablePublisher&) = delete;
+    ReconcileDurablePublisher(ReconcileDurablePublisher&&) = delete;
+    ReconcileDurablePublisher& operator=(ReconcileDurablePublisher&&) = delete;
+
+    // Points an idle publisher at a port, for an owner that has to construct it before its sink exists. Refused
+    // (false, nothing changed) while a resolution is pending: part of that resolution (the Ambiguous re-record)
+    // may already be in the log behind the old port, and the rest must follow it there.
+    bool set_port(const DurableOrderAuditPort& port) noexcept {
+        if (has_pending_) return false;
+        port_ = port;
+        return true;
+    }
+
+    // The oldest unpublished resolution, handed back ONLY once its durable ACK is in hand: `ev_out` is the
+    // event and `record_out` the AuditRecord that was just made durable (the caller publishes the same record
+    // to its in-memory audit ring). Returns false when there is nothing to publish -- the ring is empty, or
+    // the durable append was not acknowledged. In the second case blocked() is true and the next call retries
+    // the same append; nothing behind the pending event is popped meanwhile. An unwired port reads as
+    // "not acknowledged" (DurableOrderAuditPort::append_durable() fails when no function is injected).
+    bool next_acked(ReconcileEventRing& events, std::int64_t now_ms, ReconcileEvent& ev_out,
+                    AuditRecord& record_out) noexcept {
+        if (!has_pending_) {
+            if (!events.try_pop(pending_)) return false;
+            has_pending_ = true;
+            remap_acked_ = false;
+        }
+        if (!remap_acked_ && detail::needs_ambiguous_remap_frame(pending_)) {
+            if (!append(detail::make_ambiguous_remap_record(pending_, now_ms), now_ms)) return false;
+            remap_acked_ = true;  // a retry of the resolution below must not write this frame a second time
+        }
+        const AuditRecord record = detail::make_reconcile_audit_record(pending_, now_ms);
+        if (!append(record, now_ms)) return false;
+        ev_out = pending_;
+        record_out = record;
+        has_pending_ = false;
+        return true;
+    }
+
+    // True while one resolution has been popped from the ring but not yet durably acknowledged.
+    bool blocked() const noexcept { return has_pending_; }
+    // The blocked resolution; meaningful only while blocked().
+    const ReconcileEvent& pending() const noexcept { return pending_; }
+
+    // Frames the sink acknowledged / appends it did not (each retry of a blocked resolution counts again).
+    std::uint64_t acked_frames() const noexcept { return acked_frames_; }
+    std::uint64_t failed_appends() const noexcept { return failed_appends_; }
+
+    const DurableOrderAuditPort& port() const noexcept { return port_; }
+
+private:
+    bool append(const AuditRecord& record, std::int64_t now_ms) noexcept {
+        const AuditAppendResult result = port_.append_durable(record, now_ms);
+        if (result.acked()) [[likely]] {
+            ++acked_frames_;
+            return true;
+        }
+        ++failed_appends_;
+        return false;
+    }
+
+    DurableOrderAuditPort port_{};
+    ReconcileEvent pending_{};
+    bool has_pending_{false};
+    bool remap_acked_{false};
+    std::uint64_t acked_frames_{0};
+    std::uint64_t failed_appends_{0};
+};
+
+// Runs on the hot/submit thread. Drains `events`; for each, appends the corresponding AuditRecord to the
+// in-memory audit ring (the ONLY place OrderReconciled/OrderEscalated are ever emitted, matching
+// orchestrate_submit()'s own per-transition audit style), applies its fill to PositionTruth, then releases the
+// InFlightRegistry slot via mark_resolved_handle() IF AND ONLY IF is_exchange_final(resulting_state) --
+// EscalatedToOperator and the still-live Accepted/PartialFill are audited but do not release (see
+// docs/SPEC_INVARIANTS.md's InFlightRegistry entry: an order that may still be live must keep its slot).
+//
+// `durable` (SAFE-03 slice 1, same trailing-default-nullptr extension as the two parameters before it): when
+// non-null, EVERY event -- the live and escalated ones too, not only the exchange-final ones -- is made
+// durable through the publisher BEFORE any of the steps above, and the loop stops at the first event whose
+// durable append is not acknowledged (see ReconcileDurablePublisher for the ordering, the retry and the
+// replay-legality frame). When null the function behaves exactly as before this parameter existed: it
+// publishes to memory with no durable record, which is only acceptable where there is no durable sink and
+// nothing can ever arrive (the two sink-less demo harnesses) or where a test exercises the memory half on its
+// own. orchestrate_submit() never takes that branch: it drains only when ctx.reconcile_durable is wired.
 //
 // `position_truth` is a trailing-default parameter (nullptr = no-op, same
 // backward-compatible-extension pattern as RequestWeightTracker::reset()'s
@@ -660,35 +857,20 @@ inline void poll_once(OrderTracker& tracker,
 // OrderFillContext::remove() is called at exactly the same point
 // mark_resolved_handle() is -- one of this batch's own verified-exhaustive 3
 // real call sites (see order_fill_context.hpp's own header comment).
+// consume_delta() advances that shared baseline, so it runs only after the durable ACK: a resolution that is
+// retried must not have consumed its delta on the failed attempt.
 inline void drain_reconcile_events(InFlightRegistry& in_flight,
                                     AuditRingSink* audit,
                                     ReconcileEventRing& events,
                                     std::int64_t now_ms,
                                     PositionTruth* position_truth = nullptr,
-                                    OrderFillContext* fill_context = nullptr) noexcept {
+                                    OrderFillContext* fill_context = nullptr,
+                                    ReconcileDurablePublisher* durable = nullptr) noexcept {
     ReconcileEvent ev{};
-    while (events.try_pop(ev)) {
+    AuditRecord ar{};
+    while (durable ? durable->next_acked(events, now_ms, ev, ar)
+                   : detail::next_memory_only(events, now_ms, ev, ar)) {
         if (audit) {
-            AuditRecord ar{};
-            ar.timestamp_ms = now_ms;
-            ar.event_type = (ev.resulting_state == OrderState::EscalatedToOperator)
-                                 ? AuditEventType::OrderEscalated
-                                 : AuditEventType::OrderReconciled;
-            // AUDIT ORDER-RECONCILED-SYMBOL-014: symbol_id was never assigned
-            // here since OrderReconciled/OrderEscalated were first introduced
-            // (this is the only place either is ever emitted) -- every such
-            // AuditRecord's symbol_id has been the struct's default (0) since
-            // this function landed, unlike orchestrate_submit()'s own
-            // AuditRecord constructions, which do assign ctx.symbol_id. Found
-            // and fixed as part of adding ReconcileEvent::symbol_id/side for
-            // PositionTruth below -- not a design change, a historical bug fix.
-            ar.symbol_id = ev.symbol_id;
-            ar.exchange_order_id = ev.exchange_order_id;
-            ar.set_client_order_id(ev.coid.view());
-            ar.resulting_state = ev.resulting_state;
-            ar.filled_qty_ticks = ev.filled_qty_ticks;
-            ar.avg_fill_price_ticks = ev.avg_fill_price_ticks;
-            ar.side = ev.side;
             audit->append(ar);
         }
 

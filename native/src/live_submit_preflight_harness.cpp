@@ -548,6 +548,10 @@ int main(int argc, char* argv[]) {
     key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}},
                        key_rec);
     auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
+    // SAFE-03 slice 1: a reconcile resolution is made durable on this sink before it reaches memory. Nothing
+    // is ever submitted here, so the ring stays empty today; the publisher is what keeps the drains below
+    // honest the day it does not.
+    ReconcileDurablePublisher reconcile_durable(make_durable_order_audit_port(*durable_audit_sink));
 
     AccountSnapshot account{};
 
@@ -616,7 +620,8 @@ int main(int argc, char* argv[]) {
         drain_user_data_events(in_flight, &audit, user_data_events, now_ms, &position_truth, &fill_context);
         poll_once(order_tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms,
                   reconcile_wall_now_ms());
-        drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth, &fill_context);
+        drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth, &fill_context,
+                               &reconcile_durable);
         ws_supervisor.poll(now_ms);
 
         // What a live closed bar does. Called by the pipeline, in order, for every bar that reached the
@@ -762,7 +767,8 @@ int main(int argc, char* argv[]) {
     if (io_thread.joinable()) io_thread.join();
 
     const std::int64_t shutdown_now_ms = get_now_ms();
-    drain_reconcile_events(in_flight, &audit, reconcile_events, shutdown_now_ms, &position_truth, &fill_context);
+    drain_reconcile_events(in_flight, &audit, reconcile_events, shutdown_now_ms, &position_truth, &fill_context,
+                           &reconcile_durable);
     drain_user_data_events(in_flight, &audit, user_data_events, shutdown_now_ms, &position_truth, &fill_context);
 
     try {
@@ -777,6 +783,9 @@ int main(int argc, char* argv[]) {
                 poll_ticks, preflight_probes,
                 tracker.state() == HoldingState::Long ? "LONG" : "FLAT");
     std::printf("Audit records written: %zu\n", audit.count());
+    std::printf("Reconcile durable: acked_frames=%" PRIu64 " failed_appends=%" PRIu64 " blocked=%s\n",
+                reconcile_durable.acked_frames(), reconcile_durable.failed_appends(),
+                reconcile_durable.blocked() ? "yes" : "no");
     const DepthManager& depth_mgr = pipeline->depth_manager();
     const auto ds = depth_mgr.stats();
     std::printf("Depth: snapshots=%" PRIu64 " applied=%" PRIu64 " resyncs=%" PRIu64 " final_state=%s\n",

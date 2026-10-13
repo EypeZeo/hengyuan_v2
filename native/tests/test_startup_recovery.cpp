@@ -709,3 +709,254 @@ TEST_F(StartupRecoveryLogTest, TallyClassifiesResolvedKnownLiveAndUnconfirmed) {
     EXPECT_EQ(after.unconfirmed, 0u);
     EXPECT_EQ(after.resolved, 0u);
 }
+
+// ================================================================================================
+// SAFE-03 slice 1 (audit P1-002): a reconcile resolution is made durable BEFORE it reaches memory, and what
+// the drain writes must replay -- on a REAL durable log, across real restarts
+//
+// The fake-sink tests (test_order_tracker.cpp's DrainDurableTest) pin the ordering; these pin the other half:
+// DurableAuditSink::run_recovery_scan() accepts a frame only if it repeats the order's state or is a legal
+// transition from it, and calls the WHOLE log Corrupt otherwise. A recovered order whose last frame is
+// Submitting is Ambiguous only in memory, so a bare Cancelled / Expired / Escalated frame after it would be
+// exactly such a log.
+// ================================================================================================
+
+namespace {
+
+AuditAppendResult sink_append(void* user_data, const AuditRecord& rec, std::int64_t now_ms) noexcept {
+    return static_cast<DurableAuditSink*>(user_data)->append_durable(rec, now_ms);
+}
+bool sink_fenced(void* user_data) noexcept { return static_cast<DurableAuditSink*>(user_data)->fenced(); }
+DurableOrderAuditPort port_of(DurableAuditSink& sink) {
+    return DurableOrderAuditPort{&sink_append, &sink_fenced, &sink};
+}
+// A sink that never acknowledges: the durable medium is gone.
+AuditAppendResult refusing_append(void*, const AuditRecord&, std::int64_t) noexcept { return AuditAppendResult{}; }
+
+// Everything one life of the process remembers (a restart forgets all of it).
+struct Life {
+    InFlightRegistry in_flight;
+    OrderTracker tracker;
+    ToReconcileRing to_reconcile;
+    ReconcileEventRing events;
+    PositionTruth truth;
+    OrderFillContext fill_context;
+};
+
+}  // namespace
+
+class DurableReconcileLogTest : public StartupRecoveryLogTest {
+protected:
+    // Recovery of `sink`'s log into a fresh life.
+    void recover(Life& life, const DurableAuditSink& sink, std::int64_t wall_ms = OrderRecord::kClockUnset) {
+        const RecoveryApplyResult applied =
+            apply_recovery(sink.recovered_checkpoints(), life.in_flight, life.to_reconcile, life.truth,
+                           life.fill_context, &rules_for_test, wall_ms);
+        EXPECT_TRUE(applied.ok());
+    }
+
+    // One reconcile-loop tick of that life, its drain publishing durable-first through `publisher`.
+    void tick_life(Life& life, ReconcileDurablePublisher& publisher, std::int64_t mono_ms,
+                   std::int64_t wall_ms = OrderRecord::kClockUnset) {
+        poll_once(life.tracker, life.to_reconcile, life.events, port(), policy_, mono_ms, wall_ms);
+        drain_reconcile_events(life.in_flight, nullptr, life.events, mono_ms, &life.truth, &life.fill_context,
+                               &publisher);
+    }
+
+    // The previous process died with this order's last durable frame being Submitting.
+    void log_a_crash_while_submitting(const char* coid, std::int64_t at_ms = 1000) {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent(coid, 100, 10, 1), at_ms).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted(coid, 100, 10, 1), at_ms + 1).acked());
+    }
+
+    void exchange_says(OrderState state, std::int64_t filled_qty) {
+        exchange_.outcome = QueryOutcome::Found;
+        exchange_.state = state;
+        exchange_.filled_qty = filled_qty;
+    }
+};
+
+TEST_F(DurableReconcileLogTest, ARecoveredSubmittingOrderResolvedToCancelledLeavesALogThatReplaysClean) {
+    log_a_crash_while_submitting("HY-A");
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovered_checkpoints().size(), 1u);
+        ASSERT_EQ(sink.recovered_checkpoints()[0].resulting_state, OrderState::Ambiguous);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        ReconcileDurablePublisher publisher(port_of(sink));
+        exchange_says(OrderState::Cancelled, 0);
+
+        tick_life(*life, publisher, 0);
+
+        EXPECT_FALSE(life->in_flight.is_in_flight("HY-A"));
+        EXPECT_EQ(publisher.acked_frames(), 2u) << "the Ambiguous re-record, then the Cancelled resolution";
+        EXPECT_EQ(publisher.failed_appends(), 0u);
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean)
+        << "Submitting -> Cancelled written bare would make the whole log Corrupt";
+    EXPECT_TRUE(after.recovered_checkpoints().empty()) << "Cancelled is exchange-final: nothing to recover";
+}
+
+TEST_F(DurableReconcileLogTest, ARecoveredSubmittingOrderEscalatedToTheOperatorLeavesALogThatReplaysAndKeepsItOpen) {
+    log_a_crash_while_submitting("HY-A", kT0);
+    constexpr std::int64_t kRestartWall = kT0 + 3'600'000;  // an hour of downtime
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink, kRestartWall);
+        ReconcileDurablePublisher publisher(port_of(sink));
+        exchange_.outcome = QueryOutcome::Inconclusive;  // the exchange is not answering
+
+        tick_life(*life, publisher, 0, kRestartWall);  // the first look: one query, no answer
+        EXPECT_EQ(publisher.acked_frames(), 0u);
+        tick_life(*life, publisher, 100, kRestartWall + 100);  // the hour of unresolved time now counts
+
+        EXPECT_EQ(publisher.acked_frames(), 2u) << "the Ambiguous re-record, then the Escalated resolution";
+        EXPECT_TRUE(life->in_flight.is_in_flight("HY-A")) << "escalated: the slot stays held for the operator";
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    ASSERT_EQ(after.recovery_status(), RecoveryScanStatus::Recovered)
+        << "Submitting -> EscalatedToOperator written bare would make the whole log Corrupt";
+    ASSERT_EQ(after.recovered_checkpoints().size(), 1u);
+    EXPECT_EQ(after.recovered_checkpoints()[0].resulting_state, OrderState::EscalatedToOperator);
+    EXPECT_EQ(after.recovered_checkpoints()[0].symbol_id, 1u);
+}
+
+TEST_F(DurableReconcileLogTest, ARecoveredSubmittingOrderResolvedToFilledNeedsNoExtraFrame) {
+    log_a_crash_while_submitting("HY-A");
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        ReconcileDurablePublisher publisher(port_of(sink));
+        exchange_says(OrderState::Filled, 10);
+
+        tick_life(*life, publisher, 0);
+
+        EXPECT_FALSE(life->in_flight.is_in_flight("HY-A"));
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 10);
+        EXPECT_EQ(publisher.acked_frames(), 1u) << "Submitting -> Filled is legal as it stands";
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(after.recovered_checkpoints().empty());
+}
+
+TEST_F(DurableReconcileLogTest, AKnownLiveOrderCancelledByTheOperatorNeedsNoAmbiguousFrameEither) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
+    }  // crash with the order known live
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovered_checkpoints().size(), 1u);
+        ASSERT_EQ(sink.recovered_checkpoints()[0].resulting_state, OrderState::Accepted);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        ReconcileDurablePublisher publisher(port_of(sink));
+        exchange_says(OrderState::Cancelled, 0);  // the operator cancelled it from the Binance app
+
+        tick_life(*life, publisher, 0);
+
+        EXPECT_FALSE(life->in_flight.is_in_flight("HY-A"));
+        EXPECT_EQ(publisher.acked_frames(), 1u)
+            << "an Ambiguous frame after Accepted would itself be an illegal transition";
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(after.recovered_checkpoints().empty());
+}
+
+// The crash window the whole change is about: the exchange has answered, the durable medium has not
+// acknowledged, and the process dies. Nothing may have reached memory, and the restart must find the order
+// still recoverable -- and settle it exactly once.
+TEST_F(DurableReconcileLogTest, ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce) {
+    log_a_crash_while_submitting("HY-A");
+    exchange_says(OrderState::Filled, 10);
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);  // opened only to recover from; its port is not used
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        ReconcileDurablePublisher refusing(DurableOrderAuditPort{&refusing_append, nullptr, nullptr});
+
+        tick_life(*life, refusing, 0);
+
+        EXPECT_TRUE(life->in_flight.is_in_flight("HY-A")) << "the exchange knows, the log does not: still in flight";
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 0) << "and the position has not moved";
+        EXPECT_TRUE(refusing.blocked());
+    }  // the process dies here
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+        ASSERT_EQ(sink.recovered_checkpoints().size(), 1u);
+        EXPECT_EQ(sink.recovered_checkpoints()[0].resulting_state, OrderState::Ambiguous)
+            << "nothing was acknowledged, so the log still says unknown";
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        ReconcileDurablePublisher publisher(port_of(sink));
+
+        tick_life(*life, publisher, 0);
+
+        EXPECT_FALSE(life->in_flight.is_in_flight("HY-A"));
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 10) << "settled once, not twice";
+        EXPECT_EQ(publisher.acked_frames(), 1u);
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
+}
+
+// The other side of the same window: the append IS acknowledged and the process dies before it publishes
+// anything. The log now says final, so the restart does not reconcile the order a second time.
+TEST_F(DurableReconcileLogTest, AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash) {
+    log_a_crash_while_submitting("HY-A");
+    exchange_says(OrderState::Filled, 10);
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        ReconcileDurablePublisher publisher(port_of(sink));
+        poll_once(life->tracker, life->to_reconcile, life->events, port(), policy_, 0);
+
+        ReconcileEvent ev{};
+        AuditRecord record{};
+        ASSERT_TRUE(publisher.next_acked(life->events, 0, ev, record));  // acknowledged...
+        EXPECT_TRUE(life->in_flight.is_in_flight("HY-A")) << "...and nothing published yet";
+    }  // the process dies here
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(after.recovered_checkpoints().empty()) << "durably final: nothing left to reconcile";
+}
+
+TEST_F(DurableReconcileLogTest, SeveralRecoveredOrdersResolvedInOneTickEachGetTheirOwnLegalChain) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        // A: crashed Submitting.  B: known Accepted.
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-B", 100, 10, 1), 1002).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-B", 100, 10, 1), 1003).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-B", 1, 556), 1004).acked());
+    }
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovered_checkpoints().size(), 2u);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        ReconcileDurablePublisher publisher(port_of(sink));
+        exchange_says(OrderState::Cancelled, 0);  // the fake exchange gives both orders the same answer
+
+        tick_life(*life, publisher, 0);
+
+        EXPECT_EQ(life->in_flight.count(), 0u);
+        EXPECT_EQ(publisher.acked_frames(), 3u) << "A: Ambiguous re-record + Cancelled; B: Cancelled";
+        EXPECT_EQ(publisher.failed_appends(), 0u);
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(after.recovered_checkpoints().empty());
+}

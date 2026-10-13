@@ -1027,6 +1027,19 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_order_tracker)
     gtest_discover_tests(test_order_tracker)
 
+    # SAFE-03 slice 1 guard (audit P1-002): drain_reconcile_events() takes its durable publisher as a trailing
+    # DEFAULT argument, so a call site that leaves it out still compiles and publishes to memory with no
+    # durable record. Every production call (include/ and src/) is pinned with its argument count, and
+    # ReconcileDurablePublisher::next_acked() may have no caller but the drain itself. It reads the source
+    # tree, so the native/ directory is a compile definition and the target needs nothing else (same shape as
+    # test_rest_freeze_guard above).
+    add_executable(test_reconcile_durable_guard tests/test_reconcile_durable_guard.cpp)
+    target_link_libraries(test_reconcile_durable_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_reconcile_durable_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_reconcile_durable_guard)
+    gtest_discover_tests(test_reconcile_durable_guard)
+
     # Real two-thread stress for the lock-free SPSC primitives. Labelled
     # "concurrency" so the TSan CI job can select just these (`ctest -L
     # concurrency`) — building all 27 test binaries under TSan triples the job

@@ -771,11 +771,41 @@ class LiveSubmitReconcileTest : public LiveSubmitTest {
 protected:
     ToReconcileRing to_reconcile_{};
     ReconcileEventRing reconcile_events_{};
+    // SAFE-03 slice 1: the durable-first publication state for reconcile_events_ -- bound to the same (fake)
+    // durable port the submit path uses, as a real wiring would.
+    ReconcileDurablePublisher reconcile_durable_{};
 
     void SetUp() override {
         LiveSubmitTest::SetUp();
         ctx_.to_reconcile = &to_reconcile_;
         ctx_.reconcile_events = &reconcile_events_;
+        EXPECT_TRUE(reconcile_durable_.set_port(ctx_.durable_audit));
+        ctx_.reconcile_durable = &reconcile_durable_;
+    }
+
+    bool ring_has(AuditEventType type) const {
+        for (std::size_t i = 0; i < audit_.count(); ++i) {
+            const auto* ar = audit_.at(i);
+            if (ar && ar->event_type == type) return true;
+        }
+        return false;
+    }
+
+    // One order that went Ambiguous, handed to the reconcile ring, plus the resolution the reconcile thread
+    // would send back for it (queued, not yet drained).
+    ClientOrderId submit_ambiguous_and_queue_resolution(OrderState resolution) {
+        g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+        auto r = orchestrate_submit(ctx_);
+        EXPECT_EQ(r.gate, OrchestratorGate::SubmitAmbiguous);
+        ReconcileIngress in{};
+        EXPECT_TRUE(to_reconcile_.try_pop(in));
+        ReconcileEvent ev{};
+        ev.handle = in.handle;
+        ev.coid = r.order.client_order_id;
+        ev.resulting_state = resolution;
+        ev.prior_state = OrderState::Ambiguous;
+        EXPECT_TRUE(reconcile_events_.try_push(ev));
+        return r.order.client_order_id;
     }
 };
 
@@ -913,6 +943,63 @@ TEST_F(LiveSubmitReconcileTest, DrainRunsEvenWhenThisCallFailsAnEarlyGate) {
     EXPECT_EQ(in_flight_.count(), 0u);
 }
 
+// --- SAFE-03 slice 1 (audit P1-002): the drain at the top of orchestrate_submit() is durable-first ---
+//
+// Each call below stops at the kill switch (Gate 2) on purpose: the drain runs before the gates, and a call that
+// stops there makes no durable append of its own, so every append the fake sees is the drain's.
+
+TEST_F(LiveSubmitReconcileTest, ADurableFailureHoldsTheResolutionAndTheSlotUntilTheSinkAcknowledges) {
+    const ClientOrderId coid = submit_ambiguous_and_queue_resolution(OrderState::Filled);
+    ASSERT_TRUE(in_flight_.is_in_flight(coid.view()));
+
+    kill_switch_.trigger();
+    fake_durable_audit_.outcome_should_fail = true;
+    auto r2 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r2.gate, OrchestratorGate::KillSwitchNotNormal);
+
+    EXPECT_TRUE(in_flight_.is_in_flight(coid.view())) << "no durable ACK -> the slot is not released";
+    EXPECT_TRUE(reconcile_durable_.blocked());
+    EXPECT_FALSE(ring_has(AuditEventType::OrderReconciled)) << "no durable ACK -> nothing in the audit ring";
+
+    fake_durable_audit_.outcome_should_fail = false;  // the sink is back
+    auto r3 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r3.gate, OrchestratorGate::KillSwitchNotNormal);
+
+    EXPECT_FALSE(in_flight_.is_in_flight(coid.view())) << "the very same resolution, retried, now released the slot";
+    EXPECT_FALSE(reconcile_durable_.blocked());
+    EXPECT_TRUE(ring_has(AuditEventType::OrderReconciled));
+}
+
+TEST_F(LiveSubmitReconcileTest, ResolutionsAreNotDrainedAtAllWhileNoDurablePublisherIsWired) {
+    // reconcile_events wired but reconcile_durable not: the only other choice would be publishing to memory with
+    // no durable record, which is exactly what the field exists to forbid. Fail closed: leave the ring alone.
+    const ClientOrderId coid = submit_ambiguous_and_queue_resolution(OrderState::Filled);
+    ctx_.reconcile_durable = nullptr;
+
+    kill_switch_.trigger();
+    auto r2 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r2.gate, OrchestratorGate::KillSwitchNotNormal);
+
+    EXPECT_TRUE(in_flight_.is_in_flight(coid.view()));
+    EXPECT_FALSE(ring_has(AuditEventType::OrderReconciled));
+    ReconcileEvent still_queued{};
+    EXPECT_TRUE(reconcile_events_.try_pop(still_queued)) << "the resolution waits in the ring";
+}
+
+TEST_F(LiveSubmitReconcileTest, TheDrainAtTheTopMakesEveryResolutionDurableOnTheSubmitPathsPort) {
+    const ClientOrderId coid = submit_ambiguous_and_queue_resolution(OrderState::Cancelled);
+    const std::uint64_t sequence_before = fake_durable_audit_.next_sequence;
+
+    kill_switch_.trigger();
+    auto r2 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r2.gate, OrchestratorGate::KillSwitchNotNormal);
+
+    // Ambiguous -> Cancelled: the remap frame and the resolution itself.
+    EXPECT_EQ(fake_durable_audit_.next_sequence - sequence_before, 2u);
+    EXPECT_EQ(reconcile_durable_.acked_frames(), 2u);
+    EXPECT_FALSE(in_flight_.is_in_flight(coid.view()));
+}
+
 // --- Phase 3: real-file-I/O integration (durable persistence, not just gate
 // logic -- the fake port above covers gate logic; this proves the port
 // adapter wiring and the actual on-disk frame sequence are correct). ---
@@ -999,5 +1086,50 @@ TEST_F(LiveSubmitDurableIntegrationTest, RejectedPathReleasesInFlightOnlyAfterRe
     ASSERT_TRUE(restarted->is_open());
     EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Clean)
         << "Rejected is exchange-final -- nothing should need recovering";
+    EXPECT_TRUE(restarted->recovered_checkpoints().empty());
+}
+
+// --- SAFE-03 slice 1 on a REAL durable log: what the drain wrote must replay ---
+
+namespace {
+
+QueryResult cancelled_query(const OrderExpectation&, void*) {
+    return QueryResult{QueryOutcome::Found, OrderState::Cancelled, /*exchange_order_id=*/4242, /*filled_qty=*/0,
+                       /*avg_price=*/0};
+}
+
+}  // namespace
+
+TEST_F(LiveSubmitDurableIntegrationTest, AReconcileResolutionIsDurableBeforeItsSlotIsReleasedAndTheLogReplaysClean) {
+    ToReconcileRing to_reconcile;
+    ReconcileEventRing reconcile_events;
+    ReconcileDurablePublisher reconcile_durable(ctx_.durable_audit);
+    ctx_.to_reconcile = &to_reconcile;
+    ctx_.reconcile_events = &reconcile_events;
+    ctx_.reconcile_durable = &reconcile_durable;
+
+    g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+    auto r1 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r1.gate, OrchestratorGate::SubmitAmbiguous);
+
+    // The real reconcile loop, with an exchange that says the order was cancelled.
+    OrderTracker tracker;
+    const QueryPort query_port{&cancelled_query, nullptr};
+    poll_once(tracker, to_reconcile, reconcile_events, query_port, ReconcilePollPolicy{}, ctx_.now_ms);
+    ASSERT_TRUE(in_flight_.is_in_flight(r1.order.client_order_id.view())) << "found, but not yet drained";
+
+    kill_switch_.trigger();  // the next call only drains (and stops at Gate 2)
+    auto r2 = orchestrate_submit(ctx_);
+    ASSERT_EQ(r2.gate, OrchestratorGate::KillSwitchNotNormal);
+    EXPECT_FALSE(in_flight_.is_in_flight(r1.order.client_order_id.view()));
+    EXPECT_EQ(reconcile_durable.acked_frames(), 2u) << "the Ambiguous re-record and the Cancelled resolution";
+    EXPECT_EQ(reconcile_durable.failed_appends(), 0u);
+
+    // Restart: Intent, Prepared, Ambiguous, Ambiguous, Cancelled -- every frame a legal repeat or transition, the
+    // order exchange-final, so nothing to recover.
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Clean);
     EXPECT_TRUE(restarted->recovered_checkpoints().empty());
 }
