@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -149,7 +150,7 @@ public:
     bool is_log_open() const noexcept { return log_open_; }
 
     // Reflects the outcome of the MOST RECENT append_and_fsync()/
-    // write_tip_anchor() call only -- Ok after a successful one, DiskFull/
+    // write_tip_anchor()/truncate_log() call only -- Ok after a successful one, DiskFull/
     // OtherError after a failed one. Not sticky across calls (a later
     // successful write resets it to Ok), so callers that want to record a
     // failure's reason must read this immediately after that call returns
@@ -214,6 +215,49 @@ public:
             // permits it) -- not attributable to a specific errno-like cause,
             // classify as OtherError rather than guessing DiskFull.
             last_write_status_ = IoWriteStatus::OtherError;
+            return false;
+        }
+        if (FlushFileBuffers(log_handle_) == 0) {
+            record_write_failure();
+            return false;
+        }
+        return true;
+    }
+    // Shrinks the log file to exactly `new_size` bytes and makes the new size durable (SAFE-03 crash-window slice,
+    // blueprint L-36). It exists for ONE caller: a recovery scan that has just proven the log up to `new_size` and
+    // found a torn tail after it (see detail::discard_torn_tail). append_and_fsync() appends at the PHYSICAL end of
+    // the file, so a torn tail that is only skipped logically sits between the last valid frame and the next one
+    // and turns the NEXT start into Corrupt.
+    //   * never extends: new_size > the current size returns false and touches nothing;
+    //   * new_size == the current size is a successful no-op;
+    //   * idempotent and crash-safe: a crash before the new size is durable leaves the torn tail, which the next
+    //     scan drops again; the file is never left shorter than `new_size`.
+    // false = the file may still hold the tail (the caller must fence); last_write_status() says why.
+    bool truncate_log(std::uint64_t new_size) noexcept {
+        last_write_status_ = IoWriteStatus::Ok;
+        if (take_test_truncate_failure()) {
+            last_write_status_ = IoWriteStatus::OtherError;
+            return false;
+        }
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(log_handle_, &size)) {
+            record_write_failure();
+            return false;
+        }
+        const auto current = static_cast<std::uint64_t>(size.QuadPart);
+        if (new_size > current) {
+            last_write_status_ = IoWriteStatus::OtherError;  // a truncate never extends a log
+            return false;
+        }
+        if (new_size == current) return true;
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(new_size);
+        if (!SetFilePointerEx(log_handle_, pos, nullptr, FILE_BEGIN)) {
+            record_write_failure();
+            return false;
+        }
+        if (!SetEndOfFile(log_handle_)) {
+            record_write_failure();
             return false;
         }
         if (FlushFileBuffers(log_handle_) == 0) {
@@ -405,6 +449,43 @@ public:
         }
         return true;
     }
+    // Shrinks the log file to exactly `new_size` bytes and makes the new size durable (SAFE-03 crash-window slice,
+    // blueprint L-36). It exists for ONE caller: a recovery scan that has just proven the log up to `new_size` and
+    // found a torn tail after it (see detail::discard_torn_tail). append_and_fsync() appends at the PHYSICAL end of
+    // the file, so a torn tail that is only skipped logically sits between the last valid frame and the next one
+    // and turns the NEXT start into Corrupt.
+    //   * never extends: new_size > the current size returns false and touches nothing;
+    //   * new_size == the current size is a successful no-op;
+    //   * idempotent and crash-safe: a crash before the new size is durable leaves the torn tail, which the next
+    //     scan drops again; the file is never left shorter than `new_size`.
+    // false = the file may still hold the tail (the caller must fence); last_write_status() says why.
+    bool truncate_log(std::uint64_t new_size) noexcept {
+        last_write_status_ = IoWriteStatus::Ok;
+        if (take_test_truncate_failure()) {
+            last_write_status_ = IoWriteStatus::OtherError;
+            return false;
+        }
+        struct stat st{};
+        if (::fstat(log_fd_, &st) != 0) {
+            record_write_failure();
+            return false;
+        }
+        const auto current = static_cast<std::uint64_t>(st.st_size);
+        if (new_size > current) {
+            last_write_status_ = IoWriteStatus::OtherError;  // a truncate never extends a log
+            return false;
+        }
+        if (new_size == current) return true;
+        if (detail::retry_on_eintr([&] { return ::ftruncate(log_fd_, static_cast<off_t>(new_size)); }) != 0) {
+            record_write_failure();
+            return false;
+        }
+        if (detail::retry_on_eintr([&] { return ::fsync(log_fd_); }) != 0) {
+            record_write_failure();
+            return false;
+        }
+        return true;
+    }
     std::uint64_t log_size() const noexcept {
         struct stat st{};
         if (::fstat(log_fd_, &st) != 0) return 0;
@@ -525,11 +606,58 @@ private:
 #endif
 
 private:
+    // Test seam for truncate_log(): the next N calls fail the way a truncate the OS refuses would. Process-wide and
+    // consumed by truncate_log() alone; driven by DurableLogStoreTestHooks, a class defined only under native/tests/.
+    // The friend declaration is unconditional and literal-identical across every TU, like every other TestHooks
+    // class in this tree.
+    friend class DurableLogStoreTestHooks;
+    static inline std::atomic<std::uint32_t> test_fail_truncates_{0};
+    static bool take_test_truncate_failure() noexcept {
+        std::uint32_t n = test_fail_truncates_.load(std::memory_order_relaxed);
+        while (n > 0) {
+            if (test_fail_truncates_.compare_exchange_weak(n, n - 1, std::memory_order_relaxed)) return true;
+        }
+        return false;
+    }
+
     std::string log_path_;
     std::string lock_path_;
     std::string tip_path_;
     bool log_open_{false};
     IoWriteStatus last_write_status_{IoWriteStatus::Ok};
 };
+
+namespace detail {
+
+// What recovery did with the bytes after the last complete frame (SAFE-03 crash-window slice, blueprint L-36).
+enum class TornTail : std::uint8_t {
+    None = 0,     // the file ends exactly at the last complete frame
+    Dropped = 1,  // a torn tail was cut off and the new size is durable
+    TooLong = 2,  // the bytes after the last frame are at least one whole frame: no torn append leaves that
+    IoError = 3,  // the truncate failed (or the offsets are impossible): the caller must fence
+};
+
+// The ONLY place a log is ever shortened. Called by a recovery scan AFTER its anchor check passed, with `valid_end`
+// = the end of the last complete frame it verified. A log that fails the anchor check, or that holds a frame which
+// is complete but wrong (Corrupt), is never passed here: it is left byte-for-byte as it was, because those bytes
+// are evidence, not debris.
+//
+// `max_tail_bytes` is the size of the largest frame the log can hold. A crash in the middle of ONE append leaves
+// strictly fewer bytes than one frame, so a longer tail cannot be a torn append and is refused (TooLong) instead of
+// being cut -- defense in depth against a scan bug turning into data loss. The torn bytes are discarded, not kept
+// (owner decision, 2026-10-14).
+inline TornTail discard_torn_tail(DurableLogStore& store, std::uint64_t valid_end, std::uint64_t file_size,
+                                  std::uint64_t max_tail_bytes, std::uint64_t& dropped) noexcept {
+    dropped = 0;
+    if (valid_end > file_size) return TornTail::IoError;
+    const std::uint64_t tail = file_size - valid_end;
+    if (tail == 0) return TornTail::None;
+    if (tail >= max_tail_bytes) return TornTail::TooLong;
+    if (!store.truncate_log(valid_end)) return TornTail::IoError;
+    dropped = tail;
+    return TornTail::Dropped;
+}
+
+}  // namespace detail
 
 }  // namespace hy

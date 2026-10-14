@@ -166,6 +166,22 @@ inline bool decode_tip_anchor(std::span<const std::byte> in, std::span<const std
     return true;
 }
 
+// The scan status once recovery has dealt with the bytes after the last complete frame (SAFE-03 crash-window slice,
+// blueprint L-36). Clean = the log now ends on a frame boundary (nothing to cut, or the torn tail was cut and the new
+// size is durable); IoError = the truncate failed, so the torn tail is still on disk and the next append would land
+// behind it -- the caller fences; Corrupt = at least one whole frame of unexplained bytes, which no crash in the
+// middle of ONE append can leave (they are kept, not cut). `dropped` receives the number of bytes cut.
+inline RecoveryScanStatus cut_torn_tail(DurableLogStore& store, std::uint64_t valid_end, std::uint64_t file_size,
+                                        std::uint64_t max_tail_bytes, std::uint64_t& dropped) noexcept {
+    switch (discard_torn_tail(store, valid_end, file_size, max_tail_bytes, dropped)) {
+        case TornTail::None:
+        case TornTail::Dropped: return RecoveryScanStatus::Clean;
+        case TornTail::TooLong: return RecoveryScanStatus::Corrupt;
+        case TornTail::IoError: return RecoveryScanStatus::IoError;
+    }
+    return RecoveryScanStatus::IoError;
+}
+
 }  // namespace detail
 
 // --- Store identity (implementation-internal, NOT spec-pinned) ---
@@ -411,6 +427,15 @@ public:
     // one more than that is CapacityExceeded.
     std::size_t recovered_intent_orphans() const noexcept { return intent_orphan_count_; }
     std::size_t max_intent_orphans() const noexcept { return max_intent_orphans_; }
+
+    // SAFE-03 crash-window slice (blueprint L-36): how many bytes of a torn tail -- the partial frame a crash in the
+    // middle of an append left behind -- recovery cut off the end of the main log (and, for the second accessor, off
+    // the key-rotation sidecar) before the first new append. append_durable() appends at the PHYSICAL end of the
+    // file, so a tail that was only skipped when scanning would sit between the last valid frame and the next one
+    // and make the NEXT start Corrupt. 0 = the file ended on a frame boundary. The cut bytes are discarded, not
+    // kept (owner decision, 2026-10-14): they are an incomplete record whose append was never acknowledged.
+    std::uint64_t recovered_torn_tail_bytes() const noexcept { return torn_tail_bytes_; }
+    std::uint64_t recovered_rotation_torn_tail_bytes() const noexcept { return rotation_torn_tail_bytes_; }
 
     // Appends one OrderEvent frame: encode -> write -> fsync log -> write tip
     // anchor -> fsync anchor -> Acked. Any failure at any step permanently
@@ -803,12 +828,26 @@ private:
         if (expected_seq == 0) {
             // Every frame present was a torn tail at sequence 0 -- same as
             // an empty log for anchor-checking purposes.
-            return finalize_scan_with_anchor_check(/*log_tip_valid=*/false, 0, {}, {});
+            const auto first = finalize_scan_with_anchor_check(/*log_tip_valid=*/false, 0, {}, {});
+            if (first != RecoveryScanStatus::Clean && first != RecoveryScanStatus::Recovered) return first;
+            // A first frame that never completed leaves no anchor and nothing to lose: cut it, so that the first
+            // append starts the file instead of following debris.
+            const auto first_cut = detail::cut_torn_tail(log_store_, offset, content.size(), kOrderEventFrameSize,
+                                                         torn_tail_bytes_);
+            return first_cut == RecoveryScanStatus::Clean ? first : first_cut;
         }
 
         auto status = finalize_scan_with_anchor_check(/*log_tip_valid=*/true, expected_seq - 1,
                                                         macs_by_sequence.back(), macs_by_sequence);
         if (status != RecoveryScanStatus::Clean && status != RecoveryScanStatus::Recovered) return status;
+
+        // SAFE-03 crash-window slice (blueprint L-36): the scan stopped at `offset`, the end of the last complete
+        // frame; anything after it is the partial frame a crash left behind (or nothing). The anchor check above
+        // has passed, so the log up to `offset` is proven -- cut the rest. A log that failed the check, or holds a
+        // complete-but-wrong frame, never gets here and is left byte-for-byte as it was.
+        const auto cut = detail::cut_torn_tail(log_store_, offset, content.size(), kOrderEventFrameSize,
+                                               torn_tail_bytes_);
+        if (cut != RecoveryScanStatus::Clean) return cut;
 
         next_sequence_ = expected_seq;
         tip_mac_ = macs_by_sequence.back();
@@ -992,6 +1031,7 @@ private:
         std::uint64_t expected_seq = 0;
         std::array<std::byte, kMacLen> running_prev_mac{};
         std::array<std::byte, kMacLen> last_mac{};
+        std::array<std::byte, kMacLen> prev_of_last_mac{};  // the MAC of the frame before the last one
 
         while (offset < content.size()) {
             std::span<const std::byte> remaining(content.data() + offset, content.size() - offset);
@@ -1026,6 +1066,7 @@ private:
             // outstanding.
             last_rotation_ = frame.payload;
 
+            prev_of_last_mac = last_mac;
             last_mac = frame.mac;
             running_prev_mac = frame.mac;
             ++expected_seq;
@@ -1034,7 +1075,11 @@ private:
 
         if (expected_seq == 0) {
             std::vector<std::byte> anchor_bytes;
-            return !rotation_log_store_.read_tip_anchor(anchor_bytes);
+            if (rotation_log_store_.read_tip_anchor(anchor_bytes)) return false;
+            // No complete frame and no anchor: a first KeyRotated frame that never completed is cut (same reasoning
+            // as the main log's first frame above).
+            return detail::cut_torn_tail(rotation_log_store_, offset, content.size(), kKeyRotatedFrameSize,
+                                         rotation_torn_tail_bytes_) == RecoveryScanStatus::Clean;
         }
 
         std::vector<std::byte> anchor_bytes;
@@ -1051,8 +1096,20 @@ private:
                 anchor)) {
             return false;
         }
-        if (anchor.sequence_number != expected_seq - 1) return false;
-        if (anchor.mac != last_mac) return false;
+        // rotate_active_key() fsyncs the sidecar frame and THEN writes the sidecar anchor, so a crash between the
+        // two leaves the anchor exactly one frame behind a perfectly good frame (the late-fsync window, which the
+        // main log's own anchor check has always accepted). Accept that -- and nothing else: the MAC at the
+        // anchor's sequence must match what the anchor claims.
+        const bool at_tip = anchor.sequence_number == expected_seq - 1 && anchor.mac == last_mac;
+        const bool one_behind = expected_seq >= 2 && anchor.sequence_number == expected_seq - 2 &&
+                                anchor.mac == prev_of_last_mac;
+        if (!at_tip && !one_behind) return false;
+
+        // The anchor check passed: cut a torn tail (blueprint L-36), exactly as for the main log.
+        if (detail::cut_torn_tail(rotation_log_store_, offset, content.size(), kKeyRotatedFrameSize,
+                                  rotation_torn_tail_bytes_) != RecoveryScanStatus::Clean) {
+            return false;
+        }
 
         rotation_next_sequence_ = expected_seq;
         rotation_tip_mac_ = last_mac;
@@ -1225,6 +1282,8 @@ private:
     std::size_t checkpoint_count_{0};
     std::size_t max_intent_orphans_{kMaxIntentOrphans};
     std::size_t intent_orphan_count_{0};
+    std::uint64_t torn_tail_bytes_{0};
+    std::uint64_t rotation_torn_tail_bytes_{0};
 
     ExportOutboxRing* export_outbox_{nullptr};
 
