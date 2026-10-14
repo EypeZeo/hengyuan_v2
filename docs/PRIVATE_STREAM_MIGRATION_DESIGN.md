@@ -1,7 +1,7 @@
 # 私网流迁移、发单就绪门与用户数据流持久化——设计提案
 
 > **状态：提案（PROPOSAL），未被接受，不是规格。** 它把蓝图任务 1A.4（现货私有 WebSocket 用户数据流与会话对账）、审计 P1-002 的路径 ③（用户数据流排空函数）和 FI-043 要求的“屏障门”拆成可以逐片开工、逐片验收的工作，并把需要 Owner 拍板的点列在 §8。每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出 ≤5 行计划、等“开始”。
-> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。
+> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-31，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。
 > 读法：§0 是一页摘要；§1 是现状事实（每条带 `file:symbol`）；§2–§6 是设计；§7 是切片计划；§8 是决策点；§9 是风险；§10 是验收映射。
 
 ## 0. 一页摘要
@@ -20,7 +20,7 @@
 
 **规模**：我估计 6 片（M0–M5）共 10 至 14 个工作日，其中 M3（屏障与就绪门）和 M2（会话）最重；蓝图对 1A.4 本身的估计是 5 至 9 日，那个数不含就绪门和路径 ③。
 
-**需要你决定的**：§8 的 D1–D8，每条带我的推荐。最先要的是 D8：M0 需要把官方 `web-socket-api.md` 拉到本地核对协议细节（下载需要你的许可）。
+**需要你决定的**：§8 的 D1–D7，每条带我的推荐（D8 的下载许可已获批，M0 已完成，结果在 §4.2）。
 
 ## 1. 现状（事实，带 `file:symbol`）
 
@@ -105,20 +105,28 @@ flowchart LR
 - P-08：`serverShutdown` 是 JSON 文本帧事件，官方已删除固定提前量的说法，收到后应尽快建立新连接。
 - 蓝图 `5.2`：现货 WS API 签名策略 = 排除签名字段、**不做百分号编码**、参数名升序、拼成键值对序列的 UTF-8 字节流；验收要求官方示例向量、仓库内冻结的黄金向量、Testnet 联调三类证据齐备。
 
-### 4.2 **待核**（M0 要拿官方 `web-socket-api.md` 逐条核，核完写回 `5.7` 作为新的 P-编号）
+### 4.2 M0 核对结果（2026-10-14，已写入蓝图 `5.7` 的 P-24 至 P-31）
 
-1. WS API 端点与 Testnet 端点（我记得是 `wss://ws-api.binance.com:443/ws-api/v3` 与 `wss://ws-api.testnet.binance.vision/ws-api/v3`，未核）。
-2. 订阅请求与响应的确切形状：请求的 `id`、`method`、`params`（`apiKey`、`timestamp`、`recvWindow`、`signature`），响应里 `result.subscriptionId` 的位置与错误码。
-3. 事件的包装形状（我记得是 `{"subscriptionId":N,"event":{...}}`，未核）；`serverShutdown`、`eventStreamTerminated` 的确切形状与语义。
-4. `userDataStream.subscribe.signature`、`session.subscriptions`、`userDataStream.unsubscribe` 的请求权重（与现货 REST 同一个 `REQUEST_WEIGHT` 限额）。
-5. 同一账户能否在**两个连接上同时各有一个活跃订阅**（决定能否做先建后断的重叠轮换，D3）。
-6. WS API 的心跳与断线规则（服务端 ping 间隔与 pong 期限）、连接频率限制、`recvWindow` 的上限与默认值。
-7. 执行报告里 `n`、`N`、`t` 的确切字段名与类型，`balanceUpdate`、`externalLockUpdate`、`listStatus` 的字段。
+对象：现货仓库的 `web-socket-api.md`、`user-data-stream.md`、`CHANGELOG.md`（Owner 于 2026-10-14 许可下载，核完已删除）。下表每一行对应原来 7 个待核项之一。
+
+| # | 待核项 | 结论 | 登记 | 对设计的影响 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | 端点 | 生产 `wss://ws-api.binance.com:443/ws-api/v3`（443 不通时备用端口 9443），Testnet `wss://ws-api.testnet.binance.vision/ws-api/v3`；我记得的两个地址都对 | P-24 | `WsEndpointPermit` 的主机白名单放这两个主机；备用端口不进白名单（需要时另议） |
+| 2 | 订阅请求与响应形状 | 请求 `{"id","method":"userDataStream.subscribe.signature","params":{"apiKey","timestamp","signature"[,"recvWindow"]}}`；成功响应 `{"id","status":200,"result":{"subscriptionId":N}}`；失败是 `{"id","status":4xx,"error":{"code","msg"}}`；`recvWindow` 为 DECIMAL、不大于 60000 | P-24、P-25 | 签名原文只有三到四个参数；订阅专用的错误码文档里没有逐个列出，按状态码类别处理 |
+| 3 | 事件包装与连接事件 | `{"subscriptionId":N,"event":{…}}` 与记忆一致；`serverShutdown` 是 `{"event":{"e":"serverShutdown","E":ms}}`，**没有 `subscriptionId`**；`eventStreamTerminated` 带 `subscriptionId`，在订阅被 `userDataStream.unsubscribe` 停止（以及令牌过期、`session.logout`）时发出 | P-28、P-29 | 解析器把 `subscriptionId` 当作可选；`serverShutdown` 不属于任何订阅，直接触发代次结束 |
+| 4 | 权重 | `userDataStream.subscribe`、`unsubscribe`、`session.subscriptions`、`userDataStream.subscribe.signature` 均为 2；建立连接本身 2；与 REST 同属按 IP 累计的 `REQUEST_WEIGHT` | P-26 | 一次重连的固定成本 = 连接 2 + 订阅 2 + 校验 2 = 6，记入 Reconciliation 车道（D7）；清扫的查询才是大头 |
+| 5 | 同一账户在两个连接上各有一个活跃订阅 | **文档没有说明**：只限定“同一连接同一账户一个活跃订阅”，另有单会话同时 1000 个、累计 65535 次订阅的上限 | P-27 | 不能假定可行：D3 的重叠轮换在 Testnet 实测之前不可选，默认“先断后建”不变 |
+| 6 | 心跳、连接频率、`recvWindow` | 服务端每 20 秒发 ping，一分钟内收不到 pong 即断开；每个 IP 每 5 分钟 300 次连接尝试；`recvWindow` 默认 5000、上限 60000；单连接 24 小时 | P-30、P-26 | 无事件的安静账户上，**唯一的存活信号是服务端 20 秒一次的 ping 控制帧**：FI-020 的“无帧”判据必须把控制帧算进去，`stale_after_ms` 取 ping 间隔的整数倍而不是事件间隔；退避必须远低于 300 次每 5 分钟 |
+| 7 | `n`、`N`、`t` 与其余事件字段 | `n` 为字符串，`N` 可空，`t` 为数字（样例中无成交为 -1）；`balanceUpdate{e,E,a,d,T}`、`externalLockUpdate{e,E,a,d,T}`、`listStatus{e,E,s,g,c,l,L,r,C,T,O[]}`、`outboundAccountPosition{e,E,u,B[]}` | P-28、P-29 | `UserDataWsEvent` 的新字段与五个新事件种类以此为准；条件字段的缺失与新增必须容忍 |
+
+**签名配方也核了**：官方 HMAC 示例的两组签名（ASCII 与含全角数字的标的名）用独立实现按“去掉 `signature`、按参数名升序、`名=值` 用 `&` 连接、不做百分号编码、UTF-8、十六进制”复算，与官方一致（P-31）；两组向量留给 M1 写进测试，黄金向量与 Testnet 联调两类证据仍缺。
+
+**没有核到的两项**：（一）同一账户跨连接并行订阅（上表第 5 项）；（二）Testnet 是否仍支持 listenKey 端点——三份文件都没有说，`testnet/CHANGELOG.md` 没有下载，D5 因此没有新信息。这两项只能由 Owner 在 Testnet 上实测，或另行许可我下载 `testnet/CHANGELOG.md`。
 
 ### 4.3 代码层（M1）
 
 - `WsApiSigningPolicy`（新，纯函数）：输入已校验的参数集合 + `ClockReadyToken`，输出“签名输入即发送字节”的 `WsApiSignedRequest`（沿用 `build_signed_query` 的手法：单一构造点、保留参数拒绝、签名字节与发送字节同源——E-03）。类型上**只有它能签发** `WsApiSignedRequest`，会话只收这个类型。
-- `ws_api_codec`（新，纯函数）：`build_subscribe_signature_request`、`build_session_subscriptions_request`、`parse_ws_api_response`、`parse_user_data_event`（**包装感知**，取代 `UserDataJsonParser`；新增 `BalanceUpdate`、`ExternalLockUpdate`、`ListStatus`、`EventStreamTerminated`、`ServerShutdown` 五个种类，执行报告补 `n`/`N`/`t`）。
+- `ws_api_codec`（新，纯函数）：`build_subscribe_signature_request`、`build_session_subscriptions_request`、`parse_ws_api_response`、`parse_user_data_event`（**包装感知**，`subscriptionId` 可缺——`serverShutdown` 不带它（P-29）；取代 `UserDataJsonParser`；新增 `BalanceUpdate`、`ExternalLockUpdate`、`ListStatus`、`EventStreamTerminated`、`ServerShutdown` 五个种类，执行报告补 `n`/`N`/`t`）。
 - 端点与限流：`EndpointPermit` 目前只管 HTTP 响应的上限（`ResponseKind`），会话连哪个主机也只靠它。WS 会话需要同族的 `WsEndpointPermit`（主机白名单 + 单条消息上限，唯一签发者是 `issue_ws_endpoint_permit`），并把新会话登记进 `test_rest_freeze_guard` 的“所有打开连接的位置”清单——否则会话可以绕过白名单而没有测试发现；WS API 的主机（生产与 Testnet）要加进 `TransportPolicy` 的白名单。限流账本给 WS API 请求另起一个种类枚举与权重（归 Reconciliation 车道，D7）；`PrivateRestEndpoint` 是被 `spec_enum_diff` 钉住的枚举，**不往里加**。
 - 事件结构：`UserDataWsEvent` 增加 `generation`（u64）、`subscription_id`（i64）、`commission_raw`/`commission_asset`/`trade_id`；环容量保持 64 或按 §9 的 R5 重估。
 
@@ -141,7 +149,7 @@ flowchart LR
 - **断线 / 监督器离开 `Connected`** → `Down`（FI-043：自断开起就拦截）。
 - **计划轮换 / `serverShutdown` / `eventStreamTerminated`** → 视为代次结束 → `Down`（D3 若采用重叠轮换则不同）。
 - **环满丢弃计数增加**（F5）→ 同一代次内回到 `Sweeping`（“软屏障”：不重连，只重新清扫）。
-- **心跳假死**（超过 `stale_after_ms` 没有任何帧，FI-020）→ 停止会话，走代次结束。
+- **心跳假死**（超过 `stale_after_ms` 没有任何帧——**含服务端 20 秒一次的 ping 控制帧**，见 §4.2 第 6 项；FI-020）→ 停止会话，走代次结束。
 - **疑似执行报告的解析失败**（带 `"e":"executionReport"` 却取不出 `c` 或 `z`）→ 软屏障。
 
 旧代次迟到事件（FI-009）：`Sweeping` 之前与期间，旧代次事件照常经 `consume_delta` 合并（只应用正差分）；`Reconciled(G)` 之后，代次 < G 的事件直接丢弃并计数。
@@ -195,7 +203,7 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 
 | 片 | 内容 | Tier | 验证层级 | 估计 |
 | :-- | :-- | :-- | :-- | :-- |
-| **M0** 协议核对 | 拉官方 `web-socket-api.md`（需许可），核 §4.2 的 7 项，写入蓝图 `5.7`（新的 P-编号）；整理 WS API 签名的官方示例向量 | A | 文档核对（`tools/closure_ledger_check.py`、站点四层检查） | 0.5 日 |
+| **M0** 协议核对（**已完成 2026-10-14**） | 核 §4.2 的 7 项并写入蓝图 `5.7`（P-24 至 P-31）；官方 HMAC 示例的两组签名已复算一致（P-31），向量写进仓库测试留给 M1 | A | 文档核对（`tools/closure_ledger_check.py`、站点四层检查） | 0.5 日（实际） |
 | **M1** 编解码与签名 | `WsApiSigningPolicy`、`ws_api_codec`、新事件种类与字段、`EndpointPermit`/限流的 WS API 种类（不动被钉住的枚举） | B（新组件） | MSVC + WSL2 `none` + `address`；黄金向量 + 官方示例向量 + 篡改一位必须验签失败的负向对照；变异检查 | 2 日 |
 | **M2** 会话 | `BinanceWsApiUserDataSession`（握手后取信箱里的已签名字节、发订阅、校验响应与 `session.subscriptions`、读循环、盖代次、`serverShutdown`/`eventStreamTerminated` 处理、失败即停）；`WsLoopbackServer` 扩展为可读客户端帧的脚本化应答；监督器接线 | B（并发） | WSL2 `thread`（信箱交接，带负控）、`address`；回环服务端覆盖：订阅成功/失败/超时、重复订阅、断线、`serverShutdown` | 3 日 |
 | **M3** 屏障与就绪门 | `ReconnectBarrier`、对账线程的 `BarrierSweep` 入口与回报环、`SubmitReadiness`/`SubmitReadyToken`、`OrchestratorGate::NotReady`、护栏测试；现有约百个编排器测试通过夹具里的一处测试钩子接线，不逐个改；`StartupRecovery` 第一次被真正接进线束（预检线束）；FI-009/011/020/043 的确定性状态机测试 | B（状态机 + 并发） | WSL2 `thread`（两个负控仍须失败，另加清扫回报环的负控）+ `address`；变异检查；`formal/` 新增屏障模型（见 §9 的 R9） | 4 日 |
@@ -210,21 +218,21 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 | :-- | :-- | :-- | :-- |
 | D1 | 订阅方式 | 签名订阅（HMAC 可用）；或先做 Ed25519 与 `session.logon` | **签名订阅**（蓝图已定；Ed25519 另走 SPOT-03） |
 | D2 | 屏障期间拦截范围 | 一律拒绝所有新单；或区分增风险/减风险（需要仓位感知的分类） | **第一版一律拒绝**——树里没有撤单与减仓路径，分类没有对象；以后再放宽 |
-| D3 | 24 小时轮换与 `serverShutdown` | 先断后建（复用 `PublicFeedSupervisor`，屏障兜底）；或先建后断的重叠（新旧两个连接同时订阅，需 §4.2 第 5 项为真） | **先断后建**：正确性由屏障保证，窗口是重连 + 清扫的时间；等 Testnet 量出窗口再决定要不要优化 |
+| D3 | 24 小时轮换与 `serverShutdown` | 先断后建（复用 `PublicFeedSupervisor`，屏障兜底）；或先建后断的重叠（新旧两个连接同时订阅，需 §4.2 第 5 项为真——官方文档没有说明，Testnet 实测之前不可选） | **先断后建**：正确性由屏障保证，窗口是重连 + 清扫的时间；等 Testnet 量出窗口再决定要不要优化 |
 | D4 | 路径 ③ 的持久方案 | A 影子 + 合并发布者；B 转成对账事件；C 仅作提示 | **A**，C 作后备（§6.2） |
-| D5 | listenKey 整套 | M5 直接删除；或留着给 Testnet | **删除**（先核对 Testnet 是否仍支持，M0 顺带核；git 历史保留，避免两套会话语义并存） |
+| D5 | listenKey 整套 | M5 直接删除；或留着给 Testnet | **删除**（Testnet 是否仍支持 listenKey 三份已读文件都没有说，见 §4.2 末尾：M5 删除前由 Owner 在 Testnet 上确认；git 历史保留，避免两套会话语义并存） |
 | D6 | 清扫由谁执行 | 对账线程（新入口 + 回报环）；或热线程同步查询 | **对账线程**：热线程已经有同步 POST，不该再叠 64 个同步查询 |
-| D7 | WS API 请求的限流车道 | Reconciliation 车道；或独立车道 | **Reconciliation 车道**（订阅与校验属于对账类流量），权重以 M0 核到的为准 |
-| D8 | **许可** | 允许我下载官方 `web-socket-api.md`（来源 `raw.githubusercontent.com/binance/binance-spot-api-docs/master/web-socket-api.md`，约几百 KB，存入会话草稿目录，核完删除） | 请允许；这是 M0 的前提 |
+| D7 | WS API 请求的限流车道 | Reconciliation 车道；或独立车道 | **Reconciliation 车道**（订阅与校验属于对账类流量），权重已核：订阅与校验各 2、建立连接 2（P-26） |
+| D8 | **许可**（已决） | Owner 于 2026-10-14 许可下载；M0 用 `web-socket-api.md`、`user-data-stream.md`、`CHANGELOG.md` 三份文件完成，下载内容已删除 | 已完成 |
 
 ## 9. 风险与未知
 
-- **R1 协议细节未核**（§4.2 的 7 项）：M0 在写任何代码之前核完；核不出来的项按“最保守”处理并在代码里留断言。
+- **R1 协议细节**：§4.2 的 7 项已核完 6 项；剩下的“跨连接并行订阅”与“Testnet 是否仍支持 listenKey”按最保守处理（先断后建；M5 删除前再确认），并在代码里留断言。
 - **R2 真实协议证据只能由 Owner 产生。** `CLAUDE.md`：AI 会话不处理真实凭据、不提交真实订单。CI 里只有回环服务端；Testnet 联调（M5）由你用 Testnet 凭据运行，我提供线束与判据。回环测试证明“我们的客户端按我们理解的协议行事”，不证明“我们理解对了协议”——这条差距只有联调能补。
 - **R3 新的跨线程状态**：信箱（热线程 → I/O 线程）、清扫回报环（对账线程 → 热线程）。两处都按既有 SPSC/一次性交接的模式，各带 TSan 负控。
 - **R4 同步 fsync 进入 WS 排空路径**：合并后 fsync 次数与订单数成正比，但仍在热线程上；时延未测量（与 SAFE-03 切片 1 的遗留同源，`seg.budget` 仍缺）。
 - **R5 环容量 64 与丢弃**：突发期间（重连后回放的积压、一笔订单大量分笔成交）可能丢事件；设计上丢弃 = 软屏障，所以不是静默丢失，但会短暂拦截发单。容量是否要加大由 Testnet 实测决定。
-- **R6 屏障期间的拦截时长**：重连 + 订阅校验 + 清扫（最多 `kMaxInFlight` 次查询，权重 4 each = 256，在 Reconciliation 车道预算内要核）。若量出来是秒级，D3 的重叠轮换值得做。
+- **R6 屏障期间的拦截时长**：重连 + 订阅校验 + 清扫（最多 `kMaxInFlight` 次查询，权重 4 each = 256，在 Reconciliation 车道预算内要核）。若量出来是秒级，D3 的重叠轮换值得做（但前提 §4.2 第 5 项在 Testnet 上为真）。一次重连的固定权重成本只有 6（P-26）。
 - **R7 24 小时轮换与行情节奏**：轮换点应避开整点 K 线收盘（公共侧的 `BoundaryFn` 已有同样的需求），否则屏障正好压在信号时刻。
 - **R8 影子表的维护面（方案 A）**：所有持久 ACK 点都要更新它；漏一处就是不变量破洞。缓解：护栏测试逐点钉死、变异检查“漏更新一处”。
 - **R9 形式化模型**：蓝图要求并发/状态机类改动配 TLA+ 模型。屏障 + 代次 + 就绪令牌值得一个小模型（状态：代次、屏障态、在途订单的已知度；不变量：令牌签发 ⇒ 该代次已对账；负控：删掉“断线即 Down”必须违反不变量）。放在 M3。
@@ -246,4 +254,4 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 
 ---
 
-**下一步（等你表态）**：D1–D8。D8 是最先的——M0 不需要任何代码，只要许可就能开始；M1 起每片按 Tier B 出计划等“开始”。
+**下一步（等你表态）**：D1–D7。M0 已完成（D8 已许可）；M1 起每片按 Tier B 出计划、等“开始”。
