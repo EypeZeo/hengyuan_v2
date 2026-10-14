@@ -139,6 +139,10 @@ public:
     bool is_open() const noexcept { return log_store_.is_log_open(); }
     bool fenced() const noexcept { return fenced_; }
     RecoveryScanStatus recovery_status() const noexcept { return recovery_status_; }
+    // SAFE-03 crash-window slice (blueprint L-36): how many bytes of a torn tail -- the partial frame a crash in the
+    // middle of an append left behind -- recovery cut off the end of the log before the first new append (see
+    // DurableAuditSink::recovered_torn_tail_bytes() for why). 0 = the file ended on a frame boundary.
+    std::uint64_t recovered_torn_tail_bytes() const noexcept { return torn_tail_bytes_; }
 
     // Capability gate for the 2 compaction-only methods below -- callers
     // MUST check this before calling them. Always false: there is no
@@ -513,6 +517,7 @@ private:
         std::uint64_t expected_seq = 0;
         std::array<std::byte, kMacLen> running_prev_mac{};
         std::array<std::byte, kMacLen> last_mac{};
+        std::array<std::byte, kMacLen> prev_of_last_mac{};  // the MAC of the frame before the last one
         bool any_frame_seen = false;
 
         // Read-ahead buffer sized to the largest frame this sink can ever
@@ -555,6 +560,7 @@ private:
                 // permanent historical fact, not "unresolved state to
                 // recover" the way the freeze/weights/usage/bridge folds are.
                 running_prev_mac = f.mac;
+                prev_of_last_mac = last_mac;
                 last_mac = f.mac;
                 any_frame_seen = true;
                 ++expected_seq;
@@ -753,6 +759,7 @@ private:
 
             if (dispatched_ok) {
                 running_prev_mac = frame_mac;
+                prev_of_last_mac = last_mac;
                 last_mac = frame_mac;
                 any_frame_seen = true;
                 ++expected_seq;
@@ -765,24 +772,46 @@ private:
         }
 
         if (!any_frame_seen) {
-            return finalize_scan_with_anchor_check(/*log_tip_valid=*/false, 0, {});
+            const auto first = finalize_scan_with_anchor_check(/*log_tip_valid=*/false, 0, {});
+            if (first != RecoveryScanStatus::Clean && first != RecoveryScanStatus::Recovered) return first;
+            // A first frame that never completed leaves no anchor and nothing to lose: cut it, so that the first
+            // append starts the file instead of following debris.
+            const auto first_cut =
+                detail::cut_torn_tail(log_store_, offset, total_size, kMaxSnapshotFrameSize, torn_tail_bytes_);
+            return first_cut == RecoveryScanStatus::Clean ? first : first_cut;
         }
 
-        const auto status = finalize_scan_with_anchor_check(/*log_tip_valid=*/true, expected_seq - 1, last_mac);
+        const auto status =
+            finalize_scan_with_anchor_check(/*log_tip_valid=*/true, expected_seq - 1, last_mac, prev_of_last_mac);
         if (status != RecoveryScanStatus::Clean && status != RecoveryScanStatus::Recovered) return status;
+
+        // SAFE-03 crash-window slice (blueprint L-36): the scan stopped at `offset`, the end of the last complete
+        // frame; anything after it is the partial frame a crash left behind (or nothing). The anchor check above
+        // has passed, so the log up to `offset` is proven -- cut the rest, because append_and_fsync() appends at the
+        // PHYSICAL end of the file. A log that failed the check, or holds a complete-but-wrong frame, never gets
+        // here and is left byte-for-byte as it was.
+        const auto cut = detail::cut_torn_tail(log_store_, offset, total_size, kMaxSnapshotFrameSize, torn_tail_bytes_);
+        if (cut != RecoveryScanStatus::Clean) return cut;
 
         next_sequence_ = expected_seq;
         tip_mac_ = last_mac;
         return RecoveryScanStatus::Recovered;
     }
 
-    // Tip-anchor cross-check -- structurally identical to DurableAuditSink's
-    // own finalize_scan_with_anchor_check (durable_audit_sink.hpp), reused
-    // here as duplicated logic (not shared code -- that method is private,
-    // non-exported) since it is small and the two classes' recovery loops
-    // otherwise differ (this one is streaming, that one is whole-file).
+    // Tip-anchor cross-check -- the same decision as DurableAuditSink's own finalize_scan_with_anchor_check
+    // (durable_audit_sink.hpp), reused here as duplicated logic (not shared code -- that method is private,
+    // non-exported) since it is small and the two classes' recovery loops otherwise differ (this one is streaming,
+    // that one is whole-file). The comment used to claim "structurally identical" while this copy lacked the
+    // late-fsync window below; the crash-window slice (blueprint L-36) added it, with a test on each side.
+    //
+    // finish_append() fsyncs the frame and THEN writes the anchor, so a crash between the two leaves the anchor
+    // exactly one frame behind a perfectly good frame. That window is legitimate and is accepted -- iff the MAC at
+    // the anchor's sequence (the frame before the last, `log_prev_tip_mac`) is what the anchor claims. Any other
+    // lag, or a MAC that does not match, stays Corrupt: an anchor further behind is a rolled-back anchor, not a
+    // crash.
     RecoveryScanStatus finalize_scan_with_anchor_check(bool log_tip_valid, std::uint64_t log_tip_sequence,
-                                                        std::array<std::byte, kMacLen> log_tip_mac) noexcept {
+                                                        std::array<std::byte, kMacLen> log_tip_mac,
+                                                        std::array<std::byte, kMacLen> log_prev_tip_mac = {}) noexcept {
         std::vector<std::byte> anchor_bytes;
         const bool anchor_present = log_store_.read_tip_anchor(anchor_bytes);
 
@@ -801,7 +830,13 @@ private:
         }
 
         if (anchor.sequence_number > log_tip_sequence) return RecoveryScanStatus::Corrupt;
-        return anchor.mac == log_tip_mac ? RecoveryScanStatus::Clean : RecoveryScanStatus::Corrupt;
+        if (anchor.sequence_number == log_tip_sequence) {
+            return anchor.mac == log_tip_mac ? RecoveryScanStatus::Clean : RecoveryScanStatus::Corrupt;
+        }
+        if (anchor.sequence_number + 1 == log_tip_sequence && anchor.mac == log_prev_tip_mac) {
+            return RecoveryScanStatus::Clean;
+        }
+        return RecoveryScanStatus::Corrupt;
     }
 
     DurableLogStore log_store_;
@@ -815,6 +850,7 @@ private:
     RecoveryScanStatus recovery_status_{RecoveryScanStatus::IoError};
     std::uint64_t next_sequence_{0};
     std::array<std::byte, kMacLen> tip_mac_{};
+    std::uint64_t torn_tail_bytes_{0};
 
     FoldState fold_{};
 };

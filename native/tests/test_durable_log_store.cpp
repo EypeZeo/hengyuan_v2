@@ -4,6 +4,8 @@
 // layer in isolation, before either consumer exercises it -- lock/open/
 // append/fsync/tip-anchor round trips, the streaming read_chunk primitive,
 // and lock contention.
+#include "durable_log_store_test_hooks.hpp"
+
 #include <gtest/gtest.h>
 #include <hengyuan/durable_log_store.hpp>
 
@@ -323,3 +325,146 @@ TEST(DurableLogStoreDevFullTest, AppendAndFsyncOnDevFullIsClassifiedDiskFull) {
     std::remove("/tmp/hy_dls_devfull_tip");
 }
 #endif
+
+
+// --- SAFE-03 crash-window slice (blueprint L-36): truncate_log() and detail::discard_torn_tail() ---
+//
+// append_and_fsync() appends at the PHYSICAL end of the file, so a torn tail that a recovery scan only skips
+// sits between the last valid frame and the next one. truncate_log() is the primitive that cuts it, and
+// discard_torn_tail() is the one guarded place that calls it.
+
+namespace {
+
+std::string log_text(DurableLogStore& store) {
+    std::vector<std::byte> content;
+    EXPECT_TRUE(store.read_whole_log(content));
+    return std::string(reinterpret_cast<const char*>(content.data()), content.size());
+}
+
+}  // namespace
+
+TEST_F(DurableLogStoreTest, TruncateLogShrinksTheFileAndTheNextAppendFollowsTheNewEnd) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("AAAABBBB")));
+    ASSERT_EQ(store.log_size(), 8u);
+
+    ASSERT_TRUE(store.truncate_log(4));
+    EXPECT_EQ(store.log_size(), 4u);
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::Ok);
+
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("CC")));
+    EXPECT_EQ(log_text(store), "AAAACC") << "the new bytes land at the new end, not behind the cut ones";
+}
+
+TEST_F(DurableLogStoreTest, TruncateLogToZeroEmptiesTheFile) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("0123456789")));
+
+    ASSERT_TRUE(store.truncate_log(0));
+    EXPECT_EQ(store.log_size(), 0u);
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("X")));
+    EXPECT_EQ(log_text(store), "X");
+}
+
+TEST_F(DurableLogStoreTest, TruncateLogToTheCurrentSizeIsASuccessfulNoOp) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("0123456789")));
+
+    EXPECT_TRUE(store.truncate_log(10));
+    EXPECT_EQ(log_text(store), "0123456789");
+}
+
+TEST_F(DurableLogStoreTest, TruncateLogNeverExtends) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("0123456789")));
+
+    EXPECT_FALSE(store.truncate_log(11)) << "a truncate that would grow the file zero-fills it: refused";
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::OtherError);
+    EXPECT_EQ(store.log_size(), 10u);
+    EXPECT_EQ(log_text(store), "0123456789");
+}
+
+TEST_F(DurableLogStoreTest, TheTruncateFailureSeamFailsExactlyTheRequestedCallsAndLeavesTheFileAlone) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("0123456789")));
+
+    TruncateFailureSeamGuard seam(2);
+    EXPECT_FALSE(store.truncate_log(4));
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::OtherError);
+    EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 1u);
+    EXPECT_FALSE(store.truncate_log(4));
+    EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 0u);
+    EXPECT_EQ(log_text(store), "0123456789") << "a failed truncate leaves the file as it was";
+
+    EXPECT_TRUE(store.truncate_log(4)) << "the seam is spent: the third call is a real truncate";
+    EXPECT_EQ(log_text(store), "0123");
+    EXPECT_EQ(store.last_write_status(), IoWriteStatus::Ok);
+}
+
+TEST_F(DurableLogStoreTest, DiscardTornTailCutsAStrictlyShorterThanOneFrameTailAndReportsHowMuch) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("FRAMEFRAMEtor")));  // two 5-byte frames + 3 torn bytes
+
+    std::uint64_t dropped = 99;
+    EXPECT_EQ(detail::discard_torn_tail(store, /*valid_end=*/10, store.log_size(), /*max_tail_bytes=*/5, dropped),
+              detail::TornTail::Dropped);
+    EXPECT_EQ(dropped, 3u);
+    EXPECT_EQ(log_text(store), "FRAMEFRAME");
+
+    EXPECT_EQ(detail::discard_torn_tail(store, 10, store.log_size(), 5, dropped), detail::TornTail::None)
+        << "a file that ends on a frame boundary has nothing to cut";
+    EXPECT_EQ(dropped, 0u);
+}
+
+TEST_F(DurableLogStoreTest, DiscardTornTailRefusesATailOfAWholeFrameOrMoreAndLeavesTheBytes) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("FRAMEfivefive")));  // one frame + 8 unexplained bytes
+
+    std::uint64_t dropped = 99;
+    EXPECT_EQ(detail::discard_torn_tail(store, 5, store.log_size(), /*max_tail_bytes=*/5, dropped),
+              detail::TornTail::TooLong)
+        << "no crash in the middle of ONE append leaves a whole frame or more";
+    EXPECT_EQ(dropped, 0u);
+    EXPECT_EQ(log_text(store), "FRAMEfivefive") << "refused means untouched";
+
+    // The boundary: exactly one byte short of a whole frame IS a torn tail ...
+    EXPECT_EQ(detail::discard_torn_tail(store, 9, store.log_size(), 5, dropped), detail::TornTail::Dropped);
+    EXPECT_EQ(dropped, 4u);
+    EXPECT_EQ(log_text(store), "FRAMEfive");
+
+    // ... and exactly one whole frame is not.
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("e")));  // "FRAMEfivee": 5 + 5
+    EXPECT_EQ(detail::discard_torn_tail(store, 5, store.log_size(), 5, dropped), detail::TornTail::TooLong);
+    EXPECT_EQ(log_text(store), "FRAMEfivee");
+}
+
+TEST_F(DurableLogStoreTest, DiscardTornTailTreatsImpossibleOffsetsAndAFailedTruncateAsIoErrorAndLeavesTheBytes) {
+    auto store = make_store();
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    ASSERT_TRUE(store.append_and_fsync(make_bytes("FRAMEtor")));
+
+    std::uint64_t dropped = 99;
+    EXPECT_EQ(detail::discard_torn_tail(store, /*valid_end=*/9, store.log_size(), 5, dropped), detail::TornTail::IoError)
+        << "a valid end beyond the end of the file is a scan bug: refuse to guess";
+    EXPECT_EQ(log_text(store), "FRAMEtor");
+
+    TruncateFailureSeamGuard seam(1);
+    EXPECT_EQ(detail::discard_torn_tail(store, 5, store.log_size(), 5, dropped), detail::TornTail::IoError);
+    EXPECT_EQ(dropped, 0u) << "nothing was cut, so nothing is reported as cut";
+    EXPECT_EQ(log_text(store), "FRAMEtor");
+}

@@ -11,6 +11,8 @@
 // Phase 2 (docs/SPEC_INVARIANTS.md): DurableAuditSink now takes a KeyRing&
 // + active_key_id instead of a raw key -- the fixture builds a KeyRing with
 // key_id=1 loaded, mirroring test_control_plane_log_sink.cpp's own fixture.
+#include "durable_log_store_test_hooks.hpp"
+
 #include <gtest/gtest.h>
 #include <hengyuan/durable_audit_sink.hpp>
 
@@ -1568,4 +1570,536 @@ TEST_F(DurableAuditSinkTest, KeyRingExposesItsRotationCeiling) {
     EXPECT_EQ(key_ring_->live_key_count(), 2u);
     EXPECT_EQ(key_ring_->retire(2), RetireStatus::Retired);
     EXPECT_EQ(key_ring_->live_key_count(), 1u);
+}
+
+
+// --- SAFE-03 crash-window slice (blueprint L-36): a torn tail is CUT, not skipped ---
+//
+// append_durable() appends at the PHYSICAL end of the log. Recovery used to skip a torn tail logically and leave
+// the bytes on disk, so the first append after a crash-torn restart landed behind them, and the NEXT start read
+// "torn prefix + the start of the new frame" as one frame: Corrupt, fenced. Recovery now cuts the tail -- once
+// the anchor check has proven everything before it -- and discards the bytes (owner decision, 2026-10-14).
+
+namespace {
+
+std::string slurp_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+void spit_file(const std::string& path, const std::string& bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+}  // namespace
+
+TEST_F(DurableAuditSinkTest, EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing) {
+    // A crash in the middle of the second append leaves 1 .. kOrderEventFrameSize-1 bytes of it. Every one of
+    // those lengths must be cut, the next append must land on the frame boundary, and the start after THAT must
+    // still replay.
+    for (std::size_t len = 1; len < kOrderEventFrameSize; ++len) {
+        remove_all();
+        {
+            DurableAuditSink sink(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked()) << "len=" << len;
+        }
+        append_prefix_of_a_real_frame(make_submitted("HY-A", 100, 10, 1), /*sequence_number=*/1, kZeroMac, len);
+        ASSERT_EQ(log_file_size(), kOrderEventFrameSize + len) << "len=" << len;
+        {
+            DurableAuditSink restarted(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(restarted.is_open()) << "len=" << len;
+            EXPECT_FALSE(restarted.fenced()) << "len=" << len;
+            EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean) << "len=" << len;
+            EXPECT_EQ(restarted.recovered_torn_tail_bytes(), len) << "len=" << len;
+            EXPECT_EQ(restarted.recovered_intent_orphans(), 1u) << "len=" << len;
+            // the continuation of the order: Submitting follows Intent, on the frame boundary
+            ASSERT_TRUE(restarted.append_durable(make_submitted("HY-A", 100, 10, 1), 1002).acked()) << "len=" << len;
+        }
+        EXPECT_EQ(log_file_size(), 2 * kOrderEventFrameSize) << "len=" << len << ": no debris between the frames";
+        {
+            DurableAuditSink again(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(again.is_open()) << "len=" << len;
+            EXPECT_FALSE(again.fenced()) << "len=" << len << ": the log the cut tail left must replay";
+            ASSERT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered) << "len=" << len;
+            EXPECT_EQ(again.recovered_torn_tail_bytes(), 0u) << "len=" << len;
+            auto cps = again.recovered_checkpoints();
+            ASSERT_EQ(cps.size(), 1u) << "len=" << len;
+            EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous) << "len=" << len;
+        }
+    }
+}
+
+TEST_F(DurableAuditSinkTest, AFirstFrameThatNeverCompletedIsCutAndTheLogStartsAfresh) {
+    // The crash came during the very first append of the log's life: no complete frame, no anchor. The lengths
+    // straddle every decoder threshold (under the 6 bytes of the key id, under the 27-byte header, mid-payload).
+    for (const std::size_t len : {std::size_t{1}, std::size_t{5}, std::size_t{6}, std::size_t{26}, std::size_t{27},
+                                  std::size_t{28}, std::size_t{100}, kOrderEventFrameSize - 1}) {
+        remove_all();
+        append_prefix_of_a_real_frame(make_intent("HY-A", 100, 10, 1), /*sequence_number=*/0, kZeroMac, len);
+        ASSERT_EQ(log_file_size(), len) << "len=" << len;
+        {
+            DurableAuditSink sink(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(sink.is_open()) << "len=" << len;
+            EXPECT_FALSE(sink.fenced()) << "len=" << len;
+            EXPECT_EQ(sink.recovery_status(), RecoveryScanStatus::Clean) << "len=" << len;
+            EXPECT_EQ(sink.recovered_torn_tail_bytes(), len) << "len=" << len;
+            ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked()) << "len=" << len;
+        }
+        EXPECT_EQ(log_file_size(), kOrderEventFrameSize) << "len=" << len << ": the first frame starts the file";
+        DurableAuditSink again(base_path_, *key_ring_, 1);
+        EXPECT_FALSE(again.fenced()) << "len=" << len;
+        EXPECT_EQ(again.recovery_status(), RecoveryScanStatus::Clean) << "len=" << len;
+        EXPECT_EQ(again.recovered_intent_orphans(), 1u) << "len=" << len;
+    }
+}
+
+TEST_F(DurableAuditSinkTest, ATornFirstFrameBehindAnAnchorThatClaimsAFrameIsCorruptAndTheFileIsLeftAlone) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    // the log is replaced by a torn prefix of a first frame; the anchor still claims sequence 0
+    std::remove(base_path_.c_str());
+    append_prefix_of_a_real_frame(make_intent("HY-A", 100, 10, 1), 0, kZeroMac, 40);
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+        EXPECT_TRUE(restarted.fenced());
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 0u);
+    }
+    EXPECT_EQ(log_file_size(), 40u) << "a log that fails the anchor check is evidence: not one byte is cut";
+}
+
+TEST_F(DurableAuditSinkTest, ACompleteButWrongFrameIsCorruptAndNothingBehindItIsCut) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+    corrupt_log_byte(2 * kOrderEventFrameSize - 5);  // inside the second frame's MAC
+    append_prefix_of_a_real_frame(make_accepted("HY-A", 1, 555), 2, kZeroMac, 30);
+    ASSERT_EQ(log_file_size(), 2 * kOrderEventFrameSize + 30);
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+        EXPECT_TRUE(restarted.fenced());
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 0u);
+    }
+    EXPECT_EQ(log_file_size(), 2 * kOrderEventFrameSize + 30) << "Corrupt: the file is left byte-for-byte alone";
+}
+
+TEST_F(DurableAuditSinkTest, ATruncateTheOsRefusesFencesTheSinkAndLeavesTheTailOnDisk) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    }
+    append_prefix_of_a_real_frame(make_submitted("HY-A", 100, 10, 1), 1, kZeroMac, 30);
+    {
+        TruncateFailureSeamGuard seam(1);
+        DurableAuditSink refused(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(refused.is_open());
+        EXPECT_EQ(refused.recovery_status(), RecoveryScanStatus::IoError);
+        EXPECT_TRUE(refused.fenced()) << "the tail is still on disk: an append would land behind it";
+        EXPECT_FALSE(refused.append_durable(make_submitted("HY-A", 100, 10, 1), 1002).acked());
+        EXPECT_EQ(refused.recovered_torn_tail_bytes(), 0u);
+        EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 0u) << "the scan really tried to cut";
+    }
+    EXPECT_EQ(log_file_size(), kOrderEventFrameSize + 30);
+
+    DurableAuditSink healed(base_path_, *key_ring_, 1);  // the seam is spent: a start with a working truncate cuts it
+    EXPECT_FALSE(healed.fenced());
+    EXPECT_EQ(healed.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_EQ(healed.recovered_torn_tail_bytes(), 30u);
+}
+
+TEST_F(DurableAuditSinkTest, AnAnchorOneFrameBehindTheLogIsTheLateFsyncWindowAndHeals) {
+    // append_durable() fsyncs the frame and THEN writes the anchor; a crash between the two leaves the anchor one
+    // frame behind a perfectly good frame. This window was accepted but never tested.
+    std::string anchor_after_0;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        anchor_after_0 = slurp_file(base_path_ + ".tip");
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+    spit_file(base_path_ + ".tip", anchor_after_0);
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_FALSE(restarted.fenced());
+        ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+        ASSERT_EQ(restarted.recovered_checkpoints().size(), 1u);
+        EXPECT_EQ(restarted.recovered_checkpoints()[0].resulting_state, OrderState::Ambiguous);
+        ASSERT_TRUE(restarted.append_durable(make_accepted("HY-A", 1, 555), 1002).acked()) << "the anchor catches up";
+    }
+    DurableAuditSink again(base_path_, *key_ring_, 1);
+    EXPECT_FALSE(again.fenced());
+    ASSERT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered);
+    ASSERT_EQ(again.recovered_checkpoints().size(), 1u);
+    EXPECT_EQ(again.recovered_checkpoints()[0].resulting_state, OrderState::Accepted);
+}
+
+TEST_F(DurableAuditSinkTest, AnAnchorOneFrameBehindWhoseMacIsNotTheLogsIsStillCorrupt) {
+    std::string foreign_anchor;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-FOREIGN", 999, 99, 7), 1000).acked());
+        foreign_anchor = slurp_file(base_path_ + ".tip");
+    }
+    remove_all();
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+    spit_file(base_path_ + ".tip", foreign_anchor);  // sequence 0, but not THIS log's frame 0
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(DurableAuditSinkTest, AnAnchorOneFrameBehindTogetherWithATornTailIsBothHandled) {
+    std::string anchor_after_0;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        anchor_after_0 = slurp_file(base_path_ + ".tip");
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+    spit_file(base_path_ + ".tip", anchor_after_0);
+    append_prefix_of_a_real_frame(make_accepted("HY-A", 1, 555), 2, kZeroMac, 77);
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_FALSE(restarted.fenced());
+        ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 77u);
+        ASSERT_TRUE(restarted.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
+    }
+    EXPECT_EQ(log_file_size(), 3 * kOrderEventFrameSize);
+    DurableAuditSink again(base_path_, *key_ring_, 1);
+    EXPECT_FALSE(again.fenced());
+    EXPECT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+TEST_F(DurableAuditSinkTest, ATornKeyRotatedFrameIsCutSoTheNextRotationStillWorks) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0x55), rec3), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec4{};
+    ASSERT_EQ(key_ring_->add_key(4, distinct_key(0x77), rec4), KeyRingAddStatus::Ok);
+
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+    }
+    // a crash in the middle of the second rotation: 40 bytes of its KeyRotated frame reached the sidecar
+    {
+        std::array<std::byte, kKeyBlockSize> key3{};
+        ASSERT_TRUE(key_ring_->active_key(3, key3));
+        std::array<std::byte, kKeyRotatedFrameSize> frame{};
+        const KeyRotationPayload payload{2, 3, 0};
+        ASSERT_EQ(encode_key_rotated_frame(frame, 3, /*sequence=*/1, FrameTimeKind::ServerCorrectedUtc, 2000, payload,
+                                           kZeroMac, std::span<const std::byte>(key3.data(), key3.size())),
+                  kKeyRotatedFrameSize);
+        std::ofstream f(base_path_ + ".keyrotations", std::ios::binary | std::ios::app);
+        ASSERT_TRUE(f.is_open());
+        f.write(reinterpret_cast<const char*>(frame.data()), 40);
+    }
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 2);
+        ASSERT_TRUE(restarted.is_open());
+        EXPECT_FALSE(restarted.rotation_fenced());
+        EXPECT_EQ(restarted.recovered_rotation_torn_tail_bytes(), 40u);
+        EXPECT_TRUE(restarted.rotate_active_key(3, 2000)) << "the next rotation lands on the frame boundary";
+    }
+    {
+        DurableAuditSink third(base_path_, *key_ring_, 3);
+        ASSERT_TRUE(third.is_open());
+        EXPECT_FALSE(third.rotation_fenced()) << "the sidecar the cut tail left must replay";
+        EXPECT_EQ(third.recovered_rotation_torn_tail_bytes(), 0u);
+        ASSERT_TRUE(third.last_rotation().has_value());
+        EXPECT_EQ(third.last_rotation()->new_key_id, 3u);
+        EXPECT_TRUE(third.rotate_active_key(4, 3000));
+    }
+}
+
+TEST_F(DurableAuditSinkTest, ARotationAnchorOneFrameBehindTheSidecarDoesNotFenceRotation) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0x55), rec3), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec4{};
+    ASSERT_EQ(key_ring_->add_key(4, distinct_key(0x77), rec4), KeyRingAddStatus::Ok);
+
+    std::string sidecar_anchor_after_first_rotation;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+        sidecar_anchor_after_first_rotation = slurp_file(base_path_ + ".keyrotations.tip");
+        ASSERT_TRUE(sink.rotate_active_key(3, 2000));
+    }
+    // rotate_active_key() fsyncs the sidecar frame and THEN writes the sidecar anchor: the crash window leaves it
+    // one frame behind
+    spit_file(base_path_ + ".keyrotations.tip", sidecar_anchor_after_first_rotation);
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 3);
+        ASSERT_TRUE(restarted.is_open());
+        EXPECT_FALSE(restarted.rotation_fenced()) << "an anchor one frame behind is the window, not corruption";
+        ASSERT_TRUE(restarted.last_rotation().has_value());
+        EXPECT_EQ(restarted.last_rotation()->new_key_id, 3u);
+        EXPECT_TRUE(restarted.rotate_active_key(4, 3000)) << "the chain continues from the frame the anchor missed";
+    }
+    DurableAuditSink again(base_path_, *key_ring_, 4);
+    EXPECT_FALSE(again.rotation_fenced());
+}
+
+TEST_F(DurableAuditSinkTest, CutTornTailMapsEveryOutcomeToAScanStatus) {
+    DurableLogStore store(base_path_, base_path_ + ".lock", base_path_ + ".tip");
+    ASSERT_TRUE(store.acquire_lock());
+    ASSERT_TRUE(store.open_log());
+    std::vector<std::byte> bytes(13, std::byte{0x41});
+    ASSERT_TRUE(store.append_and_fsync(bytes));  // 10 bytes of "frames" + 3 torn
+
+    std::uint64_t dropped = 99;
+    EXPECT_EQ(detail::cut_torn_tail(store, 13, 13, 5, dropped), RecoveryScanStatus::Clean) << "nothing to cut";
+    EXPECT_EQ(dropped, 0u);
+    EXPECT_EQ(detail::cut_torn_tail(store, 0, 13, 5, dropped), RecoveryScanStatus::Corrupt)
+        << "13 unexplained bytes are more than any one torn append can leave: kept, and the log is Corrupt";
+    EXPECT_EQ(store.log_size(), 13u);
+    {
+        TruncateFailureSeamGuard seam(1);
+        EXPECT_EQ(detail::cut_torn_tail(store, 10, 13, 5, dropped), RecoveryScanStatus::IoError);
+    }
+    EXPECT_EQ(store.log_size(), 13u);
+    EXPECT_EQ(detail::cut_torn_tail(store, 10, 13, 5, dropped), RecoveryScanStatus::Clean) << "cut";
+    EXPECT_EQ(dropped, 3u);
+    EXPECT_EQ(store.log_size(), 10u);
+}
+
+TEST_F(DurableAuditSinkTest, AnAnchorAheadOfTheLogTogetherWithATornTailIsCorruptAndNothingIsCut) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+    }
+    // the anchor claims sequence 1, but the second frame is gone and only a torn piece of it remains
+    truncate_log_to(kOrderEventFrameSize + 30);
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt) << "tail deletion";
+        EXPECT_TRUE(restarted.fenced());
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 0u);
+    }
+    EXPECT_EQ(log_file_size(), kOrderEventFrameSize + 30) << "the anchor check failed first: the bytes are evidence";
+}
+
+TEST_F(DurableAuditSinkTest, ATornFirstKeyRotatedFrameIsCutToo) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);  // creates the (empty) sidecar
+        ASSERT_TRUE(sink.is_open());
+    }
+    {
+        std::array<std::byte, kKeyBlockSize> key2{};
+        ASSERT_TRUE(key_ring_->active_key(2, key2));
+        std::array<std::byte, kKeyRotatedFrameSize> frame{};
+        const KeyRotationPayload payload{1, 2, 0};
+        ASSERT_EQ(encode_key_rotated_frame(frame, 2, /*sequence=*/0, FrameTimeKind::ServerCorrectedUtc, 1500, payload,
+                                           kZeroMac, std::span<const std::byte>(key2.data(), key2.size())),
+                  kKeyRotatedFrameSize);
+        std::ofstream f(base_path_ + ".keyrotations", std::ios::binary | std::ios::app);
+        ASSERT_TRUE(f.is_open());
+        f.write(reinterpret_cast<const char*>(frame.data()), 40);  // the very first rotation never completed
+    }
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(restarted.is_open());
+        EXPECT_FALSE(restarted.rotation_fenced());
+        EXPECT_EQ(restarted.recovered_rotation_torn_tail_bytes(), 40u);
+        EXPECT_TRUE(restarted.rotate_active_key(2, 2000)) << "the first rotation starts the sidecar file";
+    }
+    DurableAuditSink again(base_path_, *key_ring_, 2);
+    EXPECT_FALSE(again.rotation_fenced());
+    ASSERT_TRUE(again.last_rotation().has_value());
+    EXPECT_EQ(again.last_rotation()->new_key_id, 2u);
+}
+
+TEST_F(DurableAuditSinkTest, ARotationAnchorOneFrameBehindWhoseMacIsNotTheSidecarsFencesRotation) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0x55), rec3), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec4{};
+    ASSERT_EQ(key_ring_->add_key(4, distinct_key(0x77), rec4), KeyRingAddStatus::Ok);
+
+    std::string foreign_anchor;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));  // history A: 1 -> 2
+        foreign_anchor = slurp_file(base_path_ + ".keyrotations.tip");
+    }
+    remove_all();
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(3, 1500));  // history B: 1 -> 3 -> 4
+        ASSERT_TRUE(sink.rotate_active_key(4, 2000));
+    }
+    spit_file(base_path_ + ".keyrotations.tip", foreign_anchor);  // sequence 0, but not THIS sidecar's frame 0
+    DurableAuditSink restarted(base_path_, *key_ring_, 4);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_TRUE(restarted.rotation_fenced()) << "an anchor that is not the sidecar's is not the crash window";
+}
+
+namespace {
+
+// A prefix of a real KeyRotated frame, appended to the key-rotation sidecar the way a crash in the middle of a
+// rotation leaves it. The prefix is all that matters (the cut never looks inside it), so the chain MAC is zero.
+void append_torn_key_rotated_frame(KeyRing& ring, const std::string& sidecar_path, std::uint32_t old_key_id,
+                                   std::uint32_t new_key_id, std::uint64_t sequence, std::size_t len) {
+    std::array<std::byte, kKeyBlockSize> key{};
+    ASSERT_TRUE(ring.active_key(new_key_id, key));
+    std::array<std::byte, kKeyRotatedFrameSize> frame{};
+    const KeyRotationPayload payload{old_key_id, new_key_id, 0};
+    ASSERT_EQ(encode_key_rotated_frame(frame, new_key_id, sequence, FrameTimeKind::ServerCorrectedUtc, 2000, payload,
+                                       kZeroMac, std::span<const std::byte>(key.data(), key.size())),
+              kKeyRotatedFrameSize);
+    std::ofstream f(sidecar_path, std::ios::binary | std::ios::app);
+    ASSERT_TRUE(f.is_open());
+    f.write(reinterpret_cast<const char*>(frame.data()), static_cast<std::streamsize>(len));
+}
+
+}  // namespace
+
+TEST_F(DurableAuditSinkTest, AFirstFrameCutTheOsRefusesFencesTheSinkAndLeavesTheDebrisOnDisk) {
+    append_prefix_of_a_real_frame(make_intent("HY-A", 100, 10, 1), /*sequence_number=*/0, kZeroMac, 40);
+    {
+        TruncateFailureSeamGuard seam(1);
+        DurableAuditSink refused(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(refused.is_open());
+        EXPECT_EQ(refused.recovery_status(), RecoveryScanStatus::IoError);
+        EXPECT_TRUE(refused.fenced()) << "the debris is still on disk: the first append would land behind it";
+        EXPECT_FALSE(refused.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        EXPECT_EQ(refused.recovered_torn_tail_bytes(), 0u);
+        EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 0u) << "the scan really tried to cut";
+    }
+    EXPECT_EQ(log_file_size(), 40u);
+
+    DurableAuditSink healed(base_path_, *key_ring_, 1);  // the seam is spent: a start with a working truncate cuts it
+    EXPECT_FALSE(healed.fenced());
+    EXPECT_EQ(healed.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_EQ(healed.recovered_torn_tail_bytes(), 40u);
+}
+
+TEST_F(DurableAuditSinkTest, ASidecarCutTheOsRefusesFencesRotationAndLeavesTheTailOnDisk) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0x55), rec3), KeyRingAddStatus::Ok);
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+    }
+    ASSERT_NO_FATAL_FAILURE(append_torn_key_rotated_frame(*key_ring_, base_path_ + ".keyrotations", 2, 3, 1, 40));
+    const std::size_t sidecar_size = slurp_file(base_path_ + ".keyrotations").size();
+    {
+        TruncateFailureSeamGuard seam(1);
+        DurableAuditSink refused(base_path_, *key_ring_, 2);
+        ASSERT_TRUE(refused.is_open());
+        EXPECT_FALSE(refused.fenced()) << "the sidecar is its own durability domain: the main log is unaffected";
+        EXPECT_TRUE(refused.rotation_fenced()) << "the tail is still on disk: a rotation would land behind it";
+        EXPECT_FALSE(refused.rotate_active_key(3, 2000));
+        EXPECT_EQ(refused.recovered_rotation_torn_tail_bytes(), 0u);
+        EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 0u) << "the scan really tried to cut";
+    }
+    EXPECT_EQ(slurp_file(base_path_ + ".keyrotations").size(), sidecar_size);
+
+    DurableAuditSink healed(base_path_, *key_ring_, 2);  // the seam is spent: a start with a working truncate cuts it
+    EXPECT_FALSE(healed.rotation_fenced());
+    EXPECT_EQ(healed.recovered_rotation_torn_tail_bytes(), 40u);
+    EXPECT_TRUE(healed.rotate_active_key(3, 2000));
+}
+
+TEST_F(DurableAuditSinkTest, AFirstSidecarFrameCutTheOsRefusesFencesRotationAndLeavesTheTailOnDisk) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);  // creates the (empty) sidecar
+        ASSERT_TRUE(sink.is_open());
+    }
+    ASSERT_NO_FATAL_FAILURE(append_torn_key_rotated_frame(*key_ring_, base_path_ + ".keyrotations", 1, 2, 0, 40));
+    {
+        TruncateFailureSeamGuard seam(1);
+        DurableAuditSink refused(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(refused.is_open());
+        EXPECT_TRUE(refused.rotation_fenced());
+        EXPECT_FALSE(refused.rotate_active_key(2, 2000));
+        EXPECT_EQ(refused.recovered_rotation_torn_tail_bytes(), 0u);
+        EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 0u) << "the scan really tried to cut";
+    }
+    EXPECT_EQ(slurp_file(base_path_ + ".keyrotations").size(), 40u);
+
+    DurableAuditSink healed(base_path_, *key_ring_, 1);
+    EXPECT_FALSE(healed.rotation_fenced());
+    EXPECT_EQ(healed.recovered_rotation_torn_tail_bytes(), 40u);
+}
+
+TEST_F(DurableAuditSinkTest, AForeignSidecarAnchorTogetherWithATornSidecarTailFencesRotationAndCutsNothing) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0x55), rec3), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec4{};
+    ASSERT_EQ(key_ring_->add_key(4, distinct_key(0x77), rec4), KeyRingAddStatus::Ok);
+
+    std::string foreign_anchor;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));  // history A: 1 -> 2
+        foreign_anchor = slurp_file(base_path_ + ".keyrotations.tip");
+    }
+    remove_all();
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(3, 1500));  // history B: 1 -> 3 -> 4
+        ASSERT_TRUE(sink.rotate_active_key(4, 2000));
+    }
+    spit_file(base_path_ + ".keyrotations.tip", foreign_anchor);  // sequence 0, but not THIS sidecar's frame 0
+    ASSERT_NO_FATAL_FAILURE(append_torn_key_rotated_frame(*key_ring_, base_path_ + ".keyrotations", 4, 2, 2, 33));
+    const std::size_t sidecar_size = slurp_file(base_path_ + ".keyrotations").size();
+    {
+        DurableAuditSink restarted(base_path_, *key_ring_, 4);
+        ASSERT_TRUE(restarted.is_open());
+        EXPECT_TRUE(restarted.rotation_fenced());
+        EXPECT_EQ(restarted.recovered_rotation_torn_tail_bytes(), 0u);
+    }
+    EXPECT_EQ(slurp_file(base_path_ + ".keyrotations").size(), sidecar_size)
+        << "a sidecar that fails the anchor check is evidence: not one byte is cut";
+}
+
+TEST_F(DurableAuditSinkTest, ASidecarAnchorAtTheTipWhoseMacIsNotTheSidecarsFencesRotation) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, distinct_key(0xFF), rec2), KeyRingAddStatus::Ok);
+    WrappedKeyRecord rec3{};
+    ASSERT_EQ(key_ring_->add_key(3, distinct_key(0x55), rec3), KeyRingAddStatus::Ok);
+
+    std::string foreign_anchor;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));  // history A: 1 -> 2
+        foreign_anchor = slurp_file(base_path_ + ".keyrotations.tip");
+    }
+    remove_all();
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.rotate_active_key(3, 1500));  // history B: 1 -> 3
+    }
+    spit_file(base_path_ + ".keyrotations.tip", foreign_anchor);  // sequence 0 like B's tip, but not B's frame 0
+    DurableAuditSink restarted(base_path_, *key_ring_, 3);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_TRUE(restarted.rotation_fenced()) << "a genuine anchor of another history is not this sidecar's anchor";
 }

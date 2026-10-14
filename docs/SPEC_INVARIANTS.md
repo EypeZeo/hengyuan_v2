@@ -290,7 +290,34 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       `Intent` 仍是 `Corrupt`，Gate 9b 只看在途表，不看日志）。
     - 旁注（既有，与本片无关，已用探针验证）：日志在崩溃后带着被撕裂的尾巴重新打开时，扫描只在逻辑上丢弃那段尾巴，
       **不做物理截断**；之后任何一次成功的追加都落在撕裂字节之后，再下一次启动判 `Corrupt`——失败关闭，但恰好发生
-      在崩溃恢复本该救场的场景里。另立一片。
+      在崩溃恢复本该救场的场景里。另立一片（已落地，见下一条）。
+  - **[SAFE-03 切片 3 已落地：崩溃窗口——撕裂的尾巴被物理截断，控制面日志容忍“锚点落后一帧”]**（蓝图 L-36；Owner 决定，
+    2026-10-14：撕裂的字节直接丢弃，不留旁文件）：`append_and_fsync()` 追加在文件的**物理**末尾，而两个接收器的恢复扫描
+    此前只在逻辑上跳过撕裂的尾巴、从不截断——崩溃后重新打开、成功追加一次，再下一次启动就把“撕裂前缀 + 新帧开头”读成一帧：
+    `Corrupt`、围栏（在两个接收器的真实日志上用探针验证过）。失败关闭，但恰好发生在崩溃恢复本该救场的场景里。另有一个不对称：
+    `ControlPlaneLogSink` 只拿锚点和最后一帧比，把“日志已 fsync、锚点还没写”这个合法的崩溃窗口（锚点落后一帧）判成
+    `Corrupt`，`DurableAuditSink` 则一直容忍它——而且从来没有测试覆盖过。
+    - **`DurableLogStore::truncate_log(new_size)`**：把日志缩到恰好 `new_size` 字节并让新大小落盘；永不扩大（`new_size` 大于
+      当前大小返回 false、不动文件），等于当前大小是成功的空操作，幂等且崩溃安全（新大小落盘之前崩溃，只是把撕裂的尾巴
+      留给下一次扫描再丢一次）。失败返回 false，`last_write_status()` 说明原因。
+    - **`detail::discard_torn_tail()`** 是整个代码库里唯一缩短日志的地方，返回 `TornTail`：`None`（文件正好止于帧
+      边界）、`Dropped`（已截断，新大小已落盘）、`TooLong`（尾巴不小于日志里最大的一帧——一次追加中途崩溃留下的字节严格
+      少于一帧，所以更长的不是撕裂追加，拒绝截断，免得扫描缺陷变成数据丢失）、`IoError`（截断失败，或偏移不可能）。两个接收器
+      经 `detail::cut_torn_tail()` 把它映射到 `RecoveryScanStatus`：`Clean`（`None`/`Dropped`）、`Corrupt`（`TooLong`，字节
+      原样保留）、`IoError`（围栏：尾巴仍在盘上，下一次追加会落到它后面）。
+    - **先验后截**：只有锚点校验通过之后才截断——`DurableAuditSink` 的主日志与密钥轮换旁文件、`ControlPlaneLogSink` 的每一条路径
+      （包括“根本没有完整帧”的首帧分支）。校验失败的日志、含有“完整但错误”的帧的日志都**一字节不动**：那些字节是证据，
+      不是残渣。`recovered_torn_tail_bytes()` / `recovered_rotation_torn_tail_bytes()` 报告截掉了多少字节。
+    - **锚点落后一帧**：`ControlPlaneLogSink::finalize_scan_with_anchor_check()` 与密钥轮换旁文件的扫描现在接受“锚点恰好落后
+      一帧，且锚点的 MAC 等于最后一帧**之前**那一帧的 MAC”（`prev_of_last_mac`）；落后两帧或更多、或者 MAC 不符，仍然是
+      `Corrupt`/围栏——回滚的锚点不是崩溃。“没有锚点而日志里恰有一帧”的首次追加窗口刻意保持 `IoError`（更严格，不放宽）。
+    - **测试接缝**：`DurableLogStoreTestHooks`（只存在于 `native/tests/`，生产头里只有无条件的 `friend` 声明）让接下来的 N 次
+      `truncate_log()` 失败，一个 RAII 守卫保证用完复位。回归测试覆盖：1..N-1 字节的每一个撕裂前缀长度（切完
+      继续追加、再重启仍可回放）、首帧从未完成、`KeyRotated` 帧之后与旁文件的撕裂尾巴、锚点落后 1/2 帧与外来 MAC、落后加撕裂、
+      完整但错误的帧、锚点超前的尾部删除、截断被拒绝后的围栏与下次启动自愈。
+    - **仍未覆盖**：没有 TLA+ 模型（需要改必需检查所在的 workflow，另议）；撕裂的字节不保存；上述“无锚点恰一帧”窗口；
+      Intent-only 孤儿的压实归档（蓝图 L-37）；POSIX 分支的 `truncate_log` 只由 WSL2/GCC 与 ASan 两个本地层以及 CI 覆盖，
+      不在 MSVC 变异检查之内。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
