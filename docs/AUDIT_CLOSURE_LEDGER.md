@@ -1280,8 +1280,8 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/include/hengyuan/*.hpp#ommission
-note: 成交回报里的佣金与佣金资产没有被解析，也没有费率预估。
+open: absent:native/include/hengyuan/*.hpp#fee_rate absent:native/include/hengyuan/*.hpp#fee_estimate
+note: 私网流迁移 M1 起，新的 WS API 编解码（WsApiCodec）读出成交回报里的佣金、佣金资产和成交号，并随 UserDataWsEvent 携带；但没有任何代码消费它们——没有费用账务、没有费率预估、没有余额耗尽的告警。
 ```
 
 ```ledger

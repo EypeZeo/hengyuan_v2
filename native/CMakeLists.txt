@@ -1040,6 +1040,18 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_reconcile_durable_guard)
     gtest_discover_tests(test_reconcile_durable_guard)
 
+    # Private-stream migration M1 guard: detail::build_ws_api_signed_request() signs a WebSocket API frame for ANY
+    # well-formed method name (the official "order.place" examples have to be checked against it), so the one place
+    # allowed to call it is build_subscribe_signature_request(). Every mention under include/ and src/ is pinned with
+    # its count, and the typed entry point's two calls are pinned inside its header. It reads the source tree, so the
+    # native/ directory is a compile definition and the target needs nothing else (same shape as the two guards above).
+    add_executable(test_ws_api_signing_guard tests/test_ws_api_signing_guard.cpp)
+    target_link_libraries(test_ws_api_signing_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_ws_api_signing_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_ws_api_signing_guard)
+    gtest_discover_tests(test_ws_api_signing_guard)
+
     # Real two-thread stress for the lock-free SPSC primitives. Labelled
     # "concurrency" so the TSan CI job can select just these (`ctest -L
     # concurrency`) — building all 27 test binaries under TSan triples the job
@@ -1152,6 +1164,18 @@ if(HY_BUILD_TESTS)
         target_include_directories(test_binance_query_signing PRIVATE tests)
         hengyuan_set_warnings(test_binance_query_signing)
         gtest_discover_tests(test_binance_query_signing)
+
+        # Private-stream migration M1: the request side of the spot WebSocket API (binance_ws_api_signing.hpp). It signs with the bound
+        # credentials, so it needs the OpenSSL stack like the query-signing test above; simdjson (via hengyuan_dataplane) is for the test's
+        # independent verifier, which parses the frame the way the exchange does and recomputes the signature with OpenSSL's own HMAC.
+        add_executable(test_binance_ws_api_signing tests/test_binance_ws_api_signing.cpp)
+        target_link_libraries(test_binance_ws_api_signing PRIVATE
+            hengyuan_dataplane OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST}
+            GTest::gtest_main)
+        target_include_directories(test_binance_ws_api_signing SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_ws_api_signing PRIVATE tests)
+        hengyuan_set_warnings(test_binance_ws_api_signing)
+        gtest_discover_tests(test_binance_ws_api_signing)
 
         # P2-MD-02 / Track C: REST/WS/Gate connectivity tests -- fully offline (local
         # blackhole/TLS fixtures, see tests/test_helpers/blackhole_acceptor.hpp), but they need
@@ -1384,4 +1408,13 @@ if(HY_BUILD_TESTS)
         hengyuan_dataplane GTest::gtest_main)
     hengyuan_set_warnings(test_binance_klines_codec)
     gtest_discover_tests(test_binance_klines_codec)
+
+    # Private-stream migration M1: the response/event codec of the spot WebSocket API (binance_ws_api_codec.hpp). Pure parsing over
+    # simdjson, no Boost and no OpenSSL, so it builds and runs in the default configuration; its fixtures are the official docs' own examples
+    # (tests/ws_api_official_samples.hpp, generated from them).
+    add_executable(test_binance_ws_api_codec tests/test_binance_ws_api_codec.cpp)
+    target_link_libraries(test_binance_ws_api_codec PRIVATE
+        hengyuan_dataplane GTest::gtest_main)
+    hengyuan_set_warnings(test_binance_ws_api_codec)
+    gtest_discover_tests(test_binance_ws_api_codec)
 endif()
