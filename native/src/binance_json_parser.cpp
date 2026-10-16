@@ -3,8 +3,16 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <new>
 
 namespace hy {
+
+BinanceJsonParser::BinanceJsonParser()
+    : padded_buf_(kWsReadMessageMaxBytes + simdjson::SIMDJSON_PADDING, '\0') {
+    // allocate() sizes everything an on-demand parser ever needs for a document of this length (string buffer, structural
+    // indexes, depth stacks); iterate() only re-allocates for a LONGER one, and parse() refuses those before they get there.
+    if (parser_.allocate(kWsReadMessageMaxBytes) != simdjson::SUCCESS) throw std::bad_alloc();
+}
 
 bool BinanceJsonParser::register_symbol(std::string_view binance_symbol,
                                          std::uint32_t symbol_id,
@@ -122,13 +130,16 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
     out_count = 0;
     if (max_events == 0) return ParseResult::MalformedJson;
 
-    // Reusable padded buffer, not a fresh simdjson::padded_string per message --
-    // see padded_buf_'s declaration for why (audit PERF-ALLOC-012). resize() only
-    // allocates when the high-water mark grows, so the steady state is memcpy +
-    // memset into storage this object already owns.
+    // Fixed padded buffer, not a fresh simdjson::padded_string per message -- see
+    // padded_buf_'s declaration for why (audit PERF-ALLOC-012, Appendix D L-38). A body
+    // above the limit cannot come from a session (Beast refuses the message first, at
+    // the same number); it is refused here, before the copy, rather than growing the
+    // buffer: the steady state AND the first frame are memcpy + memset into storage
+    // this object already owns.
     const std::size_t doc_len = json_bytes.size();
-    if (padded_buf_.size() < doc_len + simdjson::SIMDJSON_PADDING) {
-        padded_buf_.resize(doc_len + simdjson::SIMDJSON_PADDING);
+    if (doc_len > kWsReadMessageMaxBytes) [[unlikely]] {
+        ++counters_.malformed;
+        return ParseResult::MalformedJson;
     }
     if (doc_len > 0) {
         std::memcpy(padded_buf_.data(), json_bytes.data(), doc_len);

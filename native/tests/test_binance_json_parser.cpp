@@ -395,8 +395,9 @@ TEST(DepthTruncation, TruncationInTheAsksLoopIsAlsoCaught) {
 // --- Reusable padded buffer (audit PERF-ALLOC-012) ---
 
 TEST(ParserPaddedBuffer, RepeatedParsesOfVaryingSizesStayCorrect) {
-    // The buffer is reused and only grows, so a short message parsed after a long
-    // one must not see stale bytes from the previous document.
+    // The buffer is reused (fixed size, never reallocated), so a short message parsed
+    // after a long one must not see stale bytes from the previous document. That the
+    // parse allocates nothing is test_binance_json_parser_allocation.cpp's job.
     BinanceJsonParser p;
     ASSERT_TRUE(p.register_symbol("BTCUSDT", 0));
 
@@ -423,7 +424,7 @@ TEST(ParserPaddedBuffer, RepeatedParsesOfVaryingSizesStayCorrect) {
     EXPECT_EQ(evs[0].price_ticks, 10050000000LL);
     EXPECT_EQ(evs[0].qty_lots, 225000000LL);
 
-    // ...and back up again, to exercise growth after shrink.
+    // ...and back up again.
     ASSERT_EQ(p.parse(big, 3, evs, 512, count), ParseResult::Ok);
     EXPECT_EQ(count, 201u);
 }

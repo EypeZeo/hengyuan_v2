@@ -65,6 +65,7 @@
 #include <hengyuan/binance_tls.hpp>
 #include <hengyuan/kline_bar.hpp>
 #include <hengyuan/spsc_ring.hpp>
+#include <hengyuan/ws_frame_limits.hpp>  // kWsReadMessageMaxBytes: the session's read limit AND the parser's size
 
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -95,6 +96,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -118,22 +120,30 @@ enum class KlineParseResult : std::uint8_t {
     MissingFields = 3,   // wrong/absent "e", absent "k", or a required field inside "k" missing
 };
 
-// Zero-steady-state-allocation, matching UserDataJsonParser/binance_json_parser.hpp's own AUDIT
-// PERF-ALLOC-012 discipline exactly: a reused padded_buf_ that only grows, never a fresh
-// simdjson::padded_string per message. `out` is left at its default (is_closed == false) on any
-// non-Ok path -- never partially filled in a way a caller could mistake for a real closed bar.
+// Zero allocation in parse(), matching UserDataJsonParser/binance_json_parser.hpp's own AUDIT
+// PERF-ALLOC-012 / Appendix D L-38 discipline exactly: everything is sized once, in the
+// constructor, for the largest frame a session can deliver (kWsReadMessageMaxBytes) -- simdjson's
+// arrays and string buffer via allocate(), and one fixed padded copy buffer -- never a fresh
+// simdjson::padded_string per message and no buffer that grows on a longer frame. `out` is left
+// at its default (is_closed == false) on any non-Ok path -- never partially filled in a way a
+// caller could mistake for a real closed bar.
 class KlineJsonParser {
 public:
+    // Allocates ALL of the parser's memory, once (about 28 MB of address space, 4 MiB of it
+    // touched); parse() never allocates afterwards. Throws std::bad_alloc if that fails -- a
+    // parser that could not allocate would be a feed that silently drops every bar.
+    KlineJsonParser() : padded_buf_(kWsReadMessageMaxBytes + simdjson::SIMDJSON_PADDING, '\0') {
+        if (parser_.allocate(kWsReadMessageMaxBytes) != simdjson::SUCCESS) throw std::bad_alloc();
+    }
+
     KlineParseResult parse(std::string_view body, KlineWsEvent& out) noexcept {
         out = KlineWsEvent{};
 
+        // A body above the limit cannot come from a session (Beast refuses the message first, at
+        // the same number); it is refused here, before the copy, rather than growing a buffer.
         const std::size_t doc_len = body.size();
-        if (padded_buf_.size() < doc_len + simdjson::SIMDJSON_PADDING) {
-            try {
-                padded_buf_.resize(doc_len + simdjson::SIMDJSON_PADDING);
-            } catch (...) {
-                return KlineParseResult::MalformedJson;  // OOM on an attacker-sized message
-            }
+        if (doc_len > kWsReadMessageMaxBytes) [[unlikely]] {
+            return KlineParseResult::MalformedJson;
         }
         if (doc_len > 0) {
             std::memcpy(padded_buf_.data(), body.data(), doc_len);
@@ -221,7 +231,7 @@ private:
     }
 
     simdjson::ondemand::parser parser_;
-    std::string padded_buf_ = std::string(static_cast<std::size_t>(4 * 1024), '\0');
+    std::string padded_buf_;  // fixed: kWsReadMessageMaxBytes + SIMDJSON_PADDING, set in the constructor
 };
 
 // Host/symbol/interval only -- target ("/ws/<symbol>@kline_<interval>") is built in start().
@@ -420,9 +430,9 @@ private:
         if (ec || stop_) return fail(ec, "ssl_handshake");
         beast::get_lowest_layer(ws_).expires_never();
         // Same idle-timeout/max-message-size knobs as BinanceWsSession/BinanceUserDataWsSession's
-        // own call sites -- fixed here too, not exposed via the config struct.
-        hy::configure_ws_stream(ws_, std::chrono::seconds(90),
-                                 static_cast<std::size_t>(4 * 1024 * 1024));
+        // own call sites -- fixed here too, not exposed via the config struct. The size is the one
+        // number the frame parsers size their memory from (ws_frame_limits.hpp).
+        hy::configure_ws_stream(ws_, std::chrono::seconds(90), hy::kWsReadMessageMaxBytes);
         ws_.async_handshake(config_.host, target_,
                             beast::bind_front_handler(&BinanceKlineWsSession::on_handshake,
                                                      this->shared_from_this()));
