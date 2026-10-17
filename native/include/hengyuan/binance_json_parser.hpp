@@ -6,6 +6,7 @@
 #pragma once
 
 #include <hengyuan/binance_market_event.hpp>
+#include <hengyuan/ws_frame_limits.hpp>
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -63,6 +64,12 @@ struct ParseCounters {
 
 class BinanceJsonParser {
 public:
+    // Allocates ALL of the parser's memory, once, and parse() never allocates again (Appendix D L-38): simdjson's working arrays and
+    // string buffer sized for a frame of kWsReadMessageMaxBytes -- the largest a session can deliver -- and the padded copy buffer to
+    // match. About 28 MB of address space, 4 MiB of it touched (ws_frame_limits.hpp has the arithmetic). Throws std::bad_alloc if that
+    // fails: a parser that could not allocate would be a feed that silently drops every frame, which is worse than one that does not start.
+    BinanceJsonParser();
+
     // Returns false (and registers nothing) if the table is full, the symbol name is
     // empty/too long for SymbolEntry::name, or symbol_id is out of range.
     //
@@ -88,6 +95,8 @@ public:
     // Parse a single JSON message into one or more events.
     // trade/aggTrade produce 1 event; depthUpdate produces 1 per price level.
     // Returns status. On Ok, out_count holds the number of events written.
+    // Never allocates. A body longer than kWsReadMessageMaxBytes -- more than a session can deliver -- is refused before it is copied:
+    // MalformedJson, counted in ParseCounters::malformed.
     ParseResult parse(std::string_view json_bytes,
                       std::uint64_t recv_ns,
                       BinanceMarketEvent* out_events,
@@ -113,20 +122,29 @@ private:
     simdjson::ondemand::parser parser_;
     ParseCounters counters_{};
 
-    // AUDIT PERF-ALLOC-012: parse() used to build a fresh
+    // AUDIT PERF-ALLOC-012, completed by Appendix D L-38: parse() used to build a fresh
     // simdjson::padded_string(json_bytes) per message -- a heap allocation plus a
     // full copy of every WS frame, on the hot path, directly against CLAUDE.md's
     // zero-heap-allocation mandate.
     //
     // simdjson needs SIMDJSON_PADDING readable bytes past the document, which an
     // arbitrary caller-supplied std::string_view cannot promise, so the copy itself
-    // has to stay. What does not have to stay is the ALLOCATION: this buffer is
-    // reused across calls and only ever grows, so after the first few messages the
-    // steady state is a memcpy into already-owned storage and zero mallocs. Sized at
-    // construction to cover realistic Binance frames (depth@100ms with 20+20 levels
-    // is a few KB) so warm-up is immediate rather than gradual.
-    static constexpr std::size_t kInitialPaddedCapacity = 64 * 1024;
-    std::string padded_buf_ = std::string(kInitialPaddedCapacity, '\0');
+    // has to stay. What does not have to stay is the ALLOCATION. The first fix kept one
+    // buffer that "only ever grows" and claimed zero mallocs "after the first few
+    // messages" -- true only once the LARGEST frame had been seen: simdjson's on-demand
+    // parser sizes its own arrays lazily inside iterate(), at that frame's length, and
+    // again for every longer frame (measured with a counting operator new: 4 to 5
+    // allocations on each new high-water mark, ~28 MB for a 4 MiB frame; see
+    // tests/test_binance_json_parser_allocation.cpp). So everything is sized once, in
+    // the constructor, for the largest frame a session can deliver: parser_.allocate()
+    // for simdjson's arrays and string buffer (on-demand needs no priming parse, unlike
+    // dom::parser), and this buffer for the copy. There is no growth path; parse()
+    // refuses a longer body before it is copied.
+    //
+    // Never call parser_.set_max_capacity(): in simdjson 3.12.3 the on-demand version has
+    // its comparison inverted and clamps the maximum to 32 bytes, after which iterate()
+    // fails with CAPACITY on any larger document.
+    std::string padded_buf_;
 
     const SymbolConfig* find_symbol(std::string_view name) const noexcept;
 };

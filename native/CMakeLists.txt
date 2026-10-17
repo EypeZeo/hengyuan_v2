@@ -333,6 +333,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_binance_json_parser)
     gtest_discover_tests(test_binance_json_parser)
 
+    # Appendix D L-38: BinanceJsonParser::parse() allocates nothing once the parser exists, whatever the frame size. The binary replaces the
+    # global allocation functions with counting ones (tests/test_helpers/alloc_probe.hpp, included by this one translation unit only).
+    add_executable(test_binance_json_parser_allocation tests/test_binance_json_parser_allocation.cpp)
+    target_link_libraries(test_binance_json_parser_allocation PRIVATE hengyuan_dataplane GTest::gtest_main)
+    target_include_directories(test_binance_json_parser_allocation PRIVATE tests)
+    hengyuan_set_warnings(test_binance_json_parser_allocation)
+    gtest_discover_tests(test_binance_json_parser_allocation)
+
     add_executable(test_orderbook tests/test_orderbook.cpp)
     target_link_libraries(test_orderbook PRIVATE hengyuan_dataplane GTest::gtest_main)
     hengyuan_set_warnings(test_orderbook)
@@ -1261,6 +1269,19 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_kline_ws_session)
         hengyuan_allow_third_party_tsan_fences(test_binance_kline_ws_session)
         gtest_discover_tests(test_binance_kline_ws_session)
+
+        # Appendix D L-38: UserDataJsonParser and KlineJsonParser (both live in the session headers) allocate nothing once the parser exists.
+        # Same Boost/Beast/OpenSSL include shape as the two session tests above; same counting probe as test_binance_json_parser_allocation.
+        add_executable(test_ws_parser_allocation tests/test_ws_parser_allocation.cpp)
+        target_link_libraries(test_ws_parser_allocation PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_ws_parser_allocation SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_ws_parser_allocation PRIVATE tests)
+        hengyuan_set_warnings(test_ws_parser_allocation)
+        hengyuan_allow_third_party_tsan_fences(test_ws_parser_allocation)
+        gtest_discover_tests(test_ws_parser_allocation)
 
         # 批次 6 6b-0f-3d: the REAL public sessions (depth, kline) and the feed supervisor against a
         # local TLS WebSocket server (tests/test_helpers/ws_loopback_server.hpp) -- the positive paths the
