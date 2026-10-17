@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -121,7 +122,11 @@ static BenchResult bench_parser_depth(int iters) {
 }
 
 static BenchResult bench_spsc_roundtrip(int iters) {
-    hy::SpscRing<hy::BinanceMarketEvent, 65536> ring;
+    // On the heap, allocated here in the setup phase and never inside the timed loop: 65536 events are megabytes, and a ring of that size
+    // as a local overflows MSVC's default 1 MiB stack before the first line is printed. The measured push+pop is unchanged -- `ring` is
+    // the same object, reached through a reference.
+    const auto ring_storage = std::make_unique<hy::SpscRing<hy::BinanceMarketEvent, 65536>>();
+    hy::SpscRing<hy::BinanceMarketEvent, 65536>& ring = *ring_storage;
     hy::BinanceMarketEvent ev{};
     ev.price_ticks = 5990000000000LL;
     ev.qty_lots = 100000;
