@@ -13,7 +13,12 @@
 //   * close_all()   -- a graceful WebSocket close (going_away);
 //   * UpgradeBehavior::Stall -- TLS completes but the HTTP upgrade request is never read or answered, so a
 //     client sits in its WebSocket handshake: the one stage the blackhole fixtures cannot reach.
-// It is NOT a Binance emulator: no stream routing, no subscribe protocol, no message validation.
+// and, since private-stream migration M2 (the WebSocket API session SENDS a subscribe request and waits for the answer):
+//   * received_frames() -- every text frame a client sent, in arrival order;
+//   * set_responder()   -- a test-supplied function that decides, per client text frame, what the server says back;
+//   * ping_all()        -- a ping control frame, which is what the real WS API server sends every 20 s.
+// It is NOT a Binance emulator: no stream routing, no subscribe protocol, no message validation -- what a "subscribe answer" looks like is
+// entirely the test's responder.
 //
 // Threading: one private io_context on one dedicated thread runs every handler, so the connection list and
 // each connection's write queue need no locks; only the counters (atomics) and the recorded targets (mutex)
@@ -31,6 +36,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -127,6 +133,29 @@ public:
             }
         });
     }
+    // A WebSocket ping control frame to every matching upgraded connection (the client's WebSocket layer answers with a pong by itself).
+    void ping_all(std::string target = {}) {
+        net::post(ioc_, [this, filter = std::move(target)] {
+            for (auto& conn : conns_) {
+                if (conn->matches(filter)) conn->ping();
+            }
+        });
+    }
+
+    // --- the client's side of the conversation ------------------------------------------------------------
+    // Every text frame a client sent, in arrival order (all connections; the server does not interpret them).
+    std::vector<std::string> received_frames() const {
+        std::lock_guard<std::mutex> lock(frames_mutex_);
+        return received_;
+    }
+    // Decides what to say back to each client text frame. Runs on the server's thread; `target` is the upgrade target of the connection the
+    // frame came in on; the returned frames are sent to THAT connection, in order. The default (none set) says nothing. May be set at any time
+    // from any thread; it applies from the next frame on.
+    using Responder = std::function<std::vector<std::string>(const std::string& target, const std::string& frame)>;
+    void set_responder(Responder responder) {
+        std::lock_guard<std::mutex> lock(frames_mutex_);
+        responder_ = std::move(responder);
+    }
 
 private:
     struct Connection : std::enable_shared_from_this<Connection> {
@@ -180,9 +209,15 @@ private:
                     self->server.on_closed(self);
                     return;
                 }
+                if (self->ws.got_text()) self->server.on_client_text(self, beast::buffers_to_string(self->buffer.data()));
                 self->buffer.consume(self->buffer.size());
                 self->do_read();
             });
+        }
+
+        void ping() {
+            if (dead || !upgraded) return;
+            ws.async_ping(websocket::ping_data{}, [](boost::system::error_code) {});
         }
 
         // Same reasoning for a graceful close: it is remembered, and performed once the connection is upgraded
@@ -260,6 +295,18 @@ private:
             });
     }
 
+    // On the server thread: record the frame, ask the responder (if any) what to answer, queue the answers on that connection.
+    void on_client_text(const std::shared_ptr<Connection>& conn, const std::string& text) {
+        Responder responder;
+        {
+            std::lock_guard<std::mutex> lock(frames_mutex_);
+            received_.push_back(text);
+            responder = responder_;
+        }
+        if (!responder) return;
+        for (const std::string& reply : responder(conn->target, text)) conn->enqueue(reply);
+    }
+
     void on_closed(const std::shared_ptr<Connection>& conn) {
         if (conn->dead) return;
         conn->dead = true;
@@ -288,6 +335,9 @@ private:
     std::atomic<std::uint32_t> open_{0};
     mutable std::mutex targets_mutex_;
     std::vector<std::string> targets_;
+    mutable std::mutex frames_mutex_;
+    std::vector<std::string> received_;
+    Responder responder_;
 };
 
 }  // namespace hy::test_helpers

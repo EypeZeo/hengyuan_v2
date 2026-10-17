@@ -132,8 +132,9 @@ run_thread() {
         test_user_data_ws_concurrency test_symbol_registry_concurrency \
         compaction_lease_holder test_compaction_lease test_compaction_intent_store \
         test_seal_journal_store_lease test_intent_phase_advancer \
-        test_migrated_v2_started_publisher \
-        tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
+        test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
+        tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
+        tsan_control_relaxed_mailbox
 
     echo "--- concurrency tests (must pass) ---"
     (
@@ -191,6 +192,28 @@ run_thread() {
         fi
         echo "OK: TSan reported the injected race as expected."
         grep -A5 "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_export_worker.log | head -20
+    )
+
+    echo "--- control: tsan_control_relaxed_mailbox (must FAIL with a data race report) ---"
+    (
+        cd build-linux-tsan
+        export TSAN_OPTIONS="history_size=7:halt_on_error=1:exitcode=66"
+        set +e
+        setarch "$(uname -m)" -R ./tsan_control_relaxed_mailbox > /tmp/tsan_control_mailbox.log 2>&1
+        rc=$?
+        set -e
+        if [[ $rc -eq 0 ]]; then
+            echo "ERROR: tsan_control_relaxed_mailbox exited 0. TSan did NOT detect the injected race on this machine. Every 'no race found' result for the subscribe mailbox is unsubstantiated."
+            tail -50 /tmp/tsan_control_mailbox.log
+            exit 1
+        fi
+        if ! grep -q "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_mailbox.log; then
+            echo "ERROR: tsan_control_relaxed_mailbox failed, but NOT with a ThreadSanitizer data-race report. It may be erroring for an unrelated reason."
+            tail -50 /tmp/tsan_control_mailbox.log
+            exit 1
+        fi
+        echo "OK: TSan reported the injected race as expected."
+        grep -A5 "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_mailbox.log | head -20
     )
 }
 
