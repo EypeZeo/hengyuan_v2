@@ -194,9 +194,10 @@ static_assert(hy::SupervisedFeedSession<hy::BinanceKlineWsSession>);
 static_assert(hy::KlineFeedSession<hy::BinanceKlineWsSession>);
 
 TEST(KlineJsonParser, ReusedAcrossCallsWithDifferentBodySizes) {
-    // Exercises the reused-padded-buffer growth path (binance_json_parser.hpp's own AUDIT
+    // Exercises the reused padded copy buffer (binance_json_parser.hpp's own AUDIT
     // PERF-ALLOC-012 discipline), same test shape as
-    // UserDataJsonParser.ReusedAcrossCallsWithDifferentBodySizes.
+    // UserDataJsonParser.ReusedAcrossCallsWithDifferentBodySizes. (That parse() allocates
+    // nothing is test_ws_parser_allocation.cpp's job.)
     KlineJsonParser parser;
     KlineWsEvent ev{};
     ASSERT_EQ(parser.parse(kline_body(false), ev), KlineParseResult::Unclosed);
