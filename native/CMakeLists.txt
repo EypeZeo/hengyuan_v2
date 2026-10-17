@@ -333,6 +333,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_binance_json_parser)
     gtest_discover_tests(test_binance_json_parser)
 
+    # Appendix D L-38: BinanceJsonParser::parse() allocates nothing once the parser exists, whatever the frame size. The binary replaces the
+    # global allocation functions with counting ones (tests/test_helpers/alloc_probe.hpp, included by this one translation unit only).
+    add_executable(test_binance_json_parser_allocation tests/test_binance_json_parser_allocation.cpp)
+    target_link_libraries(test_binance_json_parser_allocation PRIVATE hengyuan_dataplane GTest::gtest_main)
+    target_include_directories(test_binance_json_parser_allocation PRIVATE tests)
+    hengyuan_set_warnings(test_binance_json_parser_allocation)
+    gtest_discover_tests(test_binance_json_parser_allocation)
+
     add_executable(test_orderbook tests/test_orderbook.cpp)
     target_link_libraries(test_orderbook PRIVATE hengyuan_dataplane GTest::gtest_main)
     hengyuan_set_warnings(test_orderbook)
@@ -1040,6 +1048,18 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_reconcile_durable_guard)
     gtest_discover_tests(test_reconcile_durable_guard)
 
+    # Private-stream migration M1 guard: detail::build_ws_api_signed_request() signs a WebSocket API frame for ANY
+    # well-formed method name (the official "order.place" examples have to be checked against it), so the one place
+    # allowed to call it is build_subscribe_signature_request(). Every mention under include/ and src/ is pinned with
+    # its count, and the typed entry point's two calls are pinned inside its header. It reads the source tree, so the
+    # native/ directory is a compile definition and the target needs nothing else (same shape as the two guards above).
+    add_executable(test_ws_api_signing_guard tests/test_ws_api_signing_guard.cpp)
+    target_link_libraries(test_ws_api_signing_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_ws_api_signing_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_ws_api_signing_guard)
+    gtest_discover_tests(test_ws_api_signing_guard)
+
     # Real two-thread stress for the lock-free SPSC primitives. Labelled
     # "concurrency" so the TSan CI job can select just these (`ctest -L
     # concurrency`) — building all 27 test binaries under TSan triples the job
@@ -1153,6 +1173,18 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_query_signing)
         gtest_discover_tests(test_binance_query_signing)
 
+        # Private-stream migration M1: the request side of the spot WebSocket API (binance_ws_api_signing.hpp). It signs with the bound
+        # credentials, so it needs the OpenSSL stack like the query-signing test above; simdjson (via hengyuan_dataplane) is for the test's
+        # independent verifier, which parses the frame the way the exchange does and recomputes the signature with OpenSSL's own HMAC.
+        add_executable(test_binance_ws_api_signing tests/test_binance_ws_api_signing.cpp)
+        target_link_libraries(test_binance_ws_api_signing PRIVATE
+            hengyuan_dataplane OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST}
+            GTest::gtest_main)
+        target_include_directories(test_binance_ws_api_signing SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_ws_api_signing PRIVATE tests)
+        hengyuan_set_warnings(test_binance_ws_api_signing)
+        gtest_discover_tests(test_binance_ws_api_signing)
+
         # P2-MD-02 / Track C: REST/WS/Gate connectivity tests -- fully offline (local
         # blackhole/TLS fixtures, see tests/test_helpers/blackhole_acceptor.hpp), but they need
         # Boost/OpenSSL to build at all, so they're gated the same as test_binance_signer above.
@@ -1261,6 +1293,19 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_kline_ws_session)
         hengyuan_allow_third_party_tsan_fences(test_binance_kline_ws_session)
         gtest_discover_tests(test_binance_kline_ws_session)
+
+        # Appendix D L-38: UserDataJsonParser and KlineJsonParser (both live in the session headers) allocate nothing once the parser exists.
+        # Same Boost/Beast/OpenSSL include shape as the two session tests above; same counting probe as test_binance_json_parser_allocation.
+        add_executable(test_ws_parser_allocation tests/test_ws_parser_allocation.cpp)
+        target_link_libraries(test_ws_parser_allocation PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_ws_parser_allocation SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_ws_parser_allocation PRIVATE tests)
+        hengyuan_set_warnings(test_ws_parser_allocation)
+        hengyuan_allow_third_party_tsan_fences(test_ws_parser_allocation)
+        gtest_discover_tests(test_ws_parser_allocation)
 
         # 批次 6 6b-0f-3d: the REAL public sessions (depth, kline) and the feed supervisor against a
         # local TLS WebSocket server (tests/test_helpers/ws_loopback_server.hpp) -- the positive paths the
@@ -1384,4 +1429,16 @@ if(HY_BUILD_TESTS)
         hengyuan_dataplane GTest::gtest_main)
     hengyuan_set_warnings(test_binance_klines_codec)
     gtest_discover_tests(test_binance_klines_codec)
+
+    # Private-stream migration M1: the response/event codec of the spot WebSocket API (binance_ws_api_codec.hpp). Pure parsing over
+    # simdjson, no Boost and no OpenSSL, so it builds and runs in the default configuration; its fixtures are the official docs' own examples
+    # (tests/ws_api_official_samples.hpp, generated from them).
+    add_executable(test_binance_ws_api_codec tests/test_binance_ws_api_codec.cpp)
+    target_link_libraries(test_binance_ws_api_codec PRIVATE
+        hengyuan_dataplane GTest::gtest_main)
+    # tests/ is on the include path for test_helpers/alloc_probe.hpp (the counting operator new behind WsApiCodecAllocation, shared with the
+    # Appendix D L-38 parser allocation tests; included by this one translation unit only).
+    target_include_directories(test_binance_ws_api_codec PRIVATE tests)
+    hengyuan_set_warnings(test_binance_ws_api_codec)
+    gtest_discover_tests(test_binance_ws_api_codec)
 endif()

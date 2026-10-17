@@ -57,6 +57,7 @@
 #include <hengyuan/binance_listen_key_publisher.hpp>
 #include <hengyuan/binance_tls.hpp>
 #include <hengyuan/binance_user_data_event.hpp>  // UserDataWsEvent/Ring, drain_user_data_events()
+#include <hengyuan/ws_frame_limits.hpp>          // kWsReadMessageMaxBytes: the session's read limit AND the parser's size
 
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -85,6 +86,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -107,22 +109,29 @@ enum class UserDataParseResult : std::uint8_t {
     MissingEventType = 2,
 };
 
-// Zero-steady-state-allocation, matching binance_json_parser.hpp's own AUDIT PERF-ALLOC-012
-// discipline exactly: a reused padded_buf_ that only grows (resize() is a no-op once the
-// high-water mark is reached), never a fresh simdjson::padded_string per message. `out` is
+// Zero allocation in parse(), matching binance_json_parser.hpp's own AUDIT PERF-ALLOC-012 /
+// Appendix D L-38 discipline exactly: everything is sized once, in the constructor, for the
+// largest frame a session can deliver (kWsReadMessageMaxBytes) -- simdjson's arrays and string
+// buffer via allocate(), and one fixed padded copy buffer -- never a fresh
+// simdjson::padded_string per message and no buffer that grows on a longer frame. `out` is
 // left at kind == Unknown/event_time_ms == 0 on any failure path -- never partially filled.
 class UserDataJsonParser {
 public:
+    // Allocates ALL of the parser's memory, once (about 28 MB of address space, 4 MiB of it
+    // touched); parse() never allocates afterwards. Throws std::bad_alloc if that fails -- a
+    // parser that could not allocate would be a session that silently drops every event.
+    UserDataJsonParser() : padded_buf_(kWsReadMessageMaxBytes + simdjson::SIMDJSON_PADDING, '\0') {
+        if (parser_.allocate(kWsReadMessageMaxBytes) != simdjson::SUCCESS) throw std::bad_alloc();
+    }
+
     UserDataParseResult parse(std::string_view body, UserDataWsEvent& out) noexcept {
         out = UserDataWsEvent{};
 
+        // A body above the limit cannot come from a session (Beast refuses the message first, at
+        // the same number); it is refused here, before the copy, rather than growing a buffer.
         const std::size_t doc_len = body.size();
-        if (padded_buf_.size() < doc_len + simdjson::SIMDJSON_PADDING) {
-            try {
-                padded_buf_.resize(doc_len + simdjson::SIMDJSON_PADDING);
-            } catch (...) {
-                return UserDataParseResult::MalformedJson;  // OOM on an attacker-sized message
-            }
+        if (doc_len > kWsReadMessageMaxBytes) [[unlikely]] {
+            return UserDataParseResult::MalformedJson;
         }
         if (doc_len > 0) {
             std::memcpy(padded_buf_.data(), body.data(), doc_len);
@@ -247,7 +256,7 @@ private:
     }
 
     simdjson::ondemand::parser parser_;
-    std::string padded_buf_ = std::string(static_cast<std::size_t>(4 * 1024), '\0');
+    std::string padded_buf_;  // fixed: kWsReadMessageMaxBytes + SIMDJSON_PADDING, set in the constructor
 };
 
 // --- Session config (host/port only -- target is derived from ListenKeyPublisher at connect
@@ -406,9 +415,9 @@ private:
         beast::get_lowest_layer(ws_).expires_never();
         // Same idle-timeout/max-message-size/keep-alive-ping knobs as BinanceWsSession's own
         // call site -- these are fixed at the call site in that file too, not exposed via
-        // either session's config struct.
-        hy::configure_ws_stream(ws_, std::chrono::seconds(90),
-                                 static_cast<std::size_t>(4 * 1024 * 1024));
+        // either session's config struct. The size is the one number the frame parsers size
+        // their memory from (ws_frame_limits.hpp).
+        hy::configure_ws_stream(ws_, std::chrono::seconds(90), hy::kWsReadMessageMaxBytes);
         ws_.async_handshake(config_.host, target_,
                             beast::bind_front_handler(&BinanceUserDataWsSession::on_handshake,
                                                      this->shared_from_this()));

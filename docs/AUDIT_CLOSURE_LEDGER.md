@@ -148,7 +148,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-001** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6a3cd87 |
 | **FI-002** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-003** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-004** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-004** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 0758969 |
 | **FI-005** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-006** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-007** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
@@ -797,10 +797,10 @@ level: L1
 status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
+baseline: 0758969
 open: absent:native/src/*.cpp#StartupRecovery
-refs: test:native/tests/test_durable_audit_sink.cpp#TornTailWriteDiscardsOnlyTheIncompleteRecord test:native/tests/test_durable_audit_sink.cpp#TornTailUnderSixBytesIsRecoveredNotCorrupt test:native/tests/test_durable_audit_sink.cpp#AnchorAheadOfTruncatedLogIsCorruptTailDeletion test:native/tests/test_startup_recovery.cpp#EachUnhealthyDurableLogConditionDegradesWithItsOwnReason
-note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；缺口是“拒绝启动并禁止增仓”要由启动恢复接入进程才成立，且没有恢复报告产物。
+refs: test:native/tests/test_durable_audit_sink.cpp#TornTailWriteDiscardsOnlyTheIncompleteRecord test:native/tests/test_durable_audit_sink.cpp#TornTailUnderSixBytesIsRecoveredNotCorrupt test:native/tests/test_durable_audit_sink.cpp#AnchorAheadOfTruncatedLogIsCorruptTailDeletion test:native/tests/test_startup_recovery.cpp#EachUnhealthyDurableLogConditionDegradesWithItsOwnReason test:native/tests/test_durable_audit_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_audit_sink.cpp#ACompleteButWrongFrameIsCorruptAndNothingBehindItIsCut test:native/tests/test_durable_audit_sink.cpp#AnAnchorAheadOfTheLogTogetherWithATornTailIsCorruptAndNothingIsCut test:native/tests/test_control_plane_log_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_log_store.cpp#DiscardTornTailRefusesATailOfAWholeFrameOrMoreAndLeavesTheBytes pr:177@0758969
+note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；PR #177 起撕裂尾部在锚点校验通过之后被物理截断（真实日志上验证第二帧的每个撕裂前缀长度：截断后下一次追加落在帧边界，再重启仍可回放），完整但错误的帧与锚点超前于日志的尾部删除一字节不动、整本日志 Corrupt，截断被操作系统拒绝则围栏；缺口是“拒绝启动并禁止增仓”要由启动恢复接入进程才成立，且没有恢复报告产物（运行期也没有人读取 recovered_torn_tail_bytes）。
 ```
 
 ```ledger
@@ -1280,8 +1280,8 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/include/hengyuan/*.hpp#ommission
-note: 成交回报里的佣金与佣金资产没有被解析，也没有费率预估。
+open: absent:native/include/hengyuan/*.hpp#fee_rate absent:native/include/hengyuan/*.hpp#fee_estimate
+note: 私网流迁移 M1 起，新的 WS API 编解码（WsApiCodec）读出成交回报里的佣金、佣金资产和成交号，并随 UserDataWsEvent 携带；但没有任何代码消费它们——没有费用账务、没有费率预估、没有余额耗尽的告警。
 ```
 
 ```ledger

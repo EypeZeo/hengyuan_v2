@@ -186,9 +186,10 @@ TEST(UserDataJsonParser, ExecutionReportWithOverlongClientOrderIdLeavesCoidEmpty
 }
 
 TEST(UserDataJsonParser, ReusedAcrossCallsWithDifferentBodySizes) {
-    // Exercises the reused-padded-buffer growth path (binance_json_parser.hpp's own AUDIT
+    // Exercises the reused padded copy buffer (binance_json_parser.hpp's own AUDIT
     // PERF-ALLOC-012 discipline) -- a small message followed by a much larger one must both
-    // parse correctly, not just whichever size the buffer happened to start at.
+    // parse correctly, neither seeing the other's bytes. (That parse() allocates nothing is
+    // test_ws_parser_allocation.cpp's job.)
     UserDataJsonParser parser;
     UserDataWsEvent ev{};
     ASSERT_EQ(parser.parse(R"({"e":"listenKeyExpired","E":1})", ev), UserDataParseResult::Ok);

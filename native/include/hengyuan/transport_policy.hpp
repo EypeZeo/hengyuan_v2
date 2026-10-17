@@ -58,10 +58,23 @@ inline constexpr EndpointAllowlist binance_default_endpoints() noexcept {
     return al;
 }
 
+// The spot WebSocket API hosts (blueprint 5.7 P-24; private-stream migration M1). A separate list, never mixed into the REST one: REST
+// already fills every slot of kMaxEndpoints, a REST permit must not be spendable on a WS API host, and a WS API permit must not be
+// spendable on a REST host. The production default names the production host only; EnvironmentBinding::testnet() replaces it with
+// the testnet host, so the two environments never share an entry.
+inline constexpr EndpointAllowlist binance_default_ws_api_endpoints() noexcept {
+    EndpointAllowlist al{};
+    al.hosts[0] = "ws-api.binance.com";
+    al.count = 1;
+    return al;
+}
+
 // --- Transport policy ---
 
 struct TransportPolicy {
     EndpointAllowlist endpoint_allowlist = binance_default_endpoints();
+    // Hosts a WebSocket API session may connect to (WsEndpointPermit below). Independent of endpoint_allowlist.
+    EndpointAllowlist ws_api_allowlist = binance_default_ws_api_endpoints();
     bool tls_verify_peer{true};
     bool tls_verify_hostname{true};
     bool follow_redirects{false};
@@ -206,6 +219,44 @@ private:
     const std::size_t cap = kind_cap < p.max_response_bytes ? kind_cap : p.max_response_bytes;
     if (cap == 0) return std::nullopt;
     return EndpointPermit(host, kResponseHeaderCapBytes, static_cast<std::uint64_t>(cap));
+}
+
+// The most one WebSocket API frame (a response or a user-data event) is allowed to carry. Frames are small: a response is a few
+// hundred bytes, an executionReport about 1 KiB, a listStatus with a long order list a few KiB. A session hands this to the
+// WebSocket stream's read_message_max() BEFORE the first byte of a message is read, so an oversized frame is refused while it streams
+// in, not after it has been buffered. TransportPolicy::max_response_bytes is the ceiling above it, as for the REST kinds.
+inline constexpr std::size_t kWsApiMaxMessageBytes = 64 * 1024;
+static_assert(kWsApiMaxMessageBytes <= TransportPolicy{}.max_response_bytes);
+
+// Proof that `host` passed the WebSocket API allowlist of a policy, and of the most one frame may carry. The only way to obtain one is
+// issue_ws_endpoint_permit() below; the WS API session (M2) takes one by value and connects to permit.host() -- no separate host
+// argument -- and reads at most permit.max_message_bytes() per message, the same shape EndpointPermit gives the REST clients, so a
+// session that skipped the allowlist or the size bound cannot be written without the compiler noticing. `host` is a view: it must
+// outlive every copy of the permit (the issuer passes EnvironmentBinding::ws_api_host(), a view of a string literal).
+class WsEndpointPermit {
+public:
+    [[nodiscard]] std::string_view host() const noexcept { return host_; }
+    [[nodiscard]] std::uint64_t max_message_bytes() const noexcept { return max_message_bytes_; }
+
+private:
+    WsEndpointPermit(std::string_view host, std::uint64_t max_message_bytes) noexcept
+        : host_(host), max_message_bytes_(max_message_bytes) {}
+    friend std::optional<WsEndpointPermit> issue_ws_endpoint_permit(const TransportPolicy&, std::string_view) noexcept;
+
+    std::string_view host_;
+    std::uint64_t max_message_bytes_;
+};
+
+// Fails closed: nullopt for a host that is not on the WebSocket API allowlist, for a corrupt (empty or over-full) allowlist, and for a
+// policy whose response ceiling is zero (it would let nothing through).
+[[nodiscard]] inline std::optional<WsEndpointPermit> issue_ws_endpoint_permit(const TransportPolicy& p,
+                                                                               std::string_view host) noexcept {
+    const EndpointAllowlist& al = p.ws_api_allowlist;
+    if (al.count == 0 || al.count > kMaxEndpoints) return std::nullopt;
+    if (!al.contains(host)) return std::nullopt;
+    const std::size_t cap = kWsApiMaxMessageBytes < p.max_response_bytes ? kWsApiMaxMessageBytes : p.max_response_bytes;
+    if (cap == 0) return std::nullopt;
+    return WsEndpointPermit(host, static_cast<std::uint64_t>(cap));
 }
 
 // Validate HTTP status code: reject redirects (3xx).

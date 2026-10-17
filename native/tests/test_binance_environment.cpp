@@ -415,3 +415,59 @@ TEST_F(BoundHmacCredentialsTest, WipeApiKeyZeroesFullBufferWhileObjectStillAlive
     ASSERT_TRUE(creds->copy_api_key(after, written_after));
     EXPECT_EQ(written_after, 0u);  // api_key_len_ reset to 0
 }
+
+// --- private-stream migration M1: the WebSocket API host of each environment (blueprint 5.7 P-24) ---
+
+TEST(EnvironmentBindingWsApi, EachEnvironmentNamesItsOwnWsApiHostPortAndTarget) {
+    const auto testnet = EnvironmentBinding::testnet();
+    EXPECT_EQ(testnet.ws_api_host(), "ws-api.testnet.binance.vision");
+    EXPECT_EQ(testnet.ws_api_port(), "443");
+    const auto production = EnvironmentBinding::production();
+    EXPECT_EQ(production.ws_api_host(), "ws-api.binance.com");
+    EXPECT_EQ(production.ws_api_port(), "443");
+    EXPECT_EQ(EnvironmentBinding::ws_api_target(), "/ws-api/v3");
+    EXPECT_NE(testnet.ws_api_host(), production.ws_api_host());
+    // not the market-data stream host either: a different service with its own host
+    EXPECT_NE(testnet.ws_api_host(), testnet.ws_host());
+    EXPECT_NE(production.ws_api_host(), production.ws_host());
+}
+
+TEST(EnvironmentBindingWsApi, AnEnvironmentsPolicyPermitsItsOwnWsApiHostAndNeverTheOtherOnes) {
+    const auto testnet = EnvironmentBinding::testnet();
+    const auto production = EnvironmentBinding::production();
+
+    const auto own_testnet = hy::issue_ws_endpoint_permit(testnet.transport_policy(), testnet.ws_api_host());
+    ASSERT_TRUE(own_testnet.has_value());
+    EXPECT_EQ(own_testnet->host(), "ws-api.testnet.binance.vision");
+    const auto own_production = hy::issue_ws_endpoint_permit(production.transport_policy(), production.ws_api_host());
+    ASSERT_TRUE(own_production.has_value());
+    EXPECT_EQ(own_production->host(), "ws-api.binance.com");
+
+    // the environments never cross
+    EXPECT_FALSE(hy::issue_ws_endpoint_permit(testnet.transport_policy(), production.ws_api_host()).has_value());
+    EXPECT_FALSE(hy::issue_ws_endpoint_permit(production.transport_policy(), testnet.ws_api_host()).has_value());
+    // and neither policy permits a REST or market-data host for a WS API session
+    for (const auto* b : {&testnet, &production}) {
+        EXPECT_FALSE(hy::issue_ws_endpoint_permit(b->transport_policy(), b->base_host()).has_value());
+        EXPECT_FALSE(hy::issue_ws_endpoint_permit(b->transport_policy(), b->ws_host()).has_value());
+    }
+}
+
+TEST(EnvironmentBindingWsApi, TheWsApiHostIsOnNeitherEnvironmentsRestAllowlist) {
+    for (const auto& b : {EnvironmentBinding::testnet(), EnvironmentBinding::production()}) {
+        EXPECT_FALSE(b.transport_policy().endpoint_allowlist.contains(b.ws_api_host()));
+        EXPECT_FALSE(hy::issue_endpoint_permit(b.transport_policy(), b.ws_api_host(), hy::ResponseKind::SignedJson).has_value());
+    }
+}
+
+TEST(EnvironmentBindingWsApi, TheTestnetWsApiAllowlistHoldsItsHostAndNothingElse) {
+    const auto testnet = EnvironmentBinding::testnet();
+    const auto& al = testnet.transport_policy().ws_api_allowlist;
+    EXPECT_EQ(al.count, 1u);
+    EXPECT_TRUE(al.contains("ws-api.testnet.binance.vision"));
+    EXPECT_FALSE(al.contains("ws-api.binance.com"));
+    const auto production = EnvironmentBinding::production();
+    EXPECT_EQ(production.transport_policy().ws_api_allowlist.count, 1u);
+    EXPECT_TRUE(production.transport_policy().ws_api_allowlist.contains("ws-api.binance.com"));
+    EXPECT_FALSE(production.transport_policy().ws_api_allowlist.contains("ws-api.testnet.binance.vision"));
+}

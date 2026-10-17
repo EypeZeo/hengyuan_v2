@@ -28,6 +28,7 @@
 #include <hengyuan/binance_market_event.hpp>
 #include <hengyuan/binance_tls.hpp>
 #include <hengyuan/spsc_ring.hpp>
+#include <hengyuan/ws_frame_limits.hpp>
 
 #include <boost/asio.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -258,8 +259,9 @@ private:
         // The WS-level timeout option (below) takes over -- disarm the tcp_stream-level timer
         // so the two mechanisms don't fight each other.
         beast::get_lowest_layer(ws_).expires_never();
-        hy::configure_ws_stream(ws_, std::chrono::seconds(90),
-                                 static_cast<std::size_t>(4 * 1024 * 1024));
+        // kWsReadMessageMaxBytes is also what BinanceJsonParser sizes all of its memory from
+        // (ws_frame_limits.hpp): a message this session lets through never makes parse() allocate.
+        hy::configure_ws_stream(ws_, std::chrono::seconds(90), hy::kWsReadMessageMaxBytes);
         std::string target = config_.target;
         if (!config_.subscribe_streams.empty()) {
             target += "/";

@@ -3,11 +3,15 @@
 // path simulates a restart" idiom. Exercises append/fsync/tip-anchor/recovery
 // mechanics AND the two safety-critical recovery fold rules added after the
 // external review (Freeze->Clear->restart, cross-generation WaitSatisfied).
+#include "durable_log_store_test_hooks.hpp"
+
 #include <gtest/gtest.h>
 #include <hengyuan/control_plane_log_sink.hpp>
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 
@@ -496,4 +500,328 @@ TEST_F(ControlPlaneLogSinkTest, RecoveryScanAcceptsKeyRotatedFrameWithoutCorrupt
     ASSERT_TRUE(restarted.is_open());
     ASSERT_FALSE(restarted.fenced());
     EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+
+// --- SAFE-03 crash-window slice (blueprint L-36): a torn tail is CUT, and the late-fsync window is accepted ---
+//
+// Two defects, both found by probing the real sink (2026-10-13):
+//  * the same one DurableAuditSink had -- finish_append() appends at the PHYSICAL end of the log, recovery only
+//    skipped a torn tail logically, so the first append after a crash-torn restart landed behind it and the NEXT
+//    start was Corrupt (fenced);
+//  * finish_append() fsyncs the frame and THEN writes the anchor, so a crash between the two leaves the anchor one
+//    frame behind a perfectly good frame. DurableAuditSink accepted that window; this sink compared the anchor with
+//    the LAST frame only and called it Corrupt, although its comment said the two checks were "structurally
+//    identical".
+
+namespace {
+
+std::string slurp_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+void spit_file(const std::string& path, const std::string& bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+}  // namespace
+
+class ControlPlaneCrashWindowTest : public ControlPlaneLogSinkTest {
+protected:
+    // Frame 0 is a RateLimitFreeze, every later frame an EndpointWeightConfig. Each frame is appended by a sink
+    // instance of its own, so the file size and the anchor right after it can be captured while the log is not held
+    // open. anchor_[i] / end_[i] = the anchor file and the log size once frame i is durable.
+    std::string anchor_[4];
+    std::size_t end_[4]{};
+
+    void build_log(int frames) {
+        remove_all();
+        for (int i = 0; i < frames; ++i) {
+            {
+                ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+                ASSERT_TRUE(sink.is_open()) << "frame " << i;
+                ASSERT_FALSE(sink.fenced()) << "frame " << i;
+                if (i == 0) {
+                    RateLimitFreezePayload freeze{};
+                    freeze.freeze_epoch = 1;
+                    ASSERT_TRUE(sink.append_rate_freeze(freeze, FrameTimeKind::ServerCorrectedUtc).acked());
+                } else {
+                    EndpointWeightConfig weights{};
+                    ASSERT_TRUE(sink.append_weight_config(weights).acked()) << "frame " << i;
+                }
+            }
+            anchor_[i] = slurp_file(base_path_ + ".cp.tip");
+            end_[i] = slurp_file(base_path_).size();
+        }
+    }
+
+    void append_weight_config_and_close() {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        ASSERT_FALSE(sink.fenced());
+        EndpointWeightConfig weights{};
+        ASSERT_TRUE(sink.append_weight_config(weights).acked());
+    }
+};
+
+TEST_F(ControlPlaneCrashWindowTest, EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing) {
+    ASSERT_NO_FATAL_FAILURE(build_log(2));
+    const std::string full = slurp_file(base_path_);
+    const std::size_t frame1_len = end_[1] - end_[0];
+    ASSERT_GT(frame1_len, 30u);
+
+    for (std::size_t len = 1; len < frame1_len; ++len) {
+        remove_all();
+        spit_file(base_path_, full.substr(0, end_[0] + len));  // a crash in the middle of the second append
+        spit_file(base_path_ + ".cp.tip", anchor_[0]);
+        {
+            ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(restarted.is_open()) << "len=" << len;
+            EXPECT_FALSE(restarted.fenced()) << "len=" << len;
+            EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered) << "len=" << len;
+            EXPECT_EQ(restarted.recovered_torn_tail_bytes(), len) << "len=" << len;
+            EndpointWeightConfig weights{};
+            ASSERT_TRUE(restarted.append_weight_config(weights).acked()) << "len=" << len;
+        }
+        EXPECT_EQ(slurp_file(base_path_).size(), end_[1]) << "len=" << len << ": no debris between the frames";
+        {
+            ControlPlaneLogSink again(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(again.is_open()) << "len=" << len;
+            EXPECT_FALSE(again.fenced()) << "len=" << len << ": the log the cut tail left must replay";
+            EXPECT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered) << "len=" << len;
+            EXPECT_EQ(again.recovered_torn_tail_bytes(), 0u) << "len=" << len;
+        }
+    }
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AFirstFrameThatNeverCompletedIsCutAndTheLogStartsAfresh) {
+    ASSERT_NO_FATAL_FAILURE(build_log(1));
+    const std::string first = slurp_file(base_path_);
+    for (const std::size_t len : {std::size_t{1}, std::size_t{5}, std::size_t{20}, std::size_t{40}, end_[0] - 1}) {
+        remove_all();
+        spit_file(base_path_, first.substr(0, len));  // no complete frame, no anchor
+        {
+            ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+            ASSERT_TRUE(sink.is_open()) << "len=" << len;
+            EXPECT_FALSE(sink.fenced()) << "len=" << len;
+            EXPECT_EQ(sink.recovery_status(), RecoveryScanStatus::Clean) << "len=" << len;
+            EXPECT_EQ(sink.recovered_torn_tail_bytes(), len) << "len=" << len;
+            RateLimitFreezePayload freeze{};
+            freeze.freeze_epoch = 1;
+            ASSERT_TRUE(sink.append_rate_freeze(freeze, FrameTimeKind::ServerCorrectedUtc).acked()) << "len=" << len;
+        }
+        EXPECT_EQ(slurp_file(base_path_).size(), end_[0]) << "len=" << len << ": the first frame starts the file";
+        ControlPlaneLogSink again(base_path_, *key_ring_, 1);
+        EXPECT_FALSE(again.fenced()) << "len=" << len;
+        EXPECT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered) << "len=" << len;
+    }
+}
+
+TEST_F(ControlPlaneCrashWindowTest, ATornTailAfterAKeyRotatedFrameIsCutToo) {
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, make_plaintext_key(0x20), rec2), KeyRingAddStatus::Ok);
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        EndpointWeightConfig cfg{};
+        ASSERT_TRUE(sink.append_weight_config(cfg).acked());
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));
+    }
+    const std::string anchor_after_rotation = slurp_file(base_path_ + ".cp.tip");
+    const std::size_t size_after_rotation = slurp_file(base_path_).size();
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 2);
+        RateLimitUsageSnapshotPayload usage{};
+        ASSERT_TRUE(sink.append_usage_snapshot(usage).acked());
+    }
+    const std::string full = slurp_file(base_path_);
+    const std::size_t next_len = full.size() - size_after_rotation;
+    ASSERT_GT(next_len, 25u);
+
+    spit_file(base_path_, full.substr(0, size_after_rotation + 25));
+    spit_file(base_path_ + ".cp.tip", anchor_after_rotation);
+    {
+        ControlPlaneLogSink restarted(base_path_, *key_ring_, 2);
+        EXPECT_FALSE(restarted.fenced());
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 25u);
+        RateLimitUsageSnapshotPayload usage{};
+        ASSERT_TRUE(restarted.append_usage_snapshot(usage).acked());
+    }
+    EXPECT_EQ(slurp_file(base_path_).size(), full.size());
+    ControlPlaneLogSink again(base_path_, *key_ring_, 2);
+    EXPECT_FALSE(again.fenced());
+    EXPECT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AnAnchorOneFrameBehindTheLogIsTheLateFsyncWindowAndHeals) {
+    ASSERT_NO_FATAL_FAILURE(build_log(2));
+    spit_file(base_path_ + ".cp.tip", anchor_[0]);  // frame 1 is durable, its anchor never was
+    {
+        ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_FALSE(restarted.fenced());
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 0u);
+        EndpointWeightConfig weights{};
+        ASSERT_TRUE(restarted.append_weight_config(weights).acked()) << "the anchor catches up with this append";
+    }
+    ControlPlaneLogSink again(base_path_, *key_ring_, 1);
+    EXPECT_FALSE(again.fenced());
+    EXPECT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AnAnchorTwoFramesBehindTheLogIsStillCorrupt) {
+    ASSERT_NO_FATAL_FAILURE(build_log(3));
+    spit_file(base_path_ + ".cp.tip", anchor_[0]);  // a rolled-back anchor, not a crash: only ONE frame is allowed
+    ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AnAnchorOneFrameBehindWhoseMacIsNotTheLogsIsStillCorrupt) {
+    ASSERT_NO_FATAL_FAILURE(build_log(2));
+    const std::string log = slurp_file(base_path_);
+
+    remove_all();
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        RateLimitFreezePayload other{};
+        other.freeze_epoch = 7;  // a different history: its frame 0 has a different MAC
+        ASSERT_TRUE(sink.append_rate_freeze(other, FrameTimeKind::ServerCorrectedUtc).acked());
+    }
+    const std::string foreign_anchor = slurp_file(base_path_ + ".cp.tip");
+
+    remove_all();
+    spit_file(base_path_, log);
+    spit_file(base_path_ + ".cp.tip", foreign_anchor);  // sequence 0, but not THIS log's frame 0
+    ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AnAnchorOneFrameBehindTogetherWithATornTailIsBothHandled) {
+    ASSERT_NO_FATAL_FAILURE(build_log(3));
+    const std::string full = slurp_file(base_path_);
+    spit_file(base_path_, full.substr(0, end_[1] + 20));  // frame 2 torn, frame 1 durable
+    spit_file(base_path_ + ".cp.tip", anchor_[0]);          // frame 1's anchor never written
+    {
+        ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_FALSE(restarted.fenced());
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 20u);
+        EndpointWeightConfig weights{};
+        ASSERT_TRUE(restarted.append_weight_config(weights).acked());
+    }
+    EXPECT_EQ(slurp_file(base_path_).size(), end_[2]);
+    ControlPlaneLogSink again(base_path_, *key_ring_, 1);
+    EXPECT_FALSE(again.fenced());
+    EXPECT_EQ(again.recovery_status(), RecoveryScanStatus::Recovered);
+}
+
+TEST_F(ControlPlaneCrashWindowTest, ATornFirstFrameBehindAnAnchorThatClaimsAFrameIsCorruptAndTheFileIsLeftAlone) {
+    ASSERT_NO_FATAL_FAILURE(build_log(1));
+    const std::string first = slurp_file(base_path_);
+    spit_file(base_path_, first.substr(0, 30));  // the anchor still claims sequence 0
+    {
+        ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+        EXPECT_TRUE(restarted.fenced());
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 0u);
+    }
+    EXPECT_EQ(slurp_file(base_path_).size(), 30u) << "a log that fails the anchor check is evidence: not one byte is cut";
+}
+
+TEST_F(ControlPlaneCrashWindowTest, ACompleteButWrongFrameIsCorruptAndNothingBehindItIsCut) {
+    ASSERT_NO_FATAL_FAILURE(build_log(2));
+    std::string log = slurp_file(base_path_);
+    log[end_[1] - 5] = static_cast<char>(log[end_[1] - 5] ^ 0x01);  // inside frame 1's MAC
+    log += log.substr(end_[0], 20);                                  // and a torn-looking tail behind it
+    spit_file(base_path_, log);
+    {
+        ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt);
+        EXPECT_TRUE(restarted.fenced());
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 0u);
+    }
+    EXPECT_EQ(slurp_file(base_path_).size(), end_[1] + 20) << "Corrupt: the file is left byte-for-byte alone";
+}
+
+TEST_F(ControlPlaneCrashWindowTest, ATruncateTheOsRefusesFencesTheSinkAndLeavesTheTailOnDisk) {
+    ASSERT_NO_FATAL_FAILURE(build_log(2));
+    const std::string full = slurp_file(base_path_);
+    spit_file(base_path_, full.substr(0, end_[0] + 30));
+    spit_file(base_path_ + ".cp.tip", anchor_[0]);
+    {
+        TruncateFailureSeamGuard seam(1);
+        ControlPlaneLogSink refused(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(refused.is_open());
+        EXPECT_EQ(refused.recovery_status(), RecoveryScanStatus::IoError);
+        EXPECT_TRUE(refused.fenced()) << "the tail is still on disk: an append would land behind it";
+        EndpointWeightConfig weights{};
+        EXPECT_FALSE(refused.append_weight_config(weights).acked());
+        EXPECT_EQ(refused.recovered_torn_tail_bytes(), 0u);
+        EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 0u) << "the scan really tried to cut";
+    }
+    EXPECT_EQ(slurp_file(base_path_).size(), end_[0] + 30);
+
+    ControlPlaneLogSink healed(base_path_, *key_ring_, 1);  // the seam is spent: a start with a working truncate cuts it
+    EXPECT_FALSE(healed.fenced());
+    EXPECT_EQ(healed.recovered_torn_tail_bytes(), 30u);
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AnAnchorAheadOfTheLogTogetherWithATornTailIsCorruptAndNothingIsCut) {
+    ASSERT_NO_FATAL_FAILURE(build_log(2));
+    const std::string full = slurp_file(base_path_);
+    spit_file(base_path_, full.substr(0, end_[0] + 20));  // the anchor claims frame 1, only a piece of it is left
+    {
+        ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt) << "tail deletion";
+        EXPECT_TRUE(restarted.fenced());
+        EXPECT_EQ(restarted.recovered_torn_tail_bytes(), 0u);
+    }
+    EXPECT_EQ(slurp_file(base_path_).size(), end_[0] + 20) << "the anchor check failed first: the bytes are evidence";
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AFirstFrameCutTheOsRefusesFencesTheSinkAndLeavesTheDebrisOnDisk) {
+    ASSERT_NO_FATAL_FAILURE(build_log(1));
+    const std::string first = slurp_file(base_path_);
+    remove_all();
+    spit_file(base_path_, first.substr(0, 40));  // no complete frame, no anchor
+    {
+        TruncateFailureSeamGuard seam(1);
+        ControlPlaneLogSink refused(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(refused.is_open());
+        EXPECT_EQ(refused.recovery_status(), RecoveryScanStatus::IoError);
+        EXPECT_TRUE(refused.fenced()) << "the debris is still on disk: the first append would land behind it";
+        RateLimitFreezePayload freeze{};
+        freeze.freeze_epoch = 1;
+        EXPECT_FALSE(refused.append_rate_freeze(freeze, FrameTimeKind::ServerCorrectedUtc).acked());
+        EXPECT_EQ(refused.recovered_torn_tail_bytes(), 0u);
+        EXPECT_EQ(DurableLogStoreTestHooks::pending_truncate_failures(), 0u) << "the scan really tried to cut";
+    }
+    EXPECT_EQ(slurp_file(base_path_).size(), 40u);
+
+    ControlPlaneLogSink healed(base_path_, *key_ring_, 1);  // the seam is spent: a start with a working truncate cuts it
+    EXPECT_FALSE(healed.fenced());
+    EXPECT_EQ(healed.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_EQ(healed.recovered_torn_tail_bytes(), 40u);
+}
+
+TEST_F(ControlPlaneCrashWindowTest, AnAnchorOneFrameBehindAKeyRotatedFrameIsTheLateFsyncWindowToo) {
+    // The frame before the last is the KeyRotated frame: prev_of_last_mac must be maintained at that site as well.
+    WrappedKeyRecord rec2{};
+    ASSERT_EQ(key_ring_->add_key(2, make_plaintext_key(0x20), rec2), KeyRingAddStatus::Ok);
+    std::string anchor_after_weights;
+    {
+        ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
+        EndpointWeightConfig cfg{};
+        ASSERT_TRUE(sink.append_weight_config(cfg).acked());
+        anchor_after_weights = slurp_file(base_path_ + ".cp.tip");
+        ASSERT_TRUE(sink.rotate_active_key(2, 1500));  // the KeyRotated frame is the LAST one; its anchor never lands
+    }
+    spit_file(base_path_ + ".cp.tip", anchor_after_weights);
+    {
+        ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);  // the anchor is still signed under key 1
+        EXPECT_FALSE(restarted.fenced());
+        EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    }
 }

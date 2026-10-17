@@ -8,6 +8,11 @@
 
 using hy::EndpointAllowlist;
 using hy::EndpointPermit;
+using hy::WsEndpointPermit;
+using hy::binance_default_ws_api_endpoints;
+using hy::issue_ws_endpoint_permit;
+using hy::kMaxEndpoints;
+using hy::kWsApiMaxMessageBytes;
 using hy::RequestWeightTracker;
 using hy::ResponseKind;
 using hy::SanitizedError;
@@ -546,4 +551,77 @@ TEST(ClockSkew, OrdinaryValuesStillBehave) {
     EXPECT_EQ(check_clock_skew(now, now + 5000, 5000), TransportCheck::Ok) << "boundary is inclusive";
     EXPECT_EQ(check_clock_skew(now, now + 5001, 5000), TransportCheck::ClockSkewTooLarge);
     EXPECT_EQ(check_clock_skew(now, now - 5001, 5000), TransportCheck::ClockSkewTooLarge);
+}
+
+// --- WsEndpointPermit (private-stream migration M1; blueprint 5.7 P-24) ---
+//
+// The WebSocket API has its own allowlist: REST already fills every slot of kMaxEndpoints, a REST permit must not be spendable on a WS API
+// host, and a WS API permit must not be spendable on a REST host.
+
+TEST(WsEndpointPermit, IsIssuedForTheProductionWsApiHostAndNamesThatHost) {
+    const TransportPolicy p{};
+    const auto permit = issue_ws_endpoint_permit(p, "ws-api.binance.com");
+    ASSERT_TRUE(permit.has_value());
+    EXPECT_EQ(permit->host(), "ws-api.binance.com");
+    EXPECT_EQ(permit->max_message_bytes(), 64u * 1024u);
+    EXPECT_EQ(kWsApiMaxMessageBytes, 64u * 1024u);
+}
+
+TEST(WsEndpointPermit, IsRefusedForEveryOtherHost) {
+    const TransportPolicy p{};
+    for (const std::string_view host : {std::string_view("ws-api.testnet.binance.vision"), std::string_view("testnet.binance.vision"),
+                                        std::string_view("api.binance.com"), std::string_view("api1.binance.com"),
+                                        std::string_view("stream.binance.com"), std::string_view("stream.testnet.binance.vision"),
+                                        std::string_view(""), std::string_view("ws-api.binance.com.evil.com"),
+                                        std::string_view("evil.ws-api.binance.com"), std::string_view("WS-API.BINANCE.COM"),
+                                        std::string_view("ws-api.binance.com "), std::string_view("ws-api.binance.com:443")}) {
+        EXPECT_FALSE(issue_ws_endpoint_permit(p, host).has_value()) << "[" << host << "]";
+    }
+}
+
+TEST(WsEndpointPermit, TheTwoAllowlistsAreIndependentAndTheirPermitsDoNotCross) {
+    const TransportPolicy p{};
+    EXPECT_FALSE(issue_endpoint_permit(p, "ws-api.binance.com", ResponseKind::SignedJson).has_value())
+        << "a REST permit for a WS API host";
+    EXPECT_FALSE(issue_ws_endpoint_permit(p, "api.binance.com").has_value()) << "a WS API permit for a REST host";
+    EXPECT_FALSE(p.endpoint_allowlist.contains("ws-api.binance.com"));
+    EXPECT_FALSE(p.ws_api_allowlist.contains("api.binance.com"));
+    // the REST list is untouched: still all of its four slots, in its old order
+    EXPECT_EQ(p.endpoint_allowlist.count, 4u);
+    EXPECT_TRUE(p.endpoint_allowlist.contains("api.binance.com"));
+    EXPECT_TRUE(p.endpoint_allowlist.contains("api3.binance.com"));
+    // and the WS API list is exactly the one production host
+    const EndpointAllowlist ws = binance_default_ws_api_endpoints();
+    EXPECT_EQ(ws.count, 1u);
+    EXPECT_TRUE(ws.contains("ws-api.binance.com"));
+}
+
+TEST(WsEndpointPermit, IsRefusedOnACorruptOrEmptyAllowlistEvenForAListedHost) {
+    TransportPolicy p{};
+    p.ws_api_allowlist.count = 0;
+    EXPECT_FALSE(issue_ws_endpoint_permit(p, "ws-api.binance.com").has_value());
+    p.ws_api_allowlist.count = kMaxEndpoints + 1;  // more entries than the array holds
+    EXPECT_FALSE(issue_ws_endpoint_permit(p, "ws-api.binance.com").has_value());
+    p.ws_api_allowlist.count = 1;
+    EXPECT_TRUE(issue_ws_endpoint_permit(p, "ws-api.binance.com").has_value());
+}
+
+TEST(WsEndpointPermit, TheCapIsTheSmallerOfTheWsApiCapAndThePolicyCeiling) {
+    TransportPolicy p{};
+    p.max_response_bytes = 1000;
+    EXPECT_EQ(issue_ws_endpoint_permit(p, "ws-api.binance.com")->max_message_bytes(), 1000u);
+    p.max_response_bytes = kWsApiMaxMessageBytes;
+    EXPECT_EQ(issue_ws_endpoint_permit(p, "ws-api.binance.com")->max_message_bytes(), kWsApiMaxMessageBytes);
+    p.max_response_bytes = 64 * 1024 * 1024;
+    EXPECT_EQ(issue_ws_endpoint_permit(p, "ws-api.binance.com")->max_message_bytes(), kWsApiMaxMessageBytes);
+    p.max_response_bytes = 0;  // a ceiling of zero lets nothing through
+    EXPECT_FALSE(issue_ws_endpoint_permit(p, "ws-api.binance.com").has_value());
+}
+
+TEST(WsEndpointPermit, CannotBeBuiltFromAHostWithoutTheCheck) {
+    EXPECT_FALSE(std::is_default_constructible_v<WsEndpointPermit>);
+    EXPECT_FALSE((std::is_constructible_v<WsEndpointPermit, std::string_view>));
+    EXPECT_FALSE((std::is_constructible_v<WsEndpointPermit, std::string_view, std::uint64_t>));
+    EXPECT_FALSE((std::is_convertible_v<std::string_view, WsEndpointPermit>));
+    EXPECT_TRUE(std::is_copy_constructible_v<WsEndpointPermit>);
 }
