@@ -53,6 +53,16 @@ namespace hy {
 class CanonicalUnsignedQuery;
 class SignedQuery;
 class ClockReadyToken;  // binance_clock_sync.hpp
+class BoundHmacCredentials;
+// binance_ws_api_signing.hpp (private-stream migration M1): the WS API signed-request builder needs BoundHmacCredentials::sign() just as
+// build_signed_query() does, so it is a friend below; the same forward-declaration trick applies.
+struct WsApiParam;
+class WsApiSignedRequest;
+enum class WsApiSigningError : std::uint8_t;
+namespace detail {
+std::pair<WsApiSigningError, WsApiSignedRequest> build_ws_api_signed_request(
+    BoundHmacCredentials&, std::string_view, std::uint64_t, std::span<const WsApiParam>, ClockReadyToken) noexcept;
+}  // namespace detail
 
 enum class QuerySigningError : std::uint8_t {
     Ok = 0,
@@ -123,18 +133,25 @@ public:
                                    testnet_transport_policy(),
                                    "HENGYUAN_BINANCE_TESTNET_API_KEY",
                                    "HENGYUAN_BINANCE_TESTNET_SECRET",
-                                   "stream.testnet.binance.vision", "443");
+                                   "stream.testnet.binance.vision", "443",
+                                   "ws-api.testnet.binance.vision", "443");
     }
     static EnvironmentBinding production() noexcept {
         return EnvironmentBinding(BinanceEnvironment::Production, "api.binance.com",
                                    production_transport_policy(),
                                    "HENGYUAN_BINANCE_LIVE_API_KEY",
                                    "HENGYUAN_BINANCE_LIVE_SECRET",
-                                   "stream.binance.com", "9443");
+                                   "stream.binance.com", "9443",
+                                   "ws-api.binance.com", "443");
     }
 
     BinanceEnvironment environment() const noexcept { return environment_; }
     std::string_view base_host() const noexcept { return base_host_; }
+    // The spot WebSocket API of this environment (blueprint 5.7 P-24): wss://<ws_api_host>:<ws_api_port><kWsApiTarget>. The host is on
+    // transport_policy().ws_api_allowlist, which holds this environment's host and nothing else.
+    std::string_view ws_api_host() const noexcept { return ws_api_host_; }
+    std::string_view ws_api_port() const noexcept { return ws_api_port_; }
+    static constexpr std::string_view ws_api_target() noexcept { return "/ws-api/v3"; }
     const TransportPolicy& transport_policy() const noexcept { return transport_policy_; }
     std::string_view api_key_env_key() const noexcept { return api_key_env_key_; }
     std::string_view secret_env_key() const noexcept { return secret_env_key_; }
@@ -149,10 +166,11 @@ private:
     EnvironmentBinding(BinanceEnvironment env, std::string_view host,
                        TransportPolicy policy, std::string_view api_key_env,
                        std::string_view secret_env, std::string_view ws_host,
-                       std::string_view ws_port) noexcept
+                       std::string_view ws_port, std::string_view ws_api_host,
+                       std::string_view ws_api_port) noexcept
         : environment_(env), base_host_(host), transport_policy_(policy),
           api_key_env_key_(api_key_env), secret_env_key_(secret_env), ws_host_(ws_host),
-          ws_port_(ws_port) {}
+          ws_port_(ws_port), ws_api_host_(ws_api_host), ws_api_port_(ws_api_port) {}
 
     // Endpoint allowlist contains ONLY testnet.binance.vision — never
     // shares state with production_transport_policy(). Deliberately does NOT include
@@ -162,6 +180,10 @@ private:
         p.endpoint_allowlist = EndpointAllowlist{};
         p.endpoint_allowlist.hosts[0] = "testnet.binance.vision";
         p.endpoint_allowlist.count = 1;
+        // The WebSocket API allowlist is likewise this environment's host only -- never the production one.
+        p.ws_api_allowlist = EndpointAllowlist{};
+        p.ws_api_allowlist.hosts[0] = "ws-api.testnet.binance.vision";
+        p.ws_api_allowlist.count = 1;
         return p;
     }
     // Default TransportPolicy already uses binance_default_endpoints()
@@ -176,6 +198,8 @@ private:
     std::string_view secret_env_key_;
     std::string_view ws_host_;
     std::string_view ws_port_;
+    std::string_view ws_api_host_;
+    std::string_view ws_api_port_;
 };
 
 static_assert(std::is_trivially_copyable_v<EnvironmentBinding>);
@@ -340,6 +364,9 @@ private:
     // that header is visible.
     friend std::pair<QuerySigningError, SignedQuery> build_signed_query(
         BoundHmacCredentials&, const CanonicalUnsignedQuery&, ClockReadyToken) noexcept;
+    // The same for the WebSocket API request builder (binance_ws_api_signing.hpp): the one place that signs a WS API frame.
+    friend std::pair<WsApiSigningError, WsApiSignedRequest> detail::build_ws_api_signed_request(
+        BoundHmacCredentials&, std::string_view, std::uint64_t, std::span<const WsApiParam>, ClockReadyToken) noexcept;
 };
 
 }  // namespace hy

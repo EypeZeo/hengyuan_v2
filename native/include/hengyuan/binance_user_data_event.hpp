@@ -44,8 +44,29 @@ enum class UserDataEventKind : std::uint8_t {
     Unknown = 0,
     ExecutionReport = 1,
     OutboundAccountPosition = 2,
-    ListenKeyExpired = 3,
+    ListenKeyExpired = 3,  // listenKey stream only; retired together with that stream (private-stream migration M5)
+    // The WebSocket API user data stream (private-stream migration M1; blueprint 5.7 P-28, P-29):
+    BalanceUpdate = 4,           // balanceUpdate: a deposit, withdrawal or transfer between accounts
+    ExternalLockUpdate = 5,      // externalLockUpdate: an external system locked or unlocked part of the spot balance
+    ListStatus = 6,              // listStatus: an order list changed state (sent besides the executionReport)
+    EventStreamTerminated = 7,   // eventStreamTerminated: THIS subscription ended
+    ServerShutdown = 8,          // serverShutdown: the connection is about to close -- a connection event, no subscription
 };
+
+// listStatus "L" -- the state of an order list as a whole.
+enum class ListOrderStatus : std::uint8_t {
+    Unknown = 0,
+    Executing = 1,  // EXECUTING
+    AllDone = 2,    // ALL_DONE
+    Reject = 3,     // REJECT
+};
+
+inline bool parse_binance_list_order_status(std::string_view s, ListOrderStatus& out) noexcept {
+    if (s == "EXECUTING") { out = ListOrderStatus::Executing; return true; }
+    if (s == "ALL_DONE") { out = ListOrderStatus::AllDone; return true; }
+    if (s == "REJECT") { out = ListOrderStatus::Reject; return true; }
+    return false;
+}
 
 // Binance executionReport "x" field -- WS-event-only vocabulary, audit/observability purposes
 // only (see drain_user_data_events()'s own comment for why this never gates whether a fill gets
@@ -91,7 +112,14 @@ inline bool parse_binance_execution_type(std::string_view s, ExecutionType& out)
 struct UserDataWsEvent {
     std::int64_t event_time_ms{0};        // "E"
     std::int64_t exchange_order_id{0};    // "i" -- only meaningful when kind == ExecutionReport
-    std::int64_t transaction_time_ms{0};  // "T"
+    std::int64_t transaction_time_ms{0};  // "T" (executionReport, balanceUpdate, externalLockUpdate, listStatus);
+                                           // "u", the time of the last account update (outboundAccountPosition)
+    // --- WebSocket API user data stream (private-stream migration M1). The listenKey parser leaves all of these at their defaults. ---
+    std::uint64_t generation{0};          // the connection generation that received the frame: stamped by the session (M2), never by the
+                                           // parser; 0 = not stamped
+    std::int64_t subscription_id{-1};     // the wrapper's "subscriptionId"; -1 = the frame carried none (serverShutdown never does)
+    std::int64_t trade_id{-1};            // "t" -- the exchange's own -1 means "no trade" (an event that is not a fill)
+    std::int64_t order_list_id{-1};       // "g" -- listStatus; -1 = none
 
     ClientOrderId coid{};                 // "c"
     char last_qty_raw[24]{};              // "l" -- last executed quantity, raw decimal string
@@ -103,6 +131,11 @@ struct UserDataWsEvent {
                                            // completeness per this batch's plan; not consumed by
                                            // any decision this slice makes)
     char order_price_raw[24]{};           // "p" -- original order price (same as above)
+    char commission_raw[24]{};            // "n" -- commission of THIS fill, raw decimal string (the accounting kernel, blueprint 6.1.7,
+                                           // is what consumes it; nothing in this slice does)
+    char commission_asset[16]{};          // "N" -- commission asset; empty when the exchange sent null (no commission)
+    char asset[16]{};                     // "a" -- balanceUpdate / externalLockUpdate
+    char delta_raw[24]{};                 // "d" -- balanceUpdate / externalLockUpdate: the balance delta, raw decimal string
 
     UserDataEventKind kind{UserDataEventKind::Unknown};
     OrderSide side{OrderSide::Buy};        // "S" -- defensive cross-check only; the operational
@@ -119,6 +152,7 @@ struct UserDataWsEvent {
                                             // enum: this codebase only ever sends GTC (L5 §1),
                                             // same discipline binance_private_rest.hpp's REST
                                             // response parsing already applies to this field.
+    ListOrderStatus list_order_status{ListOrderStatus::Unknown};  // "L" -- listStatus
 };
 static_assert(std::is_trivially_copyable_v<UserDataWsEvent>,
               "UserDataWsEvent crosses the SpscRing producer/consumer boundary");
