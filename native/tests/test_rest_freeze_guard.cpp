@@ -22,6 +22,11 @@
 // orchestrator already counted this POST" and "this client has no tracker" -- have exactly one call site
 // each, pinned below.
 //
+// Private-stream migration M2 does the same for the WebSocket API user-data session: its one connection point is pinned as a WsEndpointPermit
+// session (host and frame cap out of the permit, no host member of its own), and the three steps that make a generation -- issue the endpoint
+// permit, sign the subscribe request, hand it to the session -- each have exactly one production caller, the factory
+// (binance_ws_api_session_factory.hpp), so a second path that connects without the allowlist, the budget or a fresh signature is a review item.
+//
 // It also pins the containment of the test seam (rest_test_seam.hpp): the builder that can fill a
 // RestTestSeam is named only by that header's friend declaration, and nothing under include/ or src/ may
 // declare a connect-target override or an extra-trust-anchor member again.
@@ -155,6 +160,8 @@ enum class Kind {
     EndpointPermit,
     // WebSocket session: connects to the binding's stream host, a separate mechanism from REST policy.
     WebSocket,
+    // WebSocket API session (private-stream migration M2): takes a WsEndpointPermit and a RateLimitPermit instead of a host.
+    WsEndpointPermit,
 };
 
 struct Pinned {
@@ -174,6 +181,7 @@ constexpr Pinned kPinned[] = {
     {"include/hengyuan/binance_ws_session.hpp", 1, 1, Kind::WebSocket},
     {"include/hengyuan/binance_kline_ws_session.hpp", 1, 1, Kind::WebSocket},
     {"include/hengyuan/binance_user_data_ws_session.hpp", 1, 1, Kind::WebSocket},
+    {"include/hengyuan/binance_ws_api_user_data_session.hpp", 1, 1, Kind::WsEndpointPermit},
 };
 
 const Pinned* find_pinned(std::string_view rel) {
@@ -406,5 +414,62 @@ TEST(RestFreezeGuardSeam, NoProductionTypeDeclaresAConnectTargetOrATrustAnchorMe
     for (const SourceFile& f : production_sources()) {
         EXPECT_EQ(count_of(f.code, "std::string connect_host_override"), 0u) << f.rel;
         EXPECT_EQ(count_of(f.code, "std::string extra_trusted_ca_pem_path"), 0u) << f.rel;
+    }
+}
+
+// --- private-stream migration M2: the WebSocket API session ------------------------------------------------
+
+TEST(RestFreezeGuardWsApi, TheWsApiSessionsAreExactlyThePermitTakingOnes) {
+    std::vector<std::string> sessions;
+    for (const Pinned& p : kPinned) {
+        if (p.kind == Kind::WsEndpointPermit) sessions.emplace_back(p.file);
+    }
+    EXPECT_EQ(sessions, (std::vector<std::string>{"include/hengyuan/binance_ws_api_user_data_session.hpp"}));
+}
+
+TEST(RestFreezeGuardWsApi, TheWsApiSessionTakesItsHostAndItsFrameCapOutOfThePermit) {
+    for (const Pinned& p : kPinned) {
+        if (p.kind != Kind::WsEndpointPermit) continue;
+        const SourceFile* f = find_source(p.file);
+        ASSERT_NE(f, nullptr) << p.file;
+        EXPECT_GE(count_of(f->code, "WsEndpointPermit& permit"), p.resolves) << p.file << ": fewer permit-taking constructors than connections";
+        EXPECT_EQ(count_of(f->code, "host_(permit.host())"), 1u) << p.file << ": the host must come out of the permit, once";
+        EXPECT_EQ(count_of(f->code, "max_message_bytes_(permit.max_message_bytes())"), 1u)
+            << p.file << ": the frame cap must come out of the permit, once";
+        EXPECT_EQ(count_of(f->code, "configure_ws_stream("), 1u) << p.file << ": one stream configuration per connection";
+        EXPECT_EQ(count_of(f->code, "static_cast<std::size_t>(max_message_bytes_)"), 2u)
+            << p.file << ": the stream's read limit and the buffer reservation, and no literal";
+        EXPECT_EQ(count_of(f->code, "std::string host;"), 0u) << p.file << ": a member that could name another host";
+        EXPECT_EQ(count_of(f->code, "RateLimitPermit connect_permit,"), 1u) << p.file << ": the connection must be counted against the budget";
+    }
+}
+
+TEST(RestFreezeGuardWsApi, EachStepThatMakesAGenerationHasExactlyOneProductionCaller) {
+    constexpr std::string_view kFactory = "include/hengyuan/binance_ws_api_session_factory.hpp";
+    struct Step {
+        std::string_view symbol;
+        std::string_view definition_file;  // where it is declared and defined (these files may name it more than once)
+        std::size_t definition_mentions;
+    };
+    constexpr Step kSteps[] = {
+        // the friend declaration and the definition
+        {"issue_ws_endpoint_permit(", "include/hengyuan/transport_policy.hpp", 2},
+        // the friend declaration inside WsApiSignedRequest and the definition
+        {"build_subscribe_signature_request(", "include/hengyuan/binance_ws_api_signing.hpp", 2},
+        // the definition only
+        {"deposit_subscribe(", "include/hengyuan/binance_ws_api_user_data_session.hpp", 1},
+    };
+    for (const Step& step : kSteps) {
+        for (const SourceFile& f : production_sources()) {
+            const std::size_t n = count_of(f.code, step.symbol);
+            if (f.rel == step.definition_file) {
+                EXPECT_EQ(n, step.definition_mentions) << f.rel << ": " << step.symbol << " is declared/defined here and nowhere else in this file";
+            } else if (f.rel == kFactory) {
+                EXPECT_EQ(n, 1u) << f.rel << ": the factory is the one caller of " << step.symbol;
+            } else {
+                EXPECT_EQ(n, 0u) << f.rel << " names " << step.symbol << ": only " << kFactory
+                                 << " may -- a generation that skips the allowlist, the budget or a fresh signature is a review item";
+            }
+        }
     }
 }

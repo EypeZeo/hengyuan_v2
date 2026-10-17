@@ -139,6 +139,9 @@ jobs:
       # hot thread, an SpscRing with self-checking payloads) and ListenKeyPublisher (the other way).
       # test_symbol_registry_concurrency is the ninth (L4 5.3): SymbolRegistry's multi-reader /
       # single-writer std::shared_mutex snapshot publication.
+      # test_ws_api_mailbox_concurrency joined with private-stream migration M2: the one-shot
+      # release/acquire handoff of a pre-signed subscribe frame from the credential-owning thread to the
+      # WebSocket API session's I/O thread; tsan_control_relaxed_mailbox is its negative control (below).
       # test_compaction_lease, test_compaction_intent_store, test_seal_journal_store_lease,
       # test_intent_phase_advancer and test_migrated_v2_started_publisher are the file-lease family
       # (the seal-journal subsystem, frozen): CandidateLease / SealJournalStoreLease
@@ -161,8 +164,9 @@ jobs:
             test_user_data_ws_concurrency test_symbol_registry_concurrency \
             compaction_lease_holder test_compaction_lease test_compaction_intent_store \
             test_seal_journal_store_lease test_intent_phase_advancer \
-            test_migrated_v2_started_publisher \
-            tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer
+            test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
+            tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
+            tsan_control_relaxed_mailbox
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
       # race whose two halves are separated in time gets reported at all — it
@@ -223,6 +227,28 @@ jobs:
           fi
           echo "OK: TSan reported the injected dual-consumer race as expected — the gate is live."
 
+      # Private-stream migration M2: the same discipline for the WebSocket API subscribe mailbox. Its
+      # release store of Ready and acquire claim are what hand a signed frame across threads; a control
+      # with both downgraded to relaxed MUST be reported, or "no race in test_ws_api_mailbox_concurrency"
+      # proves nothing about THIS boundary.
+      - name: "Control: TSan MUST flag the deliberately-relaxed subscribe mailbox"
+        working-directory: native/build-tsan
+        env:
+          TSAN_OPTIONS: "history_size=7:halt_on_error=1:exitcode=66"
+        run: |
+          set -u
+          if ./tsan_control_relaxed_mailbox > control_mailbox.log 2>&1; then
+            echo "::error::tsan_control_relaxed_mailbox exited 0. TSan did NOT detect the injected missing release/acquire pair in the subscribe mailbox on this runner. Every 'no data races found' result for the mailbox is unsubstantiated."
+            tail -50 control_mailbox.log
+            exit 1
+          fi
+          if ! grep -q "WARNING: ThreadSanitizer: data race" control_mailbox.log; then
+            echo "::error::tsan_control_relaxed_mailbox failed, but NOT with a ThreadSanitizer data-race report. It is probably failing for an unrelated reason (missing runtime, flag drift, build error), which would silently disable this control."
+            tail -50 control_mailbox.log
+            exit 1
+          fi
+          echo "OK: TSan reported the injected mailbox race as expected — the gate is live."
+
   arm64-weak-memory:
     name: "ARM64 Release: hardware weak-memory verdict"
     runs-on: ubuntu-24.04-arm
@@ -268,7 +294,7 @@ jobs:
             --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
             test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
             test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
-            test_user_data_ws_concurrency
+            test_user_data_ws_concurrency test_ws_api_mailbox_concurrency
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the

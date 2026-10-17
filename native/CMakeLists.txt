@@ -1097,6 +1097,21 @@ if(HY_BUILD_TESTS)
 
     gtest_discover_tests(test_user_data_ws_concurrency PROPERTIES LABELS concurrency)
 
+    # Private-stream migration M2: the one-shot handoff of a pre-signed subscribe frame from the credential-owning thread to the WebSocket API
+    # session on the I/O thread (ws_api_subscribe_mailbox.hpp). Boost- and OpenSSL-free on purpose -- the TSan job builds without
+    # HY_BUILD_DEMO -- so the contract tests and the two-thread tests live apart from the session's loopback test (HY_BUILD_DEMO, below).
+    # The two-thread file carries the `concurrency` label, which puts it on the TSan and ARM64 lists (tools/concurrency_targets_check.py keeps
+    # those lists honest); tsan_control_relaxed_mailbox is its negative control.
+    add_executable(test_ws_api_subscribe_mailbox tests/test_ws_api_subscribe_mailbox.cpp)
+    target_link_libraries(test_ws_api_subscribe_mailbox PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_ws_api_subscribe_mailbox)
+    gtest_discover_tests(test_ws_api_subscribe_mailbox)
+
+    add_executable(test_ws_api_mailbox_concurrency tests/test_ws_api_mailbox_concurrency.cpp)
+    target_link_libraries(test_ws_api_mailbox_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_ws_api_mailbox_concurrency)
+    gtest_discover_tests(test_ws_api_mailbox_concurrency PROPERTIES LABELS concurrency)
+
     # Batch 6, 6b-0f-2: public-feed reconnect supervisor. The state machine is generic over the
     # session type and Boost-free, so it is unit-tested against fakes with a fake clock
     # (test_public_feed_supervisor); the one arrangement it relies on and cannot prove by itself --
@@ -1140,6 +1155,12 @@ if(HY_BUILD_TESTS)
             tests/tsan_control_export_worker_dual_consumer.cpp)
         target_link_libraries(tsan_control_export_worker_dual_consumer PRIVATE hengyuan_core Threads::Threads)
         hengyuan_set_warnings(tsan_control_export_worker_dual_consumer)
+
+        # Private-stream migration M2: the same proof for the WebSocket API subscribe mailbox -- its release/acquire pair downgraded to
+        # relaxed, which TSan MUST report (see the file's own header comment).
+        add_executable(tsan_control_relaxed_mailbox tests/tsan_control_relaxed_mailbox.cpp)
+        target_link_libraries(tsan_control_relaxed_mailbox PRIVATE hengyuan_core Threads::Threads)
+        hengyuan_set_warnings(tsan_control_relaxed_mailbox)
     endif()
 
     # P2-EXEC-LIVE-01: HMAC signer (requires OpenSSL)
@@ -1323,6 +1344,22 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_ws_loopback_sessions)
         hengyuan_allow_third_party_tsan_fences(test_ws_loopback_sessions)
         gtest_discover_tests(test_ws_loopback_sessions)
+
+        # Private-stream migration M2: the REAL WebSocket API user-data session, its hot-thread factory and PublicFeedSupervisor against the same
+        # local TLS server (extended to read client frames and script answers). The subscribe request is signed with synthetic credentials by the
+        # real signer, so this target needs the same OpenSSL set as the signing test on top of Boost.
+        add_executable(test_binance_ws_api_user_data_session tests/test_binance_ws_api_user_data_session.cpp)
+        target_link_libraries(test_binance_ws_api_user_data_session PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_ws_api_user_data_session SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_ws_api_user_data_session PRIVATE tests)
+        target_compile_definitions(test_binance_ws_api_user_data_session PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_binance_ws_api_user_data_session)
+        hengyuan_allow_third_party_tsan_fences(test_binance_ws_api_user_data_session)
+        gtest_discover_tests(test_binance_ws_api_user_data_session)
 
         # 批次 6 6b-0f-7: the whole public-feed pipeline (kline + depth supervised feeds, their drivers,
         # gates and the validity verdict) against REAL sessions on the loopback server; only the two REST
