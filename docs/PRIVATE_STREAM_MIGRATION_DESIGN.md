@@ -1,7 +1,7 @@
 # 私网流迁移、发单就绪门与用户数据流持久化——设计提案
 
-> **状态：提案（PROPOSAL），未被接受，不是规格。** 它把蓝图任务 1A.4（现货私有 WebSocket 用户数据流与会话对账）、审计 P1-002 的路径 ③（用户数据流排空函数）和 FI-043 要求的“屏障门”拆成可以逐片开工、逐片验收的工作，并把需要 Owner 拍板的点列在 §8。每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出 ≤5 行计划、等“开始”。
-> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。
+> **状态：已接受（Owner 于 2026-10-15 说“合并，按推荐，开始，可以下载”：D1 至 D7 按推荐，M1 开始）；它仍是设计，不是规格——每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出计划、等“开始”，细节以那一片的计划与蓝图为准。** 它把蓝图任务 1A.4（现货私有 WebSocket 用户数据流与会话对账）、审计 P1-002 的路径 ③（用户数据流排空函数）和 FI-043 要求的“屏障门”拆成可以逐片开工、逐片验收的工作，并把需要 Owner 拍板的点列在 §8。每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出 ≤5 行计划、等“开始”。
+> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。
 > 读法：§0 是一页摘要；§1 是现状事实（每条带 `file:symbol`）；§2–§6 是设计；§7 是切片计划；§8 是决策点；§9 是风险；§10 是验收映射。
 
 ## 0. 一页摘要
@@ -130,6 +130,13 @@ flowchart LR
 - 端点与限流：`EndpointPermit` 目前只管 HTTP 响应的上限（`ResponseKind`），会话连哪个主机也只靠它。WS 会话需要同族的 `WsEndpointPermit`（主机白名单 + 单条消息上限，唯一签发者是 `issue_ws_endpoint_permit`），并把新会话登记进 `test_rest_freeze_guard` 的“所有打开连接的位置”清单——否则会话可以绕过白名单而没有测试发现；WS API 的主机（生产与 Testnet）要加进 `TransportPolicy` 的白名单。限流账本给 WS API 请求另起一个种类枚举与权重（归 Reconciliation 车道，D7）；`PrivateRestEndpoint` 是被 `spec_enum_diff` 钉住的枚举，**不往里加**。
 - 事件结构：`UserDataWsEvent` 增加 `generation`（u64）、`subscription_id`（i64）、`commission_raw`/`commission_asset`/`trade_id`；环容量保持 64 或按 §9 的 R5 重估。
 
+**M1 的实现情况（2026-10-17，PR #179，合并提交 `4702b20`）与同上面草图的差别：**
+
+- 请求侧在 `binance_ws_api_signing.hpp`：`WsApiSigningPolicy` 没有做成类，而是唯一的签名点 `detail::build_ws_api_signed_request()` 加四个具名入口（`build_subscribe_signature_request`、`build_session_subscriptions_request`、`build_user_data_unsubscribe_request` 及其“全部取消”形式）；“只有它能签发”靠 `WsApiSignedRequest` / `WsApiUnsignedRequest` 的私有构造函数加友元，并由守卫 `test_ws_api_signing_guard` 钉住签名点只被具名入口调用。会让 JSON 需要转义或会模糊载荷结构的值被**拒绝而不是转义**，时间戳只取自 `ClockReadyToken`。
+- 响应与事件侧在 `binance_ws_api_codec.hpp`：不是 `parse_ws_api_response` / `parse_user_data_event` 两个自由函数，而是一个 `WsApiCodec` 实例（`parse()` 一次区分响应与事件）；它用 simdjson 的 **DOM** 而不是 on-demand，因为 on-demand 只读被问到的字段，会放过缺右括号或尾部多余内容的帧；所有内存在构造函数里一次定好，`parse()` 不再分配（由 `WsApiCodecAllocation` 测量；这个测量曾推翻了“构造时一次分配”的第一版：DOM 文档缓冲原本在第一次解析时才分配）。旧的 `UserDataJsonParser` 原样保留，M5 随 listenKey 整套退役。
+- 事件结构比草图多了 `order_list_id`、`asset`、`delta_raw`、`list_order_status`（`listStatus`、`balanceUpdate`、`externalLockUpdate` 要用）；环容量保持 64，事件从 216 字节增至 328 字节（MSVC x64）。
+- `WsEndpointPermit` 与 `TransportPolicy::ws_api_allowlist` 如草图（REST 白名单的四个槽位已满，所以另起一个）；限流种类是 `WsApiRequestKind` 加 `ws_api_weight()`，许可走 `SpotRateLimitTracker::reserve_weight_only_explicit(Reconciliation, …)`，没有动 `PrivateRestEndpoint`。**把新会话登记进 `test_rest_freeze_guard` 的“所有打开连接的位置”清单留到 M2**——M1 没有任何代码打开连接，没有东西可登记。
+
 ## 5. 连接代次、重连屏障与发单就绪门
 
 ### 5.1 代次
@@ -204,7 +211,7 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 | 片 | 内容 | Tier | 验证层级 | 估计 |
 | :-- | :-- | :-- | :-- | :-- |
 | **M0** 协议核对（**已完成 2026-10-14**） | 核 §4.2 的 7 项并写入蓝图 `5.7`（P-24 至 P-32）；官方 HMAC 示例的两组签名已复算一致（P-31），向量写进仓库测试留给 M1 | A | 文档核对（`tools/closure_ledger_check.py`、站点四层检查） | 0.5 日（实际） |
-| **M1** 编解码与签名 | `WsApiSigningPolicy`、`ws_api_codec`、新事件种类与字段、`EndpointPermit`/限流的 WS API 种类（不动被钉住的枚举） | B（新组件） | MSVC + WSL2 `none` + `address`；黄金向量 + 官方示例向量 + 篡改一位必须验签失败的负向对照；变异检查 | 2 日 |
+| **M1** 编解码与签名（**已完成 2026-10-17，PR #179，合并提交 `4702b20`**） | `WsApiSigningPolicy`、`ws_api_codec`、新事件种类与字段、`EndpointPermit`/限流的 WS API 种类（不动被钉住的枚举）；实际还有守卫 `test_ws_api_signing_guard`、`WsApiCodecAllocation`（构造之后 `parse()` 零分配的测量）与上面 §4.3 列出的差别 | B（新组件） | MSVC + WSL2 `none` + `address`；黄金向量 + 官方示例向量 + 篡改一位必须验签失败的负向对照；变异检查；实际：MSVC、WSL2 `none` 与 `address`、手动 Sanitizer，变异检查 93 个变异体中 92 个被杀死、1 个等价，官方两组 HMAC 示例逐字节复现 | 估计 2 日；实际 2026-10-15 至 2026-10-17（含一次与 PR #180 的合并冲突） |
 | **M2** 会话 | `BinanceWsApiUserDataSession`（握手后取信箱里的已签名字节、发订阅、校验响应与 `session.subscriptions`、读循环、盖代次、`serverShutdown`/`eventStreamTerminated` 处理、失败即停）；`WsLoopbackServer` 扩展为可读客户端帧的脚本化应答；监督器接线 | B（并发） | WSL2 `thread`（信箱交接，带负控）、`address`；回环服务端覆盖：订阅成功/失败/超时、重复订阅、断线、`serverShutdown` | 3 日 |
 | **M3** 屏障与就绪门 | `ReconnectBarrier`、对账线程的 `BarrierSweep` 入口与回报环、`SubmitReadiness`/`SubmitReadyToken`、`OrchestratorGate::NotReady`、护栏测试；现有约百个编排器测试通过夹具里的一处测试钩子接线，不逐个改；`StartupRecovery` 第一次被真正接进线束（预检线束）；FI-009/011/020/043 的确定性状态机测试 | B（状态机 + 并发） | WSL2 `thread`（两个负控仍须失败，另加清扫回报环的负控）+ `address`；变异检查；`formal/` 新增屏障模型（见 §9 的 R9） | 4 日 |
 | **M4** 路径 ③ 持久优先 | `OrderFillContext` 影子、`durable_path`、WS 合并发布者、`drain_user_data_events` 改造、影子更新点的护栏 | B | WSL2 `address` + `thread`（若发布者与排空共用待定事件）；真实日志重启测试；变异检查 | 2 日 |
@@ -216,13 +223,13 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 
 | # | 决定 | 选项 | 我的推荐 |
 | :-- | :-- | :-- | :-- |
-| D1 | 订阅方式 | 签名订阅（HMAC 可用）；或先做 Ed25519 与 `session.logon` | **签名订阅**（蓝图已定；Ed25519 另走 SPOT-03） |
-| D2 | 屏障期间拦截范围 | 一律拒绝所有新单；或区分增风险/减风险（需要仓位感知的分类） | **第一版一律拒绝**——树里没有撤单与减仓路径，分类没有对象；以后再放宽 |
-| D3 | 24 小时轮换与 `serverShutdown` | 先断后建（复用 `PublicFeedSupervisor`，屏障兜底）；或先建后断的重叠（新旧两个连接同时订阅，需 §4.2 第 5 项为真——官方文档没有说明，Testnet 实测之前不可选） | **先断后建**：正确性由屏障保证，窗口是重连 + 清扫的时间；等 Testnet 量出窗口再决定要不要优化 |
-| D4 | 路径 ③ 的持久方案 | A 影子 + 合并发布者；B 转成对账事件；C 仅作提示 | **A**，C 作后备（§6.2） |
-| D5 | listenKey 整套 | M5 直接删除；或留着给 Testnet | **删除**（Testnet 自 2026-02-04 起同样没有 listenKey，蓝图 `5.7` 的 P-32，没有为 Testnet 保留旧栈的理由；git 历史保留，避免两套会话语义并存） |
-| D6 | 清扫由谁执行 | 对账线程（新入口 + 回报环）；或热线程同步查询 | **对账线程**：热线程已经有同步 POST，不该再叠 64 个同步查询 |
-| D7 | WS API 请求的限流车道 | Reconciliation 车道；或独立车道 | **Reconciliation 车道**（订阅与校验属于对账类流量），权重已核：订阅与校验各 2、建立连接 2（P-26） |
+| D1 | 订阅方式 | 签名订阅（HMAC 可用）；或先做 Ed25519 与 `session.logon` | **签名订阅**（蓝图已定；Ed25519 另走 SPOT-03） **→ 已决：按推荐（Owner，2026-10-15）** |
+| D2 | 屏障期间拦截范围 | 一律拒绝所有新单；或区分增风险/减风险（需要仓位感知的分类） | **第一版一律拒绝**——树里没有撤单与减仓路径，分类没有对象；以后再放宽 **→ 已决：按推荐（Owner，2026-10-15）** |
+| D3 | 24 小时轮换与 `serverShutdown` | 先断后建（复用 `PublicFeedSupervisor`，屏障兜底）；或先建后断的重叠（新旧两个连接同时订阅，需 §4.2 第 5 项为真——官方文档没有说明，Testnet 实测之前不可选） | **先断后建**：正确性由屏障保证，窗口是重连 + 清扫的时间；等 Testnet 量出窗口再决定要不要优化 **→ 已决：按推荐（Owner，2026-10-15）** |
+| D4 | 路径 ③ 的持久方案 | A 影子 + 合并发布者；B 转成对账事件；C 仅作提示 | **A**，C 作后备（§6.2） **→ 已决：按推荐（Owner，2026-10-15）** |
+| D5 | listenKey 整套 | M5 直接删除；或留着给 Testnet | **删除**（Testnet 自 2026-02-04 起同样没有 listenKey，蓝图 `5.7` 的 P-32，没有为 Testnet 保留旧栈的理由；git 历史保留，避免两套会话语义并存） **→ 已决：按推荐（Owner，2026-10-15）** |
+| D6 | 清扫由谁执行 | 对账线程（新入口 + 回报环）；或热线程同步查询 | **对账线程**：热线程已经有同步 POST，不该再叠 64 个同步查询 **→ 已决：按推荐（Owner，2026-10-15）** |
+| D7 | WS API 请求的限流车道 | Reconciliation 车道；或独立车道 | **Reconciliation 车道**（订阅与校验属于对账类流量），权重已核：订阅与校验各 2、建立连接 2（P-26） **→ 已决：按推荐（Owner，2026-10-15）** |
 | D8 | **许可**（已决） | Owner 于 2026-10-14 许可下载；M0 用 `web-socket-api.md`、`user-data-stream.md`、`CHANGELOG.md` 三份文件完成，下载内容已删除 | 已完成 |
 
 ## 9. 风险与未知
