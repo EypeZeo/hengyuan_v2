@@ -6,20 +6,14 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_ws_api_codec.hpp>
 
+#include "test_helpers/alloc_probe.hpp"
 #include "ws_api_official_samples.hpp"
 
-#include <atomic>
 #include <cstddef>
-#include <cstdlib>
 #include <cstring>
-#include <new>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#if defined(_MSC_VER)
-#include <malloc.h>
-#endif
 
 using hy::ExecutionType;
 using hy::ListOrderStatus;
@@ -32,93 +26,6 @@ using hy::WsApiFrame;
 using hy::WsApiFrameKind;
 using hy::WsApiParseResult;
 namespace samples = hy::test_samples;
-
-// --- allocation probe ---------------------------------------------------------------------------------------------------------------
-// The codec's design is "no heap after construction" (its simdjson parser memory and its padded copy buffer are sized once, in the
-// constructor). WsApiCodecAllocation below turns that sentence into a measurement: this binary's global allocation functions are replaced
-// by counting ones, and a window is open only around parse() calls -- never around gtest's own bookkeeping. What is counted is operator
-// new / new[] in every form, which is how this codebase defines "heap" on a hot path (CLAUDE.md, Engineering Mandate 1); a raw malloc()
-// called from inside a library would not be seen.
-namespace alloc_probe {
-
-std::atomic<bool> g_open{false};
-std::atomic<std::size_t> g_calls{0};
-
-inline void note() noexcept {
-    if (g_open.load(std::memory_order_relaxed)) g_calls.fetch_add(1, std::memory_order_relaxed);
-}
-
-inline void* plain_alloc(std::size_t n) noexcept { return std::malloc(n != 0 ? n : 1); }
-
-#if defined(_MSC_VER)
-inline void* aligned_alloc_impl(std::size_t n, std::size_t align) noexcept { return _aligned_malloc(n != 0 ? n : 1, align); }
-inline void aligned_free_impl(void* p) noexcept { _aligned_free(p); }
-#else
-inline void* aligned_alloc_impl(std::size_t n, std::size_t align) noexcept {
-    void* p = nullptr;
-    return ::posix_memalign(&p, align < sizeof(void*) ? sizeof(void*) : align, n != 0 ? n : 1) == 0 ? p : nullptr;
-}
-inline void aligned_free_impl(void* p) noexcept { std::free(p); }
-#endif
-
-class Window {
-public:
-    Window() noexcept {
-        g_calls.store(0, std::memory_order_relaxed);
-        g_open.store(true, std::memory_order_relaxed);
-    }
-    ~Window() { g_open.store(false, std::memory_order_relaxed); }
-    Window(const Window&) = delete;
-    Window& operator=(const Window&) = delete;
-    [[nodiscard]] std::size_t calls() const noexcept { return g_calls.load(std::memory_order_relaxed); }
-};
-
-}  // namespace alloc_probe
-
-// GCC 14's -Wmismatched-new-delete cannot see that BOTH halves of this pair are replaced: when a replacement operator delete is inlined into
-// code whose pointer came from operator new, it reports the std::free() inside as a mismatch. So the replacements are never inlined
-// (a standalone delete body sees a pointer of unknown origin), and the block carries a diagnostic fence as well.
-#if defined(_MSC_VER)
-#define HY_PROBE_NOINLINE
-#else
-#define HY_PROBE_NOINLINE __attribute__((noinline))
-#endif
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
-#endif
-
-HY_PROBE_NOINLINE void* operator new(std::size_t n) {
-    alloc_probe::note();
-    if (void* p = alloc_probe::plain_alloc(n)) return p;
-    throw std::bad_alloc();
-}
-HY_PROBE_NOINLINE void* operator new[](std::size_t n) { return ::operator new(n); }
-HY_PROBE_NOINLINE void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
-    alloc_probe::note();
-    return alloc_probe::plain_alloc(n);
-}
-HY_PROBE_NOINLINE void* operator new[](std::size_t n, const std::nothrow_t&) noexcept { return ::operator new(n, std::nothrow); }
-HY_PROBE_NOINLINE void* operator new(std::size_t n, std::align_val_t align) {
-    alloc_probe::note();
-    if (void* p = alloc_probe::aligned_alloc_impl(n, static_cast<std::size_t>(align))) return p;
-    throw std::bad_alloc();
-}
-HY_PROBE_NOINLINE void* operator new[](std::size_t n, std::align_val_t align) { return ::operator new(n, align); }
-HY_PROBE_NOINLINE void operator delete(void* p) noexcept { std::free(p); }
-HY_PROBE_NOINLINE void operator delete[](void* p) noexcept { std::free(p); }
-HY_PROBE_NOINLINE void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-HY_PROBE_NOINLINE void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-HY_PROBE_NOINLINE void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
-HY_PROBE_NOINLINE void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
-HY_PROBE_NOINLINE void operator delete(void* p, std::align_val_t) noexcept { alloc_probe::aligned_free_impl(p); }
-HY_PROBE_NOINLINE void operator delete[](void* p, std::align_val_t) noexcept { alloc_probe::aligned_free_impl(p); }
-HY_PROBE_NOINLINE void operator delete(void* p, std::size_t, std::align_val_t) noexcept { alloc_probe::aligned_free_impl(p); }
-HY_PROBE_NOINLINE void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { alloc_probe::aligned_free_impl(p); }
-
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 namespace {
 
@@ -640,30 +547,20 @@ TEST(WsApiCodecRobustness, DeeplyNestedAndHugeNumbersAreHandledWithoutIncident) 
 }
 
 // --- the allocation claim ---
+//
+// The codec's design is "no heap after construction": its simdjson parser memory (working arrays AND the DOM document) and its padded copy
+// buffer are sized once, in the constructor. These tests turn that sentence into a measurement. test_helpers/alloc_probe.hpp replaces this
+// binary's global allocation functions with counting ones, and a window is open only around parse() calls -- never around gtest's own
+// bookkeeping. The first version of the second test FAILED: dom::parser::allocate() sizes only the working arrays, and the document is
+// allocated by the first parse() at that input's size and regrown by every larger one, so the constructor now makes that first parse itself.
 
-namespace {
-volatile char* volatile g_probe_sink = nullptr;  // volatile: the compiler may not drop the block it holds
-}  // namespace
-
+// The positive control: without it, "0 allocations" below could be true for the wrong reason.
 TEST(WsApiCodecAllocation, TheProbeSeesTheAllocationsItIsMeantToSee) {
-    // The positive control. If the counting functions were not the ones this binary links, or the window never opened, the test below
-    // would pass for the wrong reason. (simdjson allocates through the nothrow array form.)
-    std::size_t after_array = 0;
-    std::size_t after_nothrow = 0;
-    {
-        const alloc_probe::Window window;
-        g_probe_sink = new char[100];
-        g_probe_sink[0] = 1;
-        after_array = window.calls();
-        delete[] const_cast<char*>(g_probe_sink);
-        g_probe_sink = new (std::nothrow) char[100];
-        g_probe_sink[0] = 1;
-        after_nothrow = window.calls();
-        delete[] const_cast<char*>(g_probe_sink);
-    }
-    g_probe_sink = nullptr;
-    EXPECT_EQ(after_array, 1u) << "new char[N] must be counted";
-    EXPECT_EQ(after_nothrow, 2u) << "new (std::nothrow) char[N] must be counted";
+    const alloc_probe::SelfCheck c = alloc_probe::selfcheck();
+    EXPECT_EQ(c.after_array_new, 1u) << "new char[N] must be counted";
+    EXPECT_EQ(c.after_nothrow_array_new, 2u) << "new (std::nothrow) char[N] must be counted (simdjson allocates through it)";
+    EXPECT_EQ(c.after_string_growth, 3u) << "a std::string growing past its small buffer must be counted";
+    EXPECT_EQ(c.outside_window, 0u) << "nothing outside a window may be counted";
 }
 
 TEST(WsApiCodecAllocation, ParsingAllocatesNothingOnceTheCodecExists) {

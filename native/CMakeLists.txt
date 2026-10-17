@@ -1436,6 +1436,9 @@ if(HY_BUILD_TESTS)
     add_executable(test_binance_ws_api_codec tests/test_binance_ws_api_codec.cpp)
     target_link_libraries(test_binance_ws_api_codec PRIVATE
         hengyuan_dataplane GTest::gtest_main)
+    # tests/ is on the include path for test_helpers/alloc_probe.hpp (the counting operator new behind WsApiCodecAllocation, shared with the
+    # Appendix D L-38 parser allocation tests; included by this one translation unit only).
+    target_include_directories(test_binance_ws_api_codec PRIVATE tests)
     hengyuan_set_warnings(test_binance_ws_api_codec)
     gtest_discover_tests(test_binance_ws_api_codec)
 endif()
