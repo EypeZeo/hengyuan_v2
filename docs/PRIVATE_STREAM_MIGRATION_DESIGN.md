@@ -1,7 +1,7 @@
 # 私网流迁移、发单就绪门与用户数据流持久化——设计提案
 
 > **状态：已接受（Owner 于 2026-10-15 说“合并，按推荐，开始，可以下载”：D1 至 D7 按推荐，M1 开始）；它仍是设计，不是规格——每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出计划、等“开始”，细节以那一片的计划与蓝图为准。** 它把蓝图任务 1A.4（现货私有 WebSocket 用户数据流与会话对账）、审计 P1-002 的路径 ③（用户数据流排空函数）和 FI-043 要求的“屏障门”拆成可以逐片开工、逐片验收的工作，并把需要 Owner 拍板的点列在 §8。每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出 ≤5 行计划、等“开始”。
-> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。
+> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。**2026-10-18 增补**：M2 已合入（PR #184，合并提交 `f853947`），其中漏掉了本文 §5.1 与 §7 要求的 `session.subscriptions` 校验，由 M2b 补上（PR #185，合并提交 `781d1f2`）；§4.3 补了 M2 与 M2b 的实现情况，§7 的 M2 行改为已完成并新增 M2b 行；M3 起尚未开工。
 > 读法：§0 是一页摘要；§1 是现状事实（每条带 `file:symbol`）；§2–§6 是设计；§7 是切片计划；§8 是决策点；§9 是风险；§10 是验收映射。
 
 ## 0. 一页摘要
@@ -137,6 +137,15 @@ flowchart LR
 - 事件结构比草图多了 `order_list_id`、`asset`、`delta_raw`、`list_order_status`（`listStatus`、`balanceUpdate`、`externalLockUpdate` 要用）；环容量保持 64，事件从 216 字节增至 328 字节（MSVC x64）。
 - `WsEndpointPermit` 与 `TransportPolicy::ws_api_allowlist` 如草图（REST 白名单的四个槽位已满，所以另起一个）；限流种类是 `WsApiRequestKind` 加 `ws_api_weight()`，许可走 `SpotRateLimitTracker::reserve_weight_only_explicit(Reconciliation, …)`，没有动 `PrivateRestEndpoint`。**把新会话登记进 `test_rest_freeze_guard` 的“所有打开连接的位置”清单留到 M2**——M1 没有任何代码打开连接，没有东西可登记。
 
+**M2 与 M2b 的实现情况（2026-10-17，PR #184，合并提交 `f853947`；2026-10-18，PR #185，合并提交 `781d1f2`）与上面草图的差别：**
+
+- 信箱 `ws_api_subscribe_mailbox.hpp`（无 Boost 与 OpenSSL）：一次性，`post` 与 `take` 各只成功一次，都是 compare-exchange，帧是定长的（1536 字节 = 一个已签名请求的上限）；与 `start()` 的先后无关（会话握手之后每 2 毫秒轮询一次），所以即时签名的变体只需在 `subscribe_wait` 之内调用 `deposit_subscribe()`，会话不用改。它是本设计第一个真正的跨线程边界，所以带一个 TSan 负控 `tsan_control_relaxed_mailbox`。
+- 会话 `binance_ws_api_user_data_session.hpp`：主机与单条消息上限只来自 `WsEndpointPermit`；连接、订阅请求、`session.subscriptions` 请求各带一个 `RateLimitPermit`，为更便宜的请求预留的许可被拒；签名后超过 `max_signed_age`（默认 4 秒，`recvWindow` 默认 5000 毫秒）的帧不发；订阅应答之前收到事件（`serverShutdown` 除外）按协议违规失败即停；会话自己用 M1 的 `build_session_subscriptions_request` 构造第二个请求（无签名、不需要凭据，所以不经信箱；请求号 = 订阅请求号 + 1，工厂的请求号因此按 2 前进）。
+- 与 §5.1 的差别：M2 先合入，**没有**§5.1 要求的校验（M2 的计划没有把它列进范围，是遗漏，PR #184 的正文已披露），M2b 补上：订阅应答被接受后会话发 `session.subscriptions`，应答是 200 且恰好列出刚确认的那一个订阅，`is_connected()` 才为真。两个应答之间到达的事件照常交付并盖代次（订阅号已确认，丢掉它们就是丢成交），只是不让 `is_connected()` 为真，所以 M3 的屏障必须把“看到事件”和“已连接”当成两件独立的事。一代的固定权重是 6，与 §4.2 第 4 项一致。
+- 工厂 `binance_ws_api_session_factory.hpp`：新鲜的时钟令牌 → 上一代被 418/429 拒绝时的封禁检查（`retryAfter` 取两个应答里出现的那个）→ 端点许可 → **先签名** → Reconciliation 车道的三个许可 → 会话与已在信箱里的帧；任何一步失败返回空，监督器记一次失败并退避。M2 的版本先预留后签名，凭据签不了名时白花 4 权重，M2b 改了；车道只够付三个许可里的一部分时已预留的部分不退还（限流追踪器没有公开的、不消耗额度的预检）。
+- M2b 修了 M2 的一个潜伏竞争：`fail()` 与 `end_with()` 先置 `stop_`、后写统计与结束原因，`stopped()` 为真时 `end_cause()` 可能还是 `None`；现在先占原因（`claim_end()`，对结束原因的 CAS）、再写统计、最后置 `stop_`。
+- 没有核实的一项（蓝图附录 D 的 L-39）：交易所是否会在一个从未 `session.logon` 的会话上回答 `session.subscriptions`。若拒绝，每一代都会停在 `subscriptions_rejected`（失败即停、没有任何东西发到市场），M5 的第一次 Testnet 联调会定。
+
 ## 5. 连接代次、重连屏障与发单就绪门
 
 ### 5.1 代次
@@ -212,7 +221,8 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 | :-- | :-- | :-- | :-- | :-- |
 | **M0** 协议核对（**已完成 2026-10-14**） | 核 §4.2 的 7 项并写入蓝图 `5.7`（P-24 至 P-32）；官方 HMAC 示例的两组签名已复算一致（P-31），向量写进仓库测试留给 M1 | A | 文档核对（`tools/closure_ledger_check.py`、站点四层检查） | 0.5 日（实际） |
 | **M1** 编解码与签名（**已完成 2026-10-17，PR #179，合并提交 `4702b20`**） | `WsApiSigningPolicy`、`ws_api_codec`、新事件种类与字段、`EndpointPermit`/限流的 WS API 种类（不动被钉住的枚举）；实际还有守卫 `test_ws_api_signing_guard`、`WsApiCodecAllocation`（构造之后 `parse()` 零分配的测量）与上面 §4.3 列出的差别 | B（新组件） | MSVC + WSL2 `none` + `address`；黄金向量 + 官方示例向量 + 篡改一位必须验签失败的负向对照；变异检查；实际：MSVC、WSL2 `none` 与 `address`、手动 Sanitizer，变异检查 93 个变异体中 92 个被杀死、1 个等价，官方两组 HMAC 示例逐字节复现 | 估计 2 日；实际 2026-10-15 至 2026-10-17（含一次与 PR #180 的合并冲突） |
-| **M2** 会话 | `BinanceWsApiUserDataSession`（握手后取信箱里的已签名字节、发订阅、校验响应与 `session.subscriptions`、读循环、盖代次、`serverShutdown`/`eventStreamTerminated` 处理、失败即停）；`WsLoopbackServer` 扩展为可读客户端帧的脚本化应答；监督器接线 | B（并发） | WSL2 `thread`（信箱交接，带负控）、`address`；回环服务端覆盖：订阅成功/失败/超时、重复订阅、断线、`serverShutdown` | 3 日 |
+| **M2** 会话（**已完成 2026-10-17，PR #184，合并提交 `f853947`；其中 `session.subscriptions` 校验由 M2b 补上**） | `BinanceWsApiUserDataSession`（握手后取信箱里的已签名字节、发订阅、校验响应与 `session.subscriptions`、读循环、盖代次、`serverShutdown`/`eventStreamTerminated` 处理、失败即停）；`WsLoopbackServer` 扩展为可读客户端帧的脚本化应答；监督器接线 | B（并发） | WSL2 `thread`（信箱交接，带负控）、`address`；回环服务端覆盖：订阅成功/失败/超时、重复订阅、断线、`serverShutdown`；实际：MSVC、WSL2 `none`、`address` 与 `thread` 层、手动 Sanitizer，变异检查 47 个变异体全部被杀死，守卫 11 个负控 | 估计 3 日；实际 2026-10-17 |
+| **M2b** `session.subscriptions` 校验（**已完成 2026-10-18，PR #185，合并提交 `781d1f2`**） | 补上 M2 漏掉的一步：订阅应答后会话发无签名的 `session.subscriptions`，只有恰好列出刚确认的那一个订阅，`is_connected()` 才为真；工厂多预留一个许可（一代 6 权重）并改为先签名后预留；`WsApiResponse::subscription_list_malformed`；顺带修 M2 的 `stopped()` 先于结束原因变真的竞争 | B（状态机） | MSVC + WSL2 `none` + `address`，本地 TSan 跑会话测试；变异检查；实际：MSVC 2545、GCC 2551、ASan 6 个可执行文件、本地 TSan 51 个用例 0 报告，变异检查 39 个变异体中 34 个被杀死、5 个存活且各有解释，守卫 11 个负控 | 估计 0.5 日；实际 2026-10-17 至 2026-10-18（含一次进程中断） |
 | **M3** 屏障与就绪门 | `ReconnectBarrier`、对账线程的 `BarrierSweep` 入口与回报环、`SubmitReadiness`/`SubmitReadyToken`、`OrchestratorGate::NotReady`、护栏测试；现有约百个编排器测试通过夹具里的一处测试钩子接线，不逐个改；`StartupRecovery` 第一次被真正接进线束（预检线束）；FI-009/011/020/043 的确定性状态机测试 | B（状态机 + 并发） | WSL2 `thread`（两个负控仍须失败，另加清扫回报环的负控）+ `address`；变异检查；`formal/` 新增屏障模型（见 §9 的 R9） | 4 日 |
 | **M4** 路径 ③ 持久优先 | `OrderFillContext` 影子、`durable_path`、WS 合并发布者、`drain_user_data_events` 改造、影子更新点的护栏 | B | WSL2 `address` + `thread`（若发布者与排空共用待定事件）；真实日志重启测试；变异检查 | 2 日 |
 | **M5** 退役与联调 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），迁移 `live_submit_reconcile_harness_demo` 与预检线束；**Owner 用 Testnet 凭据跑联调**并贴日志 | B | 全量三层 + CI 手动 Sanitizer；Testnet 联调由 Owner 执行 | 2 日（不含联调等待） |
