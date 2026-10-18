@@ -124,6 +124,9 @@ class DurableAuditSinkTest : public ::testing::Test {
 protected:
     std::string base_path_;
     std::unique_ptr<KeyRing> key_ring_;
+    // base_path_ minus its ".log"; use_fresh_base_path() derives its never-used names from it.
+    std::string base_path_stem_;
+    unsigned fresh_base_paths_used_{0};
 
     void SetUp() override {
         static int counter = 0;
@@ -131,12 +134,12 @@ protected:
 #ifdef _WIN32
         char tmp[MAX_PATH];
         GetTempPathA(MAX_PATH, tmp);
-        base_path_ = std::string(tmp) + "hy_das_" + std::to_string(GetCurrentProcessId()) + "_" +
-                     std::to_string(counter) + ".log";
+        base_path_stem_ = std::string(tmp) + "hy_das_" + std::to_string(GetCurrentProcessId()) + "_" +
+                          std::to_string(counter);
 #else
-        base_path_ =
-            "/tmp/hy_das_" + std::to_string(getpid()) + "_" + std::to_string(counter) + ".log";
+        base_path_stem_ = "/tmp/hy_das_" + std::to_string(getpid()) + "_" + std::to_string(counter);
 #endif
+        base_path_ = base_path_stem_ + ".log";
         remove_all();
 
         std::array<std::byte, kKekSize> kek{};
@@ -164,6 +167,21 @@ protected:
         std::remove((base_path_ + ".storeid.lock").c_str());
         std::remove((base_path_ + ".storeid.tip").c_str());
         std::remove((base_path_ + ".storeid.tip.tmp").c_str());
+    }
+
+    // For a loop that runs one scenario many times, each pass on a store of its own: moves the fixture to a base path
+    // nothing has used yet and deletes the files of the one it leaves. Do not call remove_all() at the top of such a
+    // loop and re-use the names: on a Windows host with real-time antivirus that races with the scanner. The sink
+    // renames <tip>.tmp over <tip>, the loop deletes <tip> a few milliseconds later, and the next pass's
+    // CreateFileA(<tip>.tmp, share=0) can fail with ERROR_SHARING_VIOLATION. DurableLogStore::write_tip_anchor reports
+    // that as a failed append and the sink fences (fence_reason IoError, recovery_status Clean), which is how
+    // EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing failed in roughly one run in ten. A name nothing has used cannot
+    // collide with a handle still held for an old one (a standalone probe with the same Win32 calls saw no failure with
+    // fresh names, and none with a 30 ms gap before the delete; the commit message has the numbers). The sink itself
+    // never deletes its tip, so this is the fixture's pattern, not the sink's.
+    void use_fresh_base_path() {
+        remove_all();
+        base_path_ = base_path_stem_ + "_" + std::to_string(++fresh_base_paths_used_) + ".log";
     }
 
     // Overwrites `n` bytes at `offset` in the log file with garbage, for
@@ -1592,6 +1610,37 @@ void spit_file(const std::string& path, const std::string& bytes) {
     f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
+const char* fence_reason_name(FenceReason r) {
+    switch (r) {
+        case FenceReason::None: return "None";
+        case FenceReason::IoError: return "IoError";
+        case FenceReason::DiskFull: return "DiskFull";
+    }
+    return "?";
+}
+
+const char* recovery_status_name(RecoveryScanStatus s) {
+    switch (s) {
+        case RecoveryScanStatus::Clean: return "Clean";
+        case RecoveryScanStatus::Recovered: return "Recovered";
+        case RecoveryScanStatus::Corrupt: return "Corrupt";
+        case RecoveryScanStatus::CapacityExceeded: return "CapacityExceeded";
+        case RecoveryScanStatus::IoError: return "IoError";
+        case RecoveryScanStatus::ExternalAnchorUnavailable: return "ExternalAnchorUnavailable";
+    }
+    return "?";
+}
+
+// Why a sink refused an append. The bool alone cannot tell an I/O failure while appending (fenced, fence_reason
+// IoError, recovery_status Clean -- on Windows typically a sharing violation from a scanner, see
+// DurableAuditSinkTest::use_fresh_base_path()) from a failed recovery (recovery_status Corrupt / IoError): the two
+// need different fixes.
+std::string describe_sink(const DurableAuditSink& sink) {
+    return std::string(" [is_open=") + (sink.is_open() ? "1" : "0") + " fenced=" + (sink.fenced() ? "1" : "0") +
+           " fence_reason=" + fence_reason_name(sink.fence_reason()) +
+           " recovery_status=" + recovery_status_name(sink.recovery_status()) + "]";
+}
+
 }  // namespace
 
 TEST_F(DurableAuditSinkTest, EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing) {
@@ -1599,10 +1648,11 @@ TEST_F(DurableAuditSinkTest, EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing) {
     // those lengths must be cut, the next append must land on the frame boundary, and the start after THAT must
     // still replay.
     for (std::size_t len = 1; len < kOrderEventFrameSize; ++len) {
-        remove_all();
+        use_fresh_base_path();  // not remove_all(): see its comment (Windows: re-using names just deleted flakes)
         {
             DurableAuditSink sink(base_path_, *key_ring_, 1);
-            ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked()) << "len=" << len;
+            ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked())
+                << "len=" << len << describe_sink(sink);
         }
         append_prefix_of_a_real_frame(make_submitted("HY-A", 100, 10, 1), /*sequence_number=*/1, kZeroMac, len);
         ASSERT_EQ(log_file_size(), kOrderEventFrameSize + len) << "len=" << len;
@@ -1614,7 +1664,8 @@ TEST_F(DurableAuditSinkTest, EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing) {
             EXPECT_EQ(restarted.recovered_torn_tail_bytes(), len) << "len=" << len;
             EXPECT_EQ(restarted.recovered_intent_orphans(), 1u) << "len=" << len;
             // the continuation of the order: Submitting follows Intent, on the frame boundary
-            ASSERT_TRUE(restarted.append_durable(make_submitted("HY-A", 100, 10, 1), 1002).acked()) << "len=" << len;
+            ASSERT_TRUE(restarted.append_durable(make_submitted("HY-A", 100, 10, 1), 1002).acked())
+                << "len=" << len << describe_sink(restarted);
         }
         EXPECT_EQ(log_file_size(), 2 * kOrderEventFrameSize) << "len=" << len << ": no debris between the frames";
         {
@@ -1635,7 +1686,7 @@ TEST_F(DurableAuditSinkTest, AFirstFrameThatNeverCompletedIsCutAndTheLogStartsAf
     // straddle every decoder threshold (under the 6 bytes of the key id, under the 27-byte header, mid-payload).
     for (const std::size_t len : {std::size_t{1}, std::size_t{5}, std::size_t{6}, std::size_t{26}, std::size_t{27},
                                   std::size_t{28}, std::size_t{100}, kOrderEventFrameSize - 1}) {
-        remove_all();
+        use_fresh_base_path();
         append_prefix_of_a_real_frame(make_intent("HY-A", 100, 10, 1), /*sequence_number=*/0, kZeroMac, len);
         ASSERT_EQ(log_file_size(), len) << "len=" << len;
         {
@@ -1644,7 +1695,8 @@ TEST_F(DurableAuditSinkTest, AFirstFrameThatNeverCompletedIsCutAndTheLogStartsAf
             EXPECT_FALSE(sink.fenced()) << "len=" << len;
             EXPECT_EQ(sink.recovery_status(), RecoveryScanStatus::Clean) << "len=" << len;
             EXPECT_EQ(sink.recovered_torn_tail_bytes(), len) << "len=" << len;
-            ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked()) << "len=" << len;
+            ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked())
+                << "len=" << len << describe_sink(sink);
         }
         EXPECT_EQ(log_file_size(), kOrderEventFrameSize) << "len=" << len << ": the first frame starts the file";
         DurableAuditSink again(base_path_, *key_ring_, 1);
