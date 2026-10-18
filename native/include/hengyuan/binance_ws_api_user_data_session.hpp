@@ -11,8 +11,9 @@
 // What one session is: ONE connection and ONE subscription, i.e. one GENERATION (the number is assigned by the supervisor and stamped on
 // every event the session delivers). Lifecycle, all on the session's strand:
 //   resolve -> TCP connect -> TLS (SNI + hostname verification) -> WebSocket upgrade -> wait for the pre-signed subscribe frame ->
-//   write it -> wait for the answer -> read loop.
-// and the invariants the code enforces rather than hopes for:
+//   write it -> wait for the answer -> ask which subscriptions the connection holds (session.subscriptions) -> wait for that answer -> live.
+// The read loop runs from the end of the upgrade on (a ping is answered only while a read is pending). The invariants the code enforces
+// rather than hopes for:
 //   1. The host comes from a WsEndpointPermit and nowhere else, and one WebSocket message is read at most permit.max_message_bytes(): the
 //      permit exists only for a host on the policy's WebSocket-API allowlist. A connection that skipped the allowlist cannot be written
 //      without the compiler noticing (tests/test_rest_freeze_guard.cpp pins the connection point).
@@ -28,6 +29,12 @@
 //      {"subscriptionId":N}}. Anything else — another status, no subscription id, another id, an event before the answer — ends the session
 //      (fail-stop), and a rejected answer's status, error code and retryAfter (an absolute ms timestamp when the IP is rate limited or banned,
 //      P-26) are recorded for whoever decides how long to wait.
+//      Then the exchange is asked what it holds: session.subscriptions (no signature, so the session builds it itself, with the id after the
+//      subscribe request's) and the stream counts as connected only when that answer is 200 and lists EXACTLY ONE subscription, the one just
+//      confirmed (design 5.1; the exchange keeps one active subscription per connection and account, P-06/P-27). A list of none, of two, of
+//      another number or with an entry that is not a subscription, another status or id, or no answer in time ends the session the same way.
+//      Events that arrive between the two answers carry our subscription number and are delivered like any other; they only do not make
+//      the stream "connected".
 //   6. Every accepted event is stamped with this session's generation. An event that names a subscription that is not ours is dropped and
 //      counted (serverShutdown names none: it is a connection event, and it is accepted whenever it arrives).
 //   7. An executionReport the codec cannot read completely (no usable client order id, no cumulative quantity) is NOT delivered half-filled;
@@ -38,10 +45,11 @@
 //   9. Any other failure (DNS, TCP, TLS, upgrade, read error or idle timeout, oversized message, write error, answer timeout) is fail-stop,
 //      exactly like BinanceUserDataWsSession: no reconnect logic inside this class.
 //
-// is_connected() means "the subscription is confirmed", NOT "the TCP/WebSocket handshake is done" (that is handshake_done()): a connection
-// that has not subscribed carries no events, and PublicFeedSupervisor's connect deadline then covers the whole path up to the confirmed
-// stream. last_activity_steady_ms() is updated by every data frame AND every control frame (the server's 20 s ping is the only sign of life on
-// a quiet account, P-30): the reconnect barrier's heartbeat check (M3, FI-020) reads it.
+// is_connected() means "the subscription is confirmed by both answers" (the subscribe answer and the session.subscriptions listing), NOT
+// "the TCP/WebSocket handshake is done" (that is handshake_done()): a connection that has not subscribed carries no events, and
+// PublicFeedSupervisor's connect deadline then covers the whole path up to the verified stream. last_activity_steady_ms() is updated by
+// every data frame AND every control frame (the server's 20 s ping is the only sign of life on a quiet account, P-30): the reconnect
+// barrier's heartbeat check (M3, FI-020) reads it.
 //
 // Threads. All I/O handlers run on the session's strand on the ONE io_context thread (consecutive generations share the event ring and the
 // codec, so they must share that thread — see public_feed_supervisor.hpp). Callable from any thread: stop(), stopped(), is_connected(),
@@ -80,6 +88,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -96,6 +105,11 @@ using tcp = net::ip::tcp;
 // visible.
 static_assert(kWsApiSubscribeFrameMaxBytes == kMaxWsApiFrameBytes, "a signed request must fit the mailbox exactly");
 
+// One generation sends two requests on its connection: the subscribe request (id R, chosen by the factory) and, right after its answer,
+// session.subscriptions (id R + 1, chosen here). The factory hands out request ids in steps of this many, so no two requests of one
+// connection share an id and no id of one generation is reused by the next.
+inline constexpr std::uint64_t kWsApiRequestIdsPerGeneration = 2;
+
 struct WsApiUserDataSessionConfig {
     std::string port = "443";
     std::string target = "/ws-api/v3";  // EnvironmentBinding::ws_api_target()
@@ -104,7 +118,8 @@ struct WsApiUserDataSessionConfig {
     // After the upgrade: how long to wait for the mailbox to hold a frame. A producer that posts before start() makes this irrelevant; one that
     // posts later (just-in-time signing) must be done within it.
     std::chrono::milliseconds subscribe_wait{10'000};
-    // After the subscribe frame was written: how long to wait for the answer.
+    // After a request was written (the subscribe frame, then the session.subscriptions request): how long to wait for its answer. Each of
+    // the two answers gets the whole time.
     std::chrono::milliseconds response_timeout{10'000};
     // A signed frame older than this (steady clock, since signing) is not sent. recvWindow is 5000 ms by default (TransportPolicy), and the
     // frame still has to cross the wire.
@@ -138,7 +153,13 @@ struct WsApiUserDataSessionStats {
     // The subscribe answer, once there is one.
     std::int32_t subscribe_status{0};
     std::int64_t subscribe_error_code{0};
-    std::int64_t retry_after_ms{0};  // absolute timestamp (ms) from the exchange, 0 = none
+    // The session.subscriptions answer, once there is one: its status, its error code, and how many subscriptions it listed (at most
+    // kMaxListedSubscriptions are counted).
+    std::int32_t verify_status{0};
+    std::int64_t verify_error_code{0};
+    std::uint32_t subscriptions_listed{0};
+    // Absolute timestamp (ms) from the exchange when EITHER answer was refused with a retryAfter; 0 = none.
+    std::int64_t retry_after_ms{0};
     beast::error_code last_error_ec{};
     std::string last_error_stage;  // "resolve", "connect", "ssl_handshake", "ws_handshake", "read", "write", "subscribe_rejected", ...
 };
@@ -147,9 +168,12 @@ class BinanceWsApiUserDataSession : public std::enable_shared_from_this<BinanceW
     using StrandType = net::strand<net::io_context::executor_type>;
 
 public:
+    // connect_permit pays for the connection and verify_permit for the session.subscriptions request this session sends by itself once the
+    // subscribe answer is in; the subscribe request's own permit travels with its frame (deposit_subscribe). start() refuses a permit that
+    // was reserved for less than its request costs.
     BinanceWsApiUserDataSession(net::io_context& ioc, ssl::context& ssl_ctx, UserDataWsEventRing& ring, WsApiCodec& codec,
-                                const WsEndpointPermit& permit, RateLimitPermit connect_permit, std::uint64_t generation,
-                                WsApiUserDataSessionConfig config)
+                                const WsEndpointPermit& permit, RateLimitPermit connect_permit, RateLimitPermit verify_permit,
+                                std::uint64_t generation, WsApiUserDataSessionConfig config)
         : strand_(net::make_strand(ioc))
         , resolver_(strand_)
         , ws_(strand_, ssl_ctx)
@@ -161,6 +185,7 @@ public:
         , host_(permit.host())
         , max_message_bytes_(permit.max_message_bytes())
         , connect_permit_(connect_permit)
+        , verify_permit_(verify_permit)
         , generation_(generation)
         , config_(std::move(config)) {
         // One message never grows the buffer: the cap is known before the first byte (and Beast refuses a larger message while it streams in).
@@ -198,6 +223,10 @@ public:
             fail(beast::error_code{}, "connect_permit_too_small");
             return;
         }
+        if (!permit_covers(verify_permit_, WsApiRequestKind::SessionSubscriptions)) {
+            fail(beast::error_code{}, "verify_permit_too_small");
+            return;
+        }
         net::co_spawn(strand_, resolve_coro(this->shared_from_this()), net::detached);
     }
 
@@ -207,12 +236,14 @@ public:
         net::post(strand_, [self = this->shared_from_this()] { self->do_stop(); });
     }
 
-    [[nodiscard]] bool stopped() const noexcept { return stop_.load(std::memory_order_relaxed); }
-    // The subscription is confirmed (see the header comment): events flow only after this turns true.
+    // True once the session has ended; end_cause() and stats_snapshot() then already say why (see claim_end()).
+    [[nodiscard]] bool stopped() const noexcept { return stop_.load(std::memory_order_acquire); }
+    // The subscription is confirmed by both answers (see the header comment). Events may already have been delivered by then: the ones that
+    // arrived between the two answers.
     [[nodiscard]] bool is_connected() const noexcept { return subscribed_.load(std::memory_order_acquire); }
     // TCP, TLS and the WebSocket upgrade are done (the subscribe frame may not have been sent yet).
     [[nodiscard]] bool handshake_done() const noexcept { return handshake_done_.load(std::memory_order_relaxed); }
-    // -1 until the subscribe answer was accepted.
+    // -1 until the subscribe answer was accepted (is_connected() additionally waits for the session.subscriptions listing).
     [[nodiscard]] std::int64_t subscription_id() const noexcept { return subscription_id_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
     [[nodiscard]] WsApiSessionEnd end_cause() const noexcept {
@@ -245,6 +276,20 @@ public:
 private:
     static constexpr std::size_t kReserveCapBytes = 64 * 1024;
     static constexpr std::chrono::milliseconds kMailboxPollInterval{2};
+
+    // Where the session is in its two-request conversation. Touched only on the strand.
+    enum class Phase : std::uint8_t {
+        Idle = 0,               // no request is out yet (connecting, or waiting for the subscribe frame)
+        SubscribeSent = 1,      // the subscribe frame is out; its answer is awaited
+        SubscribeAnswered = 2,  // accepted; the session.subscriptions request is not out yet (it waits for the subscribe write to complete)
+        VerifySent = 3,         // the session.subscriptions request is out; its answer is awaited
+        Live = 4,               // both answers accepted
+    };
+
+    // The subscribe answer has been accepted: from now on events of our subscription are legitimate.
+    bool subscribe_answered() const noexcept {
+        return phase_ == Phase::SubscribeAnswered || phase_ == Phase::VerifySent || phase_ == Phase::Live;
+    }
 
     bool is_expected_stop(beast::error_code ec) const noexcept {
         if (stop_requested_.load(std::memory_order_acquire)) {
@@ -357,7 +402,7 @@ private:
         }
         subscribe_frame_ = frame;
         request_id_ = frame.request_id;
-        awaiting_response_ = true;
+        phase_ = Phase::SubscribeSent;
         ws_.text(true);
         ws_.async_write(net::buffer(subscribe_frame_.bytes.data(), subscribe_frame_.length),
                         beast::bind_front_handler(&BinanceWsApiUserDataSession::on_subscribe_written, this->shared_from_this()));
@@ -366,12 +411,55 @@ private:
     void on_subscribe_written(beast::error_code ec, std::size_t) {
         if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "write");
-        if (!awaiting_response_) return;  // the answer overtook this completion handler
+        subscribe_written_ = true;
+        if (phase_ == Phase::SubscribeSent) {
+            arm_response_timer();  // the answer is still to come
+        } else if (phase_ == Phase::SubscribeAnswered) {
+            // The answer overtook this completion handler. Beast allows one write at a time and counts a write as finished when its handler
+            // has run, so the second request waited for exactly this moment.
+            (void)send_verify();
+        }
+    }
+
+    // --- the second request: what does the exchange say this connection holds? ---------------------------------------
+
+    // On the strand. False = the session ended (the request could not be built).
+    bool send_verify() {
+        verify_request_id_ = request_id_ + 1;  // request_id_ came from a request the signing code accepted: far below the maximum
+        auto [err, request] = build_session_subscriptions_request(verify_request_id_);
+        if (err != WsApiSigningError::Ok) {
+            fail(beast::error_code{}, "verify_request");
+            return false;
+        }
+        verify_request_.emplace(request);  // the frame must outlive the async write that sends it
+        const std::string_view text = verify_request_->frame();
+        phase_ = Phase::VerifySent;
+        ws_.text(true);
+        ws_.async_write(net::buffer(text.data(), text.size()),
+                        beast::bind_front_handler(&BinanceWsApiUserDataSession::on_verify_written, this->shared_from_this()));
+        return true;
+    }
+
+    void on_verify_written(beast::error_code ec, std::size_t) {
+        if (is_expected_stop(ec)) return;
+        if (ec || stop_) return fail(ec, "write");
+        if (phase_ == Phase::VerifySent) arm_response_timer();  // the answer is still to come
+    }
+
+    // The wait for the answer to the request that was just written. The handler remembers WHICH wait it is: a timer that expired a moment
+    // before cancel() cannot be recalled, and its handler must not end the next wait.
+    void arm_response_timer() {
+        const Phase armed_for = phase_;
         response_timer_.expires_after(config_.response_timeout);
-        response_timer_.async_wait([self = this->shared_from_this()](beast::error_code wec) {
+        response_timer_.async_wait([self = this->shared_from_this(), armed_for](beast::error_code wec) {
             if (wec) return;  // cancelled: the answer arrived, or a stop
-            if (self->awaiting_response_ && !self->stop_) self->fail(beast::error_code{}, "subscribe_timeout");
+            self->on_response_timeout(armed_for);
         });
+    }
+
+    void on_response_timeout(Phase armed_for) {
+        if (stop_ || phase_ != armed_for) return;
+        fail(beast::error_code{}, armed_for == Phase::SubscribeSent ? "subscribe_timeout" : "subscriptions_timeout");
     }
 
     // --- the read loop ---------------------------------------------------------------------------------------
@@ -429,11 +517,29 @@ private:
 
     // False = the session ended (do not read again).
     bool handle_response(const WsApiResponse& r) {
-        if (!awaiting_response_) {
-            std::lock_guard<std::mutex> lock(stats_mutex_);
-            ++stats_.unexpected_responses;
-            return true;
+        switch (phase_) {
+            case Phase::SubscribeSent:
+                return on_subscribe_answer(r);
+            case Phase::VerifySent:
+                // A repeat of the subscribe answer is a duplicate (counted and ignored, like any answer nobody awaits); any other id that is
+                // not the awaited one ends the session in on_verify_answer().
+                if (r.id_known && r.id == request_id_) return count_unexpected_response();
+                return on_verify_answer(r);
+            case Phase::Idle:
+            case Phase::SubscribeAnswered:
+            case Phase::Live:
+                break;
         }
+        return count_unexpected_response();
+    }
+
+    bool count_unexpected_response() {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.unexpected_responses;
+        return true;
+    }
+
+    bool on_subscribe_answer(const WsApiResponse& r) {
         if (!r.id_known || r.id != request_id_) {
             fail(beast::error_code{}, "response_id_mismatch");
             return false;
@@ -442,15 +548,44 @@ private:
             std::lock_guard<std::mutex> lock(stats_mutex_);
             stats_.subscribe_status = r.status;
             stats_.subscribe_error_code = r.error_code;
-            stats_.retry_after_ms = r.retry_after_ms;
+            if (r.retry_after_ms > 0) stats_.retry_after_ms = r.retry_after_ms;
         }
         if (r.status != 200 || !r.has_subscription_id || r.subscription_id < 0) {
             fail(beast::error_code{}, "subscribe_rejected");
             return false;
         }
-        awaiting_response_ = false;
         response_timer_.cancel();
         subscription_id_.store(r.subscription_id, std::memory_order_release);
+        phase_ = Phase::SubscribeAnswered;
+        // The second request goes out now, unless the subscribe write has not completed yet: then on_subscribe_written() sends it.
+        return subscribe_written_ ? send_verify() : true;
+    }
+
+    // The answer to session.subscriptions: the stream is "connected" only if the exchange lists exactly the subscription it just confirmed.
+    bool on_verify_answer(const WsApiResponse& r) {
+        if (!r.id_known || r.id != verify_request_id_) {
+            fail(beast::error_code{}, "response_id_mismatch");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            stats_.verify_status = r.status;
+            stats_.verify_error_code = r.error_code;
+            stats_.subscriptions_listed = r.subscription_count;
+            if (r.retry_after_ms > 0) stats_.retry_after_ms = r.retry_after_ms;
+        }
+        if (!r.ok()) {
+            fail(beast::error_code{}, "subscriptions_rejected");
+            return false;
+        }
+        const bool exactly_ours = r.has_subscription_list && !r.subscription_list_truncated && !r.subscription_list_malformed &&
+                                  r.subscription_count == 1 && r.subscription_ids[0] == subscription_id_.load(std::memory_order_relaxed);
+        if (!exactly_ours) {
+            fail(beast::error_code{}, "subscriptions_mismatch");
+            return false;
+        }
+        response_timer_.cancel();
+        phase_ = Phase::Live;
         subscribed_.store(true, std::memory_order_release);
         return true;
     }
@@ -458,7 +593,7 @@ private:
     bool handle_event(UserDataWsEvent& ev) {
         // serverShutdown is a CONNECTION event: no subscription id, and valid at any moment, even before the answer (P-29).
         if (ev.kind != UserDataEventKind::ServerShutdown) {
-            if (!subscribed_.load(std::memory_order_acquire)) {
+            if (!subscribe_answered()) {
                 fail(beast::error_code{}, "event_before_subscribe_response");
                 return false;
             }
@@ -500,36 +635,40 @@ private:
 
     // --- ending ----------------------------------------------------------------------------------------------
 
-    void set_end_cause(WsApiSessionEnd cause) noexcept {
+    // The first cause wins: true = this call set it, so this call alone decides how the session ended (a loser changes nothing, records
+    // nothing). The cause is claimed BEFORE stop_ is raised, and whatever the winner records is written before stop_ too: a thread that sees
+    // stopped() == true therefore also sees why (end_cause(), stats_snapshot()), and a failure that races a stop() cannot be recorded as one
+    // while the cause says the other.
+    bool claim_end(WsApiSessionEnd cause) noexcept {
         std::uint8_t expected = static_cast<std::uint8_t>(WsApiSessionEnd::None);
-        end_cause_.compare_exchange_strong(expected, static_cast<std::uint8_t>(cause), std::memory_order_acq_rel,
-                                           std::memory_order_acquire);  // first cause wins
+        return end_cause_.compare_exchange_strong(expected, static_cast<std::uint8_t>(cause), std::memory_order_acq_rel,
+                                                  std::memory_order_acquire);
     }
 
     // Fail-stop: records the first failure only (the cancelled handlers of a session that is already ending must not add noise), then closes
     // the transport on the strand. Callable from any thread.
     void fail(beast::error_code ec, const char* what) {
-        if (stop_.exchange(true, std::memory_order_acq_rel)) return;
+        if (!claim_end(WsApiSessionEnd::Failed)) return;
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             ++stats_.errors;
             stats_.last_error_ec = ec;
             stats_.last_error_stage = what;
         }
-        set_end_cause(WsApiSessionEnd::Failed);
+        stop_.store(true, std::memory_order_release);
         net::post(strand_, [self = this->shared_from_this()] { self->close_transport(); });
     }
 
     // On the strand: the exchange ended this generation (not a failure).
     void end_with(WsApiSessionEnd cause) {
-        if (stop_.exchange(true, std::memory_order_acq_rel)) return;
-        set_end_cause(cause);
+        if (!claim_end(cause)) return;
+        stop_.store(true, std::memory_order_release);
         close_transport();
     }
 
     // On the strand, posted by stop().
     void do_stop() {
-        set_end_cause(WsApiSessionEnd::Requested);
+        (void)claim_end(WsApiSessionEnd::Requested);
         stop_.store(true, std::memory_order_release);
         close_transport();
     }
@@ -560,6 +699,7 @@ private:
     const std::string host_;  // a copy of permit.host(): the resolver and the SNI call need a NUL-terminated string
     const std::uint64_t max_message_bytes_;
     const RateLimitPermit connect_permit_;
+    const RateLimitPermit verify_permit_;
     const std::uint64_t generation_;
     const WsApiUserDataSessionConfig config_;
 
@@ -567,8 +707,11 @@ private:
 
     // Touched only on the strand.
     WsApiSubscribeFrame subscribe_frame_{};  // must outlive the async write that sends it
+    std::optional<WsApiUnsignedRequest> verify_request_;  // ditto
     std::uint64_t request_id_{0};
-    bool awaiting_response_{false};
+    std::uint64_t verify_request_id_{0};
+    Phase phase_{Phase::Idle};
+    bool subscribe_written_{false};  // the subscribe write's completion handler has run
     std::int64_t mailbox_wait_started_ms_{0};
 
     mutable std::mutex stats_mutex_;

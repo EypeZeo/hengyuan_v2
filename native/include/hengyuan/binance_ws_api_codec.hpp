@@ -83,6 +83,9 @@ struct WsApiResponse {
     std::int64_t subscription_id{0};  // "result"."subscriptionId" (userDataStream.subscribe.signature)
     bool has_subscription_list{false};  // "result" was an array (session.subscriptions)
     bool subscription_list_truncated{false};
+    // An element of the array was not an object with an integer "subscriptionId". It is not counted in subscription_count, so a caller that
+    // asks "is this list exactly one subscription" must also ask this: [{"subscriptionId":0}, 5] is not that.
+    bool subscription_list_malformed{false};
     std::uint8_t subscription_count{0};
     std::array<std::int64_t, kMaxListedSubscriptions> subscription_ids{};
 
@@ -279,7 +282,10 @@ private:
                 for (const simdjson::dom::element item : ra) {
                     simdjson::dom::object io;
                     std::int64_t sid = 0;
-                    if (item.get_object().get(io) != simdjson::SUCCESS || !detail::ws_field_int64(io, "subscriptionId", sid)) continue;
+                    if (item.get_object().get(io) != simdjson::SUCCESS || !detail::ws_field_int64(io, "subscriptionId", sid)) {
+                        r.subscription_list_malformed = true;
+                        continue;
+                    }
                     if (r.subscription_count >= kMaxListedSubscriptions) {
                         r.subscription_list_truncated = true;
                         break;

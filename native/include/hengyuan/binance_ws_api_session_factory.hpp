@@ -9,13 +9,17 @@
 //      new connection is started until that moment — a retry during a ban only extends it, so the attempt is refused locally and costs
 //      nothing;
 //   3. a WsEndpointPermit for the endpoint's host (only a host on the policy's WebSocket-API allowlist gets one);
-//   4. two RateLimitPermits from the tracker's Reconciliation lane: one for the connection (weight 2) and one for the subscribe request
-//      (weight 2), P-26, design D7;
-//   5. the signed subscribe request (build_subscribe_signature_request: timestamp only from the token, signature only from the bound
-//      credentials), signed as late as possible, with a request id that is new for every generation;
+//   4. the signed subscribe request (build_subscribe_signature_request: timestamp only from the token, signature only from the bound
+//      credentials), signed as late as possible, with a request id that is new for every generation (the session uses the next number for
+//      its session.subscriptions request, so the ids go out two at a time). It comes BEFORE the budget on purpose: a signature that cannot be
+//      made (wrong thread, bad key) must not have cost anything;
+//   5. three RateLimitPermits from the tracker's Reconciliation lane: one for the connection, one for the subscribe request and one for the
+//      session.subscriptions request the session sends once the subscribe answer is in (weight 2 each, 6 per generation, P-26, design D7);
 //   6. the session, with the subscribe frame already in its mailbox. The supervisor then calls start().
 // Any step that fails returns null: PublicFeedSupervisor counts that as a failed attempt and backs off — it never spins, and a refused
-// attempt has not touched the network.
+// attempt has not touched the network. A refusal before step 5 has spent no budget at all. Inside step 5 the three reservations are made one
+// after the other, so a lane that can pay for the first but not for all of them keeps what it already paid (the tracker has no public
+// pre-check that consumes nothing, and a lane that low is starved anyway).
 //
 // Why the signature is made BEFORE the connection exists (not just-in-time after the handshake): the supervisor's factory contract is
 // "construct, do not start", and the hot thread is the only place that can sign. The price is that a slow handshake can leave the frame too
@@ -71,7 +75,7 @@ struct WsApiSessionFactoryStats {
     std::uint64_t refused_clock{0};     // no fresh ClockReadyToken
     std::uint64_t refused_ban{0};       // the previous generation was told to wait (retryAfter)
     std::uint64_t refused_endpoint{0};  // the host is not on the WebSocket-API allowlist
-    std::uint64_t refused_budget{0};    // the Reconciliation lane could not pay for the connection and the subscribe request
+    std::uint64_t refused_budget{0};    // the Reconciliation lane could not pay for the connection and both requests
     std::uint64_t sign_failed{0};       // build_subscribe_signature_request refused (wrong thread, bad key, ...)
     std::uint64_t create_failed{0};     // the session could not be built or its mailbox refused the frame
     std::int64_t ban_until_server_ms{0};
@@ -140,7 +144,17 @@ private:
             ++stats_.refused_endpoint;
             return nullptr;
         }
-        // 4. the budget: the connection and the subscribe request, both on the Reconciliation lane
+        // 4. sign, as late as possible but before anything is paid for, with a request id that is new for every generation (the session
+        //    uses the next number for its own request, so the ids advance by kWsApiRequestIdsPerGeneration)
+        const std::uint64_t request_id = next_request_id_;
+        auto [err, request] = build_subscribe_signature_request(deps_.credentials, request_id, *token, recv_window_ms_);
+        if (err != WsApiSigningError::Ok) {
+            ++stats_.sign_failed;
+            return nullptr;
+        }
+        next_request_id_ += kWsApiRequestIdsPerGeneration;
+        const std::int64_t signed_at = BinanceWsApiUserDataSession::steady_now_ms();
+        // 5. the budget: the connection and both requests, all on the Reconciliation lane
         const std::optional<RateLimitPermit> connect_permit =
             deps_.limiter.reserve_weight_only_explicit(RateLimitLane::Reconciliation, ws_api_weight(WsApiRequestKind::Connect));
         if (!connect_permit) {
@@ -153,17 +167,15 @@ private:
             ++stats_.refused_budget;
             return nullptr;
         }
-        // 5. sign, as late as possible, with a request id that is new for every generation
-        const std::uint64_t request_id = next_request_id_++;
-        auto [err, request] = build_subscribe_signature_request(deps_.credentials, request_id, *token, recv_window_ms_);
-        if (err != WsApiSigningError::Ok) {
-            ++stats_.sign_failed;
+        const std::optional<RateLimitPermit> verify_permit = deps_.limiter.reserve_weight_only_explicit(
+            RateLimitLane::Reconciliation, ws_api_weight(WsApiRequestKind::SessionSubscriptions));
+        if (!verify_permit) {
+            ++stats_.refused_budget;
             return nullptr;
         }
-        const std::int64_t signed_at = BinanceWsApiUserDataSession::steady_now_ms();
         // 6. the session, with its subscribe frame already waiting
         auto session = std::make_shared<BinanceWsApiUserDataSession>(deps_.ioc, deps_.ssl_ctx, deps_.ring, deps_.codec, *endpoint_permit,
-                                                                     *connect_permit, generation, session_config_);
+                                                                     *connect_permit, *verify_permit, generation, session_config_);
         if (!session->deposit_subscribe(request, *subscribe_permit, signed_at)) {
             ++stats_.create_failed;
             return nullptr;

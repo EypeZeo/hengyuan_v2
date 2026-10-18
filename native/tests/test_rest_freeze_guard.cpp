@@ -441,6 +441,12 @@ TEST(RestFreezeGuardWsApi, TheWsApiSessionTakesItsHostAndItsFrameCapOutOfThePerm
             << p.file << ": the stream's read limit and the buffer reservation, and no literal";
         EXPECT_EQ(count_of(f->code, "std::string host;"), 0u) << p.file << ": a member that could name another host";
         EXPECT_EQ(count_of(f->code, "RateLimitPermit connect_permit,"), 1u) << p.file << ": the connection must be counted against the budget";
+        EXPECT_EQ(count_of(f->code, "RateLimitPermit verify_permit,"), 1u)
+            << p.file << ": the session.subscriptions request the session sends by itself must be counted against the budget";
+        // ... and each of the three kinds of request is checked against the weight it costs, once.
+        EXPECT_EQ(count_of(f->code, "permit_covers(connect_permit_, WsApiRequestKind::Connect)"), 1u) << p.file;
+        EXPECT_EQ(count_of(f->code, "permit_covers(permit, WsApiRequestKind::SubscribeSignature)"), 1u) << p.file;
+        EXPECT_EQ(count_of(f->code, "permit_covers(verify_permit_, WsApiRequestKind::SessionSubscriptions)"), 1u) << p.file;
     }
 }
 
@@ -472,4 +478,39 @@ TEST(RestFreezeGuardWsApi, EachStepThatMakesAGenerationHasExactlyOneProductionCa
             }
         }
     }
+}
+
+// The second request of a generation is unsigned and needs nothing the hot thread owns, so the SESSION builds it (right after the subscribe
+// answer). Still exactly one production place may: a second one could send it at a moment the design does not allow.
+TEST(RestFreezeGuardWsApi, TheListingRequestIsBuiltInTheSessionAndNowhereElse) {
+    constexpr std::string_view kSession = "include/hengyuan/binance_ws_api_user_data_session.hpp";
+    constexpr std::string_view kSigning = "include/hengyuan/binance_ws_api_signing.hpp";
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t n = count_of(f.code, "build_session_subscriptions_request(");
+        if (f.rel == kSigning) {
+            // the friend declaration inside WsApiUnsignedRequest and the definition
+            EXPECT_EQ(n, 2u) << f.rel;
+        } else if (f.rel == kSession) {
+            EXPECT_EQ(n, 1u) << f.rel << ": the session is the one caller";
+        } else {
+            EXPECT_EQ(n, 0u) << f.rel << " builds the session.subscriptions request: only " << kSession << " may";
+        }
+    }
+}
+
+// Every request the session sends is paid for by the factory, before the session exists -- and after the signature, so that a signature that
+// cannot be made costs nothing.
+TEST(RestFreezeGuardWsApi, TheFactoryPaysForEveryKindOfRequestTheSessionSendsAndOnlyAfterSigning) {
+    const SourceFile* f = find_source("include/hengyuan/binance_ws_api_session_factory.hpp");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(count_of(f->code, "reserve_weight_only_explicit("), 3u)
+        << "one reservation per request: the connection, the subscribe request, the session.subscriptions request";
+    EXPECT_EQ(count_of(f->code, "ws_api_weight(WsApiRequestKind::Connect)"), 1u);
+    EXPECT_EQ(count_of(f->code, "ws_api_weight(WsApiRequestKind::SubscribeSignature)"), 1u);
+    EXPECT_EQ(count_of(f->code, "ws_api_weight(WsApiRequestKind::SessionSubscriptions)"), 1u);
+    const std::size_t signs = f->code.find("build_subscribe_signature_request(");
+    const std::size_t pays = f->code.find("reserve_weight_only_explicit(");
+    ASSERT_NE(signs, std::string::npos);
+    ASSERT_NE(pays, std::string::npos);
+    EXPECT_LT(signs, pays) << "sign first: a signature that cannot be made (wrong thread, bad key) must not have spent budget";
 }

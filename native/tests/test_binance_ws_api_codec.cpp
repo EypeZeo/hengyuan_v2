@@ -325,6 +325,7 @@ TEST(WsApiCodecResponses, TheOfficialSessionSubscriptionsResponseGivesTheList) {
     EXPECT_EQ(r.subscription_ids[0], 0);
     EXPECT_EQ(r.subscription_ids[1], 1);
     EXPECT_FALSE(r.subscription_list_truncated);
+    EXPECT_FALSE(r.subscription_list_malformed) << "every element of the official example is a subscription";
     EXPECT_TRUE(r.ok());
 }
 
@@ -332,6 +333,7 @@ TEST(WsApiCodecResponses, AnEmptySubscriptionListIsAListWithNothingInIt) {
     const Parsed p = parse_fresh(R"({"id":9,"status":200,"result":[]})");
     ASSERT_EQ(p.result, WsApiParseResult::Ok);
     EXPECT_TRUE(p.frame.response.has_subscription_list);
+    EXPECT_FALSE(p.frame.response.subscription_list_malformed);
     EXPECT_EQ(p.frame.response.subscription_count, 0u);
     EXPECT_TRUE(p.frame.response.id_known);
     EXPECT_EQ(p.frame.response.id, 9u);
@@ -347,6 +349,7 @@ TEST(WsApiCodecResponses, AListLongerThanTheCapacityIsFlaggedNotStored) {
     const Parsed p = parse_fresh(body);
     ASSERT_EQ(p.result, WsApiParseResult::Ok);
     EXPECT_TRUE(p.frame.response.subscription_list_truncated);
+    EXPECT_FALSE(p.frame.response.subscription_list_malformed) << "too many is not the same thing as unreadable";
     EXPECT_EQ(p.frame.response.subscription_count, hy::kMaxListedSubscriptions);
     EXPECT_EQ(p.frame.response.subscription_ids[hy::kMaxListedSubscriptions - 1], static_cast<std::int64_t>(hy::kMaxListedSubscriptions) - 1);
 }
@@ -357,6 +360,31 @@ TEST(WsApiCodecResponses, ElementsThatAreNotSubscriptionsAreSkipped) {
     ASSERT_EQ(p.frame.response.subscription_count, 2u);
     EXPECT_EQ(p.frame.response.subscription_ids[0], 4);
     EXPECT_EQ(p.frame.response.subscription_ids[1], 6);
+    EXPECT_TRUE(p.frame.response.subscription_list_malformed) << "skipped is not the same as absent: the caller is told something was there";
+}
+
+TEST(WsApiCodecResponses, EveryKindOfElementThatIsNotASubscriptionMarksTheListMalformed) {
+    // The session accepts a stream only if the exchange lists exactly the subscription it confirmed. A list [{"subscriptionId":0}, <junk>]
+    // must therefore not look like a list of exactly one: the junk is not counted in subscription_count, but it is flagged.
+    for (const char* junk : {"5", "\"s\"", "null", "true", "[]", "{}", R"({"x":1})", R"({"subscriptionId":"no"})", R"({"subscriptionId":null})",
+                             R"({"subscriptionId":1.5})"}) {
+        const std::string body = std::string(R"({"id":1,"status":200,"result":[{"subscriptionId":0},)") + junk + "]}";
+        const Parsed p = parse_fresh(body);
+        ASSERT_EQ(p.result, WsApiParseResult::Ok) << body;
+        EXPECT_TRUE(p.frame.response.has_subscription_list) << body;
+        EXPECT_EQ(p.frame.response.subscription_count, 1u) << body;
+        EXPECT_TRUE(p.frame.response.subscription_list_malformed) << body;
+    }
+}
+
+TEST(WsApiCodecResponses, ASubscribeAnswerAndAnErrorAreNeverAMalformedList) {
+    for (const char* body : {R"({"id":1,"status":200,"result":{"subscriptionId":3}})", R"({"id":1,"status":400,"error":{"code":-1,"msg":"x"}})",
+                             R"({"id":1,"status":200,"result":{}})"}) {
+        const Parsed p = parse_fresh(body);
+        ASSERT_EQ(p.result, WsApiParseResult::Ok) << body;
+        EXPECT_FALSE(p.frame.response.has_subscription_list) << body;
+        EXPECT_FALSE(p.frame.response.subscription_list_malformed) << body;
+    }
 }
 
 TEST(WsApiCodecResponses, TheOfficialErrorResponseGivesStatusAndCodeAndNoMessage) {
