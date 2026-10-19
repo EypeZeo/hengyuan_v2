@@ -1,7 +1,7 @@
 # 私网流迁移、发单就绪门与用户数据流持久化——设计提案
 
 > **状态：已接受（Owner 于 2026-10-15 说“合并，按推荐，开始，可以下载”：D1 至 D7 按推荐，M1 开始）；它仍是设计，不是规格——每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出计划、等“开始”，细节以那一片的计划与蓝图为准。** 它把蓝图任务 1A.4（现货私有 WebSocket 用户数据流与会话对账）、审计 P1-002 的路径 ③（用户数据流排空函数）和 FI-043 要求的“屏障门”拆成可以逐片开工、逐片验收的工作，并把需要 Owner 拍板的点列在 §8。每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出 ≤5 行计划、等“开始”。
-> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。**2026-10-18 增补**：M2 已合入（PR #184，合并提交 `f853947`），其中漏掉了本文 §5.1 与 §7 要求的 `session.subscriptions` 校验，由 M2b 补上（PR #185，合并提交 `781d1f2`）；§4.3 补了 M2 与 M2b 的实现情况，§7 的 M2 行改为已完成并新增 M2b 行；M3 起尚未开工。
+> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。**2026-10-18 增补**：M2 已合入（PR #184，合并提交 `f853947`），其中漏掉了本文 §5.1 与 §7 要求的 `session.subscriptions` 校验，由 M2b 补上（PR #185，合并提交 `781d1f2`）；§4.3 补了 M2 与 M2b 的实现情况，§7 的 M2 行改为已完成并新增 M2b 行；M3 起尚未开工。**2026-10-19 增补**：M3 拆成 M3a（纯逻辑：重连屏障、发单就绪令牌、Gate 2b、排空过滤；PR #188，合并提交 `62c4647`）与 M3b（清扫的跨线程传输、TSan 负控、TLA+ 模型）；§5 补了 M3a 的实现情况与同设计草图的差别，§7 的 M3 行拆成 M3a（已完成）与 M3b；M3b 起尚未开工。
 > 读法：§0 是一页摘要；§1 是现状事实（每条带 `file:symbol`）；§2–§6 是设计；§7 是切片计划；§8 是决策点；§9 是风险；§10 是验收映射。
 
 ## 0. 一页摘要
@@ -191,6 +191,15 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 - `OrchestratorContext` 加 `SubmitReadiness* readiness`；`orchestrate_submit()` 在最前面（Gate 0）取令牌，取不到 → 新闸门 `OrchestratorGate::NotReady`（附原因枚举，供告警）。**未接线 = 拒绝**，生产线束必须接；测试夹具用一个测试钩子签发；一个文本护栏测试钉死“生产线束的 `OrchestratorContext` 都设置了 `readiness`”（沿用 `test_reconcile_durable_guard` 的手法）。
 - 这一个令牌同时收口了 SAFE-01 遗留的“编排器级时钟就绪门”和 SAFE-04 将要提供的熔断状态——它们成为令牌的输入，而不是各自散落的 `if`。
 
+**M3a 的实现情况（2026-10-19，PR #188，合并提交 `62c4647`）与上面草图的差别：**
+
+- `ReconnectBarrier`（`reconnect_barrier.hpp`）是 `constexpr` 的纯逻辑，热线程独占，无堆、无原子、不读时钟。输入是 `FeedObservation`（监督器的代次、会话的已连接 / 最近一帧时间 / 丢包计数 / 读不出的回报计数、采样时刻）；§5.2 表里的触发条件都落地了：换代或会话未连接 → Down；Down 时看到已连接 → Sweeping；**两个丢失计数任何一个变化**（不是“增加”：计数在一个会话内单调，任何差异都说明读数不是屏障上次看到的）→ 软屏障；60 秒（`stale_after_ms`，三个 ping 间隔）没有任何帧 → 判死、Down、`take_stop_request()` 一次性地请循环停会话；`on_generation_ended(g)` 在消费者排到 `serverShutdown` / `eventStreamTerminated` 的那一刻结束该代，早于监督器发现；`admit_event(g)` 丢弃比 Reconciled 那一代更老的事件并计数。
+- 清扫协议带**纪元**：`take_sweep_request(now)` 发出请求，`on_sweep_report(report, now)` 只认当前纪元的回报，对一次已被后来事件作废的清扫的回答什么也改变不了；无人回答的请求超时后换新纪元重发；回报里还有未决订单或账户不新鲜则隔一会儿再发。回报是 `SweepReport{epoch, unresolved, account_fresh}`——比 §5.3 草图多一个 `account_fresh`，因为 §5.2 的 Reconciled 条件里有“账户快照新鲜”。**传输（对账线程的 `BarrierSweep` 入口与回报环）是 M3b。**
+- `SubmitReadiness::authorize()` 通过 `ReadinessProbe`（三个函数指针，和 `SubmitPort` 同一风格）在做决定的那一刻读事实，**先**用新读到的观察刷新屏障再判断，所以正确性不依赖主循环有没有跑过；拒绝时给出第一个不成立的 `NotReadyReason`，优先级固定（`NoProbe` > `KillSwitchNotNormal` > `StartupNotReady` > `FeedDown` / `BarrierSweeping` > `ClockNotReady`）。`SubmitReadyToken` 不是租约，签发之后不再复查（蓝图附录 D 的 L-40）。
+- **Gate 2b 在审计门与熔断门之后**，不是草图写的“最前面（Gate 0）”：审计 sink 必须能记下这次拒绝，熔断被触发时要继续报告自己（`KillSwitchNotNormal`）。`OrchestratorGate::NotReady = 23`；未接线 = 拒单；拒绝落审计环为 `PreflightFailed`，先于任何 durable 写入和发送。
+- 草图里的“夹具用一个测试钩子签发”没有照做：生产代码里没有测试钩子，每个夹具带一个 `SyntheticReadiness` 成员（真实的屏障与启动恢复，由脚本化观察驱动到就绪），所以这些测试里 Gate 2b 是真门；护栏 `test_submit_readiness_guard` 钉住每个生产构造 `OrchestratorContext` 的位置给 `.readiness` 的确切文本、哪些文件可以用 `SyntheticReadiness`、令牌只有一个签发点和一个友元、每个 `drain_user_data_events()` 调用的屏障参数。
+- M3 行里的“`StartupRecovery` 第一次被真正接进线束（预检线束）”**没有做**：预检线束仍跑在已退役的 listenKey 流上，没有 WS API 的代次可读，用合成就绪加横幅明说，真实接线随 M5。
+
 ## 6. 路径 ③：用户数据流的持久优先
 
 ### 6.1 为什么不是照抄 SAFE-03 切片 1
@@ -223,7 +232,8 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 | **M1** 编解码与签名（**已完成 2026-10-17，PR #179，合并提交 `4702b20`**） | `WsApiSigningPolicy`、`ws_api_codec`、新事件种类与字段、`EndpointPermit`/限流的 WS API 种类（不动被钉住的枚举）；实际还有守卫 `test_ws_api_signing_guard`、`WsApiCodecAllocation`（构造之后 `parse()` 零分配的测量）与上面 §4.3 列出的差别 | B（新组件） | MSVC + WSL2 `none` + `address`；黄金向量 + 官方示例向量 + 篡改一位必须验签失败的负向对照；变异检查；实际：MSVC、WSL2 `none` 与 `address`、手动 Sanitizer，变异检查 93 个变异体中 92 个被杀死、1 个等价，官方两组 HMAC 示例逐字节复现 | 估计 2 日；实际 2026-10-15 至 2026-10-17（含一次与 PR #180 的合并冲突） |
 | **M2** 会话（**已完成 2026-10-17，PR #184，合并提交 `f853947`；其中 `session.subscriptions` 校验由 M2b 补上**） | `BinanceWsApiUserDataSession`（握手后取信箱里的已签名字节、发订阅、校验响应与 `session.subscriptions`、读循环、盖代次、`serverShutdown`/`eventStreamTerminated` 处理、失败即停）；`WsLoopbackServer` 扩展为可读客户端帧的脚本化应答；监督器接线 | B（并发） | WSL2 `thread`（信箱交接，带负控）、`address`；回环服务端覆盖：订阅成功/失败/超时、重复订阅、断线、`serverShutdown`；实际：MSVC、WSL2 `none`、`address` 与 `thread` 层、手动 Sanitizer，变异检查 47 个变异体全部被杀死，守卫 11 个负控 | 估计 3 日；实际 2026-10-17 |
 | **M2b** `session.subscriptions` 校验（**已完成 2026-10-18，PR #185，合并提交 `781d1f2`**） | 补上 M2 漏掉的一步：订阅应答后会话发无签名的 `session.subscriptions`，只有恰好列出刚确认的那一个订阅，`is_connected()` 才为真；工厂多预留一个许可（一代 6 权重）并改为先签名后预留；`WsApiResponse::subscription_list_malformed`；顺带修 M2 的 `stopped()` 先于结束原因变真的竞争 | B（状态机） | MSVC + WSL2 `none` + `address`，本地 TSan 跑会话测试；变异检查；实际：MSVC 2545、GCC 2551、ASan 6 个可执行文件、本地 TSan 51 个用例 0 报告，变异检查 39 个变异体中 34 个被杀死、5 个存活且各有解释，守卫 11 个负控 | 估计 0.5 日；实际 2026-10-17 至 2026-10-18（含一次进程中断） |
-| **M3** 屏障与就绪门 | `ReconnectBarrier`、对账线程的 `BarrierSweep` 入口与回报环、`SubmitReadiness`/`SubmitReadyToken`、`OrchestratorGate::NotReady`、护栏测试；现有约百个编排器测试通过夹具里的一处测试钩子接线，不逐个改；`StartupRecovery` 第一次被真正接进线束（预检线束）；FI-009/011/020/043 的确定性状态机测试 | B（状态机 + 并发） | WSL2 `thread`（两个负控仍须失败，另加清扫回报环的负控）+ `address`；变异检查；`formal/` 新增屏障模型（见 §9 的 R9） | 4 日 |
+| **M3a** 屏障与就绪门（纯逻辑）（**已完成 2026-10-19，PR #188，合并提交 `62c4647`**） | `ReconnectBarrier`、`FeedObservation` 适配器、`SubmitReadiness` / `SubmitReadyToken`、`OrchestratorGate::NotReady`（Gate 2b）、排空过滤、合成就绪（真实组件加脚本化观察）、护栏测试；FI-009/011/020/043 的确定性状态机测试（含由真实监督器加假会话和真实回环会话驱动的端到端）；实际没有做“预检线束接真实 `StartupRecovery`”（随 M5） | B（状态机） | MSVC + WSL2 `none` + `address` + `thread`；变异检查；实际：MSVC 2694、GCC 2700、ASan 11 个可执行文件、`thread` 层 210 个并发用例 + 三个负控、手动 Sanitizer 三个作业，变异检查 133 个变异体（124 + 守卫 9）：8 个存活，均为等价或纵深防御 | 估计 2 日；实际 2026-10-18 至 2026-10-19 |
+| **M3b** 清扫的传输 | 对账线程的 `BarrierSweep` 入口与回报环（唯一新的跨线程共享状态）、该环的 TSan 负控、`formal/` 的屏障模型（§9 的 R9）；把 `ReconnectBarrier` 的清扫协议接到 `OrderTracker` / `poll_once` | B（并发） | WSL2 `thread`（三个现有负控仍须失败，另加清扫回报环的负控）+ `address`；TLA+ 模型与它的负控；变异检查 | 2 日 |
 | **M4** 路径 ③ 持久优先 | `OrderFillContext` 影子、`durable_path`、WS 合并发布者、`drain_user_data_events` 改造、影子更新点的护栏 | B | WSL2 `address` + `thread`（若发布者与排空共用待定事件）；真实日志重启测试；变异检查 | 2 日 |
 | **M5** 退役与联调 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），迁移 `live_submit_reconcile_harness_demo` 与预检线束；**Owner 用 Testnet 凭据跑联调**并贴日志 | B | 全量三层 + CI 手动 Sanitizer；Testnet 联调由 Owner 执行 | 2 日（不含联调等待） |
 
