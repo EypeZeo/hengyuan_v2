@@ -157,6 +157,10 @@ D0-0 边界冻结产物。每条协议断言都给出官方来源与核验日期
 - 深度：桥接状态机 `UNVERIFIED → BUFFERING → BRIDGING → VERIFIED → GAP`；缺口终止该代次的可用性，不得由后续快照回填；首个桥接点之前仅是原始观察。
 - 成交、聚合成交、标记价、强平：见各流“判据”。
 - 账本互验：离线推得的缺口必须有对应账本事件（深度缺口 `GAP_DETECTED` 的 `bad_q`、丢弃 `OVERRUN` 的序号区间），否则判失败；每个连接代次必须有 `WS_OPEN`。
+- 已知缺口确认：交易所侧丢包时连接是好的、录制器不知情，账本无从解释，这样的缺口会永远判失败。数据湖根目录的 `acks.jsonl`（每行一个 JSON，字段 `v` `id` `code` `stream` `run` `gen` `q` `detail` `reason` `evidence` `by` `at`；`verify --acks <文件>` 可改用别处的文件）是操作员对**单个**已查明缺口的书面确认，最后一步才生效，只看账本没能解释的 FAIL：
+  - 只有 `TRADE_ID_GAP`、`AGGTRADE_ID_GAP`、`MARK_CADENCE_GAP` 可确认；完整性、顺序、序号空洞、深度缺口、代次边界都不可确认；
+  - 一条确认必须与校验报出的那一条逐项精确相同（`code` `stream` `run` `gen` `q` 和该码的全部 `detail` 键值），匹配的 FAIL 降为 INFO（`explained_by` 为 `ACK:<id>`），`RESULT` 行末尾追加 `ACKED=<n>`；一条确认至多用一次；
+  - 格式不合格的行（含重复的 `id`、同一缺口的第二条、`reason` 少于 20 个字符、未知字段）判 `ACK_INVALID`（FAIL，含行号），文件读不了也判 `ACK_INVALID`，没有文件才是“没有确认”；没有匹配到任何缺口的确认报 `ACK_UNMATCHED`（WARN，含行号）；账本已经解释的缺口，确认留作未匹配。
 - 退出码：0 无失败，1 有失败，2 无法读取。
 
 ## 7. 账本事件

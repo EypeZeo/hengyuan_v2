@@ -34,7 +34,7 @@ D:\My_Projects\hengyuan_ops\d0\
 1. `pull`：镜像宿主机上已封存的段，逐段校验大小与 SHA-256，**之后**才回执（宿主机凭回执才清理）。
 2. 只读探测宿主机（`hostprobe.py` 经 ssh 标准输入送过去，不写任何东西）：服务状态与重启数、磁盘、保留与驱逐、未回执积压、最近 24 小时账本事件（`latest.txt` 里 `rotations …` 与 `unplanned closes …` 两行是计划轮换与非计划断连的次数和重连空洞范围，只是事实，超过阈值才成告警）、时钟同步、内存、journal、同机服务。
 3. 本地空间检查。
-4. **每 7 天**对整个数据湖做一次完整 `verify`（含哈希）并保存 `report`。
+4. **每 7 天**对整个数据湖做一次完整 `verify`（含哈希）并保存 `report`。`verify` 没通过时不更新“上次验证”时间，所以失败期间**每次**维保都会重跑整湖验证（约 1.5 小时）；已确认的缺口（见下文“已知缺口确认”）让它恢复成每周一次。
 5. 写 `logs\latest.txt`（给人看）、`logs\status.json`（给程序看）、当次完整日志；退出码 0 正常、1 WARN、2 CRIT（计划任务的“上次运行结果”就是它）。
 
 日志只保留 60 天，维保不会删除任何数据。
@@ -69,9 +69,32 @@ D:\My_Projects\hengyuan_ops\d0\
 | `MEMORY_HIGH` / `OOM_KILL` | WARN ≥300 MB / CRIT | 录制器内存（单元 `MemoryHigh=400M`） | 看趋势：anon 在 138 至 163 MB 之间浮动属正常；持续上涨再查 |
 | `JOURNAL_VOLATILE` / `JOURNAL_BIG` | WARN | journal 又不持久了 / 超过 250 MB（上限 200 MB） | 检查 `/etc/systemd/journald.conf.d/50-hy-persistent.conf` 与 `/var/log/journal` |
 | `COTENANT_DOWN` | WARN | `x-ui`、`xray` 或 `fail2ban` 没在运行 | 不是录制器的服务，但说明宿主机出了问题；别动它们，告诉机主 |
-| `VERIFY_FAIL` | CRIT | 周验证发现完整性或连续性失败 | 看 `verify-*.txt`；先判断是数据损坏还是已知空洞（轮换、重启）未被账本解释 |
+| `VERIFY_FAIL` | CRIT | 周验证发现完整性或连续性失败 | 看 `verify-*.txt`；先判断是数据损坏还是已知空洞（轮换、重启）未被账本解释；若查明是交易所侧的单次丢包，按下文“已知缺口确认”写一条确认（完整性类失败不能确认，要修数据） |
 | `LOCAL_DISK_LOW` | WARN <40 GB，CRIT <15 GB | 本机放数据湖的盘 | 数据湖每天约 +0.6 GB；腾空间或把整个数据湖搬到更大的盘（改 `maint.json`） |
 | `NO_RECENT_SUCCESS` | CRIT | 48 小时没有成功的运行，且这次也失败 | 计划任务没在跑或一直失败：看任务的“上次运行结果”与 `logs\` |
+
+## 已知缺口确认（`acks.jsonl`）
+
+**为什么需要**：交易所那一侧丢了几条消息、连接本身是好的，录制器不知情，账本无从解释，`verify` 就一直判失败。没有确认机制时 `VERIFY_FAIL` 永远是 CRIT：级别失去区分度（之后任何新的真实失败只让计数加一），每次维保都重跑整湖验证，`NO_RECENT_SUCCESS` 跟着一直亮。首例是 2026-10-13T02:20:32.6Z 的 usdm aggTrade（同一条 `usdm_market` 连接上 BTC 缺 2 个、ETH 缺 21 个聚合成交，持续约 0.7 秒；同一连接的 `markPrice@1s` 照常到达，其余连接平滑，账本没有任何录制器侧事件）。
+
+**能确认什么**：只有 `TRADE_ID_GAP`、`AGGTRADE_ID_GAP`、`MARK_CADENCE_GAP`。`SEQ_HOLE`、`SHA_MISMATCH`、`DEPTH_GAP` 等一律不能：那说明数据湖或录制器坏了，要修，不是要确认。
+
+**确认之前必须查清（四条都要成立，查到的事实写进 `evidence`）**：
+
+1. `verify --json` 里没有完整性、顺序、序号空洞类的 FAIL，只有上述连续性缺口。
+2. 缺口的 `q` 区间（`detail.prev_q` 到 `q`）内，账本没有录制器侧事件：`OVERRUN`、`LOOP_LAG`、`STREAM_STALL`、`WS_CLOSE`、`WS_OPEN`、`WRITE_ERROR`、`TASK_CRASH`。`q` 与记录共用一个计数器，按它查最准。
+3. 缺口期间同一条连接的其他流照常到达（例如 aggTrade 缺口里整秒的 `markPrice@1s` 还在），其他连接没有同时停顿。
+4. 缺口落在一个代次之内，`verify` 没有同时报 `SEQ_HOLE`。
+
+**怎么写**：在数据湖根目录（`maint.json` 的 `lake`）建 `acks.jsonl`，一个缺口一行，只追加不改写。`code` `stream` `run` `gen` `q` 和 `detail` 原样抄自 `verify --root <数据湖> --json` 的 `issues_listed` 里那条 FAIL；`reason` 至少 20 个字符，`at` 是 UTC 的 `YYYY-MM-DDTHH:MM:SSZ`：
+
+```json
+{"v":1,"id":"AGG-20261013-BTC","code":"AGGTRADE_ID_GAP","stream":"usdm:btcusdt@aggTrade","run":4,"gen":6,"q":56902165,"detail":{"prev":3482940129,"got":3482940132,"missing":2,"prev_q":56901846},"reason":"交易所侧约 0.7 秒的聚合成交丢失，连接健康，账本无录制器侧事件","evidence":"同连接 markPrice 照常到达；q 区间内账本没有任何事件；其余连接平滑","by":"姓名","at":"2026-10-19T08:00:00Z"}
+```
+
+**规则（`verify` 强制）**：一条只覆盖与它逐项相同的那一个缺口（换一个 `q`、`gen`、哪怕 `missing` 差 1 都不匹配）；写错的行本身判 `ACK_INVALID`（FAIL，含行号），读不了整个文件也判失败，不会读成“没有确认”；没有匹配到缺口的确认报 `ACK_UNMATCHED`（WARN，含行号：缺口消失了、被账本解释了，或抄错了）；删掉一行，那个缺口的 FAIL 就回来。确认文件跟着数据湖走（搬家时一起带走），不入库。
+
+**写完之后**：`python -m hy_recorder verify --root <数据湖>` 应得到 `RESULT: PASS (… ACKED=<n>)` 并列出 `acknowledged: …`。`latest.txt` 的 `verify:` 行从此每次都带 `ACKED=<n>`，提醒还有 n 个已确认的缺口；这些缺口仍是数据里的真实空洞，做研究取数时要避开（`verify-*.txt` 与 `--json` 的 `issues_listed` 里它们以 INFO 和 `explained_by: ACK:<id>` 出现）。
 
 ## 例行维保清单
 

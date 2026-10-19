@@ -19,7 +19,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_verify(args: argparse.Namespace) -> int:
     from .verify import verify_lake
 
-    report = verify_lake(Path(args.root), check_hashes=not args.no_hash)
+    report = verify_lake(
+        Path(args.root), check_hashes=not args.no_hash, acks_path=Path(args.acks) if args.acks else None
+    )
     print(json.dumps(report.to_dict(), indent=1, sort_keys=True) if args.json else report.render_text())
     return report.exit_code
 
@@ -102,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--root", required=True)
     v.add_argument("--json", action="store_true")
     v.add_argument("--no-hash", action="store_true", help="skip SHA-256 of segments (size still checked)")
+    v.add_argument("--acks", help="acknowledgement file of known gaps (default: <root>/acks.jsonl)")
     v.set_defaults(fn=_cmd_verify)
     rp = sub.add_parser("report", help="operations report: rates, storage, bridge time, gaps, clock offset")
     rp.add_argument("--root", required=True)
