@@ -20,6 +20,7 @@
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include "test_helpers/server_time_body.hpp"
 #include <hengyuan/binance_submit_adapter.hpp>
+#include <hengyuan/synthetic_readiness.hpp>
 
 #include "binance_private_rest_test_hooks.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
@@ -163,6 +164,7 @@ class SubmitAdapterOrchestratorTest : public ::testing::Test {
 protected:
     AuditRingSink audit_;
     KillSwitch kill_switch_;
+    SyntheticReadiness readiness_{kill_switch_};  // Gate 2b (private-stream migration M3a)
     DryRunEvidenceChain evidence_;
     SpotRateLimitTracker rate_limiter_;
     InFlightRegistry in_flight_;
@@ -199,6 +201,7 @@ protected:
 
         ctx_.audit = &audit_;
         ctx_.kill_switch = &kill_switch_;
+        ctx_.readiness = &readiness_.readiness();
         ctx_.evidence = &evidence_;
         ctx_.signer_ready = true;
         ctx_.depth_synced = true;

@@ -158,6 +158,24 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **一个真实的 GCC-only 发现**：`live_submit_evidence_harness.cpp` 里有第二个 `switch
     (OrchestratorGate)`（`gate_name()` 辅助函数），MSVC `/W4` 没有对新增枚举值缺失 case 报警，GCC
     `-Wswitch` 报了——本仓库"两边工具链都要跑"这条规则又抓到一次真实分歧。
+- `OrchestratorGate::NotReady = 23`（私网流迁移 M3a，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.4）— **spec 之外的追加值**，
+  接在 spec 钉死的最后一个值 `AuditWriteNotAcked = 22` 之后；`tools/spec_enum_diff.py` 对 `OrchestratorGate` 只查数值冲突
+  （delta 区块不查成员），这个值零冲突，也不会被它感知——正确性靠 `test_live_submit_orchestrator.cpp` 里钉死数值的用例。
+  - **位置**：Gate 2b，在 Gate 1（审计）和 Gate 2（熔断）**之后**、Gate 3（证据）之前，不是设计文档表里写的“最前面”：审计 sink
+    必须能记下这次拒绝，熔断被触发时也要继续报告自己（`KillSwitchNotNormal`），所以就绪门排在两者之后；两个顺序都有用例钉死
+    （用例 AuditCheckedBeforeReadiness / KillSwitchCheckedBeforeReadiness / ReadinessCheckedBeforeEvidence /
+    ReadinessCheckedBeforeEveryLaterGate，在 test_live_submit_orchestrator.cpp）。
+  - **未接线 = 拒单**（`ctx.readiness == nullptr` → `NotReadyReason::Unwired`），与周围所有可空字段的“未接线 = 行为不变”
+    相反，这是刻意的反向：一个忘了接就绪门的调用点不能是静默放行。拒绝落审计环为 `PreflightFailed`，`detail_code` =
+    `NotReadyReason`，`detail_msg` = 原因名；先于任何 durable 写入（没有 Intent 帧）、先于任何发送。
+  - 原因的优先级是固定的（`NoProbe` > `KillSwitchNotNormal` > `StartupNotReady` > `FeedDown` / `BarrierSweeping` >
+    `ClockNotReady`），`authorize()` 每次决定前先用新读到的 `FeedObservation` 刷新屏障，所以正确性不依赖主循环有没有跑过。
+    `GenerationMismatch` 是屏障 `observe()` 之后结构上不可达的防御分支（保留是为了屏障将来被改动时令牌不会悄悄变弱）。
+  - 两个 `gate_name()` 穷举 switch（`live_submit_evidence_harness.cpp`、`live_submit_preflight_harness.cpp`）补了 `NotReady` 的
+    case——上一条的 GCC `-Wswitch` 硬约束，这次在写代码时就核对了，没有等 GCC 来报。
+  - `test_submit_readiness_guard.cpp`：每个构造 `OrchestratorContext` 的生产位置都被固定（个数 + 给 `.readiness` 的确切文本，
+    显式 `nullptr` 会被抓到）；`SyntheticReadiness` 只允许三个演练/线束文件使用；`SubmitReadyToken` 只有一个铸造点和一个友元；
+    每个 `drain_user_data_events()` 调用的屏障参数被固定（旧 listenKey 流的三个无屏障调用点写明理由，M5 随该流一起删除）。
 
 ### 容量 / 生命周期
 

@@ -4,11 +4,14 @@
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/synthetic_readiness.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -100,6 +103,8 @@ class LiveSubmitTest : public ::testing::Test {
 protected:
     AuditRingSink audit_;
     KillSwitch kill_switch_;
+    // Gate 2b (private-stream migration M3a): the real barrier and startup recovery, driven to "ready" by scripted observations.
+    SyntheticReadiness readiness_{kill_switch_};
     DryRunEvidenceChain evidence_;
     SpotRateLimitTracker rate_limiter_;
     InFlightRegistry in_flight_;
@@ -136,6 +141,7 @@ protected:
 
         ctx_.audit = &audit_;
         ctx_.kill_switch = &kill_switch_;
+        ctx_.readiness = &readiness_.readiness();
         ctx_.evidence = &evidence_;
         ctx_.signer_ready = true;
         ctx_.depth_synced = true;
@@ -411,6 +417,225 @@ TEST_F(LiveSubmitTest, KillSwitchTriggeredBlocks) {
     auto r = orchestrate_submit(ctx_);
     EXPECT_EQ(r.gate, OrchestratorGate::KillSwitchNotNormal);
     EXPECT_GE(audit_.count(), 1u);
+}
+
+// --- Gate 2b: SubmitReadyToken (private-stream migration M3a) ---
+//
+// The readiness is the REAL SubmitReadiness over the real barrier and startup recovery, driven to "ready" by scripted observations
+// (synthetic_readiness.hpp); the tests below take it apart through the barrier's own public API, exactly as a stream event would.
+// Which conditions refuse, and in which order, is pinned in test_submit_readiness.cpp; here it is the orchestrator's side of the contract:
+// where the gate sits, what a refusal does and does not leave behind, and that an unwired readiness is a refusal.
+
+TEST_F(LiveSubmitTest, UnwiredReadinessIsARefusalNotAPassThrough) {
+    ctx_.readiness = nullptr;
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::NotReady);
+    EXPECT_EQ(r.not_ready_reason, NotReadyReason::Unwired);
+    EXPECT_EQ(r.ready_generation, 0u);
+    EXPECT_EQ(g_mock_submit_calls, 0);
+}
+
+TEST_F(LiveSubmitTest, AReadyOrderCarriesTheGenerationItsTokenRestedOn) {
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(r.not_ready_reason, NotReadyReason::None);
+    EXPECT_EQ(r.ready_generation, 1u);
+}
+
+TEST_F(LiveSubmitTest, ARefusalForANotReadyReasonWritesNothingDurableAndSendsNothing) {
+    ctx_.readiness = nullptr;
+    auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::NotReady);
+    EXPECT_EQ(fake_durable_audit_.next_sequence, 0u) << "no Intent frame, no Prepared frame: the refusal precedes every durable write";
+    EXPECT_EQ(g_mock_submit_calls, 0);
+    EXPECT_TRUE(r.order.client_order_id.empty());
+}
+
+TEST_F(LiveSubmitTest, ANotReadyRefusalIsAuditedWithItsReason) {
+    ctx_.readiness = nullptr;
+    const std::size_t before = audit_.count();
+    (void)orchestrate_submit(ctx_);
+    ASSERT_EQ(audit_.count(), before + 1);
+    const AuditRecord* ar = audit_.last();
+    ASSERT_NE(ar, nullptr);
+    EXPECT_EQ(ar->event_type, AuditEventType::PreflightFailed);
+    EXPECT_EQ(ar->detail_code, static_cast<std::int64_t>(NotReadyReason::Unwired));
+    EXPECT_STREQ(ar->detail_msg, "Unwired");
+    EXPECT_EQ(ar->mode, ExecutionMode::Live);
+}
+
+TEST_F(LiveSubmitTest, ADrainedServerShutdownRefusesTheNextOrderAsFeedDown) {  // FI-011
+    // The consumer drained a serverShutdown of generation 1; the session still looks connected to the supervisor.
+    readiness_.readiness().barrier().on_generation_ended(1);
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::NotReady);
+    EXPECT_EQ(r.not_ready_reason, NotReadyReason::FeedDown);
+    EXPECT_EQ(g_mock_submit_calls, 0);
+    EXPECT_STREQ(audit_.last()->detail_msg, "FeedDown");
+}
+
+TEST_F(LiveSubmitTest, ALostEventRefusesAsSweepingUntilTheSweepIsAnswered) {  // F5, FI-009
+    const std::int64_t steady_now =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    FeedObservation trouble{};
+    trouble.generation = 1;
+    trouble.connected = true;
+    trouble.last_activity_ms = steady_now;
+    trouble.sampled_at_ms = steady_now;
+    trouble.ring_drops = 1;  // an event was dropped; the synthetic feed reports 0, any difference is a trouble reading
+    ReconnectBarrier& barrier = readiness_.readiness().barrier();
+    barrier.observe(trouble);
+    ASSERT_EQ(barrier.state(), BarrierState::Sweeping);
+
+    auto refused = orchestrate_submit(ctx_);
+    EXPECT_EQ(refused.gate, OrchestratorGate::NotReady);
+    EXPECT_EQ(refused.not_ready_reason, NotReadyReason::BarrierSweeping);
+    EXPECT_EQ(g_mock_submit_calls, 0);
+
+    const std::optional<std::uint64_t> epoch = barrier.take_sweep_request(ctx_.now_ms);
+    ASSERT_TRUE(epoch.has_value());
+    barrier.on_sweep_report(SweepReport{*epoch, 0U, true}, ctx_.now_ms);
+
+    auto accepted = orchestrate_submit(ctx_);
+    EXPECT_EQ(accepted.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(g_mock_submit_calls, 1);
+}
+
+TEST_F(LiveSubmitTest, AGenerationChangeRefusesEveryOrderUntilItsSweepIsAnswered) {  // FI-043
+    const std::int64_t steady_now =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    FeedObservation next_generation{};
+    next_generation.generation = 2;  // the barrier follows whatever generation the feed reports; the synthetic feed says 1, so it re-sweeps either way
+    next_generation.connected = true;
+    next_generation.last_activity_ms = steady_now;
+    next_generation.sampled_at_ms = steady_now;
+    ReconnectBarrier& barrier = readiness_.readiness().barrier();
+    barrier.observe(next_generation);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto r = orchestrate_submit(ctx_);
+        EXPECT_EQ(r.gate, OrchestratorGate::NotReady) << attempt;
+        EXPECT_EQ(r.not_ready_reason, NotReadyReason::BarrierSweeping) << attempt;
+    }
+    EXPECT_EQ(g_mock_submit_calls, 0);
+
+    const std::optional<std::uint64_t> epoch = barrier.take_sweep_request(ctx_.now_ms);
+    ASSERT_TRUE(epoch.has_value());
+    barrier.on_sweep_report(SweepReport{*epoch, 0U, true}, ctx_.now_ms);
+    auto accepted = orchestrate_submit(ctx_);
+    EXPECT_EQ(accepted.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(accepted.ready_generation, 1u) << "the token rests on the generation the feed reports now";
+}
+
+TEST_F(LiveSubmitTest, AKillSwitchResetNeedsNoNewSweep) {
+    kill_switch_.trigger();
+    EXPECT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::KillSwitchNotNormal);
+    kill_switch_.operator_reset();
+    EXPECT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAccepted);
+}
+
+// --- Gate 2b and the user-data events the same call drains (private-stream migration M3a) ---
+
+namespace {
+
+UserDataWsEvent stamped_event(UserDataEventKind kind, std::uint64_t generation) {
+    UserDataWsEvent ev{};
+    ev.kind = kind;
+    ev.generation = generation;
+    return ev;
+}
+
+}  // namespace
+
+TEST_F(LiveSubmitTest, AnOlderGenerationsEventDrainedByTheCallIsCountedAsLate) {  // FI-009 through the production entry point
+    SyntheticReadiness second_generation(kill_switch_, /*generation=*/2);
+    ctx_.readiness = &second_generation.readiness();
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(stamped_event(UserDataEventKind::BalanceUpdate, 1)));
+    ASSERT_TRUE(ring.try_push(stamped_event(UserDataEventKind::BalanceUpdate, 2)));
+    ASSERT_TRUE(ring.try_push(stamped_event(UserDataEventKind::BalanceUpdate, 0)));  // not stamped: always merged
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(r.ready_generation, 2u);
+    EXPECT_EQ(second_generation.readiness().barrier().stats().late_events_dropped, 1u)
+        << "only the generation-1 event is older than the Reconciled generation 2";
+}
+
+TEST_F(LiveSubmitTest, ADrainedServerShutdownRefusesTheVeryCallThatDrainedIt) {  // FI-011 through the production entry point
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(stamped_event(UserDataEventKind::ServerShutdown, /*generation=*/1)));
+
+    auto r = orchestrate_submit(ctx_);  // drains the shutdown first, then asks Gate 2b
+
+    EXPECT_EQ(r.gate, OrchestratorGate::NotReady);
+    EXPECT_EQ(r.not_ready_reason, NotReadyReason::FeedDown);
+    EXPECT_EQ(g_mock_submit_calls, 0);
+    EXPECT_EQ(readiness_.readiness().barrier().stats().generation_ends_seen, 1u);
+}
+
+TEST_F(LiveSubmitTest, AnEventStreamTerminatedRefusesTheVeryCallThatDrainedItToo) {  // FI-011
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(stamped_event(UserDataEventKind::EventStreamTerminated, /*generation=*/1)));
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::NotReady);
+    EXPECT_EQ(r.not_ready_reason, NotReadyReason::FeedDown);
+}
+
+TEST_F(LiveSubmitTest, AnUnwiredReadinessStillDrainsTheRingWithoutABarrier) {
+    ctx_.readiness = nullptr;
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(stamped_event(UserDataEventKind::ServerShutdown, 1)));
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::NotReady);
+    EXPECT_EQ(r.not_ready_reason, NotReadyReason::Unwired);
+    UserDataWsEvent leftover{};
+    EXPECT_FALSE(ring.try_pop(leftover)) << "the event was drained, barrier or not";
+}
+
+// --- Gate ordering around 2b: audit and kill switch before it, evidence and everything else after it ---
+
+TEST_F(LiveSubmitTest, AuditCheckedBeforeReadiness) {
+    audit_.set_available(false);
+    ctx_.readiness = nullptr;
+    EXPECT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::AuditUnavailable);
+}
+
+TEST_F(LiveSubmitTest, KillSwitchCheckedBeforeReadiness) {
+    kill_switch_.trigger();
+    ctx_.readiness = nullptr;
+    auto r = orchestrate_submit(ctx_);
+    EXPECT_EQ(r.gate, OrchestratorGate::KillSwitchNotNormal) << "a tripped switch keeps reporting itself, whatever the readiness says";
+}
+
+TEST_F(LiveSubmitTest, ReadinessCheckedBeforeEvidence) {
+    evidence_.reset();
+    ctx_.readiness = nullptr;
+    EXPECT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::NotReady);
+}
+
+TEST_F(LiveSubmitTest, ReadinessCheckedBeforeEveryLaterGate) {
+    ctx_.readiness = nullptr;
+    evidence_.reset();
+    ctx_.signer_ready = false;
+    ctx_.depth_synced = false;
+    ctx_.confirmation.confirmed = false;
+    ctx_.symbol_rules = nullptr;
+    ctx_.account = nullptr;
+    EXPECT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::NotReady);
+}
+
+TEST_F(LiveSubmitTest, NotReadyHasItsOwnGateValueAfterTheSpecsLastOne) {
+    EXPECT_EQ(static_cast<int>(OrchestratorGate::NotReady), 23);
+    EXPECT_EQ(static_cast<int>(OrchestratorGate::AuditWriteNotAcked), 22) << "the spec's last value is untouched";
 }
 
 // --- Gate 3: Dry-run evidence ---

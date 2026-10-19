@@ -47,6 +47,7 @@
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/synthetic_readiness.hpp>
 
 #include <array>
 #include <atomic>
@@ -214,10 +215,13 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
         while (!reconcile_ready.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
+        // Gate 2b: owned by the hot thread, like everything else orchestrate_submit() touches; long-lived, because it owns the barrier.
+        SyntheticReadiness readiness(kill_switch);
         for (int i = 0; i < kIterations; ++i) {
             OrchestratorContext ctx{};
             ctx.audit = &audit;
             ctx.kill_switch = &kill_switch;
+            ctx.readiness = &readiness.readiness();
             ctx.evidence = &evidence;
             ctx.signer_ready = true;
             ctx.depth_synced = true;

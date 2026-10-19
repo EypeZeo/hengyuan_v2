@@ -58,6 +58,7 @@
 #pragma once
 
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/synthetic_readiness.hpp>
 
 #include <array>
 #include <cstddef>
@@ -288,6 +289,9 @@ inline void remove_scratch_files(const std::string& base) {
 struct DrillRig {
     AuditRingSink audit;
     KillSwitch kill_switch;
+    // Gate 2b (private-stream migration M3a): a drill has no private stream either, so its readiness is the synthetic one -- the real barrier and
+    // startup recovery driven with scripted observations (synthetic_readiness.hpp). Declared right after kill_switch, which it refers to.
+    SyntheticReadiness synthetic_readiness{kill_switch};
     DryRunEvidenceChain scaffold;  // gets the drill's context past Gate 3 -- never exposed (see the header)
     SpotRateLimitTracker rate_limiter;
     InFlightRegistry in_flight;
@@ -353,6 +357,7 @@ struct DrillRig {
 
         ctx.audit = &audit;
         ctx.kill_switch = &kill_switch;
+        ctx.readiness = &synthetic_readiness.readiness();
         ctx.evidence = &scaffold;
         ctx.signer_ready = true;
         ctx.depth_synced = true;

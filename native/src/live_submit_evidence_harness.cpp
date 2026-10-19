@@ -19,6 +19,7 @@
 // SIMULATION ONLY. No network. No secret. No real order.
 
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/synthetic_readiness.hpp>
 
 #include <array>
 #include <cstdio>
@@ -106,6 +107,7 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::AuditWriteNotAcked: return "AuditWriteNotAcked";
         case OrchestratorGate::SubmitPartialFill: return "SubmitPartialFill";
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
+        case OrchestratorGate::NotReady: return "NotReady";
     }
     return "?";
 }
@@ -138,6 +140,7 @@ void remove_durable_audit_files(const std::string& base_path) {
 struct Fixture {
     AuditRingSink audit;
     KillSwitch kill_switch;
+    SyntheticReadiness synthetic_readiness{kill_switch};  // after kill_switch: it refers to it. See the banner in main().
     DryRunEvidenceChain evidence;
     SpotRateLimitTracker rate_limiter;
     InFlightRegistry in_flight;
@@ -183,6 +186,7 @@ struct Fixture {
 
         ctx.audit = &audit;
         ctx.kill_switch = &kill_switch;
+        ctx.readiness = &synthetic_readiness.readiness();
         ctx.evidence = &evidence;
         ctx.signer_ready = true;
         ctx.depth_synced = true;
@@ -283,7 +287,9 @@ int main() {
     std::printf("SIMULATION ONLY. Mock SubmitPort. No network. No real order.\n");
     std::printf("(Real testnet execution requires a SubmitPort implementation per\n");
     std::printf(" SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md, and testnet credentials\n");
-    std::printf(" neither of which this harness has.)\n\n");
+    std::printf(" neither of which this harness has.)\n");
+    std::printf("Gate 2b (SubmitReadyToken) is wired to a SYNTHETIC readiness here: this harness has no private\n");
+    std::printf("user-data stream, so the stream/sweep part of the gate is exercised by the unit tests, not by this run.\n\n");
 
     auto stamp = build_stamp();
     std::printf("Build stamp: 0x%08X (derived from __DATE__ __TIME__)\n\n", stamp);

@@ -32,6 +32,7 @@
 #include <hengyuan/order_fill_context.hpp>  // OrderFillContext, OrderFillContextEntry
 #include <hengyuan/order_lifecycle.hpp>     // ClientOrderId, InFlightRegistry, OrderState
 #include <hengyuan/position_truth.hpp>      // PositionTruth
+#include <hengyuan/reconnect_barrier.hpp>   // ReconnectBarrier (private-stream migration M3a): the late-event filter of drain_user_data_events()
 #include <hengyuan/spsc_ring.hpp>
 
 #include <cstdint>
@@ -194,12 +195,29 @@ using UserDataWsEventRing = SpscRing<UserDataWsEvent, 64>;
 // drain_reconcile_events() now also route through (see those files' own comments) -- so a fill
 // this function observes here can never be double-applied by either of the other two paths, and
 // vice versa, regardless of which of the three fires first for a given order.
+//
+// `barrier` (private-stream migration M3a, trailing default nullptr -- omitted, nothing below changes) is the
+// ReconnectBarrier of the stream that produced `events`. Two things happen before an event is looked at:
+//   * a serverShutdown / eventStreamTerminated event tells the barrier its generation is OVER (on_generation_ended),
+//     before the supervisor has even noticed the session stopping -- the one thing a pending event can say that the
+//     session's atomics have not said yet;
+//   * an event stamped with a generation OLDER than the one the barrier has Reconciled is dropped and counted
+//     (admit_event): the sweep that made that generation Reconciled already reflects whatever it said. Until then
+//     (Down, Sweeping) old events are merged as usual -- consume_delta() applies positive deltas only, so a late
+//     duplicate is harmless.
 inline void drain_user_data_events(const InFlightRegistry& in_flight, AuditRingSink* audit,
                                     UserDataWsEventRing& events, std::int64_t now_ms,
                                     PositionTruth* position_truth = nullptr,
-                                    OrderFillContext* fill_context = nullptr) noexcept {
+                                    OrderFillContext* fill_context = nullptr,
+                                    ReconnectBarrier* barrier = nullptr) noexcept {
     UserDataWsEvent ev{};
     while (events.try_pop(ev)) {
+        if (barrier != nullptr) {
+            if (ev.kind == UserDataEventKind::ServerShutdown || ev.kind == UserDataEventKind::EventStreamTerminated) {
+                barrier->on_generation_ended(ev.generation);
+            }
+            if (!barrier->admit_event(ev.generation)) continue;
+        }
         if (ev.kind != UserDataEventKind::ExecutionReport) continue;
         if (!in_flight.is_in_flight(ev.coid.view())) continue;
 
