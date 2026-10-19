@@ -73,6 +73,7 @@
 #include <hengyuan/public_feed_pipeline.hpp>
 #include <hengyuan/strategy_spec_evaluator.hpp>
 #include <hengyuan/strategy_spec_toml_parser.hpp>
+#include <hengyuan/synthetic_readiness.hpp>
 #include <hengyuan/verified_dry_run_evidence.hpp>
 
 #include <array>
@@ -147,6 +148,7 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::AuditWriteNotAcked: return "AuditWriteNotAcked";
         case OrchestratorGate::SubmitPartialFill: return "SubmitPartialFill";
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
+        case OrchestratorGate::NotReady: return "NotReady";
     }
     return "?";
 }
@@ -525,6 +527,10 @@ int main(int argc, char* argv[]) {
     // --- Real KillSwitch (Normal) --------------------------------------------------------------
     KillSwitch kill_switch;
     kill_switch.operator_reset();
+    // Private-stream migration M3a: Gate 2b (SubmitReadyToken) needs a readiness. This harness still runs on the retired listenKey stream, so a
+    // connected, swept WS API generation does not exist here; the readiness is the SYNTHETIC one (the real components driven with scripted
+    // observations, synthetic_readiness.hpp). The stream/sweep part of the gate is exercised by the unit tests, NOT by this run (M5 wires the real one).
+    SyntheticReadiness synthetic_readiness(kill_switch);
 
     // Real DurableAuditSink -- this harness never gets far enough to write an order-lifecycle
     // record worth persisting (confirmation is never bound), so an ephemeral per-run temp file
@@ -560,6 +566,8 @@ int main(int argc, char* argv[]) {
                 "depth+kline WS.\n");
     std::printf("ctx.submit_port is a MOCK, never the real make_binance_submit_port() result -- "
                 "no real network order write is possible from this process.\n");
+    std::printf("Gate 2b (SubmitReadyToken) uses a SYNTHETIC readiness here: this harness has no private WS API stream "
+                "(it still runs on the retired listenKey one), so that part of the gate is NOT exercised by this run.\n");
     std::printf("Running for %d seconds (Ctrl+C to stop early).\n\n", duration_s);
 
     std::int64_t next_clock_sync_ms = 60'000;
@@ -665,6 +673,7 @@ int main(int argc, char* argv[]) {
             OrchestratorContext ctx{};
             ctx.audit = &audit;
             ctx.kill_switch = &kill_switch;
+            ctx.readiness = &synthetic_readiness.readiness();
             ctx.evidence = &verified_evidence.chain();
             ctx.signer_ready = true;
             ctx.depth_synced = (pipeline->depth_manager().state() == DepthState::Tracking);

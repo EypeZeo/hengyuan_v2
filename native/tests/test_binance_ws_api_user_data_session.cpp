@@ -19,7 +19,9 @@
 #include <hengyuan/binance_ws_api_session_factory.hpp>
 #include <hengyuan/binance_ws_api_signing.hpp>
 #include <hengyuan/binance_ws_api_user_data_session.hpp>
+#include <hengyuan/feed_observation.hpp>
 #include <hengyuan/public_feed_supervisor.hpp>
+#include <hengyuan/reconnect_barrier.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
 #include <hengyuan/transport_policy.hpp>
 
@@ -34,6 +36,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -52,6 +55,9 @@ using hy::test_helpers::wait_until;
 using hy::test_helpers::WsLoopbackServer;
 using Session = BinanceWsApiUserDataSession;
 using Supervisor = hy::PublicFeedSupervisor<Session>;
+
+// M3a: the reconnect barrier's adapter (feed_observation.hpp) reads the session through exactly these accessors.
+static_assert(hy::ObservableFeedSession<Session>);
 
 constexpr const char* kTarget = "/ws-api/v3";
 
@@ -995,6 +1001,19 @@ protected:
     hy::WsApiSessionFactory::Deps deps() {
         return hy::WsApiSessionFactory::Deps{rig_.ioc, rig_.ssl_ctx, ring_, codec_, creds_->get(), clock_, limiter_};
     }
+    // The barrier's view of the supervisor right now (feed_observation.hpp), on the session's own steady clock.
+    static hy::FeedObservation observe_now(const Supervisor& sup) { return hy::make_feed_observation(sup, Session::steady_now_ms()); }
+
+    // The barrier subscribed to the supervisor's generation and swept clean: Reconciled.
+    static void reconcile(hy::ReconnectBarrier& barrier, const Supervisor& sup) {
+        barrier.observe(observe_now(sup));
+        ASSERT_EQ(barrier.state(), hy::BarrierState::Sweeping) << "connected and verified, not swept";
+        const std::optional<std::uint64_t> epoch = barrier.take_sweep_request(Session::steady_now_ms());
+        ASSERT_TRUE(epoch.has_value());
+        barrier.on_sweep_report(hy::SweepReport{*epoch, 0U, true}, Session::steady_now_ms());
+        ASSERT_EQ(barrier.state(), hy::BarrierState::Reconciled);
+    }
+
     // Polls the supervisor on THIS thread (the hot thread) until `pred` holds.
     template <typename Pred>
     bool poll_until(Supervisor& sup, Pred pred, int timeout_ms = 5000) {
@@ -1226,5 +1245,187 @@ TEST_F(WsApiFactoryTest, APlannedRolloverReplacesTheConnectionAndSignsAgain) {
     const std::vector<std::string> frames = only(server_->received_frames(), &is_subscribe);
     ASSERT_GE(frames.size(), 2U);
     EXPECT_NE(frames[0], frames[1]);
+    sup.shutdown();
+}
+
+// --- M3a: the reconnect barrier fed by a REAL generation ---------------------------------------------------------------
+//
+// test_reconnect_barrier.cpp and test_submit_readiness.cpp pin the state machine against scripted sessions. These run the same adapter
+// (make_feed_observation) against the real WebSocket API session on the loopback server, so a mismatch between what the session reports and what
+// the adapter reads -- a renamed accessor, a clock in the wrong domain, a counter that does not count -- fails here.
+
+TEST_F(WsApiFactoryTest, TheFeedObservationOfARealGenerationIsConnectedOnceItsStreamIsVerified) {
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    const hy::FeedObservation before = observe_now(sup);
+    EXPECT_FALSE(before.connected) << "nothing started";
+    EXPECT_EQ(before.generation, 0U);
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.healthy(); }));
+    const hy::FeedObservation o = observe_now(sup);
+    EXPECT_TRUE(o.connected);
+    EXPECT_EQ(o.generation, 1U);
+    EXPECT_GT(o.last_activity_ms, 0);
+    EXPECT_LT(o.sampled_at_ms - o.last_activity_ms, 5000) << "the session's activity clock and the observation's clock are in the same domain";
+    EXPECT_EQ(o.ring_drops, 0U);
+    EXPECT_EQ(o.lost_events, 0U);
+    sup.shutdown();
+}
+
+TEST_F(WsApiFactoryTest, AGenerationIsNotConnectedForTheBarrierWhileItsStreamIsUnverified) {
+    // The server confirms the subscription but never answers the listing: the session is not connected, the supervisor is Connecting.
+    answer_verify_with([](std::uint64_t) { return std::vector<std::string>{}; });
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.generation() == 1U && sup.current() != nullptr && sup.current()->subscription_id() == 0; }));
+    for (int i = 0; i < 20; ++i) {
+        sup.poll(steady_ms());
+        const hy::FeedObservation o = observe_now(sup);
+        EXPECT_FALSE(o.connected) << "subscribed but not verified is not connected";
+        EXPECT_EQ(o.generation, 1U);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    sup.shutdown();
+}
+
+TEST_F(WsApiFactoryTest, ALostExecutionReportReachesTheBarrierAsASoftBarrier) {  // F5
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.healthy(); }));
+    hy::ReconnectBarrier barrier;
+    reconcile(barrier, sup);
+
+    std::string no_order_id(samples::kEventExecutionReport);
+    const std::string c = R"("c":"mUvoqJxFIILMdfAW5iGSOW",)";
+    const auto p = no_order_id.find(c);
+    ASSERT_NE(p, std::string::npos);
+    no_order_id.erase(p, c.size());
+    server_->send_text(no_order_id);
+    ASSERT_TRUE(wait_until([&] { return sup.current()->lost_events() == 1U; }));
+
+    barrier.observe(observe_now(sup));
+    EXPECT_EQ(barrier.state(), hy::BarrierState::Sweeping);
+    EXPECT_EQ(barrier.stats().soft_barriers, 1U);
+    EXPECT_EQ(sup.generation(), 1U) << "no reconnect";
+    sup.shutdown();
+}
+
+TEST_F(WsApiFactoryTest, ADroppedEventReachesTheBarrierAsASoftBarrier) {  // F5
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.healthy(); }));
+    hy::ReconnectBarrier barrier;
+    reconcile(barrier, sup);
+
+    for (int i = 0; i < 100; ++i) server_->send_text(std::string(samples::kEventBalanceUpdate));  // the ring holds 64 and nobody drains it
+    ASSERT_TRUE(wait_until([&] { return sup.current()->ring_drops() > 0U; }));
+
+    barrier.observe(observe_now(sup));
+    EXPECT_EQ(barrier.state(), hy::BarrierState::Sweeping);
+    EXPECT_EQ(barrier.stats().soft_barriers, 1U);
+    EXPECT_EQ(sup.generation(), 1U);
+    sup.shutdown();
+}
+
+TEST_F(WsApiFactoryTest, ADrainedServerShutdownEndsTheGenerationAtOnceAndTheNextOneNeedsItsOwnSweep) {  // FI-011 + FI-043
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.healthy(); }));
+    hy::ReconnectBarrier barrier;
+    reconcile(barrier, sup);
+    ASSERT_EQ(barrier.reconciled_generation(), 1U);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    server_->send_text(kServerShutdown);
+    hy::InFlightRegistry in_flight;
+    hy::AuditRingSink audit;
+    // The consumer drains the ring through the real drain, with the barrier. No supervisor poll in between: the barrier learns of the end
+    // from the EVENT, before anything has noticed the session stopping.
+    ASSERT_TRUE(wait_until([&] {
+        hy::drain_user_data_events(in_flight, &audit, ring_, system_now_ms(), nullptr, nullptr, &barrier);
+        return barrier.state() == hy::BarrierState::Down;
+    }));
+    EXPECT_EQ(barrier.stats().generation_ends_seen, 1U);
+    EXPECT_EQ(barrier.reconciled_generation(), 0U);
+    barrier.observe(observe_now(sup));  // generation 1 may still look connected for a moment: that must not bring the barrier back
+    EXPECT_EQ(barrier.state(), hy::BarrierState::Down);
+
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.generation() == 2U && sup.healthy(); })) << "generation " << sup.generation();
+    barrier.observe(observe_now(sup));
+    EXPECT_EQ(barrier.state(), hy::BarrierState::Sweeping) << "the new generation is connected and verified, and not swept";
+    EXPECT_EQ(barrier.generation(), 2U);
+    const std::optional<std::uint64_t> epoch = barrier.take_sweep_request(Session::steady_now_ms());
+    ASSERT_TRUE(epoch.has_value());
+    barrier.on_sweep_report(hy::SweepReport{*epoch, 0U, true}, Session::steady_now_ms());
+    EXPECT_EQ(barrier.state(), hy::BarrierState::Reconciled);
+    EXPECT_EQ(barrier.reconciled_generation(), 2U);
+    sup.shutdown();
+}
+
+TEST_F(WsApiFactoryTest, ADroppedConnectionIsDownAtOnceAndTheNextGenerationNeedsItsOwnSweep) {  // FI-043
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.healthy(); }));
+    hy::ReconnectBarrier barrier;
+    reconcile(barrier, sup);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    server_->drop_all();
+    // Between the drop and the supervisor's next poll the session stops by itself: from that moment the barrier must say Down.
+    ASSERT_TRUE(wait_until([&] {
+        barrier.observe(observe_now(sup));
+        return barrier.state() == hy::BarrierState::Down;
+    }));
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.generation() == 2U && sup.healthy(); })) << "generation " << sup.generation();
+    barrier.observe(observe_now(sup));
+    EXPECT_EQ(barrier.state(), hy::BarrierState::Sweeping);
+    sup.shutdown();
+}
+
+TEST_F(WsApiFactoryTest, ASilentRealConnectionIsDeclaredDeadStoppedAndReplaced) {  // FI-020
+    hy::BarrierPolicy policy;
+    policy.stale_after_ms = 300;  // stands in for the production minute
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.healthy(); }));
+    hy::ReconnectBarrier barrier(policy);
+    reconcile(barrier, sup);
+
+    // The TCP connection stays open and the server says nothing at all: no data frame, no ping.
+    ASSERT_TRUE(wait_until([&] {
+        barrier.observe(observe_now(sup));
+        return barrier.state() == hy::BarrierState::Down;
+    }));
+    EXPECT_EQ(barrier.stats().stale_heartbeats, 1U);
+    EXPECT_TRUE(barrier.take_stop_request());
+    const std::shared_ptr<Session> silent = sup.current();
+    ASSERT_NE(silent, nullptr);
+    EXPECT_FALSE(silent->stopped()) << "the connection is open; only the heartbeat says it is dead";
+
+    silent->stop();  // what the loop does with the barrier's stop request
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.generation() == 2U && sup.healthy(); })) << "generation " << sup.generation();
+    barrier.observe(observe_now(sup));
+    EXPECT_EQ(barrier.state(), hy::BarrierState::Sweeping) << "the replacement starts unswept";
+    sup.shutdown();
+}
+
+TEST_F(WsApiFactoryTest, PingsKeepAQuietRealConnectionAlive) {  // FI-020, the other half: a quiet account has no events at all
+    hy::BarrierPolicy policy;
+    policy.stale_after_ms = 500;
+    hy::WsApiSessionFactory factory(deps(), endpoint());
+    Supervisor sup([&factory](std::uint64_t g) { return factory(g); }, fast_policy());
+    ASSERT_TRUE(poll_until(sup, [&] { return sup.healthy(); }));
+    hy::ReconnectBarrier barrier(policy);
+    reconcile(barrier, sup);
+
+    const std::int64_t until = Session::steady_now_ms() + 1500;  // three times the staleness bound, pinged every 50 ms
+    while (Session::steady_now_ms() < until) {
+        server_->ping_all();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        barrier.observe(observe_now(sup));
+        ASSERT_EQ(barrier.state(), hy::BarrierState::Reconciled) << "a ping is a sign of life";
+    }
+    EXPECT_EQ(barrier.stats().stale_heartbeats, 0U);
+    EXPECT_FALSE(barrier.take_stop_request());
+    EXPECT_EQ(sup.generation(), 1U);
     sup.shutdown();
 }

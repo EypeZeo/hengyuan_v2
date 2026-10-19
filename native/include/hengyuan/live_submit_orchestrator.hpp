@@ -7,6 +7,9 @@
 // ADR-019 D1–D12 gate chain enforced in sequence:
 //   1. Audit sink available (D10)
 //   2. Kill switch Normal (D3 清单 B-1, D9)
+//  2b. SubmitReadyToken (private-stream migration M3a, submit_readiness.hpp): the startup recovery is Ready, the private user-data stream is a
+//      connected, verified subscription that has been swept (ReconnectBarrier Reconciled), a signing timestamp can be issued. Unwired = refused.
+//      Placed after 1 and 2 so the audit sink can record a refusal and the kill-switch gate keeps its own observable value.
 //   3. Dry-run evidence 4/4 + consistent build (D11)
 //   4. Signer ready (D3 清单 B-5)
 //   5. Depth synced (D3 清单 B-3)
@@ -37,6 +40,7 @@
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
+#include <hengyuan/submit_readiness.hpp>
 #include <hengyuan/transport_policy.hpp>
 
 #include <cstdint>
@@ -247,12 +251,20 @@ enum class OrchestratorGate : std::uint8_t {
     // same way (fail closed, no transition, no release), so a single value is
     // enough; docs/SPEC_INVARIANTS.md's Phase 3 section has the full reasoning.
     AuditWriteNotAcked = 22,
+    // Private-stream migration M3a (design 5.4), appended after the spec's last value: Gate 2b found no SubmitReadyToken -- the readiness is not
+    // wired, or the stream / startup recovery / clock / kill switch does not allow an order right now. OrchestratorResult::not_ready_reason says
+    // which. Nothing was written to the durable log and nothing was sent.
+    NotReady = 23,
 };
 
 struct OrchestratorResult {
     OrchestratorGate gate{OrchestratorGate::Passed};
     OrderRecord order{};
     PreTradeCheck pre_trade_detail{PreTradeCheck::Ok};
+    // Appended (M3a). Set when gate == NotReady; None otherwise.
+    NotReadyReason not_ready_reason{NotReadyReason::None};
+    // Appended (M3a). The stream generation the SubmitReadyToken rested on; 0 when no token was obtained (a call that stopped before Gate 2b).
+    std::uint64_t ready_generation{0};
 };
 
 // --- Orchestrator context (all dependencies injected) ---
@@ -298,6 +310,12 @@ struct OrchestratorContext {
     // convention as reconcile_events above -- unset means orchestrate_submit() behaves exactly
     // as before (no WS event draining).
     UserDataWsEventRing* user_data_events{nullptr};
+
+    // Private-stream migration M3a (submit_readiness.hpp). UNLIKE the nullable fields around it, an unset readiness does NOT mean "behave as before":
+    // Gate 2b refuses every order (OrchestratorGate::NotReady, NotReadyReason::Unwired). Owned by the hot/submit thread and outliving every call (it
+    // owns the ReconnectBarrier, whose state spans calls). The same barrier filters the user-data events drained above: once Reconciled(G), an event of
+    // an older generation is dropped. test_submit_readiness_guard.cpp pins that every OrchestratorContext built under include/ and src/ sets it.
+    SubmitReadiness* readiness{nullptr};
 
     // TODO 1A.3 follow-up (minimal PositionTruth). Nullable, defaults to
     // nullptr for the same backward-compatibility reason as to_reconcile/
@@ -374,7 +392,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // fold-in to be visible to that gate in the SAME call -- not just a style convention anymore.
     if (ctx.in_flight && ctx.user_data_events) {
         drain_user_data_events(*ctx.in_flight, ctx.audit, *ctx.user_data_events, ctx.now_ms,
-                                ctx.position_truth, ctx.fill_context);
+                                ctx.position_truth, ctx.fill_context,
+                                ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr);
     }
 
     // Gate 1: Audit available
@@ -393,6 +412,32 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.set_detail("kill switch not Normal");
         ctx.audit->append(ar);
         return result;
+    }
+
+    // Gate 2b (private-stream migration M3a, design 5.4): a SubmitReadyToken, or no order. After the two gates above on purpose: the audit sink must
+    // be able to record the refusal, and a tripped kill switch keeps reporting itself as KillSwitchNotNormal. The token is the proof that this ran;
+    // its generation travels back in the result. Unwired is a refusal, not a pass-through (the reverse of the nullable fields above).
+    {
+        NotReadyReason why = NotReadyReason::Unwired;
+        std::optional<SubmitReadyToken> ready_token;
+        if (ctx.readiness != nullptr) {
+            ReadinessResult readiness_result = ctx.readiness->authorize(ctx.now_ms);
+            ready_token = std::move(readiness_result.token);
+            why = readiness_result.reason;
+        }
+        if (!ready_token) {
+            result.gate = OrchestratorGate::NotReady;
+            result.not_ready_reason = why;
+            AuditRecord ar{};
+            ar.timestamp_ms = ctx.now_ms;
+            ar.event_type = AuditEventType::PreflightFailed;
+            ar.mode = ctx.mode;
+            ar.detail_code = static_cast<std::int64_t>(why);
+            ar.set_detail(not_ready_reason_name(why));  // a string literal: no formatting, no allocation
+            ctx.audit->append(ar);
+            return result;
+        }
+        result.ready_generation = ready_token->generation();
     }
 
     // Gate 3: Dry-run evidence 4/4 + consistent build

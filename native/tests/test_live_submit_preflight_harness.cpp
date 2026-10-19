@@ -23,6 +23,7 @@
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/synthetic_readiness.hpp>
 
 #include <array>
 #include <cstring>
@@ -91,6 +92,7 @@ void remove_durable_audit_files(const std::string& base_path) {
 struct Fixture {
     AuditRingSink audit;
     KillSwitch kill_switch;
+    SyntheticReadiness synthetic_readiness{kill_switch};  // Gate 2b (private-stream migration M3a)
     DryRunEvidenceChain evidence;
     SpotRateLimitTracker rate_limiter;
     InFlightRegistry in_flight;
@@ -146,6 +148,7 @@ struct Fixture {
 
         ctx.audit = &audit;
         ctx.kill_switch = &kill_switch;
+        ctx.readiness = &synthetic_readiness.readiness();
         ctx.evidence = &evidence;
         ctx.signer_ready = true;
         ctx.depth_synced = true;
