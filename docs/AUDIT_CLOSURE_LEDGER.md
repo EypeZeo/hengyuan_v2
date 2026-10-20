@@ -153,9 +153,9 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-006** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-007** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-008** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-009** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-009** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 62c4647 |
 | **FI-010** | PRE_OWNER_LIVE | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-011** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-011** | PRE_OWNER_LIVE | L2 | PARTIAL | NOT_RUN | BLOCKED | 62c4647 |
 | **FI-012** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-013** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-014** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -164,7 +164,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-017** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-018** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-019** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-020** | PRE_OWNER_LIVE | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-020** | PRE_OWNER_LIVE | L2 | PARTIAL | NOT_RUN | BLOCKED | 62c4647 |
 | **FI-021** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-022** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-023** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -187,17 +187,17 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-040** | PRE_D3 | L1 | IMPLEMENTED | PASS | PASS | a0a7eed |
 | **FI-041** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-042** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-043** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-043** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 62c4647 |
 | **FI-044** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-045** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 28 | 4 | 17 | 7 | BLOCKED |
-| PRE_OWNER_LIVE | 13 | 0 | 1 | 12 | BLOCKED |
+| PRE_D3 | 28 | 4 | 19 | 5 | BLOCKED |
+| PRE_OWNER_LIVE | 13 | 0 | 3 | 10 | BLOCKED |
 | CANARY | 4 | 0 | 0 | 4 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 23，PARTIAL 18，IMPLEMENTED 4，合计 45，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 19，PARTIAL 22，IMPLEMENTED 4，合计 45，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -874,13 +874,13 @@ gate_tag: PRE_D3
 scope: 按产品
 stage: 1A
 level: L1
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
-open: absent:native/include/hengyuan/*.hpp#ReconnectBarrier
-refs: test:native/tests/test_durable_control_plane_abi.cpp#StaleGenerationDoesNotReleaseReusedSlot test:native/tests/test_binance_ws_api_user_data_session.cpp#SubscribesOnceAndDeliversEventsStampedWithTheGenerationAndTheSubscription
-note: 现有“代次”测试里的 `StaleGenerationDoesNotReleaseReusedSlot` 说的是在途槽位的代次，不是连接代次。私网流迁移 M2 起，新的 WS API 会话给它交付的每个事件都盖上自己的连接代次（`UserDataWsEvent::generation`，回环测试覆盖）；但“对账屏障完成后按连接代次过滤迟到事件”不存在（M3）。
+baseline: 62c4647
+open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation
+refs: test:native/tests/test_durable_control_plane_abi.cpp#StaleGenerationDoesNotReleaseReusedSlot test:native/tests/test_binance_ws_api_user_data_session.cpp#SubscribesOnceAndDeliversEventsStampedWithTheGenerationAndTheSubscription test:native/tests/test_reconnect_barrier.cpp#AnEventOfAnOlderGenerationIsDroppedAndCountedOnceReconciled test:native/tests/test_binance_user_data_event.cpp#AnOlderGenerationsFillIsDroppedOnceTheNewGenerationIsReconciled test:native/tests/test_binance_user_data_event.cpp#ARotationEndToEnd
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：现有“代次”测试里的 `StaleGenerationDoesNotReleaseReusedSlot` 说的是在途槽位的代次，不是连接代次。私网流迁移 M2 起，新的 WS API 会话给每个事件盖上自己的连接代次（`UserDataWsEvent::generation`）；M3a 起，`ReconnectBarrier::admit_event()` 经 `drain_user_data_events()` 在某一代次对账完成（Reconciled）后丢弃更旧代次的事件并计数、完成之前照常合并（状态机表、排空接线与轮换全程测试覆盖）。仍缺：对账清扫在热线程与对账线程之间的传输（M3b）、任何运行中的进程把真实会话读进屏障（M5），也没有“代次日志”产物，没有对真实端点验证过。
 ```
 
 ```ledger
@@ -906,13 +906,13 @@ gate_tag: PRE_OWNER_LIVE
 scope: 现货
 stage: 1A
 level: L2
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
-open: absent:native/include/hengyuan/*.hpp#ReconnectBarrier
-refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownLeadsToAFreshSignedGeneration test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownAfterTheSubscriptionIsDeliveredAndEndsTheGeneration
-note: 旧的 listenKey 会话和公共行情会话都不处理服务端关闭事件。私网流迁移 M2 起，新的 WS API 会话把 serverShutdown 先交付进事件环再结束本代，监督器随后用新的签名请求开新一代（回环测试覆盖）；但“新代次对账收敛后才放行”的重连屏障不存在（M3），也没有对真实端点验证过。
+baseline: 62c4647
+open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation
+refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownLeadsToAFreshSignedGeneration test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownAfterTheSubscriptionIsDeliveredAndEndsTheGeneration test:native/tests/test_binance_ws_api_user_data_session.cpp#ADrainedServerShutdownEndsTheGenerationAtOnceAndTheNextOneNeedsItsOwnSweep test:native/tests/test_reconnect_barrier.cpp#ServerShutdownEndsTheGenerationBeforeTheSupervisorNoticesAnything test:native/tests/test_binance_user_data_event.cpp#ServerShutdownEndsItsGenerationAtOnce
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：旧的 listenKey 会话和公共行情会话都不处理服务端关闭事件。私网流迁移 M2 起，新的 WS API 会话把 serverShutdown 先交付进事件环再结束本代，监督器随后用新的签名请求开新一代（回环测试覆盖）；M3a 起，`drain_user_data_events()` 读到 serverShutdown / eventStreamTerminated 就让 `ReconnectBarrier::on_generation_ended()` 立刻把本代记为结束（监督器还没发现会话停止时屏障已是 Down，且该代次此后不会因会话仍显示已连接而回来），新代次必须自己的清扫完成才放行（状态机表、排空接线与真实回环会话测试覆盖）。仍缺：清扫传输（M3b）与进程接线（M5），也没有“重连日志”产物，没有对真实端点验证过。
 ```
 
 ```ledger
@@ -1047,13 +1047,13 @@ gate_tag: PRE_OWNER_LIVE
 scope: 全部
 stage: 1A
 level: L2
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
-open: absent:native/include/hengyuan/*.hpp#data_stale
-refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#PingFramesAreCountedAndKeepTheActivityClockMoving
-note: 会话有空闲超时旋钮、监督器有重连退避，但没有“数据状态陈旧”标志，也没有对应判据的测试。私网流迁移 M2 起，新的 WS API 会话暴露 `last_activity_steady_ms()`（数据帧与服务端 ping 控制帧都会刷新）和 ping 计数，这是判据的输入；判据本身（超过多久无活动即陈旧并回到 Down）不存在（M3）。
+baseline: 62c4647
+open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation
+refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#PingFramesAreCountedAndKeepTheActivityClockMoving test:native/tests/test_binance_ws_api_user_data_session.cpp#ASilentRealConnectionIsDeclaredDeadStoppedAndReplaced test:native/tests/test_binance_ws_api_user_data_session.cpp#PingsKeepAQuietRealConnectionAlive test:native/tests/test_reconnect_barrier.cpp#ASilentConnectionIsDeadWhateverTcpSaysAndTheLoopIsToldToStopIt test:native/tests/test_submit_readiness.cpp#ASilentConnectionIsRefusedStoppedAndReplacedByAnUnsweptGeneration
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：会话有空闲超时旋钮、监督器有重连退避。私网流迁移 M2 起，新的 WS API 会话暴露 `last_activity_steady_ms()`（数据帧与服务端 ping 控制帧都会刷新）和 ping 计数；M3a 起，`ReconnectBarrier` 以 `stale_after_ms`（默认 60 秒，即三个 ping 间隔）为判据：这么久没有任何帧就判定连接已死、回到 Down，并通过 `take_stop_request()` 让循环停掉这条会话、由监督器开新一代（新一代从“未清扫”开始）；有服务端 ping 的安静账户不会被误判（状态机表、监督器端到端与真实回环会话测试覆盖，含边界与分钟级判据的缩放）。仍缺：主循环里真正执行这一步的进程（M5）与“数据状态日志”产物，没有对真实端点验证过。
 ```
 
 ```ledger
@@ -1402,13 +1402,13 @@ gate_tag: PRE_D3
 scope: 按产品
 stage: 1A
 level: L1
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
-baseline: 6cb56bd
-open: absent:native/include/hengyuan/*.hpp#ReconnectBarrier open:native/include/hengyuan/binance_private_rest.hpp#create_listen_key
-refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#EveryGenerationSignsAgainAndNeverReplaysAnOldRequest
-note: 私网流迁移 M2 起，树内有订阅式会话（`BinanceWsApiUserDataSession`，签名订阅，每个代次重新签名、不重放旧请求；回环测试覆盖），但它没有接入任何运行中的进程；旧的 listenKey 路径仍在树里（M5 删除）；重连屏障与发单就绪门不存在（M3）。
+baseline: 62c4647
+open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation open:native/include/hengyuan/binance_private_rest.hpp#create_listen_key
+refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#EveryGenerationSignsAgainAndNeverReplaysAnOldRequest test:native/tests/test_reconnect_barrier.cpp#ARotationRunsDownThenSweepingThenReconciledInThatOrder test:native/tests/test_submit_readiness.cpp#ARotationBlocksFromTheMomentTheOldConnectionIsGoneUntilTheNewOneIsSwept test:native/tests/test_live_submit_orchestrator.cpp#AGenerationChangeRefusesEveryOrderUntilItsSweepIsAnswered test:native/tests/test_binance_ws_api_user_data_session.cpp#ADroppedConnectionIsDownAtOnceAndTheNextGenerationNeedsItsOwnSweep
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：私网流迁移 M2 起，树内有订阅式会话（`BinanceWsApiUserDataSession`，签名订阅，每个代次重新签名、不重放旧请求；回环测试覆盖）；M3a 起，`ReconnectBarrier`（Down / Sweeping / Reconciled(G)）与 `SubmitReadiness`/`SubmitReadyToken` 存在，`orchestrate_submit()` 的 Gate 2b 在没有令牌时拒单（`OrchestratorGate::NotReady`，未接线同样拒单）：代次变化时从旧连接消失起就拒单，直到新代次自己的清扫回报（状态机表、监督器端到端、编排器与真实回环会话测试覆盖）。但它们没有接入任何运行中的进程（M5），清扫的跨线程传输不存在（M3b），旧的 listenKey 路径仍在树里（M5 删除），也没有“重连屏障轨迹”产物。
 ```
 
 ```ledger

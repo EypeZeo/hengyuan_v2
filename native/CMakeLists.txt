@@ -1060,6 +1060,35 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_ws_api_signing_guard)
     gtest_discover_tests(test_ws_api_signing_guard)
 
+    # Private-stream migration M3a (docs/PRIVATE_STREAM_MIGRATION_DESIGN.md 5.2-5.4): "may a NEW order leave while the private stream is anything
+    # less than a connected, verified, swept subscription?". reconnect_barrier.hpp is the pure state machine (no clock, no I/O: observations in, a
+    # state out); submit_readiness.hpp turns it, the startup recovery, the kill switch and the clock into a SubmitReadyToken that
+    # orchestrate_submit() (Gate 2b) requires; feed_observation.hpp reads a PublicFeedSupervisor into the barrier's input. All of it is
+    # Boost- and OpenSSL-free on purpose -- the TSan job builds without HY_BUILD_DEMO -- and single-threaded (hot-thread owned), so none of
+    # these targets carries the `concurrency` label. test_reconnect_barrier is an exhaustive state x event table plus a 300 000-step random walk
+    # checking the invariants after every step (FI-009/011/020/043); test_submit_readiness drives the readiness against a REAL
+    # PublicFeedSupervisor with scripted sessions (rotation, 24 h rollover, a silent connection, a dropped event).
+    add_executable(test_reconnect_barrier tests/test_reconnect_barrier.cpp)
+    target_link_libraries(test_reconnect_barrier PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_reconnect_barrier)
+    gtest_discover_tests(test_reconnect_barrier)
+
+    add_executable(test_submit_readiness tests/test_submit_readiness.cpp)
+    target_link_libraries(test_submit_readiness PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_submit_readiness)
+    gtest_discover_tests(test_submit_readiness)
+
+    # M3a guard: every OrchestratorContext built under include/ and src/ sets a reviewed readiness (an unset one refuses every order),
+    # SyntheticReadiness is used only by the listed drills and harnesses, SubmitReadyToken has one mint site and one friend, and every
+    # drain_user_data_events() call is pinned with its barrier argument. It reads the source tree, so the native/ directory is a compile
+    # definition and the target needs nothing else (same shape as the guards above).
+    add_executable(test_submit_readiness_guard tests/test_submit_readiness_guard.cpp)
+    target_link_libraries(test_submit_readiness_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_submit_readiness_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_submit_readiness_guard)
+    gtest_discover_tests(test_submit_readiness_guard)
+
     # Real two-thread stress for the lock-free SPSC primitives. Labelled
     # "concurrency" so the TSan CI job can select just these (`ctest -L
     # concurrency`) — building all 27 test binaries under TSan triples the job

@@ -130,6 +130,12 @@ SEARCH_FILES = [
     # members (AppendFn/FencedFn) with it -- the same "a symbol can only drift unnoticed in a file nobody looks
     # at" gap every entry above closes.
     REPO_ROOT / "native" / "include" / "hengyuan" / "durable_order_audit_port.hpp",
+    # Private-stream migration M3a (docs/SPEC_INVARIANTS.md "SubmitOutcome / OrchestratorGate", NotReady = 23): the reconnect barrier, the
+    # readiness token and its synthetic twin are new load-bearing symbols (FeedObservation, NotReadyReason's enumerators, SubmitReadyToken,
+    # SyntheticReadiness) -- the same "a symbol can only drift unnoticed in a file nobody looks at" gap every entry above closes.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "reconnect_barrier.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "submit_readiness.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "synthetic_readiness.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

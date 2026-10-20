@@ -9,16 +9,22 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_user_data_event.hpp>
 
+#include <cstdint>
 #include <cstring>
+#include <optional>
 
 using hy::AuditEventType;
 using hy::AuditRingSink;
+using hy::BarrierState;
 using hy::drain_user_data_events;
+using hy::FeedObservation;
 using hy::InFlightRegistry;
 using hy::kClientOrderIdLen;
 using hy::OrderFillContext;
 using hy::OrderSide;
 using hy::PositionTruth;
+using hy::ReconnectBarrier;
+using hy::SweepReport;
 using hy::UserDataEventKind;
 using hy::UserDataWsEvent;
 using hy::UserDataWsEventRing;
@@ -255,4 +261,253 @@ TEST_F(DrainUserDataEventsFoldInTest, NullPositionTruthAndFillContextIsUnchanged
     EXPECT_EQ(audit_.last()->exchange_order_id, 42);
     EXPECT_EQ(audit_.last()->symbol_id, 0u);
     EXPECT_EQ(audit_.last()->filled_qty_ticks, 0);
+}
+
+// --- Private-stream migration M3a: the ReconnectBarrier filter of drain_user_data_events() ---------------------------------
+//
+//   FI-009  an event stamped with an OLDER generation than the one the barrier has Reconciled is dropped (and counted); until then it is merged
+//   FI-011  a serverShutdown / eventStreamTerminated event ends its generation at once, whatever the supervisor still says
+//   FI-043  ... and the generation after it starts from "not swept"
+// The barrier's own state machine is pinned in test_reconnect_barrier.cpp; this is the wiring: what the drain feeds it, and what it lets through.
+
+namespace {
+
+FeedObservation barrier_feed(std::uint64_t generation) {
+    FeedObservation o{};
+    o.generation = generation;
+    o.connected = true;
+    o.last_activity_ms = 1000;
+    o.sampled_at_ms = 1000;
+    return o;
+}
+
+// Subscribed to `generation` and swept: Reconciled(generation).
+ReconnectBarrier reconciled_barrier(std::uint64_t generation) {
+    ReconnectBarrier b;
+    b.observe(barrier_feed(generation));
+    if (const std::optional<std::uint64_t> epoch = b.take_sweep_request(1000)) {
+        b.on_sweep_report(SweepReport{*epoch, 0U, true}, 1000);
+    }
+    return b;
+}
+
+class DrainUserDataEventsBarrierTest : public DrainUserDataEventsFoldInTest {
+protected:
+    ReconnectBarrier barrier_;
+
+    void push_report(const char* coid, const char* z, const char* quote_z, std::uint64_t generation) {
+        UserDataWsEvent ev{};
+        ev.kind = UserDataEventKind::ExecutionReport;
+        std::strncpy(ev.coid.id, coid, kClientOrderIdLen);
+        set_raw(ev.cumulative_filled_qty_raw, z);
+        set_raw(ev.cumulative_quote_qty_raw, quote_z);
+        ev.generation = generation;
+        ASSERT_TRUE(events_.try_push(ev));
+    }
+
+    void push_kind(UserDataEventKind kind, std::uint64_t generation) {
+        UserDataWsEvent ev{};
+        ev.kind = kind;
+        ev.generation = generation;
+        ASSERT_TRUE(events_.try_push(ev));
+    }
+
+    void drain_with_barrier() {
+        drain_user_data_events(in_flight_, &audit_, events_, 2000, &position_truth_, &fill_context_, &barrier_);
+    }
+};
+
+}  // namespace
+
+TEST_F(DrainUserDataEventsBarrierTest, AnOlderGenerationsFillIsDroppedOnceTheNewGenerationIsReconciled) {  // FI-009
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    barrier_ = reconciled_barrier(2);
+    push_report("HY-A", "30", "3000", /*generation=*/1);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 0) << "the sweep that made generation 2 Reconciled already reflects whatever generation 1 said";
+    EXPECT_EQ(audit_.count(), 0u);
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 1u);
+
+    push_report("HY-A", "30", "3000", /*generation=*/2);
+    drain_with_barrier();
+
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 30);
+    EXPECT_NE(audit_.count(), 0u);
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 1u) << "the current generation's own event is not late";
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, ANewerGenerationsFillIsNotLate) {
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    barrier_ = reconciled_barrier(2);
+    push_report("HY-A", "30", "3000", /*generation=*/3);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 30);
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 0u);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, AnOlderGenerationsFillIsStillMergedWhileTheNewGenerationIsBeingSwept) {  // FI-009
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    barrier_.observe(barrier_feed(2));  // generation 2 is subscribed; its sweep has not been answered
+    ASSERT_EQ(barrier_.state(), BarrierState::Sweeping);
+    push_report("HY-A", "30", "3000", /*generation=*/1);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 30) << "before Reconciled nothing says the sweep has seen this fill: merge it (positive deltas only)";
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 0u);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, AnOlderGenerationsFillIsStillMergedWhileTheBarrierIsDown) {
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    push_report("HY-A", "30", "3000", /*generation=*/1);  // the barrier has seen nothing at all
+
+    drain_with_barrier();
+
+    EXPECT_EQ(barrier_.state(), BarrierState::Down);
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 30);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, AnUnstampedEventIsAlwaysMerged) {
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    barrier_ = reconciled_barrier(5);
+    push_report("HY-A", "30", "3000", /*generation=*/0);  // the retired listenKey session never stamps a generation
+
+    drain_with_barrier();
+
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 30);
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 0u);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, EveryKindOfOlderEventIsCountedNotOnlyFills) {
+    barrier_ = reconciled_barrier(3);
+    push_kind(UserDataEventKind::BalanceUpdate, 1);
+    push_kind(UserDataEventKind::OutboundAccountPosition, 2);
+    push_kind(UserDataEventKind::ListStatus, 2);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 3u);
+    EXPECT_EQ(barrier_.state(), BarrierState::Reconciled);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, ServerShutdownEndsItsGenerationAtOnce) {  // FI-011
+    barrier_ = reconciled_barrier(1);
+    push_kind(UserDataEventKind::ServerShutdown, /*generation=*/1);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(barrier_.state(), BarrierState::Down);
+    EXPECT_EQ(barrier_.reconciled_generation(), 0u);
+    EXPECT_EQ(barrier_.stats().generation_ends_seen, 1u);
+    // The session still looks connected for a moment (the supervisor has not polled): that must not bring the barrier back.
+    barrier_.observe(barrier_feed(1));
+    EXPECT_EQ(barrier_.state(), BarrierState::Down);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, EventStreamTerminatedEndsItsGenerationToo) {  // FI-011
+    barrier_ = reconciled_barrier(1);
+    push_kind(UserDataEventKind::EventStreamTerminated, /*generation=*/1);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(barrier_.state(), BarrierState::Down);
+    barrier_.observe(barrier_feed(1));
+    EXPECT_EQ(barrier_.state(), BarrierState::Down);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, OtherEventsDoNotEndAGeneration) {
+    barrier_ = reconciled_barrier(1);
+    push_kind(UserDataEventKind::BalanceUpdate, 1);
+    push_kind(UserDataEventKind::OutboundAccountPosition, 1);
+    push_kind(UserDataEventKind::ExternalLockUpdate, 1);
+    push_kind(UserDataEventKind::ListStatus, 1);
+    push_kind(UserDataEventKind::ListenKeyExpired, 1);
+    push_kind(UserDataEventKind::Unknown, 1);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(barrier_.state(), BarrierState::Reconciled);
+    EXPECT_EQ(barrier_.stats().generation_ends_seen, 0u);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, TheEndOfAnOlderGenerationLeavesTheCurrentOneAlone) {
+    barrier_ = reconciled_barrier(2);
+    push_kind(UserDataEventKind::ServerShutdown, /*generation=*/1);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(barrier_.state(), BarrierState::Reconciled);
+    EXPECT_EQ(barrier_.stats().generation_ends_seen, 0u);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, AnUnstampedShutdownSaysNothingAboutThisStream) {
+    barrier_ = reconciled_barrier(2);
+    push_kind(UserDataEventKind::ServerShutdown, /*generation=*/0);
+
+    drain_with_barrier();
+
+    EXPECT_EQ(barrier_.state(), BarrierState::Reconciled);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, AFillBehindItsGenerationsShutdownInTheSameBatchIsStillApplied) {  // FI-011 + FI-009
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    barrier_ = reconciled_barrier(1);
+    push_report("HY-A", "10", "1000", 1);
+    push_kind(UserDataEventKind::ServerShutdown, 1);
+    push_report("HY-A", "20", "2000", 1);  // drained after the shutdown of its own generation: NOT late, the generation is over, not superseded
+
+    drain_with_barrier();
+
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 20);
+    EXPECT_EQ(barrier_.state(), BarrierState::Down);
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 0u);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, ARotationEndToEnd) {  // FI-043 + FI-011 + FI-009 through the drain
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    barrier_ = reconciled_barrier(1);
+
+    // generation 1 ends with a fill behind its shutdown
+    push_kind(UserDataEventKind::ServerShutdown, 1);
+    push_report("HY-A", "10", "1000", 1);
+    drain_with_barrier();
+    ASSERT_EQ(barrier_.state(), BarrierState::Down);
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 10);
+
+    // generation 2 connects: Sweeping until its sweep is answered
+    barrier_.observe(barrier_feed(2));
+    ASSERT_EQ(barrier_.state(), BarrierState::Sweeping);
+    push_report("HY-A", "20", "2000", 1);  // a straggler of generation 1 while the sweep is pending: merged
+    drain_with_barrier();
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 20);
+
+    const std::optional<std::uint64_t> epoch = barrier_.take_sweep_request(1000);
+    ASSERT_TRUE(epoch.has_value());
+    barrier_.on_sweep_report(SweepReport{*epoch, 0U, true}, 1000);
+    ASSERT_EQ(barrier_.state(), BarrierState::Reconciled);
+
+    // ... and once swept, a straggler of generation 1 is dropped, a fill of generation 2 is applied
+    push_report("HY-A", "30", "3000", 1);
+    drain_with_barrier();
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 20);
+    EXPECT_EQ(barrier_.stats().late_events_dropped, 1u);
+    push_report("HY-A", "30", "3000", 2);
+    drain_with_barrier();
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 30);
+}
+
+TEST_F(DrainUserDataEventsBarrierTest, ANullBarrierLeavesTheDrainExactlyAsItWas) {
+    track_order("HY-A", /*symbol_id=*/7, OrderSide::Buy);
+    push_kind(UserDataEventKind::ServerShutdown, 1);
+    push_report("HY-A", "30", "3000", /*generation=*/1);
+
+    drain_user_data_events(in_flight_, &audit_, events_, 2000, &position_truth_, &fill_context_, /*barrier=*/nullptr);
+
+    EXPECT_EQ(position_truth_.net_qty_ticks(7), 30);
+    EXPECT_EQ(barrier_.state(), BarrierState::Down) << "an unrelated barrier is not touched";
+    EXPECT_EQ(barrier_.stats().generation_ends_seen, 0u);
 }
