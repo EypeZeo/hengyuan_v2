@@ -23,7 +23,7 @@ pandas、Polars、DuckDB 与 `zstd -dc` 都能直接读取封存段（`scripts/e
 
 ```bash
 python3 -m hy_recorder run --config /etc/hy-recorder/recorder.toml   # 录制，直到 SIGTERM/SIGINT，然后优雅封存
-python3 -m hy_recorder verify --root <数据目录> [--json] [--no-hash]  # 离线校验；退出码 0 无失败，1 有失败
+python3 -m hy_recorder verify --root <数据目录> [--json] [--no-hash] [--acks <文件>]  # 离线校验；退出码 0 无失败，1 有失败
 python3 -m hy_recorder report --root <数据目录> [--json]               # 运行报告：速率、体量与 MB/天、桥接耗时、缺口、时钟偏差
 python3 -m hy_recorder status --root <数据目录>                        # 读 status.json
 python3 -m hy_recorder config-check --config <配置>                    # 校验配置并列出推导出的连接
@@ -63,6 +63,8 @@ python -m hy_recorder verify --root D:\data\hy-lake
 `pull` 逐段流式取回、核对大小与 SHA-256、fsync 后原子落地，**之后**才在主机写 `acks/<sha256>`；校验失败的段不回执、不落地。本地清单描述"本地归档持有什么"：主机事后清理的段，本地照常保留。
 
 定期维保（每日 pull、只读探测宿主机、阈值检查、每周完整 `verify`）由 `python -m hy_recorder maint --config maint.json` 完成，用 `tools/install_maint_task.ps1` 注册成 Windows 计划任务；布局、告警含义与处置见 [MAINTENANCE.md](MAINTENANCE.md)。
+
+交易所侧的单次丢包（账本无从解释，`verify` 因此判 FAIL，维保级别会一直是 CRIT）由操作员在数据湖根目录的 `acks.jsonl` 里逐条确认：只有三类连续性缺口可确认，一条确认只覆盖与它逐项相同的那一个缺口，写错的行本身判失败，没有对应缺口的确认报 WARN。规则见 [DATA_DICTIONARY.md](DATA_DICTIONARY.md) §6，流程见 [MAINTENANCE.md](MAINTENANCE.md)“已知缺口确认”。
 
 ## 已知限制与残留风险
 

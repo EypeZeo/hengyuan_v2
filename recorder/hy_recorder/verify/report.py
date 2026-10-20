@@ -3,7 +3,8 @@
 ``verify_lake`` never trusts the recorder's own ledger as evidence that data is fine: every
 continuity fact is re-derived from the raw records. The ledger is used only to *explain* a gap
 that the raw data already proves (a gap with no ledger explanation is a FAIL: "the ledger says
-nothing happened" is exactly the false-safety this tool exists to catch).
+nothing happened" is exactly the false-safety this tool exists to catch). The one thing that may still
+lower such a FAIL afterwards is an operator acknowledgement of that exact gap (``acks.py``), applied last.
 
 Exit code: 0 = no FAIL, 1 = at least one FAIL, 2 = the lake could not be read.
 """
@@ -19,6 +20,7 @@ from ..envelope import EnvelopeError, Record, decode_record
 from ..fsutil import sha256_file
 from ..ledger import Ledger
 from ..manifest import Manifest
+from .acks import ACK_FILE, apply_acks, load_acks
 from .reader import SegmentReader
 from .streams import (
     FAIL,
@@ -44,6 +46,7 @@ class Report:
     streams: dict[str, dict[str, Any]] = field(default_factory=dict)
     segments: dict[str, Any] = field(default_factory=dict)
     runs: dict[int, dict[str, Any]] = field(default_factory=dict)
+    acks: dict[str, Any] = field(default_factory=dict)
 
     def count(self, severity: str) -> int:
         return sum(1 for i in self.issues if i.severity == severity)
@@ -77,6 +80,7 @@ class Report:
             "streams": self.streams,
             "segments": self.segments,
             "runs": {str(k): v for k, v in sorted(self.runs.items())},
+            "acks": self.acks,
         }
 
     def render_text(self) -> str:
@@ -99,9 +103,18 @@ class Report:
             )
         for code, sev in sorted(self.by_code().items()):
             lines.append("  %-30s %s" % (code, ", ".join("%s=%d" % kv for kv in sorted(sev.items()))))
+        applied = self.acks.get("applied") or []
+        if applied:
+            lines.append("acknowledged: %d known gap(s): %s" % (len(applied), ", ".join(applied)))
         lines.append(
-            "RESULT: %s (FAIL=%d WARN=%d INFO=%d)"
-            % ("PASS" if self.exit_code == 0 else "FAIL", self.fail_count, self.count(WARN), self.count(INFO))
+            "RESULT: %s (FAIL=%d WARN=%d INFO=%d%s)"
+            % (
+                "PASS" if self.exit_code == 0 else "FAIL",
+                self.fail_count,
+                self.count(WARN),
+                self.count(INFO),
+                " ACKED=%d" % len(applied) if applied else "",
+            )
         )
         return "\n".join(lines)
 
@@ -179,7 +192,7 @@ def _subtract(hole: tuple[int, int], ranges: list[tuple[int, int]]) -> list[tupl
     return pieces
 
 
-def verify_lake(root: Path, *, check_hashes: bool = True) -> Report:
+def verify_lake(root: Path, *, check_hashes: bool = True, acks_path: Path | None = None) -> Report:
     root = Path(root)
     report = Report(root=str(root))
     issues = report.issues
@@ -382,6 +395,22 @@ def verify_lake(root: Path, *, check_hashes: bool = True) -> Report:
     for stream, run, gen, q in boundaries:
         if (run, gen, stream) not in opens:
             issues.append(Issue("GEN_BOUNDARY_UNEXPLAINED", FAIL, stream, run, q, gen))
+
+    # 5. operator acknowledgements, last: they only ever see what the ledger could not explain
+    ack_file = Path(acks_path) if acks_path is not None else root / ACK_FILE
+    acks, ack_issues = load_acks(ack_file)
+    issues.extend(ack_issues)
+    applied, unmatched = apply_acks(issues, acks)
+    for a in unmatched:
+        detail = {"id": a.id, "code": a.code, "line": a.line}
+        issues.append(Issue("ACK_UNMATCHED", WARN, a.stream, a.run, a.q, a.gen, detail))
+    report.acks = {
+        "file": ack_file.name,
+        "entries": len(acks),
+        "applied": applied,
+        "unmatched": [a.id for a in unmatched],
+        "invalid": len(ack_issues),
+    }
     return report
 
 
