@@ -131,10 +131,14 @@ public:
     SubmitReadiness& operator=(const SubmitReadiness&) = delete;
 
     // The loop's per-cycle refresh: pulls a fresh feed observation into the barrier (heartbeat watch, soft barriers, generation changes) even when
-    // no order is being sent. authorize() does not depend on it having run.
-    void observe() noexcept {
-        if (!probe_.is_valid()) return;
-        barrier_.observe(probe_.feed(probe_.user_data));
+    // no order is being sent. authorize() does not depend on it having run. Returns the steady-clock reading the observation was taken at -- the
+    // barrier's own time domain, for a caller that must hand it a "now" (the sweep pump) -- or nullopt when the probe is incomplete and nothing was
+    // observed.
+    std::optional<std::int64_t> observe() noexcept {
+        if (!probe_.is_valid()) return std::nullopt;
+        const FeedObservation feed = probe_.feed(probe_.user_data);
+        barrier_.observe(feed);
+        return feed.sampled_at_ms;
     }
 
     [[nodiscard]] ReadinessResult authorize(std::int64_t now_ms) noexcept {
