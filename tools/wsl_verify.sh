@@ -12,6 +12,9 @@
 #   bash tools/wsl_verify.sh thread    # mirrors ci-native-sanitizers.yml's tsan-concurrency job
 #   bash tools/wsl_verify.sh all       # all three in sequence
 #
+# Flaky GitHub connection: once, `bash tools/wsl_deps_mirror.sh` makes local mirrors of simdjson and googletest; this script then uses them (see the
+# comment after the HY_BUILD_JOBS check) and a configure no longer needs the network.
+#
 # Parallel-worktree usage: REPO below is hardcoded to the single shared
 # ~/repos/hengyuan_v2 default for backward compatibility -- it does NOT infer
 # from your current directory, so running this from inside a different
@@ -56,6 +59,17 @@ if ! [[ "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "HY_BUILD_JOBS must be a positive integer (got: ${BUILD_JOBS})" >&2
     exit 2
 fi
+
+# FetchContent clones simdjson and googletest from GitHub at configure time, once per build directory. A flaky connection (curl 92, an HTTP/2 stream
+# cancel) kills the configure of a tier, and a failing FetchContent retries for 10 to 20 minutes before it gives up. If tools/wsl_deps_mirror.sh has made
+# local bare mirrors that hold the tags native/CMakeLists.txt pins, point git at them for THIS process only (GIT_CONFIG_* environment variables; no global
+# git config is touched). Missing or stale mirrors: nothing is printed and nothing changes -- the clones go to the network exactly as before.
+_hy_mirror_env="$(bash "$(dirname "${BASH_SOURCE[0]}")/wsl_deps_mirror.sh" --env 2>/dev/null || true)"
+if [[ -n "${_hy_mirror_env}" ]]; then
+    eval "${_hy_mirror_env}"
+    echo "dependency mirrors: simdjson and googletest come from ${HY_DEPS_MIRROR:-${HOME}/.cache/hy_deps} (tools/wsl_deps_mirror.sh)"
+fi
+unset _hy_mirror_env
 
 # Local iteration-speed levers, all opt-in-by-detection: none of these change
 # the compiler, flags, or test matrix the CI YAML validates (the script's own
