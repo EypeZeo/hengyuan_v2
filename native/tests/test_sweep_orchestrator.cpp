@@ -8,17 +8,21 @@
 //   * without the pump nothing is posted and the barrier stays where the scripted facts leave it (the pump is opt-in, like the other nullable fields);
 //   * the marker reaches the barrier even when the call is refused at an early gate: servicing and draining come before every gate;
 //   * without a durable publisher the reconcile ring is not drained at all (fail-closed, as before), so the marker waits and the barrier stays Sweeping.
+//   * the hot thread's half of the sweep -- servicing the pump, draining the marker, applying the report -- allocates nothing (Engineering Mandate 1).
 #include <gtest/gtest.h>
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
+#include "test_helpers/alloc_probe.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/startup_recovery.hpp>
 #include <hengyuan/submit_readiness.hpp>
 #include <hengyuan/sweep_pump.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
+#include <string>
 
 using namespace hy;
 
@@ -266,4 +270,49 @@ TEST_F(SweepOrchestratorTest, ARefusedAccountKeepsTheOrderBackUntilTheSnapshotIs
     EXPECT_EQ(r.gate, OrchestratorGate::NotReady) << "a clean sweep with an account older than the request is not enough";
     EXPECT_EQ(r.not_ready_reason, NotReadyReason::BarrierSweeping);
     EXPECT_EQ(pump_.stats().reports_account_stale, 1U);
+}
+
+// Engineering Mandate 1 (CLAUDE.md): the hot thread allocates nothing. test_helpers/alloc_probe.hpp replaces the global operator new of this executable and
+// counts the calls made while a Window is open (it may be included from one translation unit only: this file is the only one of test_sweep_orchestrator).
+// Every input -- the contexts, the hand-over of the request to the reconcile thread's tick -- is built OUTSIDE the windows; inside there is only
+// orchestrate_submit().
+TEST_F(SweepOrchestratorTest, TheHotThreadsHalfOfTheSweepAllocatesNothing) {
+    const alloc_probe::SelfCheck control = alloc_probe::selfcheck();  // the positive control: a "0" below would be true for the wrong reason without it
+    ASSERT_EQ(control.after_array_new, 1u);
+    ASSERT_EQ(control.after_nothrow_array_new, 2u);
+    ASSERT_EQ(control.after_string_growth, 3u);
+    ASSERT_EQ(control.outside_window, 0u);
+
+    std::string problems;
+    const auto measured_call = [&](const char* what, OrchestratorContext& ctx, OrchestratorGate expected) {
+        OrchestratorResult r{};
+        std::size_t calls = 0;
+        std::size_t bytes = 0;
+        {
+            const alloc_probe::Window window;
+            r = orchestrate_submit(ctx);
+            calls = window.calls();
+            bytes = window.bytes();
+        }
+        if (r.gate != expected) problems += std::string(what) + ": gate " + std::to_string(static_cast<int>(r.gate)) + ". ";
+        if (calls != 0) problems += std::string(what) + ": " + std::to_string(calls) + " call(s) to operator new, " + std::to_string(bytes) + " byte(s). ";
+    };
+
+    // 1. the call that is refused at Gate 2b and POSTS the sweep request (service(): observe, take_sweep_request, ring push)
+    OrchestratorContext first = context(/*with_pump=*/true, /*with_publisher=*/true);
+    measured_call("the refused call that posts the request", first, OrchestratorGate::NotReady);
+    SweepRequest posted{};
+    ASSERT_TRUE(requests_.try_pop(posted));
+    ASSERT_TRUE(requests_.try_push(posted));  // handed to the reconcile thread's tick, by hand
+    reconcile_tick();
+
+    // 2. the call that drains the marker (drain_reconcile_events, the sink, the pump's observe and the report), is Reconciled, and sends the order
+    OrchestratorContext second = context(true, true);
+    measured_call("the call that drains the marker and sends the order", second, OrchestratorGate::SubmitAccepted);
+
+    // 3. a plain call with the barrier Reconciled: the pump has nothing to post and the ring nothing to hand over
+    OrchestratorContext third = context(true, true);
+    measured_call("a plain call after the barrier is Reconciled", third, OrchestratorGate::SubmitAccepted);
+
+    EXPECT_TRUE(problems.empty()) << problems;
 }
