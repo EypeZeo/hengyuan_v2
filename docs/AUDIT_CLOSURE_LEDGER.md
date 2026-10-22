@@ -4,8 +4,8 @@
 <!-- ledger-meta fi_baseline=6cb56bd -->
 <!-- ledger-meta adjudicated=2026-10-07 -->
 
-**范围**：批 1——蓝图 `4.2` 的 17 项上游审计缺陷与 `4.3` 的 9 项补充审计（共 26 项）；`4.4` 的 5 项暂缓台账是其中 P2-006、P2-007、P2-008、P3-001、P3-002 的解冻条件视图，随来源项裁定。批 2——蓝图第 7 卷的 45 条故障用例。
-**基线**：批 1 为主干 `f5ce782`（2026-10-07），批 2 为主干 `6cb56bd`（2026-10-08）。
+**范围**：批 1——蓝图 `4.2` 的 17 项上游审计缺陷与 `4.3` 的 9 项补充审计（共 26 项）；`4.4` 的 5 项暂缓台账是其中 P2-006、P2-007、P2-008、P3-001、P3-002 的解冻条件视图，随来源项裁定。批 2——蓝图第 7 卷的 45 条故障用例。批 3——蓝图 v2.8.0 新增的 12 条故障用例（FI-046 至 FI-057）。
+**基线**：批 1 为主干 `f5ce782`（2026-10-07），批 2 为主干 `6cb56bd`（2026-10-08），批 3 为主干 `58b60d0`（2026-10-22）。
 **权威性**：本文件是蓝图 `4.2`、`4.3`、`4.4` 状态词的逐项复验记录。蓝图表中的状态词、BKL 台账状态与 FI 状态必须与本文件一致，由 `tools/closure_ledger_check.py` 机械核对；二者不一致时先改本文件的证据，再改蓝图。
 
 核对命令（Windows PowerShell 与 bash 均可）：
@@ -190,14 +190,26 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-043** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 62c4647 |
 | **FI-044** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-045** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-046** | PRE_D3 | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-047** | PRE_OWNER_LIVE | L3 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-048** | CANARY | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-049** | PRE_D3 | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-050** | CANARY | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-051** | PRE_D3 | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-052** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-053** | PRE_D3 | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-054** | PRE_D3 | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-055** | PRE_D3 | L3 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-056** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-057** | PRE_D3 | L2 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 28 | 4 | 19 | 5 | BLOCKED |
-| PRE_OWNER_LIVE | 13 | 0 | 3 | 10 | BLOCKED |
-| CANARY | 4 | 0 | 0 | 4 | BLOCKED |
+| PRE_D3 | 37 | 4 | 21 | 12 | BLOCKED |
+| PRE_OWNER_LIVE | 14 | 0 | 3 | 11 | BLOCKED |
+| CANARY | 6 | 0 | 0 | 6 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 19，PARTIAL 22，IMPLEMENTED 4，合计 45，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 29，PARTIAL 24，IMPLEMENTED 4，合计 57，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -214,6 +226,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 10. **批 2 改判六条（`NOT_TESTABLE_YET` → `PARTIAL`）**，每条都有直接断言其不变量一部分的单测：FI-005（`/dev/full` 真实写入失败被分类为 DiskFull 且接收器栅栏）、FI-008（重复成交事件不重复累计）、FI-010（序号缺口检出并重同步）、FI-016（非 TRADING 标的拒绝新订单；撤单一半不存在）、FI-034（撤单中直接转成交、非法回退被拒）、FI-038（容量耗尽后失败关闭、持续接受的订单不耗尽注册表）。其余 39 条状态不变，但“尚未”的断言都改成了可失败的引用。
 11. **FI-041 不关闭。** 出路已落地并实测（纯文档 PR 都得到四个 gate；探针 #140 证明红色 PR 被平台拒绝合并），缺的是闸门判定表的入库回归测试：PR #137 时的 304 种输入自测只在一次性本地脚本里，仓库里没有对应文件。
 12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机没有被任何程序引用（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 在复验基线 `6cb56bd` 时零生产调用点（FI-015、FI-040），已于 2026-10-11 随 PR #165 接到 `sync_clock` 的发布路径；全树没有“对账屏障”（FI-002、FI-003、FI-009、FI-043 共同的缺口）。
+13. **批 3（蓝图 v2.8.0，主干 `58b60d0`）：新增 12 条故障用例同样没有一条能通过门禁。** FI-056、FI-057 判 `PARTIAL`（理由见各自的 note），其余 10 条判 `NOT_TESTABLE_YET`；注册表合计 57 条：`PARTIAL` 24、`NOT_TESTABLE_YET` 29、`IMPLEMENTED` 4，门禁 PASS 仍为 4 条（FI-032、FI-033、FI-037、FI-040）。各条的门禁登记与验证级别依据蓝图 `7.1` 在 v2.8.0 写明的释义（待 R-17 确认）；FI-048、FI-050 偏离输入报告的首个门禁标签，理由见蓝图 `附录 B` 的 B.1。
 
 ## 4 明细
 
@@ -1440,4 +1453,188 @@ baseline: 6cb56bd
 open: absent:native/include/hengyuan/*.hpp#Ed25519
 refs: bp:"任务 SPOT-03"
 note: 仓库只有 HMAC 后端，任务 SPOT-03 为 P1 可选；本用例仅在签名后端为 Ed25519 时适用。
+```
+
+**批 3（蓝图 v2.8.0）**：FI-046 至 FI-057 在主干 `58b60d0` 上按本节同一规则裁定，`baseline` 均为 `58b60d0`；“尚未”的断言写成可失败的引用，实现落地时核对会失败、迫使本文件与蓝图前移。
+
+```ledger
+id: FI-046
+title: fsync 延迟与超时
+gate_tag: PRE_D3
+scope: 全部
+stage: 0 与 1A
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:native/include/hengyuan/*.hpp#StorageDegraded absent:native/include/hengyuan/*.hpp#STORAGE_DEGRADED
+note: 没有 fsync 延迟注入接缝，也没有存储降级状态；写入失败与磁盘满归 FI-005，不在本条。
+```
+
+```ledger
+id: FI-047
+title: 主机接管与旧实例复活
+gate_tag: PRE_OWNER_LIVE
+scope: 全部
+stage: 6
+level: L3
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:native/include/hengyuan/*.hpp#trading_epoch
+note: 单节点拓扑，没有围栏控制面与交易纪元（蓝图 L-45）；拓扑待 R-20。
+```
+
+```ledger
+id: FI-048
+title: 工作站离线 30 天与冷备恢复
+gate_tag: CANARY
+scope: 全部
+stage: 4
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:recorder/hy_recorder/*.py#REMOTE_ACKED
+note: 录制段只由开发工作站拉取，没有异地冷备（蓝图 L-34）；对象存储选型待 R-19。
+```
+
+```ledger
+id: FI-049
+title: 假公告与盘口背离
+gate_tag: PRE_D3
+scope: 全部
+stage: 2 与 3
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:py_core/*/*.py#CORROBORATED
+note: 情报管线未开工；本条只在情报事件接入策略决策（情报阶段四）起适用。
+```
+
+```ledger
+id: FI-050
+title: 在线失效归因
+gate_tag: CANARY
+scope: 全部
+stage: 6
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:py_core/*/*.py#incident_id absent:native/include/hengyuan/*.hpp#incident_id
+note: 没有在线有效性监控。
+```
+
+```ledger
+id: FI-051
+title: 时间止损与退出单超时
+gate_tag: PRE_D3
+scope: 全部
+stage: 1A、3 与 6
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:native/include/hengyuan/*.hpp#ExitPending absent:py_core/*/*.py#EXIT_PENDING
+note: 没有退出状态机，也没有撤单路径。
+```
+
+```ledger
+id: FI-052
+title: 因果沙箱拒绝泄露产物
+gate_tag: PRE_D3
+scope: 全部
+stage: 3
+level: L1
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:py_core/*/*.py#PointInTimeStore absent:py_core/*/*.py#CausalView
+note: SAFE-05 的前缀差分只在被采样的 bar 上生效，时点视图与单步沙箱不存在；本条只适用于经任务 3.3 准入门申请准入的策略。
+```
+
+```ledger
+id: FI-053
+title: 撤单结果未知
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:native/include/hengyuan/*.hpp#cancel_order absent:native/include/hengyuan/*.hpp#CancelUnknown
+note: 全树没有撤单路径（蓝图 L-42）；撤单与成交竞态的收敛属 FI-034，仅可撤单时禁止新单属 FI-016。
+```
+
+```ledger
+id: FI-054
+title: 情报源陈旧、乱序、修订
+gate_tag: PRE_D3
+scope: 全部
+stage: 2
+level: L1 与 L2
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:py_core/*/*.py#source_auth_state
+note: 情报管线未开工；本条只在情报事件接入策略决策起适用。
+```
+
+```ledger
+id: FI-055
+title: 令牌签发后的时间窗
+gate_tag: PRE_D3
+scope: 按产品
+stage: 1A
+level: L3
+status: NOT_TESTABLE_YET
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: open:native/include/hengyuan/submit_readiness.hpp#"It is not a lease"
+note: 令牌是 Gate 2b 签发即用的一次性快照，注释写明不是租约（蓝图 L-40）；发送之前的最后一门不存在。
+```
+
+```ledger
+id: FI-056
+title: 孤儿累积与归档崩溃
+gate_tag: PRE_D3
+scope: 全部
+stage: 0 与 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet"
+refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan
+note: PARTIAL：越过 Intent 的订单永不归为孤儿、孤儿预算是精确上界、越界时启动以恢复扫描失败降级，均有真实日志上的单测；运行期计数、分级告警与可验证归档都不存在，路线待 R-18。
+```
+
+```ledger
+id: FI-057
+title: 订阅校验不受支持与额外订阅
+gate_tag: PRE_D3
+scope: 现货
+stage: 1A
+level: L2
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 58b60d0
+open: absent:native/include/hengyuan/*.hpp#CapabilityUnsupported absent:native/include/hengyuan/*.hpp#CAPABILITY_UNSUPPORTED
+refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#TheStreamIsConnectedOnlyOnceTheListingNamesExactlyTheConfirmedSubscription test:native/tests/test_binance_ws_api_user_data_session.cpp#AListingThatIsNotExactlyTheConfirmedSubscriptionEndsTheSession test:native/tests/test_binance_ws_api_user_data_session.cpp#ARefusedListingEndsTheSessionAndKeepsStatusCodeAndRetryAfter
+note: PARTIAL：回环单测断言只有订阅列表恰好列出刚确认的订阅时流才算已连接，列表不符或列表请求被拒答时会话结束并保留状态码（不以订阅确认推定就绪）；能力不受支持的单独分类与私网流降级状态不存在，从未对真实端点验证（蓝图 L-39）。
 ```
