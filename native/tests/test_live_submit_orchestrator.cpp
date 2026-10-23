@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
+#include "test_helpers/alloc_probe.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/synthetic_readiness.hpp>
 
@@ -1671,4 +1672,114 @@ TEST_F(LiveSubmitDurableIntegrationTest, RefusalsAfterTheIntentFrameDoNotStopThe
     EXPECT_EQ(cps[0].resulting_state, OrderState::Accepted);
     EXPECT_STREQ(cps[0].client_order_id.id, sent.order.client_order_id.id);
     EXPECT_EQ(restarted->recovered_intent_orphans(), kRefused);
+}
+
+// --- Engineering Mandate 1 (CLAUDE.md): the order path allocates nothing ---
+//
+// test_helpers/alloc_probe.hpp replaces the global operator new of this executable and counts the calls made while a Window is open (its header says
+// why it may be included from one translation unit only: this file is the only one of test_live_submit_orchestrator). Every input is built before
+// the window opens; inside it there is only the call under test. "Heap" is operator new here, as everywhere in this tree: a malloc() made inside a
+// library is invisible to the probe.
+
+namespace {
+
+struct Allocations {
+    std::size_t calls{0};
+    std::size_t bytes{0};
+};
+
+template <class Fn>
+Allocations count_allocations(Fn&& fn) {
+    Allocations a;
+    {
+        const alloc_probe::Window window;
+        fn();
+        a.calls = window.calls();
+        a.bytes = window.bytes();
+    }
+    return a;
+}
+
+std::string allocation_report(const char* what, const Allocations& a) {
+    return std::string(what) + ": " + std::to_string(a.calls) + " call(s) to operator new, " + std::to_string(a.bytes) + " byte(s). ";
+}
+
+}  // namespace
+
+TEST(OrderPathAllocation, TheProbeSeesTheAllocationsItIsMeantToSee) {
+    // The positive control: a "0 allocations" result below would be true for the wrong reason if the counting functions were not the ones this
+    // executable links, or the window never opened.
+    const alloc_probe::SelfCheck c = alloc_probe::selfcheck();
+    EXPECT_EQ(c.after_array_new, 1u);
+    EXPECT_EQ(c.after_nothrow_array_new, 2u);
+    EXPECT_EQ(c.after_string_growth, 3u);
+    EXPECT_EQ(c.outside_window, 0u);
+}
+
+TEST_F(LiveSubmitTest, EveryOutcomeAndEveryRefusalOfAnOrderAllocatesNothing) {
+    std::string problems;
+    const auto probe = [&](const char* what, OrchestratorGate expected) {
+        ++ctx_.sequence;
+        OrchestratorResult r{};
+        const Allocations a = count_allocations([&] { r = orchestrate_submit(ctx_); });
+        if (r.gate != expected) {
+            problems += std::string(what) + ": gate " + std::to_string(static_cast<int>(r.gate)) + ", expected " +
+                        std::to_string(static_cast<int>(expected)) + ". ";
+        }
+        if (a.calls != 0) problems += allocation_report(what, a);
+    };
+
+    probe("accepted", OrchestratorGate::SubmitAccepted);
+    probe("accepted, second order", OrchestratorGate::SubmitAccepted);
+    g_mock_response = {SubmitOutcome::Rejected, 0, -1013};
+    probe("rejected by the exchange", OrchestratorGate::SubmitRejected);
+    g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+    probe("timeout (ambiguous)", OrchestratorGate::SubmitAmbiguous);
+    g_mock_response = {SubmitOutcome::NetworkError, 0, 0};
+    probe("network error", OrchestratorGate::SubmitNetworkError);
+    g_mock_response = {SubmitOutcome::Accepted, 12345, 0};
+
+    g_mock_current_rules_version = 2;  // the symbol rules moved on since the snapshot
+    probe("stale rules version", OrchestratorGate::SubmitStaleRulesVersion);
+    g_mock_current_rules_version = 1;
+
+    const auto readiness = ctx_.readiness;
+    ctx_.readiness = nullptr;  // not wired: a refusal at Gate 2b
+    probe("no readiness wired", OrchestratorGate::NotReady);
+    ctx_.readiness = readiness;
+
+    ctx_.signer_ready = false;
+    probe("signer not ready", OrchestratorGate::SignerNotReady);
+    ctx_.signer_ready = true;
+
+    kill_switch_.trigger();
+    probe("kill switch tripped", OrchestratorGate::KillSwitchNotNormal);
+
+    EXPECT_TRUE(problems.empty()) << problems;
+}
+
+TEST_F(LiveSubmitReconcileTest, DrainingAResolutionInsideTheNextOrderAllocatesNothing) {
+    // The reconcile drain runs at the top of every orchestrate_submit(): durable publication through the port, the audit ring, PositionTruth is not
+    // wired here, the in-flight slot release. One call that drains a resolution AND submits an order.
+    const ClientOrderId coid = submit_ambiguous_and_queue_resolution(OrderState::Cancelled);
+    ASSERT_EQ(in_flight_.count(), 1u);
+
+    ++ctx_.sequence;
+    g_mock_response = {SubmitOutcome::Accepted, 12345, 0};
+    OrchestratorResult r{};
+    const Allocations a = count_allocations([&] { r = orchestrate_submit(ctx_); });
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_FALSE(in_flight_.is_in_flight(coid.view())) << "the resolution was drained inside the measured call";
+    EXPECT_EQ(a.calls, 0u) << allocation_report("drain + order", a);
+}
+
+TEST_F(LiveSubmitDurableIntegrationTest, AnOrderThroughTheRealDurableSinkAllocatesNothing) {
+    // Three durable appends per order (Intent, Prepared, Outcome), each one a log append plus an atomic rewrite of the tip anchor. The anchor's
+    // temporary name and (on POSIX) its directory used to be built per call with std::string: two or three allocations per append.
+    OrchestratorResult r{};
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAccepted) << "the first order, outside any window";
+    ++ctx_.sequence;
+    const Allocations a = count_allocations([&] { r = orchestrate_submit(ctx_); });
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(a.calls, 0u) << allocation_report("one order, three durable appends", a);
 }
