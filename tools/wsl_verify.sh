@@ -133,6 +133,7 @@ run_thread() {
         compaction_lease_holder test_compaction_lease test_compaction_intent_store \
         test_seal_journal_store_lease test_intent_phase_advancer \
         test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
+        test_sweep_concurrency \
         tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
         tsan_control_relaxed_mailbox
 

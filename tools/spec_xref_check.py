@@ -136,6 +136,10 @@ SEARCH_FILES = [
     REPO_ROOT / "native" / "include" / "hengyuan" / "reconnect_barrier.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "submit_readiness.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "synthetic_readiness.hpp",
+    # Private-stream migration M3b (docs/SPEC_INVARIANTS.md "屏障的扫描传输"): the sweep's transport -- SweepRequestRing, SweepJob, the SweepSink and
+    # SweepAccountProbe callbacks, and the hot thread's SweepPump -- are new load-bearing symbols, the same gap.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "barrier_sweep.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "sweep_pump.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
