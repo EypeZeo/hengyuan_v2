@@ -176,6 +176,27 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - `test_submit_readiness_guard.cpp`：每个构造 `OrchestratorContext` 的生产位置都被固定（个数 + 给 `.readiness` 的确切文本，
     显式 `nullptr` 会被抓到）；`SyntheticReadiness` 只允许三个演练/线束文件使用；`SubmitReadyToken` 只有一个铸造点和一个友元；
     每个 `drain_user_data_events()` 调用的屏障参数被固定（旧 listenKey 流的三个无屏障调用点写明理由，M5 随该流一起删除）。
+- 屏障的扫描传输（私网流迁移 M3b，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.3）— **没有新的跨线程原语、没有新的原子量**：请求走一条
+  `SweepRequestRing`（`SpscRing<SweepRequest,4>`，热线程写、对账线程读，最新的 epoch 胜出）；回答是 `ReconcileEventKind::SweepDone`
+  标记，**夹在既有的 `ReconcileEventRing` 里**，不是设计文档草案里的第二条报告环（偏离了批准的 5 行计划，理由：FIFO 让“标记排在它之前
+  产生的每个裁决之后”由构造保证，第二条环需要一个计数器加一条“发布够数才应用报告”的规则）。内存序只由已有的 `SpscRing` 提供；
+  TSan/ARM64 覆盖来自 test_sweep_concurrency（三张清单都登记了，没有新的负控，因为没有新的原子协议）。
+  - **四条顺序**（缺一条，模型的 ReconciledIsSwept 或 TokensOnlyWhenReady 就会破；formal/reconnect_sweep.tla 每条一个开关、每个开关一份
+    必须失败的配置，CI 的 Model: reconnect_sweep 步骤反向检查它们）：① `poll_once()` **先取请求、后排空入口环**（请求之前发出的订单
+    一定已在环里）；② 标记在 FIFO 里排在它之前产生的每个裁决之后，所以 `drain_reconcile_events()` 弹出标记时，之前的裁决都已持久确认
+    并发布（持久追加失败时队首阻塞，标记留在环里，没有任何旁路）；③ 回答按 epoch 校验：只有对当前 epoch 的回答才算；
+    ④ 热线程先 `observe()` 再应用回答，`account_fresh` 由热线程用请求发出的时刻求值（`SweepAccountProbe`），不跨线程传谓词。
+  - **失败关闭的几处取舍**（刻意的，不是遗漏）：`SweepAccountProbe` 未接线 ⇒ 账户永不“新鲜” ⇒ 屏障永不完成（M5 之前没有东西刷新账户，
+    所以 M3b 本身不会放行任何订单）；升级给操作员的订单永久计入 `unresolved`（`count_unknown_fate()` = 不可轮询的未终态订单 + 已升级
+    未平的订单）——有一笔这样的订单，屏障就回不到 `Reconciled`（操作员的回路不存在，设计文档附录 D）；事件环满时裁决推迟、订单保持
+    “未回答”，标记推送失败则重试（`marker_push_failures`）；请求环满时请求被撤回（`on_sweep_request_undelivered`，下一次再发同一个
+    epoch，不计超时）；一次扫描里的查询不比订单自己的节奏慢，等待上限 `sweep_retry_interval_ms`。
+  - **接线**：`OrchestratorContext` 里的 sweep 成员（`SweepPump*`）在 `orchestrate_submit()` 最前面 `service()`，先于对账排空；`drain_reconcile_events()`
+    的第 8 个参数是标记的接收者，**不传就把标记消费并丢弃**（屏障永不完成，同样失败关闭）。生产里只有编排器传它，所有线束/演练不传；
+    没有任何生产的 `poll_once()` 调用传 `SweepJob`（M5 接线并写进守卫）。
+  - `test_barrier_sweep_guard.cpp`：`poll_once()` 里取请求在排空入口环之前；标记只有一个制造点（`poll_once()`），屏障报告只有两个应用点
+    （`SweepPump` 与 `SyntheticReadiness`）；请求只由 `SweepPump` 制造和推送、只由 `SweepJob` 弹出；每个生产 `drain_reconcile_events()`
+    调用的参数个数与 sink 参数的确切文本被固定；没有生产的 `poll_once()` 带 `SweepJob`。
 
 ### 容量 / 生命周期
 

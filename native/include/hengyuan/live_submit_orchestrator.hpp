@@ -41,6 +41,7 @@
 #include <hengyuan/order_tracker.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
 #include <hengyuan/submit_readiness.hpp>
+#include <hengyuan/sweep_pump.hpp>
 #include <hengyuan/transport_policy.hpp>
 
 #include <cstdint>
@@ -317,6 +318,13 @@ struct OrchestratorContext {
     // an older generation is dropped. test_submit_readiness_guard.cpp pins that every OrchestratorContext built under include/ and src/ sets it.
     SubmitReadiness* readiness{nullptr};
 
+    // Private-stream migration M3b (sweep_pump.hpp): the hot thread's side of the barrier sweep. Nullable like the fields around it: unset means
+    // orchestrate_submit() does not move the sweep, and the barrier completes only if somebody else drives it (the synthetic readiness scripts the
+    // whole exchange; a live process wires the pump, M5). Set, every call first refreshes the barrier and posts the sweep request if one is due, and
+    // hands the reconcile drain a sink so a SweepDone marker reaches the barrier at the point the ring's order puts it. Owned by the hot/submit
+    // thread, outliving every call, and built over the same SubmitReadiness as `readiness`.
+    SweepPump* sweep{nullptr};
+
     // TODO 1A.3 follow-up (minimal PositionTruth). Nullable, defaults to
     // nullptr for the same backward-compatibility reason as to_reconcile/
     // reconcile_events above -- unset means orchestrate_submit() behaves
@@ -379,9 +387,14 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // ctx.reconcile_events must be wired for there to be anything to drain into -- and so must
     // ctx.reconcile_durable (SAFE-03 slice 1): without a durable publisher the ring is left alone rather
     // than drained memory-first (see that field's comment).
+    // M3b: first bring the barrier up to date and post the sweep request if one is due, so that the drain below hands a SweepDone marker to a barrier
+    // that has already looked at the feed.
+    if (ctx.sweep != nullptr) ctx.sweep->service();
     if (ctx.in_flight && ctx.reconcile_events && ctx.reconcile_durable) {
+        const SweepSink sweep_sink = ctx.sweep != nullptr ? ctx.sweep->sink() : SweepSink{};
         drain_reconcile_events(*ctx.in_flight, ctx.audit, *ctx.reconcile_events, ctx.now_ms,
-                                ctx.position_truth, ctx.fill_context, ctx.reconcile_durable);
+                                ctx.position_truth, ctx.fill_context, ctx.reconcile_durable,
+                                sweep_sink.is_valid() ? &sweep_sink : nullptr);
     }
     // TODO 1A.4: same unconditional-before-gates placement and reasoning as the reconcile drain
     // above -- even a KillSwitch-halted or audit-unavailable call still owns the only writer

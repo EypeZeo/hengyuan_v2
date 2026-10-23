@@ -9,7 +9,8 @@
 //   2. this test, for the one thing behaviour cannot see: drain_reconcile_events() takes its
 //      ReconcileDurablePublisher as a trailing DEFAULT argument, so a call site that simply leaves it out still
 //      compiles and quietly publishes to memory with no durable record. Every call under include/ and src/ is
-//      pinned here with its argument count (7 = durable, 6 = memory-only) AND, for a durable call, the exact
+//      pinned here with its argument count (7 = durable, 6 = memory-only, 8 = durable plus the M3b sweep sink,
+//      whose own text test_barrier_sweep_guard.cpp pins) AND, for a durable call, the exact
 //      text of its seventh argument -- an explicit `nullptr` there still makes seven arguments and would be a
 //      memory-only call in disguise (the mutation check found exactly that hole in a count-only version of
 //      this guard). A new call site, a pinned one that loses or changes the argument, or a pinned one that gains
@@ -175,6 +176,9 @@ std::vector<std::vector<std::string>> call_args(const std::string& code, std::st
 // now_ms, position_truth, fill_context, durable) -- the seventh argument.
 constexpr std::size_t kDurableArgCount = 7;
 constexpr std::size_t kMemoryOnlyArgCount = 6;
+// Private-stream migration M3b: an eighth argument is the sweep sink (the hot thread's receiver of the SweepDone marker). It follows the durable
+// one, which stays the seventh -- test_barrier_sweep_guard.cpp pins the sink's text.
+constexpr std::size_t kDurableWithSweepSinkArgCount = 8;
 
 struct SourceFile {
     std::string rel;   // relative to native/, forward slashes
@@ -213,7 +217,7 @@ struct Pin {
 
 // Every production call of drain_reconcile_events(), and what kind it is.
 const Pin kDrainCalls[] = {
-    {"include/hengyuan/live_submit_orchestrator.hpp", 1, kDurableArgCount, "ctx.reconcile_durable",
+    {"include/hengyuan/live_submit_orchestrator.hpp", 1, kDurableWithSweepSinkArgCount, "ctx.reconcile_durable",
      "orchestrate_submit(): drains only when ctx.reconcile_durable is wired (no publisher = no drain)"},
     {"include/hengyuan/verified_dry_run_evidence.hpp", 1, kDurableArgCount, "&rig.reconcile_durable",
      "the ambiguity drill reconciles on the drill rig's real scratch log"},
@@ -296,8 +300,8 @@ TEST(ReconcileDurableGuard, EveryProductionDrainCallIsPinnedWithItsDurableArgume
             if (args.size() != pin->args) {
                 problems.push_back(f.rel + ": a call has " + std::to_string(args.size()) + " arguments, expected " +
                                    std::to_string(pin->args) + " (" + pin->why + ")");
-            } else if (pin->args == kDurableArgCount && args.back() != pin->durable_arg) {
-                problems.push_back(f.rel + ": the seventh argument is `" + args.back() + "`, expected `" +
+            } else if (pin->args >= kDurableArgCount && args[kDurableArgCount - 1] != pin->durable_arg) {
+                problems.push_back(f.rel + ": the seventh argument is `" + args[kDurableArgCount - 1] + "`, expected `" +
                                    pin->durable_arg + "` -- anything else (an explicit nullptr above all) is a "
                                    "memory-only call with a durable-looking argument list");
             }
