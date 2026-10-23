@@ -134,8 +134,18 @@ public:
     // them (e.g. DurableAuditSink uses path+".lock"/path+".tip";
     // ControlPlaneLogSink uses path+".cp.lock"/path+".cp.tip" so the two
     // sinks can coexist over sibling base paths without colliding).
+    //
+    // The tip anchor's temporary name (and, on POSIX, the directory that is fsynced after the rename) are built HERE, once: every durable
+    // append rewrites the anchor, so a std::string built inside write_tip_anchor() was two or three heap allocations per append on the order
+    // path (Engineering Mandate 1; test_live_submit_orchestrator's OrderPathAllocation tests count them).
     DurableLogStore(std::string log_path, std::string lock_path, std::string tip_path) noexcept
-        : log_path_(std::move(log_path)), lock_path_(std::move(lock_path)), tip_path_(std::move(tip_path)) {}
+        : log_path_(std::move(log_path)), lock_path_(std::move(lock_path)), tip_path_(std::move(tip_path)),
+          tip_tmp_path_(tip_path_ + ".tmp") {
+#if !defined(_WIN32)
+        const auto slash = tip_path_.find_last_of('/');
+        tip_dir_ = (slash == std::string::npos) ? "." : tip_path_.substr(0, slash);
+#endif
+    }
 
     ~DurableLogStore() {
         close_log();
@@ -301,7 +311,7 @@ public:
     }
     bool write_tip_anchor(std::span<const std::byte> anchor_bytes) noexcept {
         last_write_status_ = IoWriteStatus::Ok;
-        const std::string tmp_path = tip_path_ + ".tmp";
+        const std::string& tmp_path = tip_tmp_path_;
         HANDLE h = CreateFileA(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) {
@@ -511,7 +521,7 @@ public:
     }
     bool write_tip_anchor(std::span<const std::byte> anchor_bytes) noexcept {
         last_write_status_ = IoWriteStatus::Ok;
-        const std::string tmp_path = tip_path_ + ".tmp";
+        const std::string& tmp_path = tip_tmp_path_;
         int fd = ::open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
         if (fd < 0) {
             record_write_failure();
@@ -549,8 +559,7 @@ public:
         // Directory-entry fsync: the rename itself needs the containing
         // directory's metadata flushed for crash-durability, not just the
         // file's own contents.
-        const auto slash = tip_path_.find_last_of('/');
-        const std::string dir = (slash == std::string::npos) ? "." : tip_path_.substr(0, slash);
+        const std::string& dir = tip_dir_;
         int dir_fd = ::open(dir.c_str(), O_RDONLY);
         if (dir_fd < 0) {
             record_write_failure();
@@ -623,6 +632,10 @@ private:
     std::string log_path_;
     std::string lock_path_;
     std::string tip_path_;
+    std::string tip_tmp_path_;  // tip_path_ + ".tmp", built once by the constructor
+#if !defined(_WIN32)
+    std::string tip_dir_;  // the directory of tip_path_ ("." when it has none), built once by the constructor
+#endif
     bool log_open_{false};
     IoWriteStatus last_write_status_{IoWriteStatus::Ok};
 };
