@@ -24,9 +24,10 @@
 //     whatever TCP says: Down, and take_stop_request() tells the loop to stop the session so the supervisor starts a new generation.
 //   * on_generation_ended(g): the consumer drained a serverShutdown / eventStreamTerminated event of generation g. g is over NOW, before the
 //     supervisor has noticed the session stopping; observations of g (or older) can no longer bring the barrier up.
-//   * take_sweep_request(now) / on_sweep_report(report, now): the sweep protocol (the transport is M3b). A request carries an EPOCH; a report is
-//     honoured only for the epoch that is current, so the answer to a sweep that a later trouble event made obsolete changes nothing, and a
-//     sweep nobody answers is asked again under a new epoch after sweep_timeout_ms.
+//   * take_sweep_request(now) / on_sweep_report(report, now): the sweep protocol (the transport is barrier_sweep.hpp / sweep_pump.hpp, M3b). A
+//     request carries an EPOCH; a report is honoured only for the epoch that is current, so the answer to a sweep that a later trouble event made
+//     obsolete changes nothing, and a sweep nobody answers is asked again under a new epoch after sweep_timeout_ms. A request that could not be put
+//     on the ring to the reconcile thread is rescinded with on_sweep_request_undelivered(epoch).
 //   * admit_event(g): an event stamped with a generation OLDER than the Reconciled one is dropped (and counted): the sweep already reflects
 //     whatever it said. Before Reconciled -- Down or Sweeping -- old events are merged: OrderFillContext::consume_delta() only ever applies a
 //     positive delta, so a late duplicate is harmless there. Generation 0 means "not stamped" (the retired listenKey session) and is always merged.
@@ -80,7 +81,7 @@ struct FeedObservation {
     std::int64_t sampled_at_ms{0};     // steady-clock ms at which the fields above were read
 };
 
-// The reconcile thread's answer to a BarrierSweep request (M3b carries it; M3a defines what the barrier needs from it).
+// The reconcile thread's answer to a sweep request (carried by barrier_sweep.hpp's SweepDone marker; the hot thread adds account_fresh).
 struct SweepReport {
     std::uint64_t epoch{0};        // the epoch of the request being answered
     std::uint32_t unresolved{0};   // orders in flight that still have no definite answer newer than the sweep's start
@@ -91,7 +92,8 @@ struct BarrierStats {
     std::uint64_t generations_seen{0};
     std::uint64_t downs{0};                // entries into Down from another state
     std::uint64_t sweeps_begun{0};         // entries into Sweeping (including restarts)
-    std::uint64_t sweeps_requested{0};     // requests handed out by take_sweep_request()
+    std::uint64_t sweeps_requested{0};     // requests handed out by take_sweep_request() (offers; an undelivered one is offered again)
+    std::uint64_t sweeps_undelivered{0};   // requests rescinded by on_sweep_request_undelivered(): they never left the hot thread
     std::uint64_t sweeps_completed{0};     // reports that made the barrier Reconciled
     std::uint64_t sweeps_unresolved{0};    // reports that left orders without a definite answer
     std::uint64_t sweep_timeouts{0};       // requests nobody answered in time
@@ -178,7 +180,7 @@ public:
         return pending;
     }
 
-    // --- the sweep (design 5.3; the transport is M3b) -------------------------------------------------------------
+    // --- the sweep (design 5.3; the transport is barrier_sweep.hpp / sweep_pump.hpp, M3b) -------------------------
 
     // The epoch to request a sweep under, or nullopt when none is due: not Sweeping, a request is already outstanding, or the wait after an
     // unresolved answer has not passed. An outstanding request that nobody answered within sweep_timeout_ms is replaced by a new epoch.
@@ -196,6 +198,15 @@ public:
         requested_at_ms_ = now_ms;
         ++stats_.sweeps_requested;
         return epoch_;
+    }
+
+    // The request take_sweep_request() handed out for `epoch` never left the hot thread (the ring to the reconcile thread was full). Nothing was
+    // sent, so there is nothing to wait for: the next take_sweep_request() offers the same epoch again, without the timeout and without a pause.
+    // Ignored unless `epoch` is the request that is outstanding.
+    constexpr void on_sweep_request_undelivered(std::uint64_t epoch) noexcept {
+        if (state_ != BarrierState::Sweeping || !sweep_outstanding_ || epoch != epoch_) return;
+        sweep_outstanding_ = false;
+        ++stats_.sweeps_undelivered;
     }
 
     constexpr void on_sweep_report(const SweepReport& report, std::int64_t now_ms) noexcept {

@@ -41,10 +41,14 @@
 //   - The durable audit sink is single-writer too, and it belongs to the hot/submit thread: a
 //     reconcile resolution is made durable by drain_reconcile_events() through that thread's
 //     ReconcileDurablePublisher, never by poll_once() (SAFE-03 slice 1).
+//   - The barrier sweep (private-stream migration M3b, barrier_sweep.hpp) adds NO new shared state to
+//     this contract: its request arrives on a small SpscRing that poll_once() consumes, and its answer
+//     leaves as a marker IN the ReconcileEventRing below, behind every resolution the sweep produced.
 
 #pragma once
 
 #include <hengyuan/audit_trail.hpp>
+#include <hengyuan/barrier_sweep.hpp>
 #include <hengyuan/durable_order_audit_port.hpp>
 #include <hengyuan/order_fill_context.hpp>
 #include <hengyuan/order_lifecycle.hpp>
@@ -167,6 +171,11 @@ struct ReconcilePollPolicy {
     // UnknownQuarantinePolicy in order_lifecycle.hpp). Defaults are the Owner's 2026-09-29 numbers:
     // 5 sent queries AND 5000 ms, or a 15000 ms absolute cap.
     UnknownQuarantinePolicy quarantine{};
+
+    // M3b (barrier_sweep.hpp): while a sweep is running, an order that has no definite answer under it yet is asked again after AT MOST this long
+    // (and never slower than its normal cadence above). An order whose last query predates the sweep, or that was never queried, is asked at once:
+    // that earlier answer is exactly what the sweep exists to replace. The per-tick budget max_queries_per_tick still applies to a sweep.
+    std::int64_t sweep_retry_interval_ms{500};
 };
 
 // base * multiplier^attempt, saturating at max_interval_ms and never
@@ -239,6 +248,7 @@ public:
                     stamp_unknown_since(slots_[i].record, now_ms, wall_now_ms);
                 }
                 slots_[i].last_poll_ms = kNeverPolled;
+                slots_[i].answered_epoch = 0;
                 ++count_;
                 return true;
             }
@@ -282,7 +292,54 @@ public:
         if (idx != kNotFound) slots_[idx].last_poll_ms = now_ms;
     }
 
+    // --- the barrier sweep's bookkeeping (M3b, barrier_sweep.hpp) ------------------------------------------------
+    //
+    // An order has been ANSWERED under sweep epoch E when a query after the sweep began identified its state and, if the state changed, the resolution
+    // was handed to the hot thread. An answer is a fact about one epoch: a newer sweep starts with every order unanswered again.
+
+    void note_answered(std::string_view coid, std::uint64_t epoch) noexcept {
+        auto idx = find_index(coid);
+        if (idx != kNotFound) slots_[idx].answered_epoch = epoch;
+    }
+
+    // 0 = never answered (or not tracked).
+    std::uint64_t answered_epoch(std::string_view coid) const noexcept {
+        auto idx = find_index(coid);
+        return idx == kNotFound ? std::uint64_t{0} : slots_[idx].answered_epoch;
+    }
+
+    // An order left this table for the operator (R-10 escalation) with its fate unknown. It is no longer polled and nothing in the tree resolves it
+    // yet, so a sweep must never forget it: it stays in count_unknown_fate() for the life of the process.
+    void note_escalated() noexcept {
+        if (escalated_open_ < std::numeric_limits<std::uint32_t>::max()) ++escalated_open_;
+    }
+
+    // Tracked orders poll_once() can ask about -- Ambiguous or live, not exchange-final -- that sweep `epoch` has not answered yet.
+    std::uint32_t count_unanswered(std::uint64_t epoch) const noexcept {
+        std::uint32_t n = 0;
+        for (std::size_t i = 0; i < kMaxInFlight; ++i) {
+            if (!slots_[i].active || is_exchange_final(slots_[i].record.state)) continue;
+            if (is_pollable(slots_[i].record.state) && slots_[i].answered_epoch != epoch) ++n;
+        }
+        return n;
+    }
+
+    // Orders whose fate is unknown and that this loop will not ask about: the ones escalated to the operator (no longer tracked) plus any tracked,
+    // non-final order in a state poll_once() skips. A sweep reports them as unresolved, whatever else it learned.
+    std::uint32_t count_unknown_fate() const noexcept {
+        std::uint64_t n = escalated_open_;
+        for (std::size_t i = 0; i < kMaxInFlight; ++i) {
+            if (!slots_[i].active || is_exchange_final(slots_[i].record.state)) continue;
+            if (!is_pollable(slots_[i].record.state)) ++n;
+        }
+        return n > std::numeric_limits<std::uint32_t>::max() ? std::numeric_limits<std::uint32_t>::max() : static_cast<std::uint32_t>(n);
+    }
+
 private:
+    static constexpr bool is_pollable(OrderState s) noexcept {
+        return s == OrderState::Ambiguous || s == OrderState::Accepted || s == OrderState::PartialFill;
+    }
+
     static constexpr std::size_t kNotFound = static_cast<std::size_t>(-1);
 
     struct Slot {
@@ -290,6 +347,7 @@ private:
         InFlightHandle handle{};
         OrderRecord record{};
         std::int64_t last_poll_ms{0};
+        std::uint64_t answered_epoch{0};  // M3b: the sweep epoch that last answered this order; 0 = none
     };
 
     std::size_t find_index(std::string_view coid) const noexcept {
@@ -302,6 +360,7 @@ private:
 
     std::array<Slot, kMaxInFlight> slots_{};
     std::size_t count_{0};
+    std::uint32_t escalated_open_{0};  // M3b: escalated to the operator and never resolved; see note_escalated()
 };
 
 // --- Cross-thread messages ---
@@ -309,6 +368,13 @@ private:
 struct ReconcileIngress {   // hot thread -> reconcile thread: newly-Ambiguous order
     InFlightHandle handle;
     OrderRecord record;
+};
+
+// M3b (barrier_sweep.hpp): what a ReconcileEvent is. A Resolution is what this ring has always carried. A SweepDone marker rides the SAME ring so
+// that its FIFO order puts it behind every resolution the sweep produced: when the hot thread pops it, those are already durable and published.
+enum class ReconcileEventKind : std::uint8_t {
+    Resolution = 0,
+    SweepDone = 1,
 };
 
 struct ReconcileEvent {     // reconcile thread -> hot thread: a discovered result.
@@ -345,6 +411,13 @@ struct ReconcileEvent {     // reconcile thread -> hot thread: a discovered resu
     // Appended at the end like the two blocks above. Intent = "not provided": no event poll_once() emits
     // carries it, and a hand-built event that leaves it gets no extra frame.
     OrderState prior_state{OrderState::Intent};
+
+    // M3b. Appended last like the blocks above; the default is the only kind poll_once() emitted before sweeps existed. For kind == SweepDone just
+    // these two fields mean anything -- the epoch of the request that was answered and how many orders still have no definite answer -- and every
+    // field above is value-initialised and ignored. A marker is never made durable and never touches PositionTruth or the in-flight registry.
+    ReconcileEventKind kind{ReconcileEventKind::Resolution};
+    std::uint64_t sweep_epoch{0};
+    std::uint32_t sweep_unresolved{0};
 };
 
 static_assert(std::is_trivially_copyable_v<OrderRecord>,
@@ -478,12 +551,24 @@ inline AuditRecord make_ambiguous_remap_record(const ReconcileEvent& ev, std::in
     return ar;
 }
 
-// drain_reconcile_events() without a durable publisher: pop and describe, nothing is made durable.
+// drain_reconcile_events() without a durable publisher: pop and describe, nothing is made durable. A control entry (a SweepDone marker) has nothing
+// to describe: record_out is left empty and the caller tells it apart by ev_out.kind.
 inline bool next_memory_only(ReconcileEventRing& events, std::int64_t now_ms, ReconcileEvent& ev_out,
                               AuditRecord& record_out) noexcept {
     if (!events.try_pop(ev_out)) return false;
-    record_out = make_reconcile_audit_record(ev_out, now_ms);
+    record_out = ev_out.kind == ReconcileEventKind::Resolution ? make_reconcile_audit_record(ev_out, now_ms) : AuditRecord{};
     return true;
+}
+
+// True while an order must NOT be queried yet. For an ordinary poll that is the cadence it always had: `normal_gap_ms` since its last query. For an
+// order a running sweep is still waiting on, two differences: a query that predates the sweep does not make it wait (that answer is what the sweep
+// replaces), and the wait never exceeds `sweep_retry_ms`. A first query (kNeverPolled) is never gated.
+inline bool poll_gate_closed(std::int64_t now_ms, std::int64_t last_poll_ms, std::int64_t normal_gap_ms, bool sweep_due,
+                              std::int64_t sweep_started_ms, std::int64_t sweep_retry_ms) noexcept {
+    if (last_poll_ms == OrderTracker::kNeverPolled) return false;
+    if (!sweep_due) return now_ms - last_poll_ms < normal_gap_ms;
+    if (last_poll_ms < sweep_started_ms) return false;
+    return now_ms - last_poll_ms < (normal_gap_ms < sweep_retry_ms ? normal_gap_ms : sweep_retry_ms);
 }
 
 }  // namespace detail
@@ -517,6 +602,14 @@ inline bool next_memory_only(ReconcileEventRing& events, std::int64_t now_ms, Re
 // pre-transition state and stays tracked -- retried on a later call -- rather than
 // silently dropping a resolution that already cost a real query.
 //
+// THE BARRIER SWEEP (M3b, barrier_sweep.hpp; `sweep` is null for every caller that has no barrier). A request for a sweep epoch is taken FIRST in the
+// call -- before `inbound` is drained, so that every order the hot thread sent before it asked is tracked by the time the sweep looks. While the sweep
+// runs, each tracked order it has not yet answered is queried now instead of on its own schedule (see ReconcilePollPolicy::sweep_retry_interval_ms),
+// and a definite answer -- the state identified, and its resolution pushed if it changed -- marks it answered for that epoch. When no tracked order is
+// left unanswered, one SweepDone marker is pushed to `outbound` AFTER everything the sweep resolved: the ring is FIFO, so the hot thread only sees the
+// marker once it has published those resolutions. A full `outbound` delays the marker, never loses it. The marker's `unresolved` counts the orders
+// this loop will never ask about again (escalated to the operator) -- they keep the barrier from completing.
+//
 // CLOCKS (R-10): `now_ms` is the monotonic reading the backoff runs on, as before.
 // `wall_now_ms` is the wall clock in milliseconds, or OrderRecord::kClockUnset when the
 // caller has none (every pre-R-10 call site keeps compiling and then decides on the
@@ -529,7 +622,10 @@ inline void poll_once(OrderTracker& tracker,
                        const QueryPort& query_port,
                        const ReconcilePollPolicy& policy,
                        std::int64_t now_ms,
-                       std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
+                       std::int64_t wall_now_ms = OrderRecord::kClockUnset,
+                       SweepJob* sweep = nullptr) noexcept {
+    if (sweep != nullptr) (void)sweep->take_requests(now_ms);
+
     ReconcileIngress in{};
     while (inbound.try_pop(in)) {
         (void)tracker.track(in.handle, in.record, now_ms, wall_now_ms);
@@ -542,6 +638,9 @@ inline void poll_once(OrderTracker& tracker,
     }
 
     std::uint32_t queries_this_tick = 0;
+    // The sweep in progress, 0 = none. It cannot change inside this call: requests were taken above.
+    const std::uint64_t sweep_epoch = (sweep != nullptr && sweep->running()) ? sweep->epoch() : std::uint64_t{0};
+    const std::int64_t sweep_started_ms = sweep != nullptr ? sweep->started_ms() : std::int64_t{0};
 
     tracker.for_each_active([&](InFlightHandle handle, OrderRecord& record, std::int64_t last_poll_ms) {
         // An exchange-final order has nothing left to discover and should already
@@ -554,6 +653,8 @@ inline void poll_once(OrderTracker& tracker,
         if (!ambiguous && !live) return;  // e.g. EscalatedToOperator: operator owns it now
 
         auto coid = record.client_order_id.view();
+        // Waiting on a running sweep: this order has no answer under its epoch yet.
+        const bool sweep_due = sweep_epoch != 0 && tracker.answered_epoch(coid) != sweep_epoch;
 
         if (ambiguous) {
             // Every Ambiguous record was stamped by track(); stamping again here is a no-op
@@ -581,6 +682,7 @@ inline void poll_once(OrderTracker& tracker,
                 ev.exchange_order_id = escalated.exchange_order_id;
                 ev.prior_state = record.state;  // Ambiguous: only an unresolved order is ever escalated
                 if (outbound.try_push(ev)) {
+                    tracker.note_escalated();  // its fate stays unknown to this process: a sweep keeps counting it
                     tracker.untrack(coid);
                 }
                 // else: leave tracked, retried next call (see backpressure note above)
@@ -602,14 +704,17 @@ inline void poll_once(OrderTracker& tracker,
                     record.query_attempts == 0
                         ? std::uint8_t{0}
                         : static_cast<std::uint8_t>(record.query_attempts - 1);
-                if (now_ms - last_poll_ms < reconcile_backoff_delay_ms(policy, retries_elapsed)) return;
+                if (detail::poll_gate_closed(now_ms, last_poll_ms, reconcile_backoff_delay_ms(policy, retries_elapsed), sweep_due,
+                                              sweep_started_ms, policy.sweep_retry_interval_ms)) {
+                    return;
+                }
             }
         } else {
             // Live on the exchange: flat cadence, no escalation cap. See
             // ReconcilePollPolicy::live_poll_interval_ms for why not backoff.
             if (queries_this_tick >= policy.max_queries_per_tick) return;
-            if (last_poll_ms != OrderTracker::kNeverPolled &&
-                now_ms - last_poll_ms < policy.live_poll_interval_ms) {
+            if (detail::poll_gate_closed(now_ms, last_poll_ms, policy.live_poll_interval_ms, sweep_due, sweep_started_ms,
+                                          policy.sweep_retry_interval_ms)) {
                 return;
             }
         }
@@ -650,6 +755,7 @@ inline void poll_once(OrderTracker& tracker,
             attempted.filled_qty_ticks = result.filled_qty_ticks;
             attempted.avg_fill_price_ticks = result.avg_fill_price_ticks;
             record = attempted;
+            if (sweep_epoch != 0) tracker.note_answered(coid, sweep_epoch);  // identified, unchanged: a definite answer
             return;
         }
 
@@ -695,11 +801,26 @@ inline void poll_once(OrderTracker& tracker,
                 // backoff position.
                 record = resolved;
                 tracker.note_polled(coid, now_ms);
+                if (sweep_epoch != 0) tracker.note_answered(coid, sweep_epoch);  // identified, changed, and handed to the hot thread
             }
         } else {
             record = attempted;  // publish failed: keep prior state, retry later (backpressure note above)
         }
     });
+
+    // The sweep is complete when no tracked order is waiting for a query. The marker goes out AFTER everything pushed above (FIFO), or on a later
+    // tick if `outbound` is full.
+    if (sweep_epoch != 0 && tracker.count_unanswered(sweep_epoch) == 0) {
+        ReconcileEvent marker{};
+        marker.kind = ReconcileEventKind::SweepDone;
+        marker.sweep_epoch = sweep_epoch;
+        marker.sweep_unresolved = tracker.count_unknown_fate();
+        if (outbound.try_push(marker)) {
+            sweep->finished();
+        } else {
+            sweep->marker_push_failed();
+        }
+    }
 }
 
 // --- Durable-first publication of reconcile resolutions (SAFE-03 slice 1, audit P1-002) ---
@@ -772,6 +893,13 @@ public:
                     AuditRecord& record_out) noexcept {
         if (!has_pending_) {
             if (!events.try_pop(pending_)) return false;
+            if (pending_.kind != ReconcileEventKind::Resolution) {
+                // A control entry (a SweepDone marker, M3b): nothing to make durable and nothing to retry. It was popped only after every
+                // resolution in front of it was handed back, so the caller sees it exactly when those are published.
+                ev_out = pending_;
+                record_out = AuditRecord{};
+                return true;
+            }
             has_pending_ = true;
             remap_acked_ = false;
         }
@@ -859,17 +987,27 @@ private:
 // real call sites (see order_fill_context.hpp's own header comment).
 // consume_delta() advances that shared baseline, so it runs only after the durable ACK: a resolution that is
 // retried must not have consumed its delta on the failed attempt.
+//
+// `sweep` (M3b, barrier_sweep.hpp; same trailing-default-nullptr convention): receives each SweepDone marker the reconcile thread pushed. A marker is
+// delivered at the point the ring's FIFO order puts it -- after every resolution in front of it went through all of the steps above -- and does none
+// of them itself: no audit record, no durable frame, no PositionTruth, no slot release. Without a sink it is consumed and dropped (the barrier then
+// times its request out and asks again).
 inline void drain_reconcile_events(InFlightRegistry& in_flight,
                                     AuditRingSink* audit,
                                     ReconcileEventRing& events,
                                     std::int64_t now_ms,
                                     PositionTruth* position_truth = nullptr,
                                     OrderFillContext* fill_context = nullptr,
-                                    ReconcileDurablePublisher* durable = nullptr) noexcept {
+                                    ReconcileDurablePublisher* durable = nullptr,
+                                    const SweepSink* sweep = nullptr) noexcept {
     ReconcileEvent ev{};
     AuditRecord ar{};
     while (durable ? durable->next_acked(events, now_ms, ev, ar)
                    : detail::next_memory_only(events, now_ms, ev, ar)) {
+        if (ev.kind == ReconcileEventKind::SweepDone) {
+            if (sweep != nullptr) sweep->deliver(SweepDone{ev.sweep_epoch, ev.sweep_unresolved});
+            continue;
+        }
         if (audit) {
             audit->append(ar);
         }
