@@ -225,7 +225,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 9. **批 2：45 条故障用例没有一条能通过门禁。** 复验后 `PARTIAL` 20、`NOT_TESTABLE_YET` 25、`IMPLEMENTED` 0；三个门禁标签（`PRE_D3` 28 条、`PRE_OWNER_LIVE` 13 条、`CANARY` 4 条）全部 `BLOCKED`。
 10. **批 2 改判六条（`NOT_TESTABLE_YET` → `PARTIAL`）**，每条都有直接断言其不变量一部分的单测：FI-005（`/dev/full` 真实写入失败被分类为 DiskFull 且接收器栅栏）、FI-008（重复成交事件不重复累计）、FI-010（序号缺口检出并重同步）、FI-016（非 TRADING 标的拒绝新订单；撤单一半不存在）、FI-034（撤单中直接转成交、非法回退被拒）、FI-038（容量耗尽后失败关闭、持续接受的订单不耗尽注册表）。其余 39 条状态不变，但“尚未”的断言都改成了可失败的引用。
 11. **FI-041 不关闭。** 出路已落地并实测（纯文档 PR 都得到四个 gate；探针 #140 证明红色 PR 被平台拒绝合并），缺的是闸门判定表的入库回归测试：PR #137 时的 304 种输入自测只在一次性本地脚本里，仓库里没有对应文件。
-12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机没有被任何程序引用（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 在复验基线 `6cb56bd` 时零生产调用点（FI-015、FI-040），已于 2026-10-11 随 PR #165 接到 `sync_clock` 的发布路径；全树没有“对账屏障”（FI-002、FI-003、FI-009、FI-043 共同的缺口）。
+12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机没有被任何程序引用（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 在复验基线 `6cb56bd` 时零生产调用点（FI-015、FI-040），已于 2026-10-11 随 PR #165 接到 `sync_clock` 的发布路径；全树没有接入任何程序的“对账屏障”（FI-002、FI-003、FI-009、FI-043 共同的缺口；私网流迁移 M3a/M3b 之后，重连屏障与扫描传输已以库的形式存在，只被单元与并发测试驱动，没有程序运行它们，缺口仍在）。
 13. **批 3（蓝图 v2.8.0，主干 `58b60d0`）：新增 12 条故障用例同样没有一条能通过门禁。** FI-056、FI-057 判 `PARTIAL`（理由见各自的 note），其余 10 条判 `NOT_TESTABLE_YET`；注册表合计 57 条：`PARTIAL` 24、`NOT_TESTABLE_YET` 29、`IMPLEMENTED` 4，门禁 PASS 仍为 4 条（FI-032、FI-033、FI-037、FI-040）。各条的门禁登记与验证级别依据蓝图 `7.1` 在 v2.8.0 写明的释义（待 R-17 确认）；FI-048、FI-050 偏离输入报告的首个门禁标签，理由见蓝图 `附录 B` 的 B.1。
 
 ## 4 明细
@@ -781,8 +781,8 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/include/hengyuan/order_tracker.hpp#barrier
-note: 无崩溃注入，启动恢复未接线，代码里不存在“对账屏障”；发送后的歧义态分类（Ambiguous）只在进程内存在。
+open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/src/*.cpp#SweepJob
+note: 无崩溃注入，启动恢复未接线；“对账屏障”只以库的形式存在（私网流迁移 M3a 的重连屏障与 M3b 的扫描传输，只被单元与并发测试驱动），没有任何程序运行 SweepJob，重启后的对账屏障仍无从执行；发送后的歧义态分类（Ambiguous）只在进程内存在。
 ```
 
 ```ledger
@@ -796,8 +796,8 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/include/hengyuan/order_tracker.hpp#barrier
-note: 同 FI-002：无崩溃注入、无重启对账屏障，客户端订单号补全本地状态的路径无从执行。
+open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/src/*.cpp#SweepJob
+note: 同 FI-002：无崩溃注入，重启后的对账屏障没有接线（扫描传输只在库里、没有程序运行它），客户端订单号补全本地状态的路径无从执行。
 ```
 
 ```ledger
@@ -891,9 +891,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 62c4647
-open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation
+open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation
 refs: test:native/tests/test_durable_control_plane_abi.cpp#StaleGenerationDoesNotReleaseReusedSlot test:native/tests/test_binance_ws_api_user_data_session.cpp#SubscribesOnceAndDeliversEventsStampedWithTheGenerationAndTheSubscription test:native/tests/test_reconnect_barrier.cpp#AnEventOfAnOlderGenerationIsDroppedAndCountedOnceReconciled test:native/tests/test_binance_user_data_event.cpp#AnOlderGenerationsFillIsDroppedOnceTheNewGenerationIsReconciled test:native/tests/test_binance_user_data_event.cpp#ARotationEndToEnd
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：现有“代次”测试里的 `StaleGenerationDoesNotReleaseReusedSlot` 说的是在途槽位的代次，不是连接代次。私网流迁移 M2 起，新的 WS API 会话给每个事件盖上自己的连接代次（`UserDataWsEvent::generation`）；M3a 起，`ReconnectBarrier::admit_event()` 经 `drain_user_data_events()` 在某一代次对账完成（Reconciled）后丢弃更旧代次的事件并计数、完成之前照常合并（状态机表、排空接线与轮换全程测试覆盖）。仍缺：对账清扫在热线程与对账线程之间的传输（M3b）、任何运行中的进程把真实会话读进屏障（M5），也没有“代次日志”产物，没有对真实端点验证过。
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：现有“代次”测试里的 `StaleGenerationDoesNotReleaseReusedSlot` 说的是在途槽位的代次，不是连接代次。私网流迁移 M2 起，新的 WS API 会话给每个事件盖上自己的连接代次（`UserDataWsEvent::generation`）；M3a 起，`ReconnectBarrier::admit_event()` 经 `drain_user_data_events()` 在某一代次对账完成（Reconciled）后丢弃更旧代次的事件并计数、完成之前照常合并（状态机表、排空接线与轮换全程测试覆盖）。M3b 起：对账清扫在热线程与对账线程之间的传输已在树里（请求环、夹在对账事件环里的完成标记、热线程的 `SweepPump`；单元、编排器与两线程并发测试覆盖，顺序由 formal/reconnect_sweep.tla 的必须失败的负控钉住），但没有程序运行它。仍缺：任何运行中的进程运行清扫并把真实会话读进屏障（M5），也没有“代次日志”产物，没有对真实端点验证过。
 ```
 
 ```ledger
@@ -923,9 +923,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 62c4647
-open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation
+open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation
 refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownLeadsToAFreshSignedGeneration test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownAfterTheSubscriptionIsDeliveredAndEndsTheGeneration test:native/tests/test_binance_ws_api_user_data_session.cpp#ADrainedServerShutdownEndsTheGenerationAtOnceAndTheNextOneNeedsItsOwnSweep test:native/tests/test_reconnect_barrier.cpp#ServerShutdownEndsTheGenerationBeforeTheSupervisorNoticesAnything test:native/tests/test_binance_user_data_event.cpp#ServerShutdownEndsItsGenerationAtOnce
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：旧的 listenKey 会话和公共行情会话都不处理服务端关闭事件。私网流迁移 M2 起，新的 WS API 会话把 serverShutdown 先交付进事件环再结束本代，监督器随后用新的签名请求开新一代（回环测试覆盖）；M3a 起，`drain_user_data_events()` 读到 serverShutdown / eventStreamTerminated 就让 `ReconnectBarrier::on_generation_ended()` 立刻把本代记为结束（监督器还没发现会话停止时屏障已是 Down，且该代次此后不会因会话仍显示已连接而回来），新代次必须自己的清扫完成才放行（状态机表、排空接线与真实回环会话测试覆盖）。仍缺：清扫传输（M3b）与进程接线（M5），也没有“重连日志”产物，没有对真实端点验证过。
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：旧的 listenKey 会话和公共行情会话都不处理服务端关闭事件。私网流迁移 M2 起，新的 WS API 会话把 serverShutdown 先交付进事件环再结束本代，监督器随后用新的签名请求开新一代（回环测试覆盖）；M3a 起，`drain_user_data_events()` 读到 serverShutdown / eventStreamTerminated 就让 `ReconnectBarrier::on_generation_ended()` 立刻把本代记为结束（监督器还没发现会话停止时屏障已是 Down，且该代次此后不会因会话仍显示已连接而回来），新代次必须自己的清扫完成才放行（状态机表、排空接线与真实回环会话测试覆盖）。M3b 起：清扫的跨线程传输已在树里（见 FI-009），新代次的清扫回报现在能真的从对账线程回到屏障，只被单元、编排器与并发测试驱动。仍缺：进程接线（M5），也没有“重连日志”产物，没有对真实端点验证过。
 ```
 
 ```ledger
@@ -1064,7 +1064,7 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 62c4647
-open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation
+open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation
 refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#PingFramesAreCountedAndKeepTheActivityClockMoving test:native/tests/test_binance_ws_api_user_data_session.cpp#ASilentRealConnectionIsDeclaredDeadStoppedAndReplaced test:native/tests/test_binance_ws_api_user_data_session.cpp#PingsKeepAQuietRealConnectionAlive test:native/tests/test_reconnect_barrier.cpp#ASilentConnectionIsDeadWhateverTcpSaysAndTheLoopIsToldToStopIt test:native/tests/test_submit_readiness.cpp#ASilentConnectionIsRefusedStoppedAndReplacedByAnUnsweptGeneration
 note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：会话有空闲超时旋钮、监督器有重连退避。私网流迁移 M2 起，新的 WS API 会话暴露 `last_activity_steady_ms()`（数据帧与服务端 ping 控制帧都会刷新）和 ping 计数；M3a 起，`ReconnectBarrier` 以 `stale_after_ms`（默认 60 秒，即三个 ping 间隔）为判据：这么久没有任何帧就判定连接已死、回到 Down，并通过 `take_stop_request()` 让循环停掉这条会话、由监督器开新一代（新一代从“未清扫”开始）；有服务端 ping 的安静账户不会被误判（状态机表、监督器端到端与真实回环会话测试覆盖，含边界与分钟级判据的缩放）。仍缺：主循环里真正执行这一步的进程（M5）与“数据状态日志”产物，没有对真实端点验证过。
 ```
@@ -1419,9 +1419,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 62c4647
-open: open:native/include/hengyuan/reconnect_barrier.hpp#"the transport is M3b" absent:native/src/*.cpp#make_feed_observation open:native/include/hengyuan/binance_private_rest.hpp#create_listen_key
-refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#EveryGenerationSignsAgainAndNeverReplaysAnOldRequest test:native/tests/test_reconnect_barrier.cpp#ARotationRunsDownThenSweepingThenReconciledInThatOrder test:native/tests/test_submit_readiness.cpp#ARotationBlocksFromTheMomentTheOldConnectionIsGoneUntilTheNewOneIsSwept test:native/tests/test_live_submit_orchestrator.cpp#AGenerationChangeRefusesEveryOrderUntilItsSweepIsAnswered test:native/tests/test_binance_ws_api_user_data_session.cpp#ADroppedConnectionIsDownAtOnceAndTheNextGenerationNeedsItsOwnSweep
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：私网流迁移 M2 起，树内有订阅式会话（`BinanceWsApiUserDataSession`，签名订阅，每个代次重新签名、不重放旧请求；回环测试覆盖）；M3a 起，`ReconnectBarrier`（Down / Sweeping / Reconciled(G)）与 `SubmitReadiness`/`SubmitReadyToken` 存在，`orchestrate_submit()` 的 Gate 2b 在没有令牌时拒单（`OrchestratorGate::NotReady`，未接线同样拒单）：代次变化时从旧连接消失起就拒单，直到新代次自己的清扫回报（状态机表、监督器端到端、编排器与真实回环会话测试覆盖）。但它们没有接入任何运行中的进程（M5），清扫的跨线程传输不存在（M3b），旧的 listenKey 路径仍在树里（M5 删除），也没有“重连屏障轨迹”产物。
+open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation open:native/include/hengyuan/binance_private_rest.hpp#create_listen_key
+refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#EveryGenerationSignsAgainAndNeverReplaysAnOldRequest test:native/tests/test_reconnect_barrier.cpp#ARotationRunsDownThenSweepingThenReconciledInThatOrder test:native/tests/test_submit_readiness.cpp#ARotationBlocksFromTheMomentTheOldConnectionIsGoneUntilTheNewOneIsSwept test:native/tests/test_live_submit_orchestrator.cpp#AGenerationChangeRefusesEveryOrderUntilItsSweepIsAnswered test:native/tests/test_binance_ws_api_user_data_session.cpp#ADroppedConnectionIsDownAtOnceAndTheNextGenerationNeedsItsOwnSweep test:native/tests/test_sweep_orchestrator.cpp#ARefusedCallPostsTheSweepRequestAndTheNextCallAfterTheAnswerSendsTheOrder test:native/tests/test_sweep_concurrency.cpp#TheBarrierIsReconciledOnlyOnceEveryOrderThatPrecededTheRequestIsResolvedAndPublished
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：私网流迁移 M2 起，树内有订阅式会话（`BinanceWsApiUserDataSession`，签名订阅，每个代次重新签名、不重放旧请求；回环测试覆盖）；M3a 起，`ReconnectBarrier`（Down / Sweeping / Reconciled(G)）与 `SubmitReadiness`/`SubmitReadyToken` 存在，`orchestrate_submit()` 的 Gate 2b 在没有令牌时拒单（`OrchestratorGate::NotReady`，未接线同样拒单）：代次变化时从旧连接消失起就拒单，直到新代次自己的清扫回报（状态机表、监督器端到端、编排器与真实回环会话测试覆盖）。M3b 起，清扫的跨线程传输也在树里（请求环 + 夹在对账事件环里的完成标记 + 热线程的 `SweepPump`：编排器测试里一次被拒的调用发出请求，对账线程回答，下一次调用才放行；两线程测试里屏障只在请求之前发出的每个订单都已裁决并发布之后才变成 Reconciled）。但它们没有接入任何运行中的进程（M5），没有任何程序刷新清扫等待的账户快照（M5），旧的 listenKey 路径仍在树里（M5 删除），也没有“重连屏障轨迹”产物。
 ```
 
 ```ledger

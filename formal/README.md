@@ -675,3 +675,83 @@ gcAuthorized, most of it unreachable) -- no `CONSTRAINT` needed here either.
 
 - `RoundEFDesign.tla` — the model.
 - `RoundEFDesign*.cfg` — see the table above.
+
+---
+
+## `reconnect_sweep.tla` — the reconnect barrier and its sweep (private-stream migration M3a/M3b, design risk R9)
+
+The pure-logic barrier (`reconnect_barrier.hpp`), the sweep transport between the hot thread and the reconcile thread
+(`barrier_sweep.hpp`, `sweep_pump.hpp`, `order_tracker.hpp`'s `poll_once()` / `drain_reconcile_events()`), and the token
+decision (`submit_readiness.hpp`'s `authorize()`), reduced to what two claims rest on. The design that makes them true is five
+decisions; the model has one switch for each, and **a config that turns a switch off MUST fail** — that is what keeps the model
+from proving nothing.
+
+**What it checks**
+
+- `ReconciledIsSwept`: when the barrier becomes Reconciled, every order the hot thread had admitted before that sweep's request
+  was posted is either already published as resolved on the hot thread, or was confirmed still live by the sweep itself.
+  Nothing the sweep needs to know can still be in transit or unknown.
+- `TokensOnlyWhenReady`: a token is issued only while the barrier says Reconciled **and** the stream is connected on the
+  generation the barrier swept.
+- `TypeOK`; and the reachability probe `NoTokenIssued` (its config must fail) so the two claims are not vacuous.
+
+**The five switches** (`TRUE` = the shipped design)
+
+| Switch | `FALSE` means | Why the design has it |
+|---|---|---|
+| `TakeBeforeDrain` | `poll_once()` drains the ingress ring, then takes the request | an order sent before the request must be in the ring when the ring is drained |
+| `MarkerInBand` | the `SweepDone` marker travels on a channel that is not ordered against the resolutions | FIFO puts the marker behind every resolution the sweep produced; a separate report ring would need a counter |
+| `EpochChecked` | a report is honoured for any epoch | the answer to a sweep a later trouble event made obsolete must change nothing |
+| `ObserveFirst` | `authorize()` decides from the barrier's last view | the stream can drop between the loop's last look and the decision |
+| `DownOnDisconnect` | `observe()` ignores a session that is not connected | design R9: remove "disconnect -> Down" and the invariant must break |
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `reconnect_sweep.cfg` | **No error found** — the shipped design |
+| `reconnect_sweep_bypass_fifo_bug.cfg` | **`ReconciledIsSwept` violated** — `MarkerInBand = FALSE` |
+| `reconnect_sweep_drain_first_bug.cfg` | **`ReconciledIsSwept` violated** — `TakeBeforeDrain = FALSE` |
+| `reconnect_sweep_any_epoch_bug.cfg` | **`ReconciledIsSwept` violated** — `EpochChecked = FALSE` |
+| `reconnect_sweep_no_observe_bug.cfg` | **`TokensOnlyWhenReady` violated** — `ObserveFirst = FALSE` |
+| `reconnect_sweep_no_down_bug.cfg` | **`TokensOnlyWhenReady` violated** — `DownOnDisconnect = FALSE` |
+| `reconnect_sweep_probe.cfg` | **`NoTokenIssued` violated** — reachability probe |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -workers auto -config reconnect_sweep.cfg reconnect_sweep.tla
+```
+
+TLC exits `0` on success and `12` on an invariant violation, so CI inverts the check for the six expected-to-fail configs (the
+"Model: reconnect_sweep" step of `.github/workflows/ci-spec-verification.yml`).
+
+### Recorded results (2026-10-20, TLC 2.19, Java 25, 16 workers)
+
+| Config | States (distinct) | Result |
+|---|---|---|
+| main | 5,859,744 (depth 41, 22 s) | no error — exhaustive |
+| bypass_fifo | 10,233 | `ReconciledIsSwept` violated ✓ (10-state trace) |
+| drain_first | 9,196 | `ReconciledIsSwept` violated ✓ (10-state trace) |
+| any_epoch | 24,050 | `ReconciledIsSwept` violated ✓ (12-state trace) |
+| no_observe | 12,610 | `TokensOnlyWhenReady` violated ✓ (10-state trace) |
+| no_down | 11,500 | `TokensOnlyWhenReady` violated ✓ (11-state trace) |
+| probe | 9,636 | `NoTokenIssued` violated ✓ (9-state trace) |
+
+Bounds: 2 orders, 2 stream generations, 1 lost event per session, epochs up to 4, rings of 3 (events) and 2 (requests). The
+epoch bound is a `CONSTRAINT`. CI runs the bound of 4; a one-off run with 5 was exhaustive too (14,986,498 distinct states,
+depth 46, 56 s, no error), so the bound is not what keeps the model quiet. The five bug configs find their violation at depth
+12–14 (the traces above), far inside either bound.
+
+### What is deliberately NOT in this model
+
+- Memory orders. Ring operations are sequentially consistent here; the release/acquire edges are what ThreadSanitizer
+  (`test_sweep_concurrency` under `tools/wsl_verify.sh thread`) and the arm64 repeat run exercise.
+- The escalated-to-operator count and the per-tick query budget (`test_order_tracker_sweep.cpp`): they change what a sweep
+  reports and how long it takes, not the ordering the two claims rest on.
+- Time. Timeouts and the account snapshot's freshness are nondeterministic; there is no liveness config, because "the barrier is
+  eventually Reconciled" rests on exactly those two.
+
+### Files
+
+- `reconnect_sweep.tla` — the model.
+- `reconnect_sweep*.cfg` — see the table above.
