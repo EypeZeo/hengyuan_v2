@@ -1089,6 +1089,38 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_submit_readiness_guard)
     gtest_discover_tests(test_submit_readiness_guard)
 
+    # M3b: the sweep's transport. test_barrier_sweep covers SweepJob / the request ring / the sink and account probe / the barrier's rescinded request /
+    # the hot thread's SweepPump; test_order_tracker_sweep covers OrderTracker's per-epoch bookkeeping, poll_once() with a sweep job (when and whom it
+    # asks, the SweepDone marker behind every resolution, full rings, escalation) and drain_reconcile_events() delivering the marker. Both are
+    # single-threaded and deterministic; the two threads together are test_sweep_concurrency below.
+    add_executable(test_barrier_sweep tests/test_barrier_sweep.cpp)
+    target_link_libraries(test_barrier_sweep PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_barrier_sweep)
+    gtest_discover_tests(test_barrier_sweep)
+
+    add_executable(test_order_tracker_sweep tests/test_order_tracker_sweep.cpp)
+    target_link_libraries(test_order_tracker_sweep PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_order_tracker_sweep)
+    gtest_discover_tests(test_order_tracker_sweep)
+
+    # M3b: the sweep wired into orchestrate_submit() (ctx.sweep): a refused call posts the request, the next call delivers the marker, an early-gate
+    # refusal still moves the sweep, and an unwired pump or publisher leaves it alone. Single-threaded; the reconcile thread's tick is driven by hand.
+    add_executable(test_sweep_orchestrator tests/test_sweep_orchestrator.cpp)
+    target_link_libraries(test_sweep_orchestrator PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_sweep_orchestrator)
+    gtest_discover_tests(test_sweep_orchestrator)
+
+    # M3b source-text guard: poll_once() takes the sweep request before it drains the ingress ring, a SweepDone marker is made / delivered / applied in
+    # one place each, a request is made and pushed only by the pump, every production drain_reconcile_events() call is pinned with its sink argument, and
+    # no production poll_once() runs a sweep job yet. It reads the source tree, so the native/ directory is a compile definition (same shape as the
+    # guards above).
+    add_executable(test_barrier_sweep_guard tests/test_barrier_sweep_guard.cpp)
+    target_link_libraries(test_barrier_sweep_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_barrier_sweep_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_barrier_sweep_guard)
+    gtest_discover_tests(test_barrier_sweep_guard)
+
     # Real two-thread stress for the lock-free SPSC primitives. Labelled
     # "concurrency" so the TSan CI job can select just these (`ctest -L
     # concurrency`) — building all 27 test binaries under TSan triples the job
@@ -1114,6 +1146,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_reconcile_concurrency)
 
     gtest_discover_tests(test_reconcile_concurrency PROPERTIES LABELS concurrency)
+
+    # M3b: the barrier sweep across two real threads (sweep_pump.hpp / barrier_sweep.hpp / order_tracker.hpp): the barrier may be Reconciled only once
+    # every order that preceded the request is resolved and published. Its cross-thread edges are three SpscRings that already existed or are the same
+    # primitive (no new atomic protocol), so it has no negative control of its own -- but it is a `concurrency` test like its neighbours, which puts it in
+    # all three lists (the TSan build, the arm64 repeat run, tools/wsl_verify.sh) and under tools/concurrency_targets_check.py.
+    add_executable(test_sweep_concurrency tests/test_sweep_concurrency.cpp)
+    target_link_libraries(test_sweep_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_sweep_concurrency)
+    gtest_discover_tests(test_sweep_concurrency PROPERTIES LABELS concurrency)
 
     # TODO 1A.4: real two-thread stress for the two NEW cross-thread boundaries this batch
     # introduces (UserDataWsEventRing, ListenKeyPublisher) -- the first new cross-thread

@@ -142,6 +142,11 @@ jobs:
       # test_ws_api_mailbox_concurrency joined with private-stream migration M2: the one-shot
       # release/acquire handoff of a pre-signed subscribe frame from the credential-owning thread to the
       # WebSocket API session's I/O thread; tsan_control_relaxed_mailbox is its negative control (below).
+      # test_sweep_concurrency joined with private-stream migration M3b: the barrier sweep across a hot thread
+      # and a reconcile thread (the sweep request ring, the order ingress ring and the resolution ring that
+      # carries the sweep's marker, all SpscRing payload handoffs). It adds no atomic protocol of its own, so it
+      # has no negative control; it checks at the instant the barrier becomes Reconciled that every order sent
+      # before the request is resolved and published.
       # test_compaction_lease, test_compaction_intent_store, test_seal_journal_store_lease,
       # test_intent_phase_advancer and test_migrated_v2_started_publisher are the file-lease family
       # (the seal-journal subsystem, frozen): CandidateLease / SealJournalStoreLease
@@ -165,6 +170,7 @@ jobs:
             compaction_lease_holder test_compaction_lease test_compaction_intent_store \
             test_seal_journal_store_lease test_intent_phase_advancer \
             test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
+            test_sweep_concurrency \
             tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
             tsan_control_relaxed_mailbox
 
@@ -294,7 +300,8 @@ jobs:
             --target test_spsc_concurrency test_reconcile_concurrency test_shm_heartbeat \
             test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
             test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
-            test_user_data_ws_concurrency test_ws_api_mailbox_concurrency
+            test_user_data_ws_concurrency test_ws_api_mailbox_concurrency \
+            test_sweep_concurrency
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the

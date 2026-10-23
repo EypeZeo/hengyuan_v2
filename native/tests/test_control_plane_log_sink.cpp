@@ -34,12 +34,35 @@ std::array<std::byte, kKeyBlockSize> make_plaintext_key(std::uint8_t fill) {
     return key;
 }
 
+const char* recovery_status_name(RecoveryScanStatus s) {
+    switch (s) {
+        case RecoveryScanStatus::Clean: return "Clean";
+        case RecoveryScanStatus::Recovered: return "Recovered";
+        case RecoveryScanStatus::Corrupt: return "Corrupt";
+        case RecoveryScanStatus::CapacityExceeded: return "CapacityExceeded";
+        case RecoveryScanStatus::IoError: return "IoError";
+        case RecoveryScanStatus::ExternalAnchorUnavailable: return "ExternalAnchorUnavailable";
+    }
+    return "?";
+}
+
+// Why a sink refused an append. The bool alone cannot tell an I/O failure while appending (fenced, recovery_status Clean -- on Windows
+// typically a sharing violation from a scanner, see ControlPlaneLogSinkTest::use_fresh_base_path()) from a failed recovery (Corrupt / IoError):
+// the two need different fixes.
+std::string describe_sink(const ControlPlaneLogSink& sink) {
+    return std::string(" [is_open=") + (sink.is_open() ? "1" : "0") + " fenced=" + (sink.fenced() ? "1" : "0") +
+           " recovery_status=" + recovery_status_name(sink.recovery_status()) + "]";
+}
+
 }  // namespace
 
 class ControlPlaneLogSinkTest : public ::testing::Test {
 protected:
     std::string base_path_;
     std::unique_ptr<KeyRing> key_ring_;
+    // base_path_ minus its ".log"; use_fresh_base_path() derives its never-used names from it.
+    std::string base_path_stem_;
+    unsigned fresh_base_paths_used_{0};
 
     void SetUp() override {
         static int counter = 0;
@@ -47,11 +70,11 @@ protected:
 #ifdef _WIN32
         char tmp[MAX_PATH];
         GetTempPathA(MAX_PATH, tmp);
-        base_path_ = std::string(tmp) + "hy_cpls_" + std::to_string(GetCurrentProcessId()) + "_" +
-                     std::to_string(counter) + ".log";
+        base_path_stem_ = std::string(tmp) + "hy_cpls_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(counter);
 #else
-        base_path_ = "/tmp/hy_cpls_" + std::to_string(getpid()) + "_" + std::to_string(counter) + ".log";
+        base_path_stem_ = "/tmp/hy_cpls_" + std::to_string(getpid()) + "_" + std::to_string(counter);
 #endif
+        base_path_ = base_path_stem_ + ".log";
         remove_all();
 
         std::array<std::byte, kKekSize> kek{};
@@ -69,6 +92,18 @@ protected:
         std::remove((base_path_ + ".cp.lock").c_str());
         std::remove((base_path_ + ".cp.tip").c_str());
         std::remove((base_path_ + ".cp.tip.tmp").c_str());
+    }
+
+    // For a loop that runs one scenario many times (and for a test that re-creates a store it just deleted), each pass on a store of its own:
+    // moves the fixture to a base path nothing has used yet and deletes the files of the one it leaves. Do not call remove_all() and re-use the
+    // names: on a Windows host with real-time antivirus that races with the scanner. The sink renames <tip>.tmp over <tip>, the test deletes
+    // <tip> a few milliseconds later, and the next CreateFileA(<tip>.tmp, share=0) can fail with ERROR_SHARING_VIOLATION.
+    // DurableLogStore::write_tip_anchor reports that as a failed append and the sink fences -- which is how the crash-window tests below failed
+    // in roughly one run in thirty (the same mechanism as DurableAuditSinkTest::use_fresh_base_path(), PR #187). A name nothing has used cannot
+    // collide with a handle still held for an old one. The sink itself never deletes its tip: this is the fixture's pattern, not the sink's.
+    void use_fresh_base_path() {
+        remove_all();
+        base_path_ = base_path_stem_ + "_" + std::to_string(++fresh_base_paths_used_) + ".log";
     }
 };
 
@@ -537,7 +572,7 @@ protected:
     std::size_t end_[4]{};
 
     void build_log(int frames) {
-        remove_all();
+        use_fresh_base_path();
         for (int i = 0; i < frames; ++i) {
             {
                 ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
@@ -572,7 +607,7 @@ TEST_F(ControlPlaneCrashWindowTest, EveryTornPrefixLengthIsCutAndTheLogKeepsGrow
     ASSERT_GT(frame1_len, 30u);
 
     for (std::size_t len = 1; len < frame1_len; ++len) {
-        remove_all();
+        use_fresh_base_path();  // not remove_all(): see its comment (Windows: re-using names just deleted flakes)
         spit_file(base_path_, full.substr(0, end_[0] + len));  // a crash in the middle of the second append
         spit_file(base_path_ + ".cp.tip", anchor_[0]);
         {
@@ -582,7 +617,7 @@ TEST_F(ControlPlaneCrashWindowTest, EveryTornPrefixLengthIsCutAndTheLogKeepsGrow
             EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered) << "len=" << len;
             EXPECT_EQ(restarted.recovered_torn_tail_bytes(), len) << "len=" << len;
             EndpointWeightConfig weights{};
-            ASSERT_TRUE(restarted.append_weight_config(weights).acked()) << "len=" << len;
+            ASSERT_TRUE(restarted.append_weight_config(weights).acked()) << "len=" << len << describe_sink(restarted);
         }
         EXPECT_EQ(slurp_file(base_path_).size(), end_[1]) << "len=" << len << ": no debris between the frames";
         {
@@ -599,7 +634,7 @@ TEST_F(ControlPlaneCrashWindowTest, AFirstFrameThatNeverCompletedIsCutAndTheLogS
     ASSERT_NO_FATAL_FAILURE(build_log(1));
     const std::string first = slurp_file(base_path_);
     for (const std::size_t len : {std::size_t{1}, std::size_t{5}, std::size_t{20}, std::size_t{40}, end_[0] - 1}) {
-        remove_all();
+        use_fresh_base_path();
         spit_file(base_path_, first.substr(0, len));  // no complete frame, no anchor
         {
             ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
@@ -609,7 +644,8 @@ TEST_F(ControlPlaneCrashWindowTest, AFirstFrameThatNeverCompletedIsCutAndTheLogS
             EXPECT_EQ(sink.recovered_torn_tail_bytes(), len) << "len=" << len;
             RateLimitFreezePayload freeze{};
             freeze.freeze_epoch = 1;
-            ASSERT_TRUE(sink.append_rate_freeze(freeze, FrameTimeKind::ServerCorrectedUtc).acked()) << "len=" << len;
+            ASSERT_TRUE(sink.append_rate_freeze(freeze, FrameTimeKind::ServerCorrectedUtc).acked())
+                << "len=" << len << describe_sink(sink);
         }
         EXPECT_EQ(slurp_file(base_path_).size(), end_[0]) << "len=" << len << ": the first frame starts the file";
         ControlPlaneLogSink again(base_path_, *key_ring_, 1);
@@ -681,16 +717,16 @@ TEST_F(ControlPlaneCrashWindowTest, AnAnchorOneFrameBehindWhoseMacIsNotTheLogsIs
     ASSERT_NO_FATAL_FAILURE(build_log(2));
     const std::string log = slurp_file(base_path_);
 
-    remove_all();
+    use_fresh_base_path();
     {
         ControlPlaneLogSink sink(base_path_, *key_ring_, 1);
         RateLimitFreezePayload other{};
         other.freeze_epoch = 7;  // a different history: its frame 0 has a different MAC
-        ASSERT_TRUE(sink.append_rate_freeze(other, FrameTimeKind::ServerCorrectedUtc).acked());
+        ASSERT_TRUE(sink.append_rate_freeze(other, FrameTimeKind::ServerCorrectedUtc).acked()) << describe_sink(sink);
     }
     const std::string foreign_anchor = slurp_file(base_path_ + ".cp.tip");
 
-    remove_all();
+    use_fresh_base_path();
     spit_file(base_path_, log);
     spit_file(base_path_ + ".cp.tip", foreign_anchor);  // sequence 0, but not THIS log's frame 0
     ControlPlaneLogSink restarted(base_path_, *key_ring_, 1);
@@ -784,7 +820,7 @@ TEST_F(ControlPlaneCrashWindowTest, AnAnchorAheadOfTheLogTogetherWithATornTailIs
 TEST_F(ControlPlaneCrashWindowTest, AFirstFrameCutTheOsRefusesFencesTheSinkAndLeavesTheDebrisOnDisk) {
     ASSERT_NO_FATAL_FAILURE(build_log(1));
     const std::string first = slurp_file(base_path_);
-    remove_all();
+    use_fresh_base_path();
     spit_file(base_path_, first.substr(0, 40));  // no complete frame, no anchor
     {
         TruncateFailureSeamGuard seam(1);
