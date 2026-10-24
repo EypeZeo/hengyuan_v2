@@ -1310,7 +1310,7 @@ graph TD
   - **预估**：4 至 8 日。
 
 - [ ] **任务 SAFE-07 Intent 孤儿生命周期、运行期计数与可验证归档**（对应 L-37）`[TODO: P0]`
-  - **v2.9 合同**：R-18/R-22 方案已定；F.5 的统一 NotSent、v5/v6 迁移、首次 anchor 缺失失败关闭与旧 AbortedPreSend 负控均为完成条件。规格和实现尚未修改，不以本次文档合入关闭 FI-056。
+  - **v2.9 合同**：R-18/R-22 方案已定；F.5 的统一 NotSent、v5/v6 迁移、首次 anchor 缺失失败关闭与旧 AbortedPreSend 负控均为完成条件。SUBMITPORT 规格与实现尚未修改，不以本次文档合入关闭 FI-056；NotSent 的语义已于 2026-10-25 冻结在 `docs/NOTSENT_CLOSURE_DESIGN.md`（协议由 `formal/notsent_closure.tla` 在模型层检查，Q23 切片 1），实现仍未开始。
   - **现状**：Gate 10b 在确认、端口校验、在途登记与真实限流扣费之前持久化意图帧，此后每一种本地拒绝都留下一个最后一帧是 `Intent` 的孤儿；PR #172 起恢复扫描把它们计数而不登记为检查点，预算 `kMaxIntentOrphans` 为 4096（`durable_control_plane.hpp`），满额后下一次启动 `CapacityExceeded`；规格设想的压实归档（`kIntentOrphanRetainMs`）未实现；运行期没有孤儿计数，只能在重启后由 `recovered_intent_orphans()` 看到。
   - **完成条件**：① 运行期记录孤儿数、增长、预算和拒绝原因，25%/50%/75%/90% 分级告警；② 过阈值停止生成新请求、不删历史；③ 采用 R-18/R-22 共用 NotSent 持久闭合主线，纯静态预检前移仅减量，历史孤儿及关闭段用可验证检查点/归档；先冻结版本、枚举、恢复及负控规格，再实现（F.5）；④ Prepared 不明或曾进入可能发送入口者只能 UNKNOWN，不得归入可清理孤儿；⑤ 持久闭合不等于磁盘规模有界，仍须验证封段、清单、扫描预算与崩溃原子发布。
   - **验收**：注入持续限流、确认失败、端口无效与在途表已满，计数准确、原因分类正确、在达到预算之前告警；注入归档过程中的崩溃、清单撕裂与锚点落后；拒绝循环跨越多次重启时活动日志规模有界、审计追踪可复原；FI-056 通过。
@@ -1421,7 +1421,7 @@ graph TD
 - [ ] **任务 1A.6 发送前最终授权门与统一发单授权合同**（对应 L-40）`[TODO: P0]`
   - **现状**：`SubmitReadyToken` 是 Gate 2b 签发的一次性快照，`submit_readiness.hpp` 的注释写明它不是租约；签发之后约十个门与两次持久追加（POSIX 至少六次同步调用） 才到发送，期间私网流可能掉线、`serverShutdown` 可能到达、熔断可能锁存，订单照发。
   - **完成条件**：按 `5.9.2` 落地单调递增的 `readiness_epoch` 与带截止时刻的授权记录，以及网络发送之前最后一个不可绕过的门（七项检查）；任一检查失败时不发出网络请求、不删除已持久化的意图、按日志合同留为可恢复与可审计的状态，资源按“是否可能已发出”的判定处理；超过截止时刻的授权作废并重新授权，不在过期令牌上重试；全部生产调用点都经过最后一门，以源码扫描护栏钉住。
-  - **已定设计与剩余工作**：R-22 已决定采用统一 `NotSent` 持久记录；须先完成日志兼容规格、请求所有权与迟到确认合同，并校准最后一门的截止时刻，详见 F.5—F.6。设计已定不代表实现或验收完成。
+  - **已定设计与剩余工作**：R-22 已决定采用统一 `NotSent` 持久记录；须先完成日志兼容规格、请求所有权与迟到确认合同，并校准最后一门的截止时刻，详见 F.5—F.6。最终门与 NotSent 的语义、决定字的线性化与恢复规则已于 2026-10-25 冻结在 `docs/NOTSENT_CLOSURE_DESIGN.md`（模型 `formal/notsent_closure.tla`）。设计已定不代表实现或验收完成。
   - **依赖**：任务 1A.4 的 M5（真实会话读入屏障，Runtime 证据所需；清扫的传输 M3b 已由 PR #191 合入）；SAFE-04 的熔断锁存语义（实现期可先对现有的内存锁存做检查）。
   - **关闭的用例**：FI-055；并为 FI-043 提供发送时点的证据。
   - **预估**：3 至 5 日（不含 R-22 已定方案所需的日志兼容规格修订与截止参数校准）。
@@ -2126,6 +2126,13 @@ $$
 - 状态补录：私网流迁移 M3b 合入（PR #191，`ca6ac64`）：`0.1` 的执行正确性线、`6.1.4` 的用户数据流现状行、任务 1A.4 的完成情况、第七卷 FI-009、FI-011、FI-043（基线改为 `ca6ac64`，状态仍为 `PARTIAL`）与附录 D 的 L-46 据此更新；`docs/PRIVATE_STREAM_MIGRATION_DESIGN.md` 的页眉、§5.3 与 §7，以及 `docs/AUDIT_CLOSURE_LEDGER.md` 的三条基线同步。
 - 未做：站点预期完成日期的重估（见 `1.3` 后的日期状态）；R-18 至 R-23 的实现、F.1 至 F.9 的任何一项实现；Q10 至 Q23 的任何一个主题都没有因这次复核关闭。
 
+**2026-10-25 Q23 切片 1：NotSent 语义冻结与协议模型**（Owner 于 2026-10-24 批准计划后开始；Tier B，零代码）：
+
+- 新增 `docs/NOTSENT_CLOSURE_DESIGN.md`：树内现状（含 Gate 12d 到 `submit_port.call()` 之间没有门）、NotSent 的证明条件（只能是事先决定不发送的所有者写下的正向事实，不能由追加失败、超时或恢复推出）、决定字与线性化、类 A（发送前拒绝）与类 B（最终门拒绝）的写入条件与内容、释放规则、失败与迟到、恢复与重放表、v5/v6 规则、协议依赖的假设、后续切片 S2 至 S7、待 Owner 确认的 D1 至 D4。
+- 新增 TLA+ 模型 `formal/notsent_closure.tla`：设计配置（95,664 个状态）满足 `NotSentImpliesNeverCrossed`、`ReleaseNeedsProof`、`NoClaimUnderRevoke`、`NoDoubleSend`、`ReplayLegal` 等全部性质与活性；8 个开关各有一份必须失败的配置，另有 3 个可达性探针、一份显示“独占日志锁只保护重放序列、不保护安全性”的配置、饱和运行；9 个单行变异中 7 个被杀死、2 个等价。旧 `durable_log_recovery` 模型与它的两个反例未改动，结果不变。
+- 没有改任何实现、枚举取值、日志字节或 CI。新模型**尚未接入** `ci-spec-verification.yml`（必需检查所在的 workflow，等 Owner 同意）。Q23、FI-055、FI-056、任务 1A.6 与 SAFE-07 的状态都不变：仍然开放。
+- 附带更正 `docs/SPEC_INVARIANTS.md` 里 `is_exchange_final` “无生产调用点”的过期措辞（它已被恢复扫描、编排器 Gate 13 与 `OrderTracker` 使用）。
+
 ### B.1 v2.8.0（历史修订）
 
 **输入与基点**：两份增量审计提案——《HengYuan v2.8.0 增量审计提案：模块一至模块三》（跨状态机暗病、C++ 性能与 I/O、订单安全与容灾、全天候情报）与《模块四至模块七》（因果回测、在线失效诊断、小本金与市场状态、增量路书）；修订基点为远端主干 `58b60d0`（PR #190）。本版只修订规划条目、跨组件合同、故障注册表、否决规则与附录，不改任何代码与规格文档，代码状态断言的基线不变。
@@ -2828,7 +2835,7 @@ R-18/R-22 采用一条闭合协议：新增事件/状态的最终枚举值须先
 deadline 为同 boot 单调时钟域下 signal/readiness/clock/policy 各有效期最小值；重启旧授权失效。目标机测量最终门、排队和消费成本，p99 不是硬最坏上界；无基线记 NEEDS_BASELINE。ack 必须携带 boot_uuid/request_id/slot_generation，超时后迟到成功只用于恢复审计，不重启已撤销发送。
 
 ```text
-Required future model invariants (NOT TLC results):
+Model invariants (the first three are TLC-checked at protocol level in formal/notsent_closure.tla, 2026-10-25; the last two are NOT checked):
 DurableNotSent(o) => not everCrossed(o)
 everCrossed(o) => DurableIntent(o) and DurablePrepared(o)
 Released(o) => DurableNotSent(o) or
@@ -2837,7 +2844,7 @@ Acked(r) => LogCovers(r.seq) and AnchorCovers(r.seq) and RecoveryCanVerify(r)
 count(nodes with actual CanSubmit) <= 1
 ```
 
-everCrossed 是跨崩溃物理/ghost 事实，不是进程重启后可抹去的变量；CanSubmit 必须由交易资源层不可绕过的事实定义，不能等于“本地认为 epoch 合法”。保留旧 AbortedPreSend 双发负控，新增暂停复活、网络在途、晚 ACK、失败仍落盘、claim/revoke 两种次序、槽位跨代、升级中崩溃及回绕前停机。安全性与健康公平调度下的活性分别证明。
+everCrossed 是跨崩溃物理/ghost 事实，不是进程重启后可抹去的变量；CanSubmit 必须由交易资源层不可绕过的事实定义，不能等于“本地认为 epoch 合法”。保留旧 AbortedPreSend 双发负控，新增暂停复活、网络在途、晚 ACK、失败仍落盘、claim/revoke 两种次序、槽位跨代、升级中崩溃及回绕前停机。安全性与健康公平调度下的活性分别证明。2026-10-25 起 `formal/notsent_closure.tla` 在模型层覆盖其中的旧 AbortedPreSend 双发（模型内另有同构的必败配置，`durable_log_recovery` 的两个反例仍必败）、claim/revoke 两种次序、失败仍落盘与迟到落盘，并显示了对独占日志锁这一假设的依赖；暂停复活与网络在途（6.7）、槽位跨代（PERF-01）、升级中崩溃及回绕前停机（迁移切片）尚未覆盖。模型不证明实现。
 
 接管流程为 TAKEOVER_REQUESTED → 实际 OLD_SENDER_FENCED 回执 → 订单/余额/成交/账务 RECONCILED → 持久新 epoch → 影子与全门恢复。签名请求已在途者仍需对账；围栏回执不证明历史请求从未发生。仅预授权基础设施故障可自动恢复；禁止类别和现行人工回退以 5.9.6 与 ADR 补充为准。
 
@@ -3032,7 +3039,7 @@ CS = alpha_perp/(ones' * alpha_perp)
 | Q20 自动围栏实现 | 仍开放：Owner 选定有限自动恢复目标，不是已实现/已授权运行。 | R-20、F.5、S-14、ADR 补充；真实旧发送能力隔离、在途排空/对账、危险锁存、全门恢复及 FI-047 正负控后才可生效。 |
 | Q21 R2 权限/费用/恢复 | 仍开放：产品、180 天与 5 美元预算已选；无 DELETE 保证、保留例外、实际费用和恢复均未验。 | F.7、S-11；权限负控、全内容读回/清单、冻结集、预算告警及恢复演练；不能以锁可配置或 PUT 成功关闭整项。 |
 | Q22 撤单工作流/FI | 仍开放：协议文字确认不证明取消闭环。 | F.7/F.9；验应答丢失/部分成交/更名 alias/-2011/预算/其他 sender/普通与算法域、存储故障审计；不自动清仓，未知不释放。 |
-| Q23 NotSent 与迁移 | 仍开放：OWNER_APPROVED_DESIGN，现代码未实现新事件/格式。 | R-18/R-22、F.5/F.9；先冻结状态/版本规格，严格 v5/v6、迁移崩溃、持久失败/晚 ACK、唯一发送 claim、旧 AbortedPreSend 负控及恢复验收。 |
+| Q23 NotSent 与迁移 | 仍开放：OWNER_APPROVED_DESIGN；2026-10-25 语义已冻结（`docs/NOTSENT_CLOSURE_DESIGN.md`）并有 TLA+ 协议模型（`formal/notsent_closure.tla`：设计配置无反例，8 个开关各有必败配置），现代码仍未实现新事件/格式。 | R-18/R-22、F.5/F.9；语义与协议模型已冻结（设计文档 4 至 7），剩余：严格 v5/v6 读者与迁移崩溃、持久失败/晚 ACK 的实现测试、唯一发送 claim 的并发实现与 TSan 负控、旧 AbortedPreSend 负控的实现侧用例、恢复验收。 |
 
 前轮最小公开观察的可追溯摘要（不是本次新增抓帧，也不是完整原始 fixture）：
 
