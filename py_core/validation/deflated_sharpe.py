@@ -37,10 +37,12 @@ deviation of the N trials' Sharpe estimates (``V[{SR_n}]`` in Bailey & Lopez de 
 notation). This module instead passes ``sharpe_ratio_std_error`` -- the single-observation
 sampling standard error of ONE Sharpe estimate (Mertens 2002) -- into
 ``expected_max_sharpe_ratio()``. Quantified by Monte Carlo across three regimes (ratio of
-this substitute to the true cross-trial dispersion): under the strict null (all trials
-share the same zero true Sharpe) the two converge, ratio -> 0.999, so the substitution is
-asymptotically exact exactly where the paper's own derivation assumes it; when trials are
-correlated (a realistic effect of a parameter sweep re-using the same underlying data) the
+the TRUE cross-trial dispersion to this substitute; the expected-max term scales linearly
+with the dispersion it is given, so a ratio below 1 means the substitute is too large and
+DSR too strict, above 1 means the substitute is too small and DSR too lenient): under the
+strict null (all trials share the same zero true Sharpe) the two converge, ratio -> 0.999,
+so the substitution is asymptotically exact exactly where the paper's own derivation assumes
+it; when trials are correlated (a realistic effect of a parameter sweep re-using the same underlying data) the
 ratio drops to ~0.30, making DSR MORE conservative than it needs to be (safe direction);
 but when trials have genuine, varying skill (not just noise -- some candidates are
 genuinely better than others, which is exactly the situation a parameter sweep hopes to be
