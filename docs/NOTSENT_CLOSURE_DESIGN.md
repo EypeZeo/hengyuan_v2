@@ -7,7 +7,7 @@
 ## 1. 问题
 
 1. 发送前最后一道复核不存在：`Prepared` 帧 ACK 之后到 `submit_port.call()` 之间没有任何检查（蓝图 L-40）。令牌是 Gate 2b 签发的快照，之后约十个门与两次持久追加，私网流可能掉线、`serverShutdown` 可能到达、熔断可能锁存，订单照发。
-2. 即使加了最后一门，**拒绝之后订单怎么办**：`Prepared` 已落盘，恢复只会把它读成 `Ambiguous`（可能已发出），占用在途槽位与资金预留直到对账。要么接受这个代价，要么有一个**能证明“没有发出”的持久记录**。
+2. 即使加了最后一门，**拒绝之后订单怎么办**：`Prepared` 已落盘，恢复只会把它读成 `Ambiguous`（可能已发出），占用在途槽位与资金预留。而且**对账关不掉它**：`query_order()` 把一切不是“正向匹配”的回答——包括“交易所没有这个订单”的错误——折叠成 `QueryOutcome::Inconclusive`（`binance_private_rest.hpp:query_order`、`parse_order_query_response`；币安的 -2013 也没有“从未发送”的语义），所以一个从未发出的 `Prepared` 订单永远得不到结论：R-10 隔离判据到点后升级给操作员，并在 L-46 的意义上永久计入清扫的未决数，屏障不再完成。这一条同样适用于“`Prepared` ACK 之后、真正发出之前崩溃”的订单。要么接受这个代价，要么有一个**能证明“没有发出”的持久记录**。
 3. 发送前被拒的订单（Gate 11 到 12c）只留一个 `Intent` 孤儿，预算 `kMaxIntentOrphans` 是唯一的界（L-37）。
 
 蓝图的选择（R-18 / R-22）：**一个统一的 NotSent 持久闭合**，同时服务以上两类拒绝。本文冻结它的证明条件、决定字、帧、恢复与版本规则，并用 TLA+ 证明协议；不写实现。
@@ -62,7 +62,7 @@
 
 ### 4.5 失败与迟到
 
-- `Failed` 不证明没写入。NotSent 追加失败后：帧若迟到落盘 → 下次启动读到 NotSent，闭合（仍然正确，因为它从未跨越）；没落盘 → 读到 `Prepared` → `Ambiguous` → 对账（交易所没有这个订单，走现有路径收敛）。代价是多一段 UNKNOWN，不是不安全。
+- `Failed` 不证明没写入。NotSent 追加失败后：帧若迟到落盘 → 下次启动读到 NotSent，闭合（仍然正确，因为它从未跨越）；没落盘 → 读到 `Prepared` → `Ambiguous`。**这不是“多一段 UNKNOWN”**：今天的对账不能把“交易所没有这个订单”当结论（§1 第 2 点），这样的订单只会走 R-10 隔离升级给操作员。所以 NotSent 追加失败不会不安全（安全性质不依赖对账能否下结论），但也不便宜：一次丢失的 NotSent 帧等于一次操作员升级。模型用 `ReconcileConcludesAbsent` 精确显示了这一点（§6 A6）。
 - **迟到的完成（ACK）只是审计证据**：调用方已经放弃（超过截止、已围栏）之后到达的完成，不得改变该进程的任何状态，不得释放槽位，不得让订单变成可发送。同步写入器下这条恒真；异步或组提交写入器（PERF-01）必须让每个请求携带 `(boot_uuid, request_id, slot_index, slot_generation)`，完成按它匹配，不匹配就丢弃并计数；请求未结清之前槽位不得复用。
 - 前任进程的迟到落盘**不得**与继任者的恢复扫描交错：见 §6 假设 A1。
 
@@ -103,6 +103,7 @@
 - **A3 claim 是传输边界之前的最后一步。**claim 与第一个可能写出的字节之间，只允许不能阻塞的工作。
 - **A4 “可以发送”只有一个来源**：决定字。没有第二个局部标志。
 - **A5 时间域。**截止、退避用单调时钟；这些是门的输入，不在模型里。
+- **A6 对账能否结论“交易所没有它”。**设计**不**依赖这一条为真：模型的安全性质在 `ReconcileConcludesAbsent = FALSE`（今天的代码）下全部成立（`notsent_closure_no_absent_safety.cfg`）。依赖它的只有进展：为真时，`Prepared` 之后没有闭合帧的订单最终能由对账收敛；为假时，它们永远停在 `Ambiguous`（`notsent_closure_no_absent_liveness.cfg` 必须失败，反例是一个 `Prepared` 迟到落盘、从未发出、被恢复成 `Ambiguous` 的订单）。让它为真需要另一个设计（例如在 `recvWindow` 过期后、带可审计证据地把“查无此单”认作终局，或操作员的证明路径），不在本文。**在那之前，缩小 `Ambiguous` 窗口（claim 越晚越好）和让 NotSent 可靠落盘，是仅有的两把手段。**
 
 ## 7. 形式化模型 `formal/notsent_closure.tla`
 
@@ -123,6 +124,8 @@
 | `RecoveryNeverClosesPrepared` | 恢复把“`Prepared` 之后没有任何帧”读成 NotSent | `ClosedNotSentIsTrue` |
 | `RecoveryWaitsForWriter` | 继任者不等前任的最后一次写入就扫描（假设 A1） | `ReplayLegal`（`notsent_closure_no_lock_safety.cfg` 证明此时其余性质仍成立） |
 
+**两个环境假设各有一对配置**：`RecoveryWaitsForWriter`（A1）——`notsent_closure_no_lock_bug.cfg` 必败于 `ReplayLegal`，`notsent_closure_no_lock_safety.cfg` 证明其余性质仍成立；`ReconcileConcludesAbsent`（A6，今天为假）——`notsent_closure_no_absent_safety.cfg` 证明安全性质仍成立，`notsent_closure_no_absent_liveness.cfg` 必败于活性 `EventualSettlement`。
+
 另有三个可达性探针（必败）：`NotSentNeverDurable`、`LateNotSentNeverLands`（NotSent 在调用方被告知失败或崩溃**之后**落盘）、`SentWhileRevokedNeverHappens`（先 claim 后撤销：订单在途，设计只承诺“先到的撤销会赢”，不承诺撤回）。结果表与运行方法见 `formal/README.md`。
 
 **不在模型里的东西**（不是遗漏，各有归属）：帧布局与版本规则（§5，实现时用测试验证）；日志 / anchor / 目录分层（一个 `landed` 布尔，与旧模型一致；F.5 的 `Acked ⇒ LogCovers ∧ AnchorCovers` 与 F.6 属 PERF-01）；多节点与主机围栏（F.5 的 `count(CanSubmit) ≤ 1`，任务 6.7）；异步写入器的请求号与槽位代次（§4.5，PERF-01）；`Intent` 帧与孤儿计数（SAFE-07）；时间与截止；一个撤销闩锁代表所有拒绝原因。
@@ -136,20 +139,22 @@
 | 片 | 内容 | 验证与负控 |
 | :-- | :-- | :-- |
 | S2 codec 读者 | `format_version` 6 与两套合法集合，只读不写；未知版本、v5 帧里的 v6 值、版本回退各有明确状态 | MSVC + GCC `none`；codec 表驱动用例 |
-| S3 状态机与恢复 | `NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
+| S3 状态机与恢复 | `NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料；**命名**：`order_tracker.hpp` 已有 `QueryOutcome::NotSent`（R-10，意思是对账**查询**没有离开进程），订单状态与事件的新名字要与它区分（实现 PR 里定），否则 grep 和读者都会混 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
 | S4 写入 | sink 追加 NotSent（沿用 `append_durable`）、故障注入：Failed、迟到、撕裂尾 | `address`；旧 `AbortedPreSend` 双发场景作为必败 / 必拒用例保留 |
 | S5 最终门（1A.6、FI-055） | 决定字与门；撤销者与所有者的两种次序；`ServerShutdown`、代次变化、熔断、授权截止注入 | `thread` + arm64 重复；**新增一个 TSan 负控**（把决定字的配对降成 relaxed 必须被抓到）；变异检查 |
 | S6 类 A 闭合（SAFE-07、FI-056） | 各拒绝路径写 NotSent；孤儿计数；纯静态预检前移只作减量优化 | 孤儿预算与告警；拒绝循环的日志规模有界；Q19 先量出每次拒绝多一条持久链的成本 |
 | S7 迁移 | 清单、读者先行开关、回退前停机；仅当存在真实日志 | 迁移中崩溃、清单撕裂、旧构建遇 v6 |
+| S8 操作员闭合（D5，L-46） | 另开设计：操作员出具的闭合帧与清扫未决数的减少 | 另定；先有设计与模型，再有实现 |
 
 ## 9. 请 Owner 确认的点
 
-不阻塞本切片；给出推荐，不同意就说。
+不阻塞本切片；给出推荐，不同意就说。D5 是这次建模意外发现的，分量最重。
 
 - **D1 类 A 是否一律写 NotSent。**推荐一律写（R-18 的统一路线）；若 Q19 量出拒绝循环里每次多一条持久链太贵，先把纯静态检查前移到 `Intent` 帧之前减少拒绝次数——那是优化，不改语义。
 - **D2 第一份真实日志之前的版本策略。**推荐：现在直接升 v6，不做迁移工具（v4、v5 的先例）；第一次会写下我们要保留的日志的运行（M5 的 Testnet 联调）起，§5 的 1 到 6 全部生效。
 - **D3 NotSent 之后是否归还本地限流预留。**推荐归还（请求没有离开；只动本地限流器，不对交易所状态做任何断言）。
 - **D4 claim 取在 `call` 之前还是端口的写出回调里。**推荐 S5 先取在 `call` 之前；写出回调作为后续优化，目的只是缩小 `Ambiguous` 窗口。
+- **D5 操作员的回头路。**NotSent 管不到“claim 之后、写出之前崩溃”的订单，也管不到已经升级给操作员的订单；今天它们没有任何出口（§1 第 2 点，L-46）。推荐另开一个设计：操作员在交易所核实“这个 COID 没有订单”之后，经一个带认证的工具写一个**操作员出具的闭合帧**（与 NotSent 不同的事件，证据来源是人而不是进程内决定字），并让清扫的未决数随之减少。它独立于本文的协议，应排在 S5 之后、M5 联调之前。
 
 ## 10. 与蓝图 F.5 的对照
 

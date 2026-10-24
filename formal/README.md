@@ -790,6 +790,14 @@ that `durable_log_recovery.tla` and its two regression controls stay exactly as 
 | `RecoveryNeverClosesPrepared` | recovery reads `Prepared`-and-nothing-after as `NotSent` | only the incarnation that decided *not to send* may write `NotSent` |
 | `RecoveryWaitsForWriter` | a successor scans before the predecessor's last write has landed or been lost | design assumption: the exclusive log open (`durable_log_store.hpp`) |
 
+**A ninth constant, `ReconcileConcludesAbsent`, is an assumption about the environment, not a design decision.** `FALSE` (the tree today):
+reconciling an `Ambiguous` order can only ever end in "the exchange has it" — `query_order()` folds every answer that is not a positive
+match, an unknown-order error included, into `QueryOutcome::Inconclusive`. The safety claims do not depend on it; progress does: an
+order whose `Prepared` frame is the last durable frame and which the exchange never saw stays `Ambiguous` for ever (in the tree: R-10
+quarantine, then escalated to the operator and counted as unresolved for the life of the process, blueprint L-46). Each of the two
+assumptions (`RecoveryWaitsForWriter`, `ReconcileConcludesAbsent`) has a pair of configs: one that shows what still holds without it,
+one that shows what breaks.
+
 ### The configs, and what each one MUST report
 
 | Config | Expected result |
@@ -797,6 +805,7 @@ that `durable_log_recovery.tla` and its two regression controls stay exactly as 
 | `notsent_closure.cfg` | **No error found** — the design |
 | `notsent_closure_liveness.cfg` | **No error found** — `EventualSettlement` holds |
 | `notsent_closure_no_lock_safety.cfg` | **No error found** — `RecoveryWaitsForWriter = FALSE`, every invariant but `ReplayLegal` |
+| `notsent_closure_no_absent_safety.cfg` | **No error found** — `ReconcileConcludesAbsent = FALSE`, every invariant of the design |
 | `notsent_closure_saturation.cfg` | **No error found** — larger budgets, manual only |
 | `notsent_closure_stale_claim_bug.cfg` | **`NoClaimUnderRevoke` violated** — `AtomicClaim = FALSE` |
 | `notsent_closure_plain_revoke_bug.cfg` | **`NotSentImpliesNeverCrossed` violated** — `ExclusiveDecision = FALSE` |
@@ -806,6 +815,7 @@ that `durable_log_recovery.tla` and its two regression controls stay exactly as 
 | `notsent_closure_coid_reuse_bug.cfg` | **`NotSentImpliesNeverCrossed` violated** — `SingleAttemptCoid = FALSE` |
 | `notsent_closure_recovery_closes_bug.cfg` | **`ClosedNotSentIsTrue` violated** — `RecoveryNeverClosesPrepared = FALSE` |
 | `notsent_closure_no_lock_bug.cfg` | **`ReplayLegal` violated** — `RecoveryWaitsForWriter = FALSE` |
+| `notsent_closure_no_absent_liveness.cfg` | **`Temporal properties were violated`** (`EventualSettlement`, exit 13) — `ReconcileConcludesAbsent = FALSE` |
 | `notsent_closure_probe.cfg` | **`NotSentNeverDurable` violated** — a `NotSent` frame can become durable |
 | `notsent_closure_probe_late.cfg` | **`LateNotSentNeverLands` violated** — it can land after the caller was told `Failed` or died |
 | `notsent_closure_probe_sent_revoked.cfg` | **`SentWhileRevokedNeverHappens` violated** — claim first, revoke second: in flight, no recall |
@@ -817,7 +827,7 @@ java -cp tools/tla2tools.jar tlc2.TLC -workers auto -config notsent_closure.cfg 
 
 TLC exits `0` on success and `12` on an invariant violation. `notsent_closure_liveness.cfg` has no `CONSTRAINT` line, deliberately (see the
 traps above). **Not yet wired into `.github/workflows/ci-spec-verification.yml`**: that is a required-check workflow and the extra step
-(three runs that must pass — design, liveness, no-lock safety — and eleven that must fail) is the owner's call.
+(four runs that must pass — design, liveness, no-lock safety, no-absent safety — and twelve that must fail; the no-absent liveness run fails with a temporal violation, exit 13, not an invariant) is the owner's call.
 
 ### Recorded results (2026-10-25, TLC 2.19, Java 25, 16 workers)
 
@@ -826,6 +836,8 @@ traps above). **Not yet wired into `.github/workflows/ci-spec-verification.yml`*
 | main | 95,664 (depth 26) | no error — exhaustive |
 | liveness | 95,664 (depth 26) | no error |
 | no_lock_safety | 217,856 (depth 32) | no error |
+| no_absent_safety | 32,832 (depth 26) | no error |
+| no_absent_liveness | 32,832 | `EventualSettlement` violated ✓ (12-state trace ending in a stuttering state: order 1 is `Ambiguous` — its `Prepared` landed late — and nothing can close it) |
 | saturation | 273,264 (depth 31) | no error |
 | stale_claim | 692 | `NoClaimUnderRevoke` violated ✓ (7-state trace) |
 | plain_revoke | 2,087 | `NotSentImpliesNeverCrossed` violated ✓ (9) |

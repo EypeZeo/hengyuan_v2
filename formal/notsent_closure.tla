@@ -36,7 +36,8 @@
  *   "nothing happened".
  *
  * THE EIGHT SWITCHES (TRUE = the design). A config that turns one off MUST fail, with the invariant named in
- * its file; that is what keeps the model from proving nothing.
+ * its file; that is what keeps the model from proving nothing. A ninth constant, ReconcileConcludesAbsent, is an
+ * ASSUMPTION about the environment and is described after them.
  *
  *   AtomicClaim                 TRUE: "is a revocation latched?" and "claim the order" are one step.
  *                               FALSE: the check is a separate earlier step, the claim trusts its answer
@@ -60,6 +61,13 @@
  *                               an ASSUMPTION of the design, and the config with FALSE shows exactly what
  *                               depends on it (ReplayLegal; the safety claims above do not).
  *
+ * THE OTHER ASSUMPTION: ReconcileConcludesAbsent. TRUE: reconciling an Ambiguous order the exchange does not
+ * have ends in an Outcome (Rejected). FALSE: reconciliation can only ever conclude "the exchange HAS it" --
+ * which is what the tree does today: query_order() / parse_order_query_response() fold every answer that is not
+ * a positive match, an "unknown order" error included, into QueryOutcome::Inconclusive, so a never-sent order
+ * with a Prepared frame stays Ambiguous until the R-10 quarantine escalates it to the operator. The safety
+ * claims do not depend on it; EventualSettlement does, and the FALSE config shows which orders it strands.
+ *
  * KNOWN RESOLUTION LIMITS
  *   - An order that recovers with no durable frame is `Dead`: nothing resumes an attempt, a new attempt has a
  *     new client-order-id (Gate 9). durable_log_recovery.tla lets such an order start again; here that would
@@ -81,6 +89,7 @@ CONSTANTS
     SingleAttemptCoid,
     RecoveryNeverClosesPrepared,
     RecoveryWaitsForWriter,
+    ReconcileConcludesAbsent,
     MaxCrashes,          \* modeling budget, NOT a design bound
     MaxAppendFailures,   \* modeling budget, NOT a design bound
     MaxLogLen            \* StateConstraint bound; a CONSTANT so the saturation run is a cfg change
@@ -93,6 +102,7 @@ ASSUME ReleaseAfterAck              \in BOOLEAN
 ASSUME SingleAttemptCoid            \in BOOLEAN
 ASSUME RecoveryNeverClosesPrepared  \in BOOLEAN
 ASSUME RecoveryWaitsForWriter       \in BOOLEAN
+ASSUME ReconcileConcludesAbsent     \in BOOLEAN
 ASSUME MaxCrashes \in Nat
 ASSUME MaxAppendFailures \in Nat
 ASSUME MaxLogLen \in Nat
@@ -225,6 +235,7 @@ StartOutcome(c) ==
 \* Reconciliation of an Ambiguous order (the only way out of Ambiguous, spec round 11).
 StartReconcile(c) ==
     /\ state[c] = "Ambiguous"
+    /\ (ReconcileConcludesAbsent \/ exchangeHasOrder[c])
     /\ StartAppend(c, "Outcome", ObservedOutcome(c))
     /\ UNCHANGED <<state, decision, seen, revoked, durableLog, sendCount, exchangeHasOrder, fenced,
                    crashesLeft, failsLeft, hist, released>>
