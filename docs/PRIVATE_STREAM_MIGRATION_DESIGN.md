@@ -1,7 +1,7 @@
 # 私网流迁移、发单就绪门与用户数据流持久化——设计提案
 
 > **状态：已接受（Owner 于 2026-10-15 说“合并，按推荐，开始，可以下载”：D1 至 D7 按推荐，M1 开始）；它仍是设计，不是规格——每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出计划、等“开始”，细节以那一片的计划与蓝图为准。** 它把蓝图任务 1A.4（现货私有 WebSocket 用户数据流与会话对账）、审计 P1-002 的路径 ③（用户数据流排空函数）和 FI-043 要求的“屏障门”拆成可以逐片开工、逐片验收的工作，并把需要 Owner 拍板的点列在 §8。每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出 ≤5 行计划、等“开始”。
-> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。**2026-10-18 增补**：M2 已合入（PR #184，合并提交 `f853947`），其中漏掉了本文 §5.1 与 §7 要求的 `session.subscriptions` 校验，由 M2b 补上（PR #185，合并提交 `781d1f2`）；§4.3 补了 M2 与 M2b 的实现情况，§7 的 M2 行改为已完成并新增 M2b 行；M3 起尚未开工。**2026-10-19 增补**：M3 拆成 M3a（纯逻辑：重连屏障、发单就绪令牌、Gate 2b、排空过滤；PR #188，合并提交 `62c4647`）与 M3b（清扫的跨线程传输、TSan 负控、TLA+ 模型）；§5 补了 M3a 的实现情况与同设计草图的差别，§7 的 M3 行拆成 M3a（已完成）与 M3b；M3b 起尚未开工。
+> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。**2026-10-18 增补**：M2 已合入（PR #184，合并提交 `f853947`），其中漏掉了本文 §5.1 与 §7 要求的 `session.subscriptions` 校验，由 M2b 补上（PR #185，合并提交 `781d1f2`）；§4.3 补了 M2 与 M2b 的实现情况，§7 的 M2 行改为已完成并新增 M2b 行；M3 起尚未开工。**2026-10-19 增补**：M3 拆成 M3a（纯逻辑：重连屏障、发单就绪令牌、Gate 2b、排空过滤；PR #188，合并提交 `62c4647`）与 M3b（清扫的跨线程传输、TSan 负控、TLA+ 模型）；§5 补了 M3a 的实现情况与同设计草图的差别，§7 的 M3 行拆成 M3a（已完成）与 M3b；M3b 起尚未开工。**2026-10-24 增补**：M3b 已合入（PR #191，合并提交 `ca6ac64`，2026-10-23）；§5.3 补了 M3b 的实现情况与同设计草图的差别（回报不是第二个环，而是夹在既有对账事件环里的完成标记，因此没有新增 TSan 负控），§7 的 M3b 行改为已完成；M4 起尚未开工。
 > 读法：§0 是一页摘要；§1 是现状事实（每条带 `file:symbol`）；§2–§6 是设计；§7 是切片计划；§8 是决策点；§9 是风险；§10 是验收映射。
 
 ## 0. 一页摘要
@@ -174,6 +174,14 @@ flowchart LR
 
 对账线程新增一种入口请求 `BarrierSweep{epoch}`：把当时在途的每个订单立刻查询一次（走现有 `QueryPort`，经持久优先的对账排空发布），全部有确定答案后把 `{epoch, 未决数}` 回报热线程。回报用一个小的 SPSC 环（对账线程为生产者），与现有 `ReconcileEventRing` 同一个模式。这是本设计里唯一**新的跨线程共享状态**，所以 M3 要走 WSL2 `thread` 层，并带一个负控（把 acquire/release 降成 relaxed 必须被 TSan 抓到）。
 
+**M3b 的实现情况（2026-10-23，PR #191，合并提交 `ca6ac64`）与上面草图的差别：**
+
+- 请求与回报**不是**两个环：热 → 对账是 `SweepRequestRing`（`SpscRing<SweepRequest, 4>`，消费者只留最新的纪元）；对账 → 热是 `SweepDone{epoch, unresolved}` 完成标记，**夹在既有的 `ReconcileEventRing` 里**（`ReconcileEvent::kind == SweepDone`）。草图里的独立回报环需要一个计数器和“先发布 N 条再应用回报”的规则；环是先进先出的，这条规则由构造成立：热线程弹出标记时，清扫产生的每一条裁决已被 `drain_reconcile_events()` 持久化并发布。结果是**没有新的原子协议**，所以 M3b **没有**新增 TSan 负控（本节上一版说会有）；`test_sweep_concurrency` 在三个并发清单里，三个既有负控仍须失败，已核对。
+- `OrderTracker::poll_once(..., SweepJob*)` 在排空入口环**之前**取请求，使请求之前发出的订单已在环里。单线程测试看不出这个次序：`test_barrier_sweep_guard`（源码护栏）、`formal/reconnect_sweep_drain_first_bug.cfg`（必败配置）和概率性的两线程测试各钉一部分。
+- `drain_reconcile_events(..., const SweepSink*)` 是第八个参数（第七个是持久发布者）；没有 sink 时标记被消费并丢弃，屏障得不到回答、超时后再发（失败关闭）。`SweepPump::service()` 在 `ctx.sweep` 非空时于 `orchestrate_submit()` 开头运行（没有主循环，直到 M5）。
+- 清扫完成 = `poll_once()` 能问的每个订单都得到晚于请求的权威明确回答；被升级给操作员的订单永远不再被问，计入 `unresolved`，屏障在其存续期间保持 Sweeping——失败关闭，但操作员的回头路还不存在（蓝图附录 D 的 L-46）。`SweepAccountProbe` 没有接线，账户永远不“新鲜”，屏障至今不会完成；账户刷新器随 M5。
+- `formal/reconnect_sweep.tla`：5 个开关（任意纪元 `any_epoch`、绕过先进先出 `bypass_fifo`、先排空后取请求 `drain_first`、不降为 Down `no_down`、不观察 `no_observe`），每个有必败配置，另有探针；主配置 5,859,744 个状态；`ci-spec-verification.yml` 新增 `reconnect_sweep` 模型步骤。
+
 ### 5.4 发单就绪令牌
 
 ```
@@ -233,7 +241,7 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 | **M2** 会话（**已完成 2026-10-17，PR #184，合并提交 `f853947`；其中 `session.subscriptions` 校验由 M2b 补上**） | `BinanceWsApiUserDataSession`（握手后取信箱里的已签名字节、发订阅、校验响应与 `session.subscriptions`、读循环、盖代次、`serverShutdown`/`eventStreamTerminated` 处理、失败即停）；`WsLoopbackServer` 扩展为可读客户端帧的脚本化应答；监督器接线 | B（并发） | WSL2 `thread`（信箱交接，带负控）、`address`；回环服务端覆盖：订阅成功/失败/超时、重复订阅、断线、`serverShutdown`；实际：MSVC、WSL2 `none`、`address` 与 `thread` 层、手动 Sanitizer，变异检查 47 个变异体全部被杀死，守卫 11 个负控 | 估计 3 日；实际 2026-10-17 |
 | **M2b** `session.subscriptions` 校验（**已完成 2026-10-18，PR #185，合并提交 `781d1f2`**） | 补上 M2 漏掉的一步：订阅应答后会话发无签名的 `session.subscriptions`，只有恰好列出刚确认的那一个订阅，`is_connected()` 才为真；工厂多预留一个许可（一代 6 权重）并改为先签名后预留；`WsApiResponse::subscription_list_malformed`；顺带修 M2 的 `stopped()` 先于结束原因变真的竞争 | B（状态机） | MSVC + WSL2 `none` + `address`，本地 TSan 跑会话测试；变异检查；实际：MSVC 2545、GCC 2551、ASan 6 个可执行文件、本地 TSan 51 个用例 0 报告，变异检查 39 个变异体中 34 个被杀死、5 个存活且各有解释，守卫 11 个负控 | 估计 0.5 日；实际 2026-10-17 至 2026-10-18（含一次进程中断） |
 | **M3a** 屏障与就绪门（纯逻辑）（**已完成 2026-10-19，PR #188，合并提交 `62c4647`**） | `ReconnectBarrier`、`FeedObservation` 适配器、`SubmitReadiness` / `SubmitReadyToken`、`OrchestratorGate::NotReady`（Gate 2b）、排空过滤、合成就绪（真实组件加脚本化观察）、护栏测试；FI-009/011/020/043 的确定性状态机测试（含由真实监督器加假会话和真实回环会话驱动的端到端）；实际没有做“预检线束接真实 `StartupRecovery`”（随 M5） | B（状态机） | MSVC + WSL2 `none` + `address` + `thread`；变异检查；实际：MSVC 2694、GCC 2700、ASan 11 个可执行文件、`thread` 层 210 个并发用例 + 三个负控、手动 Sanitizer 三个作业，变异检查 133 个变异体（124 + 守卫 9）：8 个存活，均为等价或纵深防御 | 估计 2 日；实际 2026-10-18 至 2026-10-19 |
-| **M3b** 清扫的传输 | 对账线程的 `BarrierSweep` 入口与回报环（唯一新的跨线程共享状态）、该环的 TSan 负控、`formal/` 的屏障模型（§9 的 R9）；把 `ReconnectBarrier` 的清扫协议接到 `OrderTracker` / `poll_once` | B（并发） | WSL2 `thread`（三个现有负控仍须失败，另加清扫回报环的负控）+ `address`；TLA+ 模型与它的负控；变异检查 | 2 日 |
+| **M3b** 清扫的传输（**已完成 2026-10-23，PR #191，合并提交 `ca6ac64`**） | 请求环加夹在对账事件环里的完成标记（不是独立的回报环）、`SweepJob` / `SweepPump` / `SweepSink`、`poll_once` 的取请求次序、`formal/reconnect_sweep.tla` 与 5 个必败配置、护栏与 CI 模型步骤；没有新的原子协议，因此没有新增 TSan 负控（见 §5.3） | B（并发） | MSVC + WSL2 `none` + `address` + `thread`；TLA+ 模型与它的必败配置；变异检查；实际：MSVC 登记 2765 个、运行 2763 个（新增 71 个），GCC 2771 个、0 警告，ASan 18 个可执行文件，`thread` 层 212 个用例（+2）且三个既有负控仍失败，手动 Sanitizer（run 39465113371）三个作业全绿，变异检查 85 个变异体（81 个被杀死、4 个等价，两处真实缺口 SP09 与 OT18 补了测试） | 估计 2 日；实际 2026-10-20 至 2026-10-23 |
 | **M4** 路径 ③ 持久优先 | `OrderFillContext` 影子、`durable_path`、WS 合并发布者、`drain_user_data_events` 改造、影子更新点的护栏 | B | WSL2 `address` + `thread`（若发布者与排空共用待定事件）；真实日志重启测试；变异检查 | 2 日 |
 | **M5** 退役与联调 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），迁移 `live_submit_reconcile_harness_demo` 与预检线束；**Owner 用 Testnet 凭据跑联调**并贴日志 | B | 全量三层 + CI 手动 Sanitizer；Testnet 联调由 Owner 执行 | 2 日（不含联调等待） |
 
