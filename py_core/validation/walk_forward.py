@@ -105,8 +105,10 @@ def run_walk_forward_analysis(
     next-bar-open engine's own ``shift(1)`` has nothing before the sliced series' first row
     to shift from, so it trades flat there regardless of the true prior-bar signal) --  a
     small, well-understood, one-bar-per-fold boundary artifact, not a lookahead violation
-    and not something that inflates results (it can only suppress a trade the strategy would
-    have made, never fabricate one from future information).
+    (it can only suppress a trade the strategy would have made, never fabricate one from
+    future information). Suppressing a trade can raise OR lower the stitched result -- the
+    skipped trade may have been a loser -- so the artifact is bounded in size (one bar per
+    fold) but its direction is not known in advance and must not be described as conservative.
 
     Raises:
         ValueError: param_grid or splits is empty, or a split's train/test indices are not

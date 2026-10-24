@@ -623,7 +623,7 @@ def test_read_range_matches_records_to_dataframe_baseline(tmp_path: Path) -> Non
 
 
 def test_read_range_rejects_naive_datetime(tmp_path: Path) -> None:
-    naive_start = datetime(2024, 1, 1)  # noqa: DTZ001 -- deliberately naive, this is what's under test
+    naive_start = datetime(2024, 1, 1, tzinfo=UTC).replace(tzinfo=None)  # deliberately naive: what's under test
     with pytest.raises(ValueError, match="UTC"):
         wh.read_range(tmp_path, _CRYPTO, _BTC, _1D, naive_start, datetime(2024, 1, 2, tzinfo=UTC))
 

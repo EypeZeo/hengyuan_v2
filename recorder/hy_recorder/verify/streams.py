@@ -7,9 +7,10 @@ Rules come from real 5-minute samples taken on 2026-09-29 (DATA_DICTIONARY.md):
                           adjacency is NOT a criterion: 32 of 4,550 events were not adjacent, so it
                           is only counted as information.
 * usdm  ``@markPrice@1s``: event time ``E`` advances ~1000 ms (995 to 1005 ms measured).
-* usdm  ``!forceOrder@arr``: notification stream (largest liquidation per 1000 ms per symbol since
-                          2026-04-14); only schema and event-time order are checked. It says nothing
-                          about total liquidation volume.
+* usdm  ``!forceOrder@arr``: notification stream (at most one liquidation per 1000 ms per symbol; whether
+                          it is the latest or the largest one is an unresolved conflict between the
+                          official change log and the stream docs, blueprint P-11); only schema and
+                          event-time order are checked. It says nothing about total liquidation volume.
 * depth (spot / usdm)   : the bridge state machine (``hy_recorder.bridge``).
 """
 
@@ -27,7 +28,9 @@ INFO = "INFO"
 
 MARK_GAP_FAIL_MS = 3500
 MARK_GAP_WARN_MS = 1500
-FORCE_EPOCH_WALL_US = 1_776_124_800_000_000  # 2026-04-14T00:00:00Z: semantics changed to "largest"
+# 2026-04-14T00:00:00Z: effective date the change log gives for the latest->largest description change.
+# A segmentation date only; it is not proof that the server changed what it sends (blueprint P-11).
+FORCE_EPOCH_WALL_US = 1_776_124_800_000_000
 
 
 @dataclass

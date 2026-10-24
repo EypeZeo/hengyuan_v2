@@ -39,7 +39,7 @@ closed the cross-mechanism dedup problem it was presumably meant to solve. No AD
 `py_core` code anywhere in the repository requires it. If a real need surfaces later (PnL
 attribution, trade-quality analysis), start from `docs/adr/ADR-019-*.md` D10's migration/DB-review
 packet requirement, and from two evaluated implementation paths: extending `AuditRecord` with a
-new `AuditEventType` value (small, reuses the existing 165-byte durable pipeline) versus a bespoke
+new `AuditEventType` value (small, reuses the existing durable pipeline: 165-byte `AuditRecord` payload, 256-byte frame) versus a bespoke
 non-`DurableRecordType` frame following the `KeyRotatedRecord` precedent (large — that precedent
 solves a signing-order problem unrelated to trade persistence). A new `DurableRecordType` enum
 value is not an option — that enum is closed/spec-transcribed and CI-enforced via
