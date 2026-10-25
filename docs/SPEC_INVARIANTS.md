@@ -363,7 +363,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       不在 MSVC 变异检查之内。
 
   - **[D5 切片 R1 已落地：读者先行——`OrderOperatorResolved` 帧与帧格式 v6]**（`docs/OPERATOR_RESOLUTION_DESIGN.md` §7、§10；
-    Owner 2026-10-25 “开始”；Tier B）：被困订单的“回头路”（离线工具，切片 R3）会写下的闭合帧，恢复读者现在能读、能校验，
+    Owner 2026-10-25 “开始”，“合并”；Tier B；PR #203，合并提交 a4372ba）：被困订单的“回头路”（离线工具，切片 R3）会写下的闭合帧，恢复读者现在能读、能校验，
     但**没有任何生产代码能写它**：工具是 R3，R1 只让读者先行（`docs/NOTSENT_CLOSURE_DESIGN.md` §5 第 4 条）。
     - **新增符号**：`AuditEventType::OrderOperatorResolved` = 22（只在 v6 帧里合法）；`kFrameFormatVersionV6` = 6
       （`kFrameFormatVersion` 仍是 5——控制面各记录的编解码都按它写、按它严格校验，那些存储永远不会有 v6）；
