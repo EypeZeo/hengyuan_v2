@@ -633,6 +633,26 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_audit_export)
     gtest_discover_tests(test_durable_audit_export)
 
+    # D5 slice R1 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.2 and 10): the recovery reader's rules for an
+    # OrderOperatorResolved frame and for frame format v6 -- crafted logs (the tool that writes such a frame is slice
+    # R3), but every frame is made by the production encoder and every log is read by the production sink and
+    # verifier -- plus the OperatorOpen mode and the writer-follows-the-tip rule.
+    add_executable(test_operator_resolution_reader tests/test_operator_resolution_reader.cpp)
+    target_link_libraries(test_operator_resolution_reader PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_reader)
+    gtest_discover_tests(test_operator_resolution_reader)
+
+    # D5 slice R1 guard: nothing but the definition, the codec and the reader may name the operator event; nothing
+    # but the sink header names OperatorOpen; the write version is assigned once and is what the only production
+    # encoder call passes. It reads the source tree, so the native/ directory is a compile definition (same shape as
+    # test_reconcile_durable_guard below).
+    add_executable(test_operator_resolution_guard tests/test_operator_resolution_guard.cpp)
+    target_link_libraries(test_operator_resolution_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_operator_resolution_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_operator_resolution_guard)
+    gtest_discover_tests(test_operator_resolution_guard)
+
     # Phase 5 (docs/SPEC_INVARIANTS.md): export-worker best-effort telemetry
     # consumer for ExportOutboxRing (L2, real file I/O for LastRemoteAckedTip
     # persistence; ExternalAnchorClient stays mock-only via FakeExternalAnchorClient,

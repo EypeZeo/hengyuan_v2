@@ -15,6 +15,7 @@ using hy::determine_reconcile_action;
 using hy::is_terminal;
 using hy::make_client_order_id;
 using hy::order_state_name;
+using hy::validate_operator_resolution;
 using hy::validate_transition;
 
 // --- State names ---
@@ -659,4 +660,53 @@ TEST(TransitionRelation, NoSelfLoopIsOk) {
         EXPECT_NE(validate_transition(s, s), TransitionResult::Ok)
             << order_state_name(s) << " -> itself must not be a valid transition";
     }
+}
+
+// --- D5 / R1: the operator edge (docs/OPERATOR_RESOLUTION_DESIGN.md 3) -------------------------------------------------
+//
+// EscalatedToOperator -> Rejected exists ONLY in validate_operator_resolution(), which the recovery reader calls for an
+// OrderOperatorResolved frame. The shared state machine must keep refusing every edge out of EscalatedToOperator.
+
+namespace {
+
+constexpr OrderState kAllOrderStates[] = {
+    OrderState::Intent,   OrderState::Submitting, OrderState::Accepted,        OrderState::Rejected,
+    OrderState::Ambiguous, OrderState::PartialFill, OrderState::Filled,        OrderState::CancelRequested,
+    OrderState::Cancelled, OrderState::Expired,     OrderState::Reconciled,    OrderState::EscalatedToOperator,
+};
+
+}  // namespace
+
+TEST(OperatorResolutionEdge, TheSharedStateMachineStillRefusesEveryEdgeOutOfEscalatedToOperator) {
+    for (const OrderState to : kAllOrderStates) {
+        EXPECT_EQ(validate_transition(OrderState::EscalatedToOperator, to), TransitionResult::AlreadyTerminal)
+            << "to " << order_state_name(to);
+    }
+}
+
+TEST(OperatorResolutionEdge, EscalatedToRejectedIsTheOnlyEdgeOfTheOperatorFunction) {
+    for (const OrderState from : kAllOrderStates) {
+        for (const OrderState to : kAllOrderStates) {
+            const TransitionResult expected = (from == OrderState::EscalatedToOperator && to == OrderState::Rejected)
+                                                  ? TransitionResult::Ok
+                                                  : (is_terminal(from) ? TransitionResult::AlreadyTerminal
+                                                                       : TransitionResult::InvalidTransition);
+            EXPECT_EQ(validate_operator_resolution(from, to), expected)
+                << order_state_name(from) << " -> " << order_state_name(to);
+        }
+    }
+}
+
+TEST(OperatorResolutionEdge, SubmittingAndAmbiguousReachRejectedThroughTheSharedStateMachine) {
+    // The other two states an operator frame may close do not need the operator edge.
+    EXPECT_EQ(validate_transition(OrderState::Submitting, OrderState::Rejected), TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::Ambiguous, OrderState::Rejected), TransitionResult::Ok);
+}
+
+TEST(OperatorResolutionEdge, AnOrderRecordCannotUseTheOperatorEdge) {
+    // transition_to() is the live process's door; it goes through validate_transition() only.
+    OrderRecord rec{};
+    rec.state = OrderState::EscalatedToOperator;
+    EXPECT_EQ(rec.transition_to(OrderState::Rejected), TransitionResult::AlreadyTerminal);
+    EXPECT_EQ(rec.state, OrderState::EscalatedToOperator);
 }

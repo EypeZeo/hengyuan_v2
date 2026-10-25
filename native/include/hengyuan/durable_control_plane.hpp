@@ -1903,6 +1903,31 @@ struct OrderRecoveryCheckpoint {
 static_assert(std::is_trivially_copyable_v<OrderRecoveryCheckpoint>);
 static_assert(std::is_standard_layout_v<OrderRecoveryCheckpoint>);
 
+// --- OperatorResolvedOrder / kMaxOperatorResolved (D5 slice R1) ---
+// docs/OPERATOR_RESOLUTION_DESIGN.md 7.3. An order the offline operator tool closed with an OrderOperatorResolved
+// frame ("the exchange has no such order") is final: recovery makes no checkpoint for it, registers nothing in
+// flight and reconciles nothing. What it does hand out is THIS list, one entry per such order in log order, so that
+// the late-fill alarm of slice R4 can tell "an execution report for an order an operator wrote off" (a wrong proof:
+// the order is live after all) from the late duplicate of an ordinary final order. Keyed by client order id.
+//
+// The list must be COMPLETE to be of any use: an order wrongly written off can rest on the exchange and fill weeks
+// later, so "the most recent N" would be a hole. The bound is therefore a fail-closed one, like kMaxIntentOrphans:
+// more entries than kMaxOperatorResolved is RecoveryScanStatus::CapacityExceeded for the trading process (a
+// deliberate operator procedure, not an accident, produced every one of them; 1024 is far beyond any realistic
+// count), and only the operator tool's OperatorOpen mode (durable_audit_sink.hpp) opens such a store, counting
+// instead of failing.
+inline constexpr std::size_t kMaxOperatorResolved = 1024;
+
+struct OperatorResolvedOrder {
+    ClientOrderId client_order_id{};
+    std::uint32_t symbol_id{0};
+    OrderSide side{OrderSide::Buy};
+    std::int64_t qty_ticks{0};         // the order's intended quantity (it was never filled: that is the conclusion)
+    std::uint64_t frame_sequence{0};   // the sequence number of the OrderOperatorResolved frame
+};
+static_assert(std::is_trivially_copyable_v<OperatorResolvedOrder>);
+static_assert(std::is_standard_layout_v<OperatorResolvedOrder>);
+
 // --- LastRemoteAckedTip ---
 // SPEC-STRUCT: docs/BINANCE_PRIVATE_REST_L4_SPEC.md:4586
 //
