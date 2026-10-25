@@ -14,7 +14,7 @@ audit — see its own section at the bottom). Each has its own config table and 
 run separately. Two further models closed the audit's remaining named gaps:
 `key_rotation.tla` (the two-step key rotation crash protocol, KEY-ROTATE-008) and
 `depth_snapshot_bootstrap.tla` (the Binance depth snapshot bootstrap state machine,
-MD-BOOK-002) — see their sections below.
+MD-BOOK-002) — see their sections below. Two later models: `reconnect_sweep.tla` (the reconnect barrier and its sweep, private-stream migration M3a/M3b) and `notsent_closure.tla` (the final send claim and the NotSent closure, Q23 slice 1).
 
 ## Setup (one-time)
 
@@ -755,3 +755,125 @@ depth 46, 56 s, no error), so the bound is not what keeps the model quiet. The f
 
 - `reconnect_sweep.tla` — the model.
 - `reconnect_sweep*.cfg` — see the table above.
+
+---
+
+## `notsent_closure.tla` — the final send claim and the NotSent closure (Q23 slice 1, design `docs/NOTSENT_CLOSURE_DESIGN.md`)
+
+The window between the durable `Prepared` frame (Gate 12d) and the first byte of the order request (`submit_port.call()`), which
+task 1A.6 fills with a final authorization gate, and the durable `NotSent` frame that closes an order refused in that window (or
+before it, for the Intent-only orphans of SAFE-07) **without** treating it as possibly on the wire. It reuses this directory's
+conventions on purpose — non-atomic appends, the late fsync, the writer fence, per-order weak fairness — and is a separate module so
+that `durable_log_recovery.tla` and its two regression controls stay exactly as they were. Nothing it models is implemented.
+
+**What it checks** (the design config must satisfy all of them)
+
+- `NotSentImpliesNeverCrossed`: a durable `NotSent` frame means the order was never sent. `ClosedNotSentIsTrue` / `ClosedNotSentIsDurable`:
+  the same for the in-memory state, including the one recovery produces, and it always has a durable frame behind it.
+- `ReleaseNeedsProof`: nothing is released without a durable closing frame (`NotSent` or an exchange `Outcome`).
+- `NoClaimUnderRevoke`, `SendRequiresClaim`, `ClaimRejectExclusive`: no claim while a revocation is latched, the only way to cross is a
+  claim, and the decision is exclusive.
+- `NoDoubleSend`, `SendImpliesDurablePrepared`: the two properties of `durable_log_recovery.tla`, re-proved with the new frame in play.
+- `ReplayLegal`: per order the durable frame kinds are always a sequence replay accepts (a closing frame is last).
+- `TerminalIsStable`, `FencedWriterMakesNoNewWrites` and three modeling-sanity invariants; liveness `EventualSettlement`.
+
+**The eight switches** (`TRUE` = the design; **a config that turns one off MUST fail** — that is what keeps the model from proving nothing)
+
+| Switch | `FALSE` means | Why the design has it |
+|---|---|---|
+| `AtomicClaim` | the revocation test and the claim are two steps | "seven independent loads and then a plain call" is not a proof (blueprint 5.9.2) |
+| `ExclusiveDecision` | a plain store can overwrite a decision already taken | once claimed, an order may be on the wire: a revoker must lose, not rewrite |
+| `FinalGateAfterPrepared` | a claim can be taken before the `Prepared` ACK | the gate is only worth anything where `Prepared` is already durable |
+| `NoCompensationOnFailure` | `Failed` is read as "it did not happen" (revision 13's `AbortedPreSend`) | a `Failed` append may have landed; it fences, nothing else |
+| `ReleaseAfterAck` | resources are released when the closing append is issued | release against a durable fact only |
+| `SingleAttemptCoid` | a closed order goes back to `Intent` under the same id | a client-order-id is one attempt; a frame after `NotSent` is `Corrupt` |
+| `RecoveryNeverClosesPrepared` | recovery reads `Prepared`-and-nothing-after as `NotSent` | only the incarnation that decided *not to send* may write `NotSent` |
+| `RecoveryWaitsForWriter` | a successor scans before the predecessor's last write has landed or been lost | design assumption: the exclusive log open (`durable_log_store.hpp`) |
+
+**A ninth constant, `ReconcileConcludesAbsent`, is an assumption about the environment, not a design decision.** `FALSE` (the tree today):
+reconciling an `Ambiguous` order can only ever end in "the exchange has it" — `query_order()` folds every answer that is not a positive
+match, an unknown-order error included, into `QueryOutcome::Inconclusive`. The safety claims do not depend on it; progress does: an
+order whose `Prepared` frame is the last durable frame and which the exchange never saw stays `Ambiguous` for ever (in the tree: R-10
+quarantine, then escalated to the operator and counted as unresolved for the life of the process, blueprint L-46). Each of the two
+assumptions (`RecoveryWaitsForWriter`, `ReconcileConcludesAbsent`) has a pair of configs: one that shows what still holds without it,
+one that shows what breaks.
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `notsent_closure.cfg` | **No error found** — the design |
+| `notsent_closure_liveness.cfg` | **No error found** — `EventualSettlement` holds |
+| `notsent_closure_no_lock_safety.cfg` | **No error found** — `RecoveryWaitsForWriter = FALSE`, every invariant but `ReplayLegal` |
+| `notsent_closure_no_absent_safety.cfg` | **No error found** — `ReconcileConcludesAbsent = FALSE`, every invariant of the design |
+| `notsent_closure_saturation.cfg` | **No error found** — larger budgets, manual only |
+| `notsent_closure_stale_claim_bug.cfg` | **`NoClaimUnderRevoke` violated** — `AtomicClaim = FALSE` |
+| `notsent_closure_plain_revoke_bug.cfg` | **`NotSentImpliesNeverCrossed` violated** — `ExclusiveDecision = FALSE` |
+| `notsent_closure_gate_before_prepared_bug.cfg` | **`SendImpliesDurablePrepared` violated** — `FinalGateAfterPrepared = FALSE` |
+| `notsent_closure_failure_compensation_bug.cfg` | **`NoDoubleSend` violated** — `NoCompensationOnFailure = FALSE` |
+| `notsent_closure_release_early_bug.cfg` | **`ReleaseNeedsProof` violated** — `ReleaseAfterAck = FALSE` |
+| `notsent_closure_coid_reuse_bug.cfg` | **`NotSentImpliesNeverCrossed` violated** — `SingleAttemptCoid = FALSE` |
+| `notsent_closure_recovery_closes_bug.cfg` | **`ClosedNotSentIsTrue` violated** — `RecoveryNeverClosesPrepared = FALSE` |
+| `notsent_closure_no_lock_bug.cfg` | **`ReplayLegal` violated** — `RecoveryWaitsForWriter = FALSE` |
+| `notsent_closure_no_absent_liveness.cfg` | **`Temporal properties were violated`** (`EventualSettlement`, exit 13) — `ReconcileConcludesAbsent = FALSE` |
+| `notsent_closure_probe.cfg` | **`NotSentNeverDurable` violated** — a `NotSent` frame can become durable |
+| `notsent_closure_probe_late.cfg` | **`LateNotSentNeverLands` violated** — it can land after the caller was told `Failed` or died |
+| `notsent_closure_probe_sent_revoked.cfg` | **`SentWhileRevokedNeverHappens` violated** — claim first, revoke second: in flight, no recall |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -workers auto -config notsent_closure.cfg notsent_closure.tla
+```
+
+TLC exits `0` on success and `12` on an invariant violation. `notsent_closure_liveness.cfg` has no `CONSTRAINT` line, deliberately (see the
+traps above). **Not yet wired into `.github/workflows/ci-spec-verification.yml`**: that is a required-check workflow and the extra step
+(four runs that must pass — design, liveness, no-lock safety, no-absent safety — and twelve that must fail; the no-absent liveness run fails with a temporal violation, exit 13, not an invariant) is the owner's call.
+
+### Recorded results (2026-10-25, TLC 2.19, Java 25, 16 workers)
+
+| Config | States (distinct) | Result |
+|---|---|---|
+| main | 95,664 (depth 26) | no error — exhaustive |
+| liveness | 95,664 (depth 26) | no error |
+| no_lock_safety | 217,856 (depth 32) | no error |
+| no_absent_safety | 32,832 (depth 26) | no error |
+| no_absent_liveness | 32,832 | `EventualSettlement` violated ✓ (12-state trace ending in a stuttering state: order 1 is `Ambiguous` — its `Prepared` landed late — and nothing can close it) |
+| saturation | 273,264 (depth 31) | no error |
+| stale_claim | 692 | `NoClaimUnderRevoke` violated ✓ (7-state trace) |
+| plain_revoke | 2,087 | `NotSentImpliesNeverCrossed` violated ✓ (9) |
+| gate_before_prepared | 331 | `SendImpliesDurablePrepared` violated ✓ (3) |
+| failure_compensation | 44,634 | `NoDoubleSend` violated ✓ (14) |
+| release_early | 122 | `ReleaseNeedsProof` violated ✓ (2) |
+| coid_reuse | 2,929 | `NotSentImpliesNeverCrossed` violated ✓ (9) |
+| recovery_closes | 1,267 | `ClosedNotSentIsTrue` violated ✓ (8: prepare, claim, send, crash, recover) |
+| no_lock | 6,150 | `ReplayLegal` violated ✓ (11: reject, `NotSent` pending, crash, recover as `Ambiguous`, the `NotSent` lands, reconcile) |
+| probe / probe_late / probe_sent_revoked | 330 / 391 / 1,255 | each violated ✓ (3 / 4 / 7) |
+
+The counts of the violating runs vary with worker scheduling (TLC stops at the first hit). Bounds: 2 orders,
+2 crashes, 1 append failure, log length ≤ 7; saturation 3 / 2 / 9 grows the state count 2.9× with the violations still at zero.
+`durable_log_recovery.tla` and its configs were re-run unchanged on the same toolchain (239,633 states, `_buggy` and `_abortedpresend`
+still violate `NoDoubleSend`).
+
+### Mutation check
+
+Nine one-line mutations of the design actions, each run against the design config on a scratch copy. Seven are killed, by the invariant
+that is meant to guard the line: `Claim` without `~revoked` (`NoClaimUnderRevoke`), `Send` without a claim (`SendRequiresClaim`),
+`StartNotSent` without a `Rejecting` decision (`NotSentImpliesNeverCrossed`), a second claim on the same order (`NoDoubleSend`), no fence
+after a `Failed` append (`ReplayLegal`), `NetworkDeliver` without the `OutcomeLatched` guard (`OutcomeMatchesGroundTruth`), recovery
+reading a durable `NotSent` as `Ambiguous` (`ReplayLegal`). Two survive and are equivalent: `Reject` without `state = "Submitting"`, and
+`StartNotSentPre` without `decision = "None"` — in the design the other guard already implies them.
+
+### What is deliberately NOT in this model
+
+- The frame layout and the v5 / v6 version rules (design §5): tested when they are implemented.
+- The log / anchor / directory layers behind `landed` (one boolean, as in `durable_log_recovery.tla`; F.5's `Acked ⇒ LogCovers ∧
+  AnchorCovers` and F.6 belong to PERF-01), more than one process (host fencing, task 6.7), an asynchronous writer with request ids and
+  slot generations (PERF-01).
+- The `Intent` frame and orphan accounting (SAFE-07): an order with no frame is simply `Intent` in memory.
+- Time: one revocation latch stands for every reason the final gate can refuse.
+- An attempt that recovers without any frame is `Dead` and is never resumed (a client-order-id is single-attempt).
+
+### Files
+
+- `notsent_closure.tla` — the model.
+- `notsent_closure*.cfg` — see the table above.

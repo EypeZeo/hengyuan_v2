@@ -51,9 +51,10 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   丢弃一个未解决的升级订单仍需要的快照）。| 首次确立 round 9 | self-inflicted: round 15→16
   （曾遗漏 `AbortedPreSend` 导致 checkpoint 永久泄漏，round 16 修复补上；但 round 17 该状态本身被整体
   移除，这个特判又变得没有意义——见下一条）
-  - **代码现状：已定义，未启用。** `order_lifecycle.hpp` 已落地该谓词，但除 ABI 测试外**无任何生产
-    调用点**。不要把它读成"已强制执行"——真正会用到它的消费者（compaction 保留规则、COID 释放、
-    poll/reconcile 循环）尚不存在。
+  - **代码现状（2026-10-25 更正）：已定义，并已有生产调用点。** `order_lifecycle.hpp` 的这个谓词现在被恢复
+    扫描（`durable_audit_sink.hpp` 跳过已终局的订单）、编排器 Gate 13、`order_tracker.hpp` 的槽位释放与
+    `drain_reconcile_events()` 使用。此前这里写着"除 ABI 测试外无任何生产调用点"，是相关 PR 合入后没有回头更新
+    的过期措辞；压实侧的保留规则是否使用它，本次更正没有核对。
   - **不要**把 `order_lifecycle.hpp:93`（`validate_transition` 开头的 `is_terminal(from)` →
     `AlreadyTerminal`）改成 `is_exchange_final`：那里是纯状态机守卫（"没有任何自动转移离开此状态"），
     改了会**放行** `Reconciled →` 和 `EscalatedToOperator →` 的自动转移，是回归而非修复。
@@ -73,7 +74,10 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
 - `OrderState::AbortedPreSend` — **已被移除，不是活跃状态**。round 17 的结论：`Submitting` 只在 Gate 9
   `OrderSubmitPrepared` 真正 `.acked()` 之后才会被设置一次，pre-send 失败根本不会经过 `Submitting`，
   因此这个状态、它的 transition、`is_terminal()`/`is_exchange_final()` 里的特判全部撤销。**任何 spec
-  文本如果还把 `AbortedPreSend` 当作活跃状态处理，即为过期表述。**| 引入 round 13(rev14)，
+  文本如果还把 `AbortedPreSend` 当作活跃状态处理，即为过期表述。**2026-10-25 补记：R-18 / R-22 提议的
+  NotSent 闭合（docs/NOTSENT_CLOSURE_DESIGN.md，formal/notsent_closure.tla）不是它的复活**——它是一个
+  事先决定了不发送的所有者写下的正向持久事实，不能由追加失败、超时或恢复推出；旧的双发反例仍是
+  formal/durable_log_recovery_abortedpresend.cfg，新模型里另有同构的必败配置。| 引入 round 13(rev14)，
   废弃 round 17(rev18)
 - `Submitting` 状态赋值时机 — 权威定义：仅在 **Gate 9**，`OrderSubmitPrepared` 被 `.acked()` 之后设置
   一次；**不在 Gate 6**（in-flight 注册）设置。| round 17 修正（此前版本的 pseudocode 注释曾在 Gate 6
