@@ -653,6 +653,22 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_operator_resolution_guard)
     gtest_discover_tests(test_operator_resolution_guard)
 
+    # D5 slice R2 (docs/OPERATOR_RESOLUTION_DESIGN.md 5, 6 and 10): the decisions behind an OrderOperatorResolved
+    # frame's evidence (operator_resolution_evidence.hpp) -- the fence arithmetic, the allOrders windows, the client order
+    # id's timestamp and the rules that turn the exchange's verdicts into a conclusion. Pure logic: it links no JSON
+    # library, which is the point of keeping the parser in a header of its own.
+    add_executable(test_operator_resolution_evidence tests/test_operator_resolution_evidence.cpp)
+    target_link_libraries(test_operator_resolution_evidence PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_evidence)
+    gtest_discover_tests(test_operator_resolution_evidence)
+
+    # D5 slice R2: reading the exchange's answers (operator_resolution_response.hpp) -- pure parsing over simdjson, no
+    # Boost and no OpenSSL, so it builds and runs in the default configuration like test_binance_klines_codec.
+    add_executable(test_operator_resolution_response tests/test_operator_resolution_response.cpp)
+    target_link_libraries(test_operator_resolution_response PRIVATE hengyuan_dataplane GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_response)
+    gtest_discover_tests(test_operator_resolution_response)
+
     # Phase 5 (docs/SPEC_INVARIANTS.md): export-worker best-effort telemetry
     # consumer for ExportOutboxRing (L2, real file I/O for LastRemoteAckedTip
     # persistence; ExternalAnchorClient stays mock-only via FakeExternalAnchorClient,
