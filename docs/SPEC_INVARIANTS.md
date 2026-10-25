@@ -2491,6 +2491,8 @@ fenced sink"）——如果进程本身不崩溃、不重启，这个订单会�
 - **`EscalatedToOperator`/`EscalatedLedger`/`OrderOperatorResolved`/§6.5 容量记账生命周期不做**：
   用户已明确确认这一轮不做，留待后续单独排期——这是 InFlightRegistry 容量耗尽的独立问题，和
   "接入 durable-before-send 门禁"是两件不同的事。
+  （2026-10-25 补记：`OrderOperatorResolved` 的证据 / 栅栏 / 离线工具 / 读者规则已有设计与模型，见 docs/OPERATOR_RESOLUTION_DESIGN.md 与
+  formal/operator_resolution.tla；仍无实现，`EscalatedLedger` 的容量记账部分仍未排期。）
 - **`is_exchange_final()`/`is_terminal()` 在释放点的用法维持现状不变**：已核实今天 Gate 13 逐分支
   硬编码"只有 `Rejected` 释放"，恰好和 `is_exchange_final()` 对这 5 个可达结果（`Accepted`/
   `Rejected`/`Timeout`/`NetworkError`/`StaleRulesVersion`）的判定完全一致；把它泛化成真正的

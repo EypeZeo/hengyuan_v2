@@ -37,8 +37,8 @@ name: CI Spec Verification
 # minutes go DOWN, which is the actual constraint being optimized against here.
 #
 # Model count (2026-10 note): the paragraphs above describe the 7 models that existed when
-# this was consolidated. The job now runs 11 (one "Model:" step each; reconnect_sweep joined
-# with private-stream migration M3b, notsent_closure with Q23 slice 1). formal/ holds 12 .tla files: RoundEFDesignReceiptVerified.tla
+# this was consolidated. The job now runs 12 (one "Model:" step each; reconnect_sweep joined
+# with private-stream migration M3b, notsent_closure with Q23 slice 1, operator_resolution with D5). formal/ holds 13 .tla files: RoundEFDesignReceiptVerified.tla
 # is a research fork whose own header says its placement is deliberately unset until a design
 # freeze, so it is intentionally not run here.
 
@@ -168,7 +168,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
-    # Sum-ceiling across 11 sequential models (7 when consolidated), was 7 x independent 20-min caps
+    # Sum-ceiling across 12 sequential models (7 when consolidated), was 7 x independent 20-min caps
     # possible in parallel before this consolidation -- see this file's header
     # comment for why billed minutes (not wall-clock) is the thing being
     # optimized here.
@@ -185,7 +185,7 @@ jobs:
 
       # tla2tools.jar is gitignored (a 2MB binary does not belong in the tree),
       # so CI fetches the pinned release the same way the local setup does.
-      # ONE fetch for all 11 models below, not 11.
+      # ONE fetch for all 12 models below, not 12.
       - name: Cache TLA+ tools
         id: cache-tla
         uses: actions/cache@v6
@@ -601,6 +601,57 @@ jobs:
           done
           exit $fail
 
+      - name: "Model: operator_resolution (the operator's way back for an order nothing else can close, D5)"
+        id: m_operator_resolution
+        continue-on-error: true
+        working-directory: formal
+        # Three runs MUST pass: the design, what the tool's scope does not break (a reconcile that cannot match an existing order), and liveness.
+        # Ten MUST fail: five turn one design decision OFF (exclusive open, the fence measured from the tool's own lock, the fence, the read-lag
+        # allowance, reading the exchange at all), two are assumption controls whose failure is a temporal violation rather than an invariant's
+        # (no operator path at all, which is the tree today; a reconcile that cannot match, which is the documented limit of v1), three are
+        # reachability probes that keep the invariants from holding vacuously. See formal/README.md and docs/OPERATOR_RESOLUTION_DESIGN.md.
+        run: |
+          set -u
+          # Must pass: the design, what the tool's scope does NOT break (reconcile that cannot match an existing order), and liveness.
+          for cfg in operator_resolution.cfg operator_resolution_no_match_safety.cfg; do
+            java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC -workers auto -config "$cfg" operator_resolution.tla || exit 1
+          done
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC -workers auto -config operator_resolution_liveness.cfg operator_resolution.tla || exit 1
+
+          # Must fail, each with the named message.
+          fail=0
+          for pair in \
+            "operator_resolution_no_exclusive_bug.cfg|Invariant ClosedAbsentIsTrue is violated|the tool runs beside a live process (no exclusive open)" \
+            "operator_resolution_no_fence_bug.cfg|Invariant ClosedAbsentIsTrue is violated|no fence: evidence accepted the moment the tool holds the lock" \
+            "operator_resolution_no_lag_bug.cfg|Invariant ClosedAbsentIsTrue is violated|the evidence read is not required to be past the fence by the read lag" \
+            "operator_resolution_claimed_crash_bug.cfg|Invariant ClosedAbsentIsTrue is violated|the fence starts at a crash time the operator claims, not at the tool's own lock" \
+            "operator_resolution_no_check_bug.cfg|Invariant ClosedAbsentIsTrue is violated|the tool does not read the exchange" \
+            "operator_resolution_no_path_liveness.cfg|Temporal properties were violated|no operator path (the tree today): an order the exchange never saw is never closed" \
+            "operator_resolution_no_match_liveness.cfg|Temporal properties were violated|reconcile cannot match an existing order and the tool refuses it too (the documented limit of v1)" \
+            "operator_resolution_probe.cfg|Invariant OpClosedNeverDurable is violated|reachability probe (the tool can close an order)" \
+            "operator_resolution_probe_sent.cfg|Invariant ClosedSentUndeliveredNeverHappens is violated|reachability probe (it can close an order whose request left and was never accepted)" \
+            "operator_resolution_probe_present.cfg|Invariant PresentVerdictNeverHappens is violated|reachability probe (it can face an order the exchange has, and say so)"
+          do
+            cfg="${pair%%|*}"; rest="${pair#*|}"
+            msg="${rest%%|*}"; desc="${rest#*|}"
+            echo "::group::$cfg — expecting '$msg'"
+            echo "  control: $desc"
+            if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+                 -workers auto -config "$cfg" operator_resolution.tla > "/tmp/$cfg.log" 2>&1; then
+              echo "::error::$cfg PASSED but was expected to report '$msg'. The model has stopped discriminating; do not trust the safety run until this is fixed."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            elif grep -q "$msg" "/tmp/$cfg.log"; then
+              echo "  OK: '$msg' as expected"
+            else
+              echo "::error::$cfg failed, but NOT with the expected '$msg'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       # Aggregate: turns any individual model's failure into an overall job
       # failure. `if: always()` so this runs even though every model step
       # above is `continue-on-error: true`. Each model's own pass/fail is
@@ -622,6 +673,7 @@ jobs:
           [ "${{ steps.m_depthsnapshot.outcome }}" = "failure" ] && { echo "::error::depth_snapshot_bootstrap failed"; fail=1; }
           [ "${{ steps.m_reconnect_sweep.outcome }}" = "failure" ] && { echo "::error::reconnect_sweep failed"; fail=1; }
           [ "${{ steps.m_notsent_closure.outcome }}" = "failure" ] && { echo "::error::notsent_closure failed"; fail=1; }
+          [ "${{ steps.m_operator_resolution.outcome }}" = "failure" ] && { echo "::error::operator_resolution failed"; fail=1; }
           exit $fail
 
   # Always runs and is the only check of this workflow meant to be a required status check: it passes only if
