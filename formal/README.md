@@ -14,7 +14,7 @@ audit — see its own section at the bottom). Each has its own config table and 
 run separately. Two further models closed the audit's remaining named gaps:
 `key_rotation.tla` (the two-step key rotation crash protocol, KEY-ROTATE-008) and
 `depth_snapshot_bootstrap.tla` (the Binance depth snapshot bootstrap state machine,
-MD-BOOK-002) — see their sections below. Two later models: `reconnect_sweep.tla` (the reconnect barrier and its sweep, private-stream migration M3a/M3b) and `notsent_closure.tla` (the final send claim and the NotSent closure, Q23 slice 1).
+MD-BOOK-002) — see their sections below. Three later models: `reconnect_sweep.tla` (the reconnect barrier and its sweep, private-stream migration M3a/M3b), `notsent_closure.tla` (the final send claim and the NotSent closure, Q23 slice 1) and `operator_resolution.tla` (the operator's way back for an order nothing else can close, D5).
 
 ## Setup (one-time)
 
@@ -877,3 +877,113 @@ reading a durable `NotSent` as `Ambiguous` (`ReplayLegal`). Two survive and are 
 
 - `notsent_closure.tla` — the model.
 - `notsent_closure*.cfg` — see the table above.
+
+---
+
+## `operator_resolution.tla` — the operator's way back for an order nothing else can close (D5, design `docs/OPERATOR_RESOLUTION_DESIGN.md`)
+
+An order has a durable `Prepared` frame and nothing after it; its process is gone; reconciliation can never answer "the exchange does not
+have it" (`notsent_closure.tla`'s `ReconcileConcludesAbsent = FALSE`, the tree today); and the log cannot be edited. The design is an
+**offline tool** the operator runs on the stopped host: it takes the log's exclusive lock, proves that the exchange has no such order **and
+never will**, and appends one closing frame (`OrderOperatorResolved`, SUBMITPORT spec 6.5 item 4). Nothing it models is implemented.
+
+**What makes "never will" provable.** A signed request is accepted only while `serverTime - timestamp <= recvWindow` (checked on arrival and
+again before the matching engine). The sending process is dead before the tool holds the lock, so `Window` ticks after the lock (recvWindow
+plus the bound on the process's clock offset) no request of that process can still be accepted; and a read of the exchange may trail its
+true state by `Lag` ticks, so the evidence must be read `Lag` ticks past that. Time is **relative and saturating** (the age of a request,
+of an acceptance, of the tool's lock), so the graph is finite without a time horizon and the liveness runs cannot "run out of time".
+
+**What it checks** (the design config must satisfy all of them)
+
+- `ClosedAbsentIsTrue`: a durable closing frame means the exchange never accepted the request — before the frame **or after it**.
+- `ReplayLegal`, `ExclusiveHolds`, and three modeling-sanity invariants (`DeliveredOnlyIfSent`, `SentOnlyIfPrepared`,
+  `OutcomeOnlyIfDelivered` — reconciliation closes only what the exchange has).
+- Liveness `EventualSettlement`, under exactly these fairness assumptions: time advances; a process sends the order it prepared (or crashes);
+  reconciliation matches what it can match; a Degraded process is stopped; the tool, once locked, reads, closes and unlocks; the operator walks away from a run only a bounded number
+  of times (`MaxAborts`); and a dead process he is not holding down is restarted (**strong** fairness). The model's first liveness
+  counterexample was exactly the missing last two: with an operator who aborts every run just before the closing frame, no design settles.
+
+**The five design switches** (`TRUE` = the design; **a config that turns one off MUST fail**)
+
+| Switch | `FALSE` means | Why the design has it |
+|---|---|---|
+| `ExclusiveOpen` | the tool can run beside a live process | the process may send after the tool has looked |
+| `FenceFromLock` | the fence starts at a crash time the operator claims | the tool measures its own lock, it does not take his word |
+| `FenceChecked` | no fence | the dead process's request may still be in flight |
+| `LagAllowance` | the evidence read need not be `Lag` past the fence | a lagging read reports "absent" for a request accepted in the last moment of its window |
+| `ChecksExchange` | the tool does not read the exchange | the operator's word would be enough to close an order that exists |
+
+**Two assumptions about the environment** (named, a pair of configs each — one shows what still holds without it, one what breaks):
+
+| Assumption | `FALSE` means | Configs |
+|---|---|---|
+| `OperatorPathExists` (FALSE today) | nothing can close an order the exchange never saw | `no_path_liveness` (must fail: `EventualSettlement`, exit 13) |
+| `ReconcileResolvesExisting` | reconciliation cannot match an order the exchange has (a response that fails validation); the tool refuses it too — v1 closes only orders that provably left no position | `no_match_safety` (no error), `no_match_liveness` (must fail: the documented limit of v1) |
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `operator_resolution.cfg` | **No error found** — the design |
+| `operator_resolution_liveness.cfg` | **No error found** — `EventualSettlement` holds |
+| `operator_resolution_no_match_safety.cfg` | **No error found** — `ReconcileResolvesExisting = FALSE`, every invariant of the design |
+| `operator_resolution_saturation.cfg` | **No error found** — wider window, longer lag, more crashes and aborts; manual only |
+| `operator_resolution_no_exclusive_bug.cfg` | **`ClosedAbsentIsTrue` violated** — `ExclusiveOpen = FALSE` |
+| `operator_resolution_no_fence_bug.cfg` | **`ClosedAbsentIsTrue` violated** — `FenceChecked = FALSE` |
+| `operator_resolution_no_lag_bug.cfg` | **`ClosedAbsentIsTrue` violated** — `LagAllowance = FALSE` |
+| `operator_resolution_claimed_crash_bug.cfg` | **`ClosedAbsentIsTrue` violated** — `FenceFromLock = FALSE` |
+| `operator_resolution_no_check_bug.cfg` | **`ClosedAbsentIsTrue` violated** — `ChecksExchange = FALSE` |
+| `operator_resolution_no_path_liveness.cfg` | **`Temporal properties were violated`** (`EventualSettlement`, exit 13) — `OperatorPathExists = FALSE` |
+| `operator_resolution_no_match_liveness.cfg` | **`Temporal properties were violated`** (`EventualSettlement`, exit 13) — `ReconcileResolvesExisting = FALSE` |
+| `operator_resolution_probe.cfg` | **`OpClosedNeverDurable` violated** — the tool can close an order |
+| `operator_resolution_probe_sent.cfg` | **`ClosedSentUndeliveredNeverHappens` violated** — it can close an order whose request left and was never accepted (the case the fence exists for) |
+| `operator_resolution_probe_present.cfg` | **`PresentVerdictNeverHappens` violated** — it can face an order the exchange has, and say so |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -workers auto -config operator_resolution.cfg operator_resolution.tla
+```
+
+TLC exits `0` on success, `12` on an invariant violation and `13` on a temporal one. None of this model's configs has a `CONSTRAINT` line
+(time saturates), which is what keeps the liveness runs sound. **Not yet wired into `.github/workflows/ci-spec-verification.yml`** unless
+the pull request that introduced this section says it is.
+
+### Recorded results (2026-10-25, TLC 2.19, Java 25, 16 workers)
+
+| Config | States (distinct) | Result |
+|---|---|---|
+| main | 39,248 (depth 25) | no error — exhaustive |
+| liveness | 39,248 (depth 24) | no error (`EventualSettlement` holds) |
+| no_match_safety | 23,888 (depth 25) | no error |
+| saturation (window 3, lag 2, 2 crashes, 2 aborts) | 244,055 (depth 31) | no error |
+| no_exclusive / no_fence / no_lag / claimed_crash / no_check | 42,021 / 2,457 / 8,305 / 9,508 / 8,450 | `ClosedAbsentIsTrue` violated ✓ (9 to 12-state traces) |
+| no_path_liveness | 5,554 | `EventualSettlement` violated ✓ (a request that left and was lost: nobody can close it) |
+| no_match_liveness | 23,888 | `EventualSettlement` violated ✓ (the tool closes the absent order, refuses the present one, which stays) |
+| probe / probe_sent / probe_present | 6,145 / 7,377 / 1,341 | each violated ✓ |
+
+The state counts of violating runs vary with worker scheduling (TLC stops at the first hit). Bounds: 2 orders, window 2, lag 1, 1 crash,
+1 abort.
+
+### Mutation check
+
+Twelve one-line mutations of the design actions, each run against the design config on a scratch copy. Ten are killed, by the property that is
+meant to guard the line: a stale request still accepted, evidence accepted when stale, the tool locking beside a live process, requests that
+never age, an inverted read lag, an order sent that was never prepared, the operator's claimed offset honoured, a "read" that reads nothing, a
+reconcile that closes what the exchange does not have (`OutcomeOnlyIfDelivered`, added because this mutant first survived), and a lock that
+does not age (killed by the liveness config). Two survive and are equivalent in the design: a process starting while the tool holds the log
+(the operator's hold-down already excludes it), and the tool closing an already-closed order (the evidence to do so can only come from a read of
+an unresolved order, and the exclusive log keeps it so).
+
+### What is deliberately NOT in this model
+
+- The frame layout, the v6 rules and the reader's accept / refuse table (design §7).
+- The non-atomic append and the late fsync (`notsent_closure.tla`): here an append is one step, and a lost closing append just leaves the order
+  unresolved for a second run of the tool.
+- The point query, the order list and the open-orders query as separate reads: they are one read here, whose only imperfection is its lag.
+- Fills (v1 closes only orders that left no position), the order's symbol, a second sender of the same credentials (host fencing, task 6.7), and
+  the exchange environment and account the evidence is read from (design §9 R-env: the log does not record them).
+
+### Files
+
+- `operator_resolution.tla` — the model.
+- `operator_resolution*.cfg` — see the table above.
