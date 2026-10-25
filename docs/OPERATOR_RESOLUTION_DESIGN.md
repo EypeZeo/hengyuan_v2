@@ -1,6 +1,6 @@
 # 操作员解决（Operator Resolution）：被困订单的回头路（D5）
 
-状态：**设计，语义已冻结；切片 R1（恢复读者）已实现，没有任何一方会写这个帧（写者是 R3）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 说“开始”。
+状态：**设计，语义已冻结；切片 R1（恢复读者）已合入（PR #203，`a4372ba`，2026-10-25），没有任何一方会写这个帧（写者是 R3）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 说“开始”，对 PR #203 说“合并”。
 依据：SUBMITPORT 规格 §6.5 第 4、5 条（已被接受的 `OrderOperatorResolved`）；`docs/NOTSENT_CLOSURE_DESIGN.md` §1、A6、D5；蓝图 L-43、L-46、`5.9.4`。
 模型：`formal/operator_resolution.tla`（§8）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值（事件号、位布局的最终形式）随实现 PR 分配**，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。R1 已分配：事件号 22，`detail_code` 的位布局冻结在 `native/include/hengyuan/operator_resolution_frame.hpp`。
 
@@ -190,7 +190,7 @@
 
 | 片 | 内容 | 验证与负控 |
 | :-- | :-- | :-- |
-| R1 读者 | 事件类型、`validate_operator_resolution`、§7.2 的接受 / 拒绝表、`recovered_operator_resolved()`、`OperatorOpen` 打开模式、守卫；与 NotSent 的 codec 读者（`NOTSENT_CLOSURE_DESIGN.md` S2）同一次 v6 | MSVC + GCC `none`、`address`；表中每一行与每个 `Corrupt` 一个用例；`validate_transition(EscalatedToOperator, *)` 仍为 `AlreadyTerminal`；变异检查 |
+| R1 读者（已合入：PR #203，`a4372ba`，2026-10-25） | 事件类型、`validate_operator_resolution`、§7.2 的接受 / 拒绝表、`recovered_operator_resolved()`、`OperatorOpen` 打开模式、守卫；与 NotSent 的 codec 读者（`NOTSENT_CLOSURE_DESIGN.md` S2）同一次 v6 | MSVC + GCC `none`、`address`；表中每一行与每个 `Corrupt` 一个用例；`validate_transition(EscalatedToOperator, *)` 仍为 `AlreadyTerminal`；变异检查 |
 | R2 证据原语（纯逻辑） | 栅栏计算（`constexpr`、用交易所时间）、证据位的编解码、查询结果分类（`-2013` / `-2026` / 其它错误 / 成功，**对账路径不变**）、`allOrders` 分页规划 | 表驱动用例；变异检查；`closure_ledger_check` 若新增 FI 则同步 |
 | R3 工具 | 离线 CLI；回环假交易所（含**落后于真实状态**的读、错误码、翻页）；确认输入；证据附件 | MSVC + GCC；`address`；栅栏与读延迟的负控；全部拒绝路径各一个用例 |
 | R4 迟到成交告警 | R-late：对 operator-resolved COID 的成交触发熔断 | 单元 + 恢复往返；变异检查 |
