@@ -194,6 +194,19 @@ inline TransitionResult validate_transition(OrderState from, OrderState to) noex
     return TransitionResult::InvalidTransition;
 }
 
+// D5 / R1 (docs/OPERATOR_RESOLUTION_DESIGN.md 3 and 7.2): the ONE edge only the offline operator tool may add,
+// EscalatedToOperator -> Rejected, recorded by an OrderOperatorResolved frame (an operator who has looked at the
+// exchange says "there is no such order"). It is deliberately NOT a case of validate_transition() above: that function
+// is shared with the live process's OrderRecord::transition_to(), and every edge out of EscalatedToOperator must
+// stay AlreadyTerminal there -- an escalated order may still be live on the exchange, and no automatic path may
+// ever conclude otherwise. Only the recovery reader (durable_audit_sink.hpp) calls this, and only for a frame whose
+// event type is OrderOperatorResolved; test_operator_resolution_guard.cpp pins both facts. The other two states an
+// operator frame may close (Submitting, Ambiguous) already reach Rejected through validate_transition().
+inline TransitionResult validate_operator_resolution(OrderState from, OrderState to) noexcept {
+    if (from == OrderState::EscalatedToOperator && to == OrderState::Rejected) return TransitionResult::Ok;
+    return is_terminal(from) ? TransitionResult::AlreadyTerminal : TransitionResult::InvalidTransition;
+}
+
 // L4 §6.5's status-string -> OrderState table. Returns false (out untouched) for anything
 // unrecognized -- "not a guess": an unrecognized `status` value is not evidence of any
 // particular outcome and must fail schema validation in the caller, exactly like a

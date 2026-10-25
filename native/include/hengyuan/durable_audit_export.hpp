@@ -148,6 +148,7 @@ struct AuditLogVerification {
     std::size_t error_offset{0};                    // byte offset of the frame that failed (status != Ok)
     std::uint64_t error_sequence{0};                // the sequence number that frame was expected to carry
     std::array<std::byte, kMacLen> tail_mac{};      // the last verified frame's mac (valid when frames > 0)
+    std::uint8_t max_frame_version{0};              // the highest frame format version seen (0 = no frame); D5 / R1
     std::array<std::uint32_t, kMaxLiveKeys> key_ids{};  // distinct key ids seen, in first-appearance order
     std::size_t key_id_count{0};
     std::size_t log_bytes{0};
@@ -311,6 +312,16 @@ inline AuditLogVerification verify_audit_log(std::span<const std::byte> log, con
             v.error_sequence = expected_seq;
             return v;
         }
+        // D5 / R1: the same rule the writer's recovery scan applies -- the format version of a store never goes
+        // back (a v5 frame after a v6 one). A hard error here too, so an export never presents as one coherent
+        // log something the writer itself would refuse to start from.
+        if (frame.format_version < v.max_frame_version) {
+            v.status = ExportStatus::MalformedFrame;
+            v.error_offset = offset;
+            v.error_sequence = expected_seq;
+            return v;
+        }
+        v.max_frame_version = frame.format_version;
         detail::export_note_key_id(v, frame.key_id);
         if (have_anchor && frame.sequence_number == anchor.sequence_number) {
             mac_at_anchor = frame.mac;
@@ -379,7 +390,9 @@ inline std::string audit_export_manifest_line(const AuditLogVerification& v) {
     s += "{\"type\":\"manifest\",\"format\":";
     detail::export_json_string(s, kAuditExportFormat.data(), kAuditExportFormat.size());
     s += ",\"frame_format_version\":";
-    s += std::to_string(static_cast<unsigned>(kFrameFormatVersion));
+    // The highest version present (5 for every log that exists today, 6 once an OrderOperatorResolved frame is in
+    // it); an empty log reports the version a writer would start it at.
+    s += std::to_string(static_cast<unsigned>(v.max_frame_version != 0 ? v.max_frame_version : kFrameFormatVersion));
     s += ",\"frames\":";
     s += std::to_string(v.frames);
     if (v.frames > 0) {

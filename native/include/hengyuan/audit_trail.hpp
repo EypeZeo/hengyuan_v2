@@ -50,6 +50,12 @@ enum class AuditEventType : std::uint8_t {
     // the end, matching this enum's own established convention (every prior addition was a
     // trailing value, never inserted).
     UserDataStreamEventObserved = 21,
+    // D5 / R1 (docs/OPERATOR_RESOLUTION_DESIGN.md): the offline operator tool's closure of an order nothing else can
+    // close -- "the exchange has no such order and, after the fence, never will". Appended at the end like every prior
+    // addition. Legal ONLY in a v6 frame (durable_frame_codec.hpp); the recovery scan accepts it under the rules of
+    // that document's 7.2 and nowhere else. Nothing in the live process may construct one
+    // (test_operator_resolution_guard.cpp pins that), and in R1 nothing at all does: the writer is slice R3.
+    OrderOperatorResolved = 22,
 };
 
 inline const char* audit_event_name(AuditEventType t) noexcept {
@@ -76,6 +82,7 @@ inline const char* audit_event_name(AuditEventType t) noexcept {
         case AuditEventType::RateLimitApproaching: return "RATE_LIMIT_APPROACHING";
         case AuditEventType::OrderSubmitPrepared: return "ORDER_SUBMIT_PREPARED";
         case AuditEventType::UserDataStreamEventObserved: return "USER_DATA_STREAM_EVENT_OBSERVED";
+        case AuditEventType::OrderOperatorResolved: return "ORDER_OPERATOR_RESOLVED";
     }
     return "UNKNOWN";
 }

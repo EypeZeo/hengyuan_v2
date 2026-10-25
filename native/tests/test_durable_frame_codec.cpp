@@ -3,6 +3,7 @@
 // durable_audit_sink.hpp's job (test_durable_audit_sink.cpp).
 #include <gtest/gtest.h>
 #include <hengyuan/durable_frame_codec.hpp>
+#include <hengyuan/operator_resolution_frame.hpp>
 
 #include <array>
 #include <cstring>
@@ -286,11 +287,18 @@ TEST(OrderEventFrameCodec, WrongFormatVersionRejected) {
     auto key = as_key("k");
     std::vector<std::byte> buf(kOrderEventFrameSize);
     encode_order_event_frame(buf, /*key_id=*/1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key);
-    buf[0] = std::byte{6};  // valid-looking but not kFrameFormatVersion(5)
 
-    DecodedOrderFrame decoded{};
-    std::size_t frame_size = 0;
-    EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::UnknownVersion);
+    // This build reads exactly versions 5 and 6 (D5 / R1 made 6 readable); everything else -- the versions before
+    // 5, the first one past 6, a stray high byte -- is UnknownVersion. 7 is the "valid-looking but not ours" case
+    // the old form of this test used 6 for.
+    constexpr std::array<std::uint8_t, 6> kUnread = {0, 3, 4, 7, 8, 255};
+    for (const std::uint8_t version : kUnread) {
+        buf[0] = static_cast<std::byte>(version);
+        DecodedOrderFrame decoded{};
+        std::size_t frame_size = 0;
+        EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::UnknownVersion)
+            << "version " << static_cast<unsigned>(version);
+    }
 }
 
 TEST(OrderEventFrameCodec, OutOfRangeRecordTypeRejected) {
@@ -388,6 +396,228 @@ TEST(OrderEventFrameCodec, TamperedKeyIdIsChecksumMismatch) {
 
     buf[2] ^= std::byte{0x01};  // key_id occupies bytes [2,6)
 
+    DecodedOrderFrame decoded{};
+    std::size_t frame_size = 0;
+    EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::ChecksumMismatch);
+}
+
+// --- D5 / R1: format version 6 (docs/OPERATOR_RESOLUTION_DESIGN.md 7, durable_frame_codec.hpp's FORMAT v5 -> v6) ---
+//
+// v6 has the same layout as v5 and one more legal event type, AuditEventType::OrderOperatorResolved = 22. The
+// reader takes versions 5 and 6; the encoder writes the version it is told to and refuses any pairing of version and
+// event type that the decoder would call MalformedEnum.
+
+namespace {
+
+AuditRecord make_operator_resolved_record() {
+    AuditRecord rec = make_sample_record();
+    rec.event_type = AuditEventType::OrderOperatorResolved;
+    rec.resulting_state = OrderState::Rejected;
+    rec.exchange_order_id = 0;
+    rec.filled_qty_ticks = 0;
+    rec.avg_fill_price_ticks = 0;
+    rec.detail_code = static_cast<std::int64_t>(operator_resolution::kKindAbsent | operator_resolution::kAbsentRequiredBits);
+    rec.set_detail("op=test;ev=00000000000000000000000000000000");
+    return rec;
+}
+
+// Rewrites the version byte of an already encoded frame and signs it again, so that the ONLY thing wrong with the
+// result is the pairing of version and content -- a frame the encoder itself refuses to produce, which the decoder
+// must still classify correctly (a MAC that no longer matches would be caught LATER than the enum check and could
+// mask a decoder that stopped checking the pairing).
+void set_version_and_resign(std::vector<std::byte>& frame, std::uint8_t version, std::span<const std::byte> key) {
+    frame[0] = static_cast<std::byte>(version);
+    const std::size_t content_len = kOrderEventFrameSize - kMacLen;
+    const auto mac = crypto::hmac_sha256(key, std::span<const std::byte>(frame.data(), content_len));
+    std::memcpy(frame.data() + content_len, mac.bytes.data(), kMacLen);
+}
+
+}  // namespace
+
+TEST(AuditEventTypeBounds, EachVersionHasItsOwnNewestEventType) {
+    constexpr auto kNewestV5 = static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
+    constexpr auto kNewestV6 = static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved);
+    static_assert(kNewestV5 == 21 && kNewestV6 == 22, "the wire values are ABI; renumbering reinterprets every frame");
+
+    EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV5, kFrameFormatVersion));
+    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kNewestV6, kFrameFormatVersion))
+        << "the operator event must not exist in a v5 frame";
+    EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV5, kFrameFormatVersionV6));
+    EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV6, kFrameFormatVersionV6));
+    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kNewestV6 + 1, kFrameFormatVersionV6))
+        << "v6 raises the bound by exactly one value";
+    for (std::uint8_t e = 0; e <= kNewestV5; ++e) {
+        EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(e, kFrameFormatVersion)) << unsigned{e};
+        EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(e, kFrameFormatVersionV6)) << unsigned{e};
+    }
+    // A version this build does not read has no legal event type at all.
+    constexpr std::array<std::uint8_t, 4> kUnread = {0, 4, 7, 255};
+    for (const std::uint8_t version : kUnread) {
+        EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(0, version)) << unsigned{version};
+    }
+    // The pre-v6 one-argument form is the v5 bound, unchanged.
+    EXPECT_TRUE(detail::is_legal_audit_event_type(kNewestV5));
+    EXPECT_FALSE(detail::is_legal_audit_event_type(kNewestV6));
+}
+
+TEST(AuditRecordCodecV6, OperatorEventDecodesOnlyWhenTheFrameIsV6) {
+    const AuditRecord rec = make_operator_resolved_record();
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+
+    AuditRecord decoded{};
+    ASSERT_TRUE(decode_audit_record(buf, decoded, kFrameFormatVersionV6));
+    EXPECT_EQ(decoded.event_type, AuditEventType::OrderOperatorResolved);
+    EXPECT_EQ(decoded.resulting_state, OrderState::Rejected);
+    EXPECT_EQ(decoded.detail_code, rec.detail_code);
+    EXPECT_STREQ(decoded.detail_msg, rec.detail_msg);
+
+    EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersion)) << "v5 must refuse event 22";
+    EXPECT_FALSE(decode_audit_record(buf, decoded)) << "the two-argument form is the v5 bound";
+    EXPECT_FALSE(decode_audit_record(buf, decoded, 7));
+}
+
+TEST(AuditRecordCodecV6, EventTypeOneAboveTheV6BoundIsStillRejected) {
+    AuditRecord rec = make_sample_record();
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+    buf[8] = std::byte{23};  // event_type is payload offset 8; 23 is one past OrderOperatorResolved
+    AuditRecord decoded{};
+    EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersionV6));
+}
+
+TEST(OrderEventFrameCodecV6, DefaultEncodingStaysV5AndSaysSo) {
+    AuditRecord rec = make_sample_record();
+    auto key = as_key("test-hmac-key");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    ASSERT_EQ(encode_order_event_frame(buf, 7, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key),
+              kOrderEventFrameSize);
+    EXPECT_EQ(buf[0], std::byte{5}) << "every writer that never heard of v6 keeps emitting v5, byte for byte";
+
+    DecodedOrderFrame decoded{};
+    std::size_t frame_size = 0;
+    ASSERT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::Ok);
+    EXPECT_EQ(decoded.format_version, kFrameFormatVersion);
+}
+
+TEST(OrderEventFrameCodecV6, V5AndV6EncodingsOfTheSameRecordDifferOnlyInVersionAndMac) {
+    AuditRecord rec = make_sample_record();
+    auto key = as_key("test-hmac-key");
+    std::vector<std::byte> v5(kOrderEventFrameSize);
+    std::vector<std::byte> v6(kOrderEventFrameSize);
+    ASSERT_EQ(encode_order_event_frame(v5, 7, 3, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                       kFrameFormatVersion),
+              kOrderEventFrameSize);
+    ASSERT_EQ(encode_order_event_frame(v6, 7, 3, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                       kFrameFormatVersionV6),
+              kOrderEventFrameSize);
+    EXPECT_EQ(v5[0], std::byte{5});
+    EXPECT_EQ(v6[0], std::byte{6});
+    // The layout is identical: everything between the version byte and the trailing mac is the same.
+    for (std::size_t i = 1; i < kOrderEventFrameSize - kMacLen; ++i) {
+        ASSERT_EQ(v5[i], v6[i]) << "byte " << i;
+    }
+    EXPECT_NE(std::memcmp(v5.data() + kOrderEventFrameSize - kMacLen, v6.data() + kOrderEventFrameSize - kMacLen, kMacLen), 0)
+        << "the mac covers the version byte";
+}
+
+TEST(OrderEventFrameCodecV6, V6FrameRoundTripsAndReportsItsVersion) {
+    const AuditRecord rec = make_operator_resolved_record();
+    auto key = as_key("test-hmac-key");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    ASSERT_EQ(encode_order_event_frame(buf, 7, 11, FrameTimeKind::ServerCorrectedUtc, 1'700'000'000'000, rec, kZeroMac,
+                                       key, kFrameFormatVersionV6),
+              kOrderEventFrameSize);
+    EXPECT_EQ(buf[0], std::byte{6});
+
+    DecodedOrderFrame decoded{};
+    std::size_t frame_size = 0;
+    ASSERT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::Ok);
+    EXPECT_EQ(frame_size, kOrderEventFrameSize);
+    EXPECT_EQ(decoded.format_version, kFrameFormatVersionV6);
+    EXPECT_EQ(decoded.sequence_number, 11u);
+    EXPECT_EQ(decoded.record.event_type, AuditEventType::OrderOperatorResolved);
+    EXPECT_EQ(decoded.record.detail_code, rec.detail_code);
+    EXPECT_STREQ(decoded.record.detail_msg, rec.detail_msg);
+}
+
+TEST(OrderEventFrameCodecV6, EveryOlderEventTypeStillRoundTripsAtBothVersions) {
+    auto key = as_key("test-hmac-key");
+    for (const std::uint8_t version : {kFrameFormatVersion, kFrameFormatVersionV6}) {
+        for (std::uint8_t e = 0; e <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved); ++e) {
+            AuditRecord rec = make_sample_record();
+            rec.event_type = static_cast<AuditEventType>(e);
+            std::vector<std::byte> buf(kOrderEventFrameSize);
+            ASSERT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                               version),
+                      kOrderEventFrameSize)
+                << "event " << unsigned{e} << " version " << unsigned{version};
+            DecodedOrderFrame decoded{};
+            std::size_t frame_size = 0;
+            ASSERT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::Ok)
+                << "event " << unsigned{e} << " version " << unsigned{version};
+            EXPECT_EQ(decoded.record.event_type, rec.event_type);
+            EXPECT_EQ(decoded.format_version, version);
+        }
+    }
+}
+
+TEST(OrderEventFrameCodecV6, EncoderRefusesTheOperatorEventInAV5Frame) {
+    const AuditRecord rec = make_operator_resolved_record();
+    auto key = as_key("k");
+    std::vector<std::byte> buf(kOrderEventFrameSize, std::byte{0xAB});
+    EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                       kFrameFormatVersion),
+              0u);
+    EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key), 0u)
+        << "the default version is 5";
+    for (const std::byte b : buf) ASSERT_EQ(b, std::byte{0xAB}) << "a refused encode must not write anything";
+}
+
+TEST(OrderEventFrameCodecV6, EncoderRefusesVersionsAndEventTypesTheReaderWouldRefuse) {
+    auto key = as_key("k");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    constexpr std::array<std::uint8_t, 5> kUnread = {0, 3, 4, 7, 255};
+    for (const std::uint8_t version : kUnread) {
+        EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, make_sample_record(),
+                                           kZeroMac, key, version),
+                  0u)
+            << "version " << unsigned{version};
+    }
+    AuditRecord beyond = make_sample_record();
+    beyond.event_type = static_cast<AuditEventType>(23);  // one past the v6 bound
+    EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, beyond, kZeroMac, key,
+                                       kFrameFormatVersionV6),
+              0u);
+}
+
+TEST(OrderEventFrameCodecV6, OperatorEventInAV5FrameIsMalformedEnumEvenWithAValidMac) {
+    const AuditRecord rec = make_operator_resolved_record();
+    auto key = as_key("test-hmac-key");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    ASSERT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                       kFrameFormatVersionV6),
+              kOrderEventFrameSize);
+    // Relabel it v5 and sign it again: structurally perfect, wrongly paired.
+    set_version_and_resign(buf, kFrameFormatVersion, key);
+
+    DecodedOrderFrame decoded{};
+    std::size_t frame_size = 0;
+    EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::MalformedEnum);
+
+    // And relabelled v6 again it is fine -- the re-signing helper itself is sound.
+    set_version_and_resign(buf, kFrameFormatVersionV6, key);
+    EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::Ok);
+}
+
+TEST(OrderEventFrameCodecV6, ARelabelledVersionWithoutResigningIsAChecksumMismatch) {
+    // The version byte is inside the MAC: an attacker (or a flipped bit) cannot turn a v5 frame into a v6 one.
+    AuditRecord rec = make_sample_record();
+    auto key = as_key("test-hmac-key");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    ASSERT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key),
+              kOrderEventFrameSize);
+    buf[0] = std::byte{6};
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
     EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::ChecksumMismatch);

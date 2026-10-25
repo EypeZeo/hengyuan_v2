@@ -56,6 +56,17 @@
 // credentials have ever been used against this code, so there is no real
 // deployed v4 data anywhere, only this repo's own test fixtures (updated in
 // the same commit).
+//
+// FORMAT v5 -> v6 (D5 slice R1, docs/OPERATOR_RESOLUTION_DESIGN.md 7 and docs/NOTSENT_CLOSURE_DESIGN.md 5): the
+// layout is IDENTICAL (256-byte frame, 165-byte payload); what v6 adds is a larger set of legal event types
+// (AuditEventType::OrderOperatorResolved = 22). This build READS order-event frames at version 5 and 6 and WRITES
+// only the version the store's own tip already has (5 for every store that exists today -- DurableAuditSink adopts
+// the tip's version after its recovery scan), so no existing log changes by a byte. An event type that is not legal
+// for the frame's own version is MalformedEnum: a v5 frame that carries event 22 is corrupt, not "early". Versions
+// never go back inside one store (a v5 frame after a v6 one is Corrupt) -- that rule needs the whole sequence, so
+// it lives in the scans (DurableAuditSink::run_recovery_scan_impl, verify_audit_log), not in the single-frame
+// decode here. kFrameFormatVersion itself stays 5 on purpose: control_plane_frame_codec.hpp writes and strictly
+// checks every control-plane record against it, and those stores never get v6.
 
 #pragma once
 
@@ -71,6 +82,9 @@
 namespace hy {
 
 inline constexpr std::uint8_t kFrameFormatVersion = 5;
+// D5 / R1: the second readable version of an order-event frame (see the FORMAT v5 -> v6 note at the top). Nothing
+// writes it unless the store's tip already carries it; the first v6 frame of a store is the operator tool's (R3).
+inline constexpr std::uint8_t kFrameFormatVersionV6 = 6;
 inline constexpr std::size_t kMacLen = 32;
 
 // --- AuditRecord wire encoding (the OrderEvent payload) ---
@@ -160,17 +174,34 @@ inline void read_bytes(const std::byte*& p, void* dst, std::size_t n) noexcept {
     p += n;
 }
 
+// The frame versions an order-event frame may carry (see the FORMAT v5 -> v6 note at the top of this file).
+inline bool is_readable_order_event_version(std::uint8_t version) noexcept {
+    return version == kFrameFormatVersion || version == kFrameFormatVersionV6;
+}
+
+// Is `v` an AuditEventType a frame of format `version` may carry?
+//
+// v5's bound was OrderSubmitPrepared (20) and went stale the moment
+// AuditEventType::UserDataStreamEventObserved (21, audit_trail.hpp) was appended --
+// TODO 1A.4's drain_user_data_events() (binance_user_data_event.hpp) has been constructing
+// AuditRecord instances with that event_type ever since, but decode_audit_record() would
+// reject any of them as MalformedEnum once they hit a real DurableAuditSink (the only
+// reason this hasn't bitten yet is that the sole runnable harness today uses the in-memory
+// AuditRingSink, which never calls this decode path at all). Found during Batch G's
+// ExecutionJournal research; unrelated to that decision, fixed here since it's a one-line
+// bound correction with an existing regression-test template to extend.
+//
+// v6 (D5 / R1) raises the bound to OrderOperatorResolved (22) and nothing else; any version this build does
+// not read has no legal event at all.
+inline bool is_legal_audit_event_type_for_version(std::uint8_t v, std::uint8_t version) noexcept {
+    if (version == kFrameFormatVersion) return v <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
+    if (version == kFrameFormatVersionV6) return v <= static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved);
+    return false;
+}
+
+// The v5 bound -- what every frame written today is held to.
 inline bool is_legal_audit_event_type(std::uint8_t v) noexcept {
-    // Bound was OrderSubmitPrepared (20) and went stale the moment
-    // AuditEventType::UserDataStreamEventObserved (21, audit_trail.hpp) was appended --
-    // TODO 1A.4's drain_user_data_events() (binance_user_data_event.hpp) has been constructing
-    // AuditRecord instances with that event_type ever since, but decode_audit_record() would
-    // reject any of them as MalformedEnum once they hit a real DurableAuditSink (the only
-    // reason this hasn't bitten yet is that the sole runnable harness today uses the in-memory
-    // AuditRingSink, which never calls this decode path at all). Found during Batch G's
-    // ExecutionJournal research; unrelated to that decision, fixed here since it's a one-line
-    // bound correction with an existing regression-test template to extend.
-    return v <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
+    return is_legal_audit_event_type_for_version(v, kFrameFormatVersion);
 }
 
 inline bool is_legal_execution_mode(std::uint8_t v) noexcept {
@@ -221,13 +252,16 @@ inline void encode_audit_record(std::span<std::byte, kAuditRecordWireSize> out,
 // false (leaving `out` in an unspecified state) if any enum field is out of
 // its legal range -- never trusts the byte to already be a valid enumerator,
 // matching this codebase's decode-time range-check discipline throughout.
+//
+// `format_version` is the version of the frame that carries the payload: the legal event types depend on it (the
+// FORMAT v5 -> v6 note at the top). Defaults to v5, so a caller that never learned about v6 keeps the old bound.
 inline bool decode_audit_record(std::span<const std::byte, kAuditRecordWireSize> in,
-                                 AuditRecord& out) noexcept {
+                                 AuditRecord& out, std::uint8_t format_version = kFrameFormatVersion) noexcept {
     const std::byte* p = in.data();
     out.timestamp_ms = detail::read_i64_le(p);
 
     const std::uint8_t event_type_raw = detail::read_u8(p);
-    if (!detail::is_legal_audit_event_type(event_type_raw)) return false;
+    if (!detail::is_legal_audit_event_type_for_version(event_type_raw, format_version)) return false;
     out.event_type = static_cast<AuditEventType>(event_type_raw);
 
     const std::uint8_t mode_raw = detail::read_u8(p);
@@ -279,6 +313,12 @@ inline constexpr std::size_t kOrderEventFrameSize =
 // must have already resolved `hmac_key` from a KeyRing lookup for this
 // exact `key_id` (key_ring.hpp); this function has no key-selection logic
 // of its own, it only writes the identifier into the frame header.
+//
+// `format_version` (D5 / R1) is the version byte written into the frame; the only production caller,
+// DurableAuditSink::append_durable(), passes its store's own write version. It also returns 0 -- writes nothing --
+// for a version this build does not read, and for a record whose event type is not legal for that version: a frame
+// the reader would call MalformedEnum is never produced in the first place (a v5 store asked to append
+// OrderOperatorResolved fences instead of laying down a log its own next start would reject).
 inline std::size_t encode_order_event_frame(
     std::span<std::byte> out,
     std::uint32_t key_id,
@@ -287,13 +327,18 @@ inline std::size_t encode_order_event_frame(
     std::int64_t recorded_utc_ms,
     const AuditRecord& record,
     std::span<const std::byte, kMacLen> prev_mac,
-    std::span<const std::byte> hmac_key) noexcept {
+    std::span<const std::byte> hmac_key,
+    std::uint8_t format_version = kFrameFormatVersion) noexcept {
     if (out.size() < kOrderEventFrameSize) return 0;
+    // One check covers both refusals: a version this build does not read has no legal event type at all.
+    if (!detail::is_legal_audit_event_type_for_version(static_cast<std::uint8_t>(record.event_type), format_version)) {
+        return 0;
+    }
 
     std::byte* p = out.data();
     const std::byte* const content_start = p;
 
-    detail::write_u8(p, kFrameFormatVersion);
+    detail::write_u8(p, format_version);
     detail::write_u8(p, static_cast<std::uint8_t>(DurableRecordType::OrderEvent));
     detail::write_u32_le(p, key_id);
     detail::write_u64_le(p, sequence_number);
@@ -322,7 +367,7 @@ enum class FrameDecodeStatus : std::uint8_t {
     Ok = 0,
     Truncated = 1,             // fewer bytes available than the frame needs -- only a
                                 // legal outcome at true EOF (torn tail write)
-    UnknownVersion = 2,        // format_version != kFrameFormatVersion
+    UnknownVersion = 2,        // format_version is neither kFrameFormatVersion (5) nor kFrameFormatVersionV6 (6)
     MalformedEnum = 3,         // record_type/time_kind/event_type/mode/resulting_state
                                 // out of their legal range
     PayloadLengthInvalid = 4,  // payload_length != kAuditRecordWireSize
@@ -332,6 +377,9 @@ enum class FrameDecodeStatus : std::uint8_t {
 };
 
 struct DecodedOrderFrame {
+    // The version byte the frame carried (5 or 6; anything else never reaches an Ok decode). The scans use it for
+    // the "versions never go back inside one store" rule and the manifest of the export reports the highest one.
+    std::uint8_t format_version{kFrameFormatVersion};
     DurableRecordType record_type{DurableRecordType::OrderEvent};
     std::uint32_t key_id{0};
     std::uint64_t sequence_number{0};
@@ -395,7 +443,7 @@ inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
     const std::byte* const content_start = p;
 
     const std::uint8_t version = detail::read_u8(p);
-    if (version != kFrameFormatVersion) return FrameDecodeStatus::UnknownVersion;
+    if (!detail::is_readable_order_event_version(version)) return FrameDecodeStatus::UnknownVersion;
 
     const std::uint8_t record_type_raw = detail::read_u8(p);
     if (!detail::is_legal_durable_record_type(record_type_raw)) return FrameDecodeStatus::MalformedEnum;
@@ -417,7 +465,7 @@ inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
 
     AuditRecord record{};
     if (!decode_audit_record(std::span<const std::byte, kAuditRecordWireSize>(p, kAuditRecordWireSize),
-                              record)) {
+                              record, version)) {
         return FrameDecodeStatus::MalformedEnum;
     }
     p += kAuditRecordWireSize;
@@ -440,6 +488,7 @@ inline FrameDecodeStatus decode_order_event_frame(std::span<const std::byte> in,
         return FrameDecodeStatus::ChecksumMismatch;
     }
 
+    out.format_version = version;
     out.record_type = static_cast<DurableRecordType>(record_type_raw);
     out.key_id = key_id;
     out.sequence_number = sequence_number;
