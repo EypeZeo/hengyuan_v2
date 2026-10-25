@@ -1,8 +1,8 @@
 # 操作员解决（Operator Resolution）：被困订单的回头路（D5）
 
-状态：**设计，语义已冻结；没有任何实现**。无代码、无枚举取值、无日志字节变化。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”。
+状态：**设计，语义已冻结；切片 R1（恢复读者）已实现，没有任何一方会写这个帧（写者是 R3）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 说“开始”。
 依据：SUBMITPORT 规格 §6.5 第 4、5 条（已被接受的 `OrderOperatorResolved`）；`docs/NOTSENT_CLOSURE_DESIGN.md` §1、A6、D5；蓝图 L-43、L-46、`5.9.4`。
-模型：`formal/operator_resolution.tla`（§8）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值（事件号、位布局的最终形式）随实现 PR 分配**，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。
+模型：`formal/operator_resolution.tla`（§8）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值（事件号、位布局的最终形式）随实现 PR 分配**，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。R1 已分配：事件号 22，`detail_code` 的位布局冻结在 `native/include/hengyuan/operator_resolution_frame.hpp`。
 
 ## 1. 问题：一个被困订单就是一块砖
 
@@ -116,7 +116,7 @@
 | `client_order_id`、`symbol_id`、`side`、`price_ticks`、`qty_ticks`、`mode` | 原样取自该订单恢复出的意图 |
 | `exchange_order_id`、`filled_qty_ticks`、`avg_fill_price_ticks` | 0 |
 | `timestamp_ms`、帧头时间 | 工具的时钟；帧头时间类型 `ServerCorrectedUtc`（取交易所 `serverTime`） |
-| `detail_code`（提案，实现 PR 冻结） | 位 0–3 结论种类（1 = ABSENT）；位 4 栅栏已满足；位 5 点查为 `-2013`；位 6 `allOrders` 无此单；位 7 `openOrders` 无此单；位 8 操作员已确认；位 9 独占锁已持有；位 16–31 实际等待秒数（封顶）；位 32–47 工具版本；其余位必须为 0 |
+| `detail_code`（R1 已冻结，`operator_resolution_frame.hpp`） | 位 0–3 结论种类（1 = ABSENT）；位 4 栅栏已满足；位 5 点查为 `-2013`；位 6 `allOrders` 无此单；位 7 `openOrders` 无此单；位 8 操作员已确认；位 9 独占锁已持有；位 16–31 实际等待秒数（封顶）；位 32–47 工具版本；其余位（10–15 与 48–63，含符号位）必须为 0 |
 | `detail_msg`（≤ 64 字节 ASCII） | `op=<操作员标签>;ev=<证据附件 SHA-256 前 32 位十六进制>` |
 
 ### 7.2 读者规则（违反任何一条 = `Corrupt`，失败关闭）
@@ -126,10 +126,13 @@
 3. `detail_code`：种类 = ABSENT 时位 4 至 9 必须全部置位，保留位必须为 0。（置位只是声明，读者无法核实它为真——真正的保证在 §5 的协议和工具，读者的这一条只是让一个不声称证据的写者无法混进来。）
 4. 该帧必须是该 COID 的最后一帧。
 5. 本事件只在 v6 帧里合法；v5 帧里出现 = `Corrupt`。
+6. （R1 补充）订单先前出现过交易所订单号或成交的，不得被结清：那是一个存在过的订单，ABSENT 的结论与日志自己的记录矛盾。
+7. （R1 补充）本事件永远不能是一个订单号的首帧，即使它自称 `Intent`。
+8. （R1 补充）一个存储里帧版本单调不减：v5 帧出现在 v6 帧之后 = `Corrupt`（存储可以从 v6 起头）。因此写者随存储尖端的版本走：操作员帧写下之后，交易进程接着写的也是 v6，否则下一次启动就会撞上“v6 之后的 v5”。
 
 ### 7.3 产物
 
-该订单不进检查点；恢复提供一个有界的列表 `recovered_operator_resolved()`（供 §9 的迟到成交告警；容量与溢出规则随实现）。
+该订单不进检查点；恢复提供一个有界的列表 `recovered_operator_resolved()`（供 §9 的迟到成交告警）。R1 的容量规则：`kMaxOperatorResolved` = 1024；这个表必须完整才有用（被错误结清的挂单可能几周后才成交），所以交易进程超过就 `CapacityExceeded`、不启动；`OperatorOpen` 打开模式（只给离线工具）改为计数，`recovery_overflow()` 说明没装下什么，其余失败（`Corrupt`、`IoError`）照旧围栏。
 
 ### 7.4 与 NotSent 的区别
 

@@ -362,6 +362,46 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       Intent-only 孤儿的压实归档（蓝图 L-37）；POSIX 分支的 `truncate_log` 只由 WSL2/GCC 与 ASan 两个本地层以及 CI 覆盖，
       不在 MSVC 变异检查之内。
 
+  - **[D5 切片 R1 已落地：读者先行——`OrderOperatorResolved` 帧与帧格式 v6]**（`docs/OPERATOR_RESOLUTION_DESIGN.md` §7、§10；
+    Owner 2026-10-25 “开始”；Tier B）：被困订单的“回头路”（离线工具，切片 R3）会写下的闭合帧，恢复读者现在能读、能校验，
+    但**没有任何生产代码能写它**：工具是 R3，R1 只让读者先行（`docs/NOTSENT_CLOSURE_DESIGN.md` §5 第 4 条）。
+    - **新增符号**：`AuditEventType::OrderOperatorResolved` = 22（只在 v6 帧里合法）；`kFrameFormatVersionV6` = 6
+      （`kFrameFormatVersion` 仍是 5——控制面各记录的编解码都按它写、按它严格校验，那些存储永远不会有 v6）；
+      `is_legal_audit_event_type_for_version()`；`encode_order_event_frame()` 末尾的 `format_version` 参数（默认 5；对读不了的
+      版本、对该版本里非法的事件类型返回 0、什么都不写）；`DecodedOrderFrame` 带上 `format_version`；
+      `validate_operator_resolution()`（只有 `EscalatedToOperator` → `Rejected` 一条边）；`operator_resolution_frame.hpp`
+      冻结 `detail_code` 的位布局，`is_valid_absent_detail_code()` 判形状；`OperatorResolvedOrder` 与 `kMaxOperatorResolved`
+      = 1024（`durable_control_plane.hpp`）；`AuditSinkOpenMode`（`Trading` / `OperatorOpen`）、`RecoveryOverflow`、
+      `DurableAuditSink` 的 `recovered_operator_resolved()` / `recovery_overflow()` / `write_format_version()`。
+    - **帧格式**：v6 与 v5 布局完全相同（256 字节），只多一个合法事件类型；读者读 5 和 6，v5 帧里出现事件 22 是
+      `MalformedEnum`（不是“提前”），5 与 6 之外的版本是 `UnknownVersion`。版本字节在 MAC 之内，改标签必须重新签名。
+    - **读者规则**（`DurableAuditSink::run_recovery_scan_impl()`，设计 §7.2；任何一条不满足 = 整本日志 `Corrupt`，接收器围栏）：
+      ① 前一状态必须是 `Submitting`（`OrderSubmitPrepared` 之后）、`Ambiguous` 或 `EscalatedToOperator`——前两者经
+      `validate_transition()`，第三者**只**经 `validate_operator_resolution()`；② 帧必须说 `Rejected`、成交与交易所订单号为 0，
+      且品种、方向、价格、数量、模式与 Intent 帧一致；③ `detail_code` 是 ABSENT 的形状（种类 1，第 4 至 9 位全置位，
+      保留位为 0，负数无效）——置位只是声明，读者核实不了，保证在协议与工具；④ 它是该订单号的**最后一帧**（之后任何帧，
+      同状态重复的 `Rejected` 也算，都是 `Corrupt`）；⑤ 只在 v6 帧里合法。本片补的两条：订单先前出现过交易所订单号或成交的，
+      不得被结清；事件 22 永远不能是一个订单号的首帧（即使它自称 `Intent`）。
+    - **版本不回退**：一个存储里帧版本单调不减，v5 帧出现在 v6 帧之后是 `Corrupt`（存储可以从 v6 起头）。写者随存储尖端走：
+      `write_version_` 只由恢复扫描赋值一次（取见到的最高版本），所以今天所有存储仍写 v5、一字节不变；而操作员工具写下第一个
+      v6 帧之后，交易进程接着写的也是 v6——否则下次启动就会撞上“v6 之后的 v5”，把整本日志判 `Corrupt`。`append_durable()`
+      遇到写版本里非法的事件（v5 存储上的事件 22）围栏，且不写任何字节。
+    - **产物**：被结清的订单是终态（`Rejected`）——不进 `recovered_checkpoints()`、不算孤儿、不进在途表、`StartupRecovery` 不再
+      等它；`recovered_operator_resolved()` 按日志顺序列出它们（订单号、品种、方向、数量、帧序号），给切片 R4 的迟到成交告警用。
+      这个表必须**完整**才有用（被错误结清的挂单可能几周后才成交），所以满额（`kMaxOperatorResolved`）是失败关闭的：交易进程
+      `CapacityExceeded`。
+    - **`OperatorOpen`**：只给离线工具（切片 R3）。同一次扫描，但三个界（未决订单 `kMaxInFlight`、Intent 孤儿预算、操作员结清表）
+      改为计数而不是失败，接收器保持可用——否则最需要操作员的存储（未决订单超过 64 笔）恰恰写不进去那一帧；
+      `recovery_overflow()` 说明列表没装下什么。`Corrupt` 与 `IoError` 照旧围栏。每个界都写成“不是 `OperatorOpen` 就严格”，
+      枚举的越界值不会变成宽松。交易进程**不得**用这个模式。
+    - **守卫**（`test_operator_resolution_guard.cpp`，读源码）：事件 22 只被定义处、编解码和读者提及（逐文件钉次数）；除 sink
+      头文件外没有任何源文件出现 `OperatorOpen`；`validate_operator_resolution()` 只有读者调用；`write_version_` 全库只赋值一次，
+      `encode_order_event_frame()` 全库只有一个生产调用且以 `write_version_` 为版本；`kFrameFormatVersionV6` 只出现在编解码与
+      sink，控制面仍是 `kFrameFormatVersion`。`validate_transition()` 对 `EscalatedToOperator` 出发的每条边仍是 `AlreadyTerminal`
+      （`test_order_lifecycle.cpp`）。导出器（`durable_audit_export.hpp`）同读 v5/v6、同样拒绝版本回退，清单报告日志里最高的版本。
+    - **仍未覆盖**：写事件 22 的一方（切片 R3 的离线工具）；证据原语（R2）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的
+      前置）；NotSent 的状态与事件（`docs/NOTSENT_CLOSURE_DESIGN.md` S2/S3，会在同一个 v6 里再追加）；迁移（没有真实日志之前不需要）。
+
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/

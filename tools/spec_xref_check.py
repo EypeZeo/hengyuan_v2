@@ -140,6 +140,9 @@ SEARCH_FILES = [
     # SweepAccountProbe callbacks, and the hot thread's SweepPump -- are new load-bearing symbols, the same gap.
     REPO_ROOT / "native" / "include" / "hengyuan" / "barrier_sweep.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "sweep_pump.hpp",
+    # D5 slice R1 (docs/SPEC_INVARIANTS.md "D5 切片 R1"): the frozen bit layout of an OrderOperatorResolved frame's
+    # detail_code and its shape predicate are new load-bearing symbols -- the same gap every entry above closes.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_frame.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
