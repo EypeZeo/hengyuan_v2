@@ -48,7 +48,7 @@ D:\My_Projects\hengyuan_ops\d0\
 | `PULL_FAILED` | WARN，连续第二次起 CRIT | pull 整体失败（多半是 ssh 连不上） | 手动 `pull` 一次；宿主机被封/挂起时查提供商面板；pull 幂等，重跑安全 |
 | `PULL_ERRORS` | CRIT | 有段没能镜像或校验失败（不回执、不落地） | 看 `maint-*.log`，重跑 `pull`；反复失败就别删宿主机上的段，先查原因 |
 | `PULL_LOST` | CRIT | 有段在被拉取前已被宿主机清理：**数据已丢** | 记下时间范围（宿主机清单有 `prune` 事件），查为什么 pull 停了 |
-| `HOST_UNREACHABLE` | WARN，连续第二次起 CRIT | 探测连不上宿主机 | 同上；录制本身可能还在跑，宿主机自己的保留规则兜底 |
+| `HOST_UNREACHABLE` | WARN，连续第二次起 CRIT | 探测连不上宿主机 | 同上，并先排除最坏的一种：**提供商把虚拟机关停了**（续费到期等），查提供商面板与续费日期。网络问题时录制本身可能还在跑，宿主机自己的保留规则兜底；虚拟机被关停时录制也停了，那段数据永久缺失，而维保这边看到的是同一条 `HOST_UNREACHABLE`（2026-10-24 至 25 日就是这样，空洞约 24 小时 49 分）。本机开着 TUN 模式的代理时，“TCP 连得上但没有 SSH 横幅”既可能是宿主机宕机，也可能是代理吞了端口，先看提供商面板再去动代理 |
 | `RECORDER_INACTIVE` | CRIT | `hy-recorder` 不在运行 | `systemctl status hy-recorder`、`journalctl -u hy-recorder -b`（journal 已持久化）；`Restart=always` 仍没起来就是真故障 |
 | `RECORDER_RESTARTED` | WARN | 同一次开机内重启数增加（崩溃或看门狗自杀） | 看 journal 与账本的 `PROC_STOP`/`TASK_CRASH`；每次重启都是一个数据空洞 |
 | `HOST_REBOOTED` | INFO | 宿主机重启过 | 对照 `CLOCK_STATE` 与 `PROC_START.prev_clean`；周验证会列出空洞 |
