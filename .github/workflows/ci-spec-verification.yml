@@ -37,8 +37,8 @@ name: CI Spec Verification
 # minutes go DOWN, which is the actual constraint being optimized against here.
 #
 # Model count (2026-10 note): the paragraphs above describe the 7 models that existed when
-# this was consolidated. The job now runs 10 (one "Model:" step each; reconnect_sweep joined
-# with private-stream migration M3b). formal/ holds 11 .tla files: RoundEFDesignReceiptVerified.tla
+# this was consolidated. The job now runs 11 (one "Model:" step each; reconnect_sweep joined
+# with private-stream migration M3b, notsent_closure with Q23 slice 1). formal/ holds 12 .tla files: RoundEFDesignReceiptVerified.tla
 # is a research fork whose own header says its placement is deliberately unset until a design
 # freeze, so it is intentionally not run here.
 
@@ -168,7 +168,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
-    # Sum-ceiling across 10 sequential models (7 when consolidated), was 7 x independent 20-min caps
+    # Sum-ceiling across 11 sequential models (7 when consolidated), was 7 x independent 20-min caps
     # possible in parallel before this consolidation -- see this file's header
     # comment for why billed minutes (not wall-clock) is the thing being
     # optimized here.
@@ -185,7 +185,7 @@ jobs:
 
       # tla2tools.jar is gitignored (a 2MB binary does not belong in the tree),
       # so CI fetches the pinned release the same way the local setup does.
-      # ONE fetch for all 10 models below, not 10.
+      # ONE fetch for all 11 models below, not 11.
       - name: Cache TLA+ tools
         id: cache-tla
         uses: actions/cache@v6
@@ -549,6 +549,58 @@ jobs:
           done
           exit $fail
 
+      - name: "Model: notsent_closure (final send claim + NotSent closure, Q23 slice 1)"
+        id: m_notsent_closure
+        continue-on-error: true
+        working-directory: formal
+        # Four runs MUST pass: the design; the two environment assumptions shown NOT to touch safety (the exclusive log open, and a reconcile that
+        # cannot conclude "the exchange does not have it", which is what the tree does today); and liveness. Twelve MUST fail: eight turn one design
+        # decision OFF, one is the liveness run that shows what the second assumption costs (a temporal violation, so the message is not an invariant's),
+        # three are reachability probes that keep the invariants from holding vacuously. See formal/README.md and docs/NOTSENT_CLOSURE_DESIGN.md.
+        run: |
+          set -u
+          # Must pass: the design, what the exclusive log open and an absent-concluding reconcile are NOT needed for, and liveness.
+          for cfg in notsent_closure.cfg notsent_closure_no_lock_safety.cfg notsent_closure_no_absent_safety.cfg; do
+            java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC -workers auto -config "$cfg" notsent_closure.tla || exit 1
+          done
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC -workers auto -config notsent_closure_liveness.cfg notsent_closure.tla || exit 1
+
+          # Must fail, each with the named message.
+          fail=0
+          for pair in \
+            "notsent_closure_stale_claim_bug.cfg|Invariant NoClaimUnderRevoke is violated|the revocation test and the claim are two steps (the claim trusts a stale answer)" \
+            "notsent_closure_plain_revoke_bug.cfg|Invariant NotSentImpliesNeverCrossed is violated|a revoker overwrites a decision already taken with a plain store" \
+            "notsent_closure_gate_before_prepared_bug.cfg|Invariant SendImpliesDurablePrepared is violated|the claim can be taken before the Prepared ACK" \
+            "notsent_closure_failure_compensation_bug.cfg|Invariant NoDoubleSend is violated|revision 13's AbortedPreSend: a Failed append is read as 'did not happen'" \
+            "notsent_closure_release_early_bug.cfg|Invariant ReleaseNeedsProof is violated|resources are released when the closing append is issued, not when it is ACKed" \
+            "notsent_closure_coid_reuse_bug.cfg|Invariant NotSentImpliesNeverCrossed is violated|a closed client-order-id is started again" \
+            "notsent_closure_recovery_closes_bug.cfg|Invariant ClosedNotSentIsTrue is violated|recovery closes a Prepared-only order as NotSent" \
+            "notsent_closure_no_lock_bug.cfg|Invariant ReplayLegal is violated|a successor scans before the predecessor's last write landed (the exclusive-open assumption)" \
+            "notsent_closure_no_absent_liveness.cfg|Temporal properties were violated|reconciliation cannot conclude 'the exchange does not have it' (the tree today): a never-sent Prepared order is never settled" \
+            "notsent_closure_probe.cfg|Invariant NotSentNeverDurable is violated|reachability probe (a NotSent frame can become durable)" \
+            "notsent_closure_probe_late.cfg|Invariant LateNotSentNeverLands is violated|reachability probe (it can land after the caller was told Failed or died)" \
+            "notsent_closure_probe_sent_revoked.cfg|Invariant SentWhileRevokedNeverHappens is violated|reachability probe (claim first, revoke second: in flight)"
+          do
+            cfg="${pair%%|*}"; rest="${pair#*|}"
+            msg="${rest%%|*}"; desc="${rest#*|}"
+            echo "::group::$cfg — expecting '$msg'"
+            echo "  control: $desc"
+            if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+                 -workers auto -config "$cfg" notsent_closure.tla > "/tmp/$cfg.log" 2>&1; then
+              echo "::error::$cfg PASSED but was expected to report '$msg'. The model has stopped discriminating; do not trust the safety run until this is fixed."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            elif grep -q "$msg" "/tmp/$cfg.log"; then
+              echo "  OK: '$msg' as expected"
+            else
+              echo "::error::$cfg failed, but NOT with the expected '$msg'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       # Aggregate: turns any individual model's failure into an overall job
       # failure. `if: always()` so this runs even though every model step
       # above is `continue-on-error: true`. Each model's own pass/fail is
@@ -569,6 +621,7 @@ jobs:
           [ "${{ steps.m_retryidempotency.outcome }}" = "failure" ] && { echo "::error::RoundERetryIdempotency failed"; fail=1; }
           [ "${{ steps.m_depthsnapshot.outcome }}" = "failure" ] && { echo "::error::depth_snapshot_bootstrap failed"; fail=1; }
           [ "${{ steps.m_reconnect_sweep.outcome }}" = "failure" ] && { echo "::error::reconnect_sweep failed"; fail=1; }
+          [ "${{ steps.m_notsent_closure.outcome }}" = "failure" ] && { echo "::error::notsent_closure failed"; fail=1; }
           exit $fail
 
   # Always runs and is the only check of this workflow meant to be a required status check: it passes only if
