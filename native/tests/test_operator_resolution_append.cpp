@@ -590,6 +590,20 @@ TEST_F(OperatorAppendTest, AnOrderThatIsNotUnresolvedIsNotThere) {
                              "an order that is already final");
 }
 
+TEST_F(OperatorAppendTest, AnEmptyClientOrderIdNamesNoOrder) {
+    // The recovery scan does not filter an empty client order id, so a log whose frames carry one yields a checkpoint with an
+    // empty id. The writer must not read "" as a name: an empty id is no order, however many empty ones the log holds.
+    const OrderSpec empty{""};
+    write_history(ambiguous_history(empty));
+    {
+        const auto sink = open(AuditSinkOpenMode::OperatorOpen);
+        ASSERT_EQ(sink->recovered_checkpoints().size(), 1u) << "the scan keeps the order whose id is empty";
+        EXPECT_EQ(sink->recovered_checkpoints()[0].client_order_id.view(), "");
+    }
+    expect_refused_untouched(attempt(operator_resolved(empty)), OperatorAppendStatus::NoSuchUnresolvedOrder,
+                             "an empty client order id names no order");
+}
+
 TEST_F(OperatorAppendTest, ADryRunOrderIsNotResolved) {
     OrderSpec dry = kA;
     dry.mode = ExecutionMode::DryRun;
