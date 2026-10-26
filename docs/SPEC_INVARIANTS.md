@@ -404,7 +404,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       日志之前不需要）。
 
   - **[D5 切片 R2 已落地：证据原语——栅栏算术、查询结果分类、`allOrders` 窗口、结论函数]**（`docs/OPERATOR_RESOLUTION_DESIGN.md` §5、
-    §6、§10；Owner 2026-10-25 “开始”；Tier B）：离线工具（切片 R3）判断“交易所没有这个订单，也永远不会有”所需的全部**决策**，做成只吃
+    §6、§10；Owner 2026-10-25 “开始”，“合并”；Tier B；PR #205，合并提交 99d8cb4）：离线工具（切片 R3）判断“交易所没有这个订单，也永远不会有”所需的全部**决策**，做成只吃
     普通值的纯函数，每一条拒绝都能用表格用例钉住；**没有任何生产代码调用它们**（工具是 R3），对账路径不变——`query_order()` 仍把一切
     不是正向匹配的答案折叠成 `Inconclusive`。
     - **两个头文件**：`operator_resolution_evidence.hpp` 是决策（不分配、不解析 JSON、不抛异常，`#include` 清单固定）；
