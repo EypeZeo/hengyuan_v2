@@ -82,6 +82,7 @@
 #pragma once
 
 #include <hengyuan/account_truth.hpp>  // SymbolRules -- append_snapshot's payload
+#include <hengyuan/audit_trail.hpp>    // ExecutionMode -- OrderRecoveryCheckpoint::mode (D5 R3-0)
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/spsc_ring.hpp>  // hy::kCacheLine
 #include <array>
@@ -1899,6 +1900,20 @@ struct OrderRecoveryCheckpoint {
     // frames already on disk, so no on-disk format changes. checkpoint_to_order_record() turns it
     // into OrderRecord::unknown_since_wall_ms after a plausibility check (recovered_wall_anchor()).
     std::int64_t unknown_since_utc_ms{0};
+
+    // D5 / R3-0 (docs/OPERATOR_RESOLUTION_DESIGN.md 6): two facts about an unresolved order that the recovery scan
+    // already had in hand and used to drop, which the offline operator tool needs. IN MEMORY ONLY, like the rest of
+    // this struct: both are rebuilt from frames already on disk, so no on-disk format changes.
+    //   mode                 the ExecutionMode of the order's Intent frame. The tool resolves only Live orders -- a
+    //                        DryRun order never reached an exchange. The default is DryRun: a checkpoint that was not
+    //                        filled in by the scan is refused, not resolved.
+    //   send_started_utc_ms  the recorded time of the FIRST frame that put the order in Submitting (the Prepared
+    //                        frame, written before the request left), when that time is a ServerCorrectedUtc reading;
+    //                        0 = none. Unlike unknown_since_utc_ms it never moves to the Ambiguous frame, which is
+    //                        written AFTER the send attempt: the window in which the exchange can have created the
+    //                        order starts at the send, not at the moment the process gave up waiting.
+    ExecutionMode mode{ExecutionMode::DryRun};
+    std::int64_t send_started_utc_ms{0};
 };
 static_assert(std::is_trivially_copyable_v<OrderRecoveryCheckpoint>);
 static_assert(std::is_standard_layout_v<OrderRecoveryCheckpoint>);

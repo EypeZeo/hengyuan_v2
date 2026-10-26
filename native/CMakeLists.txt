@@ -669,6 +669,22 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_operator_resolution_response)
     gtest_discover_tests(test_operator_resolution_response)
 
+    # D5 slice R3-0 (docs/OPERATOR_RESOLUTION_DESIGN.md 6 step 7 and 10): the writer side of the operator's way back --
+    # DurableAuditSink::append_operator_resolution() (OperatorOpen only, event 22 only, pre-checked with the reader's own
+    # rules from operator_resolution_rules.hpp), the two checkpoint facts the tool needs (mode, send start time) and the
+    # writer-vs-reader differential. Real sinks over real files: the only crafted frames are the ones the writer cannot make.
+    add_executable(test_operator_resolution_append tests/test_operator_resolution_append.cpp)
+    target_link_libraries(test_operator_resolution_append PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_append)
+    gtest_discover_tests(test_operator_resolution_append)
+
+    # D5 slice R3-0: what the control-plane log says `symbol_id` stands for (ControlPlaneLogSink::recovered_symbol_name()) --
+    # the fold over the symbol-registry snapshots that gives a name only when every snapshot agrees.
+    add_executable(test_symbol_name_fold tests/test_symbol_name_fold.cpp)
+    target_link_libraries(test_symbol_name_fold PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_symbol_name_fold)
+    gtest_discover_tests(test_symbol_name_fold)
+
     # Phase 5 (docs/SPEC_INVARIANTS.md): export-worker best-effort telemetry
     # consumer for ExportOutboxRing (L2, real file I/O for LastRemoteAckedTip
     # persistence; ExternalAnchorClient stays mock-only via FakeExternalAnchorClient,

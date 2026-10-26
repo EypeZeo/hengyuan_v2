@@ -227,6 +227,7 @@ constexpr const char* kSink = "include/hengyuan/durable_audit_sink.hpp";
 constexpr const char* kTrail = "include/hengyuan/audit_trail.hpp";
 constexpr const char* kLifecycle = "include/hengyuan/order_lifecycle.hpp";
 constexpr const char* kFrame = "include/hengyuan/operator_resolution_frame.hpp";
+constexpr const char* kRules = "include/hengyuan/operator_resolution_rules.hpp";
 constexpr const char* kEvidence = "include/hengyuan/operator_resolution_evidence.hpp";
 constexpr const char* kResponse = "include/hengyuan/operator_resolution_response.hpp";
 
@@ -362,7 +363,8 @@ TEST(OperatorResolutionGuard, TheOperatorEventIsNamedOnlyByItsDefinitionTheCodec
     expect_named_only_in("OrderOperatorResolved",
                          {{kTrail, 2, "the enumerator and its name in audit_event_name()"},
                           {kCodec, 1, "is_legal_audit_event_type_for_version(): the one version that may carry it"},
-                          {kSink, 1, "the recovery scan recognising the frame (never constructing one)"}});
+                          {kSink, 2, "the recovery scan recognising the frame, and append_operator_resolution() recognising "
+                                     "the one record it may write (R3-0) -- neither constructs one"}});
 }
 
 TEST(OperatorResolutionGuard, OperatorOpenIsNamedByNothingButTheSinkHeader) {
@@ -385,14 +387,35 @@ TEST(OperatorResolutionGuard, OperatorOpenIsNamedByNothingButTheSinkHeader) {
     EXPECT_GT(in_sink, 3u) << "the sink header defines the mode and applies it to the three bounds";
 }
 
-TEST(OperatorResolutionGuard, TheOperatorEdgeFunctionIsCalledByTheReaderAndNothingElse) {
+TEST(OperatorResolutionGuard, TheOperatorEdgeFunctionIsCalledByTheSharedResolutionRuleAndNothingElse) {
+    // R3-0 moved the rule out of the sink: check_resolution() applies it for the reader AND the writer.
     expect_named_only_in("validate_operator_resolution",
-                         {{kLifecycle, 1, "the definition"}, {kSink, 1, "accepts_operator_resolution()"}});
+                         {{kLifecycle, 1, "the definition"}, {kRules, 1, "check_resolution(): the one place the edge is applied"}});
 }
 
-TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedOnceByTheRecoveryScan) {
+TEST(OperatorResolutionGuard, TheSharedResolutionRuleIsAppliedByTheReaderAndTheWriterAlone) {
+    // One rule, two callers, both in the sink: the recovery scan's accepts_operator_resolution() and the writer's
+    // append_operator_resolution() -- so a frame the writer lets through is a frame the next start accepts.
+    expect_named_only_in("check_resolution", {{kRules, 1, "the definition"},
+                                              {kSink, 2, "accepts_operator_resolution() (the reader) and "
+                                                         "append_operator_resolution() (the writer's pre-check)"}});
+    const SourceFile* sink = find_source(kSink);
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(count_identifier(function_body(sink->code, "accepts_operator_resolution"), "check_resolution"), 1u);
+    EXPECT_EQ(count_identifier(function_body(sink->code, "append_operator_resolution"), "check_resolution"), 1u);
+}
+
+TEST(OperatorResolutionGuard, TheOperatorAppendHasNoProductionCaller) {
+    // R3-0 builds the writer; the offline tool that calls it is slice R3a. Until then nothing may: the day the tool exists,
+    // its translation unit is added here with the reason (and the guard on OperatorOpen above gets the same entry).
+    expect_named_only_in("append_operator_resolution", {{kSink, 1, "the definition"}});
+}
+
+TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedByTheRecoveryScanAndByTheAckedOperatorFrameOnly) {
     std::size_t assignments = 0;
     std::vector<std::string> elsewhere;
+    const SourceFile* sink = find_source(kSink);
+    ASSERT_NE(sink, nullptr);
     for (const SourceFile& f : production_sources()) {
         const std::size_t any = count_identifier(f.code, "write_version_");
         if (f.rel == kSink) {
@@ -402,12 +425,25 @@ TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedOnceByTheRecoveryScan) {
         }
     }
     for (const std::string& f : elsewhere) ADD_FAILURE() << f << " names write_version_";
-    EXPECT_EQ(assignments, 1u)
-        << "write_version_ may be set exactly once, from the highest version the recovery scan saw; a second "
-           "assignment is a way to write the first v6 frame of a store without a v6 frame ever having been there";
+    EXPECT_EQ(assignments, 2u)
+        << "write_version_ is set exactly twice: from the highest version the recovery scan saw, and to 6 right after "
+           "append_operator_resolution() has had an operator frame acknowledged. A third assignment is a way to write "
+           "the first v6 frame of a store without a v6 frame ever having been there (or to go back to v5 after one)";
+    const std::string scan = function_body(sink->code, "run_recovery_scan_impl");
+    ASSERT_FALSE(scan.empty());
+    EXPECT_EQ(count_assignments(scan, "write_version_"), 1u) << "the first assignment belongs to the recovery scan";
+    const std::string append = function_body(sink->code, "append_operator_resolution");
+    ASSERT_FALSE(append.empty());
+    EXPECT_EQ(count_assignments(append, "write_version_"), 1u) << "the second belongs to append_operator_resolution()";
+    // ...and it comes AFTER the append was acknowledged, never before: a refused or failed append leaves the version alone.
+    const std::size_t acked_at = append.find("acked()");
+    const std::size_t assigned_at = append.find("write_version_ =");
+    ASSERT_NE(acked_at, std::string::npos);
+    ASSERT_NE(assigned_at, std::string::npos);
+    EXPECT_LT(acked_at, assigned_at);
 }
 
-TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesTheWriteVersion) {
+TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAndHasTwoCallers) {
     std::size_t total_calls = 0;
     for (const SourceFile& f : production_sources()) {
         const std::vector<std::vector<std::string>> calls = call_args(f.code, "encode_order_event_frame");
@@ -417,10 +453,29 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesTheWriteVersion)
                                    "decides what ends up in a log";
         for (const std::vector<std::string>& args : calls) {
             ASSERT_EQ(args.size(), 9u) << f.rel << ": (buf, key_id, seq, time_kind, now, record, prev_mac, key, version)";
-            EXPECT_EQ(args.back(), "write_version_") << f.rel;
+            EXPECT_EQ(args.back(), "version") << f.rel << ": the version of THIS frame, handed in by append_impl()'s caller";
         }
     }
     EXPECT_EQ(total_calls, 1u);
+
+    // append_impl() is where that version comes from: the store's write version for append_durable(), 6 for the operator
+    // frame -- and the 6 is passed only from inside append_operator_resolution().
+    const SourceFile* sink = find_source(kSink);
+    ASSERT_NE(sink, nullptr);
+    const std::vector<std::vector<std::string>> impl_calls = call_args(sink->code, "append_impl");
+    ASSERT_EQ(impl_calls.size(), 2u);
+    std::size_t with_write_version = 0;
+    std::size_t with_v6 = 0;
+    for (const std::vector<std::string>& args : impl_calls) {
+        ASSERT_EQ(args.size(), 3u) << "(record, now_ms, version)";
+        if (args.back() == "write_version_") ++with_write_version;
+        if (args.back() == "kFrameFormatVersionV6") ++with_v6;
+    }
+    EXPECT_EQ(with_write_version, 1u);
+    EXPECT_EQ(with_v6, 1u);
+    EXPECT_EQ(count_identifier(function_body(sink->code, "append_operator_resolution"), "kFrameFormatVersionV6"), 2u)
+        << "the append call and the assignment after it";
+    EXPECT_EQ(count_identifier(function_body(sink->code, "append_durable"), "write_version_"), 1u);
 }
 
 TEST(OperatorResolutionGuard, FormatVersionSixIsNamedOnlyByTheCodecAndTheSink) {
