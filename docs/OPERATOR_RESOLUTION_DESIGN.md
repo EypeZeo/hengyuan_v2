@@ -1,6 +1,6 @@
 # 操作员解决（Operator Resolution）：被困订单的回头路（D5）
 
-状态：**设计，语义已冻结；切片 R1（恢复读者）已合入（PR #203，`a4372ba`，2026-10-25），没有任何一方会写这个帧（写者是 R3）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 说“开始”，对 PR #203 说“合并”。
+状态：**设计，语义已冻结；切片 R1（恢复读者）已合入（PR #203，`a4372ba`，2026-10-25）；切片 R2（证据原语：栅栏算术、查询结果分类、`allOrders` 窗口、结论函数）已实现；两者都没有任何一方会写这个帧（写者是 R3）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 与 R2 说“开始”，对 PR #203 说“合并”。
 依据：SUBMITPORT 规格 §6.5 第 4、5 条（已被接受的 `OrderOperatorResolved`）；`docs/NOTSENT_CLOSURE_DESIGN.md` §1、A6、D5；蓝图 L-43、L-46、`5.9.4`。
 模型：`formal/operator_resolution.tla`（§8）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值（事件号、位布局的最终形式）随实现 PR 分配**，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。R1 已分配：事件号 22，`detail_code` 的位布局冻结在 `native/include/hengyuan/operator_resolution_frame.hpp`。
 
@@ -100,6 +100,11 @@
    - (c) `openOrders`（不带 symbol）：不得有此 COID；
    - (d) 账户余额快照：仅显示，供操作员核对。
    时间窗起点用 `Prepared` 帧的 `recorded_utc_ms`（仅当 `time_kind` 为 `ServerCorrectedUtc`），否则用 COID 里的时间戳（`HY-{timestamp_ms}-…`，需是合理墙钟）；两者都不可用则拒绝。
+   **R2 的实现取舍**（`operator_resolution_evidence.hpp` / `operator_resolution_response.hpp`，都是纯函数，由 `conclude_absent()` 一处汇总，工具递进去的只有每次读的判定）：
+   (a) 只有 HTTP **400** 且错误体 `code` 恰为 -2013 才算“无此单”（状态是声明的一部分，真实表现由 R6 测量）；`-2026` 是 `Archived`，意思是订单存在过；
+   (b) 每页窗口不超过 24 小时少 1 秒，请求 `limit` = 1000；官方文档对截断没有任何标记，所以满页（1000 条）一律当作可能被截断而拒绝；窗口首尾相接（下一页起点 = 上一页终点），无论交易所把终点算开区间还是闭区间都不留缝；`allOrders` 的每个元素的 symbol 必须等于所请求的，错品种的页什么也证明不了；
+   (c) 时间窗起点取两个锚点（`Prepared` / `Submitting` 帧的服务器校正时间、COID 里的时间戳）中**较早的**再减 2W——比上面的“优先帧时间，否则 COID”只会更早（更多页，绝不留缝）；
+   (d) 所有时间必须落在 2020-01-01 至 2100-01-01 之内，之外的读数（例如解析失败而默认成 0 的 serverTime）永远满足不了栅栏。
 6. **展示与确认**：显示全部证据与清单（操作员须在交易所 App 的订单历史和成交历史里自行核对该时间窗内没有此订单 / 成交、余额与预期一致、API 权限未变），然后要求键入确认短语，绑定 COID、结论、环境名和证据摘要前 8 位。输入方式沿用 `OperatorConfirmationGate` / `OperatorInputReader`。
 7. **追加** `OrderOperatorResolved`，必须 durable `Acked`。失败：报告并退出，不重试——重新运行是幂等的（恢复扫描已把写进去的订单当终局，不再列出）。
 8. **证据附件**：`<store>.operator-evidence/<coid>-<utc>.json`——原始响应（去掉签名与密钥）、工具版本、栅栏与读延迟参数、各次 `serverTime` 读数；帧里存它的 SHA-256 前 32 位十六进制。
@@ -191,7 +196,7 @@
 | 片 | 内容 | 验证与负控 |
 | :-- | :-- | :-- |
 | R1 读者（已合入：PR #203，`a4372ba`，2026-10-25） | 事件类型、`validate_operator_resolution`、§7.2 的接受 / 拒绝表、`recovered_operator_resolved()`、`OperatorOpen` 打开模式、守卫；与 NotSent 的 codec 读者（`NOTSENT_CLOSURE_DESIGN.md` S2）同一次 v6 | MSVC + GCC `none`、`address`；表中每一行与每个 `Corrupt` 一个用例；`validate_transition(EscalatedToOperator, *)` 仍为 `AlreadyTerminal`；变异检查 |
-| R2 证据原语（纯逻辑） | 栅栏计算（`constexpr`、用交易所时间）、证据位的编解码、查询结果分类（`-2013` / `-2026` / 其它错误 / 成功，**对账路径不变**）、`allOrders` 分页规划 | 表驱动用例；变异检查；`closure_ledger_check` 若新增 FI 则同步 |
+| R2 证据原语（纯逻辑；已实现，见 `docs/SPEC_INVARIANTS.md`“D5 切片 R2”） | 栅栏计算（`constexpr`、用交易所时间）、证据位的编解码、查询结果分类（`-2013` / `-2026` / 其它错误 / 成功，**对账路径不变**）、`allOrders` 分页规划 | 表驱动用例；变异检查；`closure_ledger_check` 若新增 FI 则同步 |
 | R3 工具 | 离线 CLI；回环假交易所（含**落后于真实状态**的读、错误码、翻页）；确认输入；证据附件 | MSVC + GCC；`address`；栅栏与读延迟的负控；全部拒绝路径各一个用例 |
 | R4 迟到成交告警 | R-late：对 operator-resolved COID 的成交触发熔断 | 单元 + 恢复往返；变异检查 |
 | R5 环境与账户绑定 | R-env：存储记环境、解析账户 UID、工具拒绝不一致 | 生产启用的前置 |

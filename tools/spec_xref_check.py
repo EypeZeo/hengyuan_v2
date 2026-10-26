@@ -143,6 +143,10 @@ SEARCH_FILES = [
     # D5 slice R1 (docs/SPEC_INVARIANTS.md "D5 切片 R1"): the frozen bit layout of an OrderOperatorResolved frame's
     # detail_code and its shape predicate are new load-bearing symbols -- the same gap every entry above closes.
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_frame.hpp",
+    # D5 slice R2 (docs/SPEC_INVARIANTS.md "D5 切片 R2"): the evidence decisions (fence, windows, conclusion) and the parser of
+    # the exchange's answers -- two more load-bearing sets of symbols that no spec names.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_evidence.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_response.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

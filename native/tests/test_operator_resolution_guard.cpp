@@ -226,6 +226,64 @@ constexpr const char* kCodec = "include/hengyuan/durable_frame_codec.hpp";
 constexpr const char* kSink = "include/hengyuan/durable_audit_sink.hpp";
 constexpr const char* kTrail = "include/hengyuan/audit_trail.hpp";
 constexpr const char* kLifecycle = "include/hengyuan/order_lifecycle.hpp";
+constexpr const char* kFrame = "include/hengyuan/operator_resolution_frame.hpp";
+constexpr const char* kEvidence = "include/hengyuan/operator_resolution_evidence.hpp";
+constexpr const char* kResponse = "include/hengyuan/operator_resolution_response.hpp";
+
+const SourceFile* find_source(std::string_view rel) {
+    for (const SourceFile& f : production_sources()) {
+        if (f.rel == rel) return &f;
+    }
+    return nullptr;
+}
+
+// The relative paths of the production files that name `name` as an identifier, in scan order.
+std::vector<std::string> files_naming(std::string_view name) {
+    std::vector<std::string> out;
+    for (const SourceFile& f : production_sources()) {
+        if (count_identifier(f.code, name) != 0) out.push_back(f.rel);
+    }
+    return out;
+}
+
+// The text between the braces of the body of the function `name` (its first occurrence followed by a parameter list and a
+// brace), braces matched. Empty if there is none.
+std::string function_body(const std::string& code, std::string_view name) {
+    for (std::size_t pos = code.find(name); pos != std::string::npos; pos = code.find(name, pos + name.size())) {
+        if (pos > 0 && is_ident_char(code[pos - 1])) continue;
+        std::size_t i = pos + name.size();
+        while (i < code.size() && std::isspace(static_cast<unsigned char>(code[i])) != 0) ++i;
+        if (i >= code.size() || code[i] != '(') continue;
+        int paren = 0;
+        for (; i < code.size(); ++i) {  // to the end of the parameter list
+            if (code[i] == '(') ++paren;
+            if (code[i] == ')' && --paren == 0) break;
+        }
+        while (i < code.size() && code[i] != '{' && code[i] != ';') ++i;  // qualifiers, then the body or the end of a declaration
+        if (i >= code.size() || code[i] != '{') continue;
+        const std::size_t begin = i + 1;
+        int depth = 1;
+        for (++i; i < code.size(); ++i) {
+            if (code[i] == '{') ++depth;
+            if (code[i] == '}' && --depth == 0) return code.substr(begin, i - begin);
+        }
+    }
+    return {};
+}
+
+// The `#include` lines of a file, squeezed, in order.
+std::vector<std::string> include_lines(const std::string& code) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos < code.size()) {
+        std::size_t end = code.find('\n', pos);
+        if (end == std::string::npos) end = code.size();
+        const std::string line = squeeze(code.substr(pos, end - pos));
+        if (line.rfind("#include", 0) == 0) out.push_back(line);
+        pos = end + 1;
+    }
+    return out;
+}
 
 struct Pin {
     const char* file;
@@ -384,4 +442,82 @@ TEST(OperatorResolutionGuard, FormatVersionSixIsNamedOnlyByTheCodecAndTheSink) {
         EXPECT_EQ(count_identifier(f.code, "kFrameFormatVersionV6"), 0u);
     }
     EXPECT_TRUE(saw_control_plane);
+}
+
+// --- D5 slice R2: the evidence primitives -----------------------------------------------------------------------------
+//
+//   6. The two evidence headers are for the offline operator tool (slice R3) and the tests. No production file includes
+//      either, except that the response parser includes the decision header it feeds -- so neither can end up in the
+//      trading process, and the reconciliation path keeps folding every answer that is not a positive match into
+//      QueryOutcome::Inconclusive.
+//   7. The decision header allocates nothing and parses nothing: its includes are an exact list, and none of the names that
+//      allocate, throw or parse JSON appears in it. (The parser is the other header, and it allocates by design.)
+//   8. The frame's machine field is built in one place. The six claim bits are named only by the frame header (which defines
+//      them and checks them) and the decision header, and detail::make_absent_detail_code() -- the only builder -- is
+//      called by conclude_absent() and nothing else, so no code can write "the fence was satisfied" without conclude_absent()
+//      having looked at the evidence.
+
+TEST(OperatorResolutionGuard, TheFunctionBodyHelperHasKnownAnswers) {
+    const std::string code = code_only("int f() noexcept { if (x) { y(); } return 1; }\nint g() { z(); }\nint h();\n");
+    const std::string f = function_body(code, "f");
+    EXPECT_NE(f.find("y()"), std::string::npos);
+    EXPECT_NE(f.find("return 1"), std::string::npos);
+    EXPECT_EQ(f.find("z()"), std::string::npos) << "the body ends at the matching brace";
+    EXPECT_NE(function_body(code, "g").find("z()"), std::string::npos);
+    EXPECT_TRUE(function_body(code, "h").empty()) << "a declaration has no body";
+    EXPECT_TRUE(function_body(code, "nope").empty());
+    EXPECT_EQ(include_lines(code_only("#include <a>\n  #include   <b/c.hpp>\n// #include <d>\nint x;\n")),
+              (std::vector<std::string>{"#include <a>", "#include <b/c.hpp>"}));
+}
+
+TEST(OperatorResolutionGuard, TheEvidenceHeadersAreIncludedByNoProductionFileButEachOther) {
+    expect_named_only_in("operator_resolution_evidence",
+                         {{kResponse, 1, "the parser produces the verdicts the decision header consumes"}});
+    expect_named_only_in("operator_resolution_response", {});
+    ASSERT_NE(find_source(kEvidence), nullptr);
+    ASSERT_NE(find_source(kResponse), nullptr);
+}
+
+TEST(OperatorResolutionGuard, TheDecisionHeaderAllocatesNothingAndParsesNothing) {
+    const SourceFile* f = find_source(kEvidence);
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(include_lines(f->code),
+              (std::vector<std::string>{"#include <array>", "#include <cstddef>", "#include <cstdint>", "#include <limits>",
+                                        "#include <optional>", "#include <span>", "#include <string_view>",
+                                        "#include <hengyuan/operator_resolution_frame.hpp>"}))
+        << "an include added here must be argued for: this header is the part of the evidence path that allocates nothing";
+    for (const char* word :
+         {"simdjson", "vector", "string", "unique_ptr", "shared_ptr", "make_unique", "make_shared", "new", "delete", "malloc",
+          "calloc", "realloc", "free", "map", "unordered_map", "set", "list", "deque", "function", "ostream", "istream",
+          "iostream", "fstream", "sstream", "printf", "snprintf", "throw", "try", "catch", "exception"}) {
+        EXPECT_EQ(count_identifier(f->code, word), 0u) << word;
+    }
+    // the response header is where the allocating parser lives, and it says so
+    const SourceFile* r = find_source(kResponse);
+    ASSERT_NE(r, nullptr);
+    EXPECT_GT(count_identifier(r->code, "simdjson"), 0u);
+}
+
+TEST(OperatorResolutionGuard, TheMachineFieldBuilderIsCalledByTheConclusionAlone) {
+    expect_named_only_in("make_absent_detail_code",
+                         {{kEvidence, 2, "the definition, and the one call inside conclude_absent()"}});
+    const SourceFile* f = find_source(kEvidence);
+    ASSERT_NE(f, nullptr);
+    const std::string body = function_body(f->code, "conclude_absent");
+    ASSERT_FALSE(body.empty());
+    EXPECT_EQ(count_identifier(body, "make_absent_detail_code"), 1u) << "the call must be inside conclude_absent()";
+    EXPECT_EQ(call_args(f->code, "make_absent_detail_code").size(), 1u);
+}
+
+TEST(OperatorResolutionGuard, TheClaimBitsAreNamedOnlyByTheFrameHeaderAndTheDecisionHeader) {
+    for (const char* bit : {"kAbsentRequiredBits", "kFenceSatisfied", "kPointQueryUnknownOrder", "kAllOrdersAbsent",
+                            "kOpenOrdersAbsent", "kOperatorConfirmed", "kLockHeld", "kWaitedSecondsShift", "kToolVersionShift"}) {
+        const std::vector<std::string> files = files_naming(bit);
+        for (const std::string& file : files) {
+            EXPECT_TRUE(file == kFrame || file == kEvidence)
+                << file << " names " << bit << ": a detail_code is built by conclude_absent() and read by "
+                           "is_valid_absent_detail_code(), nowhere else";
+        }
+        EXPECT_FALSE(files.empty()) << bit << " is not named anywhere any more";
+    }
 }

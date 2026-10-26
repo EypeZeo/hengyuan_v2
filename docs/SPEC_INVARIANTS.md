@@ -399,8 +399,46 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       `encode_order_event_frame()` 全库只有一个生产调用且以 `write_version_` 为版本；`kFrameFormatVersionV6` 只出现在编解码与
       sink，控制面仍是 `kFrameFormatVersion`。`validate_transition()` 对 `EscalatedToOperator` 出发的每条边仍是 `AlreadyTerminal`
       （`test_order_lifecycle.cpp`）。导出器（`durable_audit_export.hpp`）同读 v5/v6、同样拒绝版本回退，清单报告日志里最高的版本。
-    - **仍未覆盖**：写事件 22 的一方（切片 R3 的离线工具）；证据原语（R2）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的
-      前置）；NotSent 的状态与事件（`docs/NOTSENT_CLOSURE_DESIGN.md` S2/S3，会在同一个 v6 里再追加）；迁移（没有真实日志之前不需要）。
+    - **仍未覆盖**：写事件 22 的一方（切片 R3 的离线工具）；证据原语（R2，已落地，见下一条）；迟到成交告警（R4）；环境与账户绑定
+      （R5，生产启用的前置）；NotSent 的状态与事件（`docs/NOTSENT_CLOSURE_DESIGN.md` S2/S3，会在同一个 v6 里再追加）；迁移（没有真实
+      日志之前不需要）。
+
+  - **[D5 切片 R2 已落地：证据原语——栅栏算术、查询结果分类、`allOrders` 窗口、结论函数]**（`docs/OPERATOR_RESOLUTION_DESIGN.md` §5、
+    §6、§10；Owner 2026-10-25 “开始”；Tier B）：离线工具（切片 R3）判断“交易所没有这个订单，也永远不会有”所需的全部**决策**，做成只吃
+    普通值的纯函数，每一条拒绝都能用表格用例钉住；**没有任何生产代码调用它们**（工具是 R3），对账路径不变——`query_order()` 仍把一切
+    不是正向匹配的答案折叠成 `Inconclusive`。
+    - **两个头文件**：`operator_resolution_evidence.hpp` 是决策（不分配、不解析 JSON、不抛异常，`#include` 清单固定）；
+      `operator_resolution_response.hpp` 是全库唯一解析交易所 JSON 的地方（simdjson 的 DOM，整份文档校验，会分配，只给离线工具）。
+      两者都不被任何生产头文件包含（响应头包含决策头除外）。
+    - **时间与栅栏**（设计 §5.2、O4）：`ExchangeMs` 是交易所时间的强类型；落在 `kMinPlausibleExchangeMs` 至 `kMaxPlausibleExchangeMs`
+      （2020-01-01 至 2100-01-01）之外的读数是垃圾，永远满足不了栅栏——解析失败而默认成 0 的 serverTime 若被当作锁基准，“读 − 锁”会大到
+      凭空通过。`FenceParams` 的默认值同时是下限：`recv_window_ms` = `clock_skew_ms` = 60 s、`margin_ms` = 30 s、`read_lag_ms` = 120 s，
+      只许调大（上限 1 小时），合计 `kDefaultEvidenceWaitMs` = 4.5 分钟。证据读最早在“锁基准 + W + B + 余量 + L”，`FenceVerdict`
+      的边界精确到毫秒；读在锁之前、时间不合理、参数越界各有各的判定；全部运算 checked，不回绕。
+    - **点查分类**（`classify_point_query()`）：只有“HTTP 400 且错误体 `code` 恰为 -2013”是 `PointQueryVerdict::NoSuchOrder`——状态是
+      声明的一部分（真实表现由 R6 的 Testnet 演练测量）。`-2026` 是**另一个码**（`Archived`），意思是订单存在过；带 orderId 的成功响应
+      是 `OrderExists`；其它整数错误码是 `OtherError`；其余（非 JSON、截断、重复键、类型不对、尾部垃圾、BOM、坏 UTF-8、超过
+      `kMaxEvidenceBodyBytes`、状态不对）一律 `Unusable`。每个证据枚举的零值都是“没有证据”（`Unusable`、`Malformed`、
+      `NotEvaluated`、`Unset`），没填的判定永远不算数。
+    - **列表分类**（`scan_orders_array()`、`classify_all_orders_page()`、`classify_open_orders_page()`）：每个元素必须是带唯一字符串
+      clientOrderId 的对象，否则整页不可用；订单号按 JSON 反转义后的整串相等匹配，不看前缀；`allOrders` 还要求每个元素的 symbol 等于
+      请求的品种（错品种的页什么也证明不了）；满 `kAllOrdersPageLimit`（1000）条的页是 `PossiblyTruncated`——官方文档没有任何截断
+      标记，只能靠条数；只有 HTTP 200 算数。
+    - **`allOrders` 窗口**（`plan_all_orders_windows()`）：每页不超过 `kAllOrdersMaxSpanMs`（24 小时少 1 秒）、至多 `kAllOrdersMaxPages`
+      （14）页，首尾相接（下一页起点 = 上一页终点，无论交易所把终点算开区间还是闭区间都不留缝）；要多于 14 页就拒绝，交给操作员。
+      区间（`all_orders_range()`）从**较早的**锚点往前 2W 起，到证据读基准止；锚点是发送开始那一帧的服务器校正时间，以及客户端订单号里的
+      时间戳（`client_order_id_timestamp()` 按 `make_client_order_id()` 的语法严格解析）。设计写的是“优先帧时间，否则订单号”，取最小值
+      只会更早：更多页，绝不留缝。
+    - **结论**（`conclude_absent()`）：只有持有锁、栅栏与读延迟已过、点查说无此单、`allOrders` 的每一页都 `Clear`（页数与由同样输入
+      重新算出的计划一一对应，工具递不进一个更短的区间）、`openOrders` 也 `Clear`、操作员已确认，才给出 `AbsentConclusionStatus::Absent`
+      和帧的 `detail_code`；第一个不满足的条件按协议顺序报告。造 `detail_code` 的 `make_absent_detail_code()` 只被它调用。
+    - **守卫**（`test_operator_resolution_guard.cpp`，读源码）：两个证据头文件不被任何生产文件包含（响应头包含决策头除外）；决策头的
+      `#include` 清单固定、不出现任何分配 / 抛异常 / 容器 / JSON 的名字；`make_absent_detail_code()` 只在 `conclude_absent()` 里被调用；
+      六个声明位只出现在帧头与决策头。
+    - **仍未覆盖**：发请求、读 `serverTime`、取锁、确认输入、写帧的工具（切片 R3）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的
+      前置）；`-2013` 的状态码与读延迟 L 的真实表现（R6，Testnet 演练）；发送开始那一帧的服务器校正时间怎样从日志里取出来——检查点里的
+      `unknown_since_utc_ms` 对 `Ambiguous` 订单是 Ambiguous 那一帧的时间，不是发送开始的时间，R3 要么自己扫日志，要么加一个只在内存里的
+      字段（订单号里的时间戳在此之前兜底，且因为取最小值，不会因此出错）。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
