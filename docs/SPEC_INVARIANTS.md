@@ -440,6 +440,40 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       `unknown_since_utc_ms` 对 `Ambiguous` 订单是 Ambiguous 那一帧的时间，不是发送开始的时间，R3 要么自己扫日志，要么加一个只在内存里的
       字段（订单号里的时间戳在此之前兜底，且因为取最小值，不会因此出错）。
 
+  - **[D5 切片 R3-0 已落地：工具的持久层数据源——检查点的两个事实、共享规则、写者 `append_operator_resolution()`、品种名折叠]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-26 “开始，按这个切法做R3-0”；Tier B；PR 待合并）：离线工具（切片 R3a / R3b）要问交易所
+    “这个订单存在吗”，持久层得先给出三样东西——订单的模式与发送开始时间、写闭合帧的唯一入口、`symbol_id` 对应的交易所品种名。本片只补这三样：
+    **没有任何生产代码调用写者**（工具是 R3a），没有改任何帧格式，没有改控制面日志的格式或追加路径。
+    - **检查点的两个事实**（`OrderRecoveryCheckpoint`，`durable_control_plane.hpp`；只在内存里，是恢复扫描本来就持有、之前被丢掉的数据）：
+      `mode`（Intent 帧的模式；默认 `DryRun` = 被拒绝，没填的检查点永远不会被结清）与 `send_started_utc_ms`（第一个让订单进入 `Submitting` 的帧的服务器校正时间，
+      0 = 没有可信的时间；之后重复的 `Submitting` 帧、没有时间的首帧之后补上时间的重复帧、`Ambiguous` 帧都不会移动它）。`unknown_since_utc_ms` 不变——
+      对 `Ambiguous` 订单它仍是 Ambiguous 帧的时间，所以发送开始时间要单独存（这是 R2 “仍未覆盖”里留给 R3 的那个缺口）。
+    - **共享规则**（`operator_resolution_rules.hpp`，L1 纯逻辑）：`check_resolution()` 是 R1 写进恢复扫描的设计 §7.2 规则 1 至 3 与 6，原样搬出：
+      读者（`DurableAuditSink::accepts_operator_resolution()`）与写者的预检是**同一个函数**，所以写者放行的帧下次启动一定接受，不会把整本日志变成 `Corrupt`。
+      返回 `ResolutionCheck`——第一条被打破的规则；零值 `NotChecked` 不是通过。
+    - **写者**（`DurableAuditSink::append_operator_resolution()`）：`OrderOperatorResolved` 进入日志的唯一方法，也是一个存储得到第一个 v6 帧的唯一方法。
+      只在 `AuditSinkOpenMode::OperatorOpen` 的接收器上有用；只收事件 22；只收 `recovered_checkpoints()` 里的订单（最终态订单、Intent 孤儿、不认识的订单号、
+      `OperatorOpen` 扫描里超出检查点容量的订单都不在里面）；只收 `Live` 订单（`DryRun` 订单没到过交易所——这一条只有写者拒绝，读者不需要）；一个会话里每个订单
+      一次；再用 `check_resolution()` 对着检查点核对；存储里已结清的订单数（恢复读到的加上本会话已确认的）达到 `kMaxOperatorResolved` 时再拒绝一个
+      （`ResolvedTableFull`）——读者的另一条规则是交易进程打不开结清表超限的存储，写者不能把存储推到那一步，而且一旦到了就没有回头路。**每一条拒绝都发生在碰日志之前**：不写字节、不围栏、写版本不动、`recovered_checkpoints()` 不被编辑——
+      只有追加本身能围栏（与 `append_durable()` 一样）。成功 = 帧已持久且确认：`write_format_version()` 变成 6（存储的尖端现在是 v6，版本不回退规则要求之后
+      的一切都是 v6），该订单在 `operator_resolved_this_session()` 里标记为已结清。结果 `OperatorResolutionAppend{status, check, append}`：
+      `OperatorAppendStatus` 的零值是 `NotAttempted`，`AuditAppendResult` 默认是 `Failed`——没填的结果不是成功。
+    - **版本的写入点**：`write_version_` 全库只赋值两次——恢复扫描一次，操作员帧被确认之后一次。`append_durable()` 与写者共用 `append_impl(rec, now_ms, version)`；
+      `encode_order_event_frame()` 仍只有一个生产调用点，版本参数就是 `version`。
+    - **品种名**（`ControlPlaneLogSink::recovered_symbol_name()`、`recovered_snapshot_count()`）：审计日志只记 `symbol_id`，交易所品种名只存在于控制面日志持久化的
+      符号注册表快照里，按**位置**给出（`SymbolRegistry::refresh_from_exchange_info()`：第 i 个就是 `symbol_id == i`）。恢复扫描把每个快照折叠进每个 id 的名字表：
+      名字必须是 `[A-Z0-9]{1,19}` 且在 20 字节字段内以 NUL 结尾（解码器逐字节拷贝，什么都不检查）；**每个**提到这个 id 的快照都给同一个名字才是 `Known`；两个快照不一致、
+      或有一个名字不是品种，就是 `Conflict`，而且是永久的——之后某个快照改回原名也不恢复。没有快照提到的 id、`kMaxSymbols` 及之后的 id、以及恢复没有得到
+      `Clean` / `Recovered` 的日志（哪怕坏帧之前的快照已经折叠过）一律 `Unknown`；撕裂的尾部不被折叠。较短的快照对它没列出的 id 什么也不说（那些订单是在更早的快照下
+      下的，那个快照命名了它们）。只读；20 个出参的 `recover_control_plane()` 没动。
+    - **守卫**（`test_operator_resolution_guard.cpp`，读源码）：`validate_operator_resolution()` 只在 `check_resolution()` 里被调用；`check_resolution()` 全库只有读者与写者
+      两个调用（各在自己的函数体里一次）；`append_operator_resolution()` 没有生产调用方；`write_version_` 恰好两次赋值（一次在恢复扫描，一次在写者里、在 `acked()` 之后）；
+      `encode_order_event_frame()` 的唯一生产调用以 `version` 为版本；`append_impl()` 两个调用，一个传 `write_version_`、一个传 `kFrameFormatVersionV6`。
+    - **仍未覆盖**：工具本身——请求、确认输入、证据附件、取锁、真实传输（切片 R3a / R3b）；迟到成交告警（R4）；环境与账户绑定（R5）；**审计日志与控制面日志之间没有绑定**
+      （与蓝图 L-48 同类）：换掉控制面日志文件，旧订单的 `symbol_id` 可能被新快照命名成另一个品种而仍是 `Known`——所以 R3a 的确认短语必须把品种名亮给操作员；
+      `OperatorOpen` 扫描里超出 `kMaxInFlight` 的未决订单本次会话不可结清（`recovery_overflow().checkpoints` 给出数量；先结清列出的，数量降到容量以内后交易进程才能再打开）。
+
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/

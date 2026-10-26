@@ -147,6 +147,9 @@ SEARCH_FILES = [
     # the exchange's answers -- two more load-bearing sets of symbols that no spec names.
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_evidence.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_response.hpp",
+    # D5 slice R3-0 (docs/SPEC_INVARIANTS.md "D5 切片 R3-0"): the shared resolution rule the recovery reader and the operator
+    # writer both apply -- one more load-bearing symbol set that no spec names.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_rules.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
