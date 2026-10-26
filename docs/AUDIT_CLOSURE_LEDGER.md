@@ -25,7 +25,7 @@ python tools/closure_ledger_check.py --self-test
 - FI-055/056：最终门验证本次 handle/代次的唯一所有权；R-18/R-22 已确定统一 NotSent 持久闭合设计，仍需规格/版本迁移/模型/实现验收；延迟注入须覆盖完整日志、anchor 与目录同步链，不仅两次逻辑追加。
 - FI-046/047/048/049/054 及相关回归的细分故障与预算条件见蓝图 F.9。自动围栏和有限自动恢复、R2/180 天保留均未实现；不提高 ImplPathStatus，也不豁免首笔实盘之前的恢复、监控和 Owner 授权。
 - 2026-10-25（Q23 切片 1）：FI-055/056 里 NotSent 的语义已冻结于 `docs/NOTSENT_CLOSURE_DESIGN.md`，协议有模型 `formal/notsent_closure.tla`（模型层：设计配置无反例，8 个开关各有必败配置）。两条用例的状态、门禁结论与证据不变：模型不证明实现，实现、迁移与负控仍未做。
-- 2026-10-25（D5）：被困订单的出口（L-46）有了设计与模型（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`），与 FI-002、FI-003、FI-009、FI-011、FI-043 的状态与证据无关，一律不变；实现 R1（恢复读者）已于 2026-10-25 合入（PR #203，`a4372ba`），不改变上述任何一项的状态与证据，R2 至 R6 未开始。
+- 2026-10-25（D5）：被困订单的出口（L-46）有了设计与模型（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`），与 FI-002、FI-003、FI-009、FI-011、FI-043 的状态与证据无关，一律不变；实现 R1（恢复读者）已于 2026-10-25 合入（PR #203，`a4372ba`），R2（证据原语）已于 2026-10-26 合入（PR #205，`99d8cb4`），都不改变上述任何一项的状态与证据，R3 至 R6 未开始。
 
 本次只同步合同说明；本表与蓝图状态一致性仍由下列核对工具验证，不能用文档合并关闭未执行的故障用例。
 
