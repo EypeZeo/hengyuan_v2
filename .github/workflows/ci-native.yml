@@ -69,9 +69,11 @@ jobs:
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
     # Safety cap: a hung job shouldn't silently burn the private-repo 2000
-    # min/month Actions budget. A clean run is a few minutes; 20 is generous
-    # headroom, not a target.
-    timeout-minutes: 20
+    # min/month Actions budget. A clean run is ~10-12 minutes (apt 0.5 + build 7-8 + test 3); 30 is
+    # headroom, not a target. 20 was not enough: on 2026-10-26/27 the runner's apt step took 9-12 minutes
+    # and the two master pushes (99d8cb4, f7b964c) were cancelled at the cap mid-test, which turned
+    # `native: gate` red although nothing was wrong with the code (owner approved the raise, 2026-10-27).
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
