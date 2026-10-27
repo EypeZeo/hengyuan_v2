@@ -583,16 +583,15 @@ public:
             out.status = OperatorAppendStatus::DryRunOrder;
             return out;
         }
-        out.check = operator_resolution::check_resolution(target_of(checkpoints_[index]), rec);
+        out.check = operator_resolution::check_resolution(operator_resolution::target_of(checkpoints_[index]), rec);
         if (out.check != operator_resolution::ResolutionCheck::Ok) {
             out.status = OperatorAppendStatus::Refused;
             return out;
         }
         // The reader's other rule about this frame: a trading start refuses a store with more than kMaxOperatorResolved
         // resolved orders (the table behind recovered_operator_resolved() must be complete). A frame that would be the
-        // 1025th would make the store unopenable for trading with no way back, so it is refused here. (A scan that
-        // overflowed the table has operator_resolved_count_ saturated at the capacity, so that case is covered too.)
-        if (operator_resolved_count_ + session_resolved_count_ >= kMaxOperatorResolved) {
+        // 1025th would make the store unopenable for trading with no way back, so it is refused here.
+        if (!operator_resolved_table_has_room()) {
             out.status = OperatorAppendStatus::ResolvedTableFull;
             return out;
         }
@@ -606,6 +605,13 @@ public:
         ++session_resolved_count_;
         out.status = OperatorAppendStatus::Appended;
         return out;
+    }
+
+    // Is there room for one more operator-resolved order in the table a trading start needs to be complete? (A scan that
+    // overflowed the table has operator_resolved_count_ saturated at the capacity, so that case answers false too.) The
+    // writer asks it before every append, and the operator tool asks it before it spends four and a half minutes on an order.
+    bool operator_resolved_table_has_room() const noexcept {
+        return operator_resolved_count_ + session_resolved_count_ < kMaxOperatorResolved;
     }
 
     // Has append_operator_resolution() closed recovered_checkpoints()[index] in this session? (false for an index out of range.
@@ -882,9 +888,10 @@ private:
     };
 
     // D5 / R1 + R3-0 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.2): the order a resolution frame is held against, taken from
-    // the replay state of the scan or from the checkpoint recovery handed out. The rules themselves live in
-    // operator_resolution_rules.hpp because the WRITER (append_operator_resolution()) applies exactly the same ones:
-    // what it lets through, the reader accepts.
+    // the replay state of the scan. The rules themselves live in operator_resolution_rules.hpp because the WRITER
+    // (append_operator_resolution()) applies exactly the same ones: what it lets through, the reader accepts. (The same
+    // order as recovery hands it out -- a checkpoint -- is operator_resolution::target_of(), which the writer and the
+    // operator tool use.)
     static operator_resolution::ResolutionTarget target_of(const ReplayState& rs) noexcept {
         operator_resolution::ResolutionTarget t{};
         t.state = rs.state;
@@ -895,20 +902,6 @@ private:
         t.mode = rs.mode;
         t.price_ticks = rs.intended_price_ticks;
         t.qty_ticks = rs.intended_qty_ticks;
-        return t;
-    }
-    // (A checkpoint's state is the one recovery hands out: Ambiguous for an order whose last frame was Submitting. Both
-    // take the same edge to Rejected, so for this check the two are the same.)
-    static operator_resolution::ResolutionTarget target_of(const OrderRecoveryCheckpoint& cp) noexcept {
-        operator_resolution::ResolutionTarget t{};
-        t.state = cp.resulting_state;
-        t.exchange_order_id = cp.exchange_order_id;
-        t.filled_qty_ticks = cp.filled_qty_ticks;
-        t.symbol_id = cp.symbol_id;
-        t.side = cp.side;
-        t.mode = cp.mode;
-        t.price_ticks = cp.intended_price_ticks;
-        t.qty_ticks = cp.intended_qty_ticks;
         return t;
     }
 

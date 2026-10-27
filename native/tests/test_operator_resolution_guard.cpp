@@ -2,16 +2,17 @@
 // test_operator_resolution_guard.cpp -- D5 slice R1 guard (docs/OPERATOR_RESOLUTION_DESIGN.md 9, "R-guard").
 //
 // R1 teaches the recovery reader to accept ONE new kind of frame, OrderOperatorResolved, written by an offline operator
-// tool that does not exist yet (slice R3). What keeps that acceptance safe is not the reader alone but the absence of
-// anything else that could produce such a frame, or open a store the way the tool will. Behaviour cannot see an
-// absence, so this test reads the sources:
+// tool (slices R3-0, R3a and R3b). What keeps that acceptance safe is not the reader alone but the absence of anything
+// else that could produce such a frame, or open a store the way the tool does. Behaviour cannot see an absence, so this
+// test reads the sources:
 //
 //   1. AuditEventType::OrderOperatorResolved is NAMED only where it is defined, where the codec decides which
-//      version may carry it, and where the reader recognises it. A fourth file naming it is a producer (or a new
-//      reader) somebody has to look at. Each pin carries the exact number of mentions.
-//   2. OperatorOpen -- the sink mode that tolerates the capacity bounds -- is named by no source but the sink
-//      header. The trading process must never open a store that way; the day the tool exists, its translation unit
-//      is added here with the reason.
+//      version may carry it, where the reader recognises it, and (R3a) in the tool's flow, which builds the one frame
+//      it may write. A further file naming it is a producer (or a new reader) somebody has to look at. Each pin carries
+//      the exact number of mentions.
+//   2. OperatorOpen -- the sink mode that tolerates the capacity bounds -- is named by no source but the sink header
+//      and (R3a) the tool's flow, which refuses any other mode. The trading process must never open a store that way;
+//      the day the command line exists (R3b), its translation unit is added here with the reason.
 //   3. validate_operator_resolution() is called by the reader and nothing else. (That validate_transition() still
 //      refuses every edge out of EscalatedToOperator is a behaviour, pinned in test_order_lifecycle.cpp.)
 //   4. The sink's write version is assigned exactly once, by its recovery scan, and the only production call of
@@ -230,6 +231,10 @@ constexpr const char* kFrame = "include/hengyuan/operator_resolution_frame.hpp";
 constexpr const char* kRules = "include/hengyuan/operator_resolution_rules.hpp";
 constexpr const char* kEvidence = "include/hengyuan/operator_resolution_evidence.hpp";
 constexpr const char* kResponse = "include/hengyuan/operator_resolution_response.hpp";
+constexpr const char* kConfirmation = "include/hengyuan/operator_resolution_confirmation.hpp";
+constexpr const char* kPorts = "include/hengyuan/operator_resolution_ports.hpp";
+constexpr const char* kBundle = "include/hengyuan/operator_resolution_bundle.hpp";
+constexpr const char* kFlow = "include/hengyuan/operator_resolution_flow.hpp";
 
 const SourceFile* find_source(std::string_view rel) {
     for (const SourceFile& f : production_sources()) {
@@ -364,18 +369,23 @@ TEST(OperatorResolutionGuard, TheOperatorEventIsNamedOnlyByItsDefinitionTheCodec
                          {{kTrail, 2, "the enumerator and its name in audit_event_name()"},
                           {kCodec, 1, "is_legal_audit_event_type_for_version(): the one version that may carry it"},
                           {kSink, 2, "the recovery scan recognising the frame, and append_operator_resolution() recognising "
-                                     "the one record it may write (R3-0) -- neither constructs one"}});
+                                     "the one record it may write (R3-0) -- neither constructs one"},
+                          {kFlow, 1, "the one frame the tool builds, from a checkpoint and a conclusion (R3a)"}});
 }
 
-TEST(OperatorResolutionGuard, OperatorOpenIsNamedByNothingButTheSinkHeader) {
+TEST(OperatorResolutionGuard, OperatorOpenIsNamedByTheSinkHeaderAndTheToolsFlowAlone) {
     // The trading process must never open a store in the mode that tolerates the capacity bounds. Count only the
-    // fact of naming here: the header uses it in several places (the enum, the constructor, the three bounds).
+    // fact of naming here: the sink header uses it in several places (the enum, the constructor, the three bounds); the
+    // tool's flow (R3a) names it to REFUSE any sink that was not opened that way -- it opens nothing itself.
     std::vector<std::string> elsewhere;
     std::size_t in_sink = 0;
+    std::size_t in_flow = 0;
     for (const SourceFile& f : production_sources()) {
         const std::size_t n = count_identifier(f.code, "OperatorOpen");
         if (f.rel == kSink) {
             in_sink = n;
+        } else if (f.rel == kFlow) {
+            in_flow = n;
         } else if (n != 0) {
             elsewhere.push_back(f.rel);
         }
@@ -385,6 +395,12 @@ TEST(OperatorResolutionGuard, OperatorOpenIsNamedByNothingButTheSinkHeader) {
                               "guard (with its file) in the slice that introduces it";
     }
     EXPECT_GT(in_sink, 3u) << "the sink header defines the mode and applies it to the three bounds";
+    EXPECT_EQ(in_flow, 2u) << "the flow refuses a sink in any other mode, when a session begins and when an order is resolved";
+    // ...and it only compares: the flow builds no sink
+    const SourceFile* flow = find_source(kFlow);
+    ASSERT_NE(flow, nullptr);
+    EXPECT_EQ(call_args(flow->code, "DurableAuditSink").size(), 0u);
+    EXPECT_EQ(count_identifier(flow->code, "make_unique"), 0u);
 }
 
 TEST(OperatorResolutionGuard, TheOperatorEdgeFunctionIsCalledByTheSharedResolutionRuleAndNothingElse) {
@@ -405,10 +421,19 @@ TEST(OperatorResolutionGuard, TheSharedResolutionRuleIsAppliedByTheReaderAndTheW
     EXPECT_EQ(count_identifier(function_body(sink->code, "append_operator_resolution"), "check_resolution"), 1u);
 }
 
-TEST(OperatorResolutionGuard, TheOperatorAppendHasNoProductionCaller) {
-    // R3-0 builds the writer; the offline tool that calls it is slice R3a. Until then nothing may: the day the tool exists,
-    // its translation unit is added here with the reason (and the guard on OperatorOpen above gets the same entry).
-    expect_named_only_in("append_operator_resolution", {{kSink, 1, "the definition"}});
+TEST(OperatorResolutionGuard, TheOperatorAppendIsCalledByTheToolsFlowAlone) {
+    // R3-0 built the writer; R3a is the offline tool that calls it, once, at the end of resolve_order(). Nothing else may.
+    expect_named_only_in("append_operator_resolution", {{kSink, 1, "the definition"}, {kFlow, 1, "the one call"}});
+    const SourceFile* flow = find_source(kFlow);
+    ASSERT_NE(flow, nullptr);
+    const std::vector<std::vector<std::string>> calls = call_args(flow->code, "append_operator_resolution");
+    ASSERT_EQ(calls.size(), 1u);
+    ASSERT_EQ(calls[0].size(), 2u);
+    EXPECT_EQ(calls[0][0], "rec");
+    EXPECT_EQ(calls[0][1], "append_ref->count()") << "stamped with the exchange time read just before, not a local clock";
+    const std::string body = function_body(flow->code, "resolve_order");
+    ASSERT_FALSE(body.empty());
+    EXPECT_EQ(count_identifier(body, "append_operator_resolution"), 1u);
 }
 
 TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedByTheRecoveryScanAndByTheAckedOperatorFrameOnly) {
@@ -525,10 +550,15 @@ TEST(OperatorResolutionGuard, TheFunctionBodyHelperHasKnownAnswers) {
               (std::vector<std::string>{"#include <a>", "#include <b/c.hpp>"}));
 }
 
-TEST(OperatorResolutionGuard, TheEvidenceHeadersAreIncludedByNoProductionFileButEachOther) {
+TEST(OperatorResolutionGuard, TheEvidenceHeadersAreIncludedByTheOfflineToolsHeadersAlone) {
+    // R2 pinned "nothing includes them but each other"; R3a's tool headers are the offline tool, so they may -- and they are
+    // the only ones.
     expect_named_only_in("operator_resolution_evidence",
-                         {{kResponse, 1, "the parser produces the verdicts the decision header consumes"}});
-    expect_named_only_in("operator_resolution_response", {});
+                         {{kResponse, 1, "the parser produces the verdicts the decision header consumes"},
+                          {kPorts, 1, "ExchangeMs, the type of every exchange time the ports speak"},
+                          {kBundle, 1, "the verdicts, the fence parameters and the times the evidence file records"},
+                          {kFlow, 1, "the fence, the windows and the conclusion"}});
+    expect_named_only_in("operator_resolution_response", {{kFlow, 1, "the classifiers of the exchange's answers"}});
     ASSERT_NE(find_source(kEvidence), nullptr);
     ASSERT_NE(find_source(kResponse), nullptr);
 }
@@ -574,5 +604,96 @@ TEST(OperatorResolutionGuard, TheClaimBitsAreNamedOnlyByTheFrameHeaderAndTheDeci
                            "is_valid_absent_detail_code(), nowhere else";
         }
         EXPECT_FALSE(files.empty()) << bit << " is not named anywhere any more";
+    }
+}
+
+// --- D5 slice R3a: the offline tool's procedure -------------------------------------------------------------------------------
+//
+//   9. The tool's headers belong to the tool. Nothing in the trading process includes the flow, the ports or the bundle, and
+//      the confirmation header (which holds the grammar the typed phrase is made of) is included only by the tool's headers.
+//  10. The shared rule is asked in the right order: the flow asks about the ORDER (check_order_resolvable) before it waits and
+//      before it queries; only the writer and the reader ask about a FRAME (check_resolution / check_frame).
+//  11. The one frame the tool writes is built from the checkpoint and the conclusion: its machine field is assigned once, from
+//      conclude_absent()'s result, and conclude_absent() is asked exactly twice (without the operator's word, then with it).
+//  12. The confirmation header is the allocation-free part of the tool: its includes are an exact list.
+
+TEST(OperatorResolutionGuard, TheToolsHeadersAreIncludedByTheToolAlone) {
+    expect_named_only_in("operator_resolution_flow", {});
+    expect_named_only_in("operator_resolution_ports", {{kFlow, 1, "the flow reaches the world through the ports"}});
+    expect_named_only_in("operator_resolution_bundle", {{kFlow, 1, "the flow builds the evidence file"}});
+    expect_named_only_in("operator_resolution_confirmation",
+                         {{kPorts, 1, "OperatorLineResult, what the console port returns"},
+                          {kBundle, 1, "environment_name() and the digest grammar"},
+                          {kFlow, 1, "the phrase and its judge"}});
+    for (const char* f : {kFlow, kPorts, kBundle, kConfirmation}) ASSERT_NE(find_source(f), nullptr) << f;
+}
+
+TEST(OperatorResolutionGuard, TheFlowAsksAboutTheOrderAndOnlyTheWriterAndTheReaderAskAboutTheFrame) {
+    expect_named_only_in("check_order_resolvable", {{kRules, 2, "the definition and its one call inside check_resolution()"},
+                                                    {kFlow, 2, "resolve_order() before it waits, and list_unresolved_orders()"}});
+    expect_named_only_in("check_frame", {{kRules, 2, "the definition and its one call inside check_resolution()"}});
+    const SourceFile* flow = find_source(kFlow);
+    ASSERT_NE(flow, nullptr);
+    const std::string body = function_body(flow->code, "resolve_order");
+    ASSERT_FALSE(body.empty());
+    // the order is judged before the first exchange request of any kind, and before the first sleep
+    const std::size_t asked = body.find("check_order_resolvable");
+    const std::size_t first_read = body.find("exchange.");
+    const std::size_t first_sleep = body.find("sleep_for");
+    ASSERT_NE(asked, std::string::npos);
+    ASSERT_NE(first_read, std::string::npos);
+    ASSERT_NE(first_sleep, std::string::npos);
+    EXPECT_LT(asked, first_read);
+    EXPECT_LT(asked, first_sleep);
+}
+
+TEST(OperatorResolutionGuard, TheFrameTheToolWritesIsMadeOfTheCheckpointAndTheConclusionAlone) {
+    const SourceFile* flow = find_source(kFlow);
+    ASSERT_NE(flow, nullptr);
+    const std::string body = function_body(flow->code, "resolve_order");
+    ASSERT_FALSE(body.empty());
+    const std::string squeezed = squeeze(body);
+    EXPECT_EQ(count_identifier(body, "conclude_absent"), 2u) << "once without the operator's word (to know whether to ask), once with";
+    EXPECT_EQ(count_assignments(body, "rec.detail_code"), 1u);
+    EXPECT_NE(squeezed.find("rec.detail_code = fin.detail_code;"), std::string::npos)
+        << "the machine field is the conclusion's, never built by the flow";
+    // the identity of the frame is the checkpoint's, field by field
+    for (const char* assignment : {"rec.mode = cp.mode;", "rec.symbol_id = cp.symbol_id;", "rec.price_ticks = cp.intended_price_ticks;",
+                                   "rec.qty_ticks = cp.intended_qty_ticks;", "rec.side = cp.side;"}) {
+        EXPECT_NE(squeezed.find(assignment), std::string::npos) << assignment;
+    }
+    // the operator's word reaches the conclusion only after the judge said Confirmed
+    EXPECT_EQ(count_assignments(body, "in.operator_confirmed"), 2u) << "false before the prompt, true after the judge";
+    const std::size_t judged = body.find("ConfirmationVerdict::Confirmed");
+    const std::size_t set_true = body.find("in.operator_confirmed = true");
+    ASSERT_NE(judged, std::string::npos);
+    ASSERT_NE(set_true, std::string::npos);
+    EXPECT_LT(judged, set_true);
+    // nothing in the flow builds a machine field of its own
+    EXPECT_EQ(count_identifier(flow->code, "make_absent_detail_code"), 0u);
+    EXPECT_EQ(count_identifier(flow->code, "kAbsentRequiredBits"), 0u);
+}
+
+TEST(OperatorResolutionGuard, TheConfirmationHeaderAllocatesNothing) {
+    const SourceFile* f = find_source(kConfirmation);
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(include_lines(f->code),
+              (std::vector<std::string>{"#include <array>", "#include <chrono>", "#include <cstddef>", "#include <cstdint>",
+                                        "#include <string_view>", "#include <hengyuan/account_truth.hpp>",
+                                        "#include <hengyuan/operator_confirmation_gate.hpp>",
+                                        "#include <hengyuan/operator_input_reader.hpp>", "#include <hengyuan/order_lifecycle.hpp>"}))
+        << "an include added here must be argued for: this header is the part of the tool that allocates nothing";
+    // `= delete;` declares a function away (OperatorLineReader's copy operations); it is not the expression that frees memory.
+    const std::string squeezed = squeeze(f->code);
+    std::size_t deleted_functions = 0;
+    for (std::size_t at = squeezed.find("= delete;"); at != std::string::npos; at = squeezed.find("= delete;", at + 1)) {
+        ++deleted_functions;
+    }
+    EXPECT_EQ(deleted_functions, 2u);
+    for (const char* word : {"vector", "string", "unique_ptr", "shared_ptr", "make_unique", "make_shared", "new", "delete", "malloc",
+                             "calloc", "realloc", "free", "map", "unordered_map", "set", "list", "deque", "function", "ostream",
+                             "istream", "iostream", "fstream", "sstream", "printf", "snprintf", "throw", "try", "catch", "exception"}) {
+        const std::size_t allowed = std::string_view(word) == "delete" ? deleted_functions : 0u;
+        EXPECT_EQ(count_identifier(f->code, word), allowed) << word;
     }
 }

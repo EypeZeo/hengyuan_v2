@@ -685,6 +685,28 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_symbol_name_fold)
     gtest_discover_tests(test_symbol_name_fold)
 
+    # D5 slice R3a (docs/OPERATOR_RESOLUTION_DESIGN.md 6): the offline operator tool's procedure, without its transport.
+    # The phrase the operator types, the bounded line reader and the judge; no allocation, no I/O of its own.
+    add_executable(test_operator_resolution_confirmation tests/test_operator_resolution_confirmation.cpp)
+    target_link_libraries(test_operator_resolution_confirmation PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_confirmation)
+    gtest_discover_tests(test_operator_resolution_confirmation)
+
+    # D5 slice R3a: the evidence file (JSON, raw answers, SHA-256). The test parses the document with simdjson, which
+    # hengyuan_dataplane carries.
+    add_executable(test_operator_resolution_bundle tests/test_operator_resolution_bundle.cpp)
+    target_link_libraries(test_operator_resolution_bundle PRIVATE hengyuan_dataplane GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_bundle)
+    gtest_discover_tests(test_operator_resolution_bundle)
+
+    # D5 slice R3a: the whole procedure against real audit and control-plane logs in temporary files, a loopback fake
+    # exchange that holds orders and lags like the real one, a fake clock, a scripted console and an evidence store.
+    # (The flow includes the response parser, so it links simdjson through hengyuan_dataplane.)
+    add_executable(test_operator_resolution_flow tests/test_operator_resolution_flow.cpp)
+    target_link_libraries(test_operator_resolution_flow PRIVATE hengyuan_dataplane GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_flow)
+    gtest_discover_tests(test_operator_resolution_flow)
+
     # Phase 5 (docs/SPEC_INVARIANTS.md): export-worker best-effort telemetry
     # consumer for ExportOutboxRing (L2, real file I/O for LastRemoteAckedTip
     # persistence; ExternalAnchorClient stays mock-only via FakeExternalAnchorClient,
