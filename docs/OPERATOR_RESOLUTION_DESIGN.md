@@ -1,6 +1,6 @@
 # 操作员解决（Operator Resolution）：被困订单的回头路（D5）
 
-状态：**设计，语义已冻结；切片 R1（恢复读者）已合入（PR #203，`a4372ba`，2026-10-25）；切片 R2（证据原语：栅栏算术、查询结果分类、`allOrders` 窗口、结论函数）已合入（PR #205，`99d8cb4`，2026-10-26）；两者都没有任何一方会写这个帧（写者是 R3）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 与 R2 说“开始”，对 PR #203 与 #205 说“合并”。
+状态：**设计，语义已冻结；切片 R1（恢复读者）已合入（PR #203，`a4372ba`，2026-10-25）；切片 R2（证据原语：栅栏算术、查询结果分类、`allOrders` 窗口、结论函数）已合入（PR #205，`99d8cb4`，2026-10-26）；切片 R3-0（工具的持久层数据源：检查点的模式与发送开始时间、写者 `append_operator_resolution()`、读写共用的 `check_resolution()`、控制面日志的品种名折叠）已实现，PR 待合并；生产代码里仍没有任何一方调用写者（调用方是 R3a 的工具）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 与 R2 说“开始”，对 PR #203 与 #205 说“合并”，2026-10-26 对 R3 的切法（R3-0 → R3a → R3b）说“开始，按这个切法做R3-0”。
 依据：SUBMITPORT 规格 §6.5 第 4、5 条（已被接受的 `OrderOperatorResolved`）；`docs/NOTSENT_CLOSURE_DESIGN.md` §1、A6、D5；蓝图 L-43、L-46、`5.9.4`。
 模型：`formal/operator_resolution.tla`（§8）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值（事件号、位布局的最终形式）随实现 PR 分配**，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。R1 已分配：事件号 22，`detail_code` 的位布局冻结在 `native/include/hengyuan/operator_resolution_frame.hpp`。
 
@@ -197,7 +197,9 @@
 | :-- | :-- | :-- |
 | R1 读者（已合入：PR #203，`a4372ba`，2026-10-25） | 事件类型、`validate_operator_resolution`、§7.2 的接受 / 拒绝表、`recovered_operator_resolved()`、`OperatorOpen` 打开模式、守卫；与 NotSent 的 codec 读者（`NOTSENT_CLOSURE_DESIGN.md` S2）同一次 v6 | MSVC + GCC `none`、`address`；表中每一行与每个 `Corrupt` 一个用例；`validate_transition(EscalatedToOperator, *)` 仍为 `AlreadyTerminal`；变异检查 |
 | R2 证据原语（纯逻辑；已合入：PR #205，`99d8cb4`，2026-10-26，见 `docs/SPEC_INVARIANTS.md`“D5 切片 R2”） | 栅栏计算（`constexpr`、用交易所时间）、证据位的编解码、查询结果分类（`-2013` / `-2026` / 其它错误 / 成功，**对账路径不变**）、`allOrders` 分页规划 | 表驱动用例；变异检查；`closure_ledger_check` 若新增 FI 则同步 |
-| R3 工具 | 离线 CLI；回环假交易所（含**落后于真实状态**的读、错误码、翻页）；确认输入；证据附件 | MSVC + GCC；`address`；栅栏与读延迟的负控；全部拒绝路径各一个用例 |
+| R3-0 持久层数据源（已实现，PR 待合并；见 `docs/SPEC_INVARIANTS.md`“D5 切片 R3-0”） | 工具先要有的三样东西：检查点带上 `mode` 与 `send_started_utc_ms`（R2 留下的缺口）；`DurableAuditSink::append_operator_resolution()`——`OperatorOpen` 专用、只写事件 22、用与读者同一个 `check_resolution()`（`operator_resolution_rules.hpp`）预检、成功后写版本变 6；控制面日志的 `recovered_symbol_name()`——只有每个快照都同意才 `Known` | MSVC + GCC `none`、`address`；写者与读者的差分用例（写者放行 ⇔ 读者接受）；每条拒绝都不碰日志、不围栏；变异检查 |
+| R3a 工具的流程（仅逻辑与回环） | 请求（品种、两次读之间的间隔、操作员身份）、取锁后的栅栏等待、确认短语与读行（环境名、账户 UID、**品种名**亮给操作员）、证据附件；对着注入的端口与回环假交易所（含**落后于真实状态**的读、错误码、翻页）走完整条流程；**没有真实传输**。现有的 `OperatorInputResult` 只有 7 字节、`OperatorConfirmationGate` 是下单门，都不适用，需要新写 | MSVC + GCC；`address`；栅栏与读延迟的负控；全部拒绝路径各一个用例 |
+| R3b CLI 与真实传输 | 命令行；KEK 的来源（密钥文件还是参数，Owner 待定）；`PrivateRestEndpoint` / `ResponseKind` / 许可 / 配速 / 冻结守卫的新项（`PrivateRestEndpoint` 是 spec 转录、封闭的，`SignedJson` 上限 256 KiB）；真实 HTTPS 传输 | 同上，加守卫：只有工具的翻译单元能引用写帧的代码 |
 | R4 迟到成交告警 | R-late：对 operator-resolved COID 的成交触发熔断 | 单元 + 恢复往返；变异检查 |
 | R5 环境与账户绑定 | R-env：存储记环境、解析账户 UID、工具拒绝不一致 | 生产启用的前置 |
 | R6 运行手册与 Testnet 演练 | `NATIVE_EXIT_SAFETY_RUNBOOK.md` 新增一节；**Owner** 在 Testnet 上制造一个崩溃窗口订单并用工具结清；测量 `-2013` / `-2026` 的实际表现和读延迟 L | 演练记录；参数 L 的基线 |

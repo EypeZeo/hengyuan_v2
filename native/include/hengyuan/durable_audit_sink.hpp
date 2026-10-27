@@ -50,6 +50,7 @@
 #include <hengyuan/durable_log_store.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/operator_resolution_frame.hpp>
+#include <hengyuan/operator_resolution_rules.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/position_truth.hpp>
 #include <hengyuan/secure_wipe.hpp>
@@ -340,6 +341,31 @@ struct RecoveryOverflow {
     bool any() const noexcept { return checkpoints != 0 || intent_orphans != 0 || operator_resolved != 0; }
 };
 
+// D5 / R3-0: what DurableAuditSink::append_operator_resolution() did. 0 is "nothing was appended". Every status other than
+// Appended and AppendFailed is a refusal decided BEFORE anything touched the log: nothing was written and the sink is not
+// fenced. AppendFailed means the append itself failed (the sink is fenced if the failure was an I/O one, exactly as for
+// append_durable()).
+enum class OperatorAppendStatus : std::uint8_t {
+    NotAttempted = 0,
+    Appended = 1,                    // durable and acknowledged; the store's tip is v6 now
+    NotOperatorOpen = 2,             // only a sink opened with AuditSinkOpenMode::OperatorOpen may write this frame
+    SinkFenced = 3,                  // the sink is fenced or its log is not open
+    NotTheOperatorEvent = 4,         // the record is not an OrderOperatorResolved record
+    NoSuchUnresolvedOrder = 5,       // the client order id is not in recovered_checkpoints()
+    AlreadyResolvedThisSession = 6,  // this sink already appended a resolution for it
+    DryRunOrder = 7,                 // the order never reached an exchange: nothing to resolve
+    Refused = 8,                     // check_resolution() said no: see OperatorResolutionAppend::check
+    AppendFailed = 9,
+    ResolvedTableFull = 10,          // the store already holds kMaxOperatorResolved resolved orders: one more and the next
+                                     // trading open would be CapacityExceeded (the late-fill table must be complete)
+};
+
+struct OperatorResolutionAppend {
+    OperatorAppendStatus status{OperatorAppendStatus::NotAttempted};
+    operator_resolution::ResolutionCheck check{operator_resolution::ResolutionCheck::NotChecked};  // set when status == Refused
+    AuditAppendResult append{};  // set when status is Appended or AppendFailed
+};
+
 class DurableAuditSink {
 public:
     // path: base path for the log (e.g. "state/audit.log"); the lock sidecar
@@ -482,7 +508,8 @@ public:
     AuditSinkOpenMode open_mode() const noexcept { return open_mode_; }
 
     // The format version append_durable() writes: always the store's own tip version (D5 / R1, see the FORMAT
-    // v5 -> v6 note in durable_frame_codec.hpp). 5 for every store that exists today -- an empty one included.
+    // v5 -> v6 note in durable_frame_codec.hpp). 5 for every store that exists today -- an empty one included -- and 6
+    // for a store whose tip is v6, which includes the moment append_operator_resolution() has had its frame acknowledged.
     std::uint8_t write_format_version() const noexcept { return write_version_; }
 
     // SAFE-03 crash-window slice (blueprint L-36): how many bytes of a torn tail -- the partial frame a crash in the
@@ -501,6 +528,97 @@ public:
     // auto-retries. now_ms is caller-supplied (this codebase's established
     // clock-injection style, not read from a global clock here).
     AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) noexcept {
+        return append_impl(rec, now_ms, write_version_);
+    }
+
+    // D5 / R3-0 (docs/OPERATOR_RESOLUTION_DESIGN.md 6 step 7): the ONLY way an OrderOperatorResolved frame gets into a log,
+    // and so the only way a store ever gets its first v6 frame. It is the offline operator tool's call, which is why:
+    //   * it exists only on a sink opened with AuditSinkOpenMode::OperatorOpen; a trading open refuses it;
+    //   * it takes only the operator event, and only for an order that is in recovered_checkpoints() -- an unresolved
+    //     order of THIS scan (final orders, Intent-only orphans, unknown ids and orders beyond the checkpoint capacity of
+    //     an OperatorOpen scan are not there);
+    //   * the frame is held against that order with operator_resolution::check_resolution(), the very function the
+    //     recovery scan applies, so a frame this call accepts is a frame the next start accepts -- never a Corrupt store;
+    //   * only Live orders (a DryRun order never reached an exchange);
+    //   * one resolution per order per session;
+    //   * never the resolution that would take the store past kMaxOperatorResolved resolved orders: a trading start
+    //     refuses such a store (the table behind recovered_operator_resolved() must be complete), so the frame would
+    //     leave it unopenable for trading with no way back.
+    // Every refusal is decided BEFORE anything touches the log: nothing is written and the sink is NOT fenced (the caller
+    // asked for something this sink does not do; the store is undamaged). Only the append itself can fence, as in
+    // append_durable(). On success the frame is durable and acknowledged, write_format_version() becomes 6 (the store's
+    // tip IS v6 now, and the monotone version rule means everything that follows must be v6 too), and the order is marked
+    // resolved for this session. recovered_checkpoints() is NOT edited -- a span the caller is iterating stays valid; it
+    // keeps showing the store as recovery found it, and operator_resolved_this_session() says which entries are done.
+    OperatorResolutionAppend append_operator_resolution(const AuditRecord& rec, std::int64_t now_ms) noexcept {
+        OperatorResolutionAppend out{};
+        if (open_mode_ != AuditSinkOpenMode::OperatorOpen) {
+            out.status = OperatorAppendStatus::NotOperatorOpen;
+            return out;
+        }
+        if (fenced_ || !log_open_) {
+            out.status = OperatorAppendStatus::SinkFenced;
+            return out;
+        }
+        if (rec.event_type != AuditEventType::OrderOperatorResolved) {
+            out.status = OperatorAppendStatus::NotTheOperatorEvent;
+            return out;
+        }
+        std::size_t index = checkpoint_count_;
+        for (std::size_t i = 0; i < checkpoint_count_; ++i) {
+            if (same_client_order_id(checkpoints_[i].client_order_id, rec.client_order_id)) {
+                index = i;
+                break;
+            }
+        }
+        if (index == checkpoint_count_) {
+            out.status = OperatorAppendStatus::NoSuchUnresolvedOrder;
+            return out;
+        }
+        if (checkpoint_resolved_[index]) {
+            out.status = OperatorAppendStatus::AlreadyResolvedThisSession;
+            return out;
+        }
+        if (checkpoints_[index].mode != ExecutionMode::Live) {
+            out.status = OperatorAppendStatus::DryRunOrder;
+            return out;
+        }
+        out.check = operator_resolution::check_resolution(target_of(checkpoints_[index]), rec);
+        if (out.check != operator_resolution::ResolutionCheck::Ok) {
+            out.status = OperatorAppendStatus::Refused;
+            return out;
+        }
+        // The reader's other rule about this frame: a trading start refuses a store with more than kMaxOperatorResolved
+        // resolved orders (the table behind recovered_operator_resolved() must be complete). A frame that would be the
+        // 1025th would make the store unopenable for trading with no way back, so it is refused here. (A scan that
+        // overflowed the table has operator_resolved_count_ saturated at the capacity, so that case is covered too.)
+        if (operator_resolved_count_ + session_resolved_count_ >= kMaxOperatorResolved) {
+            out.status = OperatorAppendStatus::ResolvedTableFull;
+            return out;
+        }
+        out.append = append_impl(rec, now_ms, kFrameFormatVersionV6);
+        if (!out.append.acked()) {
+            out.status = OperatorAppendStatus::AppendFailed;
+            return out;
+        }
+        write_version_ = kFrameFormatVersionV6;  // the second and last assignment (the first is the recovery scan's)
+        checkpoint_resolved_[index] = true;
+        ++session_resolved_count_;
+        out.status = OperatorAppendStatus::Appended;
+        return out;
+    }
+
+    // Has append_operator_resolution() closed recovered_checkpoints()[index] in this session? (false for an index out of range.
+    // The second bound is the array's own: checkpoint_count_ never exceeds it, but a compiler that inlines this with a
+    // constant index cannot know that, and GCC reports the guarded access as -Warray-bounds.)
+    bool operator_resolved_this_session(std::size_t index) const noexcept {
+        return index < checkpoint_count_ && index < checkpoint_resolved_.size() && checkpoint_resolved_[index];
+    }
+
+private:
+    // The one place a frame is appended. `version` is the format version of THIS frame: append_durable() passes the
+    // store's write version, append_operator_resolution() passes 6. (test_operator_resolution_guard.cpp pins both callers.)
+    AuditAppendResult append_impl(const AuditRecord& rec, std::int64_t now_ms, std::uint8_t version) noexcept {
         AuditAppendResult result{};
         if (fenced_ || !log_open_) {
             result.status = AuditAppendResult::Status::Failed;
@@ -520,11 +638,11 @@ public:
         std::array<std::byte, kOrderEventFrameSize> buf{};
         const auto n = encode_order_event_frame(buf, active_key_id_, next_sequence_,
                                                  FrameTimeKind::ServerCorrectedUtc,
-                                                 now_ms, rec, tip_mac_, hmac_key, write_version_);
+                                                 now_ms, rec, tip_mac_, hmac_key, version);
         if (n != kOrderEventFrameSize) {
             // Pure encoding check, never touches log_store_ -- not a disk-full scenario by construction. D5 / R1:
-            // it now also refuses a record whose event type is not legal for write_version_ (OrderOperatorResolved
-            // on a v5 store): that is a caller bug, and fencing here is what keeps the log from ever holding a
+            // it now also refuses a record whose event type is not legal for `version` (OrderOperatorResolved
+            // in a v5 frame): that is a caller bug, and fencing here is what keeps the log from ever holding a
             // frame its own next start would call Corrupt.
             fenced_ = true;
             fence_reason_ = FenceReason::IoError;
@@ -586,6 +704,7 @@ public:
         return result;
     }
 
+public:
     // Optional: wire an ExportOutboxRing to receive a tip tuple on every
     // successful Acked append (see class header's ExportOutboxRing note).
     // Nullable; unset by default. Not owned.
@@ -762,36 +881,52 @@ private:
         std::int64_t ambiguous_utc_ms{0};
     };
 
-    // D5 / R1 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.2): may THIS OrderOperatorResolved frame close the order whose
-    // replay state is `rs`? Every "no" is Corrupt for the whole log (the caller returns it). Two rules are enforced
-    // elsewhere: "v6 only" by decode_order_event_frame() (event 22 in a v5 frame never decodes) and "the last frame
-    // of its COID" by the caller (rs.operator_resolved).
+    // D5 / R1 + R3-0 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.2): the order a resolution frame is held against, taken from
+    // the replay state of the scan or from the checkpoint recovery handed out. The rules themselves live in
+    // operator_resolution_rules.hpp because the WRITER (append_operator_resolution()) applies exactly the same ones:
+    // what it lets through, the reader accepts.
+    static operator_resolution::ResolutionTarget target_of(const ReplayState& rs) noexcept {
+        operator_resolution::ResolutionTarget t{};
+        t.state = rs.state;
+        t.exchange_order_id = rs.exchange_order_id;
+        t.filled_qty_ticks = rs.filled_qty_ticks;
+        t.symbol_id = rs.symbol_id;
+        t.side = rs.side;
+        t.mode = rs.mode;
+        t.price_ticks = rs.intended_price_ticks;
+        t.qty_ticks = rs.intended_qty_ticks;
+        return t;
+    }
+    // (A checkpoint's state is the one recovery hands out: Ambiguous for an order whose last frame was Submitting. Both
+    // take the same edge to Rejected, so for this check the two are the same.)
+    static operator_resolution::ResolutionTarget target_of(const OrderRecoveryCheckpoint& cp) noexcept {
+        operator_resolution::ResolutionTarget t{};
+        t.state = cp.resulting_state;
+        t.exchange_order_id = cp.exchange_order_id;
+        t.filled_qty_ticks = cp.filled_qty_ticks;
+        t.symbol_id = cp.symbol_id;
+        t.side = cp.side;
+        t.mode = cp.mode;
+        t.price_ticks = cp.intended_price_ticks;
+        t.qty_ticks = cp.intended_qty_ticks;
+        return t;
+    }
+
+    // May THIS OrderOperatorResolved frame close the order whose replay state is `rs`? Every "no" is Corrupt for the whole
+    // log (the caller returns it). Two rules are enforced elsewhere: "v6 only" by decode_order_event_frame() (event 22 in
+    // a v5 frame never decodes) and "the last frame of its COID" by the caller (rs.operator_resolved).
     static bool accepts_operator_resolution(const ReplayState& rs, const AuditRecord& rec) noexcept {
-        // 1. The order is in a state nothing automatic can finish: Submitting (after Prepared), Ambiguous, or
-        //    EscalatedToOperator. The first two already reach Rejected through the shared state machine; the third
-        //    only through the operator edge, which validate_transition() deliberately does not have.
-        switch (rs.state) {
-            case OrderState::Submitting:
-            case OrderState::Ambiguous:
-                if (validate_transition(rs.state, OrderState::Rejected) != TransitionResult::Ok) return false;
-                break;
-            case OrderState::EscalatedToOperator:
-                if (validate_operator_resolution(rs.state, OrderState::Rejected) != TransitionResult::Ok) return false;
-                break;
-            default:
-                return false;
+        return operator_resolution::check_resolution(target_of(rs), rec) == operator_resolution::ResolutionCheck::Ok;
+    }
+
+    // Equality of two client order ids that live in fixed arrays: bounded, and two arrays that are not terminated within
+    // their bound do not name an order. An empty id is not an order either.
+    static bool same_client_order_id(const ClientOrderId& a, const char (&b)[kClientOrderIdLen + 1]) noexcept {
+        for (std::size_t i = 0; i <= kClientOrderIdLen; ++i) {
+            if (a.id[i] != b[i]) return false;
+            if (a.id[i] == '\0') return i != 0;
         }
-        // The order must never have shown a sign of existing on the exchange: no exchange id, no fill (the average
-        // price is only ever recorded together with a fill, so it needs no check of its own).
-        if (rs.exchange_order_id != 0 || rs.filled_qty_ticks != 0) return false;
-        // 2. What the frame says: Rejected, nothing filled, no exchange id, and the same order the Intent frame
-        //    described.
-        if (rec.resulting_state != OrderState::Rejected) return false;
-        if (rec.exchange_order_id != 0 || rec.filled_qty_ticks != 0 || rec.avg_fill_price_ticks != 0) return false;
-        if (rec.symbol_id != rs.symbol_id || rec.side != rs.side || rec.mode != rs.mode) return false;
-        if (rec.price_ticks != rs.intended_price_ticks || rec.qty_ticks != rs.intended_qty_ticks) return false;
-        // 3. The machine field has the shape of an ABSENT conclusion (operator_resolution_frame.hpp).
-        return operator_resolution::is_valid_absent_detail_code(rec.detail_code);
+        return false;
     }
 
     // AUDIT REC-NOEXCEPT-006: the scan below allocates in several places (the whole
@@ -1049,6 +1184,12 @@ private:
             cp.symbol_id = rs.symbol_id;
             cp.exchange_order_id = rs.exchange_order_id;
             cp.side = rs.side;
+            // D5 / R3-0: two facts the scan already holds and used to drop (OrderRecoveryCheckpoint's own comment says why
+            // the offline operator tool needs them). submitting_utc_ms is the first Submitting frame's time, kept only
+            // when it was a ServerCorrectedUtc reading -- the same value for a genuine Ambiguous order and for the
+            // Submitting order that is remapped to Ambiguous just above.
+            cp.mode = rs.mode;
+            cp.send_started_utc_ms = rs.submitting_utc_ms;
             if (cp.resulting_state == OrderState::Ambiguous) {
                 // R-10 / L-30: the durable "first became uncertain" time. A genuine Ambiguous uses
                 // the frame that made it so; the Submitting -> Ambiguous remap above uses the
@@ -1431,11 +1572,15 @@ private:
 
     std::array<OrderRecoveryCheckpoint, kMaxInFlight> checkpoints_{};
     std::size_t checkpoint_count_{0};
+    // D5 / R3-0: which entries of checkpoints_ append_operator_resolution() has closed in this session. A parallel array,
+    // so that recovered_checkpoints() is never edited under a caller that is iterating it.
+    std::array<bool, kMaxInFlight> checkpoint_resolved_{};
+    std::size_t session_resolved_count_{0};  // how many append_operator_resolution() has acknowledged in this session
     std::size_t max_intent_orphans_{kMaxIntentOrphans};
-    // D5 / R1. open_mode_ is fixed at construction. write_version_ starts at 5 and is set ONCE, by the recovery scan,
-    // to the highest version the store's frames carry -- nothing else assigns it (test_operator_resolution_guard.cpp
-    // pins that), so no code path can write the first v6 frame of a store; the operator tool's (R3) will have to
-    // be a deliberate, reviewed addition.
+    // D5 / R1 + R3-0. open_mode_ is fixed at construction. write_version_ starts at 5 and is assigned exactly TWICE in
+    // this file (test_operator_resolution_guard.cpp pins both): by the recovery scan, to the highest version the store's
+    // frames carry; and by append_operator_resolution(), to 6, only after it has durably appended an operator frame. So
+    // no other code path can write the first v6 frame of a store, and a store that has v6 in it is never written at v5.
     AuditSinkOpenMode open_mode_{AuditSinkOpenMode::Trading};
     std::uint8_t write_version_{kFrameFormatVersion};
     std::array<OperatorResolvedOrder, kMaxOperatorResolved> operator_resolved_{};

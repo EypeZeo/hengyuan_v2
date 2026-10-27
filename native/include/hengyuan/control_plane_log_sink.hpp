@@ -96,9 +96,29 @@
 
 #include <array>
 #include <cstring>
+#include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 
 namespace hy {
+
+// D5 / R3-0 (docs/OPERATOR_RESOLUTION_DESIGN.md 6): what the control-plane log says `symbol_id` stands for. The audit
+// log records only the numeric id of an order's symbol; the exchange symbol ("BTCUSDT") lives in the symbol-registry
+// snapshots this log persists, one entry per id, keyed by POSITION (symbol_registry.hpp: parsed.symbols[i] becomes the
+// rules for symbol_id == i, and the caller keeps that order stable across refreshes). The operator tool needs the name to
+// ask the exchange about an order, and a WRONG name is the dangerous failure: a query for the wrong symbol answers "no
+// such order" for an order that exists. So the answer is only ever Known when EVERY snapshot in the log agrees.
+enum class SymbolNameStatus : std::uint8_t {
+    Unknown = 0,   // no snapshot mentioned this id, or the log could not be recovered: no answer
+    Known = 1,     // every snapshot that mentioned the id gave the same, well-formed name
+    Conflict = 2,  // two snapshots disagreed, or one gave a name that is not a symbol: refuse, do not guess
+};
+
+struct SymbolNameLookup {
+    SymbolNameStatus status{SymbolNameStatus::Unknown};
+    std::string_view name{};  // valid only when status == Known; views storage inside the sink
+};
 
 class ControlPlaneLogSink final : public DurableControlPlaneSink {
 public:
@@ -143,6 +163,21 @@ public:
     // middle of an append left behind -- recovery cut off the end of the log before the first new append (see
     // DurableAuditSink::recovered_torn_tail_bytes() for why). 0 = the file ended on a frame boundary.
     std::uint64_t recovered_torn_tail_bytes() const noexcept { return torn_tail_bytes_; }
+
+    // D5 / R3-0: the exchange symbol that `symbol_id` has meant in EVERY symbol-registry snapshot of this log (see
+    // SymbolNameStatus for why "every"). Unknown for an id no snapshot mentioned, for an id at or past kMaxSymbols, and for
+    // every id when this sink's recovery did not come back Clean/Recovered: a half-read log answers nothing. The view is
+    // into this sink and lives as long as it does. Read-only: the append path and the 20-argument recover_control_plane()
+    // interface are untouched.
+    SymbolNameLookup recovered_symbol_name(std::uint32_t symbol_id) const noexcept {
+        if (recovery_status_ != RecoveryScanStatus::Clean && recovery_status_ != RecoveryScanStatus::Recovered) return {};
+        if (symbol_id >= kMaxSymbols) return {};
+        const SymbolNameSlot& slot = fold_.symbol_names[symbol_id];
+        if (slot.status != SymbolNameStatus::Known) return {slot.status, {}};
+        return {SymbolNameStatus::Known, std::string_view(slot.name, slot.length)};
+    }
+    // How many symbol-registry snapshot frames the recovery scan read.
+    std::uint64_t recovered_snapshot_count() const noexcept { return fold_.snapshot_count; }
 
     // Capability gate for the 2 compaction-only methods below -- callers
     // MUST check this before calling them. Always false: there is no
@@ -475,7 +510,16 @@ private:
 
     // --- Recovery scan: naive fold + the two safety-critical rules ---
 
+    // D5 / R3-0: one symbol_id's name as the snapshots of the log have given it.
+    struct SymbolNameSlot {
+        SymbolNameStatus status{SymbolNameStatus::Unknown};
+        std::uint8_t length{0};
+        char name[kSymbolNameLen]{};
+    };
+
     struct FoldState {
+        std::array<SymbolNameSlot, kMaxSymbols> symbol_names{};  // D5 / R3-0, see fold_symbol_names()
+        std::uint64_t snapshot_count{0};
         RateLimitFreezePayload active_freeze{};
         bool has_freeze{false};
         EndpointWeightConfig weights{};
@@ -495,6 +539,41 @@ private:
         FreezeWaitArmPayload wait_arm{};
         bool has_wait_arm{false};
     };
+
+    // A symbol name as the exchange spells it: non-empty, terminated INSIDE the field, upper-case letters and digits only.
+    // The snapshot decoder copies the 20 name bytes as they are on the wire, so none of that is checked before this point.
+    static std::optional<std::string_view> well_formed_symbol_name(const SymbolRules& rules) noexcept {
+        std::size_t n = 0;
+        while (n < kSymbolNameLen && rules.symbol[n] != '\0') ++n;
+        if (n == 0 || n == kSymbolNameLen) return std::nullopt;
+        for (std::size_t i = 0; i < n; ++i) {
+            const char c = rules.symbol[i];
+            if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return std::nullopt;
+        }
+        return std::string_view(rules.symbol, n);
+    }
+
+    // One snapshot into the name table. An id's name becomes Known by its first well-formed mention, stays Known while
+    // every later mention agrees, and becomes Conflict -- for good -- the first time one does not (a rename, a swap of two
+    // ids, or a name that is not a symbol). A snapshot that mentions fewer ids than an earlier one says nothing about the
+    // ids it leaves out: an order that used such an id was made under an earlier snapshot, which named it.
+    void fold_symbol_names(std::span<const SymbolRules> entries) noexcept {
+        ++fold_.snapshot_count;
+        for (std::size_t i = 0; i < entries.size() && i < kMaxSymbols; ++i) {
+            SymbolNameSlot& slot = fold_.symbol_names[i];
+            if (slot.status == SymbolNameStatus::Conflict) continue;
+            const std::optional<std::string_view> name = well_formed_symbol_name(entries[i]);
+            if (!name) {
+                slot.status = SymbolNameStatus::Conflict;
+            } else if (slot.status == SymbolNameStatus::Unknown) {
+                std::memcpy(slot.name, name->data(), name->size());
+                slot.length = static_cast<std::uint8_t>(name->size());
+                slot.status = SymbolNameStatus::Known;
+            } else if (*name != std::string_view(slot.name, slot.length)) {
+                slot.status = SymbolNameStatus::Conflict;
+            }
+        }
+    }
 
     void push_probe_attempt(const FreezeProbeAttemptPayload& attempt) noexcept {
         if (fold_.probe_count < fold_.probe_ring.size()) {
@@ -736,7 +815,9 @@ private:
                     if (f.sequence_number != expected_seq || f.prev_mac != running_prev_mac) {
                         return RecoveryScanStatus::Corrupt;
                     }
-                    // Not folded into any out-param either.
+                    // Not folded into any out-param of recover_control_plane() (its interface has no slot) -- but, since
+                    // D5 / R3-0, into the per-symbol_id name table behind recovered_symbol_name().
+                    fold_symbol_names(std::span<const SymbolRules>(entries.data(), entry_count));
                     frame_mac = f.mac;
                     dispatched_ok = true;
                     break;
