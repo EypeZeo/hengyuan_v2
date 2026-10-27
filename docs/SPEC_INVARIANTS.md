@@ -474,6 +474,68 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       （与蓝图 L-48 同类）：换掉控制面日志文件，旧订单的 `symbol_id` 可能被新快照命名成另一个品种而仍是 `Known`——所以 R3a 的确认短语必须把品种名亮给操作员；
       `OperatorOpen` 扫描里超出 `kMaxInFlight` 的未决订单本次会话不可结清（`recovery_overflow().checkpoints` 给出数量；先结清列出的，数量降到容量以内后交易进程才能再打开）。
 
+  - **[D5 切片 R3a 已落地：离线工具的流程——端口、确认短语与读行器、证据文件、`resolve_order()`]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-27 “同意，开始R3a”；Tier B；PR #XXX）：设计 §6 的操作员步骤现在是代码，跑在四个**注入的端口**上
+    （交易所读、睡眠、控制台、证据存储），对着回环假交易所证明整条流程（含**落后于真实状态的读**、错误码、翻页）；**没有真实传输、没有命令行、没有任何密钥处理**（R3b）。
+    四个新头文件只有工具会包含，生产代码里没有任何一方包含它们（守卫钉住）。
+    - **端口**（`operator_resolution_ports.hpp`，只有接口）：`ExchangeReadPort`（`server_time()` / `query_order()` / `all_orders()` / `open_orders()` / `account_summary()`，
+      全是只读 GET；答案是交易所的原样 `HttpRead{transport_ok, http_status, body}`，零值不是答案，传输没完成就是 `transport_ok == false` 而不是空的 200）、`SleepPort`、
+      `ConsolePort`（`write_line()` / `read_line(timeout)`）、`EvidenceStorePort`（`store(stem, contents)`）。真实实现必须守的几条写在头文件注释里：只读密钥；密钥与签名留在实现内部
+      （所以进不了证据文件）；不加工交易所的答案。
+    - **确认短语**（`operator_resolution_confirmation.hpp`，L1，不分配）：`ABSENT <订单号> <品种> <环境> <账户 UID> <证据 SHA-256 的前 8 位十六进制>`，逐字节一致才算
+      （不 trim、不折叠大小写，多一个空格都是 `WrongPhrase`）。各字段先过文法——订单号 ≤ 36 字符 `[A-Za-z0-9._:/-]`、品种 `[A-Z0-9]{1,19}`、环境 `TESTNET` / `PRODUCTION`（越界值没有名字）、
+      UID ≠ 0、摘要 64 位小写十六进制——任何一项不合文法，短语就无效（`InvalidPhrase`），不存在能确认它的输入。**设计 §6 要的是订单号、结论、环境名与摘要前 8 位；这里多绑了两样**，
+      因为日志给不了它们：**品种名**（审计日志只记 `symbol_id`，名字来自控制面日志，二者互不绑定，蓝图 L-50——亮出名字才让操作员看到工具要问交易所什么）与**账户 UID**（没有任何存储记录
+      订单发往哪个账户，`fetch_account()` 又丢掉了 UID，蓝图 L-48——工具验不了，只能让操作员说出来并写进证据文件）。最长的有效短语 104 字节、缓冲区 192 字节，由 `static_assert`
+      （`kLongestPhraseBytes`）钉住，所以 “短语放不下” 不是任何被接受的输入会遇到的情形。
+    - **读行器**（`OperatorLineReader`）：新写的一次性读行器——现有 `OperatorInputResult` 只有 7 字节（它只收 `CONFIRM`），OperatorConfirmationGate 是下单门，都装不下短语。
+      **循环是复制而不是模板化**，为的是不碰下单确认这条在用的路径；字节来源（`OperatorTimedRead`）与原生标准输入适配器照用。CR 或 LF 结束一行；超过 192 字节的行读到行尾丢掉并返回 `TooLong`
+      （尾巴不会变成之后某个回答的开头）；超时 / 输入结束 / I/O 错误不留线程；一个实例只读一次（第二次是 `AlreadyRead`）；超过 5 分钟的超时是无效输入。
+      `judge_confirmation()` 给出 `Confirmed` / `WrongPhrase` / `NoLine` / `InvalidPhrase`，零值 `NotAsked` 不是确认。
+    - **证据文件**（`operator_resolution_bundle.hpp`）：一个**确定**的 JSON 文档（固定键序、只有整数、没有本地化、没有时钟——同样的证据永远同样的摘要）：格式名 `hy-operator-evidence/1`、
+      工具版本、订单号、品种、环境、操作员声明的 UID、栅栏四个参数、**每一次 `serverTime` 读数**（`lock` / `wait` / `read`）、两个基准时间、帧锚点（可能是 `null`）、`allOrders` 区间、
+      账户摘要（仅展示，不是证据）、三类分类结论，以及**每个请求的参数和交易所的原始答案**（HTTP 状态与正文，原样）。正文按字节放进 JSON 字符串：可见 ASCII 照旧、JSON 要求的转义照做、
+      其余一切字节（控制字符、DEL、≥ 0x80）写成 `\u00XX`——恒为合法 JSON，读者把每个码点 0..255 当一个字节就拿回原文，所以一个有敌意或损坏的正文既破坏不了文档也不会被它改动。
+      API 密钥与签名工具根本看不到（端口持有），不可能进文件。帧的 `detail_msg` = `op=<标签>;ev=<摘要前 32 位>`，标签 1–24 字符 `[A-Za-z0-9._-]`（`;` 与 `=` 不在内，63 字符放得下）。
+    - **会话**（`begin_operator_session()`）：栅栏的基准 `lock_ref` 是取锁之后的**第一次** `serverTime`（设计 §5.2）；它属于锁，不属于订单，所以一个会话可以结清多个订单，只有第一个要等。
+      接收器必须已打开、未围栏、是 `OperatorOpen`（以 `OperatorOpen` 打开存储本身就是取锁）；栅栏参数过 `validate_fence_params()`；读数要合理。`list_unresolved_orders()` 是设计 §6 第 3 步的清单：
+      状态、模式、品种（以及名字状态）、方向、价格 / 数量、发送开始时间、本工具能否结清（`check_order_resolvable()` 的结果）与本会话是否已结清。
+    - **`resolve_order()`**（`ResolveStatus` 20 个值，零值 `NotRun` 不是成功）按这个顺序；**第 7 步之前任何日志都没有被写过，任何一个拒绝都让两份日志逐字节不变**：
+      0. 请求与会话（`SessionNotReady`、`BadRequest`：环境名、UID ≠ 0、订单号文法、标签文法、超时 > 0）；
+      1. **不需要交易所就知道的拒绝，没有流量、没有等待**：接收器可用（`AuditNotUsable`）、订单在检查点里（`NoSuchUnresolvedOrder`）、本会话没结清过（`AlreadyResolvedThisSession`）、不是 `DryRun`
+         （`DryRunOrder`）、共享规则的**订单一半**（`NotResolvable`）、结清表有位置（`TableFull`）、品种名 `Known` 且合文法（`SymbolNameNotKnown`）；
+      2. **栅栏**：`earliest = lock_ref + W + B + 余量 + L`（默认 60 + 60 + 30 + 120 = 270 s，只许调大，上限 1 小时），**用交易所时钟数**，本地时钟只决定睡多久。等待之前先用 `earliest` 当读时间把
+         `allOrders` 区间与窗口计划算一遍：没有锚点、或要超过 14 个窗口的，当场拒绝（`NoUsableRange`），不白等 4.5 分钟（等待期间区间继续变长，真正读时会再算一遍，仍超限则在**等待之后、第一个证据请求之前**拒绝）。
+         然后循环：读 `serverTime`（没有、不合理或倒退 → `ServerTimeUnavailable`），`check_evidence_read()` 满足就出循环，否则睡 `min(剩余 + 250 ms, 30 s)`；本地睡眠总量超过 “栅栏跨度 + 120 s”
+         → `FenceWaitTimedOut`（交易所时钟必须跟得上，不跟就拒绝，不猜）。`+ 250 ms` 的垫子来自一个真实的缺陷：时钟略慢时，剩余时间每次睡后按固定比例缩小，用整数毫秒最终停在 “睡了但挪不动”，
+         等待在最后一毫秒上空转到超时（流程测试里慢时钟用例发现的）；多睡 250 ms 无害；
+      3. **证据**：点查询、计划里的每个 `allOrders` 窗口、`openOrders`——都在满足栅栏的那次读数**之后**；任何一次传输失败 → `EvidenceReadFailed`；账户摘要仅供展示；
+      4. 先**不带**操作员的话问一次 `conclude_absent()`，**无论结论如何都先建证据文件并存下来**——拒绝也留证据；
+      5. 结论不是 “只差确认” → 打印原因与各项分类，**不问任何人**（`EvidenceNotAbsent`）；证据存不下来 → `EvidenceStoreFailed`，也不问（没有证据文件就没有确认）；
+      6. 展示摘要（订单字段、日志里的状态与发送开始时间、环境与 UID “由您声明、本工具未验证”、交易所时钟与等待时间、各查询结果、账户摘要、**A-D5-1 至 A-D5-4 四条工具查不了的假设**与
+         “到交易所自己的订单与成交历史里看过”、证据文件名与 SHA-256），给出短语，读一行（默认 5 分钟）；
+      7. 带着确认再问一次 `conclude_absent()`；再读一次 `serverTime` 作为帧时间；**帧由检查点和结论构造**（模式、`symbol_id`、价格、数量、方向来自检查点，`resulting_state = Rejected`，
+         `detail_code` 是 `conclude_absent()` 给的位；操作员键入的内容里只有标签进了帧），交给 `append_operator_resolution()`，它再用读者自己的规则预检一遍。
+    - **共享规则的小重构**（行为不变，裁决顺序由测试钉住）：`target_of(const OrderRecoveryCheckpoint&)` 从接收器的私有函数搬进规则头；规则头新增 `check_order_resolvable()`（规则 1 与 6，只看订单）与
+      `check_frame()`（规则 2 与 3），`check_resolution()` 先后调用二者——工具要在等待之前就说清楚订单为什么不能结清；接收器新增 `operator_resolved_table_has_room()`（写者与工具共用）。
+    - **守卫**（`test_operator_resolution_guard.cpp`，读源码）新增：四个工具头只被工具包含（确认头只被端口 / 证据文件 / 流程头包含），其余生产代码都不包含；`OperatorOpen` 只有接收器头与流程头
+      （流程头两次，且只比较、不构造接收器）；`append_operator_resolution()` 只有接收器头（定义）与流程头（一次调用，参数恰为 `rec` 与 `append_ref->count()`，即刚读到的交易所时间）；
+      `check_order_resolvable()` 在流程头里先于第一次交易所请求与第一次睡眠被问到，`check_frame()` 只有规则头自己调用；帧由检查点与结论构成（`conclude_absent()` 恰两次、`rec.detail_code` 只赋值一次且来自
+      `fin`、`in.operator_confirmed` 只在 `ConfirmationVerdict::Confirmed` 之后变真、流程头不出现 `make_absent_detail_code` / `kAbsentRequiredBits`）；确认头的 `#include` 清单固定、不出现任何
+      分配 / 容器 / 异常的名字（`= delete` 只有读行器的两个）。
+    - **验证**：新增 test_operator_resolution_confirmation（22）、test_operator_resolution_bundle（9）、test_operator_resolution_flow（51；对着真实的审计日志与控制面日志临时文件、会按订单状态与可见时间返回答案的回环假交易所、
+      会前进的假时钟、可编排的控制台与证据存储）；守卫 15 → 19。MSVC 全量（`/W4 /WX`）3033 个用例 3032 通过、1 个既有跳过、0 失败；GCC-14 `none` 3042/3042；ASan+UBSan 在 11 个触及目标上 359 个用例零报告。
+      **变异检查**：341 个变异（流程头 152、确认头 93、证据文件头 78、规则头 11、接收器 7）= 330 杀死 + 11 等价；其中 329 个被各自头文件的专用测试杀死（CF49 是被头文件自己的 `static_assert` 在编译期杀死的），1 个（BD45，判决名 `Listed`）要靠流程测试。
+      首轮发现并用测试关闭的真实缺口：已围栏 / 已关闭的接收器（会话与 `resolve_order()` 各一处）、列表的字段、确认文法的字符边界（改成 256 个字节值对照字面清单）、读行器对 “截止后才到的换行” 的处理、证据文件的头字段与逐字节格式
+      （整份文档逐字节对照、转义逐字节对照、四个栅栏参数用互不相同的值）、屏幕上给操作员看的内容与拒绝原因、`AppendFailed` 与 `AppendRefused` 的映射、帧时间必须在确认之后重新读取、写者必须用**该订单自己**的检查点（多个订单字段互不相同才分得出）、
+      证据文件名的消毒、默认 5 分钟的确认等待、结论必须用会话自己的栅栏参数、等待提示向上取整。三处冗余被删除而不是记成等价：循环里重复的 `is_plausible`（`check_evidence_read()` 已经拒绝并给出 `ImplausibleTime`）、等待之后重复的区间检查
+      （计划检查已覆盖）、以及一个把剩余秒数多报 1 的取整错误（`remaining / 1000 + 1`）。11 个等价变异：LS07、RS14、RS15（名字查询对非 `Known` 的订单本来就是空串，且 `Known` 蕴含文法）、RS92（短语的各字段在此之前都已校验，不可能无效）、
+      RS97（`conclude_absent()` 是纯函数，第二次只差操作员的话）、CF50（缓冲区的任意上界；下界 104 由 `static_assert` 钉住）、CF68（同一个 `static_assert` 使缓冲区溢出不可达）、CF75 / CF78 / CF79（与现有 OperatorInputReader 逐字一致的截止时间防御分支，
+      输出等价且没有时钟注入点无法确定性触发）、CF93（`size` 永远不超过缓冲区）。
+    - **仍未覆盖**：真实传输、命令行、KEK / 密钥来源、`PrivateRestEndpoint` / ResponseKind / 许可 / 配速 / 冻结守卫的新项（R3b）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的前置）；
+      `-2013` 的真实状态码与读延迟 L（R6，Testnet 演练——回环假交易所只证明**过程**，不证明交易所的行为）。**账户 UID 与环境只是操作员的声明**，工具验不了（L-48）；**品种名与审计日志之间没有绑定**
+      （L-50），所以短语把品种名亮给操作员、假设 A-D5-4 要他自己核对。确认的等待最长 5 分钟，期间已读的证据不会更新——持锁时旧进程已停是 A-D5-1，由操作员保证，工具查不了。
+
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/

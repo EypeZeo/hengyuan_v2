@@ -150,6 +150,12 @@ SEARCH_FILES = [
     # D5 slice R3-0 (docs/SPEC_INVARIANTS.md "D5 切片 R3-0"): the shared resolution rule the recovery reader and the operator
     # writer both apply -- one more load-bearing symbol set that no spec names.
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_rules.hpp",
+    # D5 slice R3a (docs/SPEC_INVARIANTS.md "D5 切片 R3a"): the offline operator tool's procedure over injected ports -- the
+    # confirmation phrase and its judge, the ports, the evidence file, and the flow itself.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_confirmation.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_ports.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_bundle.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_flow.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
