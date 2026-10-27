@@ -441,7 +441,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       字段（订单号里的时间戳在此之前兜底，且因为取最小值，不会因此出错）。
 
   - **[D5 切片 R3-0 已落地：工具的持久层数据源——检查点的两个事实、共享规则、写者 `append_operator_resolution()`、品种名折叠]**
-    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-26 “开始，按这个切法做R3-0”；Tier B；PR 待合并）：离线工具（切片 R3a / R3b）要问交易所
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-26 “开始，按这个切法做R3-0”；Tier B；PR #207，合并提交 f7b964c）：离线工具（切片 R3a / R3b）要问交易所
     “这个订单存在吗”，持久层得先给出三样东西——订单的模式与发送开始时间、写闭合帧的唯一入口、`symbol_id` 对应的交易所品种名。本片只补这三样：
     **没有任何生产代码调用写者**（工具是 R3a），没有改任何帧格式，没有改控制面日志的格式或追加路径。
     - **检查点的两个事实**（`OrderRecoveryCheckpoint`，`durable_control_plane.hpp`；只在内存里，是恢复扫描本来就持有、之前被丢掉的数据）：
