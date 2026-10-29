@@ -475,7 +475,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       `OperatorOpen` 扫描里超出 `kMaxInFlight` 的未决订单本次会话不可结清（`recovery_overflow().checkpoints` 给出数量；先结清列出的，数量降到容量以内后交易进程才能再打开）。
 
   - **[D5 切片 R3a 已落地：离线工具的流程——端口、确认短语与读行器、证据文件、`resolve_order()`]**
-    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-27 “同意，开始R3a”；Tier B；PR #210）：设计 §6 的操作员步骤现在是代码，跑在四个**注入的端口**上
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-27 “同意，开始R3a”，对 PR #210 说“合并”；Tier B；PR #210，合并提交 7b66a62）：设计 §6 的操作员步骤现在是代码，跑在四个**注入的端口**上
     （交易所读、睡眠、控制台、证据存储），对着回环假交易所证明整条流程（含**落后于真实状态的读**、错误码、翻页）；**没有真实传输、没有命令行、没有任何密钥处理**（R3b）。
     四个新头文件只有工具会包含，生产代码里没有任何一方包含它们（守卫钉住）。
     - **端口**（`operator_resolution_ports.hpp`，只有接口）：`ExchangeReadPort`（`server_time()` / `query_order()` / `all_orders()` / `open_orders()` / `account_summary()`，
