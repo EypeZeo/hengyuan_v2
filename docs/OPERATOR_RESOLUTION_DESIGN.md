@@ -1,6 +1,6 @@
 # 操作员解决（Operator Resolution）：被困订单的回头路（D5）
 
-状态：**设计，语义已冻结；切片 R1（恢复读者）已合入（PR #203，`a4372ba`，2026-10-25）；切片 R2（证据原语：栅栏算术、查询结果分类、`allOrders` 窗口、结论函数）已合入（PR #205，`99d8cb4`，2026-10-26）；切片 R3-0（工具的持久层数据源：检查点的模式与发送开始时间、写者 `append_operator_resolution()`、读写共用的 `check_resolution()`、控制面日志的品种名折叠）已合入（PR #207，`f7b964c`，2026-10-27）；生产代码里仍没有任何一方调用写者（调用方是 R3a 的工具）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 与 R2 说“开始”，对 PR #203 与 #205 说“合并”，2026-10-26 对 R3 的切法（R3-0 → R3a → R3b）说“开始，按这个切法做R3-0”。
+状态：**设计，语义已冻结；切片 R1（恢复读者）已合入（PR #203，`a4372ba`，2026-10-25）；切片 R2（证据原语：栅栏算术、查询结果分类、`allOrders` 窗口、结论函数）已合入（PR #205，`99d8cb4`，2026-10-26）；切片 R3-0（工具的持久层数据源：检查点的模式与发送开始时间、写者 `append_operator_resolution()`、读写共用的 `check_resolution()`、控制面日志的品种名折叠）已合入（PR #207，`f7b964c`，2026-10-27）；切片 R3a（离线工具的流程：四个端口、确认短语与读行器、证据文件、`resolve_order()`，对着回环假交易所证明；没有真实传输与命令行）已实现，PR #210 待合并；生产代码里没有任何一方调用写者，调用方只有离线工具的流程头（命令行是 R3b）**。起草 2026-10-25；Owner 于 2026-10-25 对 D5 说“先做D5吧”，对 R1 与 R2 说“开始”，对 PR #203 与 #205 说“合并”，2026-10-26 对 R3 的切法（R3-0 → R3a → R3b）说“开始，按这个切法做R3-0”，2026-10-27 对 R3a 说“同意，开始R3a”。
 依据：SUBMITPORT 规格 §6.5 第 4、5 条（已被接受的 `OrderOperatorResolved`）；`docs/NOTSENT_CLOSURE_DESIGN.md` §1、A6、D5；蓝图 L-43、L-46、`5.9.4`。
 模型：`formal/operator_resolution.tla`（§8）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值（事件号、位布局的最终形式）随实现 PR 分配**，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。R1 已分配：事件号 22，`detail_code` 的位布局冻结在 `native/include/hengyuan/operator_resolution_frame.hpp`。
 
@@ -105,7 +105,7 @@
    (b) 每页窗口不超过 24 小时少 1 秒，请求 `limit` = 1000；官方文档对截断没有任何标记，所以满页（1000 条）一律当作可能被截断而拒绝；窗口首尾相接（下一页起点 = 上一页终点），无论交易所把终点算开区间还是闭区间都不留缝；`allOrders` 的每个元素的 symbol 必须等于所请求的，错品种的页什么也证明不了；
    (c) 时间窗起点取两个锚点（`Prepared` / `Submitting` 帧的服务器校正时间、COID 里的时间戳）中**较早的**再减 2W——比上面的“优先帧时间，否则 COID”只会更早（更多页，绝不留缝）；
    (d) 所有时间必须落在 2020-01-01 至 2100-01-01 之内，之外的读数（例如解析失败而默认成 0 的 serverTime）永远满足不了栅栏。
-6. **展示与确认**：显示全部证据与清单（操作员须在交易所 App 的订单历史和成交历史里自行核对该时间窗内没有此订单 / 成交、余额与预期一致、API 权限未变），然后要求键入确认短语，绑定 COID、结论、环境名和证据摘要前 8 位。输入方式沿用 `OperatorConfirmationGate` / `OperatorInputReader`。
+6. **展示与确认**：显示全部证据与清单（操作员须在交易所 App 的订单历史和成交历史里自行核对该时间窗内没有此订单 / 成交、余额与预期一致、API 权限未变），然后要求键入确认短语，绑定 COID、结论（`ABSENT`）、品种名、环境名、账户 UID 和证据摘要前 8 位（品种名与账户 UID 是 R3a 实现时加的：日志给不了它们，见 L-50 与 L-48，让操作员把它们亮出来再键入）。输入方式：字节来源与原生标准输入适配器沿用 `OperatorInputReader` 的，读行器新写（`OperatorInputResult` 只有 7 字节、`OperatorConfirmationGate` 是下单门，装不下短语）。
 7. **追加** `OrderOperatorResolved`，必须 durable `Acked`。失败：报告并退出，不重试——重新运行是幂等的（恢复扫描已把写进去的订单当终局，不再列出）。
 8. **证据附件**：`<store>.operator-evidence/<coid>-<utc>.json`——原始响应（去掉签名与密钥）、工具版本、栅栏与读延迟参数、各次 `serverTime` 读数；帧里存它的 SHA-256 前 32 位十六进制。
 9. **退出**。操作员重启交易进程；恢复读到该帧，订单是 `Rejected`（终局），不再产生检查点。
@@ -198,7 +198,7 @@
 | R1 读者（已合入：PR #203，`a4372ba`，2026-10-25） | 事件类型、`validate_operator_resolution`、§7.2 的接受 / 拒绝表、`recovered_operator_resolved()`、`OperatorOpen` 打开模式、守卫；与 NotSent 的 codec 读者（`NOTSENT_CLOSURE_DESIGN.md` S2）同一次 v6 | MSVC + GCC `none`、`address`；表中每一行与每个 `Corrupt` 一个用例；`validate_transition(EscalatedToOperator, *)` 仍为 `AlreadyTerminal`；变异检查 |
 | R2 证据原语（纯逻辑；已合入：PR #205，`99d8cb4`，2026-10-26，见 `docs/SPEC_INVARIANTS.md`“D5 切片 R2”） | 栅栏计算（`constexpr`、用交易所时间）、证据位的编解码、查询结果分类（`-2013` / `-2026` / 其它错误 / 成功，**对账路径不变**）、`allOrders` 分页规划 | 表驱动用例；变异检查；`closure_ledger_check` 若新增 FI 则同步 |
 | R3-0 持久层数据源（已合入：PR #207，`f7b964c`，2026-10-27；见 `docs/SPEC_INVARIANTS.md`“D5 切片 R3-0”） | 工具先要有的三样东西：检查点带上 `mode` 与 `send_started_utc_ms`（R2 留下的缺口）；`DurableAuditSink::append_operator_resolution()`——`OperatorOpen` 专用、只写事件 22、用与读者同一个 `check_resolution()`（`operator_resolution_rules.hpp`）预检、成功后写版本变 6；控制面日志的 `recovered_symbol_name()`——只有每个快照都同意才 `Known` | MSVC + GCC `none`、`address`；写者与读者的差分用例（写者放行 ⇔ 读者接受）；每条拒绝都不碰日志、不围栏；变异检查 |
-| R3a 工具的流程（仅逻辑与回环） | 请求（品种、两次读之间的间隔、操作员身份）、取锁后的栅栏等待、确认短语与读行（环境名、账户 UID、**品种名**亮给操作员）、证据附件；对着注入的端口与回环假交易所（含**落后于真实状态**的读、错误码、翻页）走完整条流程；**没有真实传输**。现有的 `OperatorInputResult` 只有 7 字节、`OperatorConfirmationGate` 是下单门，都不适用，需要新写 | MSVC + GCC；`address`；栅栏与读延迟的负控；全部拒绝路径各一个用例 |
+| R3a 工具的流程（仅逻辑与回环；已实现：PR #210，见 `docs/SPEC_INVARIANTS.md`“D5 切片 R3a”） | 请求（订单号、环境、账户 UID、操作员标签、确认等待）、取锁后的栅栏等待、确认短语与读行（环境名、账户 UID、**品种名**亮给操作员）、证据附件；对着注入的端口与回环假交易所（含**落后于真实状态**的读、错误码、翻页）走完整条流程；**没有真实传输**。现有的 `OperatorInputResult` 只有 7 字节、`OperatorConfirmationGate` 是下单门，都不适用，所以读行器新写（循环复制而非模板化，不碰下单确认的路径）；短语比设计多绑了品种名与账户 UID（L-50、L-48） | MSVC + GCC；`address`；栅栏与读延迟的负控；全部拒绝路径各一个用例；变异检查 |
 | R3b CLI 与真实传输 | 命令行；KEK 的来源（密钥文件还是参数，Owner 待定）；`PrivateRestEndpoint` / `ResponseKind` / 许可 / 配速 / 冻结守卫的新项（`PrivateRestEndpoint` 是 spec 转录、封闭的，`SignedJson` 上限 256 KiB）；真实 HTTPS 传输 | 同上，加守卫：只有工具的翻译单元能引用写帧的代码 |
 | R4 迟到成交告警 | R-late：对 operator-resolved COID 的成交触发熔断 | 单元 + 恢复往返；变异检查 |
 | R5 环境与账户绑定 | R-env：存储记环境、解析账户 UID、工具拒绝不一致 | 生产启用的前置 |
