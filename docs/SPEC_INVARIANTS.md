@@ -573,6 +573,61 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - **仍未覆盖**：命令行、KEK / 密钥来源、证据目录与终端适配器（R3b-2）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的前置）；`-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**
       （R6，Testnet 演练——回环夹具只证明**过程**，不证明交易所的行为；若 Testnet 不带 `uid`，流程会以 `AccountUnverified` 拒绝，那时需要 Owner 决定）。L-50 的附加防线（“发送时间早于第一个命名该 id 的快照” ⇒ `Unknown`）仍未做，留给 R3b-2。
 
+  - **[D5 切片 R3b-2 已落地：离线工具的命令行 `hy_operator_resolve`——参数文法、KEK 与密钥文件、只读专用凭据、终端适配器与证据目录、退出码]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-31 “开始R3b-2，按推荐”——三项推荐：专用只读凭据名、`--kek-file`、L-50 的附加防线拆给 R3b-3；Tier B；本 PR）：被困订单第一次有了**可执行的出口**——
+    `hy_operator_resolve`（HY_BUILD_DEMO 下构建的一个薄 `main()`，其余在四个头文件里）。**仍然没有任何真实流量**：测试里只有回环 TLS 与合成凭据，我没有对真实交易所或 Testnet 发过一个字节，仓库里也没有任何真实或 Testnet 凭据；
+    **第一次真跑是 Owner 自己的动作（R6）**，而且在 R3b-3（L-50 的附加防线）与 R5（环境与账户绑定）之前不应用于生产。
+    - **文件，各管一件事**：`operator_resolution_cli.hpp`（参数文法与用法文字，纯函数，不开文件）；`operator_resolution_terminal.hpp`（`StdConsole`、`DirectoryEvidenceStore`）；`operator_resolution_tool.hpp`
+      （`run_operator_tool()`、`ToolExit`、`ExchangeProvider`、`ToolEnvironment`——**不含 Boost 与 OpenSSL**：交易所经 `ExchangeProvider` 进来，所以整个工具在默认构建里就能对着假交易所跑）；
+      `operator_resolution_real_exchange.hpp`（`RealExchangeProvider`：凭据、限流器、TLS 客户端——四个里唯一要 Boost 与 OpenSSL 的）；`src/hy_operator_resolve.cpp`（`main()`：把进程接到这些头上，
+      守卫把整个函数体钉成一段文本）。前三个头的 include 列表由守卫钉成精确列表（加一个 include 要有理由）。
+    - **参数文法**（`parse_tool_args()`；只有长选项，`--名 值`，每个至多一次；找不到的选项、缺值、看起来像选项的值、重复、值不合文法一律拒绝；**没有任何有意义的默认值**）：两个模式。`--list`
+      列出两份日志里未结清的订单，**不要凭据、不联网**；不带 `--list` 就结清**一个**订单，此时 `--coid`、`--env testnet|production`、`--uid`、`--operator`、`--credentials-file` 全部必填，与 `--list` 混用是拒绝而不是猜。
+      两种模式都必填：`--audit-log` / `--control-log`（两份日志的基路径）、`--kek-file` / `--key-file`、`--audit-key-id` / `--control-key-id`。数字只认十进制数字（无符号、无空格、无前导零、不溢出：`--uid 0123` 是笔误，不是数）；
+      `--uid` 必须为正；订单号与标签走流程已有的文法；路径非空、至多 4096 字符、不含控制字符；`--audit-log` 与 `--control-log`、`--kek-file` 与 `--key-file`、凭据文件与 KEK 文件、凭据文件与密钥文件
+      如果字符串相同就拒绝（工具另在磁盘上检查：不同写法的同一个文件也拒绝）；`--help` 不是错误，先出现的问题先报，失败信息只点选项名、从不回显值。
+    - **事件顺序，以及为什么**（`run_operator_tool()`，守卫钉住顺序）：(1) 解析；(2) 磁盘上的 “是不是同一个文件”；(3) 结清模式**先**向 `ExchangeProvider` 要交易所——凭据载入、客户端建好——**此时一份日志也没碰**，所以凭据文件缺了或错了，两份日志逐字节不变、
+      从没持过锁；(4) KEK 读进 `KeyRing` 后**立刻擦掉**载入器里的那份；密钥文件载入；两个密钥号都必须在里面——错的 KEK、坏掉或缺的密钥文件、不存在的密钥号都在打开任何日志之前被拒绝；(5) 两份日志必须已经存在
+      （sink 的构造会**创建**缺失的日志，打错路径就会 “列出” 一个空库）；(6) 审计日志以 `OperatorOpen` 打开——**这就是独占锁，所以交易进程必须已停**——然后是控制面日志；两者都打开并检查通过之后，**才** `begin_operator_session()`：
+      栅栏从锁之后的第一次 `serverTime` 起算，在锁之前的读数是保护不了任何东西的栅栏；(7) `--list` 打印后退出；否则结清一个订单（每次运行一个，下一个再运行一次——幂等）。**任何一步失败都不写任何日志**；写日志的只有流程最后那一步，且只写那一帧。
+    - **密钥材料与凭据**：KEK 经 `KekLoader` 从 `--kek-file` 读（0600 / 不是符号链接 / 恰好 32 字节 / 锁内存 / 擦除，这些检查对着给定的路径做）；日志密钥来自 `--key-file`（`HYKEYS01` 包裹密钥，`load_audit_key_file()`）加**显式**的密钥号——
+      `KeyRing` 不能枚举密钥号，不猜；一个日志只在它被写入时的密钥号下打开，错的密钥号是 `Corrupt`（“未授权的身份替换”）而不是写入。凭据来自 `--credentials-file`（`SecureEnvLoader`：0600、不是符号链接、至多 4096 字节、锁内存），
+      **专用只读密钥，名字是工具自己的**：`EnvironmentBinding::operator_testnet()` / `operator_production()` 是各自交易孪生的**副本**（同主机、同 WS 主机、同传输策略，由构造保证），只换两个名字——
+      `HENGYUAN_OPERATOR_TESTNET_API_KEY` / `HENGYUAN_OPERATOR_TESTNET_API_SECRET`、`HENGYUAN_OPERATOR_LIVE_API_KEY` / `HENGYUAN_OPERATOR_LIVE_API_SECRET`；载入器的白名单只含所选环境的那两个，
+      **所以带着交易密钥名字的文件（或工具的名字旁边多一个任何别的名字）在读到任何一个值之前就被拒绝**，选了另一个环境的名字也是。私有的 `with_credential_env_keys()` 是这类绑定存在的唯一途径，只有这两个工厂调用它（守卫）。
+      **路径来自命令行**——`kek_loader.hpp` 与 `env_loader.hpp` 的注释写着它们的路径不来自命令行（编译进去的或调用者决定的常量）。那条规则保护无人值守的进程；这个工具由操作员运行，操作员是它所读一切的信任根，
+      载入器对文件本身做的每一项检查对给定的任何路径照做。（前一个离线工具 `durable_audit_log_export` 把 KEK 以十六进制放在命令行上，那会出现在进程列表与 shell 历史里；文件路径不会，所以不沿用。）
+    - **终端**（`StdConsole`）：只输出可打印 ASCII，别的字节一律 `?`——流程写的每一行本来就是（账户摘要由解析出的字段组装），这是最后一跳的纵深防御：一个转义序列不能改写操作员终端上看到的东西；每次 `read_line()` 新建一个
+      `OperatorLineReader`（一个读行器只是一次读），字节源是原生标准输入适配器；**Windows 控制台里键入的字符不回显**（该适配器读的是按键事件；粘贴可用；POSIX 终端由 tty 回显）——这一点我没有在交互式控制台上验证。
+    - **证据目录**（`DirectoryEvidenceStore`）：`<审计日志>.operator-evidence/<订单号>-<读取时刻>.json`；目录不存在就建（一层，POSIX 上仅属主），原位不是目录就失败；**排他创建**（已存在的文件绝不被碰，更不覆盖），写完刷盘，POSIX 上再刷目录项，
+      然后才说 “已存储”——流程在这之后才写帧；任何一步失败都不留文件（目录项刷不下去的，已建的文件也删掉）。Windows 上用到的调用没有目录刷新，只做了 `FlushFileBuffers`。文件名 stem 只含 `[A-Za-z0-9._-]`、至多 128 字符，
+      路径分隔符、盘符冒号、`..` 进不去。
+    - **退出码**：0 = 订单已结清、帧已持久（`--list`、`--help` 也是 0）；2 = 命令行；3 = KEK、密钥文件或密钥号；4 = 日志（缺失、被锁、围栏、没有干净恢复）；5 = 凭据或交易所客户端；6 = 会话没能开始；
+      40 + 流程状态（`ResolveStatus`，例如 55 证据没有显示 “无此单”、57 没有确认、59 帧没能追加）；70 = 没有人预料的异常。**除 0 之外的每个码都表示没有写帧，可能的例外只有 59 与 70**——用法文字这样写，说明跑 `--list` 看订单是否还在。
+    - **限流器与信任库**：客户端接一个与交易 demo 同样配置的 `SpotRateLimitTracker`（6000 权重 / 分钟减 500 的余量；Reconciliation 车道得到剩余的 10% = 550；最坏的一次运行——一次点查、十四个 `allOrders` 窗口、`openOrders`、账户——
+      权重 384，再加约十二次时钟读数各 1，约 396）。`RealExchangeProvider` 默认要求 `client.init()`（机器自己的 TLS 信任库不空）：**这台 Windows 机器上 OpenSSL 的默认 CA 路径不存在，所以工具在这里会明确拒绝启动**（客户端没有别的信任来源，工具也不另加）——
+      真跑要在 OpenSSL 有 CA 包的机器上（Linux 主机或 WSL）。`TrustStoreCheck` 的 Skip 档只给测试用（本地假交易所的证书通过测试接缝受信，检查看不见），`main()` 用默认值，守卫钉住。
+    - **`--list` 并非严格只读**：它也要拿两份日志的独占锁（所以交易进程必须已停），恢复扫描也可能裁掉撕裂的尾巴（交易进程重启时同样会做）；它不要凭据、不发任何请求、不写帧。
+    - **守卫**（操作员守卫 24 → 31）：每个头被谁包含都钉成清单（流程头现在只被工具头包含，传输头只被真实交易所头与入口包含，新增的四个头各有自己的清单）；`OperatorOpen` 只被 sink 头、流程头与工具头命名，工具头恰好一次；
+      三个无 Boost 的头有精确 include 列表且不命名任何 Boost / OpenSSL / 客户端 / 凭据类型；五个文件不命名任何下单 / listenKey / exchangeInfo / 原始读 / `PrivateRestEndpoint`；两个操作员工厂只被绑定头（定义）与真实交易所头（各一次使用）命名，
+      五个文件不命名交易工厂 `testnet` / `production`；`run_parsed()` 里交易所 → KEK → 擦 KEK → 密钥文件 → 日志存在 → 审计日志（`OperatorOpen`）→ 控制面日志 → `--list` 停 → `begin_operator_session()` → 一次 `resolve_order()` 的顺序，
+      密钥块读后即擦；证据目录写入器只用排他创建且刷盘在先、只有一处 `remove`；`main()` 的整个函数体是钉住的文本，不命名任何存储、密钥或 `TrustStoreCheck`。
+    - **验证**：新增 test_operator_resolution_cli（26）、test_operator_resolution_tool（40）、test_operator_resolution_real_exchange（13；仅 HY_BUILD_DEMO 下）、守卫 24 → 31、test_binance_environment 25 → 30。
+      MSVC 全量（`/W4 /WX`）构建零警告零错误；全量 ctest 3210 个用例：3208 通过（含 1 个既有跳过）、2 个既有禁用、0 失败（相对 R3b-1 合并时的 3119 恰好多 91 项 = 26 + 40 + 13 + 7 + 5）。
+      WSL2 的虚拟机连续两次建不出来（HCS 0x800705aa：宿主内存余量不足），按 `CLAUDE.md` 的约定改在 tokyo-vps 上验证（2 vCPU / 5.9 GB，GCC-14.2）：触及的 10 个目标（cli 26、工具 42、真实交易所 14、守卫 31、流程 58、传输 36、环境 30、
+      私有 REST 147、原始读 32、冻结守卫 24；工具与真实交易所多出的 2 与 1 个是只在 Linux 上编译的用例：KEK 与凭据文件的权限、KEK 的符号链接）`none`（Release，`-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wshadow`）
+      构建零警告、全部通过；同样 10 个目标 ASan+UBSan（detect_stack_use_after_return、halt_on_error）零报告。完整的 `none` / ASan / TSan / ARM64 矩阵由 CI 与那唯一一次手动 sanitizer 运行给出。
+      **变异检查**（306 个独特变异：参数文法 78、终端 44、工具 128、真实交易所 37、绑定 12、入口 7；三份 MSVC 副本并行，每个变异先重建再运行；构建失败不算检出）= **283 杀死 + 12 等价 + 11 无法触发，0 个无法解释**。
+      其中 4 个只有 POSIX 的测试能杀（TM42、TM43 目录权限；TL24、TL25 KEK 权限与符号链接的文字），在 VPS 上用 GCC 单独检出；11 个原写法因 `/WX` 的未使用变量 / 参数告警构建失败，已改写后重跑，不算检出。
+      首轮暴露并用测试关闭的真实缺口：最后一个控制字符（0x1f）也必须被控制台替换（TM04）；解析被拒绝时不得把已收集的一半选项交出去（CL68）；真实工具里端口自己的 500 ms 配速没有被任何测试看着（RE24）——真实交易所测试现在断言除第一个请求外
+      每个请求之前都隔了一个间隔。只有守卫能杀的 6 个（RE07 载入器不擦、RE18 客户端不接限流器、TL72 不擦 KEK、TL82 不擦密钥块、TM30 / TM35 证据目录写入器的文本与顺序）：这些行为从外面看不见，守卫钉的是文本与顺序。
+      12 个等价：CL66（`--list` 里的同路径检查：凭据路径为空，不可能与必填路径相同）、RE09 / RE10（绑定错误与空凭据指针互相蕴含）、RE15（订单限额：读请求只记权重）、RE16（限流器不配置时的默认值正好是我们配置的那组数）、TL92 / TL93
+      （围栏标志与恢复状态互相蕴含）、TL128（空操作）、TM38 / TM39 / TM41 / TM44（占了目录位置的文件、没建成的目录——后面的 `create()` 本来就会失败）。11 个无法触发：RE25（解析之后环境不可能越界）、TL116（追加失败的说明：需要真实的 I/O 故障）、
+      TL26 / TL27 / TL28（没有输入能触发的状态的文字：读错误、锁失败、不可用的审计日志上的会话）、TL55 / TL56（要写满 4096 个只有意图的订单或 1024 个已结清订单才看得出的两个计数）、TL78（密钥文件读不出）、
+      TM32 / TM36 / TM37（`fsync` / 目录刷新失败、异常出口：需要有故障的文件系统）。
+    - **仍未覆盖**：L-50 的附加防线（“发送时间早于第一个命名该 id 的快照” ⇒ `Unknown`；**R3b-3，须在 Owner 第一次真跑之前合入**）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的前置）；`-2013` 的真实状态码、读延迟 L
+      与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练——若不带，流程以 `AccountUnverified` 拒绝，那时需要 Owner 决定）；工具对真实交易所的任何一次运行；Windows 控制台的回显。
+
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/
