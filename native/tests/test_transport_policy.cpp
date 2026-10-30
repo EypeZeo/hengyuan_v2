@@ -201,6 +201,7 @@ TEST(EndpointPermitBounds, EachKindGetsItsOwnCapUnderTheDefaultPolicy) {
         {ResponseKind::ExchangeInfo, 1024u * 1024},
         {ResponseKind::Klines, 1024u * 1024},
         {ResponseKind::DepthSnapshot, 1024u * 1024},
+        {ResponseKind::OrderList, 1024u * 1024},
     };
     for (const Row& r : rows) {
         const auto permit = issue_endpoint_permit(p, "api.binance.com", r.kind);
@@ -214,7 +215,7 @@ TEST(EndpointPermitBounds, EachKindGetsItsOwnCapUnderTheDefaultPolicy) {
 TEST(EndpointPermitBounds, NoKindAsksForMoreThanTheDefaultPolicyCeiling) {
     const TransportPolicy p{};
     for (const ResponseKind k : {ResponseKind::ServerTime, ResponseKind::SignedJson, ResponseKind::ExchangeInfo,
-                                 ResponseKind::Klines, ResponseKind::DepthSnapshot}) {
+                                 ResponseKind::Klines, ResponseKind::DepthSnapshot, ResponseKind::OrderList}) {
         EXPECT_LE(response_cap_bytes(k), p.max_response_bytes) << static_cast<int>(k);
         EXPECT_GT(response_cap_bytes(k), 0u) << static_cast<int>(k);
     }
@@ -224,7 +225,7 @@ TEST(EndpointPermitBounds, ThePolicyCeilingClampsEveryKindAndNeverRaisesOne) {
     TransportPolicy p{};
     p.max_response_bytes = 10 * 1024;
     for (const ResponseKind k : {ResponseKind::ServerTime, ResponseKind::SignedJson, ResponseKind::ExchangeInfo,
-                                 ResponseKind::Klines, ResponseKind::DepthSnapshot}) {
+                                 ResponseKind::Klines, ResponseKind::DepthSnapshot, ResponseKind::OrderList}) {
         const auto permit = issue_endpoint_permit(p, "api.binance.com", k);
         ASSERT_TRUE(permit.has_value());
         EXPECT_EQ(permit->max_body_bytes(), 10u * 1024) << "a tighter ceiling wins, kind " << static_cast<int>(k);
@@ -249,7 +250,7 @@ TEST(EndpointPermitBounds, AZeroCeilingOrAnUnknownKindIsRefused) {
 TEST(EndpointPermitBounds, TheAllowlistIsStillCheckedWhateverTheKind) {
     const TransportPolicy p{};
     for (const ResponseKind k : {ResponseKind::ServerTime, ResponseKind::SignedJson, ResponseKind::ExchangeInfo,
-                                 ResponseKind::Klines, ResponseKind::DepthSnapshot}) {
+                                 ResponseKind::Klines, ResponseKind::DepthSnapshot, ResponseKind::OrderList}) {
         EXPECT_FALSE(issue_endpoint_permit(p, "evil.com", k).has_value()) << static_cast<int>(k);
     }
 }

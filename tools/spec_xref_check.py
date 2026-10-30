@@ -156,6 +156,9 @@ SEARCH_FILES = [
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_ports.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_bundle.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_flow.hpp",
+    # D5 slice R3b-1 (docs/SPEC_INVARIANTS.md "D5 切片 R3b-1"): the offline tool's real exchange port over the private REST client --
+    # BinanceExchangeReadPort, RealSleeper, summarize_account(), and the client's raw reads live here or are used here.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_transport.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

@@ -16,8 +16,10 @@
 //   resolve_order()
 //     1. refuse what is knowable without the exchange (an unknown or already-resolved order, a DryRun order, an order the
 //        shared rule refuses, a full resolved-table, a symbol the control-plane log cannot name): no traffic, no wait;
-//     2. wait until the exchange clock says lock + W + B + margin + L, re-reading it (never trusting the local clock for the
-//        fence itself); give up if the exchange clock does not keep up;
+//     2. ask the exchange which account the API key belongs to and refuse unless it is the uid the operator stated (a wrong key or
+//        a wrong environment would make every answer below an answer about somebody else's orders; this is not evidence and costs
+//        no waiting), then wait until the exchange clock says lock + W + B + margin + L, re-reading it (never trusting the local
+//        clock for the fence itself); give up if the exchange clock does not keep up;
 //     3. read the evidence -- the point query, every allOrders window of the plan, openOrders -- all of it after that moment;
 //     4. put the raw answers into the evidence file and store it BEFORE anything else happens;
 //     5. ask conclude_absent() whether the evidence is complete and clean, without the operator's word: if it is not, say why
@@ -158,8 +160,8 @@ inline std::vector<UnresolvedOrderSummary> list_unresolved_orders(const DurableA
 
 struct OperatorResolutionRequest {
     std::string_view client_order_id;
-    OperatorEnvironment environment{static_cast<OperatorEnvironment>(255)};  // what the operator says; unverified (L-48)
-    std::uint64_t account_uid{0};                                            // ditto
+    OperatorEnvironment environment{static_cast<OperatorEnvironment>(255)};  // what the operator says; the log cannot confirm it (L-48)
+    std::uint64_t account_uid{0};  // what the operator says; resolve_order() checks it against what the exchange reports for the key
     std::string_view operator_label;  // goes into the frame's detail_msg as "op=<label>"
     std::uint16_t tool_version{kOperatorToolVersion};
     std::chrono::milliseconds confirm_timeout{kDefaultConfirmTimeout};
@@ -186,6 +188,8 @@ enum class ResolveStatus : std::uint8_t {
     NotConfirmed = 17,
     AppendRefused = 18,
     AppendFailed = 19,
+    AccountUnverified = 20,   // the exchange did not report the uid of the account the key belongs to (request failed, no single uid)
+    AccountUidMismatch = 21,  // it did, and it is not the uid the operator stated: see OperatorResolutionOutcome::exchange_account_uid
 };
 
 constexpr std::string_view resolve_status_name(ResolveStatus s) noexcept {
@@ -210,6 +214,8 @@ constexpr std::string_view resolve_status_name(ResolveStatus s) noexcept {
         case ResolveStatus::NotConfirmed: return "NotConfirmed";
         case ResolveStatus::AppendRefused: return "AppendRefused";
         case ResolveStatus::AppendFailed: return "AppendFailed";
+        case ResolveStatus::AccountUnverified: return "AccountUnverified";
+        case ResolveStatus::AccountUidMismatch: return "AccountUidMismatch";
     }
     return "Unknown";
 }
@@ -244,6 +250,7 @@ struct OperatorResolutionOutcome {
     OperatorResolutionAppend append{};
     ExchangeMs lock_ref{};
     ExchangeMs read_ref{};
+    std::optional<std::uint64_t> exchange_account_uid;  // what the exchange reported for the key's account; unset if it was not asked or did not say
     std::string evidence_digest_hex;  // empty unless an evidence file was built
     std::string evidence_stem;        // the name handed to the evidence store
 };
@@ -338,6 +345,21 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
         out.plan = plan_all_orders_windows(earliest_range.start, earliest_range.end).status;
         if (out.plan != PlanStatus::Ok) return stop(ResolveStatus::NoUsableRange);
     }
+    // Which account does this key belong to? The operator typed a uid; the exchange says which one the key reads. They must agree before
+    // anything is waited for or read as evidence: with a wrong key or a wrong environment, every answer below would be an answer about
+    // somebody else's orders. It is a single request, it is not evidence (conclude_absent() never sees it) and it comes after every
+    // refusal that needs no traffic. The summary it brings is what the operator is shown later; the uid is also written into the evidence.
+    const AccountView account = exchange.account();
+    out.exchange_account_uid = account.uid;
+    if (!account.uid) {
+        console.write_line("the exchange did not report the uid of the account this API key belongs to: nothing was written");
+        return stop(ResolveStatus::AccountUnverified);
+    }
+    if (*account.uid != req.account_uid) {
+        console.write_line("this API key belongs to account uid " + std::to_string(*account.uid) + ", not to the uid " +
+                           std::to_string(req.account_uid) + " you stated: nothing was written");
+        return stop(ResolveStatus::AccountUidMismatch);
+    }
     const std::int64_t wait_cap_ms = (earliest->count() - session.lock_ref.count()) + kFenceWaitSlackMs;  // both plausible: no overflow
     std::vector<BundleTimeReading> readings;
     readings.push_back({"lock", session.lock_ref.count()});
@@ -400,7 +422,6 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
         if (!r.transport_ok) return stop(ResolveStatus::EvidenceReadFailed);
         verdicts.open_orders = classify_open_orders_page(r.http_status, r.body, coid);
     }
-    const std::string account = exchange.account_summary();
 
     // 4. the conclusion without the operator's word, and the evidence file
     AbsentConclusionInput in{};
@@ -424,6 +445,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     header.symbol = symbol;
     header.environment = req.environment;
     header.account_uid_claimed = req.account_uid;
+    header.account_uid_reported = account.uid;
     header.fence = session.fence;
     header.lock_ref = session.lock_ref;
     header.read_ref = read_ref;
@@ -431,7 +453,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     header.range_start = range.start;
     header.range_end = range.end;
     header.time_readings = std::move(readings);
-    header.account_summary = account;
+    header.account_summary = account.summary;
     const std::string bundle = build_evidence_bundle(header, calls, verdicts);
     out.evidence_digest_hex = sha256_hex(bundle);
     out.evidence_stem = detail::evidence_stem(coid, read_ref.count());
@@ -459,7 +481,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     console.write_line("state in the log: " + std::string(order_state_name(cp.resulting_state)) + "  send started (log time, ms): " +
                        (cp.send_started_utc_ms != 0 ? std::to_string(cp.send_started_utc_ms) : std::string("unknown")));
     console.write_line("environment (stated by you): " + std::string(environment_name(req.environment)) +
-                       "  account uid (stated by you, NOT verified by this tool): " + std::to_string(req.account_uid));
+                       "  account uid (stated by you; the exchange reports the same for this API key): " + std::to_string(req.account_uid));
     console.write_line("exchange clock: lock " + std::to_string(session.lock_ref.count()) + "  read " + std::to_string(read_ref.count()) +
                        "  waited " + std::to_string(waited_seconds(session.lock_ref, read_ref)) + " s  (W " +
                        std::to_string(session.fence.recv_window_ms / 1000) + " s, B " + std::to_string(session.fence.clock_skew_ms / 1000) +
@@ -469,10 +491,10 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     console.write_line("allOrders: " + std::to_string(verdicts.all_orders.size()) + " window(s) from " +
                        std::to_string(range.start.count()) + " to " + std::to_string(range.end.count()) + ", all Clear");
     console.write_line("openOrders: " + std::string(verdict_name(verdicts.open_orders)));
-    if (account.empty()) {
+    if (account.summary.empty()) {
         console.write_line("account summary (display only): not available");
     } else {
-        console.write_line("account summary (display only): " + account);
+        console.write_line("account summary (display only): " + account.summary);
     }
     console.write_line("If you confirm, the order is closed as Rejected: the exchange has no such order and never will.");
     console.write_line("This tool cannot check, so YOU must have:");

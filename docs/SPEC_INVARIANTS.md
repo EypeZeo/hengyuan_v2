@@ -536,6 +536,43 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       `-2013` 的真实状态码与读延迟 L（R6，Testnet 演练——回环假交易所只证明**过程**，不证明交易所的行为）。**账户 UID 与环境只是操作员的声明**，工具验不了（L-48）；**品种名与审计日志之间没有绑定**
       （L-50），所以短语把品种名亮给操作员、假设 A-D5-4 要他自己核对。确认的等待最长 5 分钟，期间已读的证据不会更新——持锁时旧进程已停是 A-D5-1，由操作员保证，工具查不了。
 
+  - **[D5 切片 R3b-1 已落地：离线工具的真实交易所读——客户端的原样回传 GET、`BinanceExchangeReadPort`、账户 UID 核对]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-29 “开始R3b-1，按推荐”；Tier B；PR #212）：R3a 四个端口里的**交易所读**现在有了真实实现，走已有的认证 REST 客户端；
+    **仍然没有命令行、没有 KEK / 密钥来源、没有证据目录与终端适配器**（R3b-2）；测试里只有回环 TLS 夹具与合成凭据，**没有任何真实流量，也没有 Testnet 流量**。
+    - **缺口与做法**：客户端交易路径的 `fetch_signed_body_coro()` 把 200 以外的一切状态折成 HttpStatus 并扔掉正文，而工具唯一的 “订单不存在” 证据就是 HTTP 400 的正文 `{"code":-2013}`；
+      SignedJson 的 256 KiB 上限也装不下一页 `allOrders`（最多 1000 个订单，约 0.6 MB）。所以新增**一条并行的协程** `fetch_signed_raw_coro()`：只能 GET（动词不是参数），**任何**状态都连同正文原样返回；
+      其余与孪生者一样严——许可的主机与响应上限、预算许可、逐阶段超时、用后关闭连接、异常折成当时的阶段（超出上限是 Read 失败，不是被截断的答案）。**交易路径的三条协程、`PrivateRestEndpoint`、`query_order()`、
+      `fetch_account()` 一个字没动**（唯一被删的一行是 `sync_clock()` 的函数头，函数体原样搬进私有的 `sync_clock_impl()`）。
+    - **客户端新方法**（都是 `noexcept`；只在交易所真的回答时才给 `out` 赋值——任何 HTTP 状态都是回答，只有传输会失败）：`fetch_order_raw()`（`/api/v3/order`，权重 4）、`fetch_all_orders_raw()`
+      （`/api/v3/allOrders` 的一页，`limit` 1..1000，权重 20）、`fetch_open_orders_raw()`（`/api/v3/openOrders` 不带品种，权重 80）、`fetch_account_raw()`（`/api/v3/account?omitZeroBalances=true`，权重 20）、
+      `read_server_time()`（与 `sync_clock()` 同一次往返、同样发布时钟快照与同样的拒绝，并把交易所的 `serverTime` 交出来）。共用私有的 `signed_get_raw()`，顺序与兄弟方法一致：入口守卫 → 许可
+      → 时钟门（`ClockNotFresh`：不签名不发送）→ 预算（在时钟门之后：过期的时钟不烧预算）→ 签名 → 网络；本地拒绝一律不发送、不赋值。`PrivateRestEndpoint` 是 L4 spec 的转录、封闭的，
+      **没有 `allOrders` / `openOrders` 的槽位**，所以这两个用显式权重（20、80，Binance 文档的 IP 权重），与 listenKey 的先例同型；都记在 Reconciliation 车道。
+    - **ResponseKind 新档 OrderList = 1 MiB**（`allOrders` 的一页与 `openOrders`；等于默认策略上限，`static_assert` 钉住不超过它）；点查询与账户仍用 SignedJson（256 KiB）——两档的接线由测试钉住（300 KiB 的答案：
+      页可以、点查询与账户不行）。
+    - **传输头**（`operator_resolution_transport.hpp`，仅离线工具）：`BinanceExchangeReadPort`（实现 `ExchangeReadPort` 的五个读）、`RealSleeper`、`summarize_account()`。端口多做四件事：
+      (1) **原样**：任何状态连同正文；没完成的请求是 `transport_ok == false`，**绝不是空的 200**；
+      (2) **配速**：相邻两个请求之间固定隔 `kDefaultRequestSpacing`（500 ms），经注入的 `SleepPort` 睡（第一个请求之前不睡；客户端本地拒绝的请求没有到网络，不算数）；
+      (3) **限流闩**：回答是 429 / 418 / 403 就把回答原样交出，**此后什么也不再发**（每个读都失败为 “未完成”，`halted()` 为真）——再追着一个刚说过停的交易所发请求，就是 429 变 418 的路；
+      (4) **一次时钟刷新**：客户端说 `ClockNotFresh`（快照 5 分钟过期）时读一次 `serverTime`（这本身就发布快照），把同一个请求重发**一次**；此前什么都没签、没发。其它任何失败**不重发**。
+    - **账户 UID 核对（改了 R3a 的端口与流程）**：R3a 的 `account_summary()`（自由文本）换成 `account()`，返回 `AccountView{summary, uid}`。`resolve_order()` 在**所有无需流量的拒绝与区间预检之后、第一次等待与第一个证据请求之前**
+      问**一次**账户：交易所没说出 UID（请求失败，或答案里不是恰好一个正整数 `uid`）→ `ResolveStatus::AccountUnverified`（20）；说出的与操作员声明的不同 → `AccountUidMismatch`（21，
+      `OperatorResolutionOutcome::exchange_account_uid` 带回交易所说的）。两种都**不写任何东西、不问任何人**（两份日志逐字节不变）。证据文件新增 `account_uid_reported`（与 `account_uid_claimed` 并排；
+      格式名 `hy-operator-evidence/1` 不变——还没有任何真实文件）；确认页的文字从 “未验证” 改为 “由您声明；交易所对这把 API 密钥报告的相同”。**这验证的是 “操作员说的 UID 就是这把密钥读到的账户”，
+      不是 “订单是从这个账户发出的”**——日志里仍没有记录订单发往哪个账户（L-48，R5）。
+    - **`summarize_account()`**（纯函数）：UID 必须是**恰好一个**正整数成员 `uid`（重复键、浮点、负数、字符串、0、超出 64 位一律没有 UID）；摘要行**只由解析出的字段组装**——账户类型、权限、前 8 个余额的 free / locked，
+      名字只留 `[A-Za-z0-9._-]`、其余每字节一个 `?`、最多 16 字符，金额只认 “数字加至多一个内部小数点、≤ 24 字符”，整行 ≤ 640 字符，永远是可打印 ASCII 的单行（对 0..255 的每个码点验证过）。
+    - **守卫**：冻结守卫的连接钉子 3 → 4（async_resolve / async_connect 各 4）、签名点与时钟令牌点 3 → 4，并新增：原始协程只命名 verb::get、签名里没有动词参数、不比较 http::status::ok；
+      协程只有一个调用者（`signed_get_raw()`，恰五处命名）。操作员守卫新增：传输头不被任何生产文件包含；五个原始读只被客户端（定义）与传输头（各一次调用）命名；传输头不命名任何下单 / listenKey /
+      exchangeInfo / HTTP 动词；流程里账户先于第一次等待与第一个证据请求、两个拒绝先于第一次睡眠、端口里没有自由文本的账户摘要了。
+    - **验证**：新增 test_binance_private_rest_raw（32；对着可编排的回环 TLS 夹具：任何状态与正文逐字节回传、请求形状与签名按 HMAC 重算核对、百分号编码、预算边界——每个读恰好差 1 权重被拒、恰好够用一次、再要就拒且不发送、体积上限的两侧边界与 OrderList / SignedJson 两档的接线、静默 / 截断 / 断连 / 拒绝连接 / 握手超时 / 不被信任的证书 / 主机名不符 / 响应头超限、`read_server_time()` 的失败不改输出）、test_operator_resolution_transport（36；`summarize_account()` 的表驱动与对 0..255 每个码点的可打印 ASCII 验证、端口的配速 / 闩 / 时钟刷新 / 不重发、整个 `resolve_order()` 对着真实 TLS 的五条路径）、流程测试 51 → 58、守卫 19 → 24、冻结守卫 +3。
+      MSVC 全量（`/W4 /WX`）构建零警告零错误；全量 ctest 3119 个用例：3117 通过（含 1 个既有跳过）、2 个既有禁用、0 失败。WSL2 GCC-14 `none` 全量 3125 通过、0 失败（相对 R3a 合并时恰好多 83 项）；ASan+UBSan 在 12 个触及目标上共 489 个用例（64 + 24 + 19 + 9 + 58 + 24 + 24 + 32 + 20 + 32 + 36 + 147）零报告。
+      **变异检查**：208 个变异（传输头 118、客户端原始读 68、流程 15、证据文件 4、响应上限 3）= 196 杀死 + 5 等价 + 7 无法触发的防御分支，0 个无法解释（另有 10 个原写法因 `/WX` 的未使用变量 / 参数告警构建失败，已改写后重跑，不算检出）。其中 FU06 由守卫杀死，RC04（去掉显式的 header_limit）只有冻结守卫的文本钉子能杀——许可的响应头上限与 Beast 的默认上限恰好同为 8 KiB。
+      首轮暴露并用测试关闭的真实缺口：失败的时钟刷新不得为不会发生的重发多等一个间隔（TR112）；原始协程的主机名校验（RC14）——我原先的 “换主机证书” 用例因证书链不被信任而失败，没有测到主机名，改为信任签发它的根 CA，只让名字不符；`allOrders` 的 `end` 比 `start` 早 1 ms 必须被拒（RC43）；以及 `RealSleeper` 本身、名字截断长度、各类本地拒绝不算 “已发出” 的计数、`limit` 透传、失败不重发、握手阶段与超时的归属。
+      5 个等价变异：TR11、TR12（对 0 或负数 `sleep_for` 本来就立即返回）、TR14（类型错误时值仍为 0，被 “UID 必须为正” 兜住）、TR86（`!transport_ok` 与 `http_status != 200` 互为冗余）、RC16（显式 `close()` 与流析构等价）。7 个无法触发：TR53、RC29、RC62（异常出口，需要 bad_alloc）、TR108、TR111（重试次数已由循环上界限定、刷新不会连续失败两次）、RC09（对回环夹具无法让写阶段失败）、RC30（密钥已绑定时 `key_len == 0` 不可能）。
+    - **仍未覆盖**：命令行、KEK / 密钥来源、证据目录与终端适配器（R3b-2）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的前置）；`-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**
+      （R6，Testnet 演练——回环夹具只证明**过程**，不证明交易所的行为；若 Testnet 不带 `uid`，流程会以 `AccountUnverified` 拒绝，那时需要 Owner 决定）。L-50 的附加防线（“发送时间早于第一个命名该 id 的快照” ⇒ `Unknown`）仍未做，留给 R3b-2。
+
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/

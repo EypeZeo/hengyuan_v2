@@ -147,6 +147,7 @@ enum class ResponseKind : std::uint8_t {
     ExchangeInfo = 2,   // GET /api/v3/exchangeInfo for a symbol filter (fewer than kMaxSymbols symbols)
     Klines = 3,         // GET /api/v3/klines, one page
     DepthSnapshot = 4,  // GET /api/v3/depth
+    OrderList = 5,      // GET /api/v3/allOrders (one page) and GET /api/v3/openOrders: the offline operator tool only (D5 R3b-1)
 };
 
 // Body cap per kind, in bytes. 0 = not a kind this build knows (no permit is ever issued for it).
@@ -158,6 +159,10 @@ enum class ResponseKind : std::uint8_t {
 //                  answer (several MiB) is not a production shape and is refused here by design.
 //   Klines         up to 1000 bars of about 120 bytes per page.
 //   DepthSnapshot  up to 1000 levels per side at about 40 bytes.
+//   OrderList      one allOrders page holds up to 1000 orders of about 0.6 KiB each (roughly 600 KB), which the 256 KiB
+//                  of SignedJson cannot carry; 1 MiB is the default policy ceiling, so it needs no policy change. (A page
+//                  of exactly 1000 is refused by the operator tool as possibly truncated anyway; the cap has to hold every
+//                  page that can be believed.) openOrders without a symbol is bounded by the account's open orders.
 [[nodiscard]] inline constexpr std::size_t response_cap_bytes(ResponseKind kind) noexcept {
     switch (kind) {
         case ResponseKind::ServerTime: return 64 * 1024;
@@ -165,6 +170,7 @@ enum class ResponseKind : std::uint8_t {
         case ResponseKind::ExchangeInfo: return 1024 * 1024;
         case ResponseKind::Klines: return 1024 * 1024;
         case ResponseKind::DepthSnapshot: return 1024 * 1024;
+        case ResponseKind::OrderList: return 1024 * 1024;
     }
     return 0;
 }
@@ -180,6 +186,7 @@ static_assert(response_cap_bytes(ResponseKind::SignedJson) <= TransportPolicy{}.
 static_assert(response_cap_bytes(ResponseKind::ExchangeInfo) <= TransportPolicy{}.max_response_bytes);
 static_assert(response_cap_bytes(ResponseKind::Klines) <= TransportPolicy{}.max_response_bytes);
 static_assert(response_cap_bytes(ResponseKind::DepthSnapshot) <= TransportPolicy{}.max_response_bytes);
+static_assert(response_cap_bytes(ResponseKind::OrderList) <= TransportPolicy{}.max_response_bytes);
 
 // Proof that `host` passed check_endpoint() against a policy, and of the most the answer may be allowed to
 // carry. The only way to obtain one is issue_endpoint_permit() below. The network coroutines of every REST

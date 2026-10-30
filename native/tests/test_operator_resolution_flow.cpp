@@ -28,6 +28,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -58,7 +59,7 @@ constexpr std::int64_t kT0 = 1'790'000'000'000;  // the exchange time at which t
 constexpr std::int64_t kFenceMs = kDefaultEvidenceWaitMs;  // 270 s
 constexpr std::int64_t kSendAt = kT0 - 599'000;   // the Prepared frame's time: when the send started
 constexpr std::uint32_t kKeyId = 1;
-constexpr std::uint64_t kUid = 123456789;
+constexpr std::uint64_t kUid = kFakeAccountUid;  // the uid the fake exchange reports for its key, unless a test says otherwise
 
 struct OrderSpec {
     std::string coid;
@@ -387,7 +388,8 @@ TEST_F(FlowTest, ResolvesAnAbsentOrderAfterTheFenceAndTheOperatorsPhrase) {
     EXPECT_TRUE(rig_->console.printed("== operator resolution: order HY-1789999399000-1-0A0A =="));
     EXPECT_TRUE(rig_->console.printed("symbol: BTCUSDT (id 0)  side: Sell  quantity: 100 ticks  price: 500000 ticks  mode: Live"));
     EXPECT_TRUE(rig_->console.printed("state in the log: Ambiguous  send started (log time, ms): 1789999401000"));
-    EXPECT_TRUE(rig_->console.printed("environment (stated by you): TESTNET  account uid (stated by you, NOT verified by this tool): 123456789"));
+    EXPECT_TRUE(rig_->console.printed(
+        "environment (stated by you): TESTNET  account uid (stated by you; the exchange reports the same for this API key): 123456789"));
     EXPECT_TRUE(rig_->console.printed("exchange clock: lock 1790000000000  read 1790000270000  waited 270 s  (W 60 s, B 60 s, margin 30 s, read lag L 120 s)"));
     EXPECT_TRUE(rig_->console.printed("point query: NoSuchOrder"));
     EXPECT_TRUE(rig_->console.printed("allOrders: 1 window(s) from 1789999279000 to 1790000270000, all Clear"));
@@ -772,11 +774,12 @@ TEST_F(FlowTest, ASessionThatIsNotReadyIsNotUsedEvenWithItsPointersSet) {
 }
 
 TEST(FlowNames, EveryStatusAndEveryConclusionHasItsOwnName) {
-    const std::array<std::string_view, 20> statuses{
+    const std::array<std::string_view, 22> statuses{
         "NotRun",          "Resolved",           "BadRequest",       "SessionNotReady",     "AuditNotUsable",
         "NoSuchUnresolvedOrder", "AlreadyResolvedThisSession", "DryRunOrder", "NotResolvable", "TableFull",
         "SymbolNameNotKnown", "ServerTimeUnavailable", "FenceWaitTimedOut", "NoUsableRange", "EvidenceReadFailed",
-        "EvidenceNotAbsent", "EvidenceStoreFailed", "NotConfirmed", "AppendRefused", "AppendFailed"};
+        "EvidenceNotAbsent", "EvidenceStoreFailed", "NotConfirmed", "AppendRefused", "AppendFailed", "AccountUnverified",
+        "AccountUidMismatch"};
     for (std::size_t i = 0; i < statuses.size(); ++i) {
         EXPECT_EQ(resolve_status_name(static_cast<ResolveStatus>(i)), statuses[i]) << i;
     }
@@ -1300,6 +1303,110 @@ TEST_F(FlowTest, ARefusalStillReportsWhenItsEvidenceCannotBeStored) {
     EXPECT_TRUE(logs_untouched());
 }
 
+// --- the account: the uid the operator typed against the one the key belongs to ------------------------------------------------------------------
+
+TEST_F(FlowTest, TheAccountIsAskedOnceBeforeTheWaitAndBeforeAnyEvidenceRead) {
+    prepare(ambiguous_history(kA));
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+    ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status);
+    EXPECT_EQ(rig_->exchange.count("account"), 1u);
+    ASSERT_GE(rig_->exchange.calls.size(), 3u);
+    EXPECT_EQ(rig_->exchange.calls[0].kind, "time") << "the session's own reading";
+    EXPECT_EQ(rig_->exchange.calls[1].kind, "account") << "the next thing: before the first fence reading, so before the wait";
+    EXPECT_EQ(rig_->exchange.calls[1].at_ms, kT0) << "not a single sleep before it";
+    ASSERT_TRUE(o.exchange_account_uid.has_value());
+    EXPECT_EQ(*o.exchange_account_uid, kUid);
+}
+
+// Nothing waited, nothing read as evidence, nothing stored, nobody asked, both logs as they were.
+#define EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK()                                                      \
+    do {                                                                                           \
+        EXPECT_EQ(rig_->exchange.calls.size(), 2u) << "the session's reading and the account only"; \
+        EXPECT_EQ(rig_->exchange.count("account"), 1u);                                            \
+        EXPECT_TRUE(rig_->sleeper.sleeps.empty());                                                 \
+        EXPECT_EQ(rig_->exchange.first_evidence_call_ms(), kNever);                                \
+        EXPECT_TRUE(rig_->store.attempts.empty());                                                 \
+        EXPECT_EQ(rig_->console.reads, 0);                                                         \
+        EXPECT_TRUE(logs_untouched());                                                             \
+    } while (false)
+
+TEST_F(FlowTest, AKeyThatBelongsToAnotherAccountIsRefusedBeforeAnyWaitAndNothingIsRead) {
+    prepare(ambiguous_history(kA));
+    rig_->exchange.account_uid = kUid + 1;
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+    EXPECT_EQ(o.status, ResolveStatus::AccountUidMismatch) << resolve_status_name(o.status);
+    ASSERT_TRUE(o.exchange_account_uid.has_value());
+    EXPECT_EQ(*o.exchange_account_uid, kUid + 1);
+    EXPECT_TRUE(rig_->console.printed("this API key belongs to account uid 123456790, not to the uid 123456789 you stated: nothing was written"));
+    EXPECT_EQ(o.confirmation.verdict, ConfirmationVerdict::NotAsked);
+    EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+}
+
+TEST_F(FlowTest, EveryUidButTheStatedOneIsAMismatchWhateverTheDifference) {
+    // the comparison is on all 64 bits: a uid that differs only in a high bit, below the stated one, or at the extremes is still another account
+    for (const std::uint64_t other : {kUid - 1, kUid + 1, kUid + (std::uint64_t{1} << 32), kUid ^ (std::uint64_t{1} << 63),
+                                      std::uint64_t{1}, std::numeric_limits<std::uint64_t>::max()}) {
+        fresh_paths();
+        prepare(ambiguous_history(kA));
+        rig_->exchange.account_uid = other;
+        OperatorSession session = begin();
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+        EXPECT_EQ(o.status, ResolveStatus::AccountUidMismatch) << other;
+        ASSERT_TRUE(o.exchange_account_uid.has_value()) << other;
+        EXPECT_EQ(*o.exchange_account_uid, other);
+        EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+    }
+}
+
+TEST_F(FlowTest, AnAccountTheExchangeDoesNotNameIsRefusedBeforeAnyWaitWhateverElseItSaid) {
+    prepare(ambiguous_history(kA));
+    rig_->exchange.account_uid.reset();  // the request failed, or the answer had no single positive uid -- the summary alone is no proof
+    ASSERT_FALSE(rig_->exchange.account_text.empty());
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+    EXPECT_EQ(o.status, ResolveStatus::AccountUnverified) << resolve_status_name(o.status);
+    EXPECT_FALSE(o.exchange_account_uid.has_value());
+    EXPECT_TRUE(rig_->console.printed("the exchange did not report the uid of the account this API key belongs to: nothing was written"));
+    EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+}
+
+TEST_F(FlowTest, TheAccountCheckComesAfterTheRefusalsThatNeedNoTraffic) {
+    // an unknown order never reaches the exchange at all, whatever the account says
+    prepare(ambiguous_history(kA));
+    rig_->exchange.account_uid = kUid + 1;
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(kB));
+    EXPECT_EQ(o.status, ResolveStatus::NoSuchUnresolvedOrder);
+    EXPECT_FALSE(o.exchange_account_uid.has_value()) << "not asked";
+    expect_no_traffic();
+    EXPECT_EQ(rig_->exchange.count("account"), 0u);
+}
+
+TEST_F(FlowTest, AnIntervalNoToolCanCoverIsRefusedBeforeEvenTheAccountIsAsked) {
+    const OrderSpec odd{"ORDER-NOT-OURS-1"};
+    prepare(ambiguous_history(odd, 0));
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(odd));
+    EXPECT_EQ(o.status, ResolveStatus::NoUsableRange);
+    EXPECT_EQ(rig_->exchange.count("account"), 0u);
+    EXPECT_FALSE(o.exchange_account_uid.has_value());
+}
+
+TEST_F(FlowTest, AnEmptyAccountSummaryIsShownAsNotAvailableAndDoesNotStopTheRun) {
+    prepare(ambiguous_history(kA));
+    rig_->exchange.account_text.clear();
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+    EXPECT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status);
+    EXPECT_TRUE(rig_->console.printed("account summary (display only): not available"));
+    ASSERT_EQ(rig_->store.stored.size(), 1u);
+    EXPECT_NE(rig_->store.stored[0].second.find("\"account_summary\":\"\""), std::string::npos);
+}
+
+#undef EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK
+
 // --- the evidence file ------------------------------------------------------------------------------------------------------------------------
 
 TEST_F(FlowTest, TheStoredEvidenceHoldsWhatTheDecisionRestedOn) {
@@ -1311,7 +1418,7 @@ TEST_F(FlowTest, TheStoredEvidenceHoldsWhatTheDecisionRestedOn) {
     const std::string& b = rig_->store.stored[0].second;
     for (const char* needle :
          {"\"format\":\"hy-operator-evidence/1\"", "\"tool_version\":1", "\"client_order_id\":\"HY-1789999399000-1-0A0A\"",
-          "\"symbol\":\"BTCUSDT\"", "\"environment\":\"TESTNET\"", "\"account_uid_claimed\":123456789",
+          "\"symbol\":\"BTCUSDT\"", "\"environment\":\"TESTNET\"", "\"account_uid_claimed\":123456789", "\"account_uid_reported\":123456789",
           "\"recv_window_ms\":60000", "\"clock_skew_ms\":60000", "\"margin_ms\":30000", "\"read_lag_ms\":120000",
           "\"role\":\"lock\"", "\"role\":\"wait\"", "\"role\":\"read\"", "\"point_query\":\"NoSuchOrder\"",
           "\"all_orders\":[\"Clear\"]", "\"open_orders\":\"Clear\"", "\"name\":\"order\"", "\"name\":\"allOrders\"",
@@ -1429,7 +1536,7 @@ TEST_F(FlowTest, TheListingSaysWhichOrdersTheToolCouldResolveAndWhyNotTheOthers)
 
 TEST(OperatorResolutionFlowNames, EveryStatusHasANameAndTheZeroValueIsNotASuccess) {
     std::vector<std::string_view> seen;
-    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(ResolveStatus::AppendFailed); ++v) {
+    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(ResolveStatus::AccountUidMismatch); ++v) {
         const std::string_view n = resolve_status_name(static_cast<ResolveStatus>(v));
         EXPECT_NE(n, "Unknown") << static_cast<int>(v);
         EXPECT_EQ(std::count(seen.begin(), seen.end(), n), 0) << n << " is used twice";

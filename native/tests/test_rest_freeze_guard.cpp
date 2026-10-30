@@ -27,6 +27,10 @@
 // permit, sign the subscribe request, hand it to the session -- each have exactly one production caller, the factory
 // (binance_ws_api_session_factory.hpp), so a second path that connects without the allowlist, the budget or a fresh signature is a review item.
 //
+// D5 R3b-1 adds the private client's fourth connection: the raw GET of the offline operator tool (fetch_signed_raw_coro), which hands the HTTP
+// status and the body back whatever the status is. It takes the same two permits as its three siblings and is pinned below as GET-only, with one
+// caller (the client's signed_get_raw) and one signing/clock-token site of its own; the trading path's coroutines are untouched.
+//
 // It also pins the containment of the test seam (rest_test_seam.hpp): the builder that can fill a
 // RestTestSeam is named only by that header's friend declaration, and nothing under include/ or src/ may
 // declare a connect-target override or an extra-trust-anchor member again.
@@ -121,6 +125,34 @@ std::size_t count_of(const std::string& hay, std::string_view needle) {
     return n;
 }
 
+// The signature and the body of the function whose definition starts at the first occurrence of `head` in comment-free code: the signature is
+// everything from `head` up to the opening brace, the body runs from that brace to its matching closing brace. Both empty = not found or
+// unbalanced (the callers assert non-empty, so a rename cannot make a test pass vacuously).
+struct FunctionText {
+    std::string_view signature;
+    std::string_view body;
+};
+
+FunctionText function_text(const std::string& code, std::string_view head) {
+    const std::size_t at = code.find(head);
+    if (at == std::string::npos) return {};
+    const std::size_t open = code.find('{', at);
+    if (open == std::string::npos) return {};
+    std::size_t depth = 0;
+    for (std::size_t i = open; i < code.size(); ++i) {
+        if (code[i] == '{') {
+            ++depth;
+        } else if (code[i] == '}') {
+            --depth;
+            if (depth == 0) {
+                const std::string_view all(code);
+                return {all.substr(at, open - at), all.substr(open, i + 1 - open)};
+            }
+        }
+    }
+    return {};
+}
+
 struct SourceFile {
     std::string rel;   // relative to native/, forward slashes
     std::string code;  // code_only() of the file
@@ -175,7 +207,9 @@ struct Pinned {
 // have looked at the connection it adds, moves or removes -- which, for a REST path, means giving it an
 // EndpointPermit (transport_policy.hpp) before it resolves anything.
 constexpr Pinned kPinned[] = {
-    {"include/hengyuan/binance_private_rest.hpp", 3, 3, Kind::EndpointPermit},
+    // 4 = the three the trading path and the reconciler use (signed body, public body, server time) plus the raw GET of the offline operator
+    // tool (D5 R3b-1, fetch_signed_raw_coro): it returns the status and body of any answer, so it is a coroutine of its own.
+    {"include/hengyuan/binance_private_rest.hpp", 4, 4, Kind::EndpointPermit},
     {"include/hengyuan/binance_rest_snapshot.hpp", 1, 1, Kind::EndpointPermit},
     {"include/hengyuan/binance_klines_rest.hpp", 1, 1, Kind::EndpointPermit},
     {"include/hengyuan/binance_ws_session.hpp", 1, 1, Kind::WebSocket},
@@ -387,13 +421,61 @@ TEST(RestFreezeGuardClockToken, TheTokenIsMintedOnceAndItsTestHookIsNamedOnlyByT
 }
 
 TEST(RestFreezeGuardClockToken, EveryTimestampASignedRequestIsSignedWithWasIssuedByTheClientItself) {
-    // The private client signs in three places (account, order query, order submit); each issues its own token
-    // just before. A fourth signing site that skipped the issue would not compile (build_signed_query() takes only a
-    // token), and this keeps the two counts moving together.
+    // The private client signs in four places (account, order query, order submit, and signed_get_raw() -- the one signed GET of the offline
+    // operator tool, D5 R3b-1); each issues its own token just before. A fifth signing site that skipped the issue would not compile
+    // (build_signed_query() takes only a token), and this keeps the two counts moving together.
     const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
     ASSERT_NE(f, nullptr);
-    EXPECT_EQ(count_of(f->code, "build_signed_query("), 3u);
-    EXPECT_EQ(count_of(f->code, "issue_clock_ready_token("), 3u);
+    EXPECT_EQ(count_of(f->code, "build_signed_query("), 4u);
+    EXPECT_EQ(count_of(f->code, "issue_clock_ready_token("), 4u);
+}
+
+// --- D5 R3b-1: the raw GET of the offline operator tool stays a GET, and stays behind one door ---------------
+
+TEST(RestFreezeGuardRawRead, TheRawCoroutineIsGetOnlyAndTakesNoVerb) {
+    // fetch_signed_body_coro() takes the verb as a parameter because POST /api/v3/order and the listenKey calls share it. This one returns the
+    // answer of ANY status, so it must not be able to carry an order: the verb is not a parameter and the only verb the body names is GET.
+    const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(f, nullptr);
+    const FunctionText fn = function_text(f->code, "fetch_signed_raw_coro(");
+    ASSERT_FALSE(fn.body.empty()) << "fetch_signed_raw_coro was renamed or its braces no longer balance";
+    const std::string signature(fn.signature);
+    const std::string body(fn.body);
+    EXPECT_EQ(count_of(signature, "verb"), 0u) << "the verb must not be a parameter of the raw coroutine";
+    EXPECT_EQ(count_of(body, "verb::"), 1u) << "the raw coroutine names exactly one HTTP verb";
+    EXPECT_EQ(count_of(body, "http::verb::get"), 1u) << "and that verb is GET";
+}
+
+TEST(RestFreezeGuardRawRead, TheRawCoroutineReadsWithinThePermitAndLeavesNoRequestBody) {
+    const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(f, nullptr);
+    const FunctionText fn = function_text(f->code, "fetch_signed_raw_coro(");
+    ASSERT_FALSE(fn.body.empty());
+    const std::string body(fn.body);
+    EXPECT_EQ(count_of(body, "http::empty_body"), 1u) << "a GET carries no request body";
+    EXPECT_EQ(count_of(body, "body_limit(permit.max_body_bytes())"), 1u);
+    EXPECT_EQ(count_of(body, "header_limit(permit.max_header_bytes())"), 1u);
+    // The answer is handed back whatever the status is -- that is the point of the twin -- so the status check of its sibling must not be here.
+    EXPECT_EQ(count_of(body, "http::status::ok"), 0u);
+    EXPECT_EQ(count_of(body, "PrivateRestError::HttpStatus"), 0u);
+    // No redirect is followed and nothing is retried inside the coroutine.
+    EXPECT_EQ(count_of(body, "async_connect("), 1u);
+    EXPECT_EQ(count_of(body, "async_resolve("), 1u);
+}
+
+TEST(RestFreezeGuardRawRead, TheRawCoroutineHasOneCallerAndTheClientHasOneSignedGetHelper) {
+    constexpr std::string_view kOwner = "include/hengyuan/binance_private_rest.hpp";
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t coro = count_of(f.code, "fetch_signed_raw_coro(");
+        if (f.rel == kOwner) {
+            EXPECT_EQ(coro, 2u) << f.rel << ": the definition and the one call inside signed_get_raw()";
+            EXPECT_EQ(count_of(f.code, "signed_get_raw("), 5u)
+                << f.rel << ": the definition and the four public raw reads (order, allOrders, openOrders, account)";
+        } else {
+            EXPECT_EQ(coro, 0u) << f.rel << " reaches the raw coroutine around the client's signed_get_raw()";
+            EXPECT_EQ(count_of(f.code, "signed_get_raw("), 0u) << f.rel;
+        }
+    }
 }
 
 // --- the test seam stays a test seam -----------------------------------------------------------------
