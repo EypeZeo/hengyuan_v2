@@ -28,6 +28,8 @@
 namespace hy::operator_resolution::testing {
 
 inline constexpr std::int64_t kNever = std::numeric_limits<std::int64_t>::max();
+// The uid the fake exchange reports for its API key, unless a test changes it (the flow tests state the same one).
+inline constexpr std::uint64_t kFakeAccountUid = 123456789;
 
 // One exchange clock for the whole test. A sleep of d local milliseconds advances it by d * speed (1.0: a faithful clock).
 struct FakeWorld {
@@ -146,9 +148,12 @@ public:
         return {true, 200, body};
     }
 
-    std::string account_summary() override {
+    AccountView account() override {
         calls.push_back({"account", world_.now_ms, ""});
-        return account;
+        AccountView v;
+        v.summary = account_text;
+        v.uid = account_uid;
+        return v;
     }
 
     // --- what the tests set ---
@@ -163,7 +168,8 @@ public:
     std::uint16_t list_status{200};
     std::size_t list_filler{0};         // that many unrelated orders on every allOrders page
     std::string list_symbol_override;   // every item of an allOrders page claims this symbol
-    std::string account{"USDT free 1000.0"};
+    std::string account_text{"USDT free 1000.0"};            // the summary GET /api/v3/account is turned into
+    std::optional<std::uint64_t> account_uid{kFakeAccountUid};  // the uid it reports (nullopt: the request failed / no uid in the answer)
 
     // --- what the tests read ---
     std::vector<Call> calls;

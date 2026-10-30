@@ -235,6 +235,8 @@ constexpr const char* kConfirmation = "include/hengyuan/operator_resolution_conf
 constexpr const char* kPorts = "include/hengyuan/operator_resolution_ports.hpp";
 constexpr const char* kBundle = "include/hengyuan/operator_resolution_bundle.hpp";
 constexpr const char* kFlow = "include/hengyuan/operator_resolution_flow.hpp";
+constexpr const char* kTransport = "include/hengyuan/operator_resolution_transport.hpp";
+constexpr const char* kClient = "include/hengyuan/binance_private_rest.hpp";
 
 const SourceFile* find_source(std::string_view rel) {
     for (const SourceFile& f : production_sources()) {
@@ -558,7 +560,9 @@ TEST(OperatorResolutionGuard, TheEvidenceHeadersAreIncludedByTheOfflineToolsHead
                           {kPorts, 1, "ExchangeMs, the type of every exchange time the ports speak"},
                           {kBundle, 1, "the verdicts, the fence parameters and the times the evidence file records"},
                           {kFlow, 1, "the fence, the windows and the conclusion"}});
-    expect_named_only_in("operator_resolution_response", {{kFlow, 1, "the classifiers of the exchange's answers"}});
+    expect_named_only_in("operator_resolution_response",
+                         {{kFlow, 1, "the classifiers of the exchange's answers"},
+                          {kTransport, 1, "parse_document() and the unique-member readers the account summary is read with"}});
     ASSERT_NE(find_source(kEvidence), nullptr);
     ASSERT_NE(find_source(kResponse), nullptr);
 }
@@ -619,12 +623,14 @@ TEST(OperatorResolutionGuard, TheClaimBitsAreNamedOnlyByTheFrameHeaderAndTheDeci
 
 TEST(OperatorResolutionGuard, TheToolsHeadersAreIncludedByTheToolAlone) {
     expect_named_only_in("operator_resolution_flow", {});
-    expect_named_only_in("operator_resolution_ports", {{kFlow, 1, "the flow reaches the world through the ports"}});
+    expect_named_only_in("operator_resolution_ports", {{kFlow, 1, "the flow reaches the world through the ports"},
+                                                       {kTransport, 1, "the exchange port it implements"}});
     expect_named_only_in("operator_resolution_bundle", {{kFlow, 1, "the flow builds the evidence file"}});
     expect_named_only_in("operator_resolution_confirmation",
                          {{kPorts, 1, "OperatorLineResult, what the console port returns"},
                           {kBundle, 1, "environment_name() and the digest grammar"},
-                          {kFlow, 1, "the phrase and its judge"}});
+                          {kFlow, 1, "the phrase and its judge"},
+                          {kTransport, 1, "is_ascii_alnum(), for the tokens of the account summary"}});
     for (const char* f : {kFlow, kPorts, kBundle, kConfirmation}) ASSERT_NE(find_source(f), nullptr) << f;
 }
 
@@ -696,4 +702,80 @@ TEST(OperatorResolutionGuard, TheConfirmationHeaderAllocatesNothing) {
         const std::size_t allowed = std::string_view(word) == "delete" ? deleted_functions : 0u;
         EXPECT_EQ(count_identifier(f->code, word), allowed) << word;
     }
+}
+
+// --- D5 slice R3b-1: the offline tool's real exchange port ----------------------------------------------------------------------
+//
+//  13. The transport header belongs to the tool: no production file includes it (the command line of slice R3b-2 will be the first,
+//      and is added here with its reason).
+//  14. The client's raw reads are named by the client (their definitions) and the transport header (their one call each) alone, and
+//      the client's one signed-GET helper is named only by the four reads: a fifth raw read, or a trading-path caller of one, is a review item.
+//  15. The transport header reaches the exchange through those raw reads and nothing else: no order, no listenKey, no exchangeInfo, no HTTP
+//      verb of its own.
+//  16. The flow asks the exchange which account the key belongs to once, after the refusals that need no traffic and BEFORE the first wait or
+//      evidence request, and refuses unless it is the stated uid; the ports have no free-text account summary left to trust.
+
+TEST(OperatorResolutionGuard, TheTransportHeaderIsIncludedByNoProductionFile) {
+    expect_named_only_in("operator_resolution_transport", {});
+    ASSERT_NE(find_source(kTransport), nullptr);
+}
+
+TEST(OperatorResolutionGuard, TheClientsRawReadsAreNamedByTheClientAndTheTransportHeaderAlone) {
+    for (const char* name : {"fetch_order_raw", "fetch_all_orders_raw", "fetch_open_orders_raw", "fetch_account_raw"}) {
+        expect_named_only_in(name, {{kClient, 1, "the definition"}, {kTransport, 1, "the port's one call"}});
+    }
+    expect_named_only_in("read_server_time", {{kClient, 1, "the definition"}, {kTransport, 1, "the port's one clock reading"}});
+    expect_named_only_in("signed_get_raw", {{kClient, 5, "the definition and the four reads"}});
+}
+
+TEST(OperatorResolutionGuard, TheTransportHeaderReachesTheExchangeOnlyThroughTheRawReads) {
+    const SourceFile* f = find_source(kTransport);
+    ASSERT_NE(f, nullptr);
+    for (const char* name : {"submit_order", "submit_order_adapter", "orchestrate_submit", "SubmitPort", "SubmitFn", "create_listen_key",
+                             "keepalive_listen_key", "close_listen_key", "fetch_exchange_info", "sync_clock", "fetch_account",
+                             "query_order_adapter", "verb", "http", "fetch_signed_raw_coro", "fetch_signed_body_coro", "co_spawn",
+                             "io_context", "PrivateRestEndpoint", "reserve_budget", "no_tracker_permit"}) {
+        EXPECT_EQ(count_identifier(f->code, name), 0u) << name << ": the port may only ask the client's raw reads";
+    }
+    EXPECT_GT(count_identifier(f->code, "BinancePrivateRestClient"), 0u);
+}
+
+TEST(OperatorResolutionGuard, TheFlowChecksTheAccountOnceBeforeTheWaitAndBeforeAnyEvidenceRead) {
+    const SourceFile* flow = find_source(kFlow);
+    ASSERT_NE(flow, nullptr);
+    const std::string body = function_body(flow->code, "resolve_order");
+    ASSERT_FALSE(body.empty());
+    const std::string squeezed = squeeze(body);
+
+    std::size_t asks = 0;
+    for (std::size_t at = body.find("exchange.account()"); at != std::string::npos; at = body.find("exchange.account()", at + 1)) ++asks;
+    EXPECT_EQ(asks, 1u) << "one request for the account, asked once";
+    const std::size_t asked = body.find("exchange.account()");
+    ASSERT_NE(asked, std::string::npos);
+    for (const char* later : {"exchange.server_time()", "sleep_for", "exchange.query_order(", "exchange.all_orders(", "exchange.open_orders()"}) {
+        const std::size_t at = body.find(later);
+        ASSERT_NE(at, std::string::npos) << later;
+        EXPECT_LT(asked, at) << "the account is asked before " << later;
+    }
+    // after the order was judged and the range checked: what needs no traffic is refused without any
+    EXPECT_LT(body.find("check_order_resolvable"), asked);
+    EXPECT_LT(body.find("plan_all_orders_windows"), asked);
+
+    // refused unless the exchange named the uid and it is the stated one -- both refusals before the first wait
+    EXPECT_NE(squeezed.find("if (!account.uid) {"), std::string::npos);
+    EXPECT_NE(squeezed.find("if (*account.uid != req.account_uid) {"), std::string::npos);
+    EXPECT_EQ(count_identifier(body, "AccountUnverified"), 1u);
+    EXPECT_EQ(count_identifier(body, "AccountUidMismatch"), 1u);
+    EXPECT_LT(body.find("ResolveStatus::AccountUnverified"), body.find("sleep_for"));
+    EXPECT_LT(body.find("ResolveStatus::AccountUidMismatch"), body.find("sleep_for"));
+    // and what the exchange reported goes into the evidence file, next to what the operator stated
+    EXPECT_NE(squeezed.find("header.account_uid_reported = account.uid;"), std::string::npos);
+    EXPECT_NE(squeezed.find("header.account_uid_claimed = req.account_uid;"), std::string::npos);
+}
+
+TEST(OperatorResolutionGuard, ThePortsHaveNoFreeTextAccountSummaryLeft) {
+    const SourceFile* ports = find_source(kPorts);
+    ASSERT_NE(ports, nullptr);
+    EXPECT_EQ(count_identifier(ports->code, "account_summary"), 0u) << "the account comes back as an AccountView: a uid and a composed line";
+    EXPECT_GE(count_identifier(ports->code, "AccountView"), 2u);
 }

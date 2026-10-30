@@ -30,6 +30,7 @@ BundleHeader good_header() {
     h.symbol = "BTCUSDT";
     h.environment = OperatorEnvironment::Testnet;
     h.account_uid_claimed = 123456789;
+    h.account_uid_reported = 987654321;  // a different number: a value written under the other one's name shows
     // four different values, so that a parameter written under another one's name shows
     h.fence.recv_window_ms = 61'000;
     h.fence.clock_skew_ms = 62'000;
@@ -144,6 +145,7 @@ TEST(OperatorResolutionBundle, TheDocumentIsValidJsonWithWhatTheDesignPromises) 
     EXPECT_EQ(str(p.root, "symbol"), "BTCUSDT");
     EXPECT_EQ(str(p.root, "environment"), "TESTNET");
     EXPECT_EQ(num(p.root, "account_uid_claimed"), 123456789);
+    EXPECT_EQ(num(p.root, "account_uid_reported"), 987654321);
     EXPECT_EQ(num(p.root, "lock_ref_ms"), 1'790'000'000'000);
     EXPECT_EQ(num(p.root, "read_ref_ms"), 1'790'000'270'000);
     EXPECT_EQ(num(p.root, "frame_anchor_ms"), 1'789'999'940'000);
@@ -207,6 +209,7 @@ TEST(OperatorResolutionBundle, TheDocumentIsExactlyTheseBytes) {
         "\"symbol\":\"BTCUSDT\",\n"
         "\"environment\":\"TESTNET\",\n"
         "\"account_uid_claimed\":123456789,\n"
+        "\"account_uid_reported\":987654321,\n"
         "\"fence\":{\"recv_window_ms\":61000,\"clock_skew_ms\":62000,\"margin_ms\":63000,\"read_lag_ms\":124000},\n"
         "\"server_time_readings\":[{\"role\":\"lock\",\"ms\":1790000000000},{\"role\":\"wait\",\"ms\":1790000030000},"
         "{\"role\":\"read\",\"ms\":1790000270000}],\n"
@@ -230,6 +233,11 @@ TEST(OperatorResolutionBundle, TheDocumentIsExactlyTheseBytes) {
     no_anchor.frame_anchor.reset();
     const std::string without = build_evidence_bundle(no_anchor, good_calls(), good_verdicts());
     EXPECT_NE(without.find("\"frame_anchor_ms\":null,\n"), std::string::npos);
+
+    BundleHeader no_uid = good_header();
+    no_uid.account_uid_reported.reset();
+    const std::string unreported = build_evidence_bundle(no_uid, good_calls(), good_verdicts());
+    EXPECT_NE(unreported.find("\"account_uid_reported\":null,\n"), std::string::npos);
 }
 
 // One byte at a time against a literal oracle: printable ASCII is written as itself, the five escapes JSON names are those, and

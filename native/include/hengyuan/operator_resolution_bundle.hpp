@@ -59,7 +59,8 @@ struct BundleHeader {
     std::string_view client_order_id;
     std::string_view symbol;
     OperatorEnvironment environment{static_cast<OperatorEnvironment>(255)};
-    std::uint64_t account_uid_claimed{0};  // what the operator said; the tool cannot verify it (L-48)
+    std::uint64_t account_uid_claimed{0};  // what the operator said (the flow refuses to build a file unless the exchange says the same)
+    std::optional<std::uint64_t> account_uid_reported{};  // what GET /api/v3/account said about the key's account (null: it did not)
     FenceParams fence{};
     ExchangeMs lock_ref{};
     ExchangeMs read_ref{};
@@ -157,6 +158,12 @@ inline std::string build_evidence_bundle(const BundleHeader& h, std::span<const 
     detail::append_json_string(out, environment_name(h.environment));
     out += ",\n\"account_uid_claimed\":";
     detail::append_uint(out, h.account_uid_claimed);
+    out += ",\n\"account_uid_reported\":";
+    if (h.account_uid_reported) {
+        detail::append_uint(out, *h.account_uid_reported);
+    } else {
+        out += "null";
+    }
     out += ",\n\"fence\":{\"recv_window_ms\":";
     detail::append_int(out, h.fence.recv_window_ms);
     out += ",\"clock_skew_ms\":";

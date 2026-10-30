@@ -1406,6 +1406,36 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_private_rest)
         gtest_discover_tests(test_binance_private_rest)
 
+        # D5 slice R3b-1: the raw signed GETs of the private REST client (the status and body of ANY answer, the OrderList response cap, the
+        # explicit allOrders/openOrders weights, every local refusal sending nothing) against a local routing TLS exchange.
+        add_executable(test_binance_private_rest_raw tests/test_binance_private_rest_raw.cpp)
+        target_link_libraries(test_binance_private_rest_raw PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_binance_private_rest_raw SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_binance_private_rest_raw PRIVATE tests)
+        target_compile_definitions(test_binance_private_rest_raw PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_binance_private_rest_raw)
+        hengyuan_allow_third_party_tsan_fences(test_binance_private_rest_raw)
+        gtest_discover_tests(test_binance_private_rest_raw)
+
+        # D5 slice R3b-1: the offline operator tool's real exchange port (pacing, the rate-limit latch, the clock refresh, summarize_account)
+        # and the whole flow end to end over loopback TLS.
+        add_executable(test_operator_resolution_transport tests/test_operator_resolution_transport.cpp)
+        target_link_libraries(test_operator_resolution_transport PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_operator_resolution_transport SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_operator_resolution_transport PRIVATE tests)
+        target_compile_definitions(test_operator_resolution_transport PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_operator_resolution_transport)
+        hengyuan_allow_third_party_tsan_fences(test_operator_resolution_transport)
+        gtest_discover_tests(test_operator_resolution_transport)
+
         # FI-032 (audit P1-001) and the compile-time half of the SAFE-01 freeze guard: properties of the
         # real REST config types, the test-seam type and the permit-taking coroutines -- it has to include
         # the Boost-based client headers to name them, but opens no socket and needs no fixture.

@@ -292,6 +292,20 @@ inline constexpr std::size_t kListenKeyLen = 128;
 // gate as every other method.
 inline constexpr std::uint32_t kListenKeyCallWeight = 2;
 
+// D5 R3b-1 (the offline operator tool, docs/OPERATOR_RESOLUTION_DESIGN.md 6): the two reads that have no PrivateRestEndpoint slot -- the enum
+// is the L4 spec's transcription and stays closed -- are charged explicitly, like the listenKey calls above. Binance's documented IP weights
+// for GET /api/v3/allOrders and for GET /api/v3/openOrders without a symbol.
+inline constexpr std::uint32_t kAllOrdersCallWeight = 20;
+inline constexpr std::uint32_t kOpenOrdersAllSymbolsCallWeight = 80;
+
+// What a GET of the operator tool got back, exactly as the exchange sent it. fetch_signed_body_coro() turns every status but 200 into
+// PrivateRestError::HttpStatus and drops the body; the tool needs the body of a 400, because the one error code it relies on (-2013, "order
+// does not exist") is in it. `http_status` 0 = nothing was received.
+struct RawHttpAnswer {
+    std::uint16_t http_status{0};
+    std::string body;
+};
+
 // POST /api/v3/userDataStream's `{"listenKey": "..."}` response. PUT/DELETE return `{}` on
 // success and need no body parsing at all -- fetch_signed_body_coro()'s own HttpStatus check
 // (non-200 -> PrivateRestError::HttpStatus) is already the complete success/failure signal for
@@ -1026,6 +1040,94 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
     }
 }
 
+// D5 R3b-1: fetch_signed_body_coro()'s twin for the offline operator tool. GET only (the verb is not a parameter), and the answer is whatever the
+// exchange sent: ANY HTTP status within the permit's header and body caps is returned as {status, body}, not turned into HttpStatus -- the tool's
+// evidence is the body of a 400 (-2013 "order does not exist"). Everything else is as strict as its twin: the permit's host and caps, the budget
+// permit, the per-stage timeouts, the connection closed after use, no Accept-Encoding, and every exception folded into the stage that was running
+// (a body over the cap is a Read failure, not a truncated answer). A separate coroutine rather than a flag on the trading path's: nothing the
+// order orchestrator and the reconciler run changes.
+inline net::awaitable<std::variant<RawHttpAnswer, PrivateRestError>> fetch_signed_raw_coro(
+    EndpointPermit permit, RateLimitPermit budget, std::string target, std::string api_key,
+    PrivateRestConfig cfg, RestTestSeam seam) {
+    static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
+    using namespace boost::asio::experimental::awaitable_operators;
+
+    PrivateRestError current_stage = PrivateRestError::Resolve;
+    try {
+        const std::string host(permit.host());
+        auto executor = co_await net::this_coro::executor;
+
+        ssl::context ssl_ctx(ssl::context::tlsv12_client);
+        hy::configure_binance_ssl_context(ssl_ctx);
+        if (!seam.extra_trusted_ca_pem_path().empty()) {
+            ssl_ctx.load_verify_file(seam.extra_trusted_ca_pem_path());
+        }
+
+        tcp::resolver resolver(executor);
+        beast::ssl_stream<beast::tcp_stream> stream(executor, ssl_ctx);
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+#endif
+        if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
+            co_return PrivateRestError::TlsHandshake;
+        }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+        hy::configure_binance_hostname_verification(stream, host);
+
+        const std::string& connect_host =
+            seam.connect_host_override().empty() ? host : seam.connect_host_override();
+        net::steady_timer resolve_timer(executor);
+        resolve_timer.expires_after(std::chrono::milliseconds(cfg.effective_resolve_timeout_ms()));
+        auto resolve_result =
+            co_await (resolver.async_resolve(connect_host, cfg.port, net::use_awaitable) ||
+                      resolve_timer.async_wait(net::use_awaitable));
+        if (resolve_result.index() == 1) {
+            co_return PrivateRestError::Resolve;
+        }
+        auto results = std::get<0>(resolve_result);
+
+        current_stage = PrivateRestError::Connect;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_connect_timeout_ms()));
+        co_await beast::get_lowest_layer(stream).async_connect(results, net::use_awaitable);
+
+        current_stage = PrivateRestError::TlsHandshake;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_handshake_timeout_ms()));
+        co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
+
+        http::request<http::empty_body> req{http::verb::get, target, 11};
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "HengYuan/0.1");
+        req.set("X-MBX-APIKEY", api_key);
+
+        current_stage = PrivateRestError::Write;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_write_timeout_ms()));
+        co_await http::async_write(stream, req, net::use_awaitable);
+
+        current_stage = PrivateRestError::Read;
+        beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_read_timeout_ms()));
+        beast::flat_buffer buffer;
+        http::response_parser<http::string_body> parser;
+        parser.header_limit(permit.max_header_bytes());
+        parser.body_limit(permit.max_body_bytes());
+        co_await http::async_read(stream, buffer, parser, net::use_awaitable);
+        auto res = parser.release();
+
+        beast::get_lowest_layer(stream).close();
+
+        RawHttpAnswer answer;
+        answer.http_status = static_cast<std::uint16_t>(res.result_int());
+        answer.body = std::move(res.body());
+        co_return std::move(answer);
+
+    } catch (...) {
+        co_return current_stage;
+    }
+}
+
 // L4 §5: GET /api/v3/exchangeInfo is public/unauthenticated, but (unlike
 // fetch_server_time_coro's fixed "/api/v3/time" target) needs a caller-supplied target string
 // carrying the optional `symbols` filter -- this coroutine is fetch_server_time_coro's shape
@@ -1200,7 +1302,24 @@ public:
     // recv window (check_clock_skew(), SAFE-01 slice 4) is NOT published and returns
     // ClockSkewTooLarge: a local clock that far off, or a serverTime that implausible, is not
     // something to calibrate against -- a previously published snapshot just ages out on its TTL.
-    PrivateRestError sync_clock(const PrivateRestConfig& cfg) {
+    PrivateRestError sync_clock(const PrivateRestConfig& cfg) { return sync_clock_impl(cfg, nullptr); }
+
+    // D5 R3b-1: the same round trip as sync_clock() (the offset is published exactly as there, the same refusals apply), and the exchange's
+    // serverTime of that round trip is handed out as well -- the operator tool's fence is counted on it. `server_time_ms` is left untouched on
+    // every failure. Never throws.
+    PrivateRestError read_server_time(std::int64_t& server_time_ms) noexcept {
+        try {
+            std::int64_t value = 0;
+            const PrivateRestError e = sync_clock_impl(default_cfg_, &value);
+            if (e == PrivateRestError::None) server_time_ms = value;
+            return e;
+        } catch (...) {
+            return PrivateRestError::Read;
+        }
+    }
+
+private:
+    PrivateRestError sync_clock_impl(const PrivateRestConfig& cfg, std::int64_t* server_time_ms_out) {
         const auto permit = endpoint_permit(ResponseKind::ServerTime);
         if (!permit) return PrivateRestError::InvalidConfig;
         // Budget before the network (L4 §7.4): GET /api/v3/time, weight 1, Reconciliation lane. Refused
@@ -1246,9 +1365,11 @@ public:
             return PrivateRestError::ClockSkewTooLarge;
         }
         clock_pub_.publish(snap);
+        if (server_time_ms_out != nullptr) *server_time_ms_out = r.server_time_ms;
         return PrivateRestError::None;
     }
 
+public:
     // §4: signed. Fails closed on a stale/never-synced clock -- issue_clock_ready_token()
     // is the sole call site for that judgment, and this function never falls back to
     // uncalibrated local system time on its own failure (spec §2.2's core invariant). `out` is
@@ -1700,6 +1821,65 @@ public:
         }
     }
 
+    // --- D5 R3b-1: the reads of the offline operator tool (docs/OPERATOR_RESOLUTION_DESIGN.md 6) ---------------------------------------------
+    // GET only, signed, and the answer comes back VERBATIM: the HTTP status and the body, whatever the status is (RawHttpAnswer). That is what
+    // the tool's decision rests on -- a 400 with {"code":-2013} is its evidence that an order does not exist, which fetch_signed_body_coro()
+    // (the trading path's, untouched) folds into HttpStatus and throws away. Everything else is as strict as the sibling methods: the endpoint
+    // permit of the expected kind of answer (the host allowlist and the response caps), the clock gate (ClockNotFresh = nothing signed,
+    // nothing sent), the local budget (explicit weights where PrivateRestEndpoint has no slot: the enum is the L4 spec's transcription and stays
+    // closed), the per-stage timeouts of default_config(). Never throws. `out` is assigned only when the exchange answered
+    // (PrivateRestError::None); any HTTP status is an answer, only the transport can fail.
+    //
+    // GET /api/v3/order?symbol=&origClientOrderId= (weight 4)
+    PrivateRestError fetch_order_raw(std::string_view symbol, std::string_view client_order_id, RawHttpAnswer& out) noexcept {
+        if (!is_valid_exchange_info_symbol(symbol)) return PrivateRestError::InvalidConfig;
+        if (client_order_id.empty() || client_order_id.size() > kClientOrderIdLen) return PrivateRestError::InvalidConfig;
+        const std::pair<std::string_view, std::string_view> params[] = {
+            {"origClientOrderId", client_order_id},
+            {"symbol", symbol},
+        };
+        return signed_get_raw("/api/v3/order", ResponseKind::SignedJson, params,
+                              RawGetBudget{true, PrivateRestEndpoint::GetOrder, 0}, out);
+    }
+
+    // GET /api/v3/allOrders?symbol=&startTime=&endTime=&limit= (weight 20): one page. `limit` is 1..1000 (Binance's maximum).
+    PrivateRestError fetch_all_orders_raw(std::string_view symbol, std::int64_t start_ms, std::int64_t end_ms, std::size_t limit,
+                                          RawHttpAnswer& out) noexcept {
+        if (!is_valid_exchange_info_symbol(symbol)) return PrivateRestError::InvalidConfig;
+        if (start_ms <= 0 || end_ms < start_ms || limit == 0 || limit > 1000) return PrivateRestError::InvalidConfig;
+        char start_buf[24];
+        char end_buf[24];
+        char limit_buf[8];
+        const int ns = std::snprintf(start_buf, sizeof(start_buf), "%lld", static_cast<long long>(start_ms));
+        const int ne = std::snprintf(end_buf, sizeof(end_buf), "%lld", static_cast<long long>(end_ms));
+        const int nl = std::snprintf(limit_buf, sizeof(limit_buf), "%zu", limit);
+        if (ns <= 0 || static_cast<std::size_t>(ns) >= sizeof(start_buf) || ne <= 0 || static_cast<std::size_t>(ne) >= sizeof(end_buf) ||
+            nl <= 0 || static_cast<std::size_t>(nl) >= sizeof(limit_buf)) {
+            return PrivateRestError::InvalidConfig;
+        }
+        const std::pair<std::string_view, std::string_view> params[] = {
+            {"endTime", std::string_view(end_buf, static_cast<std::size_t>(ne))},
+            {"limit", std::string_view(limit_buf, static_cast<std::size_t>(nl))},
+            {"startTime", std::string_view(start_buf, static_cast<std::size_t>(ns))},
+            {"symbol", symbol},
+        };
+        return signed_get_raw("/api/v3/allOrders", ResponseKind::OrderList, params,
+                              RawGetBudget{false, PrivateRestEndpoint::GetOrder, kAllOrdersCallWeight}, out);
+    }
+
+    // GET /api/v3/openOrders (weight 80: no symbol, every open order of the account)
+    PrivateRestError fetch_open_orders_raw(RawHttpAnswer& out) noexcept {
+        return signed_get_raw("/api/v3/openOrders", ResponseKind::OrderList, {},
+                              RawGetBudget{false, PrivateRestEndpoint::GetOrder, kOpenOrdersAllSymbolsCallWeight}, out);
+    }
+
+    // GET /api/v3/account?omitZeroBalances=true (weight 20): for the account's uid and permissions and for the summary the operator is shown.
+    PrivateRestError fetch_account_raw(RawHttpAnswer& out) noexcept {
+        const std::pair<std::string_view, std::string_view> params[] = {{"omitZeroBalances", "true"}};
+        return signed_get_raw("/api/v3/account", ResponseKind::SignedJson, params,
+                              RawGetBudget{true, PrivateRestEndpoint::GetAccount, 0}, out);
+    }
+
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }
 
 private:
@@ -1739,6 +1919,77 @@ private:
     }
     // The one place a client without a tracker says so (test_rest_freeze_guard pins the call site).
     static RateLimitPermit no_tracker_permit() noexcept { return RateLimitPermit::unaccounted(); }
+
+    // D5 R3b-1: how the budget of one raw read is charged -- the table weight of a PrivateRestEndpoint, or an explicit weight where the enum has
+    // no slot (allOrders, openOrders without a symbol). Always the Reconciliation lane, like every non-order request.
+    struct RawGetBudget {
+        bool by_endpoint;
+        PrivateRestEndpoint endpoint;
+        std::uint32_t weight;
+    };
+
+    // D5 R3b-1: the one signed GET of the operator tool, in the order of every sibling method: entry guards, the endpoint permit of the kind of
+    // answer expected, the clock gate, the local budget (after the clock gate: a stale clock must not burn budget), the signing, the network.
+    // `business_params` are the request's own parameters; recvWindow (the client's default_config()) is added here, timestamp and signature by
+    // build_signed_query(). Never throws: anything that escapes the network section is a Read failure.
+    PrivateRestError signed_get_raw(std::string_view path, ResponseKind kind,
+                                    std::span<const std::pair<std::string_view, std::string_view>> business_params,
+                                    RawGetBudget budget_spec, RawHttpAnswer& out) noexcept {
+        if (!creds_) return PrivateRestError::SigningFailed;
+        const auto permit = endpoint_permit(kind);
+        if (!permit) return PrivateRestError::InvalidConfig;
+        try {
+            const auto clock_token = issue_clock_ready_token(clock_pub_, fetch_clock_pair());
+            if (!clock_token) return PrivateRestError::ClockNotFresh;
+
+            const auto budget = budget_spec.by_endpoint ? reserve_budget(budget_spec.endpoint)
+                                                        : reserve_budget_explicit(budget_spec.weight);
+            if (!budget) return PrivateRestError::RateLimitExhausted;
+
+            char recv_window_buf[24];
+            const int n = std::snprintf(recv_window_buf, sizeof(recv_window_buf), "%lld",
+                                        static_cast<long long>(default_cfg_.recv_window_ms));
+            if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(recv_window_buf)) return PrivateRestError::InvalidConfig;
+
+            std::array<std::pair<std::string_view, std::string_view>, 8> params{};
+            if (business_params.size() + 1 > params.size()) return PrivateRestError::InvalidConfig;
+            std::size_t count = 0;
+            for (const auto& bp : business_params) params[count++] = bp;
+            params[count++] = {"recvWindow", std::string_view(recv_window_buf, static_cast<std::size_t>(n))};
+            auto [qerr, unsigned_query] = build_canonical_query(
+                std::span<const std::pair<std::string_view, std::string_view>>(params.data(), count));
+            if (qerr != QuerySigningError::Ok) return PrivateRestError::SigningFailed;
+
+            auto [serr, signed_query] = build_signed_query(*creds_, unsigned_query, *clock_token);
+            if (serr != QuerySigningError::Ok) return PrivateRestError::SigningFailed;
+
+            std::array<char, kApiKeyLen> key_buf{};
+            std::size_t key_len = 0;
+            if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) return PrivateRestError::SigningFailed;
+
+            std::string target(path);
+            target += '?';
+            target += std::string(signed_query.wire_bytes());
+
+            net::io_context ioc;
+            std::variant<RawHttpAnswer, PrivateRestError> outcome = PrivateRestError::None;
+            net::co_spawn(
+                ioc,
+                detail::fetch_signed_raw_coro(*permit, *budget, std::move(target), std::string(key_buf.data(), key_len),
+                                              default_cfg_, test_seam_),
+                [&outcome](std::exception_ptr eptr, std::variant<RawHttpAnswer, PrivateRestError> r) {
+                    if (eptr) std::rethrow_exception(eptr);
+                    outcome = std::move(r);
+                });
+            ioc.run();
+
+            if (std::holds_alternative<PrivateRestError>(outcome)) return std::get<PrivateRestError>(outcome);
+            out = std::move(std::get<RawHttpAnswer>(outcome));
+            return PrivateRestError::None;
+        } catch (...) {
+            return PrivateRestError::Read;
+        }
+    }
 
     // Shared by keepalive_listen_key()/close_listen_key() -- identical shape (percent-encode the
     // listenKey into the query string, copy_api_key(), fetch_signed_body_coro(), no body to

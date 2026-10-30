@@ -36,6 +36,17 @@ struct HttpRead {
     std::string body;  // exactly the bytes received
 };
 
+// What GET /api/v3/account says about the account the API key belongs to (D5 slice R3b-1). The flow does not trust the uid the operator
+// typed: it compares it with the one in here and refuses to go on if they differ, or if the exchange did not say.
+struct AccountView {
+    // Design 6 step 5(d): a short summary for the operator to eyeball. Display only, never evidence. The flow prints it to the terminal as it
+    // is, so an implementation must return ONE line of printable ASCII that it composed itself from fields it parsed (balances,
+    // permissions) -- never a piece of the raw response. Empty if unavailable.
+    std::string summary;
+    // The account's uid as the exchange reports it. nullopt: the request failed, or the answer had no single positive integer uid.
+    std::optional<std::uint64_t> uid;
+};
+
 class ExchangeReadPort {
 public:
     virtual ~ExchangeReadPort() = default;
@@ -48,10 +59,8 @@ public:
     virtual HttpRead all_orders(std::string_view symbol, ExchangeMs start, ExchangeMs end, std::size_t limit) = 0;
     // GET /api/v3/openOrders -- without a symbol: every open order of the account.
     virtual HttpRead open_orders() = 0;
-    // Design 6 step 5(d): a short account summary for the operator to eyeball. Display only, never evidence; empty if unavailable.
-    // The flow prints it to the terminal as it is, so an implementation must return ONE line of printable ASCII that it composed
-    // itself from fields it parsed (balances, permissions) -- never a piece of the raw response.
-    virtual std::string account_summary() = 0;
+    // GET /api/v3/account -- the account the key belongs to (see AccountView). A request that did not complete is an empty view.
+    virtual AccountView account() = 0;
 };
 
 // The local wait between two serverTime readings. (Local time is only ever used to decide how long to sleep; the fence itself
