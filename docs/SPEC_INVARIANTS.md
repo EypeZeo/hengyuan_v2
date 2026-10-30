@@ -537,7 +537,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       （L-50），所以短语把品种名亮给操作员、假设 A-D5-4 要他自己核对。确认的等待最长 5 分钟，期间已读的证据不会更新——持锁时旧进程已停是 A-D5-1，由操作员保证，工具查不了。
 
   - **[D5 切片 R3b-1 已落地：离线工具的真实交易所读——客户端的原样回传 GET、`BinanceExchangeReadPort`、账户 UID 核对]**
-    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-29 “开始R3b-1，按推荐”；Tier B；PR #212）：R3a 四个端口里的**交易所读**现在有了真实实现，走已有的认证 REST 客户端；
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-29 “开始R3b-1，按推荐”，对 PR #212 说“合并”；Tier B；PR #212，合并提交 f06a3a2）：R3a 四个端口里的**交易所读**现在有了真实实现，走已有的认证 REST 客户端；
     **仍然没有命令行、没有 KEK / 密钥来源、没有证据目录与终端适配器**（R3b-2）；测试里只有回环 TLS 夹具与合成凭据，**没有任何真实流量，也没有 Testnet 流量**。
     - **缺口与做法**：客户端交易路径的 `fetch_signed_body_coro()` 把 200 以外的一切状态折成 HttpStatus 并扔掉正文，而工具唯一的 “订单不存在” 证据就是 HTTP 400 的正文 `{"code":-2013}`；
       SignedJson 的 256 KiB 上限也装不下一页 `allOrders`（最多 1000 个订单，约 0.6 MB）。所以新增**一条并行的协程** `fetch_signed_raw_coro()`：只能 GET（动词不是参数），**任何**状态都连同正文原样返回；
