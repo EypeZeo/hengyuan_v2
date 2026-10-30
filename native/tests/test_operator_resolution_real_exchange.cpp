@@ -519,6 +519,9 @@ TEST_F(RealToolTest, AnAbsentOrderIsResolvedWithTheOperatorKeyOverRealTls) {
     // on the wire: GETs only, to the host of the chosen environment, and every signed one carries the TOOL's key
     const std::vector<Request> requests = server_->requests();
     ASSERT_GE(requests.size(), 8u);
+    // the port's own pacing, through the sleeper the tool gave it: a 500 ms gap before every request but the first
+    const std::size_t gaps = static_cast<std::size_t>(std::count(sleeper_.sleeps.begin(), sleeper_.sleeps.end(), 500));
+    EXPECT_EQ(gaps, requests.size() - 1);
     std::size_t signed_requests = 0;
     for (const Request& r : requests) {
         EXPECT_EQ(r.method, "GET");

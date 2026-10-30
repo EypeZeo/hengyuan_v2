@@ -234,6 +234,16 @@ TEST(ToolArgs, AnUnknownRepeatedOrValuelessOptionIsRefused) {
         EXPECT_EQ(r.status, ParseStatus::DuplicateArgument) << spec.name;
         EXPECT_EQ(r.argument, spec.name);
     }
+    // a refusal hands back nothing it had collected on the way (a caller that forgot to look at the status gets an empty command line, not half of one)
+    for (const Args& bad : {Args{"--audit-log", "state/a.log", "--bogus"}, Args{"--audit-log", "state/a.log", "--audit-log", "x"},
+                            Args{"--audit-log", "state/a.log", "--uid", "0"}, Args{"--audit-log", "state/a.log", "--kek-file"}}) {
+        const ParseResult r = parse(bad);
+        EXPECT_NE(r.status, ParseStatus::Ok);
+        EXPECT_EQ(r.options.mode, ToolMode::None);
+        EXPECT_TRUE(r.options.audit_log.empty());
+        EXPECT_TRUE(r.options.kek_file.empty());
+        EXPECT_EQ(r.options.account_uid, 0u);
+    }
     // an option that is the last argument has no value; a value that looks like an option is not one
     {
         Args v = resolve_args();
@@ -470,6 +480,8 @@ TEST(StdConsole, WritesOnePrintableAsciiLinePerCallAndReplacesEverythingElse) {
         console.write_line("");
         console.write_line(std::string("nul\0inside", 10));
         console.write_line("delete\x7f");
+        console.write_line("unit\x1f" "separator");  // the last control character
+        console.write_line("\x1f");
         console.write_line("two\nlines");  // a newline inside a line would let the flow's text forge a second line
         console.write_line("carriage\rreturn");
         console.write_line(" ~ edges ");
@@ -483,6 +495,8 @@ TEST(StdConsole, WritesOnePrintableAsciiLinePerCallAndReplacesEverythingElse) {
               "\n"
               "nul?inside\n"
               "delete?\n"
+              "unit?separator\n"
+              "?\n"
               "two?lines\n"
               "carriage?return\n"
               " ~ edges \n");
