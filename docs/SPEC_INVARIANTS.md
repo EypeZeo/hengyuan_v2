@@ -663,7 +663,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       `-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练）；工具对真实或 Testnet 交易所的任何一次运行。
 
   - **[D5 切片 R4 已落地：迟到成交告警——被操作员结清的订单，交易所一开口就熔断]**
-    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §9 “R-late”、§10；Owner 2026-10-31 “开始R4，按推荐”；Tier B；本 PR）：被离线工具结清的订单（`OrderOperatorResolved`）是终局且无人跟踪的——“交易所没有这个订单，栅栏之后也永远不会有”。
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §9 “R-late”、§10；Owner 2026-10-31 “开始R4，按推荐”，对 PR #218 说“合并”；Tier B；PR #218，合并提交 df9b363）：被离线工具结清的订单（`OrderOperatorResolved`）是终局且无人跟踪的——“交易所没有这个订单，栅栏之后也永远不会有”。
     如果这个证明错了（读延迟比工具假设的大，或工具查的是不该查的账户或环境），订单其实活着；恢复不为它登记任何东西，而 `drain_user_data_events()` 对不在途的 COID 一向直接 `continue`（“预期之内的未命中”）：
     没有审计记录、没有计数、没有仓位效果，仓位漂移而没有任何东西说一声（L-47）。R4 就是这一声。
     **仍然没有任何进程接线**：没有进程运行实盘排空循环（M5 之前），所以这个告警在树里只被测试驱动、没有被任何程序创建；守卫钉住这一点。
