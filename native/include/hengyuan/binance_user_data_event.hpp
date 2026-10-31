@@ -214,7 +214,8 @@ using UserDataWsEventRing = SpscRing<UserDataWsEvent, 64>;
 // generation filter: that filter's reason ("the sweep already reflects whatever it said") does not hold for an order
 // nothing sweeps, so a report of an older generation must still raise it. What the alarm does with the report is its
 // own business (it trips the breaker and writes its own audit records); the report then takes the same path as any
-// untracked one -- no fold-in, no UserDataStreamEventObserved record, no position effect.
+// untracked one -- no fold-in, no ordinary UserDataStreamEventObserved record (the alarm wrote its own), no position
+// effect.
 inline void drain_user_data_events(const InFlightRegistry& in_flight, AuditRingSink* audit,
                                     UserDataWsEventRing& events, std::int64_t now_ms,
                                     PositionTruth* position_truth = nullptr,

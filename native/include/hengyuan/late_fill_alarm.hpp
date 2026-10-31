@@ -32,8 +32,8 @@
 // open failed (kMaxOperatorResolved, durable_control_plane.hpp). A caller that hands over the list of an OperatorOpen sink -- the tool's mode, which
 // counts what did not fit -- says so through `resolved_total` and gets an alarm that trips the breaker at once: a watch list with holes is no watch list.
 //
-// A watched id that is also in flight is NOT alarmed (the drain asks the registry first): it can only be a re-used id, and the registry's order is
-// the one this process is tracking.
+// A watched id that is also in flight is NOT alarmed (the drain asks the registry before it calls the alarm): it can only be a re-used id, and the
+// registry's order is the one this process is tracking.
 //
 // THREAD OWNERSHIP: the hot/submit thread, like the KillSwitch it trips and the registry the drain reads. No atomics, no heap, no I/O, no clock of
 // its own (the caller's now_ms stamps the records). The alarm and the OrchestratorContext it is wired into must name the SAME KillSwitch; the alarm
