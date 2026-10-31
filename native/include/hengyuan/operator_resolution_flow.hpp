@@ -15,7 +15,8 @@
 //                             one waits.
 //   resolve_order()
 //     1. refuse what is knowable without the exchange (an unknown or already-resolved order, a DryRun order, an order the
-//        shared rule refuses, a full resolved-table, a symbol the control-plane log cannot name): no traffic, no wait;
+//        shared rule refuses, a full resolved-table, a symbol the control-plane log cannot name -- or cannot show it had named
+//        before the order was sent, symbol_for_order()): no traffic, no wait;
 //     2. ask the exchange which account the API key belongs to and refuse unless it is the uid the operator stated (a wrong key or
 //        a wrong environment would make every answer below an answer about somebody else's orders; this is not evidence and costs
 //        no waiting), then wait until the exchange clock says lock + W + B + margin + L, re-reading it (never trusting the local
@@ -111,6 +112,42 @@ inline OperatorSession begin_operator_session(DurableAuditSink& audit, const Con
     return s;
 }
 
+// --- the symbol of an order -----------------------------------------------------------------------------------------------------------
+
+// The send-start time the audit log recorded for the order, as an anchor: the Prepared / Submitting frame's time, when that frame
+// carried a wall time (the checkpoint's send_started_utc_ms is 0 otherwise).
+inline std::optional<ExchangeMs> frame_anchor_of(const OrderRecoveryCheckpoint& cp) noexcept {
+    return cp.send_started_utc_ms != 0 ? std::optional<ExchangeMs>(ExchangeMs{cp.send_started_utc_ms}) : std::nullopt;
+}
+
+// D5 / R3b-3 (blueprint L-50): what the control-plane log says the order's symbol_id stands for, as far as it can be trusted for
+// THIS order. ControlPlaneLogSink::recovered_symbol_name() answers from the log alone, and cannot know whether it is the log that
+// was in use when the order was placed: had it been deleted and recreated since, an old id may have been given another symbol and
+// still be Known, and the tool would ask the exchange about the wrong one -- "no such order" is true for a wrong symbol. The cheap
+// extra defence: a name only counts for an order sent AT OR AFTER the first snapshot that gave it (the log's own record of when
+// it began to know the name). The order's send time is the EARLIEST anchor there is (earliest_send_anchor(): the frame's time and
+// the client order id's timestamp, whichever is earlier); the snapshot's time is a wall time on the exchange's clock, the id's is
+// the local clock, at most B off it, so an order sent within B of the first snapshot may be refused wrongly -- the accepted side of
+// the error, since a refusal sends the operator to the manual path and the other error resolves an order against the wrong symbol.
+// No margin is added in the permissive direction. A name with no usable time (a frame without a wall time, or an implausible one)
+// is refused too, for any order that has an anchor. An order with no anchor at all is not judged here: the range check (step 2 of
+// resolve_order()) refuses it before any request, and the refusal precedence stays what it was.
+// Unknown, Conflict and every other answer pass through unchanged; NotNamedAtOrderTime hands out no name. THE one place that asks
+// the sink for a name: resolve_order() and list_unresolved_orders() both come here (test_operator_resolution_guard.cpp pins that),
+// so the listing can never say "can be resolved" for an order the resolution would refuse for its symbol.
+inline SymbolNameLookup symbol_for_order(const ControlPlaneLogSink& names, const OrderRecoveryCheckpoint& cp) noexcept {
+    SymbolNameLookup lookup = names.recovered_symbol_name(cp.symbol_id);
+    if (lookup.status != SymbolNameStatus::Known) return lookup;
+    const std::optional<ExchangeMs> sent = earliest_send_anchor(frame_anchor_of(cp), cp.client_order_id.view());
+    if (!sent) return lookup;
+    const ExchangeMs named{lookup.named_since_ms};
+    if (!is_plausible(named) || *sent < named) {
+        lookup.status = SymbolNameStatus::NotNamedAtOrderTime;
+        lookup.name = {};
+    }
+    return lookup;
+}
+
 // --- listing ------------------------------------------------------------------------------------------------------------------------
 
 // One unresolved order as the tool lists it (design 6 step 3), with whether this tool could resolve it and why not.
@@ -121,6 +158,7 @@ struct UnresolvedOrderSummary {
     ExecutionMode mode{ExecutionMode::DryRun};
     std::uint32_t symbol_id{0};
     SymbolNameStatus symbol_status{SymbolNameStatus::Unknown};
+    std::int64_t symbol_named_since_ms{0};  // when the log first named the id; set when symbol_status is Known or NotNamedAtOrderTime
     std::string symbol;  // empty unless symbol_status == Known
     OrderSide side{OrderSide::Buy};
     std::int64_t price_ticks{0};
@@ -142,8 +180,9 @@ inline std::vector<UnresolvedOrderSummary> list_unresolved_orders(const DurableA
         s.state = cp.resulting_state;
         s.mode = cp.mode;
         s.symbol_id = cp.symbol_id;
-        const SymbolNameLookup lookup = names.recovered_symbol_name(cp.symbol_id);
+        const SymbolNameLookup lookup = symbol_for_order(names, cp);
         s.symbol_status = lookup.status;
+        s.symbol_named_since_ms = lookup.named_since_ms;
         if (lookup.status == SymbolNameStatus::Known) s.symbol = std::string(lookup.name);
         s.side = cp.side;
         s.price_ticks = cp.intended_price_ticks;
@@ -178,7 +217,7 @@ enum class ResolveStatus : std::uint8_t {
     DryRunOrder = 7,
     NotResolvable = 8,       // the shared rule refuses the order itself: see OperatorResolutionOutcome::order_check
     TableFull = 9,           // the store already holds the most operator-resolved orders a trading start can load
-    SymbolNameNotKnown = 10,  // the control-plane log does not name the order's symbol_id (or names it inconsistently)
+    SymbolNameNotKnown = 10,  // the control-plane log does not name the order's symbol_id, names it inconsistently, or not before the order was sent (symbol_status says which)
     ServerTimeUnavailable = 11,
     FenceWaitTimedOut = 12,
     NoUsableRange = 13,  // no anchor, an implausible time, or more than 14 allOrders windows: resolve by hand
@@ -242,6 +281,7 @@ struct OperatorResolutionOutcome {
     ResolveStatus status{ResolveStatus::NotRun};
     ResolutionCheck order_check{ResolutionCheck::NotChecked};
     SymbolNameStatus symbol_status{SymbolNameStatus::Unknown};
+    std::int64_t symbol_named_since_ms{0};  // when the log first named the id; set when symbol_status is Known or NotNamedAtOrderTime
     FenceVerdict fence{FenceVerdict::Unset};
     RangeStatus range{RangeStatus::Unset};
     PlanStatus plan{PlanStatus::Unset};
@@ -322,15 +362,15 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     out.order_check = check_order_resolvable(target_of(cp));
     if (out.order_check != ResolutionCheck::Ok) return stop(ResolveStatus::NotResolvable);
     if (!audit.operator_resolved_table_has_room()) return stop(ResolveStatus::TableFull);
-    const SymbolNameLookup lookup = names.recovered_symbol_name(cp.symbol_id);
+    const SymbolNameLookup lookup = symbol_for_order(names, cp);
     out.symbol_status = lookup.status;
+    out.symbol_named_since_ms = lookup.named_since_ms;
     if (lookup.status != SymbolNameStatus::Known || !is_exchange_symbol(lookup.name)) {
         return stop(ResolveStatus::SymbolNameNotKnown);
     }
     const std::string symbol(lookup.name);
     const std::string_view coid = req.client_order_id;
-    const std::optional<ExchangeMs> frame_anchor =
-        cp.send_started_utc_ms != 0 ? std::optional<ExchangeMs>(ExchangeMs{cp.send_started_utc_ms}) : std::nullopt;
+    const std::optional<ExchangeMs> frame_anchor = frame_anchor_of(cp);
 
     // 2. the fence, counted on the exchange clock
     const std::optional<ExchangeMs> earliest = earliest_evidence_read(session.lock_ref, session.fence);

@@ -274,7 +274,10 @@ protected:
 
     // --- the logs ---
 
-    void write_logs(const std::vector<Timed>& history, const std::vector<std::vector<std::string>>& snapshots = {{"BTCUSDT"}}) {
+    // The snapshots are stamped first_snapshot_at, +1000, ... (default: an hour before the orders; D5 / R3b-3 judges a symbol by
+    // when the control-plane log first named it, so a test about that says when).
+    void write_logs(const std::vector<Timed>& history, const std::vector<std::vector<std::string>>& snapshots = {{"BTCUSDT"}},
+                    std::int64_t first_snapshot_at = kT0 - 3'600'000) {
         {
             DurableAuditSink sink(audit_path_, *ring_, kKeyA);
             ASSERT_TRUE(sink.is_open());
@@ -283,7 +286,7 @@ protected:
         {
             ControlPlaneLogSink sink(cp_path_, *ring_, kKeyA);
             ASSERT_TRUE(sink.is_open());
-            std::int64_t t = kT0 - 3'600'000;
+            std::int64_t t = first_snapshot_at;
             for (const std::vector<std::string>& names : snapshots) {
                 std::vector<SymbolRules> entries;
                 for (const std::string& n : names) entries.push_back(rule(n));
@@ -530,6 +533,70 @@ TEST_F(ToolTest, ListSaysWhenTheLogCannotTellWhenTheSendStarted) {
     ASSERT_FALSE(order.empty()) << transcript();
     EXPECT_NE(order.find("send started unknown"), std::string::npos) << order;
     EXPECT_EQ(order.find("send started 0"), std::string::npos) << "a zero is not a time";
+}
+
+// --- D5 / R3b-3: a symbol the control-plane log did not provably name before the order was sent ----------------------------------
+
+TEST_F(ToolTest, ListSaysWhenTheControlPlaneLogDoesNotShowItNamedTheSymbolBeforeTheOrderWasSent) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA), {{"BTCUSDT"}}, kT0 - 500'000));  // the only snapshot is later than the order
+    EXPECT_EQ(run(list_args()), 0) << transcript();
+    const std::string order = out_line_with(kA.coid);
+    ASSERT_FALSE(order.empty()) << transcript();
+    EXPECT_NE(order.find("symbol unknown (id 0)"), std::string::npos) << "a refused name is not shown: " << order;
+    EXPECT_EQ(order.find("BTCUSDT"), std::string::npos) << order;
+    EXPECT_NE(order.find("-> cannot be resolved: the control-plane log does not show that it named this symbol before this order was sent "
+                         "(first named at " + std::to_string(kT0 - 500'000) + ")"),
+              std::string::npos)
+        << order;
+    EXPECT_EQ(order.find("-> can be resolved"), std::string::npos) << order;
+    EXPECT_TRUE(logs_untouched());
+}
+
+TEST_F(ToolTest, ListSaysSoWhenTheLogGivesNoTimeForTheNameAtAll) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA), {{"BTCUSDT"}}, 0));  // the snapshot frame carries no wall time
+    EXPECT_EQ(run(list_args()), 0) << transcript();
+    const std::string order = out_line_with(kA.coid);
+    ASSERT_FALSE(order.empty()) << transcript();
+    EXPECT_NE(order.find("(first named at an unknown time)"), std::string::npos) << order;
+    EXPECT_EQ(order.find("first named at 0"), std::string::npos) << "a zero is not a time";
+}
+
+TEST_F(ToolTest, ListShowsAnImplausibleTimeAsTheFrameRecordedItSoTheOperatorCanSeeWhatIsWrong) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA), {{"BTCUSDT"}}, -5));
+    EXPECT_EQ(run(list_args()), 0) << transcript();
+    const std::string order = out_line_with(kA.coid);
+    ASSERT_FALSE(order.empty()) << transcript();
+    EXPECT_NE(order.find("-> cannot be resolved: the control-plane log does not show that it named this symbol before this order was sent "
+                         "(first named at -5)"),
+              std::string::npos)
+        << order;
+}
+
+TEST_F(ToolTest, ListStillSaysTheOldThingForASymbolTheLogDoesNotNameAtAll) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA), {}));
+    EXPECT_EQ(run(list_args()), 0) << transcript();
+    const std::string order = out_line_with(kA.coid);
+    ASSERT_FALSE(order.empty()) << transcript();
+    EXPECT_NE(order.find("-> cannot be resolved: the control-plane log does not name this symbol"), std::string::npos) << order;
+    EXPECT_EQ(order.find("does not show that it named"), std::string::npos) << order;
+}
+
+TEST_F(ToolTest, ASymbolNotNamedBeforeTheOrderWasSentStopsTheProcedureAtOnceAndSaysWhy) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA), {{"BTCUSDT"}}, kT0 - 500'000));
+    expect_stops_with(ResolveStatus::SymbolNameNotKnown, resolve_args(kA.coid));
+    EXPECT_TRUE(out_.printed("the control-plane log does not show that it named this order's symbol before the order was sent (first named at " +
+                             std::to_string(kT0 - 500'000) + "): it may not be the log that was in use then. Nothing was written."))
+        << transcript();
+    EXPECT_TRUE(sleeper_.sleeps.empty());
+    EXPECT_EQ(exchange_.count("order"), 0u);
+    EXPECT_EQ(exchange_.count("allOrders"), 0u);
+    EXPECT_EQ(exchange_.count("openOrders"), 0u);
+}
+
+TEST_F(ToolTest, ASymbolTheLogDoesNotNameStopsTheProcedureWithoutTheExplanationOfTheNewReason) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA), {}));
+    expect_stops_with(ResolveStatus::SymbolNameNotKnown, resolve_args(kA.coid));
+    EXPECT_TRUE(out_line_with("does not show that it named").empty()) << transcript();
 }
 
 TEST_F(ToolTest, ListSaysWhyAnOrderThatOnceShowedAnExchangeIdCannotBeResolved) {

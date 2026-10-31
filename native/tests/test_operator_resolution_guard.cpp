@@ -669,6 +669,65 @@ TEST(OperatorResolutionGuard, TheFlowAsksAboutTheOrderAndOnlyTheWriterAndTheRead
     EXPECT_LT(asked, first_sleep);
 }
 
+// D5 / R3b-3 (blueprint L-50): the control-plane log's answer is "every snapshot agrees", which does not say that this is the log that
+// was in use when the order was placed. The tool therefore never takes a symbol name straight from the log: it asks through
+// symbol_for_order(), which measures the log's first naming of the id against the order's own send time. The pins below keep that the
+// only way in (the listing and the resolution share it, so neither can say "can be resolved" for what the other refuses) and keep the
+// send time the one the allOrders interval is built from.
+TEST(OperatorResolutionGuard, TheSymbolOfAnOrderIsAskedOfTheLogOnlyThroughTheJudgeThatMeasuresItAgainstTheOrdersSendTime) {
+    constexpr const char* kControlPlaneSink = "include/hengyuan/control_plane_log_sink.hpp";
+    expect_named_only_in("recovered_symbol_name", {{kControlPlaneSink, 1, "the definition"},
+                                                   {kFlow, 1, "symbol_for_order(), the one place the tool asks"}});
+    expect_named_only_in("symbol_for_order", {{kFlow, 3, "the definition, resolve_order() and list_unresolved_orders()"}});
+    expect_named_only_in("frame_anchor_of", {{kFlow, 3, "the definition, symbol_for_order() and resolve_order()"}});
+    expect_named_only_in("earliest_send_anchor", {{kEvidence, 2, "the definition and its one call inside all_orders_range()"},
+                                                  {kFlow, 1, "symbol_for_order()"}});
+
+    const SourceFile* flow = find_source(kFlow);
+    const SourceFile* evidence = find_source(kEvidence);
+    ASSERT_NE(flow, nullptr);
+    ASSERT_NE(evidence, nullptr);
+
+    // the judge: the log's answer, the order's earliest anchor made of the CHECKPOINT's own frame time and id, a plausible naming time
+    const std::string judge = function_body(flow->code, "symbol_for_order");
+    ASSERT_FALSE(judge.empty());
+    EXPECT_NE(judge.find("recovered_symbol_name"), std::string::npos);
+    EXPECT_NE(judge.find("is_plausible"), std::string::npos);
+    EXPECT_NE(judge.find("NotNamedAtOrderTime"), std::string::npos);
+    const auto anchor_calls = call_args(judge, "earliest_send_anchor");
+    ASSERT_EQ(anchor_calls.size(), 1u);
+    const std::vector<std::string> anchor_args{"frame_anchor_of(cp)", "cp.client_order_id.view()"};
+    EXPECT_EQ(anchor_calls[0], anchor_args) << "the order's send time is made of what the audit log recorded, nothing the operator typed";
+
+    // the interval allOrders covers starts from the very same anchor
+    const std::string range = function_body(evidence->code, "all_orders_range");
+    ASSERT_FALSE(range.empty());
+    const auto range_calls = call_args(range, "earliest_send_anchor");
+    ASSERT_EQ(range_calls.size(), 1u);
+    const std::vector<std::string> range_args{"frame_anchor", "client_order_id"};
+    EXPECT_EQ(range_calls[0], range_args);
+
+    // both users of the judge go through it before they do anything else with the name; the resolution before any request or wait
+    const std::string resolve = function_body(flow->code, "resolve_order");
+    const std::string listing = function_body(flow->code, "list_unresolved_orders");
+    ASSERT_FALSE(resolve.empty());
+    ASSERT_FALSE(listing.empty());
+    EXPECT_EQ(call_args(listing, "symbol_for_order").size(), 1u);
+    const auto resolve_calls = call_args(resolve, "symbol_for_order");
+    ASSERT_EQ(resolve_calls.size(), 1u);
+    const std::vector<std::string> judge_args{"names", "cp"};
+    EXPECT_EQ(resolve_calls[0], judge_args);
+    EXPECT_EQ(call_args(listing, "symbol_for_order")[0], judge_args);
+    const std::size_t judged = resolve.find("symbol_for_order");
+    const std::size_t first_read = resolve.find("exchange.");
+    const std::size_t first_sleep = resolve.find("sleep_for");
+    ASSERT_NE(judged, std::string::npos);
+    ASSERT_NE(first_read, std::string::npos);
+    ASSERT_NE(first_sleep, std::string::npos);
+    EXPECT_LT(judged, first_read);
+    EXPECT_LT(judged, first_sleep);
+}
+
 TEST(OperatorResolutionGuard, TheFrameTheToolWritesIsMadeOfTheCheckpointAndTheConclusionAlone) {
     const SourceFile* flow = find_source(kFlow);
     ASSERT_NE(flow, nullptr);

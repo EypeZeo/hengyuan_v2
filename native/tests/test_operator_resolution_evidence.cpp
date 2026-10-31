@@ -498,6 +498,63 @@ TEST(OperatorResolutionRange, StartsTwoRecvWindowsBeforeTheEarlierOfTheTwoAnchor
     EXPECT_EQ(r.start, at(-50'000 - kTwoW));
 }
 
+// --- the earliest moment the order could have been sent (D5 / R3b-3: the interval and the symbol-time guard share it) -----------
+
+TEST(OperatorResolutionSendAnchor, IsTheEarlierOfTheFrameTimeAndTheIdsTimestamp) {
+    const std::string coid_later(make_client_order_id(kNow - 10'000, 1, 0x42).view());
+    const std::string coid_earlier(make_client_order_id(kNow - 50'000, 1, 0x42).view());
+    EXPECT_EQ(earliest_send_anchor(at(-50'000), coid_later), at(-50'000)) << "the frame time is the earlier one";
+    EXPECT_EQ(earliest_send_anchor(at(-10'000), coid_earlier), at(-50'000)) << "the id is the earlier one: not the preferred frame time";
+    EXPECT_EQ(earliest_send_anchor(at(-50'000), coid_earlier), at(-50'000)) << "both equal";
+    // one millisecond apart, either way round
+    const std::string coid_at(make_client_order_id(kNow - 1000, 1, 0x42).view());
+    EXPECT_EQ(earliest_send_anchor(at(-999), coid_at), at(-1000));
+    EXPECT_EQ(earliest_send_anchor(at(-1001), coid_at), at(-1001));
+}
+
+TEST(OperatorResolutionSendAnchor, EitherAnchorAloneIsTheAnchorAndNeitherIsNothing) {
+    const std::string coid(make_client_order_id(kNow - 50'000, 1, 0x42).view());
+    EXPECT_EQ(earliest_send_anchor(std::nullopt, coid), at(-50'000));
+    EXPECT_EQ(earliest_send_anchor(at(-30'000), "not one of our ids"), at(-30'000));
+    EXPECT_EQ(earliest_send_anchor(at(-30'000), ""), at(-30'000));
+    EXPECT_FALSE(earliest_send_anchor(std::nullopt, "").has_value());
+    EXPECT_FALSE(earliest_send_anchor(std::nullopt, "garbage").has_value());
+    EXPECT_FALSE(earliest_send_anchor(std::nullopt, "HY-1000-1-0042").has_value()) << "an id whose timestamp is no wall clock is no anchor";
+}
+
+TEST(OperatorResolutionSendAnchor, AnImplausibleFrameTimeIsNotAnAnchor) {
+    const std::string coid(make_client_order_id(kNow - 50'000, 1, 0x42).view());
+    for (const std::int64_t garbage : {std::int64_t{0}, std::int64_t{1}, std::int64_t{-5}, kMinPlausibleExchangeMs - 1,
+                                       kMaxPlausibleExchangeMs + 1, std::numeric_limits<std::int64_t>::max()}) {
+        SCOPED_TRACE(garbage);
+        EXPECT_EQ(earliest_send_anchor(ExchangeMs{garbage}, coid), at(-50'000)) << "the id carries it";
+        EXPECT_FALSE(earliest_send_anchor(ExchangeMs{garbage}, "").has_value()) << "and without the id there is nothing";
+    }
+    // the edges of the plausible range are anchors
+    EXPECT_EQ(earliest_send_anchor(ExchangeMs{kMinPlausibleExchangeMs}, "").value().count(), kMinPlausibleExchangeMs);
+    EXPECT_EQ(earliest_send_anchor(ExchangeMs{kMaxPlausibleExchangeMs}, "").value().count(), kMaxPlausibleExchangeMs);
+}
+
+TEST(OperatorResolutionSendAnchor, IsExactlyWhatTheIntervalStartsFrom) {
+    // one definition of "when was the order sent": the interval is 2W before the anchor, for every combination
+    const std::string coid_later(make_client_order_id(kNow - 10'000, 1, 0x42).view());
+    const std::string coid_earlier(make_client_order_id(kNow - 50'000, 1, 0x42).view());
+    for (const std::optional<ExchangeMs> frame : {std::optional<ExchangeMs>{}, std::optional<ExchangeMs>{at(-30'000)},
+                                                  std::optional<ExchangeMs>{at(-80'000)}}) {
+        for (const std::string_view id : {std::string_view{}, std::string_view{"garbage"}, std::string_view(coid_later),
+                                          std::string_view(coid_earlier)}) {
+            const std::optional<ExchangeMs> anchor = earliest_send_anchor(frame, id);
+            const AllOrdersRange r = all_orders_range(frame, id, at(kHour), FenceParams{});
+            if (!anchor) {
+                EXPECT_EQ(r.status, RangeStatus::NoUsableAnchor);
+            } else {
+                ASSERT_EQ(r.status, RangeStatus::Ok);
+                EXPECT_EQ(r.start.count(), anchor->count() - kTwoW);
+            }
+        }
+    }
+}
+
 TEST(OperatorResolutionRange, EitherAnchorAloneIsEnough) {
     const std::string coid(make_client_order_id(kNow - 50'000, 1, 0x42).view());
     auto r = all_orders_range(std::nullopt, coid, at(kHour), FenceParams{});
