@@ -19,6 +19,10 @@
 //          exact text of that argument: a call that leaves it out still compiles and quietly merges events of a generation the sweep
 //          already settled, and never learns that a serverShutdown ended its generation. The memory-only calls are on the retired listenKey
 //          stream, which stamps no generation and has no serverShutdown; M5 removes them together with that stream.
+//        * (D5 slice R4) the same pin carries the late-fill alarm: the orchestrator's call passes ctx.late_fill as its eighth argument, the
+//          listenKey calls pass none (their harnesses open a scratch store that no operator has resolved anything in), the alarm's hook in the
+//          drain sits ahead of the barrier's stale-generation filter, and nothing under include/ or src/ builds a LateFillAlarm or assigns
+//          .late_fill yet -- no process runs the live drain loop before M5, so the day one does, the pins below fail and the wiring is reviewed.
 //
 // The scan strips comments and the contents of string/char literals first, so prose that mentions a call does not count and a string that
 // contains one cannot hide a real use. (The stripping helpers are copies of the ones in test_reconcile_durable_guard.cpp; the guards share no
@@ -298,23 +302,30 @@ struct DrainPin {
     const char* file;
     std::size_t calls;
     std::size_t args;
-    const char* barrier_arg;  // the exact text of the seventh argument; "" for a call that passes none
+    const char* barrier_arg;    // the exact text of the seventh argument; "" for a call that passes none
+    const char* late_fill_arg;  // the exact text of the eighth argument (D5 slice R4); "" for a call that passes none
     const char* why;
 };
 
+constexpr std::size_t kLateFillArgCount = 8;
 constexpr std::size_t kBarrierArgCount = 7;
 constexpr std::size_t kNoBarrierArgCount = 6;
 
 // Every production call of drain_user_data_events(), and what kind it is.
 const DrainPin kUserDataDrains[] = {
-    {"include/hengyuan/live_submit_orchestrator.hpp", 1, kBarrierArgCount, "ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr",
-     "orchestrate_submit(): the barrier of the readiness Gate 2b consults (no readiness: no barrier, and Gate 2b refuses anyway)"},
-    {"src/live_submit_preflight_harness.cpp", 3, kNoBarrierArgCount, "",
-     "NO BARRIER: the listenKey stream stamps no generation (0 = always merged) and has no serverShutdown; retired with that stream in M5"},
-    {"src/live_submit_real_credentials_demo.cpp", 3, kNoBarrierArgCount, "",
-     "NO BARRIER: the listenKey stream stamps no generation and has no serverShutdown; the SubmitPort is assembled but never invoked"},
-    {"src/live_submit_reconcile_harness_demo.cpp", 2, kNoBarrierArgCount, "",
-     "NO BARRIER: the listenKey stream stamps no generation and has no serverShutdown; nothing is ever submitted"},
+    {"include/hengyuan/live_submit_orchestrator.hpp", 1, kLateFillArgCount, "ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr",
+     "ctx.late_fill",
+     "orchestrate_submit(): the barrier of the readiness Gate 2b consults (no readiness: no barrier, and Gate 2b refuses anyway), and the late-fill "
+     "alarm of the context (unset: the drain ignores a report about a written-off order, as before R4)"},
+    {"src/live_submit_preflight_harness.cpp", 3, kNoBarrierArgCount, "", "",
+     "NO BARRIER, NO ALARM: the listenKey stream stamps no generation (0 = always merged) and has no serverShutdown; retired with that stream in "
+     "M5; the harness opens a scratch store, so no operator has resolved an order in it"},
+    {"src/live_submit_real_credentials_demo.cpp", 3, kNoBarrierArgCount, "", "",
+     "NO BARRIER, NO ALARM: the listenKey stream stamps no generation and has no serverShutdown; the SubmitPort is assembled but never invoked; "
+     "there is no durable store at all"},
+    {"src/live_submit_reconcile_harness_demo.cpp", 2, kNoBarrierArgCount, "", "",
+     "NO BARRIER, NO ALARM: the listenKey stream stamps no generation and has no serverShutdown; nothing is ever submitted; there is no durable "
+     "store at all"},
 };
 
 }  // namespace
@@ -368,6 +379,10 @@ TEST(SubmitReadinessGuard, TheExtractorsKnowWhatTheyAreLookingFor) {
     EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, nullptr);").back(), "nullptr")
         << "an explicit nullptr is seven arguments, and visibly not a barrier";
     EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, x ? &y->z() : nullptr);").back(), "x ? &y->z() : nullptr");
+    EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, ctx.late_fill);").size(), 8u);
+    EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, ctx.late_fill);").back(), "ctx.late_fill");
+    EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, nullptr);").back(), "nullptr")
+        << "an explicit nullptr is eight arguments, and visibly not an alarm";
     EXPECT_TRUE(call_args(code_only("inline void drain_user_data_events(A& a, B* b) noexcept {}"), name).empty()) << "a definition";
     EXPECT_TRUE(call_args(code_only("// drain_user_data_events(a, b)\n"), name).empty()) << "prose";
     EXPECT_EQ(count_substring("abcabcab", "abc"), 2u);
@@ -495,7 +510,8 @@ TEST(SubmitReadinessGuard, EveryProductionUserDataDrainIsPinnedWithItsBarrierArg
         if (pin == nullptr) {
             problems.push_back(f.rel + ": " + std::to_string(calls.size()) +
                                " call(s) to drain_user_data_events() that are not pinned in kUserDataDrains -- a call on the WebSocket API "
-                               "stream must pass the ReconnectBarrier (7 arguments) or be pinned, with the reason it needs none");
+                               "stream must pass the ReconnectBarrier and the late-fill alarm (8 arguments) or be pinned, with the reason it "
+                               "needs neither");
             continue;
         }
         if (calls.size() != pin->calls) {
@@ -505,9 +521,15 @@ TEST(SubmitReadinessGuard, EveryProductionUserDataDrainIsPinnedWithItsBarrierArg
             if (args.size() != pin->args) {
                 problems.push_back(f.rel + ": a call has " + std::to_string(args.size()) + " arguments, expected " + std::to_string(pin->args) +
                                    " (" + pin->why + ")");
-            } else if (pin->args == kBarrierArgCount && args.back() != pin->barrier_arg) {
-                problems.push_back(f.rel + ": the seventh argument is `" + args.back() + "`, expected `" + pin->barrier_arg +
+                continue;
+            }
+            if (pin->args >= kBarrierArgCount && args[kBarrierArgCount - 1] != pin->barrier_arg) {
+                problems.push_back(f.rel + ": the seventh argument is `" + args[kBarrierArgCount - 1] + "`, expected `" + pin->barrier_arg +
                                    "` -- anything else (an explicit nullptr above all) is a drain with no barrier in disguise");
+            }
+            if (pin->args >= kLateFillArgCount && args[kLateFillArgCount - 1] != pin->late_fill_arg) {
+                problems.push_back(f.rel + ": the eighth argument is `" + args[kLateFillArgCount - 1] + "`, expected `" + pin->late_fill_arg +
+                                   "` -- anything else (an explicit nullptr above all) is a drain with no late-fill alarm in disguise");
             }
         }
     }
@@ -535,4 +557,59 @@ TEST(SubmitReadinessGuard, TheOrchestratorOrdersGate2bAfterTheKillSwitchAndBefor
     EXPECT_LT(kill, ready);
     EXPECT_LT(ready, evidence);
     EXPECT_EQ(count_substring(f->code, "OrchestratorGate::NotReady;"), 1u) << "one place assigns the gate";
+}
+
+// --- D5 slice R4: the late-fill alarm ------------------------------------------------------------------------------------------------------
+//
+// Behaviour is test_late_fill_alarm.cpp (the table, the trip, the audit, the drain, the recovery round trip) and test_live_submit_orchestrator.cpp
+// (the very call that drains the report is refused). What behaviour cannot see is the order of two statements and the absence of a user.
+
+TEST(SubmitReadinessGuard, TheLateFillAlarmSeesAnEventBeforeTheBarrierCanDropIt) {
+    // The barrier drops an event of an older generation because "the sweep already reflects whatever it said". For an order nothing sweeps -- a
+    // written-off one -- that reason is false, so the alarm's hook must come first; behaviour pins it too (AnOlderGenerationsReport...), this is the twin.
+    const SourceFile* f = find_source("include/hengyuan/binance_user_data_event.hpp");
+    ASSERT_NE(f, nullptr);
+    const std::size_t alarm = f->code.find("late_fill->on_execution_report(");
+    const std::size_t stale_filter = f->code.find("barrier->admit_event(");
+    ASSERT_NE(alarm, std::string::npos);
+    ASSERT_NE(stale_filter, std::string::npos);
+    EXPECT_LT(alarm, stale_filter);
+    EXPECT_EQ(count_substring(f->code, "late_fill->on_execution_report("), 1u) << "one hook";
+    EXPECT_EQ(count_substring(f->code, "barrier->admit_event("), 1u);
+    // ... and it asks the registry itself: a watched id that is in flight is a tracked order, not a written-off one.
+    const std::size_t asks_registry = f->code.find("!in_flight.is_in_flight(ev.coid.view())", f->code.find("late_fill->watches("));
+    ASSERT_NE(asks_registry, std::string::npos);
+    EXPECT_LT(asks_registry, alarm);
+}
+
+TEST(SubmitReadinessGuard, NoProductionCodeBuildsALateFillAlarmOrWiresItIntoAContextYet) {
+    // The alarm is real and tested, and no process runs the live drain loop before M5 (L-43), so there is nothing to wire it into. Pinned as such:
+    // the day a production file builds one -- or assigns .late_fill -- this fails, and the wiring (which store's list, which KillSwitch) is a review
+    // item and not a side effect. The three OrchestratorContexts of kContexts stay unwired for the same reason as their drains: scratch stores.
+    std::vector<std::string> problems;
+    for (const SourceFile& f : production_sources()) {
+        if (f.rel == "include/hengyuan/late_fill_alarm.hpp") continue;  // the definition
+        const std::size_t built = constructions_of(f.code, "LateFillAlarm");
+        if (built != 0) {
+            problems.push_back(f.rel + ": builds " + std::to_string(built) +
+                               " LateFillAlarm(s); pin it (with the store whose list feeds it and the KillSwitch it trips) or remove it");
+        }
+        const std::vector<std::string> wired = member_assignments(f.code, "late_fill");
+        if (!wired.empty()) {
+            problems.push_back(f.rel + ": assigns .late_fill " + std::to_string(wired.size()) +
+                               " time(s); pin the context (and say which alarm it gets) or remove it");
+        }
+    }
+    for (const std::string& s : problems) ADD_FAILURE() << s;
+    EXPECT_TRUE(problems.empty());
+
+    // The negative controls of this check, on text with known answers.
+    const auto stripped = [](const char* t) { return code_only(t); };
+    EXPECT_EQ(constructions_of(stripped("LateFillAlarm alarm(list, list.size(), ks);"), "LateFillAlarm"), 1u);
+    EXPECT_EQ(constructions_of(stripped("auto a = std::make_unique<LateFillAlarm>(l, n, ks);"), "LateFillAlarm"), 1u);
+    EXPECT_EQ(constructions_of(stripped("LateFillAlarm* late_fill{nullptr};"), "LateFillAlarm"), 0u) << "a pointer declarator";
+    EXPECT_EQ(constructions_of(stripped("void f(LateFillAlarm& a);"), "LateFillAlarm"), 0u) << "a reference";
+    EXPECT_EQ(member_assignments(stripped("ctx.late_fill = &alarm;"), "late_fill"), (std::vector<std::string>{"&alarm"}));
+    EXPECT_TRUE(member_assignments(stripped("late_fill->on_execution_report(a, b, c, d);"), "late_fill").empty()) << "a call through it";
+    EXPECT_TRUE(member_assignments(stripped("if (ctx.late_fill == nullptr) {}"), "late_fill").empty()) << "a comparison";
 }

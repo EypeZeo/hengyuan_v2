@@ -981,6 +981,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_binance_user_data_event)
     gtest_discover_tests(test_binance_user_data_event)
 
+    # D5 slice R4: the late-fill alarm (late_fill_alarm.hpp, docs/OPERATOR_RESOLUTION_DESIGN.md 9 "R-late"): the table, the breaker
+    # trip and its audit records, the drain's hook (ahead of the barrier's stale-generation filter), and the recovery round trip --
+    # a crafted log with an operator-resolved order, read by the production sink, fed to the alarm, fired through the production
+    # drain. Boost-free, single-threaded (the hot thread), so no sanitizer list beyond the ordinary ones.
+    add_executable(test_late_fill_alarm tests/test_late_fill_alarm.cpp)
+    target_link_libraries(test_late_fill_alarm PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_late_fill_alarm)
+    gtest_discover_tests(test_late_fill_alarm)
+
     # TODO 1A.4 batch 2: dedup-safe per-in-flight-order WS-fill baseline, shared by all three
     # fill-application paths -- same Boost-free tier as the two targets above.
     add_executable(test_order_fill_context tests/test_order_fill_context.cpp)
