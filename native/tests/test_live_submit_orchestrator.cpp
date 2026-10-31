@@ -602,6 +602,119 @@ TEST_F(LiveSubmitTest, AnUnwiredReadinessStillDrainsTheRingWithoutABarrier) {
     EXPECT_FALSE(ring.try_pop(leftover)) << "the event was drained, barrier or not";
 }
 
+// --- D5 slice R4: the late-fill alarm through the production entry point (blueprint L-47) ---
+//
+// test_late_fill_alarm.cpp pins the alarm and the drain's hook. What only this entry point can show: the drain runs ahead of the gates, so the call
+// that drains a report about a written-off order is the call that is refused -- no order slips out between the report and the next call.
+
+namespace {
+
+std::array<OperatorResolvedOrder, 1> written_off_list(const char* coid) {
+    std::array<OperatorResolvedOrder, 1> list{};
+    std::snprintf(list[0].client_order_id.id, sizeof(list[0].client_order_id.id), "%s", coid);
+    list[0].symbol_id = 1;
+    list[0].side = OrderSide::Buy;
+    list[0].qty_ticks = 10;
+    return list;
+}
+
+UserDataWsEvent report_about(const char* coid, std::uint64_t generation = 0) {
+    UserDataWsEvent ev{};
+    ev.kind = UserDataEventKind::ExecutionReport;
+    ev.generation = generation;
+    ev.exec_type = ExecutionType::Trade;
+    std::snprintf(ev.coid.id, sizeof(ev.coid.id), "%s", coid);
+    std::snprintf(ev.cumulative_filled_qty_raw, sizeof(ev.cumulative_filled_qty_raw), "%s", "0.00000010");
+    return ev;
+}
+
+}  // namespace
+
+TEST_F(LiveSubmitTest, AReportAboutAWrittenOffOrderRefusesTheVeryCallThatDrainedIt) {
+    const auto list = written_off_list("HY-WRITTEN-OFF");
+    LateFillAlarm alarm(list, list.size(), kill_switch_);
+    ctx_.late_fill = &alarm;
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(report_about("HY-WRITTEN-OFF")));
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::KillSwitchNotNormal) << "the drain trips the switch before Gate 2 looks at it";
+    EXPECT_EQ(g_mock_submit_calls, 0) << "nothing reached the exchange";
+    EXPECT_EQ(kill_switch_.state(), KillState::Triggered);
+    ASSERT_GE(audit_.count(), 2u);
+    EXPECT_EQ(audit_.at(0)->event_type, AuditEventType::UserDataStreamEventObserved);
+    EXPECT_STREQ(audit_.at(0)->client_order_id, "HY-WRITTEN-OFF");
+    EXPECT_EQ(audit_.at(1)->event_type, AuditEventType::KillSwitchTriggered);
+
+    // ... and it stays refused: the next call has nothing to drain and is stopped by the switch itself.
+    EXPECT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::KillSwitchNotNormal);
+    EXPECT_EQ(g_mock_submit_calls, 0);
+}
+
+TEST_F(LiveSubmitTest, TheSameReportWithoutAnAlarmIsIgnoredAndTheOrderGoesOut) {
+    // The control of the test above: what the drain did with such a report before R4, and still does when no alarm is wired.
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(report_about("HY-WRITTEN-OFF")));
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(kill_switch_.state(), KillState::Normal);
+    EXPECT_EQ(g_mock_submit_calls, 1);
+}
+
+TEST_F(LiveSubmitTest, AReportAboutAnotherOrderDoesNotStopTheCall) {
+    const auto list = written_off_list("HY-WRITTEN-OFF");
+    LateFillAlarm alarm(list, list.size(), kill_switch_);
+    ctx_.late_fill = &alarm;
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(report_about("HY-SOME-OTHER-ORDER")));
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted) << "the late duplicate of an ordinary final order is not this alarm's business";
+    EXPECT_EQ(alarm.stats().reports, 0u);
+}
+
+TEST_F(LiveSubmitTest, TheAlarmDoesNotNeedAReadinessToStopTheCall) {
+    // No readiness means no barrier for the drain -- and Gate 2b would refuse the call as Unwired. The alarm must not depend on either: Gate 2 comes
+    // first, and it is the tripped switch that stops the call.
+    ctx_.readiness = nullptr;
+    const auto list = written_off_list("HY-WRITTEN-OFF");
+    LateFillAlarm alarm(list, list.size(), kill_switch_);
+    ctx_.late_fill = &alarm;
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(report_about("HY-WRITTEN-OFF")));
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(r.gate, OrchestratorGate::KillSwitchNotNormal);
+    EXPECT_EQ(kill_switch_.state(), KillState::Triggered);
+    EXPECT_EQ(alarm.stats().reports, 1u);
+}
+
+TEST_F(LiveSubmitTest, AnOlderGenerationsReportAboutAWrittenOffOrderStillStopsTheCall) {
+    SyntheticReadiness second_generation(kill_switch_, /*generation=*/2);
+    ctx_.readiness = &second_generation.readiness();
+    const auto list = written_off_list("HY-WRITTEN-OFF");
+    LateFillAlarm alarm(list, list.size(), kill_switch_);
+    ctx_.late_fill = &alarm;
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(report_about("HY-WRITTEN-OFF", /*generation=*/1)));
+
+    auto r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(second_generation.readiness().barrier().stats().late_events_dropped, 1u) << "the barrier drops the older generation's event as before";
+    EXPECT_EQ(r.gate, OrchestratorGate::KillSwitchNotNormal) << "... but the alarm saw it first: the sweep behind generation 2 does not track this order";
+    EXPECT_EQ(g_mock_submit_calls, 0);
+}
+
 // --- Gate ordering around 2b: audit and kill switch before it, evidence and everything else after it ---
 
 TEST_F(LiveSubmitTest, AuditCheckedBeforeReadiness) {
@@ -1771,6 +1884,24 @@ TEST_F(LiveSubmitReconcileTest, DrainingAResolutionInsideTheNextOrderAllocatesNo
     EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
     EXPECT_FALSE(in_flight_.is_in_flight(coid.view())) << "the resolution was drained inside the measured call";
     EXPECT_EQ(a.calls, 0u) << allocation_report("drain + order", a);
+}
+
+TEST_F(LiveSubmitTest, ALateFillAlarmRaisedInsideTheCallAllocatesNothing) {
+    // D5 slice R4: the alarm trips the breaker and writes its records inside the drain, on the hot thread. Fixed arrays, a view of the recovered
+    // list, stack records: the call that is refused because of it allocates nothing either.
+    const auto list = written_off_list("HY-WRITTEN-OFF");
+    LateFillAlarm alarm(list, list.size(), kill_switch_);
+    ctx_.late_fill = &alarm;
+    UserDataWsEventRing ring;
+    ctx_.user_data_events = &ring;
+    ASSERT_TRUE(ring.try_push(report_about("HY-WRITTEN-OFF")));
+
+    OrchestratorResult r{};
+    const Allocations a = count_allocations([&] { r = orchestrate_submit(ctx_); });
+
+    EXPECT_EQ(r.gate, OrchestratorGate::KillSwitchNotNormal);
+    EXPECT_EQ(alarm.stats().reports, 1u) << "the alarm was raised inside the measured call";
+    EXPECT_EQ(a.calls, 0u) << allocation_report("alarmed drain", a);
 }
 
 TEST_F(LiveSubmitDurableIntegrationTest, AnOrderThroughTheRealDurableSinkAllocatesNothing) {

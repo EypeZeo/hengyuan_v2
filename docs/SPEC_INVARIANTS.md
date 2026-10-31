@@ -387,7 +387,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       v6 帧之后，交易进程接着写的也是 v6——否则下次启动就会撞上“v6 之后的 v5”，把整本日志判 `Corrupt`。`append_durable()`
       遇到写版本里非法的事件（v5 存储上的事件 22）围栏，且不写任何字节。
     - **产物**：被结清的订单是终态（`Rejected`）——不进 `recovered_checkpoints()`、不算孤儿、不进在途表、`StartupRecovery` 不再
-      等它；`recovered_operator_resolved()` 按日志顺序列出它们（订单号、品种、方向、数量、帧序号），给切片 R4 的迟到成交告警用。
+      等它；`recovered_operator_resolved()` 按日志顺序列出它们（订单号、品种、方向、数量、帧序号），给切片 R4 的迟到成交告警用（R4 已落地，见 “D5 切片 R4”）。
       这个表必须**完整**才有用（被错误结清的挂单可能几周后才成交），所以满额（`kMaxOperatorResolved`）是失败关闭的：交易进程
       `CapacityExceeded`。
     - **`OperatorOpen`**：只给离线工具（切片 R3）。同一次扫描，但三个界（未决订单 `kMaxInFlight`、Intent 孤儿预算、操作员结清表）
@@ -661,6 +661,37 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       **变异检查**（62 个独特变异：sink 13、发送锚点 10、流程 26、工具 13；三份 MSVC 副本并行，每个变异先重建再运行；构建失败不算检出）= **60 杀死 + 2 等价，0 个无法解释**。金丝雀（SK01、FL06、TL01）都由各自的运行期测试杀死，没有靠编译期断言。2 个原写法因 `/WX` 的未使用参数告警构建失败（EV10、TL07），已改写（EV10b、TL07b）后重跑并杀死，不算检出。没有一个只有守卫能杀：绕过判定函数的两个（FL22 结清直接问日志、FL23 列表直接问日志）也被行为测试杀死，守卫另外钉住文本。只在第二阶段才被杀的是 SK03（把负的首次命名时间记成 0）：折叠测试不检查负数，流程的 “没有可用时间” 用例杀了它。2 个等价：EV07（订单号时间戳等于帧时间时取哪一个——同一个值）、TL11（结清说明的条件里 “且结果是 `SymbolNameNotKnown`” 这一项：`NotNamedAtOrderTime` 只会在 `resolve_order()` 以 `SymbolNameNotKnown` 停下的地方出现，所以多余——留着是为了日后调整顺序时不说错话）。逐个变异的覆盖：sink 的时间记录与回读（SK01 至 SK13：不记、迟 1 毫秒、负数记成 0、取最后一次提及的时间、取最小的时间、第一个提及没有时间时被后来的补上、不看时间类型、取负载里的时间、帧时间一律当 0、非 Known 状态也报时间、Known 不报时间、新状态与 Known 同值）；锚点（EV01 至 EV10b：不合理的帧时间当锚点、合理范围两端的边界、帧时间或订单号不算数、取较晚者、只在没有帧时间时才用订单号、区间忽略任一锚点）；判定与两处使用（FL01 至 FL26：负的发送时间、帧锚点缺失或晚 1 秒、Unknown / Conflict 也被判、没有锚点时被拒、`<` 变 `<=` / `>` / 加 1 毫秒余量、名字的时间差 1 毫秒、不合理时间的各种放行、永不拒绝 / 一律拒绝、拒绝时报成别的状态、名字泄漏、判定忽略任一锚点、问错的 id、两个绕过、不报时间、区间忽略检查点的帧时间）；工具的说明（TL01 至 TL13）。
     - **仍未覆盖**：迟到成交告警（R4）；环境与账户绑定（R5，生产启用的前置——这道防线只防 “日志被重建”，不防 “拿错了环境或账户的日志”：旧日志的快照比订单早，名字照样 `Known`）；
       `-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练）；工具对真实或 Testnet 交易所的任何一次运行。
+
+  - **[D5 切片 R4 已落地：迟到成交告警——被操作员结清的订单，交易所一开口就熔断]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §9 “R-late”、§10；Owner 2026-10-31 “开始R4，按推荐”；Tier B；本 PR）：被离线工具结清的订单（`OrderOperatorResolved`）是终局且无人跟踪的——“交易所没有这个订单，栅栏之后也永远不会有”。
+    如果这个证明错了（读延迟比工具假设的大，或工具查的是不该查的账户或环境），订单其实活着；恢复不为它登记任何东西，而 `drain_user_data_events()` 对不在途的 COID 一向直接 `continue`（“预期之内的未命中”）：
+    没有审计记录、没有计数、没有仓位效果，仓位漂移而没有任何东西说一声（L-47）。R4 就是这一声。
+    **仍然没有任何进程接线**：没有进程运行实盘排空循环（M5 之前），所以这个告警在树里只被测试驱动、没有被任何程序创建；守卫钉住这一点。
+    - **看什么**（`LateFillAlarm`，`late_fill_alarm.hpp`）：恰好 `recovered_operator_resolved()` 列出的 COID——不是 “任何自己的、不在途的 COID”（那会把合法的迟到重复事件误报，设计文档已明说另属一个设计）。
+      表是恢复列表的**视图**（不拷贝、没有堆分配），所以持有列表的 sink 必须比告警活得久；列表要么完整，要么交易打开已经失败（`kMaxOperatorResolved`）。构造时再给 `resolved_total`（`recovered_operator_resolved_total()`）：
+      它与列表长度不等（`OperatorOpen` 打开且溢出了），或列表比告警装得下的更长，`complete()` 为假，**构造时就熔断**——有洞的名单不是名单。
+    - **做什么**：排空函数遇到一个 ExecutionReport 事件，其 COID 在表里**且不在途**（二者同时成立只可能是被重用的 id，注册表里在途的那个才是被跟踪的），告警：
+      ① `KillSwitch::trigger()`——只从 Normal 或 Armed 升到 `Triggered`（`Triggered` 不再计数，Latched 永不降级），于是 Gate 2 与 Gate 2b 拒绝此后的每一单；排空发生在门之前，**排空到这条报告的那次调用本身就被拒**，
+      报告与下一次发单之间没有缝隙。停在 `Triggered` 而不是 Latched：Latched 是 flatten 完成之后的终态锁，这里没有任何自动平仓（`determine_emergency_policy()` 恒为 OperatorManualOnly）；两者对两道门的效果相同，也都只有 `operator_reset()` 能解除。
+      ② 写审计：每个被监视订单的**第一条**报告写一条 `UserDataStreamEventObserved`；报告每次让熔断动了一下就写一条 `KillSwitchTriggered`（品种、方向、意图数量取自恢复的条目，交易所订单号、执行类型与状态取自报告；`detail_msg` 是固定文字 “late report: operator-resolved order” / “breaker: report on operator-resolved order”）。
+      **先熔断后审计**：审计缺失（空指针）或已满只丢记录（`stats().audit_failed` 计数），挡不住熔断。**去重只对审计环、不对熔断**：操作员复位（重启的等价物）之后，同一订单的下一条报告重新熔断，并写 `KillSwitchTriggered`。
+    - **什么算数：该 COID 的任何执行报告**——有成交与否、什么执行类型都算。设计文档写的是 “`executedQty > 0`”；告警根本不读数量，这是有意的：一条报告就是 “这个订单存在（过）” 的证据，而这正是操作员的证明说不可能的事；
+      读错一个数量就是漏报，而漏报正是本片要消灭的唯一失败。代价是对不带成交的报告（撤销、过期）也熔断——它同样推翻了证明，重启即可解除。**这是 Owner 说 “按推荐” 时采用的、偏向收紧的默认值**：若想收窄回字面的 `executedQty > 0`，改动局限在 `on_execution_report()` 的入口判断。
+    - **位置**：钩子在 `drain_user_data_events()` 的循环顶部，在 `ReconnectBarrier` 的旧代次过滤**之前**。那道过滤的理由是 “让这一代对账完成的清扫已经反映了它说的一切”，对没有任何东西清扫的、已结清的订单不成立，所以旧代次的报告也必须拉响告警
+      （屏障照旧丢弃并计数那条事件，别的什么都没变）。告警之后这条报告走与任何不被跟踪的报告一样的路：不折进 `PositionTruth`、没有 `OrderFillContext`、没有普通的 `UserDataStreamEventObserved`。
+    - **不做**：不把成交折进仓位（品种与方向在条目里，数量刻度不在；“带成交的解决” 是 K3，要先有账务 / `PositionTruth` 的恢复路径）；不修复任何东西——熔断之后这个进程相信的仓位是错的，要操作员去看账户。
+      **只在内存里**：熔断（SAFE-04 才会持久）与审计环重启即忘。持久的告警记录**不能**是以已结清 COID 为键的订单帧——恢复扫描把操作员帧之后同一 COID 的任何帧都读作 `Corrupt`（设计 §7.2 第 4 条）——所以它需要自己的记录类型（M4 / SAFE-04）；
+      M4 改造这个排空函数时，钩子必须仍在屏障过滤之前。
+    - **接线**：OrchestratorContext 的 late_fill 成员（可空；未设置 = 排空照旧忽略这种报告），编排器把它作为排空的第八个参数传入。告警与上下文必须指**同一个** `KillSwitch`（告警按引用、上下文按指针，没有东西能互相检查）。
+    - **守卫**（`test_submit_readiness_guard.cpp`，7 → 9）：编排器的排空调用传 `ctx.late_fill`（第八个参数的文字被钉住，显式的 `nullptr` 是 “没有告警的排空” 的伪装）；三个 listenKey 旧 harness 的 8 处调用不传（它们只开一个没有任何结清订单的临时存储，或根本没有存储）；
+      钩子在屏障过滤之前，且先问表、再问注册表、最后才进告警；`include/` 与 `src/` 里没有任何 `LateFillAlarm` 的构造点，也没有对 `.late_fill` 的赋值——哪天有进程接线，这条会失败，接哪一个存储的列表、哪一个 `KillSwitch` 成为评审项，而不是顺带的副作用。
+    - **验证**：新增测试 45 个：告警本身、排空集成与恢复往返 37（新目标 test_late_fill_alarm：告警 22、排空 12、恢复 3）、编排器入口 6（test_live_submit_orchestrator 101 → 107：同一次调用被拒、没挂告警的对照、别的订单不拦、没有 readiness 也拦、旧代次的报告也拦、拉响告警的那次调用零分配）、守卫 2（test_submit_readiness_guard 7 → 9；排空调用的钉子另由 7 个参数扩为第八个参数）。
+      MSVC（/W4 /WX）全量构建零警告零错误；全量 ctest 3282 个用例（相对 R3b-3 合并时的 3237 恰好多 45 项）：3280 通过（含 1 个既有跳过：SealIdWatermarkLoader.DirectoryIdentityChangeThenStickyFenceAreDistinct，Windows 上设计如此）、2 个既有禁用、0 失败。（ALL_BUILD 又撞上了 CMake 4.4 的 gtest 发现竞态——退出码 1，只丢发现这一步；逐个重跑发现脚本后，ctest -N 的 3282 与各可执行文件自己列出的 3281 加 1 个自检吻合。）
+      GCC-14.2，在 tokyo-vps 上（本地 WSL2 连续两次建不出虚拟机：HCS 0x800705aa，按 CLAUDE.md 的既定规则改用 VPS；源码以 LF 字节同步、逐文件核对 md5）：触及的 12 个测试可执行文件加 4 个 harness 可执行文件（只编译，它们用旧的参数表调用排空）——none（Release，-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wshadow）零警告，12 个测试可执行文件全部通过；address（RelWithDebInfo，ASan+UBSan，泄漏检测、返回后栈使用检测、严格字符串检查、出错即中止）零报告，6 个测试可执行文件全部通过（不含那几个巨型翻译单元：VPS 只有 5.9 GB）。首个提交之后又加了 5 个测试，最终源码再跑了一遍三个有改动的目标（test_late_fill_alarm 37、test_live_submit_orchestrator 107、test_submit_readiness_guard 9），两档同样零警告零报告。完整的 none / ASan / TSan / ARM64 矩阵由 CI 与那唯一一次手动 sanitizer 运行给出。
+      **变异检查**（70 个独特变异：告警本身 52、排空钩子 13、编排器传参 3、守卫探针 2；两份 MSVC 副本并行，每个变异先重建再运行；构建失败不算检出）= **70 个全部杀死，0 个幸存**。金丝雀（LF01、UD01、OR01）在两份副本里都由 test_late_fill_alarm 或 test_live_submit_orchestrator 的运行期测试杀死。2 个原写法因 /WX 的未使用参数告警构建失败（LF09、LF52），已改写（LF09b、LF52b）后重跑并杀死，不算检出。68 个在第一阶段就被行为测试杀死；**只有守卫能杀的 2 个**：OR03（把传给排空的第八个参数写成 ctx.late_fill != nullptr ? ctx.late_fill : nullptr——行为不变，文字钉子拒绝）与 UD09（去掉钩子里对表的预检——行为等价：on_execution_report 自己会找、对陌生 id 返回假，预检只省一次注册表扫描；被守卫钉住的文字杀死，不是被行为杀死）。逐个变异的覆盖：告警的记录（LF01 至 LF14：时间、模式、品种、订单号、交易所订单号、数量、方向取反与恒为 Buy、执行类型、文字、状态总取与反取、缺审计被解引用、缺审计与被拒的记录不计数）；一条报告做什么（LF15 至 LF28：观察记录每条都写 / 只在重复时写、熔断记录连首条也写 / 只在首条写、两类记录的类型互换、每条都是首条、从不记得已告警、三个计数各不计、熔断只在首条、陌生报告回真、命中回假）；熔断（LF30 至 LF36：Armed 不升级、Triggered 再触发、Latched 也算熔断、改为 arm、改为 latch、做了不报告、报告了不做）；表（LF40 至 LF48：空表什么都找得到、空 id 不排除、首项找不到、末项找不到、比较取反、两个方向的前缀匹配、总返回第一项、“未找到”就是 0）；构造（LF50 至 LF56：超容量不截断、容量与总数各不属于完整、总数偏高与偏低仍算完整、不完整不熔断、完整反而熔断）；排空钩子（UD01 至 UD13：报告各字段、审计与时间的传递、可空性、事件种类、在途排除的取消与取反、告警与屏障过滤的次序、传错 id）；编排器传参（OR01 至 OR03）；守卫探针（GD01、GD02：生产头里出现告警的构造点、对 late_fill 成员的赋值）。
+    - **仍未覆盖**：持久的告警记录与持久的熔断（M4 / SAFE-04）；把成交折进仓位（K3）；任何进程对告警的接线（M5）；告警只看得见到达排空函数的报告——事件环满时被丢弃的报告（会话的 push_dropped 计数）看不见：
+      丢弃会让屏障退回重新清扫，但清扫只覆盖被跟踪的订单，一个已结清订单的报告丢了就是丢了；环境与账户绑定（R5，生产启用的前置——告警能在证明被推翻后叫停进程，但挡不住 “拿错了环境的日志” 这个错误本身）；
+      `-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练）；工具与告警对真实或 Testnet 交易所的任何一次运行。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 

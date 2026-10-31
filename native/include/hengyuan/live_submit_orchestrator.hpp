@@ -37,6 +37,7 @@
 #include <hengyuan/durable_order_audit_port.hpp>
 #include <hengyuan/exit_safety.hpp>
 #include <hengyuan/kill_switch.hpp>
+#include <hengyuan/late_fill_alarm.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
@@ -312,6 +313,13 @@ struct OrchestratorContext {
     // as before (no WS event draining).
     UserDataWsEventRing* user_data_events{nullptr};
 
+    // D5 slice R4 (late_fill_alarm.hpp): the alarm for an execution report about an order an operator wrote off, built from the recovered store's
+    // recovered_operator_resolved() list. Nullable, and unset means the drain above ignores such a report as it always did -- so a process that
+    // recovered a non-empty list must wire it (nothing does yet: no process runs the live drain loop, M5; test_submit_readiness_guard.cpp pins
+    // that nothing constructs one). Owned by the hot/submit thread and outliving every call. It must name the SAME KillSwitch as `kill_switch`
+    // above (it trips that switch; Gate 2 then refuses the very call that drained the report).
+    LateFillAlarm* late_fill{nullptr};
+
     // Private-stream migration M3a (submit_readiness.hpp). UNLIKE the nullable fields around it, an unset readiness does NOT mean "behave as before":
     // Gate 2b refuses every order (OrchestratorGate::NotReady, NotReadyReason::Unwired). Owned by the hot/submit thread and outliving every call (it
     // owns the ReconnectBarrier, whose state spans calls). The same barrier filters the user-data events drained above: once Reconciled(G), an event of
@@ -402,11 +410,14 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // rather than deferring keeps them from piling up for an arbitrarily long time. Now also
     // "before gates" for a second reason (TODO 1A.4 batch 2): if a downstream risk gate ever
     // reads PositionTruth::net_qty_ticks(), this drain must run before it for the WS-observed
-    // fold-in to be visible to that gate in the SAME call -- not just a style convention anymore.
+    // fold-in to be visible to that gate in the SAME call -- not just a style convention anymore. And for a third (D5 slice R4): a late-fill
+    // alarm (ctx.late_fill) trips the kill switch inside this drain, so Gate 2 below refuses the very call that drained the report -- no order
+    // can slip out between "the exchange told us about a written-off order" and the next call.
     if (ctx.in_flight && ctx.user_data_events) {
         drain_user_data_events(*ctx.in_flight, ctx.audit, *ctx.user_data_events, ctx.now_ms,
                                 ctx.position_truth, ctx.fill_context,
-                                ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr);
+                                ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr,
+                                ctx.late_fill);
     }
 
     // Gate 1: Audit available

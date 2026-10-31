@@ -29,6 +29,7 @@
 #include <hengyuan/account_truth.hpp>       // OrderSide, checked_scaled_mul_div
 #include <hengyuan/audit_trail.hpp>
 #include <hengyuan/binance_decimal.hpp>     // parse_decimal_to_ticks_with_scale
+#include <hengyuan/late_fill_alarm.hpp>     // LateFillAlarm (D5 slice R4): the alarm for a report about an order an operator wrote off
 #include <hengyuan/order_fill_context.hpp>  // OrderFillContext, OrderFillContextEntry
 #include <hengyuan/order_lifecycle.hpp>     // ClientOrderId, InFlightRegistry, OrderState
 #include <hengyuan/position_truth.hpp>      // PositionTruth
@@ -205,13 +206,31 @@ using UserDataWsEventRing = SpscRing<UserDataWsEvent, 64>;
 //     (admit_event): the sweep that made that generation Reconciled already reflects whatever it said. Until then
 //     (Down, Sweeping) old events are merged as usual -- consume_delta() applies positive deltas only, so a late
 //     duplicate is harmless.
+//
+// `late_fill` (D5 slice R4, trailing default nullptr -- omitted, nothing below changes) is the alarm for an order an
+// operator wrote off (late_fill_alarm.hpp). An execution report for one of ITS client order ids that is not in flight
+// is the "miss" this function otherwise ignores -- and the one miss that is not expected: it means the exchange has an
+// order the operator's proof said it never would. The alarm sees such a report FIRST, before the barrier's stale-
+// generation filter: that filter's reason ("the sweep already reflects whatever it said") does not hold for an order
+// nothing sweeps, so a report of an older generation must still raise it. What the alarm does with the report is its
+// own business (it trips the breaker and writes its own audit records); the report then takes the same path as any
+// untracked one -- no fold-in, no ordinary UserDataStreamEventObserved record (the alarm wrote its own), no position
+// effect.
 inline void drain_user_data_events(const InFlightRegistry& in_flight, AuditRingSink* audit,
                                     UserDataWsEventRing& events, std::int64_t now_ms,
                                     PositionTruth* position_truth = nullptr,
                                     OrderFillContext* fill_context = nullptr,
-                                    ReconnectBarrier* barrier = nullptr) noexcept {
+                                    ReconnectBarrier* barrier = nullptr,
+                                    LateFillAlarm* late_fill = nullptr) noexcept {
     UserDataWsEvent ev{};
     while (events.try_pop(ev)) {
+        if (late_fill != nullptr && ev.kind == UserDataEventKind::ExecutionReport && late_fill->watches(ev.coid.view()) &&
+            !in_flight.is_in_flight(ev.coid.view())) {
+            late_fill->on_execution_report(
+                ev.coid.view(),
+                LateFillReport{ev.exchange_order_id, static_cast<std::uint8_t>(ev.exec_type), ev.order_status, ev.order_status_known}, audit,
+                now_ms);
+        }
         if (barrier != nullptr) {
             if (ev.kind == UserDataEventKind::ServerShutdown || ev.kind == UserDataEventKind::EventStreamTerminated) {
                 barrier->on_generation_ended(ev.generation);
