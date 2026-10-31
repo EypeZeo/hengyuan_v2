@@ -466,7 +466,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       名字必须是 `[A-Z0-9]{1,19}` 且在 20 字节字段内以 NUL 结尾（解码器逐字节拷贝，什么都不检查）；**每个**提到这个 id 的快照都给同一个名字才是 `Known`；两个快照不一致、
       或有一个名字不是品种，就是 `Conflict`，而且是永久的——之后某个快照改回原名也不恢复。没有快照提到的 id、`kMaxSymbols` 及之后的 id、以及恢复没有得到
       `Clean` / `Recovered` 的日志（哪怕坏帧之前的快照已经折叠过）一律 `Unknown`；撕裂的尾部不被折叠。较短的快照对它没列出的 id 什么也不说（那些订单是在更早的快照下
-      下的，那个快照命名了它们）。只读；20 个出参的 `recover_control_plane()` 没动。
+      下的，那个快照命名了它们）。只读；20 个出参的 `recover_control_plane()` 没动。R3b-3 起 `Known` 还带第一个给出名字的快照帧的墙钟时间 `named_since_ms`，工具用它拒绝不早于订单的名字（见 “D5 切片 R3b-3”）。
     - **守卫**（`test_operator_resolution_guard.cpp`，读源码）：`validate_operator_resolution()` 只在 `check_resolution()` 里被调用；`check_resolution()` 全库只有读者与写者
       两个调用（各在自己的函数体里一次）；`append_operator_resolution()` 没有生产调用方；`write_version_` 恰好两次赋值（一次在恢复扫描，一次在写者里、在 `acked()` 之后）；
       `encode_order_event_frame()` 的唯一生产调用以 `version` 为版本；`append_impl()` 两个调用，一个传 `write_version_`、一个传 `kFrameFormatVersionV6`。
@@ -627,6 +627,40 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       TM32 / TM36 / TM37（`fsync` / 目录刷新失败、异常出口：需要有故障的文件系统）。
     - **仍未覆盖**：L-50 的附加防线（“发送时间早于第一个命名该 id 的快照” ⇒ `Unknown`；**R3b-3，须在 Owner 第一次真跑之前合入**）；迟到成交告警（R4）；环境与账户绑定（R5，生产启用的前置）；`-2013` 的真实状态码、读延迟 L
       与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练——若不带，流程以 `AccountUnverified` 拒绝，那时需要 Owner 决定）；工具对真实交易所的任何一次运行；Windows 控制台的回显。
+
+  - **[D5 切片 R3b-3 已落地：L-50 的附加防线——一个品种名只对不早于日志首次给出它的时刻发送的订单有效]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-31 “开始R3b-3，按推荐”；Tier B；本 PR）：R3-0 的品种名折叠只能回答 “控制面日志里每个快照都同意”，
+    回答不了 “这是不是订单下单当时在用的那份日志”。若控制面日志在订单之后被删除重建，一个旧的 `symbol_id` 可能被改给另一个品种、仍然是 `Known`，工具就会拿错误的品种去问交易所——
+    “没有这个订单” 对一个错误的品种是真话，而这个工具恰恰拿这句真话去结清订单。R3b-3 加一道便宜的防线（根治是 R5 的环境与账户绑定）：**名字只对不早于日志首次给出它的时刻发送的订单有效**。
+    **仍然没有任何真实流量**：工具对真实或 Testnet 交易所一次也没有运行过；本片须在 Owner 第一次真跑（R6）之前合入。
+    - **sink 记录什么**（`ControlPlaneLogSink`）：折叠表的每个槽多一个 `first_named_ms`——**日志里第一个**给出该 id 合规名字的快照帧、由其 MAC 保护的帧头时间读作墙钟时间
+      （`frame_wall_time_ms()`：`ServerCorrectedUtc` 帧取 `recorded_utc_ms`，别的时间类型取 0；注册表自己写的快照，帧头时间就是 exchangeInfo 响应里的交易所 `serverTime`）。
+      一经设定就不再动：之后一致的快照不动它，更早的时间（时钟回拨）也不把它拉回去，第一个提及没有墙钟时间时也不被后来有时间的快照 “补上”——那是不太谨慎的读法，而本 sink 的写者永远盖 `ServerCorrectedUtc`。
+      `recovered_symbol_name()` 的 `Known` 回答现在带 `named_since_ms`；别的状态为 0。`SymbolNameStatus` 新增 `NotNamedAtOrderTime = 3`——**sink 自己永远不回答它**（sink 不认识订单），只有下面的判定函数产生。
+    - **判定**（`symbol_for_order()`，`operator_resolution_flow.hpp`；`resolve_order()` 与 `list_unresolved_orders()` **都**经它、不再直接问日志，守卫钉住）：订单的发送时间取**最早的**锚点
+      （`earliest_send_anchor()`，`operator_resolution_evidence.hpp`：检查点的帧时间——只在该帧带墙钟时间时才有——与订单号里的时间戳，两者中较早者；不合理的帧时间不算锚点，`all_orders_range()` 另行拒绝它）。
+      `Known` 且有锚点时：`锚点 < named_since_ms`（严格小于），或 `named_since_ms` 不是合理的日期（0、负数、早于 2020 年、晚于 2100 年：那一帧没有墙钟时间，或时间是垃圾）⇒ `NotNamedAtOrderTime`，名字不交出。
+      恰好等于首次命名的时刻则通过（名字从日志得到它的那一刻起有效）。`Unknown`、`Conflict` 原样通过；**没有任何锚点的订单不在这里被判**——区间检查在发出任何请求之前就拒绝它，拒绝的先后次序与原来一样。
+      因为列表与结清共用这一个函数，列表不会对一个结清会因品种而拒绝的订单说 “can be resolved”。
+    - **没有余量，取最早**：快照时间是交易所时钟，订单号时间戳是本地时钟（至多比交易所时钟差 B），所以在首次快照之后 B 之内发出的订单可能被误拒——这是接受的一侧：误拒把操作员送到手工路径，另一种错误则拿错误的品种结清订单；
+      不在宽松的一侧加余量。取最早的锚点同理：它对日志的要求最高。`allOrders` 的区间现在也由同一个 `earliest_send_anchor()` 起算（行为不变，原有的区间测试照旧通过）——“订单何时发出” 只有一个定义，守卫钉住两处调用。
+    - **工具**：`--list` 对该状态写 “cannot be resolved: the control-plane log does not show that it named this symbol before this order was sent (first named at <毫秒，或 an unknown time>)”；
+      结清模式因同一原因停在 `SymbolNameNotKnown`（退出码 50，不变），再多打印一行说明与 “Nothing was written.”。`UnresolvedOrderSummary` 与 `OperatorResolutionOutcome` 多一个 `symbol_named_since_ms`，`symbol_status` 说明是哪一种。
+    - **对既有测试的影响**：六个流程测试里订单发送于数天之前，而夹具的快照默认只比订单早一小时——正是这道防线要拒绝的情形；它们现在把首个快照放到订单之前六十天，测的仍然是区间而不是品种。
+    - **压缩的前提**：这个 sink 没有压缩（`supports_compaction()` 恒为 false）。若将来加了压缩，必须把每个槽的 `first_named_ms` 带过去——否则这道防线会拒绝所有比压缩更早的订单（失败闭合，但会让工具什么也结清不了）。
+    - **守卫**（操作员守卫 31 → 32）：`recovered_symbol_name` 只在 sink 头里定义、在流程头里恰好被调用一次（就在 `symbol_for_order()` 里）；`symbol_for_order` 与 `frame_anchor_of` 各自的出现次数；
+      `earliest_send_anchor` 在证据头里两次（定义与 `all_orders_range()` 里的一次调用）、在流程头里一次；判定函数里的调用以检查点自己的 `frame_anchor_of(cp)` 与 `cp.client_order_id.view()` 为参数，区间函数里的以 `frame_anchor`、`client_order_id` 为参数；
+      `resolve_order()` 与 `list_unresolved_orders()` 各一次 `symbol_for_order(names, cp)`，前者在第一次交易所请求与第一次睡眠之前。
+    - **验证**：新增测试 27 个：折叠与回读 5（test_symbol_name_fold 20 → 25）、发送锚点 4（test_operator_resolution_evidence 42 → 46）、流程 11（test_operator_resolution_flow 58 → 69）、
+      工具的列表与结清说明 6（test_operator_resolution_tool 40 → 46）、守卫 1（31 → 32）；另有 6 个既有流程测试改用更早的首个快照（见上），折叠测试的辅助函数现在对每个非 `Known` 的答案断言时间为 0。
+      MSVC（`/W4 /WX`）全量构建零警告零错误；全量 ctest 3237 个用例（相对 R3b-2 合并时的 3210 恰好多 27 项）：3235 通过（含 1 个既有跳过：`SealIdWatermarkLoader.DirectoryIdentityChangeThenStickyFenceAreDistinct`，Windows 上设计如此）、2 个既有禁用、0 失败。（第一次全量 ctest 在三份变异副本同时编译的负载下有一个私有 REST 夹具测试 `BoundCredentialsFixture.AClientWithoutATrackerIsNotCountedAndNotRefused` 超时失败——本片没有碰那个文件——单独重跑它所在夹具的 45 个用例全部通过，空闲机器上整个 ctest 重跑为 100%。）
+      GCC-14.2，在 WSL2（本地的 GCC 一侧）上：触及的 11 个测试目标加 `hy_operator_resolve`——`none`（Release，`-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wshadow`）零警告，`address`（RelWithDebInfo，ASan+UBSan，
+      泄漏检测、返回后栈使用检测、严格字符串检查、出错即中止）零报告；两档的 11 个测试可执行文件全部通过：test_symbol_name_fold 25、test_control_plane_log_sink 28、test_operator_resolution_evidence 46、
+      test_operator_resolution_flow 69、test_operator_resolution_tool 48（比 MSVC 多的 2 个是只在 Linux 上编译的用例）、test_operator_resolution_guard 32、test_operator_resolution_response 24、test_operator_resolution_bundle 9、
+      test_operator_resolution_transport 36、test_operator_resolution_real_exchange 14、test_operator_resolution_cli 26。tokyo-vps 上另跑了一遍 `none`（源码以 LF 字节同步），结果相同。完整的 `none` / ASan / TSan / ARM64 矩阵由 CI 与那唯一一次手动 sanitizer 运行给出。
+      **变异检查**（62 个独特变异：sink 13、发送锚点 10、流程 26、工具 13；三份 MSVC 副本并行，每个变异先重建再运行；构建失败不算检出）= **60 杀死 + 2 等价，0 个无法解释**。金丝雀（SK01、FL06、TL01）都由各自的运行期测试杀死，没有靠编译期断言。2 个原写法因 `/WX` 的未使用参数告警构建失败（EV10、TL07），已改写（EV10b、TL07b）后重跑并杀死，不算检出。没有一个只有守卫能杀：绕过判定函数的两个（FL22 结清直接问日志、FL23 列表直接问日志）也被行为测试杀死，守卫另外钉住文本。只在第二阶段才被杀的是 SK03（把负的首次命名时间记成 0）：折叠测试不检查负数，流程的 “没有可用时间” 用例杀了它。2 个等价：EV07（订单号时间戳等于帧时间时取哪一个——同一个值）、TL11（结清说明的条件里 “且结果是 `SymbolNameNotKnown`” 这一项：`NotNamedAtOrderTime` 只会在 `resolve_order()` 以 `SymbolNameNotKnown` 停下的地方出现，所以多余——留着是为了日后调整顺序时不说错话）。逐个变异的覆盖：sink 的时间记录与回读（SK01 至 SK13：不记、迟 1 毫秒、负数记成 0、取最后一次提及的时间、取最小的时间、第一个提及没有时间时被后来的补上、不看时间类型、取负载里的时间、帧时间一律当 0、非 Known 状态也报时间、Known 不报时间、新状态与 Known 同值）；锚点（EV01 至 EV10b：不合理的帧时间当锚点、合理范围两端的边界、帧时间或订单号不算数、取较晚者、只在没有帧时间时才用订单号、区间忽略任一锚点）；判定与两处使用（FL01 至 FL26：负的发送时间、帧锚点缺失或晚 1 秒、Unknown / Conflict 也被判、没有锚点时被拒、`<` 变 `<=` / `>` / 加 1 毫秒余量、名字的时间差 1 毫秒、不合理时间的各种放行、永不拒绝 / 一律拒绝、拒绝时报成别的状态、名字泄漏、判定忽略任一锚点、问错的 id、两个绕过、不报时间、区间忽略检查点的帧时间）；工具的说明（TL01 至 TL13）。
+    - **仍未覆盖**：迟到成交告警（R4）；环境与账户绑定（R5，生产启用的前置——这道防线只防 “日志被重建”，不防 “拿错了环境或账户的日志”：旧日志的快照比订单早，名字照样 `Known`）；
+      `-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练）；工具对真实或 Testnet 交易所的任何一次运行。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
