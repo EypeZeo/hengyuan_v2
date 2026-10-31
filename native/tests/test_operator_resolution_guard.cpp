@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
@@ -237,6 +238,12 @@ constexpr const char* kBundle = "include/hengyuan/operator_resolution_bundle.hpp
 constexpr const char* kFlow = "include/hengyuan/operator_resolution_flow.hpp";
 constexpr const char* kTransport = "include/hengyuan/operator_resolution_transport.hpp";
 constexpr const char* kClient = "include/hengyuan/binance_private_rest.hpp";
+constexpr const char* kEnvironment = "include/hengyuan/binance_environment.hpp";
+constexpr const char* kCli = "include/hengyuan/operator_resolution_cli.hpp";
+constexpr const char* kTerminal = "include/hengyuan/operator_resolution_terminal.hpp";
+constexpr const char* kTool = "include/hengyuan/operator_resolution_tool.hpp";
+constexpr const char* kRealExchange = "include/hengyuan/operator_resolution_real_exchange.hpp";
+constexpr const char* kMain = "src/hy_operator_resolve.cpp";
 
 const SourceFile* find_source(std::string_view rel) {
     for (const SourceFile& f : production_sources()) {
@@ -375,19 +382,23 @@ TEST(OperatorResolutionGuard, TheOperatorEventIsNamedOnlyByItsDefinitionTheCodec
                           {kFlow, 1, "the one frame the tool builds, from a checkpoint and a conclusion (R3a)"}});
 }
 
-TEST(OperatorResolutionGuard, OperatorOpenIsNamedByTheSinkHeaderAndTheToolsFlowAlone) {
+TEST(OperatorResolutionGuard, OperatorOpenIsNamedByTheSinkHeaderTheToolsFlowAndTheToolsOneOpenAlone) {
     // The trading process must never open a store in the mode that tolerates the capacity bounds. Count only the
     // fact of naming here: the sink header uses it in several places (the enum, the constructor, the three bounds); the
-    // tool's flow (R3a) names it to REFUSE any sink that was not opened that way -- it opens nothing itself.
+    // tool's flow (R3a) names it to REFUSE any sink that was not opened that way -- it opens nothing itself; the tool
+    // (R3b-2, operator_resolution_tool.hpp) is the one place that opens a sink that way, once.
     std::vector<std::string> elsewhere;
     std::size_t in_sink = 0;
     std::size_t in_flow = 0;
+    std::size_t in_tool = 0;
     for (const SourceFile& f : production_sources()) {
         const std::size_t n = count_identifier(f.code, "OperatorOpen");
         if (f.rel == kSink) {
             in_sink = n;
         } else if (f.rel == kFlow) {
             in_flow = n;
+        } else if (f.rel == kTool) {
+            in_tool = n;
         } else if (n != 0) {
             elsewhere.push_back(f.rel);
         }
@@ -398,6 +409,7 @@ TEST(OperatorResolutionGuard, OperatorOpenIsNamedByTheSinkHeaderAndTheToolsFlowA
     }
     EXPECT_GT(in_sink, 3u) << "the sink header defines the mode and applies it to the three bounds";
     EXPECT_EQ(in_flow, 2u) << "the flow refuses a sink in any other mode, when a session begins and when an order is resolved";
+    EXPECT_EQ(in_tool, 1u) << "the tool opens the audit log in this mode in exactly one place";
     // ...and it only compares: the flow builds no sink
     const SourceFile* flow = find_source(kFlow);
     ASSERT_NE(flow, nullptr);
@@ -622,15 +634,19 @@ TEST(OperatorResolutionGuard, TheClaimBitsAreNamedOnlyByTheFrameHeaderAndTheDeci
 //  12. The confirmation header is the allocation-free part of the tool: its includes are an exact list.
 
 TEST(OperatorResolutionGuard, TheToolsHeadersAreIncludedByTheToolAlone) {
-    expect_named_only_in("operator_resolution_flow", {});
+    expect_named_only_in("operator_resolution_flow", {{kTool, 1, "the tool wraps the flow: one session and one resolve_order() (R3b-2)"}});
     expect_named_only_in("operator_resolution_ports", {{kFlow, 1, "the flow reaches the world through the ports"},
-                                                       {kTransport, 1, "the exchange port it implements"}});
+                                                       {kTransport, 1, "the exchange port it implements"},
+                                                       {kTerminal, 1, "the console and the evidence directory it implements (R3b-2)"},
+                                                       {kTool, 1, "the exchange, the console and the sleep it is handed (R3b-2)"}});
     expect_named_only_in("operator_resolution_bundle", {{kFlow, 1, "the flow builds the evidence file"}});
     expect_named_only_in("operator_resolution_confirmation",
                          {{kPorts, 1, "OperatorLineResult, what the console port returns"},
                           {kBundle, 1, "environment_name() and the digest grammar"},
                           {kFlow, 1, "the phrase and its judge"},
-                          {kTransport, 1, "is_ascii_alnum(), for the tokens of the account summary"}});
+                          {kTransport, 1, "is_ascii_alnum(), for the tokens of the account summary"},
+                          {kCli, 1, "the grammars of the order id and the label, and OperatorEnvironment (R3b-2)"},
+                          {kTerminal, 1, "OperatorLineReader and is_ascii_alnum() (R3b-2)"}});
     for (const char* f : {kFlow, kPorts, kBundle, kConfirmation}) ASSERT_NE(find_source(f), nullptr) << f;
 }
 
@@ -706,8 +722,7 @@ TEST(OperatorResolutionGuard, TheConfirmationHeaderAllocatesNothing) {
 
 // --- D5 slice R3b-1: the offline tool's real exchange port ----------------------------------------------------------------------
 //
-//  13. The transport header belongs to the tool: no production file includes it (the command line of slice R3b-2 will be the first,
-//      and is added here with its reason).
+//  13. The transport header belongs to the tool: only the tool's real exchange (R3b-2) includes it, and the command line's entry point.
 //  14. The client's raw reads are named by the client (their definitions) and the transport header (their one call each) alone, and
 //      the client's one signed-GET helper is named only by the four reads: a fifth raw read, or a trading-path caller of one, is a review item.
 //  15. The transport header reaches the exchange through those raw reads and nothing else: no order, no listenKey, no exchangeInfo, no HTTP
@@ -715,8 +730,10 @@ TEST(OperatorResolutionGuard, TheConfirmationHeaderAllocatesNothing) {
 //  16. The flow asks the exchange which account the key belongs to once, after the refusals that need no traffic and BEFORE the first wait or
 //      evidence request, and refuses unless it is the stated uid; the ports have no free-text account summary left to trust.
 
-TEST(OperatorResolutionGuard, TheTransportHeaderIsIncludedByNoProductionFile) {
-    expect_named_only_in("operator_resolution_transport", {});
+TEST(OperatorResolutionGuard, TheTransportHeaderIsIncludedByTheToolsRealExchangeAndItsEntryPointAlone) {
+    expect_named_only_in("operator_resolution_transport",
+                         {{kRealExchange, 1, "the port it builds over the client, and RealSleeper's header (R3b-2)"},
+                          {kMain, 1, "RealSleeper, the real wait (R3b-2)"}});
     ASSERT_NE(find_source(kTransport), nullptr);
 }
 
@@ -778,4 +795,213 @@ TEST(OperatorResolutionGuard, ThePortsHaveNoFreeTextAccountSummaryLeft) {
     ASSERT_NE(ports, nullptr);
     EXPECT_EQ(count_identifier(ports->code, "account_summary"), 0u) << "the account comes back as an AccountView: a uid and a composed line";
     EXPECT_GE(count_identifier(ports->code, "AccountView"), 2u);
+}
+
+// --- D5 slice R3b-2: the offline tool's command line ----------------------------------------------------------------------------
+//
+//  17. The tool's headers and entry point are a closed set: each is included by exactly the files that need it; the three headers that need
+//      no Boost have an exact include list (so nothing heavy, and nothing of the trading path, comes in unnoticed); the entry point is a
+//      thin main() that connects them to the process.
+//  18. The tool's credentials: EnvironmentBinding's two operator factories are named by the binding header (the definitions) and the
+//      tool's real exchange (the one use each) and nothing else, the private helper that builds them by nothing but the factories, and
+//      nothing of the tool names the trading factories.
+//  19. The order of events in the tool: the exchange (credentials) is asked for before the key material is read, the KEK is wiped once the ring
+//      holds it, both logs are open -- the audit log in OperatorOpen mode -- before the session begins, --list never begins one, and the
+//      procedure runs once.
+//  20. The evidence directory is only ever created exclusively and made durable before it says so.
+
+namespace {
+
+const char* const kToolFiles[] = {kCli, kTerminal, kTool, kRealExchange, kMain};
+
+}  // namespace
+
+TEST(OperatorResolutionGuard, TheToolsOwnHeadersAreIncludedByTheCommandLineAlone) {
+    expect_named_only_in("operator_resolution_cli", {{kTool, 1, "the options and the grammar the tool runs with"}});
+    expect_named_only_in("operator_resolution_terminal",
+                         {{kTool, 1, "the evidence directory the tool stores into"}, {kMain, 1, "the real console"}});
+    expect_named_only_in("operator_resolution_tool",
+                         {{kRealExchange, 1, "ExchangeProvider, the interface the real exchange implements"}, {kMain, 1, "run_operator_tool()"}});
+    expect_named_only_in("operator_resolution_real_exchange", {{kMain, 1, "the real provider"}});
+    for (const char* f : kToolFiles) ASSERT_NE(find_source(f), nullptr) << f;
+}
+
+TEST(OperatorResolutionGuard, TheBoostFreeHeadersOfTheToolHaveAnExactIncludeList) {
+    const SourceFile* cli = find_source(kCli);
+    const SourceFile* terminal = find_source(kTerminal);
+    const SourceFile* tool = find_source(kTool);
+    ASSERT_NE(cli, nullptr);
+    ASSERT_NE(terminal, nullptr);
+    ASSERT_NE(tool, nullptr);
+    EXPECT_EQ(include_lines(cli->code),
+              (std::vector<std::string>{"#include <array>", "#include <cstddef>", "#include <cstdint>", "#include <limits>", "#include <optional>",
+                                        "#include <span>", "#include <string>", "#include <string_view>",
+                                        "#include <hengyuan/operator_resolution_confirmation.hpp>"}))
+        << "an include added here must be argued for: this header parses a command line and does nothing else";
+    EXPECT_EQ(include_lines(terminal->code),
+              (std::vector<std::string>{"#include <chrono>", "#include <cstddef>", "#include <cstdio>", "#include <filesystem>", "#include <string>",
+                                        "#include <string_view>", "#include <system_error>", "#include <utility>",
+                                        "#include <hengyuan/durable_audit_export.hpp>", "#include <hengyuan/operator_input_reader.hpp>",
+                                        "#include <hengyuan/operator_resolution_confirmation.hpp>",
+                                        "#include <hengyuan/operator_resolution_ports.hpp>", "#include <fcntl.h>", "#include <unistd.h>"}))
+        << "an include added here must be argued for: this header moves bytes to a terminal and a directory";
+    EXPECT_EQ(include_lines(tool->code),
+              (std::vector<std::string>{"#include <array>", "#include <chrono>", "#include <cstddef>", "#include <cstdint>",
+                                        "#include <filesystem>", "#include <memory>", "#include <span>", "#include <string>",
+                                        "#include <string_view>", "#include <system_error>", "#include <vector>",
+                                        "#include <hengyuan/control_plane_log_sink.hpp>", "#include <hengyuan/durable_audit_export.hpp>",
+                                        "#include <hengyuan/durable_audit_sink.hpp>", "#include <hengyuan/kek_loader.hpp>",
+                                        "#include <hengyuan/key_ring.hpp>", "#include <hengyuan/operator_resolution_cli.hpp>",
+                                        "#include <hengyuan/operator_resolution_flow.hpp>", "#include <hengyuan/operator_resolution_ports.hpp>",
+                                        "#include <hengyuan/operator_resolution_terminal.hpp>", "#include <hengyuan/secure_wipe.hpp>"}))
+        << "an include added here must be argued for: this header is the tool without its exchange";
+    for (const SourceFile* f : {cli, terminal, tool}) {
+        for (const char* word : {"boost", "asio", "beast", "ssl", "OpenSSL", "BinancePrivateRestClient", "BinanceExchangeReadPort",
+                                 "EnvironmentBinding", "BoundHmacCredentials", "SecureEnvLoader", "RealSleeper"}) {
+            EXPECT_EQ(count_identifier(f->code, word), 0u) << f->rel << " names " << word;
+        }
+    }
+}
+
+TEST(OperatorResolutionGuard, NothingOfTheToolReachesTheTradingPath) {
+    for (const char* f : kToolFiles) {
+        const SourceFile* src = find_source(f);
+        ASSERT_NE(src, nullptr) << f;
+        for (const char* name : {"submit_order", "submit_order_adapter", "orchestrate_submit", "SubmitPort", "SubmitFn", "SubmitAdapterContext",
+                                 "make_binance_submit_port", "create_listen_key", "keepalive_listen_key", "close_listen_key",
+                                 "fetch_exchange_info", "sync_clock", "fetch_account", "query_order_adapter", "query_order", "place_order",
+                                 "fetch_signed_raw_coro", "fetch_signed_body_coro", "fetch_order_raw", "fetch_all_orders_raw",
+                                 "fetch_open_orders_raw", "fetch_account_raw", "read_server_time", "PrivateRestEndpoint"}) {
+            EXPECT_EQ(count_identifier(src->code, name), 0u) << f << " names " << name << ": the tool reaches the exchange through the port alone";
+        }
+    }
+}
+
+TEST(OperatorResolutionGuard, TheToolsBindingsAreNamedByTheBindingHeaderAndTheToolsRealExchangeAlone) {
+    expect_named_only_in("operator_testnet", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the one use"}});
+    expect_named_only_in("operator_production", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the one use"}});
+    expect_named_only_in("with_credential_env_keys", {{kEnvironment, 3, "the definition and the two operator factories"}});
+    // ...and nothing of the tool names the TRADING factories: it cannot ask for the key that places orders
+    for (const char* f : kToolFiles) {
+        const SourceFile* src = find_source(f);
+        ASSERT_NE(src, nullptr) << f;
+        EXPECT_EQ(count_identifier(src->code, "testnet"), 0u) << f << " names EnvironmentBinding::testnet()";
+        EXPECT_EQ(count_identifier(src->code, "production"), 0u) << f << " names EnvironmentBinding::production()";
+    }
+    const SourceFile* real = find_source(kRealExchange);
+    ASSERT_NE(real, nullptr);
+    EXPECT_EQ(count_identifier(real->code, "load_and_bind_credentials"), 1u);
+    EXPECT_EQ(count_identifier(real->code, "make_unique"), 2u) << "the client and the port, and nothing that builds a second client";
+    EXPECT_EQ(count_identifier(real->code, "BinancePrivateRestClient"), 3u) << "the make_unique, the accessor and the member";
+    // the order inside open(): the credentials are bound, THEN the loader (which holds the secret in the clear) is wiped; the client is charged
+    // on the tracker and takes the configuration it was given, with the environment's own host
+    const std::string open_body = function_body(real->code, "open");
+    ASSERT_FALSE(open_body.empty());
+    const std::size_t bound = open_body.find("load_and_bind_credentials(");
+    const std::size_t wiped = open_body.find("loader_.wipe()");
+    ASSERT_NE(bound, std::string::npos);
+    ASSERT_NE(wiped, std::string::npos);
+    EXPECT_LT(bound, wiped) << "the loader is wiped once the credentials hold their own copies";
+    EXPECT_NE(squeeze(open_body).find("std::make_unique<BinancePrivateRestClient>(*binding, std::move(credentials), &tracker_, "
+                                      "EndpointWeightTable{}, client_config_);"),
+              std::string::npos)
+        << "the client is built from the binding of the chosen environment, charges the tracker and takes the configuration it was given";
+    EXPECT_EQ(count_identifier(open_body, "TrustStoreCheck"), 1u);
+}
+
+TEST(OperatorResolutionGuard, TheToolTakesTheExchangeFirstThenTheKeysThenBothLogsAndOnlyThenBeginsTheSession) {
+    const SourceFile* tool = find_source(kTool);
+    ASSERT_NE(tool, nullptr);
+    const std::string body = function_body(tool->code, "run_parsed");
+    ASSERT_FALSE(body.empty());
+    const std::string squeezed = squeeze(body);
+
+    std::size_t last = 0;
+    const auto next = [&](std::string_view needle) {
+        const std::size_t at = body.find(needle, last);
+        EXPECT_NE(at, std::string::npos) << needle << " is missing, or comes before the step it must follow";
+        if (at != std::string::npos) last = at;
+        return at;
+    };
+    next("env.exchange.open(");   // the credentials first, before any log is touched
+    next("kek.load(");            // then the key material
+    next("std::make_unique<KeyRing>(");
+    next("kek.wipe()");           // the ring holds its own copy: the loader's is gone before another file is read
+    next("read_file_bounded(");
+    next("load_audit_key_file(");
+    next("is_existing_file(options.audit_log)");  // a missing log is never created by opening it
+    next("is_existing_file(options.control_log)");
+    next("DurableAuditSink audit(");  // the lock
+    next("ControlPlaneLogSink names(");
+    next("if (!resolve)");  // --list stops here
+    next("begin_operator_session(");  // the fence reference: after the lock
+    next("resolve_order(");
+
+    EXPECT_NE(squeezed.find("DurableAuditSink audit(options.audit_log, *ring, options.audit_key_id, kMaxIntentOrphans, "
+                            "AuditSinkOpenMode::OperatorOpen);"),
+              std::string::npos)
+        << "the audit log is opened in OperatorOpen mode, with the key id the command line gave";
+    EXPECT_NE(squeezed.find("if (resolve) { exchange = env.exchange.open(options, env.sleeper, err);"), std::string::npos)
+        << "the credentials are asked for in resolve mode only";
+    EXPECT_NE(squeezed.find("if (!resolve) { print_unresolved_orders(audit, names, out); return exit_code_of(ToolExit::Ok); }"), std::string::npos)
+        << "--list prints and stops: no session, no exchange";
+    // the plaintext HMAC key block the key check looked at is wiped in the same lambda that read it
+    const std::size_t looked = body.find("ring->active_key(");
+    const std::size_t scrubbed = body.find("secure_wipe(");
+    ASSERT_NE(looked, std::string::npos);
+    ASSERT_NE(scrubbed, std::string::npos);
+    EXPECT_LT(looked, scrubbed);
+    EXPECT_EQ(count_identifier(body, "secure_wipe"), 1u);
+    EXPECT_EQ(count_identifier(body, "begin_operator_session"), 1u);
+    EXPECT_EQ(count_identifier(body, "resolve_order"), 1u) << "one order per run";
+    EXPECT_EQ(count_identifier(body, "OperatorOpen"), 1u);
+    EXPECT_EQ(count_identifier(body, "KekLoader"), 1u);
+    EXPECT_EQ(count_identifier(body, "DurableAuditSink"), 1u);
+    EXPECT_EQ(count_identifier(body, "ControlPlaneLogSink"), 1u);
+    // the audit log's constructor is the only way the tool takes the lock; nothing else in the tool constructs a sink
+    EXPECT_EQ(count_identifier(tool->code, "DurableAuditSink"), 2u) << "the listing's parameter and the one construction";
+}
+
+TEST(OperatorResolutionGuard, TheEvidenceDirectoryIsCreatedExclusivelyAndFlushedBeforeItSaysSo) {
+    const SourceFile* terminal = find_source(kTerminal);
+    ASSERT_NE(terminal, nullptr);
+    EXPECT_GE(count_identifier(terminal->code, "ExclusiveOutputFile"), 1u);
+    for (const char* word : {"ofstream", "fopen", "freopen", "rename", "CreateFileA", "CreateFileW", "CreateFile", "trunc", "truncate",
+                             "create_directories", "copy", "copy_file"}) {
+        EXPECT_EQ(count_identifier(terminal->code, word), 0u) << word << ": the evidence file is created exclusively or not at all";
+    }
+    EXPECT_EQ(count_identifier(terminal->code, "remove"), 1u) << "only the cleanup of a file whose directory entry could not be made durable";
+    EXPECT_EQ(count_identifier(terminal->code, "create_directory"), 1u) << "one level";
+    EXPECT_EQ(count_identifier(terminal->code, "fsync"), 1u) << "the directory; the file itself is flushed by ExclusiveOutputFile::commit()";
+    const std::string body = function_body(terminal->code, "store");
+    ASSERT_FALSE(body.empty());
+    std::size_t last = 0;
+    for (const char* needle : {"path_for(", "ensure_directory()", "file.create(", "file.write(", "file.commit()", "sync_directory()"}) {
+        const std::size_t at = body.find(needle, last);
+        ASSERT_NE(at, std::string::npos) << needle;
+        last = at;
+    }
+    EXPECT_NE(squeeze(body).find("!= ExclusiveOutputFile::OpenStatus::Ok) return false;"), std::string::npos)
+        << "an existing file is a refusal, whatever the reason the create failed";
+}
+
+TEST(OperatorResolutionGuard, TheEntryPointIsAThinMainThatNamesNoStoreAndNoKey) {
+    const SourceFile* main_cpp = find_source(kMain);
+    ASSERT_NE(main_cpp, nullptr);
+    EXPECT_EQ(count_identifier(main_cpp->code, "run_operator_tool"), 1u);
+    for (const char* name : {"OperatorOpen", "DurableAuditSink", "ControlPlaneLogSink", "KeyRing", "KekLoader", "SecureEnvLoader", "resolve_order",
+                             "begin_operator_session", "append_operator_resolution", "BinancePrivateRestClient", "EnvironmentBinding",
+                             "BoundHmacCredentials", "TrustStoreCheck", "Skip", "PrivateRestConfig", "getenv", "system", "exit", "abort"}) {
+        EXPECT_EQ(count_identifier(main_cpp->code, name), 0u) << name;
+    }
+    const std::string body = function_body(main_cpp->code, "main");
+    ASSERT_FALSE(body.empty());
+    EXPECT_LE(std::count(body.begin(), body.end(), '\n'), 20) << "main() only connects the headers to the process";
+    EXPECT_NE(squeeze(body).find("std::vector<std::string_view> args; args.reserve(argc > 1 ? static_cast<std::size_t>(argc - 1) : 0u); "
+                                 "for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]); StdConsole out(stdout); StdConsole err(stderr); "
+                                 "RealSleeper sleeper; RealExchangeProvider exchange; ToolEnvironment env{out, err, sleeper, exchange}; "
+                                 "return run_operator_tool(args, env);"),
+              std::string::npos)
+        << "the arguments without the program name, the dialogue on stdout, the diagnostics on stderr, the real wait, the real exchange with its "
+           "default configuration and a trust store that is Required, and the exit code is the tool's";
 }

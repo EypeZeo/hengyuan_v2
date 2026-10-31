@@ -247,6 +247,25 @@ if(HY_BUILD_DEMO)
     hengyuan_set_warnings(live_submit_preflight_harness)
     hengyuan_allow_third_party_tsan_fences(live_submit_preflight_harness)
 
+    # D5 slice R3b-2 (docs/OPERATOR_RESOLUTION_DESIGN.md 6): the offline operator tool that closes an order the log cannot close, after
+    # read-only signed GETs and the operator's typed confirmation. NOT a production code path: it needs Boost/OpenSSL for the
+    # authenticated REST client, so like the demos it is built with HY_BUILD_DEMO, and the trading process includes none of it
+    # (test_operator_resolution_guard.cpp pins that). No self-check mode, so no ctest registration of the binary:
+    # test_operator_resolution_cli, _tool and _real_exchange are the coverage, over the headers this file is a thin main() around.
+    add_executable(hy_operator_resolve src/hy_operator_resolve.cpp)
+    target_link_libraries(hy_operator_resolve PRIVATE
+        hengyuan_dataplane
+        Boost::system
+        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+        Threads::Threads
+    )
+    target_include_directories(hy_operator_resolve SYSTEM PRIVATE
+        ${Boost_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
+    )
+    hengyuan_set_warnings(hy_operator_resolve)
+    hengyuan_allow_third_party_tsan_fences(hy_operator_resolve)
+
     add_executable(binance_dry_run_demo src/binance_dry_run_demo.cpp)
     target_link_libraries(binance_dry_run_demo PRIVATE
         hengyuan_dataplane
@@ -706,6 +725,21 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_operator_resolution_flow PRIVATE hengyuan_dataplane GTest::gtest_main)
     hengyuan_set_warnings(test_operator_resolution_flow)
     gtest_discover_tests(test_operator_resolution_flow)
+
+    # D5 slice R3b-2: the command line (operator_resolution_cli.hpp: the strict argument grammar, the usage text) and the real console and
+    # evidence directory (operator_resolution_terminal.hpp). No Boost, no OpenSSL, no simdjson: default configuration.
+    add_executable(test_operator_resolution_cli tests/test_operator_resolution_cli.cpp)
+    target_link_libraries(test_operator_resolution_cli PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_cli)
+    gtest_discover_tests(test_operator_resolution_cli)
+
+    # D5 slice R3b-2: the tool from the command line to the exit code (operator_resolution_tool.hpp) over real logs in temporary files,
+    # the real console adapter and evidence directory, and the flow's fake exchange. (The flow includes the response parser, so it links
+    # simdjson through hengyuan_dataplane.)
+    add_executable(test_operator_resolution_tool tests/test_operator_resolution_tool.cpp)
+    target_link_libraries(test_operator_resolution_tool PRIVATE hengyuan_dataplane GTest::gtest_main)
+    hengyuan_set_warnings(test_operator_resolution_tool)
+    gtest_discover_tests(test_operator_resolution_tool)
 
     # Phase 5 (docs/SPEC_INVARIANTS.md): export-worker best-effort telemetry
     # consumer for ExportOutboxRing (L2, real file I/O for LastRemoteAckedTip
@@ -1435,6 +1469,21 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_operator_resolution_transport)
         hengyuan_allow_third_party_tsan_fences(test_operator_resolution_transport)
         gtest_discover_tests(test_operator_resolution_transport)
+
+        # D5 slice R3b-2: the real exchange of the tool (operator_resolution_real_exchange.hpp: the credentials file, the operator
+        # bindings, the TLS client) and the whole tool over it, against a local routing TLS exchange.
+        add_executable(test_operator_resolution_real_exchange tests/test_operator_resolution_real_exchange.cpp)
+        target_link_libraries(test_operator_resolution_real_exchange PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_operator_resolution_real_exchange SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_operator_resolution_real_exchange PRIVATE tests)
+        target_compile_definitions(test_operator_resolution_real_exchange PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_operator_resolution_real_exchange)
+        hengyuan_allow_third_party_tsan_fences(test_operator_resolution_real_exchange)
+        gtest_discover_tests(test_operator_resolution_real_exchange)
 
         # FI-032 (audit P1-001) and the compile-time half of the SAFE-01 freeze guard: properties of the
         # real REST config types, the test-seam type and the permit-taking coroutines -- it has to include

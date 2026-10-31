@@ -103,6 +103,8 @@ enum class BinanceEnvironment : std::uint8_t {
 // instance; the constructor is private. Both factories hardcode their own
 // host, transport policy, and credential env-var names, so there is no
 // parameter a caller could pass to accidentally cross environments.
+// (D5 R3b-2 adds ::operator_testnet()/::operator_production(): copies of those two with the
+// credential names of the offline operator tool's read-only key -- see their comment.)
 //
 // Batch H, H4: ws_host_/ws_port_ follow the exact same discipline as every existing field
 // here -- std::string_view (never std::string, or the is_trivially_copyable_v static_assert
@@ -145,6 +147,19 @@ public:
                                    "ws-api.binance.com", "443");
     }
 
+    // D5 slice R3b-2: the bindings of the OFFLINE operator tool (hy_operator_resolve). Everything but the two credential names is the
+    // trading twin's, by construction (they are copies of it): the same host, the same WebSocket hosts, the same transport policy, so the
+    // tool cannot reach a host the trading process could not, and the same environment. The credential names are the tool's own: it reads
+    // a READ-ONLY API key the owner made for it, never the key that places orders, and a credentials file that holds the trading names
+    // (or anything else) is refused by the loader's allowlist. test_operator_resolution_guard.cpp pins that only the tool's own
+    // header names these two factories.
+    static EnvironmentBinding operator_testnet() noexcept {
+        return testnet().with_credential_env_keys("HENGYUAN_OPERATOR_TESTNET_API_KEY", "HENGYUAN_OPERATOR_TESTNET_API_SECRET");
+    }
+    static EnvironmentBinding operator_production() noexcept {
+        return production().with_credential_env_keys("HENGYUAN_OPERATOR_LIVE_API_KEY", "HENGYUAN_OPERATOR_LIVE_API_SECRET");
+    }
+
     BinanceEnvironment environment() const noexcept { return environment_; }
     std::string_view base_host() const noexcept { return base_host_; }
     // The spot WebSocket API of this environment (blueprint 5.7 P-24): wss://<ws_api_host>:<ws_api_port><kWsApiTarget>. The host is on
@@ -171,6 +186,15 @@ private:
         : environment_(env), base_host_(host), transport_policy_(policy),
           api_key_env_key_(api_key_env), secret_env_key_(secret_env), ws_host_(ws_host),
           ws_port_(ws_port), ws_api_host_(ws_api_host), ws_api_port_(ws_api_port) {}
+
+    // A copy of this binding with the two credential names replaced (see operator_testnet()). Private: it is the only way a binding
+    // with other names comes to exist, and only the factories above call it.
+    EnvironmentBinding with_credential_env_keys(std::string_view api_key_env, std::string_view secret_env) const noexcept {
+        EnvironmentBinding copy = *this;
+        copy.api_key_env_key_ = api_key_env;
+        copy.secret_env_key_ = secret_env;
+        return copy;
+    }
 
     // Endpoint allowlist contains ONLY testnet.binance.vision — never
     // shares state with production_transport_policy(). Deliberately does NOT include

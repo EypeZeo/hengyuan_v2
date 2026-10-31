@@ -11,6 +11,8 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -470,4 +472,115 @@ TEST(EnvironmentBindingWsApi, TheTestnetWsApiAllowlistHoldsItsHostAndNothingElse
     EXPECT_EQ(production.transport_policy().ws_api_allowlist.count, 1u);
     EXPECT_TRUE(production.transport_policy().ws_api_allowlist.contains("ws-api.binance.com"));
     EXPECT_FALSE(production.transport_policy().ws_api_allowlist.contains("ws-api.testnet.binance.vision"));
+}
+
+// --- D5 slice R3b-2: the offline operator tool's bindings (a read-only key of its own) ---
+
+namespace {
+
+struct BindingPair {
+    EnvironmentBinding trading;
+    EnvironmentBinding tool;
+};
+
+std::array<BindingPair, 2> binding_pairs() {
+    return {BindingPair{EnvironmentBinding::testnet(), EnvironmentBinding::operator_testnet()},
+            BindingPair{EnvironmentBinding::production(), EnvironmentBinding::operator_production()}};
+}
+
+void expect_same_allowlist(const hy::EndpointAllowlist& a, const hy::EndpointAllowlist& b) {
+    ASSERT_EQ(a.count, b.count);
+    for (std::size_t i = 0; i < a.count; ++i) EXPECT_EQ(a.hosts[i], b.hosts[i]) << i;
+}
+
+constexpr std::string_view kOperatorTestnetAllowedKeys[] = {
+    "HENGYUAN_OPERATOR_TESTNET_API_KEY",
+    "HENGYUAN_OPERATOR_TESTNET_API_SECRET",
+};
+constexpr EnvAllowlist kOperatorTestnetAllowlist{kOperatorTestnetAllowedKeys, 2};
+
+}  // namespace
+
+TEST(OperatorBindings, AreTheirTradingTwinsInEverythingButTheTwoCredentialNames) {
+    for (const BindingPair& p : binding_pairs()) {
+        EXPECT_EQ(p.tool.environment(), p.trading.environment());
+        EXPECT_EQ(p.tool.base_host(), p.trading.base_host());
+        EXPECT_EQ(p.tool.ws_host(), p.trading.ws_host());
+        EXPECT_EQ(p.tool.ws_port(), p.trading.ws_port());
+        EXPECT_EQ(p.tool.ws_api_host(), p.trading.ws_api_host());
+        EXPECT_EQ(p.tool.ws_api_port(), p.trading.ws_api_port());
+        const hy::TransportPolicy& a = p.trading.transport_policy();
+        const hy::TransportPolicy& b = p.tool.transport_policy();
+        expect_same_allowlist(a.endpoint_allowlist, b.endpoint_allowlist);
+        expect_same_allowlist(a.ws_api_allowlist, b.ws_api_allowlist);
+        EXPECT_EQ(b.tls_verify_peer, a.tls_verify_peer);
+        EXPECT_EQ(b.tls_verify_hostname, a.tls_verify_hostname);
+        EXPECT_EQ(b.follow_redirects, a.follow_redirects);
+        EXPECT_EQ(b.connect_timeout_ms, a.connect_timeout_ms);
+        EXPECT_EQ(b.read_timeout_ms, a.read_timeout_ms);
+        EXPECT_EQ(b.max_response_bytes, a.max_response_bytes);
+        EXPECT_EQ(b.recv_window_ms, a.recv_window_ms);
+        EXPECT_EQ(b.weight_limit_per_minute, a.weight_limit_per_minute);
+        EXPECT_EQ(b.weight_safety_margin, a.weight_safety_margin);
+        // and, like every binding, a plain value
+        EXPECT_TRUE(std::is_trivially_copyable_v<EnvironmentBinding>);
+    }
+}
+
+TEST(OperatorBindings, NameTheCredentialsOfTheOperatorToolAndNoOtherOnes) {
+    EXPECT_EQ(EnvironmentBinding::operator_testnet().api_key_env_key(), "HENGYUAN_OPERATOR_TESTNET_API_KEY");
+    EXPECT_EQ(EnvironmentBinding::operator_testnet().secret_env_key(), "HENGYUAN_OPERATOR_TESTNET_API_SECRET");
+    EXPECT_EQ(EnvironmentBinding::operator_production().api_key_env_key(), "HENGYUAN_OPERATOR_LIVE_API_KEY");
+    EXPECT_EQ(EnvironmentBinding::operator_production().secret_env_key(), "HENGYUAN_OPERATOR_LIVE_API_SECRET");
+    // the trading bindings keep theirs: adding the tool's did not move them
+    EXPECT_EQ(EnvironmentBinding::testnet().api_key_env_key(), "HENGYUAN_BINANCE_TESTNET_API_KEY");
+    EXPECT_EQ(EnvironmentBinding::testnet().secret_env_key(), "HENGYUAN_BINANCE_TESTNET_SECRET");
+    EXPECT_EQ(EnvironmentBinding::production().api_key_env_key(), "HENGYUAN_BINANCE_LIVE_API_KEY");
+    EXPECT_EQ(EnvironmentBinding::production().secret_env_key(), "HENGYUAN_BINANCE_LIVE_SECRET");
+}
+
+TEST(OperatorBindings, ShareNoCredentialNameWithTradingOrWithEachOther) {
+    std::vector<std::string_view> names;
+    for (const EnvironmentBinding& b : {EnvironmentBinding::testnet(), EnvironmentBinding::production(),
+                                        EnvironmentBinding::operator_testnet(), EnvironmentBinding::operator_production()}) {
+        names.push_back(b.api_key_env_key());
+        names.push_back(b.secret_env_key());
+    }
+    ASSERT_EQ(names.size(), 8u);
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        for (std::size_t j = i + 1; j < names.size(); ++j) EXPECT_NE(names[i], names[j]) << names[i];
+    }
+}
+
+TEST_F(BoundHmacCredentialsTest, TheOperatorBindingReadsTheOperatorNamesAndTheTradingBindingFindsNothingThere) {
+    {
+        std::ofstream f(tmp_path_, std::ios::binary);
+        f << "HENGYUAN_OPERATOR_TESTNET_API_KEY=" << kSyntheticApiKey << "\n"
+          << "HENGYUAN_OPERATOR_TESTNET_API_SECRET=synthetic_operator_secret_value\n";
+    }
+    chmod_owner_only();
+    SecureEnvLoader loader;
+    ASSERT_EQ(loader.load(tmp_path_.c_str(), kOperatorTestnetAllowlist).status, hy::EnvLoadStatus::Ok);
+
+    auto [err, creds] = BoundHmacCredentials::load_and_bind_credentials(EnvironmentBinding::operator_testnet(), loader);
+    EXPECT_EQ(err, QuerySigningError::Ok);
+    ASSERT_NE(creds, nullptr);
+    std::array<char, 128> out{};
+    std::size_t written = 0;
+    EXPECT_TRUE(creds->copy_api_key(out, written));
+    EXPECT_EQ(std::string_view(out.data(), written), kSyntheticApiKey);
+
+    // the trading binding asks the same loader for the trading names, which the file does not hold
+    auto [trading_err, trading_creds] = BoundHmacCredentials::load_and_bind_credentials(EnvironmentBinding::testnet(), loader);
+    EXPECT_EQ(trading_err, QuerySigningError::InvalidApiKeyFormat);
+    EXPECT_EQ(trading_creds, nullptr);
+}
+
+TEST_F(BoundHmacCredentialsTest, AFileThatHoldsTheTradingNamesIsNotLoadedByTheOperatorToolsAllowlist) {
+    write_valid_env();  // HENGYUAN_BINANCE_TESTNET_API_KEY / _SECRET
+    SecureEnvLoader loader;
+    const hy::EnvLoadResult r = loader.load(tmp_path_.c_str(), kOperatorTestnetAllowlist);
+    EXPECT_EQ(r.status, hy::EnvLoadStatus::ParseError);
+    EXPECT_EQ(r.parse_result.status, hy::EnvParseStatus::UnknownKey) << "a credentials file with the trading key in it is refused outright";
+    EXPECT_TRUE(loader.get("HENGYUAN_BINANCE_TESTNET_API_KEY").empty());
 }

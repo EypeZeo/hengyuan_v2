@@ -159,6 +159,13 @@ SEARCH_FILES = [
     # D5 slice R3b-1 (docs/SPEC_INVARIANTS.md "D5 切片 R3b-1"): the offline tool's real exchange port over the private REST client --
     # BinanceExchangeReadPort, RealSleeper, summarize_account(), and the client's raw reads live here or are used here.
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_transport.hpp",
+    # D5 slice R3b-2 (docs/SPEC_INVARIANTS.md "D5 切片 R3b-2"): the offline tool's command line -- the argument grammar (cli), the real console and
+    # evidence directory (terminal), the tool from the arguments to the exit code (tool), and its real exchange (credentials, TLS client).
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_cli.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_terminal.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_tool.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_real_exchange.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "binance_environment.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
