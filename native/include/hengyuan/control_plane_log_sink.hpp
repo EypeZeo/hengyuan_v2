@@ -109,15 +109,30 @@ namespace hy {
 // rules for symbol_id == i, and the caller keeps that order stable across refreshes). The operator tool needs the name to
 // ask the exchange about an order, and a WRONG name is the dangerous failure: a query for the wrong symbol answers "no
 // such order" for an order that exists. So the answer is only ever Known when EVERY snapshot in the log agrees.
+//
+// D5 / R3b-3 (blueprint L-50): "every snapshot agrees" says nothing about WHICH log this is. If the control-plane log was
+// deleted and recreated after the orders were placed, an old id can have been given a different symbol and still be Known,
+// so the lookup also reports since when the log has named the id (SymbolNameLookup::named_since_ms), and the operator tool
+// refuses a name that is not provably older than the order (operator_resolution_flow.hpp: symbol_for_order()).
 enum class SymbolNameStatus : std::uint8_t {
     Unknown = 0,   // no snapshot mentioned this id, or the log could not be recovered: no answer
     Known = 1,     // every snapshot that mentioned the id gave the same, well-formed name
     Conflict = 2,  // two snapshots disagreed, or one gave a name that is not a symbol: refuse, do not guess
+    // The log names the id, but not provably before the order was sent (the first snapshot that named it is later than the
+    // order, or carries no usable time): refuse. The sink never answers this itself -- it does not know the order; only
+    // symbol_for_order() produces it, from a Known lookup and the order's send time.
+    NotNamedAtOrderTime = 3,
 };
 
 struct SymbolNameLookup {
     SymbolNameStatus status{SymbolNameStatus::Unknown};
     std::string_view name{};  // valid only when status == Known; views storage inside the sink
+    // Meaningful only when status is Known (and NotNamedAtOrderTime): the wall time, in milliseconds, of the FIRST snapshot
+    // frame -- first in the log -- that gave the id its name, as its MAC-protected header records it (frame_wall_time_ms():
+    // the header time of a ServerCorrectedUtc frame, which for the registry's own snapshots is the exchange's serverTime of
+    // the exchangeInfo response). 0 when that frame carried no wall time; whatever else is here (negative, or not a
+    // plausible date) is what the frame said, and judging it is the caller's job. 0 for every other status.
+    std::int64_t named_since_ms{0};
 };
 
 class ControlPlaneLogSink final : public DurableControlPlaneSink {
@@ -168,13 +183,13 @@ public:
     // SymbolNameStatus for why "every"). Unknown for an id no snapshot mentioned, for an id at or past kMaxSymbols, and for
     // every id when this sink's recovery did not come back Clean/Recovered: a half-read log answers nothing. The view is
     // into this sink and lives as long as it does. Read-only: the append path and the 20-argument recover_control_plane()
-    // interface are untouched.
+    // interface are untouched. (A Known answer also says since when: SymbolNameLookup::named_since_ms.)
     SymbolNameLookup recovered_symbol_name(std::uint32_t symbol_id) const noexcept {
         if (recovery_status_ != RecoveryScanStatus::Clean && recovery_status_ != RecoveryScanStatus::Recovered) return {};
         if (symbol_id >= kMaxSymbols) return {};
         const SymbolNameSlot& slot = fold_.symbol_names[symbol_id];
-        if (slot.status != SymbolNameStatus::Known) return {slot.status, {}};
-        return {SymbolNameStatus::Known, std::string_view(slot.name, slot.length)};
+        if (slot.status != SymbolNameStatus::Known) return {slot.status, {}, 0};
+        return {SymbolNameStatus::Known, std::string_view(slot.name, slot.length), slot.first_named_ms};
     }
     // How many symbol-registry snapshot frames the recovery scan read.
     std::uint64_t recovered_snapshot_count() const noexcept { return fold_.snapshot_count; }
@@ -515,6 +530,7 @@ private:
         SymbolNameStatus status{SymbolNameStatus::Unknown};
         std::uint8_t length{0};
         char name[kSymbolNameLen]{};
+        std::int64_t first_named_ms{0};  // D5 / R3b-3: wall time of the frame of the first well-formed mention; see fold_symbol_names()
     };
 
     struct FoldState {
@@ -557,7 +573,12 @@ private:
     // every later mention agrees, and becomes Conflict -- for good -- the first time one does not (a rename, a swap of two
     // ids, or a name that is not a symbol). A snapshot that mentions fewer ids than an earlier one says nothing about the
     // ids it leaves out: an order that used such an id was made under an earlier snapshot, which named it.
-    void fold_symbol_names(std::span<const SymbolRules> entries) noexcept {
+    //
+    // D5 / R3b-3: the slot also keeps `frame_wall_ms`, the wall time of the frame that made the id Known (see
+    // SymbolNameLookup::named_since_ms). It is set by that first mention and never moved: not by a later snapshot that agrees
+    // (the name has been known since the first), and not forward to the first frame that happens to carry a usable time
+    // when the first one did not (that would be the less cautious reading, and the sink's own writer always stamps a wall time).
+    void fold_symbol_names(std::span<const SymbolRules> entries, std::int64_t frame_wall_ms) noexcept {
         ++fold_.snapshot_count;
         for (std::size_t i = 0; i < entries.size() && i < kMaxSymbols; ++i) {
             SymbolNameSlot& slot = fold_.symbol_names[i];
@@ -568,6 +589,7 @@ private:
             } else if (slot.status == SymbolNameStatus::Unknown) {
                 std::memcpy(slot.name, name->data(), name->size());
                 slot.length = static_cast<std::uint8_t>(name->size());
+                slot.first_named_ms = frame_wall_ms;
                 slot.status = SymbolNameStatus::Known;
             } else if (*name != std::string_view(slot.name, slot.length)) {
                 slot.status = SymbolNameStatus::Conflict;
@@ -816,8 +838,10 @@ private:
                         return RecoveryScanStatus::Corrupt;
                     }
                     // Not folded into any out-param of recover_control_plane() (its interface has no slot) -- but, since
-                    // D5 / R3-0, into the per-symbol_id name table behind recovered_symbol_name().
-                    fold_symbol_names(std::span<const SymbolRules>(entries.data(), entry_count));
+                    // D5 / R3-0, into the per-symbol_id name table behind recovered_symbol_name() -- with (R3b-3) the frame's
+                    // time read as a wall time, which is 0 for a frame that says there was no trustworthy clock.
+                    fold_symbol_names(std::span<const SymbolRules>(entries.data(), entry_count),
+                                      frame_wall_time_ms(f.time_kind, f.recorded_utc_ms));
                     frame_mac = f.mac;
                     dispatched_ok = true;
                     break;

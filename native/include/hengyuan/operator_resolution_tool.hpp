@@ -174,6 +174,11 @@ inline bool is_existing_file(const std::string& path) {
     return std::filesystem::is_regular_file(path, ec) && !ec;
 }
 
+// When the control-plane log first named a symbol, for a refusal message: the time as the frame recorded it, or why there is none.
+inline std::string named_since_text(std::int64_t named_since_ms) {
+    return named_since_ms != 0 ? std::to_string(named_since_ms) : std::string("an unknown time");
+}
+
 // Both logs, as they are on disk, for --list and for resolving.
 inline void print_unresolved_orders(const DurableAuditSink& audit, const ControlPlaneLogSink& names, ConsolePort& out) {
     const std::vector<UnresolvedOrderSummary> orders = list_unresolved_orders(audit, names);
@@ -189,6 +194,9 @@ inline void print_unresolved_orders(const DurableAuditSink& audit, const Control
             line += "  -> cannot be resolved: a dry-run order never reached the exchange";
         } else if (s.order_check != ResolutionCheck::Ok) {
             line += "  -> cannot be resolved: " + std::string(resolution_check_name(s.order_check));
+        } else if (s.symbol_status == SymbolNameStatus::NotNamedAtOrderTime) {
+            line += "  -> cannot be resolved: the control-plane log does not show that it named this symbol before this order was sent "
+                    "(first named at " + named_since_text(s.symbol_named_since_ms) + ")";
         } else if (s.symbol_status != SymbolNameStatus::Known) {
             line += "  -> cannot be resolved: the control-plane log does not name this symbol";
         } else {
@@ -332,6 +340,11 @@ inline int run_parsed(const ToolOptions& options, ToolEnvironment& env) {
     out.write_line("result: " + std::string(resolve_status_name(outcome.status)) + " (exit code " + std::to_string(code) + ")");
     if (outcome.status == ResolveStatus::AppendFailed) {
         out.write_line("the frame may or may not have been written: run --list to see whether the order is still listed.");
+    }
+    if (outcome.status == ResolveStatus::SymbolNameNotKnown && outcome.symbol_status == SymbolNameStatus::NotNamedAtOrderTime) {
+        out.write_line("the control-plane log does not show that it named this order's symbol before the order was sent (first named at " +
+                       named_since_text(outcome.symbol_named_since_ms) +
+                       "): it may not be the log that was in use then. Nothing was written.");
     }
     return code;
 }

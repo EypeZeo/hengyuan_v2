@@ -58,6 +58,13 @@ namespace {
 constexpr std::int64_t kT0 = 1'790'000'000'000;  // the exchange time at which the lock is taken
 constexpr std::int64_t kFenceMs = kDefaultEvidenceWaitMs;  // 270 s
 constexpr std::int64_t kSendAt = kT0 - 599'000;   // the Prepared frame's time: when the send started
+// The timestamp inside kA's client order id: the EARLIER of kA's two anchors (the frame's time is 2 s later), so the one D5 / R3b-3's
+// symbol-time guard measures the log's first naming against, unless a test gives the order another send time.
+constexpr std::int64_t kCoidAt = kT0 - 601'000;
+static_assert(client_order_id_timestamp("HY-1789999399000-1-0A0A").value().count() == kCoidAt);
+// A control-plane log that has named its symbols for two months: for the tests whose orders were sent DAYS ago (the interval tests), so
+// that the symbol-time guard has nothing to say about them.
+constexpr std::int64_t kLongBefore = kT0 - std::int64_t{60} * 86'400'000;
 constexpr std::uint32_t kKeyId = 1;
 constexpr std::uint64_t kUid = kFakeAccountUid;  // the uid the fake exchange reports for its key, unless a test says otherwise
 
@@ -272,11 +279,12 @@ protected:
         for (const Timed& f : frames) ASSERT_TRUE(sink.append_durable(f.rec, f.at_ms).acked()) << f.rec.client_order_id;
     }
 
-    // One snapshot per entry of `snapshots`, each listing the given names by position.
-    void write_names(const std::vector<std::vector<std::string>>& snapshots) {
+    // One snapshot per entry of `snapshots`, each listing the given names by position; stamped first_at, first_at + 1000, ... (the
+    // default is an hour before the orders: D5 / R3b-3 judges a name by when the log first gave it, so a test about that says when).
+    void write_names(const std::vector<std::vector<std::string>>& snapshots, std::int64_t first_at = kT0 - 3'600'000) {
         ControlPlaneLogSink sink(cp_path_, *ring_, kKeyId);
         ASSERT_TRUE(sink.is_open());
-        std::int64_t t = kT0 - 3'600'000;
+        std::int64_t t = first_at;
         for (const std::vector<std::string>& names : snapshots) {
             std::vector<SymbolRules> entries;
             for (const std::string& n : names) entries.push_back(rule(n));
@@ -290,9 +298,10 @@ protected:
     }
 
     // Writes the logs, opens them the way the tool does (OperatorOpen) and builds the rig. Call before begin().
-    void prepare(const std::vector<Timed>& history, const std::vector<std::vector<std::string>>& snapshots = {{"BTCUSDT"}}) {
+    void prepare(const std::vector<Timed>& history, const std::vector<std::vector<std::string>>& snapshots = {{"BTCUSDT"}},
+                 std::int64_t first_snapshot_at = kT0 - 3'600'000) {
         write_history(history);
-        write_names(snapshots);
+        write_names(snapshots, first_snapshot_at);
         before_ = file_bytes(audit_path_);
         cp_before_ = file_bytes(cp_path_);
         audit_ = std::make_unique<DurableAuditSink>(audit_path_, *ring_, kKeyId, kMaxIntentOrphans, AuditSinkOpenMode::OperatorOpen);
@@ -654,7 +663,7 @@ TEST_F(FlowTest, APageThatProvesNothingIsARefusal) {
 
 TEST_F(FlowTest, AnIntervalOfSeveralDaysIsWalkedWindowByWindowWithNoGap) {
     const std::int64_t three_days = 3 * 86'400'000;
-    prepare(ambiguous_history(kA, kT0 - three_days));
+    prepare(ambiguous_history(kA, kT0 - three_days), {{"BTCUSDT"}}, kLongBefore);
     OperatorSession session = begin();
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
     ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status);
@@ -672,7 +681,7 @@ TEST_F(FlowTest, AnIntervalOfSeveralDaysIsWalkedWindowByWindowWithNoGap) {
 }
 
 TEST_F(FlowTest, AnIntervalNoToolCanCoverIsRefusedBeforeAnyWait) {
-    prepare(ambiguous_history(kA, kT0 - 20 * 86'400'000));
+    prepare(ambiguous_history(kA, kT0 - 20 * 86'400'000), {{"BTCUSDT"}}, kLongBefore);
     OperatorSession session = begin();
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
     EXPECT_EQ(o.status, ResolveStatus::NoUsableRange);
@@ -691,7 +700,7 @@ constexpr std::int64_t send_at_for_span(std::int64_t span, std::int64_t fence_ms
 }  // namespace
 
 TEST_F(FlowTest, AnIntervalExactlyAtTheLimitIsWalkedInFourteenWindows) {
-    prepare(ambiguous_history(kA, send_at_for_span(kLongestInterval, kFenceMs)));
+    prepare(ambiguous_history(kA, send_at_for_span(kLongestInterval, kFenceMs)), {{"BTCUSDT"}}, kLongBefore);
     OperatorSession session = begin();
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
     ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status) << " / " << conclusion_name(o.conclusion);
@@ -706,7 +715,7 @@ TEST_F(FlowTest, ALongerRecvWindowWidensTheIntervalAndTheConclusionIsAskedWithTh
     // one millisecond more than one window at W = 10 min -- and one window at the default W, which is the difference a conclusion
     // asked with the DEFAULT parameters would see: it would count one window against the two that were read
     const std::int64_t send_at = kT0 + fence_ms + 1'200'000 - (kAllOrdersMaxSpanMs + 1);
-    prepare(ambiguous_history(kA, send_at));
+    prepare(ambiguous_history(kA, send_at), {{"BTCUSDT"}}, kLongBefore);
     OperatorSession session = begin(fence);
     ASSERT_EQ(session.status, SessionStatus::Ready);
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
@@ -729,7 +738,7 @@ TEST_F(FlowTest, ALongerRecvWindowWidensTheIntervalAndTheConclusionIsAskedWithTh
 }
 
 TEST_F(FlowTest, AnIntervalOneMillisecondOverTheLimitAtTheEarliestPermittedReadIsRefusedBeforeAnyWait) {
-    prepare(ambiguous_history(kA, send_at_for_span(kLongestInterval + 1, kFenceMs)));
+    prepare(ambiguous_history(kA, send_at_for_span(kLongestInterval + 1, kFenceMs)), {{"BTCUSDT"}}, kLongBefore);
     OperatorSession session = begin();
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
     EXPECT_EQ(o.status, ResolveStatus::NoUsableRange);
@@ -743,7 +752,7 @@ TEST_F(FlowTest, AnIntervalThatOnlyGrowsOverTheLimitWhileTheToolWaitsIsRefusedAf
     FenceParams fence;
     fence.margin_ms = 45'000;  // a 285 s fence: the last sleep is shorter than a step and overshoots the fence by the pad
     constexpr std::int64_t fence_ms = 285'000;
-    prepare(ambiguous_history(kA, send_at_for_span(kLongestInterval, fence_ms)));  // fits at the earliest read, not 250 ms later
+    prepare(ambiguous_history(kA, send_at_for_span(kLongestInterval, fence_ms)), {{"BTCUSDT"}}, kLongBefore);  // fits at the earliest read, not 250 ms later
     OperatorSession session = begin(fence);
     ASSERT_EQ(session.status, SessionStatus::Ready);
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
@@ -973,6 +982,245 @@ TEST_F(FlowTest, ASymbolTheControlPlaneLogCannotNameIsRefusedWithoutAnyTraffic) 
         EXPECT_EQ(o.symbol_status, SymbolNameStatus::Conflict);
         expect_no_traffic();
         EXPECT_TRUE(logs_untouched());
+    }
+}
+
+// --- the symbol must have been named before the order was sent (D5 / R3b-3, blueprint L-50) ------------------------------------
+//
+// "Every snapshot of the control-plane log agrees" does not say that this is the log that was in use when the order was placed: had
+// it been deleted and recreated since, an old symbol_id may now mean another symbol and still be Known -- and "no such order" is true
+// for a wrong symbol. So a name counts only for an order sent at or after the first snapshot that gave it; the order's send time is
+// the earliest anchor it has (the id's timestamp, the frame's time). The listing and the resolution judge it through one function.
+
+TEST_F(FlowTest, ANameTheLogFirstGaveAfterTheOrderWasSentIsRefusedWithoutAnyTraffic) {
+    prepare(ambiguous_history(kA), {{"BTCUSDT"}}, kT0 - 500'000);  // the only snapshot is later than the order
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+    EXPECT_EQ(o.status, ResolveStatus::SymbolNameNotKnown);
+    EXPECT_EQ(o.symbol_status, SymbolNameStatus::NotNamedAtOrderTime);
+    EXPECT_EQ(o.symbol_named_since_ms, kT0 - 500'000) << "the refusal says since when the log has had the name";
+    EXPECT_EQ(o.range, RangeStatus::Unset) << "refused before the interval was worked out";
+    EXPECT_EQ(o.fence, FenceVerdict::Unset);
+    expect_no_traffic();
+    EXPECT_TRUE(logs_untouched());
+}
+
+TEST_F(FlowTest, TheNameCountsFromTheMomentOfTheFirstSnapshotOnwardAndTheEarlierAnchorDecides) {
+    struct Case {
+        std::int64_t first_snapshot_at;
+        bool accepted;
+        const char* why;
+    };
+    // kA's anchors: the id's timestamp kCoidAt, the frame's time kSendAt = kCoidAt + 2000
+    const Case cases[] = {
+        {kCoidAt - 3'600'000, true, "an hour before"},
+        {kCoidAt - 1, true, "a millisecond before the earlier anchor"},
+        {kCoidAt, true, "exactly at the earlier anchor: a name is in force from the moment the log was given it"},
+        {kCoidAt + 1, false, "a millisecond after the earlier anchor"},
+        {kCoidAt + 1000, false, "between the two anchors: the frame's time alone would have let it through"},
+        {kSendAt - 1, false, "just before the later anchor"},
+        {kSendAt, false, "at the later anchor"},
+        {kSendAt + 1, false, "after both"},
+        {kT0, false, "at the lock"},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.why);
+        fresh_paths();
+        prepare(ambiguous_history(kA), {{"BTCUSDT"}}, c.first_snapshot_at);
+        const std::vector<UnresolvedOrderSummary> list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, c.accepted ? SymbolNameStatus::Known : SymbolNameStatus::NotNamedAtOrderTime);
+        EXPECT_EQ(list[0].symbol, c.accepted ? "BTCUSDT" : "") << "a refused name is not handed out";
+        EXPECT_EQ(list[0].symbol_named_since_ms, c.first_snapshot_at);
+        EXPECT_EQ(list[0].order_check, ResolutionCheck::Ok) << "the order itself is as resolvable as before";
+        // the judge itself: a refused lookup hands out no name, whatever the log's slot holds
+        const auto checkpoints = audit_->recovered_checkpoints();
+        ASSERT_EQ(checkpoints.size(), 1u);
+        const SymbolNameLookup judged = symbol_for_order(*names_, checkpoints[0]);
+        EXPECT_EQ(judged.status, list[0].symbol_status);
+        EXPECT_EQ(judged.name, std::string_view(c.accepted ? "BTCUSDT" : ""));
+        EXPECT_EQ(judged.named_since_ms, c.first_snapshot_at);
+    }
+}
+
+TEST_F(FlowTest, AnOrderSentAtTheMomentOfTheFirstSnapshotIsResolvedAndOneMillisecondEarlierIsNot) {
+    {
+        prepare(ambiguous_history(kA), {{"BTCUSDT"}}, kCoidAt);
+        OperatorSession session = begin();
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+        EXPECT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status);
+        EXPECT_EQ(o.symbol_status, SymbolNameStatus::Known);
+    }
+    fresh_paths();
+    world_.now_ms = kT0;
+    {
+        prepare(ambiguous_history(kA), {{"BTCUSDT"}}, kCoidAt + 1);
+        OperatorSession session = begin();
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+        EXPECT_EQ(o.status, ResolveStatus::SymbolNameNotKnown);
+        EXPECT_EQ(o.symbol_status, SymbolNameStatus::NotNamedAtOrderTime);
+        expect_no_traffic();
+        EXPECT_TRUE(logs_untouched());
+    }
+}
+
+TEST_F(FlowTest, TheFramesTimeIsTheAnchorWhenItIsEarlierThanTheIdsAndWhenTheIdIsNotOurs) {
+    // the send began 100 s before the id's timestamp (a clock that stepped, an id made by something else): the frame is the earlier
+    const std::int64_t frame_at = kCoidAt - 100'000;
+    {
+        prepare(ambiguous_history(kA, frame_at), {{"BTCUSDT"}}, kCoidAt - 50'000);  // before the id's timestamp, after the frame
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::NotNamedAtOrderTime);
+    }
+    fresh_paths();
+    {
+        prepare(ambiguous_history(kA, frame_at), {{"BTCUSDT"}}, frame_at);
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Known) << "at the frame's time exactly";
+    }
+    // an id with no timestamp to read: the frame alone
+    const OrderSpec odd{"ORDER-NOT-OURS-1"};
+    fresh_paths();
+    {
+        prepare(ambiguous_history(odd), {{"BTCUSDT"}}, kSendAt + 1);
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::NotNamedAtOrderTime);
+    }
+    fresh_paths();
+    {
+        prepare(ambiguous_history(odd), {{"BTCUSDT"}}, kSendAt);
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Known);
+    }
+}
+
+TEST_F(FlowTest, TheIdsTimestampIsTheAnchorWhenTheLogHasNoSendTime) {
+    {
+        prepare(ambiguous_history(kA, 0), {{"BTCUSDT"}}, kCoidAt + 1);
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].send_started_utc_ms, 0);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::NotNamedAtOrderTime);
+    }
+    fresh_paths();
+    {
+        prepare(ambiguous_history(kA, 0), {{"BTCUSDT"}}, kCoidAt);
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Known);
+    }
+}
+
+TEST_F(FlowTest, AFrameTimeThatIsNoPlausibleDateIsRefusedByTheRangeAndTheJudgeDoesNotTakeItForTheSendTime) {
+    // The audit log is MAC-protected, so a garbage send-start time means something is wrong: the range check refuses it even though
+    // the id's timestamp could stand in. The symbol judge, for its part, does not take it for the order's send time -- a tiny one
+    // would otherwise make every name look too late, a huge one every name look old enough -- and goes by the id.
+    for (const std::int64_t garbage : {std::int64_t{-5}, std::int64_t{1}, kMinPlausibleExchangeMs - 1, kMaxPlausibleExchangeMs + 1}) {
+        SCOPED_TRACE(garbage);
+        fresh_paths();
+        world_.now_ms = kT0;
+        prepare(ambiguous_history(kA, garbage));
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].send_started_utc_ms, garbage);
+        OperatorSession session = begin();
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+        EXPECT_EQ(o.symbol_status, SymbolNameStatus::Known) << "judged by the id's timestamp, an hour after the names";
+        EXPECT_EQ(o.status, ResolveStatus::NoUsableRange);
+        EXPECT_EQ(o.range, RangeStatus::ImplausibleTime);
+        expect_no_traffic();
+        EXPECT_TRUE(logs_untouched());
+    }
+}
+
+TEST_F(FlowTest, AnOrderWithNoAnchorIsNotJudgedForItsSymbolAndStillStopsAtTheRange) {
+    // nothing to measure the log's naming against: the range check refuses this order before any request, as it always did
+    const OrderSpec odd{"ORDER-NOT-OURS-1"};
+    prepare(ambiguous_history(odd, 0), {{"BTCUSDT"}}, kT0 - 100);  // the name is as late as can be
+    const auto list = list_unresolved_orders(*audit_, *names_);
+    ASSERT_EQ(list.size(), 1u);
+    EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Known);
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(odd));
+    EXPECT_EQ(o.status, ResolveStatus::NoUsableRange);
+    EXPECT_EQ(o.symbol_status, SymbolNameStatus::Known);
+    EXPECT_EQ(o.range, RangeStatus::NoUsableAnchor);
+    expect_no_traffic();
+}
+
+TEST_F(FlowTest, ANameWithoutAUsableTimeIsRefusedForAnOrderThatHasAnAnchor) {
+    // The first snapshot's frame carries no wall time, or an implausible one: the log cannot show when it began to know the name.
+    for (const std::int64_t at : {std::int64_t{0}, std::int64_t{1}, std::int64_t{-5}, kMinPlausibleExchangeMs - 1}) {
+        SCOPED_TRACE(at);
+        fresh_paths();
+        prepare(ambiguous_history(kA), {{"BTCUSDT"}}, at);
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::NotNamedAtOrderTime);
+        EXPECT_EQ(list[0].symbol_named_since_ms, at);
+        EXPECT_TRUE(list[0].symbol.empty());
+    }
+    // the first plausible time there is, long before the order, is a time
+    fresh_paths();
+    prepare(ambiguous_history(kA), {{"BTCUSDT"}}, kMinPlausibleExchangeMs);
+    const auto list = list_unresolved_orders(*audit_, *names_);
+    ASSERT_EQ(list.size(), 1u);
+    EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Known);
+}
+
+TEST_F(FlowTest, TheFirstSnapshotThatNamedTheIdDecidesNotALaterOneAndEachIdIsJudgedByItsOwn) {
+    OrderSpec second{"HY-1789999399000-4-0D0D"};  // the same timestamp as kA's id
+    second.symbol_id = 1;
+    // snapshot 1 names id 0 half a second before the orders; snapshot 2 (a second later, half a second after them) adds id 1
+    prepare(concat(ambiguous_history(kA), ambiguous_history(second)), {{"BTCUSDT"}, {"BTCUSDT", "ETHUSDT"}}, kCoidAt - 500);
+    const auto list = list_unresolved_orders(*audit_, *names_);
+    ASSERT_EQ(list.size(), 2u);
+    EXPECT_EQ(list[0].symbol_id, 0u);
+    EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Known) << "id 0 was named by snapshot 1; snapshot 2, which came after the order, only agreed";
+    EXPECT_EQ(list[0].symbol, "BTCUSDT");
+    EXPECT_EQ(list[0].symbol_named_since_ms, kCoidAt - 500);
+    EXPECT_EQ(list[1].symbol_id, 1u);
+    EXPECT_EQ(list[1].symbol_status, SymbolNameStatus::NotNamedAtOrderTime) << "id 1 was first named by snapshot 2, after the order";
+    EXPECT_TRUE(list[1].symbol.empty());
+    EXPECT_EQ(list[1].symbol_named_since_ms, kCoidAt + 500);
+}
+
+TEST_F(FlowTest, AConflictAndAnUnknownNameAreStillWhatTheyWereWhateverTheTimes) {
+    {
+        prepare(ambiguous_history(kA), {{"BTCUSDT"}, {"ETHUSDT"}}, kT0 - 500'000);  // disagreeing, and late
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Conflict);
+        EXPECT_EQ(list[0].symbol_named_since_ms, 0);
+    }
+    fresh_paths();
+    {
+        prepare(ambiguous_history(kA), {}, kT0 - 500'000);  // nothing named, and late
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        EXPECT_EQ(list[0].symbol_status, SymbolNameStatus::Unknown);
+        EXPECT_EQ(list[0].symbol_named_since_ms, 0);
+    }
+}
+
+TEST_F(FlowTest, TheListingAndTheResolutionJudgeTheSymbolTheSameWay) {
+    for (const std::int64_t at : {kCoidAt - 1000, kCoidAt, kCoidAt + 1, kSendAt, kT0 - 100, std::int64_t{0}}) {
+        SCOPED_TRACE(at);
+        fresh_paths();
+        world_.now_ms = kT0;
+        prepare(ambiguous_history(kA), {{"BTCUSDT"}}, at);
+        const auto list = list_unresolved_orders(*audit_, *names_);
+        ASSERT_EQ(list.size(), 1u);
+        OperatorSession session = begin();
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+        EXPECT_EQ(list[0].symbol_status, o.symbol_status);
+        EXPECT_EQ(list[0].symbol_named_since_ms, o.symbol_named_since_ms);
+        EXPECT_EQ(o.status, o.symbol_status == SymbolNameStatus::Known ? ResolveStatus::Resolved : ResolveStatus::SymbolNameNotKnown)
+            << resolve_status_name(o.status);
     }
 }
 

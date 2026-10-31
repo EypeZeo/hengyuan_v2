@@ -352,13 +352,26 @@ struct AllOrdersRange {
     ExchangeMs end{};
 };
 
-// The interval allOrders must cover: from 2W before the earliest moment the order could have been sent to the evidence read.
-// `frame_anchor` is the recorded time of the frame at which the send began (the Prepared / Submitting frame), only when that
-// frame carries a ServerCorrectedUtc time (frame_wall_time_ms(), durable_control_plane.hpp, is 0 for any other); the client
-// order id's timestamp is the second anchor. The EARLIER of the anchors that exist is used: the design prefers the frame time
-// and falls back to the id, and taking the minimum is never later than either, which only widens the window (more pages, never
-// a gap). A frame anchor that is present but implausible is refused, not ignored: the log is MAC-protected, so garbage there
-// means something is wrong.
+// The earliest moment the order is known to have been sent: the EARLIER of the two anchors that exist and are plausible. The
+// first is `frame_anchor`, the recorded time of the frame at which the send began (the Prepared / Submitting frame), present
+// only when that frame carries a ServerCorrectedUtc time (frame_wall_time_ms(), durable_control_plane.hpp, is 0 for any other);
+// the second is the client order id's timestamp. Taking the minimum is never later than either, which is the cautious reading
+// for both users: the allOrders interval then only gets wider (more pages, never a gap), and the symbol-time guard (D5 / R3b-3,
+// symbol_for_order() in operator_resolution_flow.hpp) asks the most of the log's naming. An implausible frame anchor is not
+// used here (all_orders_range() refuses it before asking). nullopt: neither anchor is usable.
+constexpr std::optional<ExchangeMs> earliest_send_anchor(std::optional<ExchangeMs> frame_anchor,
+                                                         std::string_view client_order_id) noexcept {
+    std::optional<ExchangeMs> base;
+    if (frame_anchor && is_plausible(*frame_anchor)) base = frame_anchor;
+    if (const auto from_id = client_order_id_timestamp(client_order_id); from_id && (!base || *from_id < *base)) {
+        base = from_id;
+    }
+    return base;
+}
+
+// The interval allOrders must cover: from 2W before the earliest moment the order could have been sent (earliest_send_anchor())
+// to the evidence read. A frame anchor that is present but implausible is refused, not ignored: the log is MAC-protected, so
+// garbage there means something is wrong.
 constexpr AllOrdersRange all_orders_range(std::optional<ExchangeMs> frame_anchor, std::string_view client_order_id,
                                           ExchangeMs read_ref, const FenceParams& p) noexcept {
     AllOrdersRange r{};
@@ -370,10 +383,7 @@ constexpr AllOrdersRange all_orders_range(std::optional<ExchangeMs> frame_anchor
         r.status = RangeStatus::ImplausibleTime;
         return r;
     }
-    std::optional<ExchangeMs> base = frame_anchor;
-    if (const auto from_id = client_order_id_timestamp(client_order_id); from_id && (!base || *from_id < *base)) {
-        base = from_id;
-    }
+    const std::optional<ExchangeMs> base = earliest_send_anchor(frame_anchor, client_order_id);
     if (!base) {
         r.status = RangeStatus::NoUsableAnchor;
         return r;

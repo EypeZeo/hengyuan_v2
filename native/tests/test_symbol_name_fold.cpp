@@ -146,10 +146,11 @@ protected:
     struct Said {
         SymbolNameStatus status{SymbolNameStatus::Unknown};
         std::string name;
+        std::int64_t since{0};  // D5 / R3b-3: SymbolNameLookup::named_since_ms
     };
     static Said said(const ControlPlaneLogSink& sink, std::uint32_t symbol_id) {
         const SymbolNameLookup l = sink.recovered_symbol_name(symbol_id);
-        return {l.status, std::string(l.name)};
+        return {l.status, std::string(l.name), l.named_since_ms};
     }
 
     void expect_known(const ControlPlaneLogSink& sink, std::uint32_t symbol_id, std::string_view name) {
@@ -161,11 +162,13 @@ protected:
         const Said s = said(sink, symbol_id);
         EXPECT_EQ(s.status, SymbolNameStatus::Conflict) << "id " << symbol_id;
         EXPECT_TRUE(s.name.empty()) << "a Conflict names nothing: id " << symbol_id << " -> " << s.name;
+        EXPECT_EQ(s.since, 0) << "a Conflict is named since no time: id " << symbol_id;
     }
     void expect_unknown(const ControlPlaneLogSink& sink, std::uint32_t symbol_id) {
         const Said s = said(sink, symbol_id);
         EXPECT_EQ(s.status, SymbolNameStatus::Unknown) << "id " << symbol_id;
         EXPECT_TRUE(s.name.empty()) << "id " << symbol_id << " -> " << s.name;
+        EXPECT_EQ(s.since, 0) << "an Unknown is named since no time: id " << symbol_id;
     }
 };
 
@@ -175,8 +178,14 @@ TEST(SymbolNameLookupDefaults, ALookupNobodyFilledInIsUnknownAndNamesNothing) {
     const SymbolNameLookup l{};
     EXPECT_EQ(l.status, SymbolNameStatus::Unknown);
     EXPECT_TRUE(l.name.empty());
+    EXPECT_EQ(l.named_since_ms, 0);
     EXPECT_NE(l.status, SymbolNameStatus::Known);
+    EXPECT_NE(l.status, SymbolNameStatus::NotNamedAtOrderTime);
     EXPECT_EQ(static_cast<std::uint8_t>(SymbolNameStatus::Unknown), 0u);
+    // the values are what the documents list: a status somebody renumbers is a status somebody reads wrongly
+    EXPECT_EQ(static_cast<std::uint8_t>(SymbolNameStatus::Known), 1u);
+    EXPECT_EQ(static_cast<std::uint8_t>(SymbolNameStatus::Conflict), 2u);
+    EXPECT_EQ(static_cast<std::uint8_t>(SymbolNameStatus::NotNamedAtOrderTime), 3u);
 }
 
 TEST_F(SymbolNameFoldTest, AFreshLogKnowsNoNameAndCountsNoSnapshot) {
@@ -496,4 +505,104 @@ TEST_F(SymbolNameFoldTest, TheNameViewLivesAsLongAsTheSinkAndDoesNotMoveBetweenC
     EXPECT_EQ(a.name.data(), a_again.name.data()) << "a view into the sink, not a copy per call";
     EXPECT_NE(a.name.data(), b.name.data());
     EXPECT_EQ(a.name, sv("BTCUSDT")) << "asking for another id did not disturb the first view";
+}
+
+// --- since when (D5 / R3b-3, blueprint L-50) -----------------------------------------------------------------------------------
+//
+// "Every snapshot agrees" does not say which log this is: had it been deleted and recreated after an order was placed, an old id
+// could have been given another symbol and still be Known. So a Known answer also says since when the log has named the id -- the
+// wall time of the first snapshot FRAME that gave it the name, as the frame's MAC-protected header records it -- and the operator
+// tool refuses a name that is not provably older than the order (operator_resolution_flow.hpp, symbol_for_order()). These tests
+// are about the time itself; the fixture's snapshots are stamped 1000, 2000, ... unless a test says otherwise.
+
+TEST_F(SymbolNameFoldTest, ANameIsKnownSinceTheFirstSnapshotThatGaveItAndNoLaterOneMovesThat) {
+    put({"BTCUSDT"});                           // 1000
+    put({"BTCUSDT", "ETHUSDT"});                // 2000: id 1 is named for the first time, id 0 agrees again
+    put({"BTCUSDT", "ETHUSDT", "SOLUSDT"}, 3);  // 3000
+    put({"BTCUSDT", "ETHUSDT", "SOLUSDT"}, 4);  // 4000: nothing new
+    const auto sink = open();
+    ASSERT_EQ(sink->recovery_status(), RecoveryScanStatus::Recovered);
+    EXPECT_EQ(said(*sink, 0).status, SymbolNameStatus::Known);
+    EXPECT_EQ(said(*sink, 0).since, 1000);
+    EXPECT_EQ(said(*sink, 1).since, 2000);
+    EXPECT_EQ(said(*sink, 2).since, 3000);
+    expect_unknown(*sink, 3);
+}
+
+TEST_F(SymbolNameFoldTest, TheTimeIsThatOfTheFirstFrameInTheLogNotTheSmallestTimeAnyFrameCarries) {
+    // A frame later in the log that carries an EARLIER time (a clock that stepped back) does not pull the time back: the order of
+    // the log is the order of what happened, and the later of the two readings is the cautious one.
+    clock_ms_ = 5000;
+    put({"BTCUSDT"});
+    clock_ms_ = 1000;
+    put({"BTCUSDT"});
+    const auto sink = open();
+    ASSERT_EQ(sink->recovery_status(), RecoveryScanStatus::Recovered);
+    expect_known(*sink, 0, "BTCUSDT");
+    EXPECT_EQ(said(*sink, 0).since, 5000);
+}
+
+TEST_F(SymbolNameFoldTest, ATimeIsReportedOnlyForAKnownNameAndNeverForAnIdThatBecameAConflict) {
+    put({"BTCUSDT", "ETHUSDT"});  // 1000
+    put({"BTCUSDC", "ETHUSDT"});  // 2000: id 0 is renamed
+    const auto sink = open();
+    ASSERT_EQ(sink->recovery_status(), RecoveryScanStatus::Recovered);
+    expect_conflict(*sink, 0);  // (and so named since no time: expect_conflict() checks it)
+    expect_known(*sink, 1, "ETHUSDT");
+    EXPECT_EQ(said(*sink, 1).since, 1000);
+}
+
+TEST_F(SymbolNameFoldTest, AFrameWithoutAWallTimeGivesTheNameNoTimeAndALaterFrameDoesNotMakeUpForIt) {
+    clock_ms_ = 0;  // the first snapshot is stamped 0: no wall time
+    put({"BTCUSDT"});
+    clock_ms_ = 7000;
+    put({"BTCUSDT", "ETHUSDT"});
+    const auto sink = open();
+    ASSERT_EQ(sink->recovery_status(), RecoveryScanStatus::Recovered);
+    expect_known(*sink, 0, "BTCUSDT");
+    EXPECT_EQ(said(*sink, 0).since, 0) << "the first frame to give the name had no time; a later one that has does not move it forward";
+    expect_known(*sink, 1, "ETHUSDT");
+    EXPECT_EQ(said(*sink, 1).since, 7000) << "an id first named by a frame with a time has that time";
+}
+
+TEST_F(SymbolNameFoldTest, AFrameThatSaysThereWasNoTrustworthyClockSeedsNoTimeWhateverItsHeaderHolds) {
+    // The writer of this sink always stamps ServerCorrectedUtc; a frame stamped UnknownBootstrap means there was no trustworthy
+    // clock when it was written, and the reader must not take a wall time from it (frame_wall_time_ms()). The spec wants 0 in
+    // such a frame's time; the decoder does not check, so this one holds 777 in both its header and its payload and must still
+    // give no time. The frame is appended by hand, to the log only: the tip anchor stays on frame 1, which is a state a log is
+    // legitimately found in (one complete frame ahead of the anchor, the crash window) and recovers as Recovered.
+    put({"BTCUSDT"});  // frame 1, stamped 1000
+    const std::string first = slurp_file(base_path_);
+
+    std::array<std::byte, kKeyBlockSize> key_block{};
+    ASSERT_TRUE(ring_->active_key(1, key_block));
+    const std::span<const std::byte> key(key_block.data(), key_block.size());
+    DecodedSnapshotFrame f1{};
+    std::array<SymbolRules, kMaxSnapshotSymbols> scratch{};
+    std::size_t scratch_count = 0;
+    std::size_t f1_size = 0;
+    ASSERT_EQ(decode_snapshot_frame(std::as_bytes(std::span<const char>(first.data(), first.size())), key, f1, scratch, scratch_count,
+                                    f1_size),
+              FrameDecodeStatus::Ok);
+    ASSERT_EQ(f1_size, first.size());
+
+    const std::vector<SymbolRules> entries{rule("BTCUSDT"), rule("ETHUSDT")};
+    SymbolRegistrySnapshotPayload snap{};
+    snap.timestamp_ms = 777;
+    snap.rules_version = 2;
+    snap.symbol_count = static_cast<std::uint32_t>(entries.size());
+    std::array<std::byte, kMaxSnapshotFrameSize> buf{};
+    const std::size_t len = encode_snapshot_frame(buf, 1, f1.sequence_number + 1, FrameTimeKind::UnknownBootstrap, 777, snap,
+                                                  std::span<const SymbolRules>(entries.data(), entries.size()),
+                                                  std::span<const std::byte, kMacLen>(f1.mac), key);
+    ASSERT_GT(len, 0u);
+    spit_file(base_path_, first + std::string(reinterpret_cast<const char*>(buf.data()), len));
+
+    const auto sink = open();
+    ASSERT_EQ(sink->recovery_status(), RecoveryScanStatus::Recovered);
+    EXPECT_EQ(sink->recovered_snapshot_count(), 2u);
+    expect_known(*sink, 0, "BTCUSDT");
+    EXPECT_EQ(said(*sink, 0).since, 1000) << "named by frame 1, which has a wall time";
+    expect_known(*sink, 1, "ETHUSDT");
+    EXPECT_EQ(said(*sink, 1).since, 0) << "named first by a frame that says there was no trustworthy clock";
 }
