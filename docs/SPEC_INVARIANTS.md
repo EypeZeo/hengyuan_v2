@@ -574,7 +574,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       （R6，Testnet 演练——回环夹具只证明**过程**，不证明交易所的行为；若 Testnet 不带 `uid`，流程会以 `AccountUnverified` 拒绝，那时需要 Owner 决定）。L-50 的附加防线（“发送时间早于第一个命名该 id 的快照” ⇒ `Unknown`）仍未做，留给 R3b-2。
 
   - **[D5 切片 R3b-2 已落地：离线工具的命令行 `hy_operator_resolve`——参数文法、KEK 与密钥文件、只读专用凭据、终端适配器与证据目录、退出码]**
-    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-31 “开始R3b-2，按推荐”——三项推荐：专用只读凭据名、`--kek-file`、L-50 的附加防线拆给 R3b-3；Tier B；本 PR）：被困订单第一次有了**可执行的出口**——
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-31 “开始R3b-2，按推荐”——三项推荐：专用只读凭据名、`--kek-file`、L-50 的附加防线拆给 R3b-3，对 PR #214 说“合并”；Tier B；PR #214，合并提交 bdaece6）：被困订单第一次有了**可执行的出口**——
     `hy_operator_resolve`（HY_BUILD_DEMO 下构建的一个薄 `main()`，其余在四个头文件里）。**仍然没有任何真实流量**：测试里只有回环 TLS 与合成凭据，我没有对真实交易所或 Testnet 发过一个字节，仓库里也没有任何真实或 Testnet 凭据；
     **第一次真跑是 Owner 自己的动作（R6）**，而且在 R3b-3（L-50 的附加防线）与 R5（环境与账户绑定）之前不应用于生产。
     - **文件，各管一件事**：`operator_resolution_cli.hpp`（参数文法与用法文字，纯函数，不开文件）；`operator_resolution_terminal.hpp`（`StdConsole`、`DirectoryEvidenceStore`）；`operator_resolution_tool.hpp`
