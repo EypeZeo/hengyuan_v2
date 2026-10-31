@@ -629,7 +629,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练——若不带，流程以 `AccountUnverified` 拒绝，那时需要 Owner 决定）；工具对真实交易所的任何一次运行；Windows 控制台的回显。
 
   - **[D5 切片 R3b-3 已落地：L-50 的附加防线——一个品种名只对不早于日志首次给出它的时刻发送的订单有效]**
-    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-31 “开始R3b-3，按推荐”；Tier B；本 PR）：R3-0 的品种名折叠只能回答 “控制面日志里每个快照都同意”，
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-31 “开始R3b-3，按推荐”，对 PR #216 说“合并”；Tier B；PR #216，合并提交 8b8ad5f）：R3-0 的品种名折叠只能回答 “控制面日志里每个快照都同意”，
     回答不了 “这是不是订单下单当时在用的那份日志”。若控制面日志在订单之后被删除重建，一个旧的 `symbol_id` 可能被改给另一个品种、仍然是 `Known`，工具就会拿错误的品种去问交易所——
     “没有这个订单” 对一个错误的品种是真话，而这个工具恰恰拿这句真话去结清订单。R3b-3 加一道便宜的防线（根治是 R5 的环境与账户绑定）：**名字只对不早于日志首次给出它的时刻发送的订单有效**。
     **仍然没有任何真实流量**：工具对真实或 Testnet 交易所一次也没有运行过；本片须在 Owner 第一次真跑（R6）之前合入。
