@@ -13,6 +13,7 @@ The read lag L of allOrders (design section 5) cannot be measured without placin
 
 Credentials: HENGYUAN_OPERATOR_TESTNET_API_KEY / HENGYUAN_OPERATOR_TESTNET_API_SECRET -- the READ-ONLY operator key the offline tool uses, not the
 trading key -- from the environment, or from the .env file named by --env-file (default ./.env), the same variable names as the tool.
+Copy .env.example to .env (git-ignored) and fill the two values in your own editor; never paste them into a chat.
 The probe signs with HMAC-SHA256; a code -1022 ("Signature for this request is not valid") usually means the key is an Ed25519 key.
 
 Run (PowerShell, Linux or WSL), from the repository root:
