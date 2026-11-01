@@ -431,7 +431,10 @@ TEST(ToolArgs, TheUsageTextNamesEveryOptionAndTheExitCodesThatMatter) {
     EXPECT_NE(usage.find("trading key is refused"), std::string::npos);
     // the exit codes the operator has to know: the one that may have left a frame behind, and the unexpected one
     EXPECT_NE(usage.find("59 the frame could not be appended"), std::string::npos);
+    EXPECT_NE(usage.find("62 to 65 the store's recorded\nenvironment or account does not allow it"), std::string::npos)
+        << "the four store-binding refusals (D5 / R5: StoreNotBound .. StoreAccountMismatch = 22 .. 25, exit 40 + n)";
     EXPECT_NE(usage.find("70 an unexpected error"), std::string::npos);
+    EXPECT_NE(usage.find("a production run needs such a binding"), std::string::npos);
     EXPECT_NE(usage.find(".operator-evidence"), std::string::npos);
     // every line is printable ASCII (the console would replace anything else) and short enough for a terminal
     for (const std::string_view line : kToolUsage) {

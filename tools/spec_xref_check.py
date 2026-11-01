@@ -166,6 +166,10 @@ SEARCH_FILES = [
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_tool.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_real_exchange.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "binance_environment.hpp",
+    # D5 slice R5 (docs/SPEC_INVARIANTS.md "D5 切片 R5"): the audit store's environment-and-account binding -- the format, the reader and the
+    # judgement (store_binding.hpp) and the write-once writer with the trading process's policy (store_binding_writer.hpp).
+    REPO_ROOT / "native" / "include" / "hengyuan" / "store_binding.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "store_binding_writer.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

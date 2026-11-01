@@ -912,8 +912,10 @@ TEST(OperatorResolutionGuard, TheBoostFreeHeadersOfTheToolHaveAnExactIncludeList
                                         "#include <hengyuan/durable_audit_sink.hpp>", "#include <hengyuan/kek_loader.hpp>",
                                         "#include <hengyuan/key_ring.hpp>", "#include <hengyuan/operator_resolution_cli.hpp>",
                                         "#include <hengyuan/operator_resolution_flow.hpp>", "#include <hengyuan/operator_resolution_ports.hpp>",
-                                        "#include <hengyuan/operator_resolution_terminal.hpp>", "#include <hengyuan/secure_wipe.hpp>"}))
-        << "an include added here must be argued for: this header is the tool without its exchange";
+                                        "#include <hengyuan/operator_resolution_terminal.hpp>", "#include <hengyuan/secure_wipe.hpp>",
+                                        "#include <hengyuan/store_binding.hpp>"}))
+        << "an include added here must be argued for: this header is the tool without its exchange (and store_binding.hpp is the READ side of "
+           "the store's binding: the writer is not on this list, and is pinned absent below)";
     for (const SourceFile* f : {cli, terminal, tool}) {
         for (const char* word : {"boost", "asio", "beast", "ssl", "OpenSSL", "BinancePrivateRestClient", "BinanceExchangeReadPort",
                                  "EnvironmentBinding", "BoundHmacCredentials", "SecureEnvLoader", "RealSleeper"}) {
@@ -992,6 +994,7 @@ TEST(OperatorResolutionGuard, TheToolTakesTheExchangeFirstThenTheKeysThenBothLog
     next("is_existing_file(options.control_log)");
     next("DurableAuditSink audit(");  // the lock
     next("ControlPlaneLogSink names(");
+    next("read_store_binding(");  // D5 / R5: the store's binding, read once both logs are open and checked
     next("if (!resolve)");  // --list stops here
     next("begin_operator_session(");  // the fence reference: after the lock
     next("resolve_order(");
@@ -1002,8 +1005,9 @@ TEST(OperatorResolutionGuard, TheToolTakesTheExchangeFirstThenTheKeysThenBothLog
         << "the audit log is opened in OperatorOpen mode, with the key id the command line gave";
     EXPECT_NE(squeezed.find("if (resolve) { exchange = env.exchange.open(options, env.sleeper, err);"), std::string::npos)
         << "the credentials are asked for in resolve mode only";
-    EXPECT_NE(squeezed.find("if (!resolve) { print_unresolved_orders(audit, names, out); return exit_code_of(ToolExit::Ok); }"), std::string::npos)
-        << "--list prints and stops: no session, no exchange";
+    EXPECT_NE(squeezed.find("if (!resolve) { print_unresolved_orders(audit, names, binding, out); return exit_code_of(ToolExit::Ok); }"),
+              std::string::npos)
+        << "--list prints (the binding with it) and stops: no session, no exchange";
     // the plaintext HMAC key block the key check looked at is wiped in the same lambda that read it
     const std::size_t looked = body.find("ring->active_key(");
     const std::size_t scrubbed = body.find("secure_wipe(");
@@ -1063,4 +1067,124 @@ TEST(OperatorResolutionGuard, TheEntryPointIsAThinMainThatNamesNoStoreAndNoKey) 
               std::string::npos)
         << "the arguments without the program name, the dialogue on stdout, the diagnostics on stderr, the real wait, the real exchange with its "
            "default configuration and a trust store that is Required, and the exit code is the tool's";
+}
+
+// --- D5 slice R5: the store's binding (store_binding.hpp reads and judges, store_binding_writer.hpp writes) -----------------------------
+//
+//  21. The tool reads a binding and never makes one. The write side (bind_store(), ensure_store_binding()) is included by no production
+//      source today -- the trading process's wiring (private-stream migration M5) will be the first, and adds its pin here with the reason --
+//      and none of the offline tool's sources names anything that writes a binding or a tip anchor.
+//  22. The binding is read once, by the tool, with the audit sink's own identity, and judged once, by the flow, right after the account
+//      check and before any wait or evidence read; everything not explicitly allowed is a refusal.
+//  23. A store's history is decided in one place: the writer asks the sink how many frames it holds, and refuses to bind a Production store
+//      that has any.
+
+namespace {
+
+constexpr const char* kBinding = "include/hengyuan/store_binding.hpp";
+constexpr const char* kBindingWriter = "include/hengyuan/store_binding_writer.hpp";
+
+const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kConfirmation, kPorts,        kBundle,
+                                      kFlow,  kTransport, kCli,  kTerminal,     kTool,         kRealExchange, kMain};
+
+}  // namespace
+
+TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
+    expect_named_only_in("store_binding_writer", {});  // the write side is included by no production source yet
+    expect_named_only_in("bind_store", {{kBindingWriter, 2, "the definition and its one call inside ensure_store_binding()"}});
+    expect_named_only_in("ensure_store_binding", {{kBindingWriter, 3, "the two overloads, and the sink overload's call of the value overload"}});
+    expect_named_only_in("encode_store_binding", {{kBindingWriter, 2, "the definition and its one call inside bind_store()"}});
+    for (const char* f : kOperatorFiles) {
+        const SourceFile* src = find_source(f);
+        ASSERT_NE(src, nullptr) << f;
+        for (const char* name : {"store_binding_writer", "bind_store", "ensure_store_binding", "encode_store_binding", "BindStatus",
+                                 "EnsureBindingStatus", "make_binding_store", "write_tip_anchor", "DurableLogStore"}) {
+            EXPECT_EQ(count_identifier(src->code, name), 0u) << f << " names " << name << ": the tool reads a store's binding and cannot make one";
+        }
+    }
+    // and the read side has no way to write one either
+    const SourceFile* reader = find_source(kBinding);
+    ASSERT_NE(reader, nullptr);
+    ASSERT_NE(find_source(kBindingWriter), nullptr);
+    for (const char* name : {"write_tip_anchor", "encode_store_binding", "bind_store", "ensure_store_binding"}) {
+        EXPECT_EQ(count_identifier(reader->code, name), 0u) << kBinding << " names " << name;
+    }
+}
+
+TEST(OperatorResolutionGuard, TheBindingIsReadByTheToolOnceAndJudgedByTheFlowOnceAfterTheAccountCheck) {
+    expect_named_only_in("read_store_binding",
+                         {{kBinding, 1, "the definition"},
+                          {kBindingWriter, 3, "bind_store() reads before and after it writes, ensure_store_binding() once"},
+                          {kTool, 1, "the one read, with the audit sink's own identity"}});
+    expect_named_only_in("judge_store_binding", {{kBinding, 1, "the definition"},
+                                                {kBindingWriter, 1, "ensure_store_binding()"},
+                                                {kFlow, 1, "resolve_order(): the one judgement of a resolution"}});
+
+    // the tool reads the audit log's own sidecar with the sink's own identity, and hands the session what it read
+    const SourceFile* tool = find_source(kTool);
+    ASSERT_NE(tool, nullptr);
+    const auto reads = call_args(tool->code, "read_store_binding");
+    ASSERT_EQ(reads.size(), 1u);
+    EXPECT_EQ(reads[0], (std::vector<std::string>{"options.audit_log", "*ring", "audit.store_uuid_lo()", "audit.store_uuid_hi()"}));
+    const auto begins = call_args(tool->code, "begin_operator_session");
+    ASSERT_EQ(begins.size(), 1u);
+    EXPECT_EQ(begins[0], (std::vector<std::string>{"audit", "names", "ports", "env.fence", "binding"}));
+
+    // the flow judges it once, against the environment the operator stated and the account the EXCHANGE reported for the key
+    const SourceFile* flow = find_source(kFlow);
+    ASSERT_NE(flow, nullptr);
+    const std::string body = function_body(flow->code, "resolve_order");
+    ASSERT_FALSE(body.empty());
+    const std::string squeezed = squeeze(body);
+    const auto judgements = call_args(body, "judge_store_binding");
+    ASSERT_EQ(judgements.size(), 1u);
+    EXPECT_EQ(judgements[0], (std::vector<std::string>{"session.binding", "store_env", "*account.uid"}));
+    EXPECT_NE(squeezed.find("const StoreEnvironment store_env = to_store_environment(req.environment);"), std::string::npos);
+    const std::size_t judged = body.find("judge_store_binding(");
+    ASSERT_NE(judged, std::string::npos);
+    EXPECT_LT(body.find("exchange.account()"), judged);
+    EXPECT_LT(body.find("ResolveStatus::AccountUidMismatch"), judged) << "after the account check: the account is what is said when both are wrong";
+    for (const char* later : {"exchange.server_time()", "sleep_for", "exchange.query_order(", "exchange.all_orders(", "exchange.open_orders()", "store.store("}) {
+        const std::size_t at = body.find(later);
+        ASSERT_NE(at, std::string::npos) << later;
+        EXPECT_LT(judged, at) << "the binding is judged before " << later;
+    }
+    // only a Match -- or no binding at all on a Testnet run -- goes on; each of the four refusals is decided before the first wait
+    EXPECT_NE(squeezed.find("if (bound != BindingJudgement::Match && !(bound == BindingJudgement::Unbound && store_env == StoreEnvironment::Testnet)) {"),
+              std::string::npos);
+    for (const char* status : {"StoreNotBound", "StoreBindingUnreadable", "StoreEnvironmentMismatch", "StoreAccountMismatch"}) {
+        EXPECT_EQ(count_identifier(body, status), 1u) << status;
+        EXPECT_LT(body.find(std::string("ResolveStatus::") + status), body.find("sleep_for")) << status;
+    }
+    // what the operator and the evidence file are shown is the session's binding, the one that was judged
+    EXPECT_NE(squeezed.find("header.store_binding = session.binding;"), std::string::npos);
+    EXPECT_EQ(count_identifier(body, "binding_line"), 2u) << "once when a legacy store is gone on with, once on the page the operator confirms from";
+    // and the session has it from begin_operator_session()'s parameter alone
+    const std::string begin_body = function_body(flow->code, "begin_operator_session");
+    ASSERT_FALSE(begin_body.empty());
+    EXPECT_NE(squeeze(begin_body).find("s.binding = binding;"), std::string::npos);
+}
+
+TEST(OperatorResolutionGuard, AStoresHistoryIsDecidedInOnePlaceFromTheSinksOwnFrameCount) {
+    std::vector<std::string> callers;
+    std::size_t calls = 0;
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t n = call_args(f.code, "frame_count").size();
+        calls += n;
+        if (n != 0) callers.push_back(f.rel);
+    }
+    EXPECT_EQ(calls, 1u);
+    EXPECT_EQ(callers, (std::vector<std::string>{kBindingWriter}));
+    const SourceFile* writer = find_source(kBindingWriter);
+    ASSERT_NE(writer, nullptr);
+    const std::string code = squeeze(writer->code);
+    EXPECT_NE(code.find("sink.frame_count() != 0"), std::string::npos);
+    EXPECT_NE(code.find("if (store_has_history && environment == StoreEnvironment::Production) return "
+                        "EnsureBindingStatus::UnboundProductionStoreWithHistory;"),
+              std::string::npos)
+        << "no Production store is bound after the fact";
+    EXPECT_NE(code.find("if (!sink.is_open() || sink.fenced() || sink.open_mode() != AuditSinkOpenMode::Trading) return "
+                        "EnsureBindingStatus::StoreNotUsable;"),
+              std::string::npos)
+        << "only an open, unfenced, Trading-mode sink: its lock is what makes this the only writer";
 }

@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 #include <hengyuan/operator_resolution_tool.hpp>
+#include <hengyuan/store_binding_writer.hpp>  // (the TEST binds stores, as a trading process would; the tool under test never includes this)
 
 #include "operator_resolution_fakes.hpp"
 #include "test_helpers/temp_directory.hpp"
@@ -61,6 +62,7 @@ constexpr std::int64_t kSendAt = kT0 - 599'000;
 constexpr std::uint32_t kKeyA = 1;
 constexpr std::uint32_t kKeyB = 2;
 constexpr std::uint64_t kUid = kFakeAccountUid;
+constexpr std::int64_t kBoundAt = kT0 - 3'600'000;  // the clock of the (test's) trading process when it bound the store
 
 struct OrderSpec {
     std::string coid;
@@ -303,6 +305,17 @@ protected:
     }
 
     bool logs_untouched() const { return file_bytes(audit_path_) == audit_before_ && file_bytes(cp_path_) == cp_before_; }
+
+    // The trading process's side, done by the test (D5 / R5): the audit store's binding file, written with the store's own uuid. It uses the
+    // primitive, not the trading policy: that refuses to bind a Production store that already holds orders, and these stores do.
+    void bind_audit_store(StoreEnvironment env, std::uint64_t uid = kUid, std::uint64_t uuid_shift = 0) {
+        DurableAuditSink sink(audit_path_, *ring_, kKeyA);
+        ASSERT_TRUE(sink.is_open());
+        ASSERT_EQ(bind_store(audit_path_, *ring_, kKeyA, sink.store_uuid_lo() + uuid_shift, sink.store_uuid_hi(), StoreBinding{env, uid, kBoundAt}),
+                  BindStatus::Written);
+    }
+
+    std::string binding_file() const { return store_binding_file_path(audit_path_); }
 
     bool audit_lock_free() {
         DurableAuditSink probe(audit_path_, *ring_, kKeyA);
@@ -699,6 +712,7 @@ TEST_F(ToolTest, AnAbsentOrderIsResolvedAndTheEvidenceIsOnDisk) {
 
 TEST_F(ToolTest, TheEnvironmentTheOperatorNamesIsTheOneInThePhraseAndInTheRequest) {
     ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    ASSERT_NO_FATAL_FAILURE(bind_audit_store(StoreEnvironment::Production));  // (a Production run needs a store bound to Production)
     EXPECT_EQ(run(resolve_args(kA.coid, "123456789", "production")), 0) << transcript();
     EXPECT_EQ(provider_.last_options.environment, OperatorEnvironment::Production);
     EXPECT_TRUE(out_.printed("ABSENT " + kA.coid + " BTCUSDT PRODUCTION 123456789 ")) << transcript();
@@ -778,6 +792,112 @@ TEST_F(ToolTest, AnAccountTheExchangeDoesNotNameStopsTheProcedureBeforeTheWait) 
     exchange_.account_uid.reset();
     expect_stops_with(ResolveStatus::AccountUnverified, resolve_args(kA.coid));
     EXPECT_TRUE(sleeper_.sleeps.empty());
+}
+
+// --- the store's binding (D5 / R5): read by the tool, never written by it ---------------------------------------------------------------------------
+
+TEST_F(ToolTest, ATestnetRunOnAStoreWithNoBindingGoesOnAndTheToolWritesNoBinding) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    EXPECT_EQ(run(resolve_args(kA.coid)), 0) << transcript();
+    EXPECT_TRUE(out_.printed("store binding: none -- a legacy store, so this tool cannot check that it was written for this environment and account"));
+    EXPECT_TRUE(out_.printed("; going on, because this is a TESTNET run"));
+    const std::vector<std::string> evidence = listing(audit_path_ + ".operator-evidence");
+    ASSERT_EQ(evidence.size(), 1u);
+    EXPECT_NE(file_text(audit_path_ + ".operator-evidence/" + evidence[0])
+                  .find("\"store_binding\":{\"status\":\"Unbound\",\"environment\":null,\"account_uid\":null,\"bound_at_ms\":null}"),
+              std::string::npos);
+    EXPECT_FALSE(fs::exists(binding_file())) << "the tool reads a binding and never makes one: a check the checker could satisfy by writing the answer checks nothing";
+    EXPECT_FALSE(fs::exists(binding_file() + ".tmp"));
+}
+
+TEST_F(ToolTest, AProductionRunNeedsAStoreThatIsBoundAndStopsBeforeTheWaitWithoutOne) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    expect_stops_with(ResolveStatus::StoreNotBound, resolve_args(kA.coid, "123456789", "production"));
+    EXPECT_EQ(exit_code_of(ResolveStatus::StoreNotBound), 62);
+    EXPECT_TRUE(sleeper_.sleeps.empty()) << "refused before the fence is waited for";
+    EXPECT_TRUE(out_.printed("this store has no environment and account binding, and a PRODUCTION run needs one"));
+    EXPECT_TRUE(out_.printed("the store's binding (" + binding_file() + ") records the environment and account the trading process used it for. "
+                             "This tool never writes it"))
+        << "and the operator is told where it lives and what to do instead";
+    EXPECT_TRUE(out_.printed("PRODUCTION store, resolve the order by hand. Nothing was written."));
+    EXPECT_FALSE(fs::exists(binding_file())) << "and it did not write one";
+}
+
+TEST_F(ToolTest, AStoreBoundToProductionIsResolvedForAProductionRunWithThatAccount) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    ASSERT_NO_FATAL_FAILURE(bind_audit_store(StoreEnvironment::Production));
+    EXPECT_EQ(run(resolve_args(kA.coid, "123456789", "production")), 0) << transcript();
+    EXPECT_TRUE(out_.printed("store binding: bound to PRODUCTION, account uid 123456789 (the same as the environment you stated and the account this API key belongs to)"));
+    const std::vector<std::string> evidence = listing(audit_path_ + ".operator-evidence");
+    ASSERT_EQ(evidence.size(), 1u);
+    EXPECT_NE(file_text(audit_path_ + ".operator-evidence/" + evidence[0])
+                  .find("\"store_binding\":{\"status\":\"Bound\",\"environment\":\"PRODUCTION\",\"account_uid\":123456789,\"bound_at_ms\":" +
+                        std::to_string(kBoundAt) + "}"),
+              std::string::npos);
+}
+
+TEST_F(ToolTest, AStoreBoundToTheOtherEnvironmentStopsTheProcedureBeforeTheWait) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    ASSERT_NO_FATAL_FAILURE(bind_audit_store(StoreEnvironment::Production));
+    expect_stops_with(ResolveStatus::StoreEnvironmentMismatch, resolve_args(kA.coid));  // --env testnet
+    EXPECT_EQ(exit_code_of(ResolveStatus::StoreEnvironmentMismatch), 64);
+    EXPECT_TRUE(sleeper_.sleeps.empty());
+    EXPECT_TRUE(out_.printed("this store is bound to PRODUCTION, not to the TESTNET you stated: nothing was written"));
+    EXPECT_TRUE(out_.printed("This tool never writes it"));
+}
+
+TEST_F(ToolTest, AStoreBoundToAnotherAccountStopsTheProcedureBeforeTheWait) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    ASSERT_NO_FATAL_FAILURE(bind_audit_store(StoreEnvironment::Testnet, kUid + 1));
+    expect_stops_with(ResolveStatus::StoreAccountMismatch, resolve_args(kA.coid));
+    EXPECT_EQ(exit_code_of(ResolveStatus::StoreAccountMismatch), 65);
+    EXPECT_TRUE(sleeper_.sleeps.empty());
+    EXPECT_TRUE(out_.printed("this store is bound to account uid 123456790, not to uid 123456789 that this API key belongs to: nothing was written"));
+    EXPECT_TRUE(out_.printed("This tool never writes it")) << "every one of the four refusals tells the operator where the binding lives";
+}
+
+TEST_F(ToolTest, ABindingThatCannotBeReadStopsTheProcedureForEitherEnvironment) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    EXPECT_EQ(exit_code_of(ResolveStatus::StoreBindingUnreadable), 63);
+    for (const char* env : {"testnet", "production"}) {
+        for (const bool another_stores_file : {false, true}) {
+            SCOPED_TRACE(std::string(env) + (another_stores_file ? ": a signed file of another store" : ": junk"));
+            out_.lines.clear();
+            exchange_.calls.clear();
+            world_.now_ms = kT0;
+            std::error_code ec;
+            fs::remove(binding_file(), ec);
+            if (another_stores_file) {
+                ASSERT_NO_FATAL_FAILURE(bind_audit_store(StoreEnvironment::Production, kUid, /*uuid_shift=*/1));
+            } else {
+                write_text(binding_file(), "junk");
+            }
+            expect_stops_with(ResolveStatus::StoreBindingUnreadable, resolve_args(kA.coid, "123456789", env));
+            EXPECT_TRUE(out_.printed("this store's binding file exists but cannot be read, or does not verify for this store: nothing was written"));
+            EXPECT_FALSE(out_.printed("going on")) << "an unreadable binding is not a legacy store";
+            EXPECT_TRUE(out_.printed("This tool never writes it"));
+            EXPECT_TRUE(sleeper_.sleeps.empty());
+        }
+    }
+}
+
+TEST_F(ToolTest, ListShowsWhatTheStoreIsBoundTo) {
+    ASSERT_NO_FATAL_FAILURE(write_logs(ambiguous_history(kA)));
+    EXPECT_EQ(run(list_args()), 0) << transcript();
+    EXPECT_TRUE(out_.printed("store binding: none -- a legacy store; a PRODUCTION resolution of its orders would be refused"));
+
+    out_.lines.clear();
+    ASSERT_NO_FATAL_FAILURE(bind_audit_store(StoreEnvironment::Production));
+    EXPECT_EQ(run(list_args()), 0) << transcript();
+    EXPECT_TRUE(out_.printed("store binding: bound to PRODUCTION, account uid 123456789 (bound at " + std::to_string(kBoundAt) + ")"));
+    EXPECT_FALSE(out_.printed("store binding: none"));
+
+    out_.lines.clear();
+    write_text(binding_file(), "junk");
+    EXPECT_EQ(run(list_args()), 0) << "listing judges nothing: no environment is stated in this mode";
+    EXPECT_TRUE(out_.printed("store binding: UNREADABLE -- the binding file exists but cannot be read, or does not verify for this store"));
+    EXPECT_TRUE(logs_untouched());
+    EXPECT_EQ(file_text(binding_file()), "junk") << "and the listing did not touch the file";
 }
 
 TEST_F(ToolTest, AnOrderTheExchangeKnowsIsReportedWithItsEvidenceAndNobodyIsAsked) {

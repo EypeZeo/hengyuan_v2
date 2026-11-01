@@ -309,7 +309,7 @@ inline constexpr std::string_view kToolUsage[] = {
     "the same API credentials while it runs. It waits out a fence of 4.5 minutes of EXCHANGE time before it reads the evidence.",
     "",
     "  hy_operator_resolve --list    <log and key arguments>",
-    "      shows the unresolved orders of the logs. Needs no credentials and sends nothing.",
+    "      shows the unresolved orders of the logs and the environment and account the store is bound to. Needs no credentials, sends nothing.",
     "  hy_operator_resolve --coid <id> --env testnet|production --uid <n> --operator <label> --credentials-file <path>",
     "                      <log and key arguments>",
     "      resolves ONE order (run it again for the next one).",
@@ -325,9 +325,10 @@ inline constexpr std::string_view kToolUsage[] = {
     "",
     "resolve arguments:",
     "  --coid <id>                  the client order id, as --list shows it",
-    "  --env testnet|production     the exchange environment the order was sent to (you state it; the log cannot confirm it)",
+    "  --env testnet|production     the exchange environment the order was sent to (you state it; the log cannot confirm it, but the",
+    "                               store's own binding, if it has one, must agree, and a production run needs such a binding)",
     "  --uid <n>                    the uid of the exchange account the order was sent from; the tool asks the exchange which",
-    "                               account the API key belongs to and refuses unless it is this one",
+    "                               account the API key belongs to and refuses unless it is this one and the store's binding agrees",
     "  --operator <label>           your tag in the log (1 to 24 of letters, digits . _ -)",
     "  --credentials-file <path>    a .env file with the tool's own READ-ONLY API key and nothing else:",
     "                               HENGYUAN_OPERATOR_TESTNET_API_KEY / HENGYUAN_OPERATOR_TESTNET_API_SECRET, or",
@@ -336,8 +337,9 @@ inline constexpr std::string_view kToolUsage[] = {
     "Evidence files go to <audit log>.operator-evidence/ and are never overwritten.",
     "Exit codes: 0 the order was resolved and the frame is durable. 2 the command line. 3 the KEK or key file. 4 a log. 5 the",
     "credentials or the exchange client. 6 the session could not start. 70 an unexpected error. 40 + n: the procedure stopped with",
-    "status n (55 evidence does not show absence, 57 not confirmed, 59 the frame could not be appended). Every code but 0 means no",
-    "frame was written, except possibly 59 and 70: run --list to see whether the order is still listed.",
+    "status n (55 evidence does not show absence, 57 not confirmed, 59 the frame could not be appended, 62 to 65 the store's recorded",
+    "environment or account does not allow it). Every code but 0 means no frame was written, except possibly 59 and 70: run --list to",
+    "see whether the order is still listed.",
 };
 
 }  // namespace hy::operator_resolution

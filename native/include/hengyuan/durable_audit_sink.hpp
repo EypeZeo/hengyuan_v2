@@ -810,6 +810,9 @@ public:
     }
 
     std::uint32_t active_key_id() const noexcept { return active_key_id_; }
+    // D5 / R5: how many frames the log holds -- the ones recovery found plus the ones appended since. 0 = nothing was ever written to this
+    // store. store_binding.hpp uses it to tell a new store (bind it) from a legacy one with history (do not bind it blindly).
+    std::uint64_t frame_count() const noexcept { return next_sequence_; }
     bool rotation_log_open() const noexcept { return rotation_log_open_; }
     bool rotation_fenced() const noexcept { return rotation_fenced_; }
 

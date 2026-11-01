@@ -32,6 +32,7 @@
 #include <hengyuan/operator_resolution_confirmation.hpp>
 #include <hengyuan/operator_resolution_evidence.hpp>
 #include <hengyuan/sha256.hpp>
+#include <hengyuan/store_binding.hpp>
 
 namespace hy::operator_resolution {
 
@@ -61,6 +62,9 @@ struct BundleHeader {
     OperatorEnvironment environment{static_cast<OperatorEnvironment>(255)};
     std::uint64_t account_uid_claimed{0};  // what the operator said (the flow refuses to build a file unless the exchange says the same)
     std::optional<std::uint64_t> account_uid_reported{};  // what GET /api/v3/account said about the key's account (null: it did not)
+    // What the store's binding file said (D5 / R5). The flow builds a file only after the binding matched the environment and account above,
+    // or -- a Testnet run -- after the store turned out to have none, so the file shows which of the two the decision rested on.
+    StoreBindingRead store_binding{};
     FenceParams fence{};
     ExchangeMs lock_ref{};
     ExchangeMs read_ref{};
@@ -164,7 +168,19 @@ inline std::string build_evidence_bundle(const BundleHeader& h, std::span<const 
     } else {
         out += "null";
     }
-    out += ",\n\"fence\":{\"recv_window_ms\":";
+    out += ",\n\"store_binding\":{\"status\":";
+    detail::append_json_string(out, store_binding_status_name(h.store_binding.status));
+    if (h.store_binding.status == StoreBindingStatus::Bound) {
+        out += ",\"environment\":";
+        detail::append_json_string(out, store_environment_name(h.store_binding.binding.environment));
+        out += ",\"account_uid\":";
+        detail::append_uint(out, h.store_binding.binding.account_uid);
+        out += ",\"bound_at_ms\":";
+        detail::append_int(out, h.store_binding.binding.bound_at_ms);
+    } else {
+        out += ",\"environment\":null,\"account_uid\":null,\"bound_at_ms\":null";
+    }
+    out += "},\n\"fence\":{\"recv_window_ms\":";
     detail::append_int(out, h.fence.recv_window_ms);
     out += ",\"clock_skew_ms\":";
     detail::append_int(out, h.fence.clock_skew_ms);
