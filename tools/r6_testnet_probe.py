@@ -77,7 +77,10 @@ def http_get(path_and_query, headers, timeout):
     except urllib.error.HTTPError as err:
         return err.code, err.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError, TimeoutError) as err:
-        return None, type(err).__name__
+        # only the class names: the exception text can carry the host and the URL, which carries the signature
+        reason = getattr(err, "reason", None)
+        detail = type(err).__name__ + (" / " + type(reason).__name__ if reason is not None and not isinstance(reason, str) else "")
+        return None, detail
 
 
 def parse_json(text):
@@ -98,15 +101,30 @@ class Probe:
         return int(time.time() * 1000) + self.offset_ms
 
     def public(self, path):
-        return http_get(path, {}, self.timeout)
+        return self._retrying(lambda: http_get(path, {}, self.timeout))
 
     def signed(self, path, params):
-        params = dict(params)
-        params["timestamp"] = self.now_ms()
-        params["recvWindow"] = RECV_WINDOW_MS
-        query = urllib.parse.urlencode(params)
-        signature = hmac.new(self.secret.encode("ascii"), query.encode("ascii"), hashlib.sha256).hexdigest()
-        return http_get(path + "?" + query + "&signature=" + signature, {"X-MBX-APIKEY": self.key}, self.timeout)
+        def once():
+            # signed afresh on every attempt: a retry seconds later must not carry a stale timestamp
+            p = dict(params)
+            p["timestamp"] = self.now_ms()
+            p["recvWindow"] = RECV_WINDOW_MS
+            query = urllib.parse.urlencode(p)
+            signature = hmac.new(self.secret.encode("ascii"), query.encode("ascii"), hashlib.sha256).hexdigest()
+            return http_get(path + "?" + query + "&signature=" + signature, {"X-MBX-APIKEY": self.key}, self.timeout)
+
+        return self._retrying(once)
+
+    @staticmethod
+    def _retrying(attempt, attempts=3, pause_s=1.5):
+        """Only a transport failure (no HTTP answer at all) is retried -- these are GETs, so repeating one is harmless."""
+        result = attempt()
+        for _ in range(attempts - 1):
+            if result[0] is not None:
+                break
+            time.sleep(pause_s)
+            result = attempt()
+        return result
 
 
 def error_fields(text):
