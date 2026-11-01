@@ -457,6 +457,49 @@ def test_a_failed_verify_is_critical_and_is_retried_on_the_next_run(tmp_path):
     assert "verify" in fakes.calls
 
 
+class _Killed(BaseException):
+    """The scheduler's time limit as the run sees it: not an Exception, so `except Exception` misses it."""
+
+
+def test_a_verify_that_passed_is_recorded_even_when_the_run_is_killed_before_it_ends(tmp_path):
+    # 2026-10-28 to 2026-11-01: the verify took ~2.5 h, the report after it ran into the scheduler's 3 h
+    # limit, the run was killed before the state write at the end, and the next start verified again (and
+    # was killed again). The pass must be on disk before the report starts.
+    fakes = Fakes()
+
+    def killed_in_the_report(cfg):
+        fakes.calls.append("report")
+        raise _Killed()
+
+    fakes.report = killed_in_the_report
+    with pytest.raises(_Killed):
+        run(tmp_path, fakes)
+    state = json.loads((tmp_path / "logs" / "state.json").read_text())
+    assert state["last_verify_utc"] == NOW.isoformat()
+    # the rest of the run did not happen
+    assert "last_success_utc" not in state
+    assert not (tmp_path / "logs" / "latest.txt").exists()
+    assert not (tmp_path / "logs" / "maint.lock").exists()  # and the lock is released
+    # the next run, an hour later, does not verify again: it is not due
+    fakes2 = Fakes()
+    run(tmp_path, fakes2, now=NOW + timedelta(hours=1), force=True)
+    assert "verify" not in fakes2.calls
+
+
+def test_a_verify_that_failed_is_not_recorded_early_and_stays_due(tmp_path):
+    fakes = Fakes()
+    fakes.verify_result = {"ok": False, "result": "RESULT: FAIL (FAIL=3 WARN=0 INFO=0)", "text": "bad\n"}
+
+    def killed_in_the_report(cfg):
+        raise _Killed()
+
+    fakes.report = killed_in_the_report
+    with pytest.raises(_Killed):
+        run(tmp_path, fakes)
+    state_path = tmp_path / "logs" / "state.json"
+    assert not state_path.exists() or "last_verify_utc" not in json.loads(state_path.read_text())
+
+
 def test_a_second_run_is_refused_while_the_lock_is_fresh_and_a_stale_lock_is_taken_over(tmp_path):
     fakes = Fakes()
     logs = tmp_path / "logs"
