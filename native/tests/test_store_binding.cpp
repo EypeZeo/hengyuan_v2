@@ -72,7 +72,9 @@ std::unique_ptr<KeyRing> make_ring(bool with_key2) {
     auto ring = std::make_unique<KeyRing>(kek);
     WrappedKeyRecord rec{};
     EXPECT_EQ(ring->add_key(kKeyId, bytes_of("store-binding-test-key-one"), rec), KeyRingAddStatus::Ok);
-    if (with_key2) EXPECT_EQ(ring->add_key(kKeyId2, bytes_of("store-binding-test-key-two"), rec), KeyRingAddStatus::Ok);
+    if (with_key2) {  // (braces: EXPECT_EQ is an if/else, and GCC's -Werror=dangling-else refuses a bare one)
+        EXPECT_EQ(ring->add_key(kKeyId2, bytes_of("store-binding-test-key-two"), rec), KeyRingAddStatus::Ok);
+    }
     return ring;
 }
 
@@ -293,7 +295,7 @@ TEST_F(StoreBindingTest, ASizeThatIsNotSeventyIsUnreadable) {
     const std::vector<std::byte> good = signed_file(kUuidLo, kUuidHi, StoreEnvironment::Production, kUid);
     for (const std::size_t size : {std::size_t{0}, std::size_t{1}, std::size_t{37}, std::size_t{38}, std::size_t{53}, std::size_t{69}, std::size_t{71}, std::size_t{140}}) {
         std::vector<std::byte> shaped(size, std::byte{0});
-        std::memcpy(shaped.data(), good.data(), std::min(size, good.size()));
+        if (size != 0) std::memcpy(shaped.data(), good.data(), std::min(size, good.size()));  // (an empty vector's data() may be null: UBSan)
         plant_binding(shaped);
         EXPECT_EQ(read().status, StoreBindingStatus::Unreadable) << size;
     }
