@@ -133,7 +133,8 @@ def main():
 
     key, secret = credentials(args.env_file)
     if not key or not secret:
-        print("error: %s and %s are not set (environment, or %s)" % (KEY_VAR, SECRET_VAR, args.env_file), file=sys.stderr)
+        print("error: the two HENGYUAN_OPERATOR_TESTNET_API_* variables are not both set (environment, or %s)" % args.env_file,
+              file=sys.stderr)
         return 2
 
     probe = Probe(key, secret, args.timeout)
