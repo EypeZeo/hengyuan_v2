@@ -363,7 +363,9 @@ TEST_F(UserDataDurableTest, ARecoveredOrderGetsTheAmbiguousFrameOnlyWhereTheTarg
         expected += c.frames;
         ASSERT_EQ(probe_.frames.size(), expected);
         EXPECT_EQ(probe_.frames.back().resulting_state, c.reported);
-        if (c.frames == 2) EXPECT_EQ(probe_.frames[probe_.frames.size() - 2].resulting_state, OrderState::Ambiguous);
+        if (c.frames == 2) {
+            EXPECT_EQ(probe_.frames[probe_.frames.size() - 2].resulting_state, OrderState::Ambiguous);
+        }
     }
 }
 
