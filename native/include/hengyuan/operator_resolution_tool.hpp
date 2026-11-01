@@ -18,7 +18,10 @@
 //   6. the audit log is opened in OperatorOpen mode -- THE EXCLUSIVE LOCK, so the trading process must be stopped -- and the control-plane
 //      log next. Both are open, and checked, BEFORE begin_operator_session(): the fence is counted from the first serverTime reading
 //      after the lock, so a reading taken before the lock would be a fence that protects nothing;
-//   7. --list prints the unresolved orders and exits; otherwise the session begins and resolve_order() runs, once.
+//   7. the store's binding file (environment and account, D5 / R5) is read -- READ: this tool includes store_binding.hpp, not the writer,
+//      and test_operator_resolution_guard.cpp pins that -- with the audit sink's own uuid; --list prints it next to the unresolved orders and
+//      exits; otherwise the session begins with it and resolve_order() runs, once, judging it against the environment the operator stated
+//      and the account the exchange reports for the key.
 // Nothing is written to a log before the flow's last step, and the only thing the flow writes there is the one frame.
 
 #pragma once
@@ -45,6 +48,7 @@
 #include <hengyuan/operator_resolution_ports.hpp>
 #include <hengyuan/operator_resolution_terminal.hpp>
 #include <hengyuan/secure_wipe.hpp>
+#include <hengyuan/store_binding.hpp>
 
 namespace hy::operator_resolution {
 
@@ -61,7 +65,7 @@ enum class ToolExit : int {
 };
 
 // resolve_order() stopped with this status: 0 for Resolved, 40 + the status number for every other one. (55 EvidenceNotAbsent, 57
-// NotConfirmed, 59 AppendFailed.) Of those only AppendFailed may have left a frame behind.
+// NotConfirmed, 59 AppendFailed, 62 to 65 the four store-binding refusals.) Of those only AppendFailed may have left a frame behind.
 inline constexpr int kResolveExitBase = 40;
 
 constexpr int exit_code_of(ToolExit e) noexcept { return static_cast<int>(e); }
@@ -179,10 +183,26 @@ inline std::string named_since_text(std::int64_t named_since_ms) {
     return named_since_ms != 0 ? std::to_string(named_since_ms) : std::string("an unknown time");
 }
 
+// The store's binding, for --list (no environment is stated in list mode, so nothing is judged: the operator reads which store this is).
+inline std::string list_binding_line(const StoreBindingRead& binding) {
+    switch (binding.status) {
+        case StoreBindingStatus::Bound:
+            return "store binding: bound to " + std::string(store_environment_name(binding.binding.environment)) + ", account uid " +
+                   std::to_string(binding.binding.account_uid) + " (bound at " + std::to_string(binding.binding.bound_at_ms) + ")";
+        case StoreBindingStatus::Unbound:
+            return "store binding: none -- a legacy store; a PRODUCTION resolution of its orders would be refused";
+        case StoreBindingStatus::Unreadable: break;
+    }
+    return "store binding: UNREADABLE -- the binding file exists but cannot be read, or does not verify for this store; every resolution of "
+           "its orders would be refused";
+}
+
 // Both logs, as they are on disk, for --list and for resolving.
-inline void print_unresolved_orders(const DurableAuditSink& audit, const ControlPlaneLogSink& names, ConsolePort& out) {
+inline void print_unresolved_orders(const DurableAuditSink& audit, const ControlPlaneLogSink& names, const StoreBindingRead& binding,
+                                    ConsolePort& out) {
     const std::vector<UnresolvedOrderSummary> orders = list_unresolved_orders(audit, names);
     out.write_line("unresolved orders: " + std::to_string(orders.size()));
+    out.write_line(list_binding_line(binding));
     for (const UnresolvedOrderSummary& s : orders) {
         std::string line = "[" + std::to_string(s.checkpoint_index + 1) + "] " + s.client_order_id + "  state " + order_state_name(s.state) +
                            "  " + (s.mode == ExecutionMode::Live ? "Live" : "DryRun") + "  ";
@@ -316,14 +336,15 @@ inline int run_parsed(const ToolOptions& options, ToolEnvironment& env) {
         return exit_code_of(ToolExit::Logs);
     }
 
-    // 7. the list, or the one order
+    // 7. the store's binding (read, never written: see the header comment), then the list, or the one order
+    const StoreBindingRead binding = read_store_binding(options.audit_log, *ring, audit.store_uuid_lo(), audit.store_uuid_hi());
     if (!resolve) {
-        print_unresolved_orders(audit, names, out);
+        print_unresolved_orders(audit, names, binding, out);
         return exit_code_of(ToolExit::Ok);
     }
     DirectoryEvidenceStore evidence(options.audit_log + std::string(kEvidenceDirectorySuffix));
     const OperatorPorts ports{*exchange, env.sleeper, out, evidence};
-    OperatorSession session = begin_operator_session(audit, names, ports, env.fence);
+    OperatorSession session = begin_operator_session(audit, names, ports, env.fence, binding);
     if (session.status != SessionStatus::Ready) {
         say(err, "error: the session could not start: " + std::string(session_status_name(session.status)) +
                      ". Nothing was written.");
@@ -340,6 +361,13 @@ inline int run_parsed(const ToolOptions& options, ToolEnvironment& env) {
     out.write_line("result: " + std::string(resolve_status_name(outcome.status)) + " (exit code " + std::to_string(code) + ")");
     if (outcome.status == ResolveStatus::AppendFailed) {
         out.write_line("the frame may or may not have been written: run --list to see whether the order is still listed.");
+    }
+    if (outcome.status == ResolveStatus::StoreNotBound || outcome.status == ResolveStatus::StoreBindingUnreadable ||
+        outcome.status == ResolveStatus::StoreEnvironmentMismatch || outcome.status == ResolveStatus::StoreAccountMismatch) {
+        out.write_line("the store's binding (" + store_binding_file_path(options.audit_log) +
+                       ") records the environment and account the trading process used it for. This tool never writes it: if the store really "
+                       "is the one you meant, the environment or the account you stated is wrong; if the binding is missing or damaged on a "
+                       "PRODUCTION store, resolve the order by hand. Nothing was written.");
     }
     if (outcome.status == ResolveStatus::SymbolNameNotKnown && outcome.symbol_status == SymbolNameStatus::NotNamedAtOrderTime) {
         out.write_line("the control-plane log does not show that it named this order's symbol before the order was sent (first named at " +

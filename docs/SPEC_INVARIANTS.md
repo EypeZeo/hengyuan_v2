@@ -693,6 +693,38 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       丢弃会让屏障退回重新清扫，但清扫只覆盖被跟踪的订单，一个已结清订单的报告丢了就是丢了；环境与账户绑定（R5，生产启用的前置——告警能在证明被推翻后叫停进程，但挡不住 “拿错了环境的日志” 这个错误本身）；
       `-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练）；工具与告警对真实或 Testnet 交易所的任何一次运行。
 
+  - **[D5 切片 R5 已落地：存储的环境与账户绑定——日志记下它属于哪个交易所环境、哪个账户，工具与交易进程都据此核对]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §9 “R-env”、§10；Owner 2026-10-31 “开始规划并实现R5以及M5”；Tier B；PR #220）：审计日志按 COID 与 symbol_id 记订单；`mode` 只有 DryRun / Live，存储身份（`<log>.storeid`）只是随机标签——没有任何一处记 “发往 Binance Production、账户 123”。
+    于是离线工具可以被指向 Testnet，对一个活在 Production 的订单读到干净的 “无此单”（对错了交易所的真话，恰是它的结论承受不起的），交易进程也可以拿 Production 凭据去开一个 Testnet 填过的存储（或反过来、或别的账户的）。此前唯一的防线是操作员确认短语（A-D5-3）。
+    - **文件**：`<log>.binding.tip`，70 字节，经 `DurableLogStore::write_tip_anchor()` 写（临时文件、刷盘、改名，与 tip anchor 和存储身份同一种崩溃一致的写法），小端：
+      `[版本 u8 = 1][store_uuid_lo u64][store_uuid_hi u64][环境 u8：1 = Testnet、2 = Production][账户 uid u64][绑定时间 i64 毫秒][key_id u32][MAC 32 字节 = HMAC(key_id 对应的密钥, 前面全部)]`。
+      由存储自己的密钥环签名，并以 uuid 绑在这个存储上：拷到别的存储的绑定文件什么都不是。做成边车文件而不是存储身份的字段：身份文件的布局与导出路径（`ExportTuple`）共用，改它等于动导出 ABI。环境码从 1 起（全零文件不是环境）；账户 uid 0 不是账户。
+    - **两个头文件，有意拆开**：`store_binding.hpp` 读与判定（`read_store_binding()`、`judge_store_binding()`、`StoreBindingRead`），`store_binding_writer.hpp` 写（`bind_store()`、`ensure_store_binding()`）。离线工具只包含前者，守卫钉住：检查的人若能自己写下答案，检查就什么也没检查，所以工具连那个函数的名字都叫不出。
+    - **读的规则**：没有文件 = `Unbound`；文件存在但读不了（I/O 错误、不是 70 字节、版本不对、MAC 不通过、密钥环没有它声明的密钥、别的存储的 uuid、存储没有身份即 uuid 0/0、环境不是 1 / 2、账户 0）= `Unreadable`，**不是** “没有绑定”——否则一个有绑定却读不出的存储会冒充旧存储通过。一个目录占着文件名也是 `Unreadable`。
+    - **写的规则**（`bind_store()`）：只写一次，从不改——同值再写是 `AlreadyBound`（什么也不写，原来的绑定时间不变），异值是 `Conflict`，读不了的文件绝不覆盖（`Unreadable`）；写完读回，不一致是 `WriteFailed`。要换环境或账户就换存储。
+    - **交易进程的策略**（`ensure_store_binding()`）：无帧的存储绑定到进程所运行的环境与账户（`BoundNew`）；已绑定的，两者都必须一致（`Verified`，否则 `EnvironmentMismatch` / `AccountMismatch`，先说环境）；读不了的拒绝（`Unreadable`）；
+      **有帧但没有绑定的旧存储**：Testnet 允许并绑定（`BoundLegacyTestnet`，首次使用即信任——演练存储没有猜错会伤到的东西），**Production 拒绝**（`UnboundProductionStoreWithHistory`）——把已有订单的存储 “事后” 绑到进程碰巧是的那个环境，是对无人能归属的订单的首次使用即信任；**没有覆盖通道**（丢了绑定的 Production 存储归档后重建）。
+      sink 重载还要求 sink 已打开、没围栏、是 `Trading` 模式（它的锁就是 “唯一写者”）；历史由 `DurableAuditSink::frame_count()`（恢复找到的帧数加之后追加的）判定，是全树唯一的调用点。
+    - **工具的用法**（`operator_resolution_tool.hpp`、`operator_resolution_flow.hpp`）：两份日志都打开并检查通过之后，工具用 sink 自己的 uuid 读一次绑定；`--list` 在列表里带一行绑定（不判定：列表模式没有声明环境）；结清时 `begin_operator_session()` 带着它，
+      `resolve_order()` 在**账户检查之后、栅栏等待之前**判定一次——用操作员声明的环境和交易所对这把密钥报告的账户（不是操作员声明的 UID，虽然那时二者相等），所以拒绝的形状与账户检查一样：只有会话的时钟读数与账户请求，没有等待、没有证据读取、没有存储、没人被问、两份日志原样。
+      放行的只有两种：`Match`，或 **Testnet 且没有绑定**（旧存储：控制台说两次——放行时一次、确认页一次——证据文件记 `"store_binding":{"status":"Unbound",...}`）；其余一律拒绝：Production 没有绑定 = `StoreNotBound`（22，退出码 62）、读不了 = `StoreBindingUnreadable`（23，63）、环境不符 = `StoreEnvironmentMismatch`（24，64）、账户不符 = `StoreAccountMismatch`（25，65）。
+      工具另有一行告诉操作员绑定文件在哪、工具从不写它、该怎么办（Production 的缺失或损坏：手工结清）。不传绑定的 `begin_operator_session()` = `Unbound`（对 Production 是收紧的一侧）。
+    - **证据文件**（`operator_resolution_bundle.hpp`）：新增 `store_binding` 对象（`status`、`environment`、`account_uid`、`bound_at_ms`，没有时后三项为 `null`，键永远在），放在 `account_uid_reported` 之后；格式名 `hy-operator-evidence/1` 不变——与 R3b-1 加 `account_uid_reported` 时同一个理由：还没有任何真实文件。
+    - **守卫**（`test_operator_resolution_guard.cpp`，新增 3 个测试，并更新工具头的精确包含列表与 `--list` / 会话调用的文字钉子）：没有任何生产源包含 `store_binding_writer.hpp`（M5 接线会是第一个，到时带理由加钉子）；`bind_store()` / `ensure_store_binding()` / `encode_store_binding()` 只在写侧头文件里出现、次数固定；离线工具的 14 个源文件不命名任何写绑定或写 tip anchor 的东西；
+      读只有工具里一处（参数是 `options.audit_log`、`*ring`、sink 的 uuid 两半），判定只有流程里一处（参数是 `session.binding`、`store_env`、`*account.uid`），在账户检查之后、第一次等待或证据读取之前，四个拒绝状态各出现一次且都在第一次 `sleep_for` 之前，放行条件的文字被钉住；`frame_count()` 的调用点全树只有一个，Production 旧存储的拒绝与 sink 重载的入口条件的文字被钉住。
+    - **不做 / 局限**：绑定记录的是**调用方的声明**（凭据的环境绑定、`GET /api/v3/account` 报的 uid），这个头文件记录与比较、验证不了；声明错了，写下的绑定也错——所以交易侧接线（M5）必须传交易所对**要拿去交易的那把密钥**报告的 uid，不是配置里的值。不保护密钥环已泄露的存储（文件由它签名）。
+      **仍无任何生产调用方**：`ensure_store_binding()` 在树里只被测试调用，M5 才接线。存储身份被重建（`.storeid.tip` 被删后重新生成）会让旧绑定成为 `Unreadable`——有意：身份变了，“同一个存储” 的前提就没了。
+    - **验证**：新增测试 56 个：新目标 test_store_binding 36（格式与偏移逐字节钉住、每个字节都受 MAC 保护且密钥号在验证前读出、读的每一种拒绝——大小、篡改、别的存储的文件、存储没有身份、密钥环没有的密钥、签名正确但环境或账户无效、版本不是 1、目录占着文件名；写一次的全部分支与写失败不留半个绑定；判定真值表；交易进程策略全表；sink 重载对 OperatorOpen / 围栏 / 未打开的拒绝；密钥轮换后旧绑定仍可验证；`frame_count()` 随重启保持）、流程 10（test_operator_resolution_flow 69 → 79：Testnet 无绑定放行并说两次、Production 无绑定拒绝、两种环境匹配、环境不符两个方向、账户不符六种差异乘两种环境、读不了的绑定乘两种环境、账户检查在先、无流量的拒绝在先、同一会话的第二个订单再判、环境映射）、工具 7（46 → 53：工具不写绑定、Production 要绑定、绑定匹配、环境不符、账户不符、读不了的绑定两种来源、`--list` 显示）、守卫 3（32 → 35）；证据文件的黄金串与摘要敏感性用例更新（9 个，不增），CLI 用法文字多两处断言。
+      MSVC（/W4 /WX）全量构建零警告零错误；全量 ctest 3338 个登记用例（相对 R4 合并时的 3282 恰好多 56 项）：3336 通过（含 1 个既有跳过：SealIdWatermarkLoader.DirectoryIdentityChangeThenStickyFenceAreDistinct，Windows 上设计如此）、2 个既有禁用、0 失败。（这次 ALL_BUILD 没有撞上 CMake 4.4 的 gtest 发现竞态——0 个发现脚本失败；ctest -N 的 3338 与各可执行文件自己列出的 3337 加 1 个自检吻合。）
+      GCC-14.2，本地 WSL2（源码经 tools/wsl_sync.sh 同步）：none（Release，-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wshadow）零警告，触及的 12 个测试可执行文件加 hy_operator_resolve（只编译）全部通过（store_binding 36、flow 79、bundle 9、tool 55、cli 26、guard 35、transport 36、real_exchange 14、append 26、reader 38、sink 80、export 42）；
+      address（RelWithDebInfo，ASan+UBSan，泄漏检测、返回后栈使用检测、严格字符串检查、出错即中止）6 个测试可执行文件（store_binding、flow、bundle、tool、cli、guard）零报告。GCC 与 UBSan 各在新测试里找出一个问题——`if (x) EXPECT_EQ(...)` 的 -Werror=dangling-else，以及对空 vector 的 data() 做 memcpy——都是测试代码，已改；被测代码没动。完整的 none / ASan / TSan / ARM64 矩阵由 CI 与那唯一一次手动 sanitizer 运行给出。
+      **变异检查**（124 个独特变异：读侧 28、写侧与策略 43、sink 访问器 3、流程 23、证据文件 7、工具 12、用法文字 2、守卫探针 6；两份 MSVC 副本并行，每个变异先重建再运行；构建失败不算检出）= **119 杀死 + 3 等价 + 2 无法触发，0 个无法解释**。
+      金丝雀（SB01、FL01、TL01）在两份副本里都由各自的运行期测试杀死，没有靠编译期断言。3 个原写法因 /WX 的未使用变量或参数告警构建失败（SB03、SB06、FL15），已改写（SB03b、SB06b、FL15b）后重跑，不算检出。**只有守卫能杀的 7 个**：6 个守卫探针（GD01 至 GD06：工具或流程包含写侧头文件、工具读第二次、流程判第二次、工具问 sink 的帧数、读侧头文件得到写 tip anchor 的能力）和 FL09（判定用操作员声明的账户而不是交易所报告的——那时二者相等，行为不变；守卫钉住参数文字 `*account.uid`）；它们被守卫的文字钉子杀死，不是被行为杀死。
+      3 个等价：SB06b（不查密钥环有没有文件声明的密钥——找不到时密钥块全零，MAC 必然不通过，结果仍是 Unreadable）、SB07（MAC 不通过时不立即返回——解码失败留下全零的字段，后面的 uuid、环境、账户检查照样拒绝）、SW16（不看 write_tip_anchor 的失败——写后读回发现文件不在，同样是 WriteFailed）。2 个无法触发：SB04（存在性探测本身出错，需要父目录的权限错误，测试里无法可移植地造出）、SW17（写后读回的逐项比较——同一个密钥环、同一个路径，读回不可能与写入的不同）。
+      其余都由行为测试在第一阶段杀死。逐类的覆盖：读侧（SB01 至 SB28：读回什么都没有或状态错、目录占着文件名被当作无绑定、早期拒绝都说 Unbound、uuid 的两半各自或同时不比、有身份缺失的存储认领 0/0 的文件、环境无效或账户 0 被相信、更长的文件被截成 70 字节、版本与 MAC 不查、MAC 少盖一个字节、密钥号读错位置、38 字节的边界、uuid 两半读反、文件名变了、判定先说账户、较小的账户通过、无绑定当作匹配、读不了当作无绑定、环境码与名字）；
+      写侧（SW01 至 SW17：环境、账户、时间、密钥号各写成别的值，uuid 两半写反，MAC 少盖一个字节，账户 0 与无环境可绑定，无身份的存储可绑定，读不了的文件被覆盖，“相同” 的判定少一个条件或用或，AlreadyBound 与 Conflict 互换，缺密钥时仍写）与策略（SW20 至 SW51：坏声明的各个半边、无身份、五种判定的状态映射、Production 旧存储的拒绝条件的各种弱化、Legacy 与 New 的各种互换、sink 重载的三个入口条件各去掉一个、历史判定的四种篡改、签名用的密钥、可用状态集合与名字）；sink 访问器（SK01 至 SK03）；
+      流程（FL01 至 FL23：四个拒绝状态的各种互换、放行条件的各种弱化与反转、判定忽略会话的绑定、结果不记入、两处控制台文字去掉或改写、证据文件不记、会话不保存、拒绝文字改写、环境映射）；证据文件（BD01 至 BD07：状态恒为 Bound、字段的条件反转、环境与账户与时间写成别的字段、空值分支少一个键、键名）；工具（TL01 至 TL12：uuid 两半读反、会话不带绑定、列表不带绑定、三行列表文字改写、列表的环境与时间字段、四个解释行的条件各去掉一个、解释文字）；用法文字（CL01、CL02）。
+
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/
