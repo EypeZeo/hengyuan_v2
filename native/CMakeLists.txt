@@ -675,6 +675,16 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_user_data_durable)
     gtest_discover_tests(test_user_data_durable)
 
+    # M4 guard (risk R8): who may append an order frame, who may move a shadow, the text order inside each writer (append, then the shadow, then the
+    # fold), and that a context wiring the user-data ring wires the durable publisher. It reads the source tree, so the native/ directory is a compile
+    # definition (same shape as test_reconcile_durable_guard).
+    add_executable(test_order_durable_path_guard tests/test_order_durable_path_guard.cpp)
+    target_link_libraries(test_order_durable_path_guard PRIVATE GTest::gtest_main)
+    target_compile_definitions(test_order_durable_path_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_order_durable_path_guard)
+    gtest_discover_tests(test_order_durable_path_guard)
+
     # D5 slice R1 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.2 and 10): the recovery reader's rules for an
     # OrderOperatorResolved frame and for frame format v6 -- crafted logs (the tool that writes such a frame is slice
     # R3), but every frame is made by the production encoder and every log is read by the production sink and

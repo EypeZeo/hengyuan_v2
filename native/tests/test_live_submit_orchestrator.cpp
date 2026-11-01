@@ -1914,3 +1914,181 @@ TEST_F(LiveSubmitDurableIntegrationTest, AnOrderThroughTheRealDurableSinkAllocat
     EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
     EXPECT_EQ(a.calls, 0u) << allocation_report("one order, three durable appends", a);
 }
+
+// --- Private-stream migration M4: the DurableShadow follows every frame the orchestrator makes durable, and only after its ACK ---------------------------
+//
+// order_durable_path.hpp: what a later writer (the user-data publisher, the reconcile publisher) plans against has to be what the log holds, so every frame
+// of an order's life moves the shadow of its fill-context entry once the sink acknowledged it -- through detail::append_order_frame(), the one place this file
+// appends. test_order_durable_path_guard.cpp pins that no other call is left; these pin what the one place does.
+
+class LiveSubmitShadowTest : public LiveSubmitTest {
+protected:
+    OrderFillContext fills_;
+
+    void SetUp() override {
+        LiveSubmitTest::SetUp();
+        ctx_.fill_context = &fills_;
+    }
+
+    ClientOrderId coid() const { return make_client_order_id(ctx_.now_ms, ctx_.sequence, ctx_.symbol_id); }
+
+    // The shadow of the order this fixture's call made, or a default shadow (Intent) when the table holds none.
+    DurableShadow shadow() const {
+        const OrderFillContextEntry* e = fills_.find(coid().view());
+        return e != nullptr ? e->shadow : DurableShadow{};
+    }
+};
+
+TEST_F(LiveSubmitShadowTest, AnAcceptedOrderCarriesTheQuantityItWasSentWithAndTheShadowSaysAccepted) {
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAccepted);
+    const OrderFillContextEntry* e = fills_.find(coid().view());
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->intended_qty_ticks, ctx_.qty_ticks) << "the bound a later planned fill is held against";
+    EXPECT_EQ(e->shadow.state, OrderState::Accepted);
+    EXPECT_FALSE(e->shadow.maybe_submitting);
+    EXPECT_EQ(e->shadow.filled_qty_ticks, 0);
+}
+
+TEST_F(LiveSubmitShadowTest, ARestingPartialFillCarriesItsFillInTheShadow) {
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 555;
+    g_mock_response.exchange_status = OrderState::PartialFill;
+    g_mock_response.filled_qty_ticks = 4;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitPartialFill);
+    EXPECT_EQ(shadow().state, OrderState::PartialFill);
+    EXPECT_EQ(shadow().filled_qty_ticks, 4);
+}
+
+TEST_F(LiveSubmitShadowTest, ATimeoutAndANetworkErrorLeaveTheShadowAtAmbiguousAndExactNotMaybeSubmitting) {
+    g_mock_response = {SubmitOutcome::Timeout, 0, 0};
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAmbiguous);
+    EXPECT_EQ(shadow().state, OrderState::Ambiguous);
+    EXPECT_FALSE(shadow().maybe_submitting) << "the orchestrator wrote the Ambiguous frame itself: the log is known to say it";
+
+    ++ctx_.sequence;
+    g_mock_response = {SubmitOutcome::NetworkError, 0, 0};
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitNetworkError);
+    EXPECT_EQ(shadow().state, OrderState::Ambiguous);
+    EXPECT_FALSE(shadow().maybe_submitting);
+}
+
+TEST_F(LiveSubmitShadowTest, ARejectedOrAnImmediatelyFilledOrderLeavesNoShadowBehind) {
+    g_mock_response = {SubmitOutcome::Rejected, 0, -1013};
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitRejected);
+    EXPECT_EQ(fills_.find(coid().view()), nullptr) << "released with its slot";
+
+    ++ctx_.sequence;
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 556;
+    g_mock_response.exchange_status = OrderState::Filled;
+    g_mock_response.filled_qty_ticks = 10;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitFilled);
+    EXPECT_EQ(fills_.find(coid().view()), nullptr);
+}
+
+TEST_F(LiveSubmitShadowTest, APreparedFrameThatIsNotAcknowledgedLeavesTheShadowAtIntent) {
+    fake_durable_audit_.prepared_should_fail = true;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::AuditWriteNotAcked);
+    const OrderFillContextEntry* e = fills_.find(coid().view());
+    ASSERT_NE(e, nullptr) << "tracked before the Prepared frame, like its in-flight slot, which is not released either";
+    EXPECT_EQ(e->shadow.state, OrderState::Intent) << "a shadow ahead of the log makes the next planned frame illegal";
+}
+
+TEST_F(LiveSubmitShadowTest, AnOutcomeFrameThatIsNotAcknowledgedLeavesTheShadowAtSubmitting) {
+    fake_durable_audit_.outcome_should_fail = true;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::AuditWriteNotAcked);
+    EXPECT_EQ(shadow().state, OrderState::Submitting) << "the Prepared frame was acknowledged, the outcome was not";
+}
+
+TEST_F(LiveSubmitShadowTest, AnIntentFrameThatIsNotAcknowledgedTracksNothing) {
+    fake_durable_audit_.intent_should_fail = true;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::AuditWriteNotAcked);
+    EXPECT_EQ(fills_.find(coid().view()), nullptr);
+    EXPECT_EQ(fills_.count(), 0u);
+}
+
+namespace {
+
+UserDataWsEvent shadow_report(const ClientOrderId& coid, OrderState status, const char* cumulative_filled) {
+    UserDataWsEvent ev{};
+    ev.kind = UserDataEventKind::ExecutionReport;
+    std::snprintf(ev.coid.id, sizeof(ev.coid.id), "%s", coid.id);
+    ev.exchange_order_id = 12345;
+    ev.order_status = status;
+    ev.order_status_known = true;
+    std::snprintf(ev.cumulative_filled_qty_raw, sizeof(ev.cumulative_filled_qty_raw), "%s", cumulative_filled);
+    return ev;
+}
+
+}  // namespace
+
+TEST_F(LiveSubmitShadowTest, AReportDrainedByTheNextCallIsMadeDurableThroughThePublisherBeforeItFoldsIn) {
+    PositionTruth truth;
+    UserDataWsEventRing ring;
+    UserDataDurablePublisher publisher(ctx_.durable_audit);
+    ctx_.position_truth = &truth;
+    ctx_.user_data_events = &ring;
+    ctx_.user_data_durable = &publisher;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAccepted);
+    const ClientOrderId order = coid();
+    // rules_.qty_scale == 8: "0.00000004" is 4 ticks
+    ASSERT_TRUE(ring.try_push(shadow_report(order, OrderState::PartialFill, "0.00000004")));
+
+    (void)orchestrate_submit(ctx_);  // the same order again (DuplicateInFlight): only the drain at its top matters here
+
+    EXPECT_EQ(publisher.stats().written, 1u);
+    EXPECT_EQ(publisher.stats().acked_frames, 1u);
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 4);
+    EXPECT_EQ(fills_.find(order.view())->shadow.state, OrderState::PartialFill);
+    EXPECT_EQ(fills_.find(order.view())->shadow.filled_qty_ticks, 4);
+}
+
+TEST_F(LiveSubmitShadowTest, AReportItsLogCannotTakeIsRefusedAndTheVeryCallThatDrainedItIsNotReady) {
+    PositionTruth truth;
+    UserDataWsEventRing ring;
+    UserDataDurablePublisher publisher(ctx_.durable_audit);
+    ctx_.position_truth = &truth;
+    ctx_.user_data_events = &ring;
+    ctx_.user_data_durable = &publisher;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAccepted);
+    const ClientOrderId order = coid();
+    ReconnectBarrier& barrier = ctx_.readiness->barrier();
+    ASSERT_EQ(barrier.state(), BarrierState::Reconciled);
+    // a CANCELED whose fill is beyond the quantity the order was sent with (rules_.qty_scale == 8: "0.00000099" is 99 ticks, the order is for 10)
+    ASSERT_TRUE(ring.try_push(shadow_report(order, OrderState::Cancelled, "0.00000099")));
+
+    const OrchestratorResult r = orchestrate_submit(ctx_);
+
+    EXPECT_EQ(publisher.stats().refused_contradiction, 1u);
+    EXPECT_EQ(publisher.stats().written, 0u);
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 0) << "no frame, no fold";
+    EXPECT_EQ(fills_.find(order.view())->shadow.state, OrderState::Accepted);
+    EXPECT_EQ(barrier.stats().events_refused, 1u);
+    EXPECT_EQ(barrier.state(), BarrierState::Sweeping) << "a sweep reads the truth from REST instead of this process guessing";
+    EXPECT_EQ(r.gate, OrchestratorGate::NotReady) << "the drain runs before Gate 2b: the call that took the report is refused";
+    EXPECT_EQ(r.not_ready_reason, NotReadyReason::BarrierSweeping);
+}
+
+TEST_F(LiveSubmitShadowTest, DrainingAUserDataReportInsideTheNextOrderAllocatesNothing) {
+    // The durable drain runs at the top of every orchestrate_submit(): intake, the held table (a fixed array inside the publisher), the planner, the append
+    // through the port, the shadow, the fold, the ring record. Nothing of it may allocate.
+    PositionTruth truth;
+    UserDataWsEventRing ring;
+    UserDataDurablePublisher publisher(ctx_.durable_audit);
+    ctx_.position_truth = &truth;
+    ctx_.user_data_events = &ring;
+    ctx_.user_data_durable = &publisher;
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAccepted);
+    const ClientOrderId order = coid();
+    ASSERT_TRUE(ring.try_push(shadow_report(order, OrderState::PartialFill, "0.00000004")));
+
+    ++ctx_.sequence;
+    OrchestratorResult r{};
+    const Allocations a = count_allocations([&] { r = orchestrate_submit(ctx_); });
+
+    EXPECT_EQ(r.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(publisher.stats().written, 1u) << "the report was made durable inside the measured call";
+    EXPECT_EQ(a.calls, 0u) << allocation_report("durable drain + order", a);
+}
