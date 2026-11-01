@@ -140,6 +140,17 @@ OperatorResolutionRequest request(const OrderSpec& o, OperatorEnvironment env = 
     return r;
 }
 
+// The store's binding as read_store_binding() would report it for a store the trading process bound to (env, uid) (D5 / R5). The flow takes
+// the read, not the file: the file's format, its refusals and its signature are test_store_binding.cpp's; the tool test goes through real files.
+constexpr std::int64_t kBoundAt = kT0 - 3'600'000;
+StoreBindingRead bound_to(StoreEnvironment env, std::uint64_t uid = kUid) {
+    StoreBindingRead r;
+    r.status = StoreBindingStatus::Bound;
+    r.binding = StoreBinding{env, uid, kBoundAt};
+    return r;
+}
+StoreBindingRead unreadable_binding() { return StoreBindingRead{StoreBindingStatus::Unreadable, {}}; }
+
 // An exchange order that every endpoint shows from the first moment (the order the dead process managed to place).
 FakeExchangeOrder visible_order(const OrderSpec& o) {
     FakeExchangeOrder e;
@@ -252,7 +263,7 @@ protected:
             if (base.empty()) continue;
             for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".cp.lock", ".cp.tip", ".cp.tip.tmp", ".keyrotations",
                                        ".keyrotations.lock", ".keyrotations.tip", ".keyrotations.tip.tmp", ".storeid",
-                                       ".storeid.lock", ".storeid.tip", ".storeid.tip.tmp"}) {
+                                       ".storeid.lock", ".storeid.tip", ".storeid.tip.tmp", ".binding.tip", ".binding.tip.tmp"}) {
                 std::remove((base + suffix).c_str());
             }
         }
@@ -312,7 +323,10 @@ protected:
         rig_ = std::make_unique<Rig>(world_);
     }
 
-    OperatorSession begin(const FenceParams& fence = {}) { return begin_operator_session(*audit_, *names_, rig_->ports, fence); }
+    // `binding` is what the tool read from the store's binding file (D5 / R5); nothing is "no binding" -- a legacy store.
+    OperatorSession begin(const FenceParams& fence = {}, const StoreBindingRead& binding = {}) {
+        return begin_operator_session(*audit_, *names_, rig_->ports, fence, binding);
+    }
 
     // Both logs exactly as they were before the tool opened them?
     bool logs_untouched() {
@@ -783,12 +797,12 @@ TEST_F(FlowTest, ASessionThatIsNotReadyIsNotUsedEvenWithItsPointersSet) {
 }
 
 TEST(FlowNames, EveryStatusAndEveryConclusionHasItsOwnName) {
-    const std::array<std::string_view, 22> statuses{
+    const std::array<std::string_view, 26> statuses{
         "NotRun",          "Resolved",           "BadRequest",       "SessionNotReady",     "AuditNotUsable",
         "NoSuchUnresolvedOrder", "AlreadyResolvedThisSession", "DryRunOrder", "NotResolvable", "TableFull",
         "SymbolNameNotKnown", "ServerTimeUnavailable", "FenceWaitTimedOut", "NoUsableRange", "EvidenceReadFailed",
         "EvidenceNotAbsent", "EvidenceStoreFailed", "NotConfirmed", "AppendRefused", "AppendFailed", "AccountUnverified",
-        "AccountUidMismatch"};
+        "AccountUidMismatch", "StoreNotBound", "StoreBindingUnreadable", "StoreEnvironmentMismatch", "StoreAccountMismatch"};
     for (std::size_t i = 0; i < statuses.size(); ++i) {
         EXPECT_EQ(resolve_status_name(static_cast<ResolveStatus>(i)), statuses[i]) << i;
     }
@@ -1521,9 +1535,9 @@ TEST_F(FlowTest, ThePhraseNamesTheEnvironmentTheOperatorStatedAndATestnetPhraseD
     fresh_paths();
     world_.now_ms = kT0;
     prepare(ambiguous_history(kA));
-    OperatorSession prod = begin();
+    OperatorSession prod = begin({}, bound_to(StoreEnvironment::Production));  // (a Production run needs a store bound to Production: D5 / R5)
     const OperatorResolutionOutcome o = resolve_order(prod, request(kA, OperatorEnvironment::Production));
-    ASSERT_EQ(o.status, ResolveStatus::Resolved);
+    ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status);
     EXPECT_NE(rig_->console.printed_phrase().find(" PRODUCTION "), std::string::npos);
     ASSERT_EQ(rig_->store.stored.size(), 1u);
     EXPECT_NE(rig_->store.stored[0].second.find("\"environment\":\"PRODUCTION\""), std::string::npos);
@@ -1653,6 +1667,173 @@ TEST_F(FlowTest, AnEmptyAccountSummaryIsShownAsNotAvailableAndDoesNotStopTheRun)
     EXPECT_NE(rig_->store.stored[0].second.find("\"account_summary\":\"\""), std::string::npos);
 }
 
+// --- the store's binding (D5 / R5) -----------------------------------------------------------------------------------------------------------------
+//
+// The store's own record of its environment and account (store_binding.hpp), held against the environment the operator stated and the account
+// the exchange reports for the key. It is judged right after the account check, so a refusal has the same shape: the session's reading and the
+// account request only, no wait, no evidence read, nothing stored, nobody asked, both logs as they were.
+
+TEST_F(FlowTest, ATestnetRunOnAStoreWithNoBindingGoesOnAndSaysSoTwice) {
+    prepare(ambiguous_history(kA));
+    OperatorSession session = begin();
+    ASSERT_EQ(session.status, SessionStatus::Ready);
+    EXPECT_EQ(session.binding.status, StoreBindingStatus::Unbound) << "passing nothing is passing 'no binding'";
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA));
+    ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status);
+    ASSERT_TRUE(o.store_binding.has_value());
+    EXPECT_EQ(*o.store_binding, BindingJudgement::Unbound);
+    std::size_t said = 0;
+    for (const std::string& l : rig_->console.lines) {
+        if (l.rfind("store binding: none -- a legacy store, so this tool cannot check that it was written for this environment and account", 0) == 0) ++said;
+    }
+    EXPECT_EQ(said, 2u) << "once when it went on (before the wait), once on the page the operator confirms from";
+    EXPECT_TRUE(rig_->console.printed("; going on, because this is a TESTNET run"));
+    ASSERT_EQ(rig_->store.stored.size(), 1u);
+    EXPECT_NE(rig_->store.stored[0].second.find("\"store_binding\":{\"status\":\"Unbound\",\"environment\":null,\"account_uid\":null,\"bound_at_ms\":null}"),
+              std::string::npos);
+}
+
+TEST_F(FlowTest, AProductionRunOnAStoreWithNoBindingIsRefusedBeforeAnyWait) {
+    prepare(ambiguous_history(kA));
+    OperatorSession session = begin();
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA, OperatorEnvironment::Production));
+    EXPECT_EQ(o.status, ResolveStatus::StoreNotBound) << resolve_status_name(o.status);
+    ASSERT_TRUE(o.store_binding.has_value());
+    EXPECT_EQ(*o.store_binding, BindingJudgement::Unbound);
+    EXPECT_TRUE(rig_->console.printed("this store has no environment and account binding, and a PRODUCTION run needs one"));
+    EXPECT_TRUE(rig_->console.printed("nothing was written"));
+    EXPECT_EQ(o.confirmation.verdict, ConfirmationVerdict::NotAsked);
+    EXPECT_EQ(o.fence, FenceVerdict::Unset);
+    EXPECT_TRUE(o.evidence_digest_hex.empty());
+    EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+}
+
+TEST_F(FlowTest, AStoreBoundToTheStatedEnvironmentAndTheKeysAccountIsGoneOnWith) {
+    for (const OperatorEnvironment env : {OperatorEnvironment::Testnet, OperatorEnvironment::Production}) {
+        SCOPED_TRACE(environment_name(env));
+        fresh_paths();
+        world_.now_ms = kT0;
+        prepare(ambiguous_history(kA));
+        OperatorSession session = begin({}, bound_to(to_store_environment(env)));
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA, env));
+        ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status);
+        ASSERT_TRUE(o.store_binding.has_value());
+        EXPECT_EQ(*o.store_binding, BindingJudgement::Match);
+        const std::string name(environment_name(env));
+        EXPECT_TRUE(rig_->console.printed("store binding: bound to " + name +
+                                          ", account uid 123456789 (the same as the environment you stated and the account this API key belongs to)"));
+        EXPECT_FALSE(rig_->console.printed("going on, because this is a TESTNET run")) << "there is nothing to go on despite";
+        ASSERT_EQ(rig_->store.stored.size(), 1u);
+        EXPECT_NE(rig_->store.stored[0].second.find("\"store_binding\":{\"status\":\"Bound\",\"environment\":\"" + name +
+                                                    "\",\"account_uid\":123456789,\"bound_at_ms\":" + std::to_string(kBoundAt) + "}"),
+                  std::string::npos);
+    }
+}
+
+TEST_F(FlowTest, AStoreBoundToTheOtherEnvironmentIsRefusedWhicheverWayRound) {
+    struct Case {
+        OperatorEnvironment stated;
+        StoreEnvironment store;
+        const char* message;
+    };
+    for (const Case& c : {Case{OperatorEnvironment::Testnet, StoreEnvironment::Production,
+                               "this store is bound to PRODUCTION, not to the TESTNET you stated: nothing was written"},
+                          Case{OperatorEnvironment::Production, StoreEnvironment::Testnet,
+                               "this store is bound to TESTNET, not to the PRODUCTION you stated: nothing was written"}}) {
+        SCOPED_TRACE(c.message);
+        fresh_paths();
+        world_.now_ms = kT0;
+        prepare(ambiguous_history(kA));
+        OperatorSession session = begin({}, bound_to(c.store));
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA, c.stated));
+        EXPECT_EQ(o.status, ResolveStatus::StoreEnvironmentMismatch) << resolve_status_name(o.status);
+        ASSERT_TRUE(o.store_binding.has_value());
+        EXPECT_EQ(*o.store_binding, BindingJudgement::EnvironmentMismatch);
+        EXPECT_TRUE(rig_->console.printed(c.message));
+        EXPECT_EQ(o.confirmation.verdict, ConfirmationVerdict::NotAsked);
+        EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+    }
+}
+
+TEST_F(FlowTest, AStoreBoundToAnotherAccountIsRefusedWhateverTheDifference) {
+    // the comparison is on all 64 bits, as the account check's is
+    for (const OperatorEnvironment env : {OperatorEnvironment::Testnet, OperatorEnvironment::Production}) {
+        for (const std::uint64_t other : {kUid - 1, kUid + 1, kUid + (std::uint64_t{1} << 32), kUid ^ (std::uint64_t{1} << 63), std::uint64_t{1},
+                                          std::numeric_limits<std::uint64_t>::max()}) {
+            SCOPED_TRACE(other);
+            fresh_paths();
+            world_.now_ms = kT0;
+            prepare(ambiguous_history(kA));
+            OperatorSession session = begin({}, bound_to(to_store_environment(env), other));
+            const OperatorResolutionOutcome o = resolve_order(session, request(kA, env));
+            EXPECT_EQ(o.status, ResolveStatus::StoreAccountMismatch) << resolve_status_name(o.status);
+            ASSERT_TRUE(o.store_binding.has_value());
+            EXPECT_EQ(*o.store_binding, BindingJudgement::AccountMismatch);
+            EXPECT_TRUE(rig_->console.printed("this store is bound to account uid " + std::to_string(other) +
+                                              ", not to uid 123456789 that this API key belongs to: nothing was written"));
+            EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+        }
+    }
+}
+
+TEST_F(FlowTest, ABindingThatCannotBeReadIsRefusedWhateverTheEnvironment) {
+    for (const OperatorEnvironment env : {OperatorEnvironment::Testnet, OperatorEnvironment::Production}) {
+        SCOPED_TRACE(environment_name(env));
+        fresh_paths();
+        world_.now_ms = kT0;
+        prepare(ambiguous_history(kA));
+        OperatorSession session = begin({}, unreadable_binding());
+        const OperatorResolutionOutcome o = resolve_order(session, request(kA, env));
+        EXPECT_EQ(o.status, ResolveStatus::StoreBindingUnreadable) << resolve_status_name(o.status);
+        ASSERT_TRUE(o.store_binding.has_value());
+        EXPECT_EQ(*o.store_binding, BindingJudgement::Unreadable);
+        EXPECT_TRUE(rig_->console.printed("this store's binding file exists but cannot be read, or does not verify for this store: nothing was written"));
+        EXPECT_FALSE(rig_->console.printed("going on")) << "an unreadable binding is not a legacy store";
+        EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+    }
+}
+
+TEST_F(FlowTest, TheBindingIsJudgedAfterTheAccountCheckNotBefore) {
+    // a key that belongs to another account AND a store bound to the other environment: what is said is the account
+    prepare(ambiguous_history(kA));
+    rig_->exchange.account_uid = kUid + 1;
+    OperatorSession session = begin({}, bound_to(StoreEnvironment::Production));
+    const OperatorResolutionOutcome o = resolve_order(session, request(kA, OperatorEnvironment::Testnet));
+    EXPECT_EQ(o.status, ResolveStatus::AccountUidMismatch) << resolve_status_name(o.status);
+    EXPECT_FALSE(o.store_binding.has_value()) << "not judged yet";
+    EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
+}
+
+TEST_F(FlowTest, TheBindingIsJudgedAfterTheRefusalsThatNeedNoTraffic) {
+    prepare(ambiguous_history(kA));
+    OperatorSession session = begin({}, bound_to(StoreEnvironment::Production, kUid + 5));
+    const OperatorResolutionOutcome o = resolve_order(session, request(kB));  // not an order of the log
+    EXPECT_EQ(o.status, ResolveStatus::NoSuchUnresolvedOrder);
+    EXPECT_FALSE(o.store_binding.has_value());
+    expect_no_traffic();
+}
+
+TEST_F(FlowTest, TheBindingBelongsToTheSessionAndEveryOrderOfItIsJudgedAgainstIt) {
+    prepare(concat(ambiguous_history(kA), ambiguous_history(kB)));
+    OperatorSession session = begin({}, bound_to(StoreEnvironment::Testnet));
+    EXPECT_EQ(session.binding.status, StoreBindingStatus::Bound);
+    EXPECT_EQ(session.binding.binding.environment, StoreEnvironment::Testnet);
+    EXPECT_EQ(session.binding.binding.account_uid, kUid);
+    ASSERT_EQ(resolve_order(session, request(kA)).status, ResolveStatus::Resolved);
+    const OperatorResolutionOutcome second = resolve_order(session, request(kB, OperatorEnvironment::Production));
+    EXPECT_EQ(second.status, ResolveStatus::StoreEnvironmentMismatch) << "the second order is judged too, on what the operator states for it";
+    EXPECT_TRUE(audit_->operator_resolved_this_session(0));
+    EXPECT_FALSE(audit_->operator_resolved_this_session(1));
+}
+
+TEST(OperatorResolutionFlowBinding, TheOperatorsEnvironmentNamesMapToTheStoresAndNothingElse) {
+    static_assert(to_store_environment(OperatorEnvironment::Testnet) == StoreEnvironment::Testnet);
+    static_assert(to_store_environment(OperatorEnvironment::Production) == StoreEnvironment::Production);
+    EXPECT_FALSE(is_valid_store_environment(to_store_environment(static_cast<OperatorEnvironment>(2))));
+    EXPECT_FALSE(is_valid_store_environment(to_store_environment(static_cast<OperatorEnvironment>(255))));
+    EXPECT_EQ(OperatorSession{}.binding.status, StoreBindingStatus::Unbound);
+}
+
 #undef EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK
 
 // --- the evidence file ------------------------------------------------------------------------------------------------------------------------
@@ -1667,6 +1848,7 @@ TEST_F(FlowTest, TheStoredEvidenceHoldsWhatTheDecisionRestedOn) {
     for (const char* needle :
          {"\"format\":\"hy-operator-evidence/1\"", "\"tool_version\":1", "\"client_order_id\":\"HY-1789999399000-1-0A0A\"",
           "\"symbol\":\"BTCUSDT\"", "\"environment\":\"TESTNET\"", "\"account_uid_claimed\":123456789", "\"account_uid_reported\":123456789",
+          "\"store_binding\":{\"status\":\"Unbound\",\"environment\":null,\"account_uid\":null,\"bound_at_ms\":null}",
           "\"recv_window_ms\":60000", "\"clock_skew_ms\":60000", "\"margin_ms\":30000", "\"read_lag_ms\":120000",
           "\"role\":\"lock\"", "\"role\":\"wait\"", "\"role\":\"read\"", "\"point_query\":\"NoSuchOrder\"",
           "\"all_orders\":[\"Clear\"]", "\"open_orders\":\"Clear\"", "\"name\":\"order\"", "\"name\":\"allOrders\"",
@@ -1784,7 +1966,7 @@ TEST_F(FlowTest, TheListingSaysWhichOrdersTheToolCouldResolveAndWhyNotTheOthers)
 
 TEST(OperatorResolutionFlowNames, EveryStatusHasANameAndTheZeroValueIsNotASuccess) {
     std::vector<std::string_view> seen;
-    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(ResolveStatus::AccountUidMismatch); ++v) {
+    for (std::uint8_t v = 0; v <= static_cast<std::uint8_t>(ResolveStatus::StoreAccountMismatch); ++v) {
         const std::string_view n = resolve_status_name(static_cast<ResolveStatus>(v));
         EXPECT_NE(n, "Unknown") << static_cast<int>(v);
         EXPECT_EQ(std::count(seen.begin(), seen.end(), n), 0) << n << " is used twice";

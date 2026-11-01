@@ -652,6 +652,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_durable_audit_export)
     gtest_discover_tests(test_durable_audit_export)
 
+    # D5 slice R5 (docs/OPERATOR_RESOLUTION_DESIGN.md 9 "R-env"): the store's signed environment-and-account binding --
+    # store_binding.hpp (format, reader, judgement) and store_binding_writer.hpp (write-once, the trading process's
+    # policy), plus DurableAuditSink::frame_count(). Real files and real sinks; the format is also pinned byte by byte.
+    add_executable(test_store_binding tests/test_store_binding.cpp)
+    target_link_libraries(test_store_binding PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_store_binding)
+    gtest_discover_tests(test_store_binding)
+
     # D5 slice R1 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.2 and 10): the recovery reader's rules for an
     # OrderOperatorResolved frame and for frame format v6 -- crafted logs (the tool that writes such a frame is slice
     # R3), but every frame is made by the production encoder and every log is read by the production sink and
