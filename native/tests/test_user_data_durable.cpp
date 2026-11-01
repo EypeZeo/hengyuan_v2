@@ -303,7 +303,7 @@ TEST_F(UserDataDurableTest, AFailedAppendPublishesNothingAndNothingIsPoppedBehin
 TEST_F(UserDataDurableTest, ARetryAfterTheAmbiguousFrameLandedWritesOnlyTheObservation) {
     admit("HY-A", OrderState::Ambiguous, 0, 10, /*maybe=*/true);  // recovered: the log holds Submitting or Ambiguous
     push(report("HY-A", OrderState::Cancelled, "0"));
-    probe_.fail_calls = {2};  // the Ambiguous frame lands, the observation does not
+    probe_.fail_calls.push_back(2);  // the Ambiguous frame lands, the observation does not
 
     drain();
 
@@ -320,6 +320,63 @@ TEST_F(UserDataDurableTest, ARetryAfterTheAmbiguousFrameLandedWritesOnlyTheObser
     EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
     EXPECT_FALSE(publisher_.blocked());
     EXPECT_EQ(shadow_of("HY-A").state, OrderState::Cancelled);
+}
+
+TEST_F(UserDataDurableTest, AnAmbiguousFrameThatIsNotAcknowledgedStopsTheObservationBehindIt) {
+    admit("HY-A", OrderState::Ambiguous, 0, 10, /*maybe=*/true);
+    push(report("HY-A", OrderState::Cancelled, "0"));
+    probe_.fail_calls.push_back(1);  // the Ambiguous frame is not acknowledged
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 1) << "the observation is not even tried: Submitting -> Cancelled written bare would make the whole log Corrupt";
+    EXPECT_TRUE(publisher_.blocked());
+    EXPECT_EQ(probe_.frames.size(), 0u);
+    EXPECT_TRUE(shadow_of("HY-A").maybe_submitting) << "nothing was acknowledged: the doubt stays";
+    EXPECT_EQ(truth_.net_qty_ticks(kSymbol), 0);
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
+}
+
+TEST_F(UserDataDurableTest, TheAmbiguousFrameCarriesTheFillTheShadowHolds) {
+    // Not reachable from a log the orchestrator wrote (an Ambiguous order has no fill), but the property is what keeps the frame legal whatever the log
+    // holds: a same-state frame never lowers the fill.
+    admit("HY-A", OrderState::Ambiguous, /*filled=*/4, 10, /*maybe=*/true);
+    push(report("HY-A", OrderState::Cancelled, "4"));
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(probe_.frames[0].filled_qty_ticks, 4);
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
+    EXPECT_EQ(probe_.frames[1].filled_qty_ticks, 4);
+}
+
+TEST_F(UserDataDurableTest, AFailureBehindAPublishedObservationKeepsTheUnpublishedOneAndOnlyThat) {
+    admit("HY-A", OrderState::Accepted);
+    admit("HY-B", OrderState::Accepted);
+    push(report("HY-A", OrderState::PartialFill, "4"));
+    push(report("HY-B", OrderState::PartialFill, "5"));
+    probe_.fail_calls.push_back(2);  // HY-A's frame lands, HY-B's does not
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 1u);
+    EXPECT_STREQ(probe_.frames[0].client_order_id, "HY-A");
+    EXPECT_EQ(publisher_.held_count(), 1u);
+    EXPECT_EQ(truth_.net_qty_ticks(kSymbol), 4) << "only what is durable";
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u) << "what stays held is HY-B, not the observation that was already published";
+    EXPECT_STREQ(probe_.frames[1].client_order_id, "HY-B");
+    EXPECT_EQ(publisher_.held_count(), 0u);
+    EXPECT_EQ(truth_.net_qty_ticks(kSymbol), 9);
 }
 
 TEST_F(UserDataDurableTest, AnObservationWhoseOrderFinishedBeforeTheRetryIsDropped) {

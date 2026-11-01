@@ -1728,7 +1728,7 @@ TEST_F(DrainDurableTest, AnExactAmbiguousShadowNeedsNoRemapFrame) {
 TEST_F(DrainDurableTest, TheShadowMovesOnlyWithAnAcknowledgedFrameSoARetryPlansFromWhatTheLogHolds) {
     const InFlightHandle h = admit("HY-A");
     push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous, /*filled=*/0);  // maybe Submitting: Ambiguous first, then Cancelled
-    probe_.fail_calls = {2};  // the Ambiguous frame lands, the resolution does not
+    probe_.fail_calls.push_back(2);  // the Ambiguous frame lands, the resolution does not
 
     drain();
 
@@ -1745,6 +1745,42 @@ TEST_F(DrainDurableTest, TheShadowMovesOnlyWithAnAcknowledgedFrameSoARetryPlansF
     ASSERT_EQ(probe_.frames.size(), 2u) << "the retry writes only the resolution: the Ambiguous frame is already in the log";
     EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
     EXPECT_FALSE(publisher_.blocked());
+}
+
+TEST_F(DrainDurableTest, AnAmbiguousReRecordThatIsNotAcknowledgedStopsTheResolutionBehindIt) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous, /*filled=*/0);  // maybe Submitting: the Ambiguous frame goes first
+    probe_.fail_calls.push_back(1);
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 1) << "the resolution is not even tried: Submitting -> Cancelled written bare would make the whole log Corrupt";
+    EXPECT_TRUE(publisher_.blocked());
+    EXPECT_EQ(probe_.frames.size(), 0u);
+    const OrderFillContextEntry* e = fill_context_.find("HY-A");
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->shadow.maybe_submitting) << "nothing was acknowledged: the doubt stays";
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A"));
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
+}
+
+TEST_F(DrainDurableTest, TheAmbiguousReRecordCarriesTheFillTheShadowHolds) {
+    // Not reachable from a log the orchestrator wrote (an Ambiguous order has no fill); the property keeps the frame legal whatever the log holds.
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous, /*filled=*/4);
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-A", DurableShadow{OrderState::Ambiguous, true, 4}));
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(probe_.frames[0].filled_qty_ticks, 4);
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
 }
 
 TEST_F(DrainDurableTest, AFrameThatIsNotAcknowledgedLeavesTheShadowWhereItWas) {

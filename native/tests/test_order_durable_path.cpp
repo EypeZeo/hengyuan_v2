@@ -186,6 +186,10 @@ TEST(DurablePath, AFillPastTheIntendedQuantityOrWithoutOneIsNeverWritten) {
     EXPECT_EQ(plan_observation(exact(OrderState::Accepted), OrderState::PartialFill, 1, -5).status, PathStatus::Unreachable);
     EXPECT_EQ(plan_observation(exact(OrderState::Accepted), OrderState::Cancelled, 0, 0).status, PathStatus::Write) << "no fill, no need for one";
     EXPECT_EQ(plan(exact(OrderState::Accepted), OrderState::PartialFill, -1).status, PathStatus::Unreachable) << "a negative cumulative fill";
+    // ... and one for a state that is nothing LATER than the log's is still malformed, not merely "old": Stale would drop it silently, with no refusal
+    // counted and no barrier told
+    EXPECT_EQ(plan(exact(OrderState::Filled, kIntended), OrderState::Accepted, -1).status, PathStatus::Unreachable);
+    EXPECT_EQ(plan_resolution(exact(OrderState::Filled, kIntended), OrderState::Accepted, -1, kIntended).status, PathStatus::Unreachable);
     // a log that already holds an overfill never gets another frame: a repeat of it is nothing new, anything that would add a frame is refused
     EXPECT_EQ(plan_observation(exact(OrderState::PartialFill, 9), OrderState::PartialFill, 9, 5).status, PathStatus::Stale);
     EXPECT_EQ(plan_observation(exact(OrderState::PartialFill, 9), OrderState::Filled, 9, 5).status, PathStatus::Unreachable);
