@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -31,6 +32,10 @@ BundleHeader good_header() {
     h.environment = OperatorEnvironment::Testnet;
     h.account_uid_claimed = 123456789;
     h.account_uid_reported = 987654321;  // a different number: a value written under the other one's name shows
+    // The store's binding: not the stated environment and not either uid, so that a value written under another one's name shows. (The flow
+    // only builds a file when the binding matched; the encoder is a pure function and does not care.)
+    h.store_binding.status = StoreBindingStatus::Bound;
+    h.store_binding.binding = StoreBinding{StoreEnvironment::Production, 555666777, 1'789'000'000'000};
     // four different values, so that a parameter written under another one's name shows
     h.fence.recv_window_ms = 61'000;
     h.fence.clock_skew_ms = 62'000;
@@ -146,6 +151,12 @@ TEST(OperatorResolutionBundle, TheDocumentIsValidJsonWithWhatTheDesignPromises) 
     EXPECT_EQ(str(p.root, "environment"), "TESTNET");
     EXPECT_EQ(num(p.root, "account_uid_claimed"), 123456789);
     EXPECT_EQ(num(p.root, "account_uid_reported"), 987654321);
+    simdjson::dom::object store_binding;
+    ASSERT_EQ(p.root["store_binding"].get(store_binding), simdjson::SUCCESS);
+    EXPECT_EQ(str(store_binding, "status"), "Bound");
+    EXPECT_EQ(str(store_binding, "environment"), "PRODUCTION");
+    EXPECT_EQ(num(store_binding, "account_uid"), 555666777);
+    EXPECT_EQ(num(store_binding, "bound_at_ms"), 1'789'000'000'000);
     EXPECT_EQ(num(p.root, "lock_ref_ms"), 1'790'000'000'000);
     EXPECT_EQ(num(p.root, "read_ref_ms"), 1'790'000'270'000);
     EXPECT_EQ(num(p.root, "frame_anchor_ms"), 1'789'999'940'000);
@@ -199,7 +210,8 @@ TEST(OperatorResolutionBundle, TheDocumentIsValidJsonWithWhatTheDesignPromises) 
 }
 
 // The whole document, byte for byte: the operator types a piece of its digest, so the format is part of the contract and a change
-// to it (a key, a separator, the trailing newline) must be a deliberate one that updates this text and the format name.
+// to it (a key, a separator, the trailing newline) must be a deliberate one that updates this text -- and the format name, once a real
+// file exists (R3b-1's account_uid_reported and R5's store_binding were added while none did, and kept "/1").
 TEST(OperatorResolutionBundle, TheDocumentIsExactlyTheseBytes) {
     const std::string golden =
         "{\n"
@@ -210,6 +222,7 @@ TEST(OperatorResolutionBundle, TheDocumentIsExactlyTheseBytes) {
         "\"environment\":\"TESTNET\",\n"
         "\"account_uid_claimed\":123456789,\n"
         "\"account_uid_reported\":987654321,\n"
+        "\"store_binding\":{\"status\":\"Bound\",\"environment\":\"PRODUCTION\",\"account_uid\":555666777,\"bound_at_ms\":1789000000000},\n"
         "\"fence\":{\"recv_window_ms\":61000,\"clock_skew_ms\":62000,\"margin_ms\":63000,\"read_lag_ms\":124000},\n"
         "\"server_time_readings\":[{\"role\":\"lock\",\"ms\":1790000000000},{\"role\":\"wait\",\"ms\":1790000030000},"
         "{\"role\":\"read\",\"ms\":1790000270000}],\n"
@@ -238,6 +251,25 @@ TEST(OperatorResolutionBundle, TheDocumentIsExactlyTheseBytes) {
     no_uid.account_uid_reported.reset();
     const std::string unreported = build_evidence_bundle(no_uid, good_calls(), good_verdicts());
     EXPECT_NE(unreported.find("\"account_uid_reported\":null,\n"), std::string::npos);
+
+    // a store without a binding, and one whose binding cannot be read, show their status and nothing else (every key is always there)
+    BundleHeader unbound = good_header();
+    unbound.store_binding = StoreBindingRead{};
+    EXPECT_NE(build_evidence_bundle(unbound, good_calls(), good_verdicts())
+                  .find("\"store_binding\":{\"status\":\"Unbound\",\"environment\":null,\"account_uid\":null,\"bound_at_ms\":null},\n"),
+              std::string::npos);
+    BundleHeader unreadable = good_header();
+    unreadable.store_binding = StoreBindingRead{StoreBindingStatus::Unreadable, StoreBinding{StoreEnvironment::Production, 7, 7}};
+    EXPECT_NE(build_evidence_bundle(unreadable, good_calls(), good_verdicts())
+                  .find("\"store_binding\":{\"status\":\"Unreadable\",\"environment\":null,\"account_uid\":null,\"bound_at_ms\":null},\n"),
+              std::string::npos)
+        << "a stale binding left in an unreadable read is not written";
+    BundleHeader testnet = good_header();
+    testnet.store_binding.binding = StoreBinding{StoreEnvironment::Testnet, std::numeric_limits<std::uint64_t>::max(), -5};
+    EXPECT_NE(build_evidence_bundle(testnet, good_calls(), good_verdicts())
+                  .find("\"store_binding\":{\"status\":\"Bound\",\"environment\":\"TESTNET\",\"account_uid\":18446744073709551615,\"bound_at_ms\":-5},\n"),
+              std::string::npos)
+        << "the whole 64 bits of the uid, and a signed time";
 }
 
 // One byte at a time against a literal oracle: printable ASCII is written as itself, the five escapes JSON names are those, and
@@ -376,6 +408,26 @@ TEST(OperatorResolutionBundle, TheBytesArePureAndEveryInputChangesTheDigest) {
         BundleHeader h = good_header();
         h.environment = OperatorEnvironment::Production;
         differs(build_evidence_bundle(h, good_calls(), good_verdicts()), "the environment");
+    }
+    {
+        BundleHeader h = good_header();
+        h.store_binding.binding.account_uid = 555666778;
+        differs(build_evidence_bundle(h, good_calls(), good_verdicts()), "the store's bound account uid");
+    }
+    {
+        BundleHeader h = good_header();
+        h.store_binding.binding.environment = StoreEnvironment::Testnet;
+        differs(build_evidence_bundle(h, good_calls(), good_verdicts()), "the store's bound environment");
+    }
+    {
+        BundleHeader h = good_header();
+        h.store_binding.binding.bound_at_ms += 1;
+        differs(build_evidence_bundle(h, good_calls(), good_verdicts()), "when the store was bound");
+    }
+    {
+        BundleHeader h = good_header();
+        h.store_binding = StoreBindingRead{};
+        differs(build_evidence_bundle(h, good_calls(), good_verdicts()), "a store with no binding against a bound one");
     }
     {
         BundleHeader h = good_header();

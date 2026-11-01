@@ -19,7 +19,9 @@
 //        before the order was sent, symbol_for_order()): no traffic, no wait;
 //     2. ask the exchange which account the API key belongs to and refuse unless it is the uid the operator stated (a wrong key or
 //        a wrong environment would make every answer below an answer about somebody else's orders; this is not evidence and costs
-//        no waiting), then wait until the exchange clock says lock + W + B + margin + L, re-reading it (never trusting the local
+//        no waiting), then hold that account and the stated environment against the store's own binding (D5 / R5, store_binding.hpp:
+//        refuse a store bound to another environment or account, one whose binding cannot be read and -- for Production -- one that
+//        has none), then wait until the exchange clock says lock + W + B + margin + L, re-reading it (never trusting the local
 //        clock for the fence itself); give up if the exchange clock does not keep up;
 //     3. read the evidence -- the point query, every allOrders window of the plan, openOrders -- all of it after that moment;
 //     4. put the raw answers into the evidence file and store it BEFORE anything else happens;
@@ -51,6 +53,7 @@
 #include <hengyuan/operator_resolution_ports.hpp>
 #include <hengyuan/operator_resolution_response.hpp>
 #include <hengyuan/operator_resolution_rules.hpp>
+#include <hengyuan/store_binding.hpp>
 
 namespace hy::operator_resolution {
 
@@ -82,13 +85,16 @@ struct OperatorSession {
     const OperatorPorts* ports{nullptr};
     FenceParams fence{};
     ExchangeMs lock_ref{};  // the first serverTime read after the lock was taken
+    StoreBindingRead binding{};  // D5 / R5: what the store's binding file said when the tool opened the store; resolve_order() judges it
 };
 
 // Call it right after the stores are open (the audit sink, opened in OperatorOpen mode, holds the exclusive lock for as long as
 // it lives; the session is valid only while it does). The reading it takes is the fence reference: the later it is taken, the
-// longer the fence, never the shorter.
+// longer the fence, never the shorter. `binding` is read_store_binding()'s answer for the audit store (the tool reads it, with the
+// sink's own uuid, right after it opened the sink): a caller that passes nothing gets "no binding", which a Testnet run goes on
+// with as a legacy store and a Production run refuses.
 inline OperatorSession begin_operator_session(DurableAuditSink& audit, const ControlPlaneLogSink& names, const OperatorPorts& ports,
-                                              const FenceParams& fence) {
+                                              const FenceParams& fence, const StoreBindingRead& binding = {}) {
     OperatorSession s{};
     if (validate_fence_params(fence) != FenceParamsStatus::Ok) {
         s.status = SessionStatus::BadFenceParams;
@@ -108,6 +114,7 @@ inline OperatorSession begin_operator_session(DurableAuditSink& audit, const Con
     s.ports = &ports;
     s.fence = fence;
     s.lock_ref = *t;
+    s.binding = binding;
     s.status = SessionStatus::Ready;
     return s;
 }
@@ -229,6 +236,12 @@ enum class ResolveStatus : std::uint8_t {
     AppendFailed = 19,
     AccountUnverified = 20,   // the exchange did not report the uid of the account the key belongs to (request failed, no single uid)
     AccountUidMismatch = 21,  // it did, and it is not the uid the operator stated: see OperatorResolutionOutcome::exchange_account_uid
+    // D5 / R5 (store_binding.hpp): the store's own record of its environment and account. All four are decided right after the account check,
+    // before any wait or evidence read; none writes anything.
+    StoreNotBound = 22,             // the store has no binding and this is a Production run (a Testnet run goes on with a legacy store)
+    StoreBindingUnreadable = 23,    // a binding file exists and cannot be believed -- never treated as "no binding"
+    StoreEnvironmentMismatch = 24,  // the store is bound to the other environment than the one the operator stated
+    StoreAccountMismatch = 25,      // the store is bound to another account than the one this API key belongs to
 };
 
 constexpr std::string_view resolve_status_name(ResolveStatus s) noexcept {
@@ -255,6 +268,10 @@ constexpr std::string_view resolve_status_name(ResolveStatus s) noexcept {
         case ResolveStatus::AppendFailed: return "AppendFailed";
         case ResolveStatus::AccountUnverified: return "AccountUnverified";
         case ResolveStatus::AccountUidMismatch: return "AccountUidMismatch";
+        case ResolveStatus::StoreNotBound: return "StoreNotBound";
+        case ResolveStatus::StoreBindingUnreadable: return "StoreBindingUnreadable";
+        case ResolveStatus::StoreEnvironmentMismatch: return "StoreEnvironmentMismatch";
+        case ResolveStatus::StoreAccountMismatch: return "StoreAccountMismatch";
     }
     return "Unknown";
 }
@@ -291,6 +308,7 @@ struct OperatorResolutionOutcome {
     ExchangeMs lock_ref{};
     ExchangeMs read_ref{};
     std::optional<std::uint64_t> exchange_account_uid;  // what the exchange reported for the key's account; unset if it was not asked or did not say
+    std::optional<BindingJudgement> store_binding;  // how the store's binding was judged (D5 / R5); unset if the run stopped before that
     std::string evidence_digest_hex;  // empty unless an evidence file was built
     std::string evidence_stem;        // the name handed to the evidence store
 };
@@ -318,7 +336,25 @@ inline BundleCall make_call(std::string name, std::string params, const HttpRead
     return c;
 }
 
+// What the operator is shown about the store's binding next to the environment and the account he stated.
+inline std::string binding_line(const StoreBindingRead& b) {
+    if (b.status == StoreBindingStatus::Bound) {
+        return "store binding: bound to " + std::string(store_environment_name(b.binding.environment)) + ", account uid " +
+               std::to_string(b.binding.account_uid) + " (the same as the environment you stated and the account this API key belongs to)";
+    }
+    return "store binding: none -- a legacy store, so this tool cannot check that it was written for this environment and account";
+}
+
 }  // namespace detail
+
+// The tool's environment names against the store's. An out-of-range value (the request check refuses it first) maps to no environment.
+constexpr StoreEnvironment to_store_environment(OperatorEnvironment e) noexcept {
+    switch (e) {
+        case OperatorEnvironment::Testnet: return StoreEnvironment::Testnet;
+        case OperatorEnvironment::Production: return StoreEnvironment::Production;
+    }
+    return static_cast<StoreEnvironment>(0);
+}
 
 inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const OperatorResolutionRequest& req) {
     OperatorResolutionOutcome out{};
@@ -400,6 +436,35 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
                            std::to_string(req.account_uid) + " you stated: nothing was written");
         return stop(ResolveStatus::AccountUidMismatch);
     }
+    // The store's own record of where its orders went (D5 / R5, store_binding.hpp): the environment the operator stated and the account the
+    // exchange just reported for the key must be the store's. Like the account check this is not evidence, costs no traffic and no waiting.
+    // A store with no binding is a legacy store: the Testnet drill stores are, and that run goes on (the console and the evidence file say
+    // so); a Production run refuses -- no Production store has ever been written, so every one that will exist can be bound from its first
+    // frame. A binding that cannot be read is never "no binding". Everything not explicitly allowed below is a refusal.
+    const StoreEnvironment store_env = to_store_environment(req.environment);
+    const BindingJudgement bound = judge_store_binding(session.binding, store_env, *account.uid);
+    out.store_binding = bound;
+    if (bound != BindingJudgement::Match && !(bound == BindingJudgement::Unbound && store_env == StoreEnvironment::Testnet)) {
+        switch (bound) {
+            case BindingJudgement::Unbound:
+                console.write_line("this store has no environment and account binding, and a PRODUCTION run needs one (the trading process binds "
+                                   "a store when it first uses it): nothing was written");
+                return stop(ResolveStatus::StoreNotBound);
+            case BindingJudgement::EnvironmentMismatch:
+                console.write_line("this store is bound to " + std::string(store_environment_name(session.binding.binding.environment)) +
+                                   ", not to the " + std::string(environment_name(req.environment)) + " you stated: nothing was written");
+                return stop(ResolveStatus::StoreEnvironmentMismatch);
+            case BindingJudgement::AccountMismatch:
+                console.write_line("this store is bound to account uid " + std::to_string(session.binding.binding.account_uid) +
+                                   ", not to uid " + std::to_string(*account.uid) + " that this API key belongs to: nothing was written");
+                return stop(ResolveStatus::StoreAccountMismatch);
+            case BindingJudgement::Match:  // (not reachable: excluded above)
+            case BindingJudgement::Unreadable: break;
+        }
+        console.write_line("this store's binding file exists but cannot be read, or does not verify for this store: nothing was written");
+        return stop(ResolveStatus::StoreBindingUnreadable);
+    }
+    if (bound == BindingJudgement::Unbound) console.write_line(detail::binding_line(session.binding) + "; going on, because this is a TESTNET run");
     const std::int64_t wait_cap_ms = (earliest->count() - session.lock_ref.count()) + kFenceWaitSlackMs;  // both plausible: no overflow
     std::vector<BundleTimeReading> readings;
     readings.push_back({"lock", session.lock_ref.count()});
@@ -486,6 +551,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     header.environment = req.environment;
     header.account_uid_claimed = req.account_uid;
     header.account_uid_reported = account.uid;
+    header.store_binding = session.binding;
     header.fence = session.fence;
     header.lock_ref = session.lock_ref;
     header.read_ref = read_ref;
@@ -522,6 +588,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
                        (cp.send_started_utc_ms != 0 ? std::to_string(cp.send_started_utc_ms) : std::string("unknown")));
     console.write_line("environment (stated by you): " + std::string(environment_name(req.environment)) +
                        "  account uid (stated by you; the exchange reports the same for this API key): " + std::to_string(req.account_uid));
+    console.write_line(detail::binding_line(session.binding));
     console.write_line("exchange clock: lock " + std::to_string(session.lock_ref.count()) + "  read " + std::to_string(read_ref.count()) +
                        "  waited " + std::to_string(waited_seconds(session.lock_ref, read_ref)) + " s  (W " +
                        std::to_string(session.fence.recv_window_ms / 1000) + " s, B " + std::to_string(session.fence.clock_skew_ms / 1000) +
