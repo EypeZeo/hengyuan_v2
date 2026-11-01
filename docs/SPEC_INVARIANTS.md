@@ -631,7 +631,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **[D5 切片 R3b-3 已落地：L-50 的附加防线——一个品种名只对不早于日志首次给出它的时刻发送的订单有效]**
     （`docs/OPERATOR_RESOLUTION_DESIGN.md` §6、§10；Owner 2026-10-31 “开始R3b-3，按推荐”，对 PR #216 说“合并”；Tier B；PR #216，合并提交 8b8ad5f）：R3-0 的品种名折叠只能回答 “控制面日志里每个快照都同意”，
     回答不了 “这是不是订单下单当时在用的那份日志”。若控制面日志在订单之后被删除重建，一个旧的 `symbol_id` 可能被改给另一个品种、仍然是 `Known`，工具就会拿错误的品种去问交易所——
-    “没有这个订单” 对一个错误的品种是真话，而这个工具恰恰拿这句真话去结清订单。R3b-3 加一道便宜的防线（根治是 R5 的环境与账户绑定）：**名字只对不早于日志首次给出它的时刻发送的订单有效**。
+    “没有这个订单” 对一个错误的品种是真话，而这个工具恰恰拿这句真话去结清订单。R3b-3 加一道便宜的防线（L-50 的根治——审计日志与控制面日志互相记录对方的存储身份——仍然开放；R5 的环境与账户绑定不是它）：**名字只对不早于日志首次给出它的时刻发送的订单有效**。
     **仍然没有任何真实流量**：工具对真实或 Testnet 交易所一次也没有运行过；本片须在 Owner 第一次真跑（R6）之前合入。
     - **sink 记录什么**（`ControlPlaneLogSink`）：折叠表的每个槽多一个 `first_named_ms`——**日志里第一个**给出该 id 合规名字的快照帧、由其 MAC 保护的帧头时间读作墙钟时间
       （`frame_wall_time_ms()`：`ServerCorrectedUtc` 帧取 `recorded_utc_ms`，别的时间类型取 0；注册表自己写的快照，帧头时间就是 exchangeInfo 响应里的交易所 `serverTime`）。
@@ -694,7 +694,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       `-2013` 的真实状态码、读延迟 L 与 **Testnet 的 `/api/v3/account` 是否带 `uid`**（R6，Testnet 演练）；工具与告警对真实或 Testnet 交易所的任何一次运行。
 
   - **[D5 切片 R5 已落地：存储的环境与账户绑定——日志记下它属于哪个交易所环境、哪个账户，工具与交易进程都据此核对]**
-    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §9 “R-env”、§10；Owner 2026-10-31 “开始规划并实现R5以及M5”；Tier B；PR #220）：审计日志按 COID 与 symbol_id 记订单；`mode` 只有 DryRun / Live，存储身份（`<log>.storeid`）只是随机标签——没有任何一处记 “发往 Binance Production、账户 123”。
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §9 “R-env”、§10；Owner 2026-10-31 “开始规划并实现R5以及M5”，对 PR #220 说“合并”；Tier B；PR #220，合并提交 3363115）：审计日志按 COID 与 symbol_id 记订单；`mode` 只有 DryRun / Live，存储身份（`<log>.storeid`）只是随机标签——没有任何一处记 “发往 Binance Production、账户 123”。
     于是离线工具可以被指向 Testnet，对一个活在 Production 的订单读到干净的 “无此单”（对错了交易所的真话，恰是它的结论承受不起的），交易进程也可以拿 Production 凭据去开一个 Testnet 填过的存储（或反过来、或别的账户的）。此前唯一的防线是操作员确认短语（A-D5-3）。
     - **文件**：`<log>.binding.tip`，70 字节，经 `DurableLogStore::write_tip_anchor()` 写（临时文件、刷盘、改名，与 tip anchor 和存储身份同一种崩溃一致的写法），小端：
       `[版本 u8 = 1][store_uuid_lo u64][store_uuid_hi u64][环境 u8：1 = Testnet、2 = Production][账户 uid u64][绑定时间 i64 毫秒][key_id u32][MAC 32 字节 = HMAC(key_id 对应的密钥, 前面全部)]`。
@@ -714,6 +714,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       读只有工具里一处（参数是 `options.audit_log`、`*ring`、sink 的 uuid 两半），判定只有流程里一处（参数是 `session.binding`、`store_env`、`*account.uid`），在账户检查之后、第一次等待或证据读取之前，四个拒绝状态各出现一次且都在第一次 `sleep_for` 之前，放行条件的文字被钉住；`frame_count()` 的调用点全树只有一个，Production 旧存储的拒绝与 sink 重载的入口条件的文字被钉住。
     - **不做 / 局限**：绑定记录的是**调用方的声明**（凭据的环境绑定、`GET /api/v3/account` 报的 uid），这个头文件记录与比较、验证不了；声明错了，写下的绑定也错——所以交易侧接线（M5）必须传交易所对**要拿去交易的那把密钥**报告的 uid，不是配置里的值。不保护密钥环已泄露的存储（文件由它签名）。
       **仍无任何生产调用方**：`ensure_store_binding()` 在树里只被测试调用，M5 才接线。存储身份被重建（`.storeid.tip` 被删后重新生成）会让旧绑定成为 `Unreadable`——有意：身份变了，“同一个存储” 的前提就没了。
+      **L-50 的根治不在本片**：审计日志与控制面日志互相记录对方的存储身份仍然开放——设计原把它与 L-48 一起算在 R5 名下，这一片只绑定了审计存储的环境与账户；控制面日志被换掉的情形，仍只靠 R3b-3 的时间防线挡（那个条目里 “根治是 R5 的环境与账户绑定” 的说法由此更正）。
     - **验证**：新增测试 56 个：新目标 test_store_binding 36（格式与偏移逐字节钉住、每个字节都受 MAC 保护且密钥号在验证前读出、读的每一种拒绝——大小、篡改、别的存储的文件、存储没有身份、密钥环没有的密钥、签名正确但环境或账户无效、版本不是 1、目录占着文件名；写一次的全部分支与写失败不留半个绑定；判定真值表；交易进程策略全表；sink 重载对 OperatorOpen / 围栏 / 未打开的拒绝；密钥轮换后旧绑定仍可验证；`frame_count()` 随重启保持）、流程 10（test_operator_resolution_flow 69 → 79：Testnet 无绑定放行并说两次、Production 无绑定拒绝、两种环境匹配、环境不符两个方向、账户不符六种差异乘两种环境、读不了的绑定乘两种环境、账户检查在先、无流量的拒绝在先、同一会话的第二个订单再判、环境映射）、工具 7（46 → 53：工具不写绑定、Production 要绑定、绑定匹配、环境不符、账户不符、读不了的绑定两种来源、`--list` 显示）、守卫 3（32 → 35）；证据文件的黄金串与摘要敏感性用例更新（9 个，不增），CLI 用法文字多两处断言。
       MSVC（/W4 /WX）全量构建零警告零错误；全量 ctest 3338 个登记用例（相对 R4 合并时的 3282 恰好多 56 项）：3336 通过（含 1 个既有跳过：SealIdWatermarkLoader.DirectoryIdentityChangeThenStickyFenceAreDistinct，Windows 上设计如此）、2 个既有禁用、0 失败。（这次 ALL_BUILD 没有撞上 CMake 4.4 的 gtest 发现竞态——0 个发现脚本失败；ctest -N 的 3338 与各可执行文件自己列出的 3337 加 1 个自检吻合。）
       GCC-14.2，本地 WSL2（源码经 tools/wsl_sync.sh 同步）：none（Release，-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wshadow）零警告，触及的 12 个测试可执行文件加 hy_operator_resolve（只编译）全部通过（store_binding 36、flow 79、bundle 9、tool 55、cli 26、guard 35、transport 36、real_exchange 14、append 26、reader 38、sink 80、export 42）；
