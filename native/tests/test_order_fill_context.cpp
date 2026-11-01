@@ -122,3 +122,89 @@ TEST(OrderFillContext, CapacityExhaustionRefusesWithoutCorruptingOtherEntries) {
     EXPECT_NE(ctx.find("HY-0"), nullptr);
     EXPECT_NE(ctx.find("HY-63"), nullptr);
 }
+
+// --- Private-stream migration M4 (order_durable_path.hpp): the durable shadow and the intended quantity ---
+
+using hy::DurableShadow;
+using hy::OrderState;
+
+TEST(OrderFillContextShadow, ATrackedOrderStartsAtIntentWithTheQuantityItWasSentWith) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-A", 1, OrderSide::Buy, 0, 0, 0, /*intended_qty_ticks=*/25));
+    const auto* e = ctx.find("HY-A");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->shadow.state, OrderState::Intent) << "the Intent frame was acknowledged before the order was tracked";
+    EXPECT_FALSE(e->shadow.maybe_submitting);
+    EXPECT_EQ(e->shadow.filled_qty_ticks, 0);
+    EXPECT_EQ(e->intended_qty_ticks, 25);
+}
+
+TEST(OrderFillContextShadow, AnExistingCallerThatPassesNoQuantityLeavesItUnknown) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-A", 1, OrderSide::Buy, 0, 0, 0));
+    EXPECT_EQ(ctx.find("HY-A")->intended_qty_ticks, 0) << "0 = unknown: no fill is ever planned for the order";
+}
+
+TEST(OrderFillContextShadow, AnAcknowledgedFrameMovesTheShadowAndTheFillOnlyGoesUp) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-A", 1, OrderSide::Buy, 0, 0, 0, 10));
+    ctx.durable_acked("HY-A", OrderState::Submitting, 0);
+    EXPECT_EQ(ctx.find("HY-A")->shadow.state, OrderState::Submitting);
+    ctx.durable_acked("HY-A", OrderState::PartialFill, 4);
+    EXPECT_EQ(ctx.find("HY-A")->shadow.state, OrderState::PartialFill);
+    EXPECT_EQ(ctx.find("HY-A")->shadow.filled_qty_ticks, 4);
+    ctx.durable_acked("HY-A", OrderState::Cancelled, 2);  // a frame that carries less fill does not lower the high-water mark
+    EXPECT_EQ(ctx.find("HY-A")->shadow.state, OrderState::Cancelled);
+    EXPECT_EQ(ctx.find("HY-A")->shadow.filled_qty_ticks, 4);
+}
+
+TEST(OrderFillContextShadow, AnAckForAnUntrackedOrderIsANoOpAndTouchesNoOtherOrder) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-A", 1, OrderSide::Buy, 0, 0, 0, 10));
+    ctx.durable_acked("HY-NEVER-TRACKED", OrderState::Filled, 10);  // must not crash, must not land on HY-A
+    EXPECT_EQ(ctx.find("HY-A")->shadow.state, OrderState::Intent);
+    EXPECT_EQ(ctx.find("HY-A")->shadow.filled_qty_ticks, 0);
+    EXPECT_EQ(ctx.count(), 1u);
+}
+
+TEST(OrderFillContextShadow, EachOrderKeepsItsOwnShadow) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-A", 1, OrderSide::Buy, 0, 0, 0, 10));
+    ASSERT_TRUE(ctx.track("HY-B", 2, OrderSide::Sell, 0, 0, 0, 20));
+    ctx.durable_acked("HY-A", OrderState::Accepted, 0);
+    ctx.durable_acked("HY-B", OrderState::PartialFill, 7);
+    EXPECT_EQ(ctx.find("HY-A")->shadow.state, OrderState::Accepted);
+    EXPECT_EQ(ctx.find("HY-A")->shadow.filled_qty_ticks, 0);
+    EXPECT_EQ(ctx.find("HY-B")->shadow.state, OrderState::PartialFill);
+    EXPECT_EQ(ctx.find("HY-B")->shadow.filled_qty_ticks, 7);
+    EXPECT_EQ(ctx.find("HY-A")->intended_qty_ticks, 10);
+    EXPECT_EQ(ctx.find("HY-B")->intended_qty_ticks, 20);
+}
+
+TEST(OrderFillContextShadow, SeedingOverwritesTheShadowOfATrackedOrderOnly) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-A", 1, OrderSide::Buy, 0, 0, 0, 10));
+    EXPECT_TRUE(ctx.seed_shadow("HY-A", hy::shadow_of_recovered(OrderState::Ambiguous, 3)));
+    const auto* e = ctx.find("HY-A");
+    EXPECT_EQ(e->shadow.state, OrderState::Ambiguous);
+    EXPECT_TRUE(e->shadow.maybe_submitting);
+    EXPECT_EQ(e->shadow.filled_qty_ticks, 3);
+    EXPECT_FALSE(ctx.seed_shadow("HY-NEVER-TRACKED", DurableShadow{})) << "nothing to seed";
+    EXPECT_EQ(ctx.count(), 1u);
+}
+
+TEST(OrderFillContextShadow, ARemovedOrderTakesItsShadowWithItAndASlotReusedStartsFresh) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-A", 1, OrderSide::Buy, 0, 0, 0, 10));
+    ASSERT_TRUE(ctx.track("HY-B", 2, OrderSide::Buy, 0, 0, 0, 10));
+    ctx.durable_acked("HY-B", OrderState::Filled, 10);
+    ctx.remove("HY-A");  // swap-with-last: HY-B moves into HY-A's slot and must keep its own shadow
+    ASSERT_NE(ctx.find("HY-B"), nullptr);
+    EXPECT_EQ(ctx.find("HY-B")->shadow.state, OrderState::Filled);
+    EXPECT_EQ(ctx.find("HY-B")->intended_qty_ticks, 10);
+    ctx.remove("HY-B");
+    ASSERT_TRUE(ctx.track("HY-C", 3, OrderSide::Buy, 0, 0, 0));  // the slot HY-B had: nothing of HY-B may leak into it
+    EXPECT_EQ(ctx.find("HY-C")->shadow.state, OrderState::Intent);
+    EXPECT_EQ(ctx.find("HY-C")->shadow.filled_qty_ticks, 0);
+    EXPECT_EQ(ctx.find("HY-C")->intended_qty_ticks, 0);
+}

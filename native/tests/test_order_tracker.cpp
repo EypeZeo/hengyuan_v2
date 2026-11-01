@@ -1366,6 +1366,9 @@ protected:
         ev.filled_qty_ticks = filled;
         ev.fill_delta_qty_ticks = filled;
         ev.avg_fill_price_ticks = avg_price;
+        // M4: the publisher plans against the order's DurableShadow. These tests model the single-writer world, where the log holds exactly the state the
+        // event says the order was in -- and an Ambiguous order may also be a last frame of Submitting, which is what shadow_of_recovered() keeps.
+        (void)fill_context_.seed_shadow(coid, shadow_of_recovered(prior, 0));
         EXPECT_TRUE(events_.try_push(ev));
     }
 
@@ -1610,6 +1613,9 @@ TEST_F(DrainDurableTest, NoAmbiguousFrameWhereTheResolutionIsLegalFromSubmitting
         const std::size_t before = probe_.frames.size();
         const InFlightHandle h = admit(coid);
         push(coid, h, c.result, c.prior);
+        // "Prior not provided" is the prior_state path's own case (SAFE-03 slice 1): an order the fill table does not hold. With a shadow of Intent the
+        // order would not be unknown but contradictory -- nothing of it was ever acknowledged, so there is nothing to follow.
+        if (c.prior == OrderState::Intent) fill_context_.remove(coid);
 
         drain();
 
@@ -1640,6 +1646,156 @@ TEST_F(DrainDurableTest, ADrainWithNothingQueuedAsksTheSinkNothing) {
     EXPECT_FALSE(publisher_.blocked());
     EXPECT_EQ(publisher_.acked_frames(), 0u);
     EXPECT_EQ(publisher_.failed_appends(), 0u);
+}
+
+// --- Private-stream migration M4: the publisher plans against the order's DurableShadow, not against the reconcile thread's prior_state ----------------
+//
+// A second writer (the user-data publisher) can have moved the log past what the reconcile thread knows. Every test below sets the shadow AFTER push() --
+// push() seeds it from the event's own prior_state, the single-writer world these fixtures model.
+
+TEST_F(DrainDurableTest, AResolutionTheLogAlreadyHoldsWritesNoFrameButStillReleasesTheFinalOrder) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, /*filled=*/100);
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-A", DurableShadow{OrderState::Filled, false, 100}));  // the stream already delivered it, durably
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 0) << "the log says this already: nothing to write";
+    EXPECT_EQ(publisher_.stale_skipped(), 1u);
+    EXPECT_EQ(publisher_.refused(), 0u);
+    EXPECT_EQ(publisher_.acked_frames(), 0u);
+    EXPECT_FALSE(publisher_.blocked());
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A")) << "the resolution is still applied: a final order releases its slot";
+    EXPECT_EQ(fill_context_.find("HY-A"), nullptr);
+    EXPECT_EQ(audit_.count(), 1u) << "and still reaches the audit ring";
+    EXPECT_EQ(truth_.net_qty_ticks(3), 100) << "memory catches up with what the log holds";
+}
+
+TEST_F(DrainDurableTest, AResolutionOlderThanWhatTheLogHoldsIsSkippedAndAFinalOrderIsNotReleasedByIt) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::PartialFill, OrderState::Accepted, /*filled=*/40);  // a REST answer from before the stream's FILLED
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-A", DurableShadow{OrderState::Filled, false, 100}));
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 0) << "a PartialFill after a Filled would make the whole log Corrupt";
+    EXPECT_EQ(publisher_.stale_skipped(), 1u);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-A")) << "PartialFill is not final: the later answer that says Filled releases it";
+    EXPECT_NE(fill_context_.find("HY-A"), nullptr);
+}
+
+TEST_F(DrainDurableTest, AResolutionThatContradictsTheLogIsRefusedWithoutAFrameAndStillApplied) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Accepted, /*filled=*/0);
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-A", DurableShadow{OrderState::Filled, false, 100}));  // both final, and different
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 0) << "no legal frame exists: nothing is written, so the log stays replayable";
+    EXPECT_EQ(publisher_.refused(), 1u);
+    EXPECT_EQ(publisher_.stale_skipped(), 0u);
+    EXPECT_FALSE(publisher_.blocked()) << "a refusal is not a retry";
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A")) << "applied all the same: the exchange stays the truth and the slot is not leaked";
+    EXPECT_EQ(audit_.count(), 1u);
+}
+
+TEST_F(DrainDurableTest, ThePlanFollowsTheShadowNotThePriorState) {
+    // The reconcile thread still knows the order as Ambiguous; the stream has since moved the log to Accepted. Ambiguous after Accepted is illegal, and
+    // the prior_state rule would write exactly that. Cancelled from Accepted is legal as it stands.
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous, /*filled=*/0);
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-A", DurableShadow{OrderState::Accepted, false, 0}));
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 1u) << "no Ambiguous re-record";
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Cancelled);
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-A"));
+}
+
+TEST_F(DrainDurableTest, AnExactAmbiguousShadowNeedsNoRemapFrame) {
+    // The orchestrator recorded the timeout itself, so the log is known to say Ambiguous: the re-record the prior_state rule would add is redundant.
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous, /*filled=*/0);
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-A", DurableShadow{OrderState::Ambiguous, false, 0}));
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 1u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Cancelled);
+}
+
+TEST_F(DrainDurableTest, TheShadowMovesOnlyWithAnAcknowledgedFrameSoARetryPlansFromWhatTheLogHolds) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous, /*filled=*/0);  // maybe Submitting: Ambiguous first, then Cancelled
+    probe_.fail_calls = {2};  // the Ambiguous frame lands, the resolution does not
+
+    drain();
+
+    EXPECT_TRUE(publisher_.blocked());
+    ASSERT_EQ(probe_.frames.size(), 1u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Ambiguous);
+    const OrderFillContextEntry* e = fill_context_.find("HY-A");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->shadow.state, OrderState::Ambiguous) << "advanced for the frame that WAS acknowledged ...";
+    EXPECT_FALSE(e->shadow.maybe_submitting) << "... which makes it exact";
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u) << "the retry writes only the resolution: the Ambiguous frame is already in the log";
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
+    EXPECT_FALSE(publisher_.blocked());
+}
+
+TEST_F(DrainDurableTest, AFrameThatIsNotAcknowledgedLeavesTheShadowWhereItWas) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, /*filled=*/100);
+    probe_.fail_all = true;
+
+    drain();
+
+    const OrderFillContextEntry* e = fill_context_.find("HY-A");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->shadow.state, OrderState::Accepted) << "a shadow ahead of the log makes the next planned frame illegal";
+    EXPECT_EQ(e->shadow.filled_qty_ticks, 0);
+}
+
+TEST_F(DrainDurableTest, AnAcknowledgedResolutionMovesTheShadowToWhatItSaid) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::PartialFill, OrderState::Accepted, /*filled=*/40);
+
+    drain();
+
+    const OrderFillContextEntry* e = fill_context_.find("HY-A");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->shadow.state, OrderState::PartialFill);
+    EXPECT_EQ(e->shadow.filled_qty_ticks, 40);
+}
+
+TEST_F(DrainDurableTest, AnOrderTheFillContextDoesNotHoldTakesThePriorStatePathAsBefore) {
+    const InFlightHandle h = admit("HY-A");
+    push("HY-A", h, OrderState::Cancelled, OrderState::Ambiguous, /*filled=*/0);
+    fill_context_.remove("HY-A");  // no shadow to plan against
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u) << "the Ambiguous re-record, then Cancelled: the rule SAFE-03 slice 1 wrote";
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
+    EXPECT_EQ(publisher_.stale_skipped(), 0u);
+    EXPECT_EQ(publisher_.refused(), 0u);
+}
+
+TEST_F(DrainDurableTest, AFillPastTheQuantityTheOrderWasSentWithIsRefusedNotWritten) {
+    const InFlightHandle h = in_flight_.register_submit_handle("HY-A");
+    ASSERT_TRUE(h.valid());
+    ASSERT_TRUE(fill_context_.track("HY-A", 3, OrderSide::Buy, 0, 0, 0, /*intended_qty_ticks=*/50));
+    push("HY-A", h, OrderState::Filled, OrderState::Accepted, /*filled=*/100);
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 0) << "the scan would take a Filled frame that overfills; this one is never written";
+    EXPECT_EQ(publisher_.refused(), 1u);
 }
 
 TEST(ReconcileDurablePublisherSurface, TheOnePendingResolutionHasOneOwner) {

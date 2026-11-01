@@ -304,28 +304,32 @@ struct DrainPin {
     std::size_t args;
     const char* barrier_arg;    // the exact text of the seventh argument; "" for a call that passes none
     const char* late_fill_arg;  // the exact text of the eighth argument (D5 slice R4); "" for a call that passes none
+    const char* durable_arg;    // the exact text of the ninth argument (private-stream migration M4); "" for a call that passes none
     const char* why;
 };
 
+constexpr std::size_t kDurableArgCount = 9;
 constexpr std::size_t kLateFillArgCount = 8;
 constexpr std::size_t kBarrierArgCount = 7;
 constexpr std::size_t kNoBarrierArgCount = 6;
 
 // Every production call of drain_user_data_events(), and what kind it is.
 const DrainPin kUserDataDrains[] = {
-    {"include/hengyuan/live_submit_orchestrator.hpp", 1, kLateFillArgCount, "ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr",
-     "ctx.late_fill",
-     "orchestrate_submit(): the barrier of the readiness Gate 2b consults (no readiness: no barrier, and Gate 2b refuses anyway), and the late-fill "
-     "alarm of the context (unset: the drain ignores a report about a written-off order, as before R4)"},
-    {"src/live_submit_preflight_harness.cpp", 3, kNoBarrierArgCount, "", "",
-     "NO BARRIER, NO ALARM: the listenKey stream stamps no generation (0 = always merged) and has no serverShutdown; retired with that stream in "
-     "M5; the harness opens a scratch store, so no operator has resolved an order in it"},
-    {"src/live_submit_real_credentials_demo.cpp", 3, kNoBarrierArgCount, "", "",
-     "NO BARRIER, NO ALARM: the listenKey stream stamps no generation and has no serverShutdown; the SubmitPort is assembled but never invoked; "
-     "there is no durable store at all"},
-    {"src/live_submit_reconcile_harness_demo.cpp", 2, kNoBarrierArgCount, "", "",
-     "NO BARRIER, NO ALARM: the listenKey stream stamps no generation and has no serverShutdown; nothing is ever submitted; there is no durable "
-     "store at all"},
+    {"include/hengyuan/live_submit_orchestrator.hpp", 1, kDurableArgCount, "ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr",
+     "ctx.late_fill", "ctx.user_data_durable",
+     "orchestrate_submit(): the barrier of the readiness Gate 2b consults (no readiness: no barrier, and Gate 2b refuses anyway), the late-fill "
+     "alarm of the context (unset: the drain ignores a report about a written-off order, as before R4), and the durable publisher of the context "
+     "(unset: the memory-first drain, acceptable only where no durable sink exists; a process that has one wires it -- M4)"},
+    {"src/live_submit_preflight_harness.cpp", 3, kNoBarrierArgCount, "", "", "",
+     "NO BARRIER, NO ALARM, MEMORY-FIRST: the listenKey stream stamps no generation (0 = always merged) and has no serverShutdown; retired with that "
+     "stream in M5, which also moves this harness onto the durable publisher; the harness opens a scratch store, so no operator has resolved an "
+     "order in it"},
+    {"src/live_submit_real_credentials_demo.cpp", 3, kNoBarrierArgCount, "", "", "",
+     "NO BARRIER, NO ALARM, MEMORY-FIRST: the listenKey stream stamps no generation and has no serverShutdown; the SubmitPort is assembled but "
+     "never invoked; there is no durable store at all"},
+    {"src/live_submit_reconcile_harness_demo.cpp", 2, kNoBarrierArgCount, "", "", "",
+     "NO BARRIER, NO ALARM, MEMORY-FIRST: the listenKey stream stamps no generation and has no serverShutdown; nothing is ever submitted; there is "
+     "no durable store at all"},
 };
 
 }  // namespace
@@ -383,6 +387,10 @@ TEST(SubmitReadinessGuard, TheExtractorsKnowWhatTheyAreLookingFor) {
     EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, ctx.late_fill);").back(), "ctx.late_fill");
     EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, nullptr);").back(), "nullptr")
         << "an explicit nullptr is eight arguments, and visibly not an alarm";
+    EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, h, ctx.user_data_durable);").size(), 9u);
+    EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, h, ctx.user_data_durable);").back(), "ctx.user_data_durable");
+    EXPECT_EQ(first_call("drain_user_data_events(a, b, c, d, e, f, g, h, nullptr);").back(), "nullptr")
+        << "an explicit nullptr is nine arguments, and visibly not a publisher";
     EXPECT_TRUE(call_args(code_only("inline void drain_user_data_events(A& a, B* b) noexcept {}"), name).empty()) << "a definition";
     EXPECT_TRUE(call_args(code_only("// drain_user_data_events(a, b)\n"), name).empty()) << "prose";
     EXPECT_EQ(count_substring("abcabcab", "abc"), 2u);
@@ -510,8 +518,8 @@ TEST(SubmitReadinessGuard, EveryProductionUserDataDrainIsPinnedWithItsBarrierArg
         if (pin == nullptr) {
             problems.push_back(f.rel + ": " + std::to_string(calls.size()) +
                                " call(s) to drain_user_data_events() that are not pinned in kUserDataDrains -- a call on the WebSocket API "
-                               "stream must pass the ReconnectBarrier and the late-fill alarm (8 arguments) or be pinned, with the reason it "
-                               "needs neither");
+                               "stream must pass the ReconnectBarrier, the late-fill alarm and the durable publisher (9 arguments) or be "
+                               "pinned, with the reason it needs none of them");
             continue;
         }
         if (calls.size() != pin->calls) {
@@ -530,6 +538,11 @@ TEST(SubmitReadinessGuard, EveryProductionUserDataDrainIsPinnedWithItsBarrierArg
             if (pin->args >= kLateFillArgCount && args[kLateFillArgCount - 1] != pin->late_fill_arg) {
                 problems.push_back(f.rel + ": the eighth argument is `" + args[kLateFillArgCount - 1] + "`, expected `" + pin->late_fill_arg +
                                    "` -- anything else (an explicit nullptr above all) is a drain with no late-fill alarm in disguise");
+            }
+            if (pin->args >= kDurableArgCount && args[kDurableArgCount - 1] != pin->durable_arg) {
+                problems.push_back(f.rel + ": the ninth argument is `" + args[kDurableArgCount - 1] + "`, expected `" + pin->durable_arg +
+                                   "` -- anything else (an explicit nullptr above all) is a memory-first drain in disguise: a report would reach "
+                                   "PositionTruth before its frame is durable");
             }
         }
     }

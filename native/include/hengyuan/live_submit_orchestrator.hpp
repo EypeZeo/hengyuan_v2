@@ -312,6 +312,14 @@ struct OrchestratorContext {
     // convention as reconcile_events above -- unset means orchestrate_submit() behaves exactly
     // as before (no WS event draining).
     UserDataWsEventRing* user_data_events{nullptr};
+    // Private-stream migration M4 (binance_user_data_event.hpp, design 6): the durable-first publisher of the execution reports drained from
+    // user_data_events. Set, a report reaches PositionTruth and the audit ring only after its frame -- planned against the order's DurableShadow in
+    // fill_context, which must then be wired too -- is durable, and what the log cannot take is refused and tells the barrier. Unset, the drain is the
+    // memory-first one it always was: acceptable only where no durable sink exists (the sink-less demo harnesses, a test of the memory half). A process
+    // that wires user_data_events and has a durable sink MUST wire this too -- test_order_durable_path_guard.cpp pins that for every production
+    // construction. Owned by the hot/submit thread and outliving every call (it holds the observations that are not durable yet); bind it to the same sink
+    // as durable_audit and reconcile_durable: one order's frames must not be split across two logs.
+    UserDataDurablePublisher* user_data_durable{nullptr};
 
     // D5 slice R4 (late_fill_alarm.hpp): the alarm for an execution report about an order an operator wrote off, built from the recovered store's
     // recovered_operator_resolved() list. Nullable, and unset means the drain above ignores such a report as it always did -- so a process that
@@ -381,6 +389,26 @@ struct OrchestratorContext {
     std::uint32_t order_weight{1};
 };
 
+namespace detail {
+
+// The ONE place this file appends a frame of an order's life to the durable log (private-stream migration M4): the append and -- only after its ACK --
+// the shadow of the order it belongs to (OrderFillContext::durable_acked()). What the planner of a LATER frame for the same order (order_durable_path.hpp,
+// used by the WebSocket and the reconcile publishers) judges legality against has to be what the log holds, so a frame that does not go through here is a
+// frame the shadow never hears about, and the next one planned from it can be illegal. Same condition as the six call sites had before it existed: no
+// valid port, or an append that was not acknowledged, is a failure and moves nothing. test_order_durable_path_guard.cpp pins that no other append_durable()
+// call is left in this file. The Intent frame (Gate 10b) is acknowledged before the order is tracked, so its shadow update is a no-op: track() starts the
+// shadow at Intent, which is what that frame says.
+[[nodiscard]] inline bool append_order_frame(OrchestratorContext& ctx, const AuditRecord& ar) noexcept {
+    if (!ctx.durable_audit.is_valid()) [[unlikely]] return false;
+    if (!ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) [[unlikely]] return false;
+    if (ctx.fill_context != nullptr) {
+        ctx.fill_context->durable_acked(std::string_view(ar.client_order_id), ar.resulting_state, ar.filled_qty_ticks);
+    }
+    return true;
+}
+
+}  // namespace detail
+
 // --- Core orchestration function ---
 
 inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept {
@@ -417,7 +445,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         drain_user_data_events(*ctx.in_flight, ctx.audit, *ctx.user_data_events, ctx.now_ms,
                                 ctx.position_truth, ctx.fill_context,
                                 ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr,
-                                ctx.late_fill);
+                                ctx.late_fill, ctx.user_data_durable);
     }
 
     // Gate 1: Audit available
@@ -615,7 +643,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
 
         // Gate 10b (spec §3/§6.2): real durable Ack, fail closed, before
         // CONFIRM/port-validity/in-flight registration.
-        if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+        if (!detail::append_order_frame(ctx, ar)) {
             result.gate = OrchestratorGate::AuditWriteNotAcked;
             return result;
         }
@@ -720,7 +748,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         (void)ctx.fill_context->track(coid.view(), ctx.symbol_id, ctx.side,
                                        ctx.pre_trade_rules_snapshot.price_scale,
                                        ctx.pre_trade_rules_snapshot.qty_scale,
-                                       ctx.pre_trade_rules_snapshot.quote_scale);
+                                       ctx.pre_trade_rules_snapshot.quote_scale,
+                                       ctx.qty_ticks);  // M4: the bound a planned fill is held against
     }
 
     // Gate 12d (spec §3/§6.2): real durable Ack for OrderSubmitPrepared, before
@@ -741,7 +770,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.resulting_state = OrderState::Submitting;  // target state this record authorizes; not applied yet
         ar.side = ctx.side;
 
-        if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+        if (!detail::append_order_frame(ctx, ar)) {
             // Never release the in-flight slot here -- a Failed result may still
             // have genuinely landed on the medium. State stays Intent; the
             // transition below never runs.
@@ -815,7 +844,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.avg_fill_price_ticks = resp.avg_fill_price_ticks;
             ar.side = ctx.side;
 
-            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+            if (!detail::append_order_frame(ctx, ar)) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
                 return result;
             }
@@ -894,7 +923,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.side = ctx.side;
             ar.set_detail("exchange rejected");
 
-            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+            if (!detail::append_order_frame(ctx, ar)) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
                 return result;  // in-flight slot NOT released, unlike an Acked reject
             }
@@ -927,7 +956,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.side = ctx.side;
             ar.set_detail("POST timeout - ambiguous, do NOT retry");
 
-            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+            if (!detail::append_order_frame(ctx, ar)) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
                 return result;
             }
@@ -959,7 +988,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.side = ctx.side;
             ar.set_detail("network error - ambiguous");
 
-            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+            if (!detail::append_order_frame(ctx, ar)) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
                 return result;
             }
@@ -995,7 +1024,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.side = ctx.side;
             ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
 
-            if (!ctx.durable_audit.is_valid() || !ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) {
+            if (!detail::append_order_frame(ctx, ar)) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
                 return result;
             }

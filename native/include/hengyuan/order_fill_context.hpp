@@ -34,6 +34,7 @@
 #pragma once
 
 #include <hengyuan/account_truth.hpp>  // OrderSide
+#include <hengyuan/order_durable_path.hpp>  // DurableShadow, after_ack (private-stream migration M4)
 #include <hengyuan/order_lifecycle.hpp>  // kClientOrderIdLen, kMaxInFlight
 
 #include <array>
@@ -50,6 +51,13 @@ struct OrderFillContextEntry {
     std::uint8_t qty_scale{0};
     std::uint8_t quote_scale{0};  // for an avg-fill-price computation at parity with the REST
                                    // formula (checked_scaled_mul_div(), account_truth.hpp)
+    // Private-stream migration M4 (order_durable_path.hpp). Appended last, like every additive field of a struct that crosses call sites.
+    // `shadow` is what the durable log holds for this order: Intent from track() on (the Intent frame was acknowledged before the order was
+    // tracked), advanced ONLY after a frame's durable ACK -- durable_acked() for every frame a writer makes durable, seed_shadow() for an order
+    // recovery hands back. `intended_qty_ticks` is the quantity the order was sent with, the bound a planned fill is held against; 0 = unknown, and
+    // plan_observation() then refuses every fill for the order (fail closed).
+    DurableShadow shadow{};
+    std::int64_t intended_qty_ticks{0};
 };
 
 // Fixed-capacity (kMaxInFlight, same as InFlightRegistry), zero-heap. Linear find/insert, same
@@ -62,8 +70,13 @@ public:
     // starting point for a freshly-registered order that has filled nothing yet. Returns false
     // (no-op) if already tracked (defensive; should be unreachable given the paired lifecycle)
     // or at capacity.
+    //
+    // `intended_qty_ticks` (M4, trailing default 0 = unknown -- omitted, nothing changes for an existing caller) is the quantity the order was sent
+    // with. The shadow starts at Intent: every caller tracks an order only after its Intent frame was acknowledged (and apply_recovery() overwrites
+    // it with seed_shadow() before the order is used).
     bool track(std::string_view coid, std::uint32_t symbol_id, OrderSide side,
-               std::uint8_t price_scale, std::uint8_t qty_scale, std::uint8_t quote_scale) noexcept {
+               std::uint8_t price_scale, std::uint8_t qty_scale, std::uint8_t quote_scale,
+               std::int64_t intended_qty_ticks = 0) noexcept {
         if (coid.empty() || coid.size() > kClientOrderIdLen) return false;
         if (find_slot(coid)) return false;  // already tracked -- defensive, should be unreachable
         if (count_ >= slots_.size()) return false;
@@ -77,9 +90,29 @@ public:
         s.ctx.price_scale = price_scale;
         s.ctx.qty_scale = qty_scale;
         s.ctx.quote_scale = quote_scale;
+        s.ctx.shadow = DurableShadow{};
+        s.ctx.intended_qty_ticks = intended_qty_ticks;
         s.last_applied_cumulative_qty_ticks = 0;
         ++count_;
         return true;
+    }
+
+    // M4: the shadow of an order recovery handed back (shadow_of_recovered()). Overwrites whatever the entry held. False (nothing changed) for an
+    // untracked coid.
+    bool seed_shadow(std::string_view coid, const DurableShadow& shadow) noexcept {
+        Slot* s = find_slot(coid);
+        if (!s) return false;
+        s->ctx.shadow = shadow;
+        return true;
+    }
+
+    // M4: a frame `(state, filled_qty_ticks)` of this order has been ACKNOWLEDGED by the durable log -- the one thing that may move the shadow. Called by
+    // every writer of order frames right after the ACK and never before it (a shadow ahead of the log makes the next planned frame illegal). An untracked
+    // coid is a normal no-op: the orchestrator's Intent frame is acknowledged before the order is tracked, and a late event can name an order that is gone.
+    void durable_acked(std::string_view coid, OrderState state, std::int64_t filled_qty_ticks) noexcept {
+        Slot* s = find_slot(coid);
+        if (!s) return;
+        s->ctx.shadow = after_ack(s->ctx.shadow, state, filled_qty_ticks);
     }
 
     // Called at the exact same call sites as InFlightRegistry::mark_resolved()/
