@@ -524,6 +524,18 @@ def run_maintenance(
             try:
                 verify = verify_fn(cfg)
                 (logs / ("verify-%s.txt" % stamp)).write_text(verify["text"], encoding="utf-8")
+                if verify["ok"]:
+                    # A verify that passed is recorded AT ONCE, not with the rest of the state at the end.
+                    # On a big lake the verify takes ~2.5 h and the report after it another half hour or
+                    # more, so the scheduler's time limit could kill the run before the final state write --
+                    # and a verify nobody recorded is due again at the next start, takes as long again and
+                    # is killed again. From 2026-10-28 to 2026-11-01 four verifies finished, none was
+                    # recorded, and state.json stayed at 10-27.
+                    state["last_verify_utc"] = now.isoformat()
+                    try:
+                        state_path.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+                    except OSError:
+                        pass  # best effort: the state write at the end says it again, as it always did
                 (logs / ("report-%s.txt" % stamp)).write_text(report_fn(cfg), encoding="utf-8")
             except Exception as exc:  # noqa: BLE001
                 verify = {
