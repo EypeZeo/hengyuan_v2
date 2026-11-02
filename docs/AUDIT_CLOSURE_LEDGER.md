@@ -26,6 +26,7 @@ python tools/closure_ledger_check.py --self-test
 - FI-046/047/048/049/054 及相关回归的细分故障与预算条件见蓝图 F.9。自动围栏和有限自动恢复、R2/180 天保留均未实现；不提高 ImplPathStatus，也不豁免首笔实盘之前的恢复、监控和 Owner 授权。
 - 2026-10-25（Q23 切片 1）：FI-055/056 里 NotSent 的语义已冻结于 `docs/NOTSENT_CLOSURE_DESIGN.md`，协议有模型 `formal/notsent_closure.tla`（模型层：设计配置无反例，8 个开关各有必败配置）。两条用例的状态、门禁结论与证据不变：模型不证明实现，实现、迁移与负控仍未做。
 - 2026-10-25（D5）：被困订单的出口（L-46）有了设计与模型（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`），与 FI-002、FI-003、FI-009、FI-011、FI-043 的状态与证据无关，一律不变；实现 R1（恢复读者）已于 2026-10-25 合入（PR #203，`a4372ba`），R2（证据原语）已于 2026-10-26 合入（PR #205，`99d8cb4`），R3-0（工具的持久层数据源）已于 2026-10-27 合入（PR #207，`f7b964c`），R3a（工具的流程：端口、确认短语与读行器、证据文件、`resolve_order()`，对着回环假交易所）已于 2026-10-29 合入（PR #210，`7b66a62`），R3b-1（离线工具的真实交易所读：客户端的原样回传 GET、`BinanceExchangeReadPort` 与配速 / 限流闩、账户 UID 与密钥所属账户的核对）已于 2026-10-30 合入（PR #212，`f06a3a2`），R3b-2（离线工具的命令行 `hy_operator_resolve`：严格的参数文法、`--list`、KEK 文件与密钥文件、只读专用凭据、终端适配器与证据目录、退出码）已于 2026-10-31 合入（PR #214，`bdaece6`），R3b-3（L-50 的附加防线：一个品种名只对不早于日志首次给出它的时刻发送的订单有效）已于 2026-10-31 合入（PR #216，`8b8ad5f`），R4（迟到成交告警：对已被操作员结清的订单，交易所一开口（该 COID 的任何执行报告）就熔断并写审计）已于 2026-10-31 合入（PR #218，`df9b363`），R5（存储的环境与账户绑定：日志记下它属于哪个交易所环境、哪个账户，离线工具据此核对）已于 2026-11-01 合入（PR #220，`3363115`），R6 的第一步（只读 Testnet 探针 `tools/r6_testnet_probe.py`：账户 `uid` 是否存在、不存在订单的真实应答、三个读端点是否可读；Owner 在 Testnet 上运行并贴回结果）已于 2026-11-01 合入（PR #221，`0ef2b4e`），都不改变上述任何一项的状态与证据，R6 的其余部分（运行手册、崩溃窗口演练、读延迟 L 的测量）未开始。
+- 2026-11-02（私网流迁移 M4）：用户数据流排空（审计 P1-002 的路径 ③）先落持久帧、再折进 `PositionTruth`（PR #224，`9675b6c`）。P1-002 的 `code` 段由 MISSING 改为 PRESENT（判断：持久出口已在代码里，未接发布者时的内存优先由守卫钉住并随 M5 删除；若认为这仍算缺口，改回 MISSING 即可），状态仍为 PARTIAL——`runtime` 与 `budget` 两段仍缺（没有进程运行这条排空，同步 fsync 的时延没有测量）；FI-031 的备注随之更新，状态与结果不变。其余条目的状态与证据不变。
 
 本次只同步合同说明；本表与蓝图状态一致性仍由下列核对工具验证，不能用文档合并关闭未执行的故障用例。
 
@@ -109,7 +110,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | :---: | :---: | :---: | :---: | :--- | :---: | :--- |
 | **P0-001** | CRITICAL | live | REMEDIATING | 实盘订单提交 | BLOCKED | code, fault, test, runtime, budget |
 | **P1-001** | HIGH | lib | CLOSED | 真实网络调用 | CLEARED | — |
-| **P1-002** | HIGH | live | PARTIAL | 订单生命周期 | BLOCKED | code, runtime, budget |
+| **P1-002** | HIGH | live | PARTIAL | 订单生命周期 | BLOCKED | runtime, budget |
 | **P1-003** | HIGH | lib | CLOSED | 账户数据解析 | CLEARED | — |
 | **P1-004** | HIGH | lib | PARTIAL | 策略回测准入 | BLOCKED | contract |
 | **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | code, fault, test, runtime, budget |
@@ -297,14 +298,14 @@ status: PARTIAL
 task: SAFE-03
 gate: 订单生命周期
 gate_result: BLOCKED
-open: open:native/include/hengyuan/binance_user_data_event.hpp#"AuditRingSink* audit,"
-refs: pr:169@38d59cf code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher code:native/include/hengyuan/order_tracker.hpp#drain_reconcile_events code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_reconcile_durable_guard.cpp#EveryProductionDrainCallIsPinnedWithItsDurableArgument
-seg.code: MISSING -- 对账排空已先持久确认再发布（ReconcileDurablePublisher）；drain_user_data_events 仍只写内存环形缓冲（它持有的是 const 注册表，不释放槽位），其终态观察从未进入持久 sink
+open: open:native/include/hengyuan/binance_user_data_event.hpp#"UserDataDurablePublisher* durable = nullptr" absent:native/src/*.cpp#StartupRecovery
+refs: pr:169@38d59cf pr:224@9675b6c code:native/include/hengyuan/binance_user_data_event.hpp#UserDataDurablePublisher code:native/include/hengyuan/order_durable_path.hpp#plan_observation code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher code:native/include/hengyuan/order_tracker.hpp#drain_reconcile_events code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_reconcile_durable_guard.cpp#EveryProductionDrainCallIsPinnedWithItsDurableArgument
+seg.code: PRESENT code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events code:native/include/hengyuan/binance_user_data_event.hpp#UserDataDurablePublisher code:native/include/hengyuan/order_durable_path.hpp#plan_observation code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher -- 对账排空与用户数据流排空都先持久确认再折进内存：ReconcileDurablePublisher（PR #169）与 UserDataDurablePublisher（经 drain_user_data_events 的 durable 参数，M4，PR #224；规划器 order_durable_path.hpp 与持久影子 DurableShadow）。限度：drain_user_data_events 未接发布者时仍是内存优先（默认参数；编排器的 user_data_durable 字段默认为空），listenKey 线束与演练的调用点就是如此，由守卫钉住并随 M5 删除；接了 WS 环的生产上下文必须同时接发布者（守卫钉住，今天空转）
 seg.contract: PRESENT doc:docs/SPEC_INVARIANTS.md#drain_reconcile_events bp:"任务 SAFE-03" -- 规格与任务已定义“先持久确认、再释放”
-seg.fault: PRESENT:UT test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderEscalatedToTheOperatorLeavesALogThatReplaysAndKeepsItOpen -- 对账路径的两个崩溃位置在真实日志上注入（FI-031 的单元测试级证据）；用户数据流路径没有
-seg.test: PRESENT test:native/tests/test_order_tracker.cpp#AResolutionThatStaysUnacknowledgedKeepsBeingRetriedAndNeverPublishesAlone test:native/tests/test_live_submit_orchestrator.cpp#ADurableFailureHoldsTheResolutionAndTheSlotUntilTheSinkAcknowledges test:native/tests/test_reconcile_concurrency.cpp#HotThreadAndReconcileThreadRaceCleanly -- 对账路径：次序在追加调用内部观察、失败不发布且恰好一次地重试、队头阻塞、回放合法性前缀及其边界、编排器失败关闭、两个真实线程之后重放日志；24 个变异体全部被预期用例杀死
-seg.runtime: MISSING -- 对账路径的崩溃恢复只有单元测试级证据（真实 DurableAuditSink 日志上的重启，CI 上随全量测试通过），没有端到端的重启运行日志（启动恢复状态机尚未接入任何运行中的程序）；用户数据流路径两者都没有
-seg.budget: MISSING -- 同步 fsync 进入对账路径后的时延与成本仍未测量（每个事件一帧，需要前缀时两帧）
+seg.fault: PRESENT:UT test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderEscalatedToTheOperatorLeavesALogThatReplaysAndKeepsItOpen -- 对账路径的两个崩溃位置在真实日志上注入（FI-031 的单元测试级证据）；用户数据流路径（M4）：持久追加失败时不折进内存、不弹出队头、同一观察重试，每个 Write 计划都能在真实 DurableAuditSink 日志上重启回放，但没有在“交易所已推、持久未确认”的位置杀进程的注入
+seg.test: PRESENT test:native/tests/test_order_tracker.cpp#AResolutionThatStaysUnacknowledgedKeepsBeingRetriedAndNeverPublishesAlone test:native/tests/test_live_submit_orchestrator.cpp#ADurableFailureHoldsTheResolutionAndTheSlotUntilTheSinkAcknowledges test:native/tests/test_reconcile_concurrency.cpp#HotThreadAndReconcileThreadRaceCleanly -- 对账路径：次序在追加调用内部观察、失败不发布且恰好一次地重试、队头阻塞、回放合法性前缀及其边界、编排器失败关闭、两个真实线程之后重放日志；24 个变异体全部被预期用例杀死。用户数据流路径（M4）：次序（ACK 先于每一个内存效果）、合并与丢弃较旧、失败与重试、每一种拒绝并通知屏障、影子不超前（守卫逐点钉住）、对真实 DurableAuditSink 的差分与随机游走；113 个变异体 = 108 杀死 + 5 等价
+seg.runtime: MISSING -- 对账路径的崩溃恢复只有单元测试级证据（真实 DurableAuditSink 日志上的重启，CI 上随全量测试通过），没有端到端的重启运行日志（启动恢复状态机尚未接入任何运行中的程序）；用户数据流路径同样只有单元测试级证据，且没有任何进程运行这条排空（M5 接线）
+seg.budget: MISSING -- 同步 fsync 进入对账路径后的时延与成本仍未测量（每个事件一帧，需要前缀时两帧）；用户数据流路径同样未测量（M4 的合并发布者让 fsync 次数与订单数而不是成交数成正比，仍在热线程上）
 closure: SAFE-03 完成；FI-031 的崩溃重启恢复日志取得
 ```
 
@@ -1246,9 +1247,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 38d59cf
-open: open:native/include/hengyuan/binance_user_data_event.hpp#"AuditRingSink* audit,"
+open: absent:native/src/*.cpp#StartupRecovery
 refs: test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderResolvedToCancelledLeavesALogThatReplaysClean test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_order_tracker.cpp#AnUnacknowledgedAppendPublishesNothingAndTheNextDrainRetriesTheSameResolution code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher pr:169@38d59cf
-note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。仍缺：用户数据流排空函数（同形缺口，下一片）、启动恢复状态机尚未接入任何运行中的程序，所以没有端到端的重启运行日志，判定信号是单元测试。
+note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。用户数据流排空函数的同形缺口由 M4 补上（PR #224，9675b6c：先持久确认再折进持仓真值，规划器保证写出的日志可回放，单元测试级）。仍缺：启动恢复状态机尚未接入任何运行中的程序，所以没有端到端的重启运行日志，判定信号是单元测试。
 ```
 
 ```ledger

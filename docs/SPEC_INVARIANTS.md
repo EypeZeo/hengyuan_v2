@@ -201,7 +201,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - `test_barrier_sweep_guard.cpp`：`poll_once()` 里取请求在排空入口环之前；标记只有一个制造点（`poll_once()`），屏障报告只有两个应用点
     （`SweepPump` 与 `SyntheticReadiness`）；请求只由 `SweepPump` 制造和推送、只由 `SweepJob` 弹出；每个生产 `drain_reconcile_events()`
     调用的参数个数与 sink 参数的确切文本被固定；没有生产的 `poll_once()` 带 `SweepJob`。
-- 路径 ③ 的持久优先（私网流迁移 M4，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §6，审计 P1-002 的第二条路径）— `drain_user_data_events()` 先落持久帧、
+- 路径 ③ 的持久优先（私网流迁移 M4，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §6，审计 P1-002 的第二条路径；Owner 于 2026-11-01 说“合并 220 221 222，开始 M4”，对 PR #224 说“合并 224 225”；Tier B；PR #224，合并提交 9675b6c）— `drain_user_data_events()` 先落持久帧、
   再折进 `PositionTruth`。**没有新的跨线程原语、没有新的原子量**：影子、待定表、发布者全部是热线程独占状态（发布者不可拷贝不可移动，须比每次排空调用
   都长寿）；并发覆盖仍来自 test_reconcile_concurrency / test_sweep_concurrency，它们的热线程现在也带影子。
   - **持久影子 `DurableShadow`**（`order_durable_path.hpp`，纯函数头，只依赖 `order_lifecycle.hpp`）：`OrderFillContext` 的每个槽位记下“日志现在对
@@ -236,7 +236,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     `test_order_durable_path_guard.cpp` 钉住“凡是给上下文接了 `user_data_events` 的生产文件也必须接 `user_data_durable`”（今天空转，M5 接线时生效）。
   - **证据**：`test_order_durable_path.cpp`（规划器的逐格表、对恢复扫描规则的性质测试与“拒绝无遗漏”的暴力路由搜索、对真实 `DurableAuditSink` 的差分——每个 Write 计划都
     能重启回放、每个拒绝要么被扫描判 `Corrupt` 要么是成交量自相矛盾——以及多订单随机游走：重开后的日志与每个未完结订单的影子逐一相等；两个写者共享影子的游走）、
-    `test_user_data_durable.cpp`（31 例：次序、合并、失败与重试、`Ambiguous` 前缀、每一种拒绝与它通知屏障）、`test_live_submit_orchestrator.cpp` 里的 LiveSubmitShadowTest
+    `test_user_data_durable.cpp`（34 例：次序、合并、失败与重试、`Ambiguous` 前缀、每一种拒绝与它通知屏障）、`test_live_submit_orchestrator.cpp` 里的 LiveSubmitShadowTest
     （每个 ACK 点之后的影子，失败时不动；经 `orchestrate_submit()` 的持久 WS 路径；该路径零分配）、`test_startup_recovery.cpp`（播种）。
 
 ### 容量 / 生命周期
