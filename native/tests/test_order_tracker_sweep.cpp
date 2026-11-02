@@ -556,6 +556,8 @@ protected:
         const InFlightHandle h = in_flight_.register_submit_handle(coid);
         EXPECT_TRUE(h.valid());
         EXPECT_TRUE(fill_context_.track(coid, 3, OrderSide::Buy, 0, 0, 0));
+        // M4: the order is live (the exchange acknowledged it), which is what the log holds -- the resolutions below say prior Accepted.
+        EXPECT_TRUE(fill_context_.seed_shadow(coid, DurableShadow{OrderState::Accepted, false, 0}));
         return h;
     }
 

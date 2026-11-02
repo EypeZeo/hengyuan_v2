@@ -201,6 +201,43 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - `test_barrier_sweep_guard.cpp`：`poll_once()` 里取请求在排空入口环之前；标记只有一个制造点（`poll_once()`），屏障报告只有两个应用点
     （`SweepPump` 与 `SyntheticReadiness`）；请求只由 `SweepPump` 制造和推送、只由 `SweepJob` 弹出；每个生产 `drain_reconcile_events()`
     调用的参数个数与 sink 参数的确切文本被固定；没有生产的 `poll_once()` 带 `SweepJob`。
+- 路径 ③ 的持久优先（私网流迁移 M4，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §6，审计 P1-002 的第二条路径）— `drain_user_data_events()` 先落持久帧、
+  再折进 `PositionTruth`。**没有新的跨线程原语、没有新的原子量**：影子、待定表、发布者全部是热线程独占状态（发布者不可拷贝不可移动，须比每次排空调用
+  都长寿）；并发覆盖仍来自 test_reconcile_concurrency / test_sweep_concurrency，它们的热线程现在也带影子。
+  - **持久影子 `DurableShadow`**（`order_durable_path.hpp`，纯函数头，只依赖 `order_lifecycle.hpp`）：`OrderFillContext` 的每个槽位记下“日志现在对
+    这个订单说了什么”（最后一个已确认帧的状态、累计成交量的高水位——与恢复扫描自己的高水位一致、`maybe_submitting`）和订单发出时的数量
+    `intended_qty_ticks`（0 = 未知，此时任何成交都被拒绝）。**它只在持久 ACK 之后移动**（`OrderFillContext::durable_acked()`），并且**每一处**写订单帧
+    的地方都必须移动它：编排器的 7 个帧统一经 `detail::append_order_frame()`（Intent 在登记之前确认，所以对它是空操作）、对账发布者、用户数据发布者；
+    恢复路径在 `apply_recovery()` 里用 `shadow_of_recovered()` 播种（恢复出的 `Ambiguous` 检查点可能对应日志里的 `Submitting`，ABI 钉住的检查点说不出
+    来，所以影子带 `maybe_submitting`，第一个 ACK 之后才变确切）。超前（ACK 之前就动）与落后（漏一处）都会让之后规划的帧非法、下次启动整本日志 `Corrupt`，
+    所以 `test_order_durable_path_guard.cpp` 逐点钉死：谁能追加订单帧（按文件的计数表）、谁能移动影子（计数）、谁能赋值影子（只有 `OrderFillContext` 的三处）、
+    每个写者内部的文本次序（规划 → 追加 → 影子 → 折叠 → 环记录）、`track()` 必须带数量。
+  - **规划**（`plan_observation()` / `plan_resolution()` / `state_path()`，全由 `validate_transition()` 推导，不抄状态表）：目标只能是交易所能说的 7 个状态
+    （对账路径多一个本地决定 `EscalatedToOperator`）；结果是 Write（可带**一帧** `Ambiguous` 前缀）、Stale（日志已说过或已更晚，不写）、Unreachable（写了
+    就会破坏回放或自相矛盾，拒绝）。前缀只在它为真的地方给：`Submitting` 到只有 `Ambiguous` 才到得了的状态，或恢复订单中两种可能末帧不都合法的目标；
+    `Accepted`/`PartialFill` 永不补（`→ Ambiguous` 不是边，也不是事实）；影子仍为 `Intent` = 有写者漏了 ACK 点，一律拒绝。**写者侧对每一帧都检查成交量**
+    （不降、不超 `intended_qty_ticks`、无意图量则拒绝任何成交），比恢复扫描严——扫描只对“同状态重复帧”检查，状态转移帧只看 `validate_transition()`，所以
+    转移帧上的超量或回退会被它静默接受（蓝图附录 D 的 L-51，随 M4 合入后的文档同步登记；收紧扫描是格式兼容性决定，不在 M4）。已知局限（L-52）：
+    `CancelRequested` 之后的 `PARTIALLY_FILLED` 是 Unreachable（没有这条边），树里还没有撤单路径，有了那天再决定。
+  - **`UserDataDurablePublisher`**（`binance_user_data_event.hpp`）+ `drain_user_data_events(..., durable)`：一份报告被解析、与本次排空里同一订单的其他报告合并
+    （最新的胜出：较新的替换、较旧的丢弃、互相矛盾的拒绝后者；一串成交只落一帧）、按影子规划、写入、ACK 之后才 `consume_delta()`/`apply_fill()` 并写环记录
+    （持久模式下环里的记录就是落盘的帧，带**累计**成交量；旧的内存优先路径仍写增量记录）。队头阻塞与对账发布者一致：有观察未持久时排空**什么也不弹**（环满、
+    会话计丢弃、屏障拦截新单）。**拒绝**（无法映射的状态、读不出的成交量、在途但不在上下文表里的订单、与提交时记录的方向不符、与日志或与自己矛盾）：计数、在环里留
+    一条无成交的痕迹、调用 `ReconnectBarrier::on_event_refused()`——丢失事件的同一个软屏障，所以由一次 REST 清扫去读真相，而不是本进程去猜。控制事件
+    （`serverShutdown` 等）与迟到成交告警在两种模式下一样工作。
+  - **对账发布者以影子为准**（`ReconcileDurablePublisher::next_acked(..., shadows)`，`drain_reconcile_events()` 传入已有的 `fill_context`）：用户数据发布者成为
+    同一批订单帧的第二个写者之后，对账线程的 `prior_state` 不再等于日志的状态——一个迟到的旧 REST 答案（`PartialFill`）落在 WS 已推到 `Filled` 的日志后面，
+    就是整本日志 `Corrupt`。有影子的订单按影子规划：Write 写规划指定的帧；Stale 不写帧但事件照常应用（终态仍释放槽位）；Unreachable 不写、计数（`refused()`），
+    事件照常应用（日志保持可回放，交易所仍是真相，槽位不泄漏）。影子精确为 `Ambiguous` 时不再补多余的 `OrderAmbiguous`（单写者时代的行为多写一帧）；不在表里的
+    订单仍走 `prior_state` 路径。
+  - **编排器**：`OrchestratorContext` 的 `user_data_durable` 字段（`UserDataDurablePublisher*`）原样传给排空；**未接发布者时排空仍是旧的内存优先行为**（只允许没有持久
+    sink 的场景），不像对账环那样失败关闭——现有 7 个以上测试靠它测屏障联动，生产里没有任何地方构造带 WS 环的上下文（M5 接线）。`test_submit_readiness_guard.cpp`
+    把每个生产 `drain_user_data_events()` 的第 9 个参数钉住（编排器必须传 `ctx.user_data_durable`，listenKey 线束 6 个参数且写明理由），
+    `test_order_durable_path_guard.cpp` 钉住“凡是给上下文接了 `user_data_events` 的生产文件也必须接 `user_data_durable`”（今天空转，M5 接线时生效）。
+  - **证据**：`test_order_durable_path.cpp`（规划器的逐格表、对恢复扫描规则的性质测试与“拒绝无遗漏”的暴力路由搜索、对真实 `DurableAuditSink` 的差分——每个 Write 计划都
+    能重启回放、每个拒绝要么被扫描判 `Corrupt` 要么是成交量自相矛盾——以及多订单随机游走：重开后的日志与每个未完结订单的影子逐一相等；两个写者共享影子的游走）、
+    `test_user_data_durable.cpp`（31 例：次序、合并、失败与重试、`Ambiguous` 前缀、每一种拒绝与它通知屏障）、`test_live_submit_orchestrator.cpp` 里的 LiveSubmitShadowTest
+    （每个 ACK 点之后的影子，失败时不动；经 `orchestrate_submit()` 的持久 WS 路径；该路径零分配）、`test_startup_recovery.cpp`（播种）。
 
 ### 容量 / 生命周期
 
@@ -725,6 +762,13 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       其余都由行为测试在第一阶段杀死。逐类的覆盖：读侧（SB01 至 SB28：读回什么都没有或状态错、目录占着文件名被当作无绑定、早期拒绝都说 Unbound、uuid 的两半各自或同时不比、有身份缺失的存储认领 0/0 的文件、环境无效或账户 0 被相信、更长的文件被截成 70 字节、版本与 MAC 不查、MAC 少盖一个字节、密钥号读错位置、38 字节的边界、uuid 两半读反、文件名变了、判定先说账户、较小的账户通过、无绑定当作匹配、读不了当作无绑定、环境码与名字）；
       写侧（SW01 至 SW17：环境、账户、时间、密钥号各写成别的值，uuid 两半写反，MAC 少盖一个字节，账户 0 与无环境可绑定，无身份的存储可绑定，读不了的文件被覆盖，“相同” 的判定少一个条件或用或，AlreadyBound 与 Conflict 互换，缺密钥时仍写）与策略（SW20 至 SW51：坏声明的各个半边、无身份、五种判定的状态映射、Production 旧存储的拒绝条件的各种弱化、Legacy 与 New 的各种互换、sink 重载的三个入口条件各去掉一个、历史判定的四种篡改、签名用的密钥、可用状态集合与名字）；sink 访问器（SK01 至 SK03）；
       流程（FL01 至 FL23：四个拒绝状态的各种互换、放行条件的各种弱化与反转、判定忽略会话的绑定、结果不记入、两处控制台文字去掉或改写、证据文件不记、会话不保存、拒绝文字改写、环境映射）；证据文件（BD01 至 BD07：状态恒为 Bound、字段的条件反转、环境与账户与时间写成别的字段、空值分支少一个键、键名）；工具（TL01 至 TL12：uuid 两半读反、会话不带绑定、列表不带绑定、三行列表文字改写、列表的环境与时间字段、四个解释行的条件各去掉一个、解释文字）；用法文字（CL01、CL02）。
+
+  - **[D5 切片 R6 第一步已落地：只读 Testnet 探针——量出三个设计与代码都假设过、没人量过的交易所事实]**
+    （`docs/OPERATOR_RESOLUTION_DESIGN.md` §9、§10 的 R6 行；Owner 2026-11-01 同意把 R6 的 Testnet 探测放在 M5a 之前、由他来跑，对 PR #221 说“合并 220 221 222”；Tier A；PR #221，合并提交 0ef2b4e）：`tools/r6_testnet_probe.py` 是一个独立的 Python 脚本（不在 `native/` 里，不是 `hy_operator_resolve`），只发 5 个 GET（`time`、`account`、`order`、`allOrders`、`openOrders`），只连 `testnet.binance.vision`（没有改主机的参数），读与工具同一组只读凭据变量 `HENGYUAN_OPERATOR_TESTNET_API_KEY` / `..._SECRET`（环境或 `--env-file`），HMAC-SHA256 签名；不下单、不撤单、不写文件，不打印密钥、密钥串、签名，`uid` 只打印 “present, N digits”；传输失败最多重试三次（每次重新签名）并打印异常类名。**我没有也不会用真实凭据运行它**——Owner 在本机填 `.env`、运行、只贴回输出末尾的 JSON 块。
+    - **量出的事实**（Owner 2026-11-01 在 Binance Spot Testnet 上用一把只含 `USER_DATA` 权限的 HMAC 只读密钥运行）：(1) `GET /api/v3/account` → HTTP 200，带 `uid`（整数、19 位十进制、非零），`accountType` 为 SPOT、`canTrade` 为真——所以工具的账户核对（R3b-1）与交易侧的 `ensure_store_binding()`（R5，M5 接线）可以在 Testnet 上用它；19 位十进制可能超出 int64，代码里账户 uid 一律按完整范围的 uint64 处理（命令行文法、账户读取、绑定文件），这一点现在有了真实的理由。(2) 查一个不存在的订单 → **HTTP 400，`code` -2013，`msg` “Order does not exist.”**，正是设计的假设（`classify_point_query()` 把 “HTTP 400 且 `code` 恰为 -2013” 当作无此单）。(3) `order`、`allOrders`、`openOrders` 对这把密钥都有应答；`allOrders`（最近一小时、`limit` 1）与 `openOrders` 返回 200 和 0 行（还没下过单）。
+    - **没有量出的**：`allOrders` 的读延迟 L（需要在 Testnet 下几张单，Owner 的动作，探针不含）；`-2026`（订单存在过但已归档）的真实表现（需要一张已归档的订单）；真实的 `hy_operator_resolve` 对 Testnet 的一次运行（运行手册一节与崩溃窗口订单的演练，R6 的其余部分）；Production 的 `uid` 与 -2013 表现（只读的 Production 凭据 `HENGYUAN_OPERATOR_LIVE_*` 至今没有用过）。Owner 到 Testnet 的链路慢（往返 1.7 至 3.4 秒），从那台机器量的任何延迟都会有噪声。
+    - **关闭了的开放问题**：上面 R3b-1、R3b-2、R3b-3 与 R4 条目的 “仍未覆盖” 把 “Testnet 的 `/api/v3/account` 是否带 `uid`（若不带，流程会以 `AccountUnverified` 挡住演练）” 与 “`-2013` 的真实状态码” 记为未量，设计 §9 把 “`-2013` 的状态是声明的一部分、真实表现由 R6 测量” 当作假设；这两件现已量过：Testnet 带 `uid`，工具不会挡住演练；不存在的订单就是 HTTP 400 / -2013。那几个条目保持写作当时的原文，答案在这里。
+    - **验证**：py_compile、ruff check（E、F、W）通过；离线自检（假传输）覆盖恰好 5 个 GET、请求头带密钥且查询带 `timestamp` / `recvWindow` / `signature`、输出里没有密钥 / 密钥串 / `uid` 的值、`uid` 存在与缺失两条路径、没有凭据时退出码 2 且不发任何请求、`.env` 解析。没有触碰 `native/`，所以原生 CI 没有运行。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 

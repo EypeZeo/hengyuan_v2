@@ -31,6 +31,8 @@
 //   * admit_event(g): an event stamped with a generation OLDER than the Reconciled one is dropped (and counted): the sweep already reflects
 //     whatever it said. Before Reconciled -- Down or Sweeping -- old events are merged: OrderFillContext::consume_delta() only ever applies a
 //     positive delta, so a late duplicate is harmless there. Generation 0 means "not stamped" (the retired listenKey session) and is always merged.
+//   * on_event_refused() (M4): the user-data publisher refused an event it drained -- one it could not record without breaking the durable log, or
+//     that contradicts it. Not knowing what it said is what a lost event is, so it is a soft barrier too.
 //
 // THREAD OWNERSHIP: the hot/submit thread, together with the rest of the order state (order_lifecycle.hpp's contract). No atomics, no heap, no
 // I/O, no clocks of its own (every time comes in as an argument, all in the same steady-clock millisecond domain as the session's
@@ -102,6 +104,7 @@ struct BarrierStats {
     std::uint64_t stale_heartbeats{0};     // sessions declared dead for silence
     std::uint64_t generation_ends_seen{0}; // on_generation_ended() calls that ended the tracked (or a newer) generation
     std::uint64_t late_events_dropped{0};  // admit_event() == false
+    std::uint64_t events_refused{0};       // on_event_refused() calls (M4), counted in every state; the ones outside Down also count in soft_barriers
 };
 
 namespace detail {
@@ -178,6 +181,18 @@ public:
         const bool pending = stop_pending_;
         stop_pending_ = false;
         return pending;
+    }
+
+    // The stream delivered an event that this process refused to act on (private-stream migration M4, design 6.3: the user-data publisher could not record
+    // it without breaking the durable log's replay, it contradicts what the log holds, or it names a status nobody can map). What it said is not known here,
+    // which is exactly what a LOST event is, and it is answered the way observe() answers a dropped one: a Reconciled barrier goes back to Sweeping (what an
+    // earlier sweep reported may be out of date) and a running sweep starts over under a new epoch (its answer may predate whatever the event said). Down
+    // already refuses, and a sweep begins when the stream is back, so only the count moves there.
+    constexpr void on_event_refused() noexcept {
+        ++stats_.events_refused;
+        if (state_ == BarrierState::Down) return;
+        ++stats_.soft_barriers;
+        begin_sweep();
     }
 
     // --- the sweep (design 5.3; the transport is barrier_sweep.hpp / sweep_pump.hpp, M3b) -------------------------

@@ -73,7 +73,7 @@ enum class TransitionResult : std::uint8_t {
     AlreadyTerminal = 2,
 };
 
-inline bool is_terminal(OrderState s) noexcept {
+constexpr bool is_terminal(OrderState s) noexcept {
     return s == OrderState::Rejected ||
            s == OrderState::Filled ||
            s == OrderState::Cancelled ||
@@ -98,7 +98,9 @@ inline bool is_exchange_final(OrderState s) noexcept {
            s == OrderState::Expired;
 }
 
-inline TransitionResult validate_transition(OrderState from, OrderState to) noexcept {
+// constexpr (M4): order_durable_path.hpp derives which frames make a WebSocket observation replayable from this very
+// function, at compile time, so its table can be static_assert-ed and can never drift from the state machine.
+constexpr TransitionResult validate_transition(OrderState from, OrderState to) noexcept {
     if (is_terminal(from)) return TransitionResult::AlreadyTerminal;
 
     switch (from) {

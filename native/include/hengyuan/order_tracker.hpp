@@ -889,8 +889,17 @@ public:
     // the durable append was not acknowledged. In the second case blocked() is true and the next call retries
     // the same append; nothing behind the pending event is popped meanwhile. An unwired port reads as
     // "not acknowledged" (DurableOrderAuditPort::append_durable() fails when no function is injected).
+    //
+    // `shadows` (private-stream migration M4, trailing default nullptr -- omitted, nothing below changes): the OrderFillContext whose entries hold each
+    // order's DurableShadow (order_durable_path.hpp), i.e. what the log really holds for it. With it, a resolution for a TRACKED order is planned against that
+    // shadow instead of against the reconcile thread's prior_state -- the user-data publisher (a second writer of the same orders' frames) can have moved the
+    // log past what the reconcile thread knows, and a resolution written from a stale prior_state (a REST answer older than a FILLED the stream already
+    // delivered) would make the whole log Corrupt at the next start. Write: the frames the plan names, shadow advanced after each ACK. Stale (the log already
+    // says this or more): no frame, the event is still handed back and applied (a final one still releases its slot). Unreachable (it contradicts the log):
+    // no frame either, counted (refused()), the event applied all the same -- the log stays replayable and the exchange stays the truth. An untracked order
+    // takes the prior_state path as before.
     bool next_acked(ReconcileEventRing& events, std::int64_t now_ms, ReconcileEvent& ev_out,
-                    AuditRecord& record_out) noexcept {
+                    AuditRecord& record_out, OrderFillContext* shadows = nullptr) noexcept {
         if (!has_pending_) {
             if (!events.try_pop(pending_)) return false;
             if (pending_.kind != ReconcileEventKind::Resolution) {
@@ -903,6 +912,7 @@ public:
             has_pending_ = true;
             remap_acked_ = false;
         }
+        if (shadows != nullptr && shadows->find(pending_.coid.view()) != nullptr) return publish_planned(*shadows, now_ms, ev_out, record_out);
         if (!remap_acked_ && detail::needs_ambiguous_remap_frame(pending_)) {
             if (!append(detail::make_ambiguous_remap_record(pending_, now_ms), now_ms)) return false;
             remap_acked_ = true;  // a retry of the resolution below must not write this frame a second time
@@ -923,10 +933,42 @@ public:
     // Frames the sink acknowledged / appends it did not (each retry of a blocked resolution counts again).
     std::uint64_t acked_frames() const noexcept { return acked_frames_; }
     std::uint64_t failed_appends() const noexcept { return failed_appends_; }
+    // M4, shadow-planned resolutions only: ones the log already said (no frame written) and ones that contradicted it (no frame written, counted).
+    std::uint64_t stale_skipped() const noexcept { return stale_skipped_; }
+    std::uint64_t refused() const noexcept { return refused_; }
 
     const DurableOrderAuditPort& port() const noexcept { return port_; }
 
 private:
+    // The M4 path of next_acked(): the pending resolution of a tracked order, planned against its shadow. false = an append was not acknowledged (the
+    // resolution stays pending; the retry plans again from what the log then holds, so an Ambiguous frame that did land is not written twice).
+    bool publish_planned(OrderFillContext& shadows, std::int64_t now_ms, ReconcileEvent& ev_out, AuditRecord& record_out) noexcept {
+        const std::string_view coid = pending_.coid.view();
+        const OrderFillContextEntry* e = shadows.find(coid);
+        // The reconcile thread already held this fill against its own record's intended quantity: a bound this table does not know is "unbounded", not 0.
+        const std::int64_t bound = e->intended_qty_ticks > 0 ? e->intended_qty_ticks : std::numeric_limits<std::int64_t>::max();
+        const DurablePath plan = plan_resolution(e->shadow, pending_.resulting_state, pending_.filled_qty_ticks, bound);
+        const AuditRecord record = detail::make_reconcile_audit_record(pending_, now_ms);
+        if (plan.status == PathStatus::Write) {
+            if (plan.ambiguous_first) {
+                AuditRecord remap = detail::make_ambiguous_remap_record(pending_, now_ms);
+                remap.filled_qty_ticks = e->shadow.filled_qty_ticks;  // a same-state frame never lowers the fill the log holds
+                if (!append(remap, now_ms)) return false;
+                shadows.durable_acked(coid, OrderState::Ambiguous, e->shadow.filled_qty_ticks);
+            }
+            if (!append(record, now_ms)) return false;
+            shadows.durable_acked(coid, pending_.resulting_state, pending_.filled_qty_ticks);
+        } else if (plan.status == PathStatus::Stale) {
+            ++stale_skipped_;
+        } else {
+            ++refused_;
+        }
+        ev_out = pending_;
+        record_out = record;
+        has_pending_ = false;
+        return true;
+    }
+
     bool append(const AuditRecord& record, std::int64_t now_ms) noexcept {
         const AuditAppendResult result = port_.append_durable(record, now_ms);
         if (result.acked()) [[likely]] {
@@ -943,6 +985,8 @@ private:
     bool remap_acked_{false};
     std::uint64_t acked_frames_{0};
     std::uint64_t failed_appends_{0};
+    std::uint64_t stale_skipped_{0};
+    std::uint64_t refused_{0};
 };
 
 // Runs on the hot/submit thread. Drains `events`; for each, appends the corresponding AuditRecord to the
@@ -1002,7 +1046,7 @@ inline void drain_reconcile_events(InFlightRegistry& in_flight,
                                     const SweepSink* sweep = nullptr) noexcept {
     ReconcileEvent ev{};
     AuditRecord ar{};
-    while (durable ? durable->next_acked(events, now_ms, ev, ar)
+    while (durable ? durable->next_acked(events, now_ms, ev, ar, fill_context)
                    : detail::next_memory_only(events, now_ms, ev, ar)) {
         if (ev.kind == ReconcileEventKind::SweepDone) {
             if (sweep != nullptr) sweep->deliver(SweepDone{ev.sweep_epoch, ev.sweep_unresolved});
