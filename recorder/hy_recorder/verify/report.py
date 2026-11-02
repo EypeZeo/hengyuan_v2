@@ -392,8 +392,28 @@ def verify_lake(root: Path, *, check_hashes: bool = True, acks_path: Path | None
     # 4. explain what the raw data proves, using the ledger only as an explanation
     _explain(issues, ledger, overruns)
     opens = {(e["run"], e["gen"], s) for e in ledger if e.get("k") == "WS_OPEN" for s in e.get("streams", [])}
+    # A frame of a stream the connection never subscribed to (the exchange's own ``!serverShutdown`` notice on
+    # a market-data connection, seen on the real host 2026-11-02) is recorded as it came, under that stream
+    # id, and the recorder writes UNEXPECTED_STREAM naming exactly (conn, gen, stream) once per generation.
+    # That generation's WS_OPEN cannot list the stream, so the first such record of every generation used to
+    # be a FAIL that the ledger had in fact explained.
+    unexpected = {
+        (e["run"], e["gen"], e["stream"])
+        for e in ledger
+        if e.get("k") == "UNEXPECTED_STREAM"
+        and isinstance(e.get("gen"), int)
+        and isinstance(e.get("stream"), str)
+    }
     for stream, run, gen, q in boundaries:
-        if (run, gen, stream) not in opens:
+        key = (run, gen, stream)
+        if key in opens:
+            continue
+        if key in unexpected:
+            # still visible, like every other explained finding: INFO, with the event that explains it
+            issues.append(
+                Issue("GEN_BOUNDARY_UNEXPLAINED", INFO, stream, run, q, gen, explained_by="UNEXPECTED_STREAM")
+            )
+        else:
             issues.append(Issue("GEN_BOUNDARY_UNEXPLAINED", FAIL, stream, run, q, gen))
 
     # 5. operator acknowledgements, last: they only ever see what the ledger could not explain
