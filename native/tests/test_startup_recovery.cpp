@@ -574,6 +574,49 @@ TEST_F(StartupRecoveryLogTest, RecoveredSellOrderFoldsWithTheRightSign) {
 
 // A resting order we knew about at the crash is a KNOWN state, so it does not block Ready -- but it
 // stays in flight, which is what keeps the planner from stacking a second order on top of it.
+// Private-stream migration M4 (order_durable_path.hpp): what the durable log holds for each recovered order is what the scan just reported, with ONE doubt
+// the ABI-pinned checkpoint cannot express -- an Ambiguous checkpoint may be a last frame of Submitting (the scan remaps it). apply_recovery() seeds the
+// shadow so that the doubt survives until the first frame any writer makes durable, and carries the quantity each order was sent with.
+TEST_F(StartupRecoveryLogTest, RecoveredOrdersSeedTheirDurableShadowFromTheirCheckpoints) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-SUB", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-SUB", 100, 10, 1), 1001).acked());  // last frame Submitting
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-ACC", 100, 20, 1), 1002).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-ACC", 100, 20, 1), 1003).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-ACC", 1, 555), 1004).acked());
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-PART", 100, 10, 1), 1005).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-PART", 100, 10, 1), 1006).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-PART", 1, 556), 1007).acked());
+        ASSERT_TRUE(sink.append_durable(make_partial_fill("HY-PART", 1, 556, 4, 100), 1008).acked());
+    }  // "crash"
+
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 3u);
+    const RecoveryApplyResult applied = apply(restarted);
+    ASSERT_TRUE(applied.ok());
+
+    const OrderFillContextEntry* sub = fill_context_.find("HY-SUB");
+    ASSERT_NE(sub, nullptr);
+    EXPECT_EQ(sub->shadow.state, OrderState::Ambiguous);
+    EXPECT_TRUE(sub->shadow.maybe_submitting) << "the log holds Submitting; the checkpoint only says Ambiguous";
+    EXPECT_EQ(sub->shadow.filled_qty_ticks, 0);
+    EXPECT_EQ(sub->intended_qty_ticks, 10);
+
+    const OrderFillContextEntry* acc = fill_context_.find("HY-ACC");
+    ASSERT_NE(acc, nullptr);
+    EXPECT_EQ(acc->shadow.state, OrderState::Accepted);
+    EXPECT_FALSE(acc->shadow.maybe_submitting) << "a live order's last frame is known exactly";
+    EXPECT_EQ(acc->intended_qty_ticks, 20);
+
+    const OrderFillContextEntry* part = fill_context_.find("HY-PART");
+    ASSERT_NE(part, nullptr);
+    EXPECT_EQ(part->shadow.state, OrderState::PartialFill);
+    EXPECT_FALSE(part->shadow.maybe_submitting);
+    EXPECT_EQ(part->shadow.filled_qty_ticks, 4);
+    EXPECT_EQ(part->intended_qty_ticks, 10);
+}
+
 TEST_F(StartupRecoveryLogTest, KnownLiveRecoveredOrderReachesReadyButStaysInFlight) {
     {
         DurableAuditSink sink(path_, *key_ring_, 1);

@@ -170,6 +170,10 @@ SEARCH_FILES = [
     # judgement (store_binding.hpp) and the write-once writer with the trading process's policy (store_binding_writer.hpp).
     REPO_ROOT / "native" / "include" / "hengyuan" / "store_binding.hpp",
     REPO_ROOT / "native" / "include" / "hengyuan" / "store_binding_writer.hpp",
+    # Private-stream migration M4 (docs/SPEC_INVARIANTS.md "路径 ③ 的持久优先"): the pure planner of which frames make a WebSocket observation replayable and
+    # the DurableShadow it plans against (order_durable_path.hpp), and the fill context that holds one shadow per order (order_fill_context.hpp).
+    REPO_ROOT / "native" / "include" / "hengyuan" / "order_durable_path.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "order_fill_context.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"

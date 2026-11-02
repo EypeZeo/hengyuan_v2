@@ -579,6 +579,65 @@ TEST(ReconnectBarrierGenerations, TheEndOfAFutureGenerationIsNotForgottenByTheEn
     EXPECT_EQ(b.state(), BarrierState::Sweeping);
 }
 
+// --- a refused event (M4): the user-data publisher would not record it ---------------------------------------------------------
+
+TEST(ReconnectBarrierRefusedEvent, SendsAReconciledGenerationBackToSweepingWithoutAReconnect) {
+    ReconnectBarrier b = reconciled(1);
+    ASSERT_TRUE(b.admit_event(1));
+    const std::uint64_t epoch_before = b.epoch();
+    b.on_event_refused();
+    EXPECT_EQ(b.state(), BarrierState::Sweeping);
+    EXPECT_EQ(b.reconciled_generation(), 0U);
+    EXPECT_EQ(b.generation(), 1U) << "no reconnect: the same generation, swept again";
+    EXPECT_GT(b.epoch(), epoch_before);
+    EXPECT_EQ(b.stats().events_refused, 1U);
+    EXPECT_EQ(b.stats().soft_barriers, 1U);
+    // the sweep that follows is an ordinary one: it is asked for at once, and a clean answer reconciles the generation again
+    const std::optional<std::uint64_t> asked = b.take_sweep_request(kNow);
+    ASSERT_TRUE(asked.has_value());
+    b.on_sweep_report(SweepReport{*asked, 0U, true}, kNow);
+    EXPECT_EQ(b.state(), BarrierState::Reconciled);
+}
+
+TEST(ReconnectBarrierRefusedEvent, RestartsARunningSweepUnderANewEpochAndTheOldAnswerIsIgnored) {
+    ReconnectBarrier b = sweeping_outstanding(1);
+    const std::uint64_t old_epoch = b.epoch();
+    b.on_event_refused();
+    EXPECT_EQ(b.state(), BarrierState::Sweeping);
+    EXPECT_FALSE(b.sweep_outstanding()) << "the request that was outstanding is over; a new one is due";
+    EXPECT_GT(b.epoch(), old_epoch);
+    b.on_sweep_report(SweepReport{old_epoch, 0U, true}, kNow);  // the answer to the sweep that began before the refused event
+    EXPECT_EQ(b.state(), BarrierState::Sweeping) << "it may predate whatever the refused event said";
+    EXPECT_EQ(b.stats().reports_ignored, 1U);
+    EXPECT_TRUE(b.take_sweep_request(kNow).has_value());
+}
+
+TEST(ReconnectBarrierRefusedEvent, WhileDownOnlyTheCountMoves) {
+    ReconnectBarrier b;
+    ASSERT_EQ(b.state(), BarrierState::Down);
+    const std::uint64_t epoch_before = b.epoch();
+    b.on_event_refused();
+    b.on_event_refused();
+    EXPECT_EQ(b.state(), BarrierState::Down);
+    EXPECT_EQ(b.epoch(), epoch_before);
+    EXPECT_EQ(b.stats().events_refused, 2U);
+    EXPECT_EQ(b.stats().soft_barriers, 0U) << "Down was already refusing: nothing was restarted";
+    EXPECT_EQ(b.stats().sweeps_begun, 0U);
+    // and the stream coming back still begins its sweep as always
+    b.observe(up(1));
+    EXPECT_EQ(b.state(), BarrierState::Sweeping);
+}
+
+TEST(ReconnectBarrierRefusedEvent, EveryRefusalOutsideDownIsASoftBarrierOfItsOwn) {
+    ReconnectBarrier b = reconciled(1);
+    b.on_event_refused();
+    b.on_event_refused();  // a second one, during the sweep the first one began
+    b.on_event_refused();
+    EXPECT_EQ(b.stats().events_refused, 3U);
+    EXPECT_EQ(b.stats().soft_barriers, 3U);
+    EXPECT_EQ(b.state(), BarrierState::Sweeping) << "a stream that keeps refusing events never gets back to Reconciled by itself";
+}
+
 TEST(ReconnectBarrierSoftBarrier, ARestartedSweepIsNotHeldBackByThePauseOfTheOneItReplaced) {
     BarrierPolicy p;
     p.resweep_after_ms = 10'000;
@@ -718,6 +777,7 @@ TEST(ReconnectBarrierTransitions, EveryStateAndEveryEvent) {
          {Dn, Sw, Sw, Rc}},
         {"a sweep request", [](ReconnectBarrier& b) { (void)b.take_sweep_request(kNow); }, {Dn, Sw, Sw, Rc}},
         {"an event of generation 0", [](ReconnectBarrier& b) { (void)b.admit_event(0); }, {Dn, Sw, Sw, Rc}},
+        {"an event was refused (M4)", [](ReconnectBarrier& b) { b.on_event_refused(); }, {Dn, Sw, Sw, Sw}},
     };
     for (const Event& e : events) {
         for (int s = 0; s < 4; ++s) {
@@ -767,7 +827,7 @@ TEST(ReconnectBarrierProperties, ARandomWalkNeverBreaksTheInvariants) {
         const std::uint64_t epoch_before = b.epoch();
         const bool outstanding_before = b.sweep_outstanding();
         const std::uint64_t gen_before = b.generation();
-        enum class Op { Observe, Report, TakeSweep, Ended, Admit, TakeStop } op = Op::Observe;
+        enum class Op { Observe, Report, TakeSweep, Ended, Admit, Refuse, TakeStop } op = Op::Observe;
         std::uint64_t pick = rng.below(100);
         bool report_accepted_by_model = false;
         bool observed_not_connected = false;
@@ -824,6 +884,17 @@ TEST(ReconnectBarrierProperties, ARandomWalkNeverBreaksTheInvariants) {
                 ASSERT_GT(g, 0U);
                 ASSERT_LT(g, b.reconciled_generation());
             }
+        } else if (pick < 98) {
+            op = Op::Refuse;  // M4: the publisher refused an event the stream delivered
+            b.on_event_refused();
+            if (before == BarrierState::Down) {
+                ASSERT_EQ(b.state(), BarrierState::Down) << "step " << step;
+                ASSERT_EQ(b.epoch(), epoch_before) << "step " << step;
+            } else {
+                ASSERT_EQ(b.state(), BarrierState::Sweeping) << "step " << step;
+                ASSERT_FALSE(b.sweep_outstanding()) << "step " << step;
+                ASSERT_GT(b.epoch(), epoch_before) << "step " << step;
+            }
         } else {
             op = Op::TakeStop;
             (void)b.take_stop_request();
@@ -874,6 +945,7 @@ TEST(ReconnectBarrierProperties, ARandomWalkNeverBreaksTheInvariants) {
     EXPECT_GT(st.stale_heartbeats, 400U);
     EXPECT_GT(st.generation_ends_seen, 2500U);
     EXPECT_GT(st.late_events_dropped, 400U);
+    EXPECT_GT(st.events_refused, 2000U);  // M4: the walk refuses an event in about 2 steps in 100
 }
 
 // --- the same machine, at compile time ----------------------------------------------------------------------------------

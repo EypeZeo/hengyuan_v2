@@ -259,7 +259,10 @@ TEST(SweepConcurrency, TheBarrierIsReconciledOnlyOnceEveryOrderThatPrecededTheRe
             std::snprintf(coid, sizeof(coid), "HY-%u", static_cast<unsigned>(admitted.size()));
             const InFlightHandle h = in_flight.register_submit_handle(coid);
             ASSERT_TRUE(h.valid());
-            ASSERT_TRUE(fill_context.track(coid, kSymbol, OrderSide::Buy, 0, 0, 0));
+            // M4: as orchestrate_submit() does it -- tracked with the quantity the order was sent with, and the shadow of an order whose Ambiguous frame was
+            // just acknowledged (an exact Ambiguous: the orchestrator wrote that frame itself)
+            ASSERT_TRUE(fill_context.track(coid, kSymbol, OrderSide::Buy, 0, 0, 0, /*intended_qty_ticks=*/100));
+            ASSERT_TRUE(fill_context.seed_shadow(coid, DurableShadow{OrderState::Ambiguous, false, 0}));
             OrderRecord rec{};
             std::snprintf(rec.client_order_id.id, sizeof(rec.client_order_id.id), "%s", coid);
             rec.symbol_id = kSymbol;
@@ -421,7 +424,10 @@ TEST(SweepConcurrency, ARequestPostedRightAfterAnOrderAlwaysCoversThatOrder) {
             std::snprintf(coid, sizeof(coid), "HY-%u", round);
             const InFlightHandle h = in_flight.register_submit_handle(coid);
             ASSERT_TRUE(h.valid());
-            ASSERT_TRUE(fill_context.track(coid, kSymbol, OrderSide::Buy, 0, 0, 0));
+            // M4: as orchestrate_submit() does it -- tracked with the quantity the order was sent with, and the shadow of an order whose Ambiguous frame was
+            // just acknowledged (an exact Ambiguous: the orchestrator wrote that frame itself)
+            ASSERT_TRUE(fill_context.track(coid, kSymbol, OrderSide::Buy, 0, 0, 0, /*intended_qty_ticks=*/100));
+            ASSERT_TRUE(fill_context.seed_shadow(coid, DurableShadow{OrderState::Ambiguous, false, 0}));
             OrderRecord rec{};
             std::snprintf(rec.client_order_id.id, sizeof(rec.client_order_id.id), "%s", coid);
             rec.symbol_id = kSymbol;

@@ -232,6 +232,38 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 - 帧内容沿用既有 `OrderEvent` 帧与 `AuditRecord`（事件类型用既有的 `UserDataStreamEventObserved` 或 `OrderReconciled`），**不新增持久记录类型**（`DurableRecordType` 是被 CI 钉住的封闭枚举）。
 - 影子的失败模式：**超前**是不变量破洞（ACK 之前就更新了影子，之后据此补的前缀会是非法帧）——所以更新只发生在 ACK 之后，并由“追加失败则影子不变”的测试与变异体钉死。**落后**（有一处写盘没有更新影子）同样会让之后的帧非法——这正是 R8 要用护栏测试逐点钉死的。`durable_path` 遇到表里没有的组合时拒绝落盘并计数（失败关闭），由软屏障交给 REST 对账兜底，而不是猜一个前缀。
 
+### 6.4 M4 的实现情况与同设计草图的差别（2026-11-01）
+
+落点：`order_durable_path.hpp`（规划器与影子，纯函数头）、`order_fill_context.hpp`（槽位里的 `DurableShadow` 与 `intended_qty_ticks`，`track()` 的末位默认参数、`seed_shadow()`、
+`durable_acked()`）、`binance_user_data_event.hpp`（`UserDataDurablePublisher`、`drain_user_data_events(..., durable)`）、`order_tracker.hpp`（`ReconcileDurablePublisher` 以影子为准）、
+`live_submit_orchestrator.hpp`（`detail::append_order_frame()`、`OrchestratorContext::user_data_durable`）、`startup_recovery.hpp`（`apply_recovery()` 播种）、`reconnect_barrier.hpp`（`on_event_refused()`）。
+**设计决策 D4（方案 A）按推荐实施；偏离或补充草图的地方如下，每一条都是实现时才暴露的事实。**
+
+1. **规划器返回三态，前缀只有 0 或 1 帧，不是 0 至 2 帧。** `plan_observation()` / `plan_resolution()` / `state_path()`（全部由 `validate_transition()` 推导，不抄状态表）给出 Write（可带一帧
+   `Ambiguous` 前缀）、Stale（日志已说过或已更晚）或 Unreachable（会破坏回放或自相矛盾）。草图里的伪状态 `AmbiguousMaybeSubmitting` 实现为 `DurableShadow::maybe_submitting` 标志；对
+   `maybe_submitting` 的订单，**对 `Submitting` 与 `Ambiguous` 两种末帧都合法的目标**（`Accepted`/`PartialFill`/`Filled`/`Rejected`）直接写、不加前缀——与 SAFE-03 切片 1 的
+   `needs_ambiguous_remap_frame()` 同一条规则，草图的“总是先补”是更保守的写法。影子仍为 `Intent` 一律拒绝（有写者漏了 ACK 点，`Intent` 不应出现在任何观察之前）。
+2. **对账发布者也必须以影子为准——草图只把它列为影子的“更新点”，这不够。** SAFE-03 切片 1 的发布者按对账线程眼里的 `prior_state` 选帧，这只在除对账线程外没有第二个写者时成立。M4 加入用户数据发布者之后，
+   一个迟到的旧 REST 答案（`PartialFill`）落在 WS 已推到 `Filled` 的日志后面，就是整本日志 `Corrupt`——这不是假想：两条路径观察同一个订单，早晚会发生。所以 `ReconcileDurablePublisher::next_acked()`
+   多一个 `shadows`（`OrderFillContext*`，`drain_reconcile_events()` 传入已有的 `fill_context`）：有影子的订单按 `plan_resolution()` 规划；**Stale 不写帧但事件照常应用**（终态仍释放槽位）；
+   **Unreachable 不写帧、计数、事件照常应用**（日志保持可回放，交易所仍是真相，槽位不泄漏——不应用会让订单永远占着槽位，因为对账线程已经把它记成了终态）；影子精确为 `Ambiguous` 时不再补多余的
+   `OrderAmbiguous`（单写者时代多写的一帧）；不在表里的订单仍走 `prior_state` 路径。
+3. **写者侧对每一帧都检查成交量，比恢复扫描严——因为扫描有一个缺口。** `run_recovery_scan_impl()` 对“同状态重复帧”检查成交量不降、不超意图量；对**状态转移帧只看 `validate_transition()`**，所以转移帧上的超量或回退被静默
+   接受（L-51）。规划器把两条检查用在每一帧上，并要求 `intended_qty_ticks`（未知则拒绝任何成交）。收紧扫描会改变什么样的既有日志算 `Corrupt`，是格式兼容性决定，不在 M4。
+4. **拒绝不是只计数。** 草图写“拒绝落盘并计数，由软屏障交给 REST 对账兜底”，但屏障当时只能由会话的 `ring_drops`/`lost_events` 计数触发，热线程没有入口。M4 加 `ReconnectBarrier::on_event_refused()`：与 `observe()` 里
+   丢失事件的分支同一个软屏障（`Reconciled` 回到 `Sweeping`，运行中的清扫换新 epoch 重来，`Down` 只计数）。每一种拒绝——无法映射的状态、读不出的成交量、在途但不在上下文表里的订单、与提交时记录的方向不符、
+   与日志或与同批另一条报告矛盾——都计数（按原因分开）、在环里留一条**无成交**的痕迹、通知屏障。
+5. **合并发布者没有窥视接口可用。** `SpscRing` 只有 `try_pop`，所以排空把事件先弹进发布者自己的定长表（每订单一个槽，`kMaxInFlight` 个，零堆分配），**合并规则由规划器自己决定**：较新的替换、较旧的丢弃、互相矛盾的拒绝后者。
+   队头阻塞与对账发布者一致：表里有未持久的观察时排空**什么也不弹**。**持久模式下环里的记录就是落盘的帧**（SAFE-03 的“一处构造，两边内容相同”），带累计成交量；旧的内存优先路径仍写增量记录，字节不变。
+6. **编排器的门：未接发布者仍是内存优先，不像对账环那样失败关闭。** 现有 7 个以上编排器测试靠“只接 WS 环”来测屏障联动（`serverShutdown`、代次切换），生产里没有任何地方构造带 WS 环的上下文（M5 才接线）。取舍是保留旧行为，
+   用护栏把它钉成“不可能无意发生”：`test_submit_readiness_guard.cpp` 钉住每个生产 `drain_user_data_events()` 的第 9 个参数，`test_order_durable_path_guard.cpp` 钉住“接了 WS 环的生产上下文必须同时接发布者”
+   （今天空转，M5 接线时生效）。所有 ACK 点则在源头收敛：编排器的 7 个帧统一经 `detail::append_order_frame()`，护栏钉住它是文件里唯一的 `append_durable()` 调用点（连同适配器共 2 处）。
+7. **`validate_transition()` 与 `is_terminal()` 改成 `constexpr`**（行为不变），规划器才能在编译期求值并被 `static_assert`。
+8. **没有新的跨线程状态**，因此没有新的 TSan 负控：影子、待定表、发布者都是热线程独占。`thread` 层仍跑既有的并发用例（它们的热线程现在也带影子）。
+
+**仍未做 / 留给后续：** 同步 fsync 进入 WS 排空路径的时延没有测量（R4；合并让 fsync 次数与订单数而不是成交数成正比，但仍在热线程上）；撤单路径不存在，`CancelRequested` 之后的 `PARTIALLY_FILLED` 是 Unreachable（L-52）；
+没有生产进程运行这条排空（M5 接线、Testnet 联调）。
+
 ## 7. 切片计划
 
 | 片 | 内容 | Tier | 验证层级 | 估计 |
