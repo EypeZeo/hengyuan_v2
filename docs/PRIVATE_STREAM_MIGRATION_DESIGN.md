@@ -1,7 +1,7 @@
 # 私网流迁移、发单就绪门与用户数据流持久化——设计提案
 
 > **状态：已接受（Owner 于 2026-10-15 说“合并，按推荐，开始，可以下载”：D1 至 D7 按推荐，M1 开始）；它仍是设计，不是规格——每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出计划、等“开始”，细节以那一片的计划与蓝图为准。** 它把蓝图任务 1A.4（现货私有 WebSocket 用户数据流与会话对账）、审计 P1-002 的路径 ③（用户数据流排空函数）和 FI-043 要求的“屏障门”拆成可以逐片开工、逐片验收的工作，并把需要 Owner 拍板的点列在 §8。每一片开工前仍按 `CLAUDE.md` 的 Tier B 流程出 ≤5 行计划、等“开始”。
-> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。**2026-10-18 增补**：M2 已合入（PR #184，合并提交 `f853947`），其中漏掉了本文 §5.1 与 §7 要求的 `session.subscriptions` 校验，由 M2b 补上（PR #185，合并提交 `781d1f2`）；§4.3 补了 M2 与 M2b 的实现情况，§7 的 M2 行改为已完成并新增 M2b 行；M3 起尚未开工。**2026-10-19 增补**：M3 拆成 M3a（纯逻辑：重连屏障、发单就绪令牌、Gate 2b、排空过滤；PR #188，合并提交 `62c4647`）与 M3b（清扫的跨线程传输、TSan 负控、TLA+ 模型）；§5 补了 M3a 的实现情况与同设计草图的差别，§7 的 M3 行拆成 M3a（已完成）与 M3b；M3b 起尚未开工。**2026-10-24 增补**：M3b 已合入（PR #191，合并提交 `ca6ac64`，2026-10-23）；§5.3 补了 M3b 的实现情况与同设计草图的差别（回报不是第二个环，而是夹在既有对账事件环里的完成标记，因此没有新增 TSan 负控），§7 的 M3b 行改为已完成；M4 起尚未开工。
+> 基线：master `66815bc`（2026-10-13，SAFE-03 切片 2 及其文档同步已合入）。本文只描述现状与设计，没有改动任何代码。**2026-10-14 增补**：M0 协议核对已完成（D8 已获 Owner 许可），结果登记为蓝图 `5.7` 的 P-24 至 P-32，本文 §4.2、§4.3、§5.2、§7、§8、§9 据此更新；除此之外本文未变。**2026-10-17 增补**：D1 至 D7 已决（按推荐，§8）；M1 已合入（PR #179，合并提交 `4702b20`），§4.3 补了实现情况与同设计草图的差别，§7 的 M1 行改为已完成；M2 起尚未开工。**2026-10-18 增补**：M2 已合入（PR #184，合并提交 `f853947`），其中漏掉了本文 §5.1 与 §7 要求的 `session.subscriptions` 校验，由 M2b 补上（PR #185，合并提交 `781d1f2`）；§4.3 补了 M2 与 M2b 的实现情况，§7 的 M2 行改为已完成并新增 M2b 行；M3 起尚未开工。**2026-10-19 增补**：M3 拆成 M3a（纯逻辑：重连屏障、发单就绪令牌、Gate 2b、排空过滤；PR #188，合并提交 `62c4647`）与 M3b（清扫的跨线程传输、TSan 负控、TLA+ 模型）；§5 补了 M3a 的实现情况与同设计草图的差别，§7 的 M3 行拆成 M3a（已完成）与 M3b；M3b 起尚未开工。**2026-10-24 增补**：M3b 已合入（PR #191，合并提交 `ca6ac64`，2026-10-23）；§5.3 补了 M3b 的实现情况与同设计草图的差别（回报不是第二个环，而是夹在既有对账事件环里的完成标记，因此没有新增 TSan 负控），§7 的 M3b 行改为已完成。**2026-11-02 增补**：M4 已合入（PR #224，合并提交 `9675b6c`）；§6.4 补了 M4 的实现情况与同设计草图的差别（规划器三态、对账发布者也以影子为准、写者侧每一帧检查成交量、拒绝通知软屏障、合并发布者的定长表），§7 的 M4 行改为已完成；M5 起尚未开工。
 > 读法：§0 是一页摘要；§1 是现状事实（每条带 `file:symbol`）；§2–§6 是设计；§7 是切片计划；§8 是决策点；§9 是风险；§10 是验收映射。
 
 ## 0. 一页摘要
@@ -10,7 +10,7 @@
 
 1. **私网流在生产现货上已经不能用。** 官方现货变更日志（2026-01-21 条目，蓝图 `5.7` 的 P-07）确认 REST `userDataStream` 三个端点与 WS API 的 `userDataStream.start/ping/stop` 自 2026-02-20 07:00 UTC 起不再提供；树内的 `BinanceUserDataWsSession` 仍连 `/ws/<listenKey>`，续期调度器、`ListenKeyPublisher` 也都围绕这条已下线的路径。今天唯一能工作的成交来源是对账线程的 REST 轮询。
 2. **没有“发单就绪门”。** `StartupRecovery::submit_enabled()` 只在测试里被调用，`orchestrate_submit()` 不认它；时钟就绪（SAFE-01）只守住了签名，没有守住发单；FI-043 要求的“自代次 N 断开至代次 N+1 权威对账收敛并发布之前，全部增风险报单被硬拦截”在树里没有对应物。
-3. **路径 ③ 只写内存。** `drain_user_data_events()` 把观察写进内存审计环并把成交差分折进 `PositionTruth`，没有任何持久记录（P1-002 剩余的一条）。
+3. **路径 ③ 只写内存。** `drain_user_data_events()` 把观察写进内存审计环并把成交差分折进 `PositionTruth`，没有任何持久记录（P1-002 剩余的一条）。**2026-11-02：M4 已合入（PR #224），代码里的这条缺口已补，见 §6.4；没有任何进程运行这条排空（M5）。**
 
 **提案**：
 - 迁移到 WS API 的**签名订阅**（`userDataStream.subscribe.signature`，HMAC 即可，不依赖 Ed25519），连接代次由现有的 `PublicFeedSupervisor<S>` 管理（它已经有代次、计划性轮换、防抖、排空确认）。
@@ -232,7 +232,7 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 - 帧内容沿用既有 `OrderEvent` 帧与 `AuditRecord`（事件类型用既有的 `UserDataStreamEventObserved` 或 `OrderReconciled`），**不新增持久记录类型**（`DurableRecordType` 是被 CI 钉住的封闭枚举）。
 - 影子的失败模式：**超前**是不变量破洞（ACK 之前就更新了影子，之后据此补的前缀会是非法帧）——所以更新只发生在 ACK 之后，并由“追加失败则影子不变”的测试与变异体钉死。**落后**（有一处写盘没有更新影子）同样会让之后的帧非法——这正是 R8 要用护栏测试逐点钉死的。`durable_path` 遇到表里没有的组合时拒绝落盘并计数（失败关闭），由软屏障交给 REST 对账兜底，而不是猜一个前缀。
 
-### 6.4 M4 的实现情况与同设计草图的差别（2026-11-01）
+### 6.4 M4 的实现情况与同设计草图的差别（2026-11-01；已合入：PR #224，合并提交 `9675b6c`，2026-11-02）
 
 落点：`order_durable_path.hpp`（规划器与影子，纯函数头）、`order_fill_context.hpp`（槽位里的 `DurableShadow` 与 `intended_qty_ticks`，`track()` 的末位默认参数、`seed_shadow()`、
 `durable_acked()`）、`binance_user_data_event.hpp`（`UserDataDurablePublisher`、`drain_user_data_events(..., durable)`）、`order_tracker.hpp`（`ReconcileDurablePublisher` 以影子为准）、
@@ -274,7 +274,7 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 | **M2b** `session.subscriptions` 校验（**已完成 2026-10-18，PR #185，合并提交 `781d1f2`**） | 补上 M2 漏掉的一步：订阅应答后会话发无签名的 `session.subscriptions`，只有恰好列出刚确认的那一个订阅，`is_connected()` 才为真；工厂多预留一个许可（一代 6 权重）并改为先签名后预留；`WsApiResponse::subscription_list_malformed`；顺带修 M2 的 `stopped()` 先于结束原因变真的竞争 | B（状态机） | MSVC + WSL2 `none` + `address`，本地 TSan 跑会话测试；变异检查；实际：MSVC 2545、GCC 2551、ASan 6 个可执行文件、本地 TSan 51 个用例 0 报告，变异检查 39 个变异体中 34 个被杀死、5 个存活且各有解释，守卫 11 个负控 | 估计 0.5 日；实际 2026-10-17 至 2026-10-18（含一次进程中断） |
 | **M3a** 屏障与就绪门（纯逻辑）（**已完成 2026-10-19，PR #188，合并提交 `62c4647`**） | `ReconnectBarrier`、`FeedObservation` 适配器、`SubmitReadiness` / `SubmitReadyToken`、`OrchestratorGate::NotReady`（Gate 2b）、排空过滤、合成就绪（真实组件加脚本化观察）、护栏测试；FI-009/011/020/043 的确定性状态机测试（含由真实监督器加假会话和真实回环会话驱动的端到端）；实际没有做“预检线束接真实 `StartupRecovery`”（随 M5） | B（状态机） | MSVC + WSL2 `none` + `address` + `thread`；变异检查；实际：MSVC 2694、GCC 2700、ASan 11 个可执行文件、`thread` 层 210 个并发用例 + 三个负控、手动 Sanitizer 三个作业，变异检查 133 个变异体（124 + 守卫 9）：8 个存活，均为等价或纵深防御 | 估计 2 日；实际 2026-10-18 至 2026-10-19 |
 | **M3b** 清扫的传输（**已完成 2026-10-23，PR #191，合并提交 `ca6ac64`**） | 请求环加夹在对账事件环里的完成标记（不是独立的回报环）、`SweepJob` / `SweepPump` / `SweepSink`、`poll_once` 的取请求次序、`formal/reconnect_sweep.tla` 与 5 个必败配置、护栏与 CI 模型步骤；没有新的原子协议，因此没有新增 TSan 负控（见 §5.3） | B（并发） | MSVC + WSL2 `none` + `address` + `thread`；TLA+ 模型与它的必败配置；变异检查；实际：MSVC 登记 2765 个、运行 2763 个（新增 71 个），GCC 2771 个、0 警告，ASan 18 个可执行文件，`thread` 层 212 个用例（+2）且三个既有负控仍失败，手动 Sanitizer（run 39465113371）三个作业全绿，变异检查 85 个变异体（81 个被杀死、4 个等价，两处真实缺口 SP09 与 OT18 补了测试） | 估计 2 日；实际 2026-10-20 至 2026-10-23 |
-| **M4** 路径 ③ 持久优先 | `OrderFillContext` 影子、`durable_path`、WS 合并发布者、`drain_user_data_events` 改造、影子更新点的护栏 | B | WSL2 `address` + `thread`（若发布者与排空共用待定事件）；真实日志重启测试；变异检查 | 2 日 |
+| **M4** 路径 ③ 持久优先（**已完成 2026-11-02，PR #224，合并提交 `9675b6c`**） | `order_durable_path.hpp`（规划器与 `DurableShadow`）、`OrderFillContext` 的影子与 `intended_qty_ticks`、`UserDataDurablePublisher` 与 `drain_user_data_events(..., durable)`、`ReconcileDurablePublisher` 以影子为准、`detail::append_order_frame()`、`apply_recovery()` 播种、`ReconnectBarrier::on_event_refused()`、守卫 `test_order_durable_path_guard`；与上面 §6.4 列出的差别 | B（并发 / 状态机） | WSL2 `address` + `thread`；真实日志重启测试；变异检查；实际：MSVC 登记 3432 个、运行 3430 个（相对 R5 新增 94 个）全部通过，WSL2 `none` 与 `address` 0 失败，`thread` 层 212 个并发用例通过且三个既有负控仍失败，变异检查 113 个变异体 = 108 杀死 + 5 等价，手动 Sanitizer（run 41451980374）：ASan+UBSan 全量 3441/3441 通过、0 报告；TSan 并发测试 212/212，三个负控都如期报告了注入的数据竞争；ARM64 真实弱内存序硬件 96 个并发用例 ×10 轮通过 | 估计 2 日 |
 | **M5** 退役与联调 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），迁移 `live_submit_reconcile_harness_demo` 与预检线束；**Owner 用 Testnet 凭据跑联调**并贴日志 | B | 全量三层 + CI 手动 Sanitizer；Testnet 联调由 Owner 执行 | 2 日（不含联调等待） |
 
 合计 13.5 日的上限；M0 可以和 M1 并行；M4 与 M3 几乎没有依赖，可以交错。**每一片都是一个独立 PR，每个 PR 都带它自己的变异检查与回归。**
@@ -315,9 +315,9 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 | FI-011 `serverShutdown` | 收到即触发代次结束与新连接；新代次对账收敛后才放行 | M2（会话识别）+ M3（屏障） |
 | FI-020 私有数据流心跳假死 | 超过 `stale_after_ms` 无帧 → 数据状态陈旧、会话重建、屏障回到 `Down` | M2 + M3 |
 | 新增：环满丢弃 → 软屏障 | 丢弃计数增加 → 同代次回到 `Sweeping`，对账完成后恢复 | M3 |
-| 新增：影子不超前 | ACK 之前影子不变；任一 ACK 点漏更新被护栏/变异体抓到 | M4 |
-| 新增：WS 路径写出的日志可回放 | 真实 `DurableAuditSink` 重启回放不 `Corrupt`（含 `Submitting` 恢复后收到 `CANCELED`） | M4 |
-| P1-002 路径 ③ | `drain_user_data_events` 先持久 ACK 再折进 `PositionTruth` | M4，合并后 P1-002 可由 `PARTIAL` 转 `CLOSED` |
+| 新增：影子不超前 | ACK 之前影子不变；任一 ACK 点漏更新被护栏/变异体抓到 | M4（已落地：`test_order_durable_path_guard` 逐点钉住，变异检查 113 个中 108 个被杀死、5 个等价） |
+| 新增：WS 路径写出的日志可回放 | 真实 `DurableAuditSink` 重启回放不 `Corrupt`（含 `Submitting` 恢复后收到 `CANCELED`） | M4（已落地：`test_order_durable_path` 的差分、随机游走与两个写者共享影子的游走） |
+| P1-002 路径 ③ | `drain_user_data_events` 先持久 ACK 再折进 `PositionTruth` | M4（已合入：PR #224，`9675b6c`）。**P1-002 没有因此转 `CLOSED`**：`live` 类条目的运行期与预算两段仍缺——没有任何进程运行这条排空（M5 接线），同步 fsync 的时延没有测量；台账里 `code` 段改为 PRESENT，状态仍为 `PARTIAL` |
 
 ---
 
