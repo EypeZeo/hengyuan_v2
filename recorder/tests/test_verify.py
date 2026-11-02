@@ -170,6 +170,76 @@ def test_generation_without_open_event_is_unexplained(tmp_path):
     assert rep.exit_code == 1 and "GEN_BOUNDARY_UNEXPLAINED" in codes(rep, "FAIL")
 
 
+# The exchange's own shutdown notice, as the real host recorded it on a spot market-data connection
+# (2026-11-02): a frame for a stream the connection never subscribed to, kept under its own stream id.
+SERVER_SHUTDOWN = "spot:!serverShutdown"
+SERVER_SHUTDOWN_FRAME = b'{"stream":"!serverShutdown","data":{"e":"serverShutdown","E":1793584826386}}'
+
+
+def _lake_with_unexpected_frame(root: Path, *, event: dict | None, gen: int = 1) -> LakeBuilder:
+    """A clean spot-depth generation plus one frame of an unsubscribed stream.
+
+    ``event`` is the UNEXPECTED_STREAM the recorder would write (None: the ledger says nothing).
+    """
+    b = LakeBuilder(root)
+    g = b.open_conn("spot_depth", [SPOT_DEPTH])
+    write_depth(b, "spot", g)
+    b.record("spot", "depth", SERVER_SHUTDOWN, SERVER_SHUTDOWN_FRAME, gen)
+    if event is not None:
+        b.event("UNEXPECTED_STREAM", **event)  # written right after the record, on the same sequence counter
+    b.stop()
+    return b
+
+
+def test_unexpected_stream_frame_explained_by_its_ledger_event_is_info_not_fail(tmp_path):
+    # WS_OPEN lists only the subscribed stream, so the unsubscribed stream's first record of a generation
+    # looks like an unopened generation; UNEXPECTED_STREAM names exactly (conn, gen, stream): the explanation.
+    event = {"conn": "spot_depth", "gen": 1, "stream": SERVER_SHUTDOWN}
+    _lake_with_unexpected_frame(tmp_path, event=event)
+    rep = verify_lake(tmp_path)
+    assert rep.exit_code == 0, rep.render_text()
+    assert "GEN_BOUNDARY_UNEXPLAINED" not in codes(rep, "FAIL")
+    explained = [i for i in rep.issues if i.code == "GEN_BOUNDARY_UNEXPLAINED"]
+    assert len(explained) == 1, "explained, but still visible"
+    assert explained[0].severity == "INFO" and explained[0].explained_by == "UNEXPECTED_STREAM"
+    assert explained[0].stream == SERVER_SHUTDOWN and explained[0].gen == 1
+    assert rep.streams[SERVER_SHUTDOWN]["records"] == 1  # the frame itself is counted, nothing dropped
+
+
+def test_unexpected_stream_frame_without_a_ledger_event_still_fails(tmp_path):
+    _lake_with_unexpected_frame(tmp_path, event=None)
+    rep = verify_lake(tmp_path)
+    assert rep.exit_code == 1 and "GEN_BOUNDARY_UNEXPLAINED" in codes(rep, "FAIL")
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"conn": "spot_depth", "gen": 2, "stream": SERVER_SHUTDOWN},  # another generation
+        {"conn": "spot_depth", "gen": 1, "stream": "spot:!somethingElse"},  # another stream
+        {"conn": "spot_depth"},  # malformed: no gen, no stream -- must neither explain nor crash the verifier
+        {"conn": "spot_depth", "gen": "1", "stream": SERVER_SHUTDOWN},  # malformed: gen is not an integer
+    ],
+)
+def test_an_unexpected_stream_event_for_something_else_does_not_explain_the_frame(tmp_path, event):
+    _lake_with_unexpected_frame(tmp_path, event=event)
+    rep = verify_lake(tmp_path)
+    assert rep.exit_code == 1 and "GEN_BOUNDARY_UNEXPLAINED" in codes(rep, "FAIL")
+
+
+def test_an_unexpected_stream_event_does_not_excuse_a_subscribed_generation_without_its_open_event(tmp_path):
+    b = LakeBuilder(tmp_path)
+    b.open_conn("spot_depth", [SPOT_DEPTH])
+    write_depth(b, "spot", 1)
+    write_depth(b, "spot", 2)  # generation 2 of a SUBSCRIBED stream with no WS_OPEN ...
+    # ... and an UNEXPECTED_STREAM event about another stream
+    b.event("UNEXPECTED_STREAM", conn="spot_depth", gen=2, stream=SERVER_SHUTDOWN)
+    b.stop()
+    rep = verify_lake(tmp_path)
+    fails = [i for i in rep.issues if i.code == "GEN_BOUNDARY_UNEXPLAINED" and i.severity == "FAIL"]
+    assert rep.exit_code == 1 and [(i.stream, i.gen) for i in fails] == [(SPOT_DEPTH, 2)]
+
+
 def _first_segment(root: Path) -> Path:
     return next((root / "raw").rglob("*.jsonl.zst"))
 
