@@ -277,6 +277,30 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **启动读取 `fetch_exchange_account_uid()`**：启动时调一次，给 `ensure_store_binding()`；与端口分开是有意的——绑定只做一次，周期与清扫的取数用不着 uid。只在应答良好时才给 `uid_out` 赋值，不抛异常（异常算 `Read`）。
   - **未接线**：没有生产代码创建 `RestAccountFetcher` 或调用启动读取（M5a-2b 的流水线与 M5b 的线束才会）。
   - **证据**：（干跑）
+- 私网流流水线（私网流迁移 M5a-2b，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.6；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B）— `private_stream_pipeline.hpp` 的 `PrivateStreamPipeline<Session>`：
+  把 M2–M5a-1 的部件接成一个组合根。**它不新增任何状态机、规则或跨线程原语**——只回答 “谁把什么交给谁、按什么次序跑、哪个线程拥有什么、StartupRecovery 等的那些事实从哪里读”。
+  - **两个节拍。** `hot_tick(now)`：监督器 `poll` → 持有者 `poll` → 恢复状态机 `update`（到期时应用一次恢复）→ `drain_hot_inputs()`。`reconcile_tick(now)`：刷新器的周期取数 → 带清扫作业的 `poll_once()`
+    （作业的账户步骤在最后一个回答之后、标记之前运行，见上一条 “账户刷新”）。`drain_hot_inputs()` 是从 `orchestrate_submit()` 顶部**原样**抽出来的三段排空（清扫泵 `service()`、对账排空、用户数据排空），
+    `orchestrate_submit()` 与热节拍共用这一个定义，所以 “下单的周期” 与 “不下单的周期” 的排空次序不会分叉（`orchestrate_submit` 的既有测试原样通过；既有守卫按调用点计数，调用点个数不变）。
+  - **谁拥有什么。** 流水线拥有环（to-reconcile、对账事件、清扫请求、账户更新）、订单跟踪器、清扫作业、刷新器、持有者、监督器、恢复状态机、就绪判定（含屏障）、清扫泵、迟到成交告警与两个持久发布者；
+    进程的持久存储、内存审计环、**唯一的** `KillSwitch`、`PositionTruth`、在途注册表、成交上下文、用户数据事件环（会话工厂的 `Deps::ring` 指向它，所以它先于流水线存在）、时钟发布者、限流追踪器，
+    以及所有碰网络的函数指针（查询端口、取账户端口、符号规则）按引用或按值传入（`PipelineParts`）。热半部与对账半部是两个按缓存行对齐的成员组；两半之间唯一共享的是环。流水线不创建线程、不自己连任何东西
+    （监督器在热线程的 `poll()` 里通过工厂连）。
+  - **`observe_recovery()`：StartupRecovery 等待的事实只在一个函数里读，节拍与就绪探针共用**，“就绪” 因此不论在哪里被问都按同样的事实判断：时钟发布者新鲜、exchangeInfo 已载入（进程设置）、存储打开且未栅栏且扫描干净、
+    恢复已应用（只一次，由存储的检查点和进程的规则查询；规则查询没接则按 “未知符号” 失败关闭 ⇒ RepopulateIncomplete）、仍未确认的恢复订单（热线程用注册表加持久影子数，`tally_recovered_orders_by_shadow()`）、
+    账户新鲜**且存储已绑定**、用户数据流已连接并验证。
+  - **存储绑定是一道门。** `bind_store(环境, 交易所报告的 uid, 时刻)` 是 `ensure_store_binding()` 的**第一个生产调用方**（守卫钉住：树里只有这一个生产源包含写侧头文件，它的唯一一次调用的第五个实参就是 `exchange_uid`，
+    不是任何配置字段；uid 来自 `rest_account_fetcher.hpp` 的启动读取）。在得到 “可以使用该存储” 的裁决之前，账户不算新鲜，进程不能就绪。被拒绝的绑定（别的环境或账户、读不了的绑定、有历史的未绑定 Production 存储、
+    已栅栏的存储）让进程一直不就绪，原因在 `binding_status()` 里，由调用方停进程。每次调用都重新对照存储判定（被拒绝不是被记住的状态）。**有意的取舍**：被拒绝的绑定不去拨 `KillSwitch`，也不新增 DegradedReason——
+    绑定是启动前提，不是运行中的事件；门是 `account_fresh`，StartupRecovery 的枚举与状态机因此不变。
+  - **线程。** 今天的真实线束是一个循环线程，它按两个节拍各调一次；这也是真实 REST 适配器唯一允许的排布（凭据与限流追踪器都属于一个线程，见上一条）。两个线程各跑一半也是支持的（两半之间只有环），
+    但真实的取数端口要等 “那条线程上自己的凭据 + 两线程共享的限流源” 的设计之后才能放到对账线程上。
+  - **守卫（七处 “尚无生产接线” 的钉子随之改成 “只有流水线”，每处带理由）**：`poll_once()` 只有流水线传清扫作业（实参 `&reconcile_.job`）；账户更新环由流水线拥有但只有头文件里的刷新器推、持有者弹；
+    刷新器 / 持有者 / `sweep_step(` / `sweep_probe(` 只出现在 `account_refresh.hpp` 和流水线里，且流水线的接法逐字钉住（作业拿刷新器的步骤、泵拿持有者的探针、两者共用一个环）；影子计数的生产调用方只有流水线一处；
+    `OrchestratorContext` 的生产构造点多一处（流水线，`readiness` 取它自己拥有的那个）；迟到成交告警只有流水线造一个，从存储的 `recovered_operator_resolved()` 列表与总数和进程唯一的 `KillSwitch` 造出，上下文的 `kill_switch` 是同一个；
+    存储绑定的写侧只有流水线包含。
+  - **未接线**：没有任何进程创建流水线（M5b 的线束迁移才会）；真实 WS 会话在回环服务端上被证明过，对真实交易所没有证明过。
+  - **证据**：（干跑）
 
 ### 容量 / 生命周期
 

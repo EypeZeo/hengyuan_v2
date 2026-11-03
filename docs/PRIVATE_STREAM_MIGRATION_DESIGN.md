@@ -224,6 +224,22 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 
 没有新的跨线程状态之外的东西：新增的只有一条 `SpscRing<AccountUpdate, 4>`（沿用现有原语），没有新原子量，因此没有新的 TSan 负控；`formal/reconnect_sweep.tla` 不变——它把账户新鲜度建模为不确定的布尔，纪元标签是对这个布尔的实现，不是新的次序。
 
+### 5.6 M5a-2 的实现情况：真实取账户端口与私网流流水线（2026-11-03）
+
+M5a-2 分两个 PR。**a-2a**（`rest_account_fetcher.hpp`、`binance_private_rest.hpp` 的 uid 重载）：`GET /api/v3/account` 的应答里的 `uid`（必需、正整数）连同快照一起交出，`fetch_account(out, uid)` 与旧重载共用一个实现体；
+`RestAccountFetcher` 把 `PrivateRestError` 映射成刷新器的 `NotSent` / `Failed`（逐枚举一张表），异常不出端口；`fetch_exchange_account_uid()` 是存储绑定需要的那次启动读取。
+**a-2b**（`private_stream_pipeline.hpp`）：把 M2–M5a-1 的部件接成一个组合根，两个节拍（热 / 对账），一个函数读 StartupRecovery 等的全部事实，存储绑定作为一道门，`ensure_store_binding()` 的第一个生产调用方。
+设计草图（§5.1–§5.3）里没有的东西有三条，都是实现时才暴露的：
+
+1. **凭据与限流追踪器只属于一个线程，所以真实的取账户（以及将来真实的订单查询）端口只能跑在那个线程上。** 设计 F11 早就写着 “签名必须在热线程做”，但 §5.2 把 “账户由对账线程取” 画成了默认；
+   `fetch_account()` 要签名、要从限流追踪器预留权重，而 `BoundHmacCredentials::sign()` / `copy_api_key()` 在别的线程上返回失败，追踪器 “别的线程不得触碰”。今天的真实线束
+   （`live_submit_preflight_harness.cpp`）是**一个循环线程**，两半在同一处 tick——这就是 M5b 的形态。真正独立的对账线程需要 “在它自己身上绑定的凭据 + 两线程都够得着的限流源”，是单独的设计分叉，本片不取。
+   用错线程不会出怪事：签名被拒 ⇒ `NotSent` ⇒ 屏障停在 `Sweeping`，计数器可见；有测试。
+2. **`drain_hot_inputs()` 是从 `orchestrate_submit()` 顶部抽出来的。** 热节拍需要和下单周期**完全相同**的排空次序（清扫泵 → 对账排空 → 用户数据排空），复制三段话就是留一个将来会分叉的口子，所以抽成一个函数，
+   两处共用。语句与注释原样搬走，既有测试与按调用点计数的守卫不受影响。
+3. **存储绑定的门是 `account_fresh`，不是 KillSwitch，也不是新的 `DegradedReason`。** 绑定是启动前提而不是运行中的事件：在得到 “可以使用该存储” 的裁决之前账户不算新鲜，进程不能就绪；被拒绝的绑定让它一直不就绪，
+   原因在状态里。这样 StartupRecovery 的枚举与状态机不变，也没有一个 “Degraded 是粘的” 的新来源。
+
 ## 6. 路径 ③：用户数据流的持久优先
 
 ### 6.1 为什么不是照抄 SAFE-03 切片 1

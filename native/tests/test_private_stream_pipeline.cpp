@@ -577,10 +577,10 @@ TEST_F(PipelineTest, TheTicksAreCountedAndTheHalvesAreIndependent) {
     pipe_->hot_tick(g_now += 5);
     pipe_->hot_tick(g_now += 5);
     EXPECT_EQ(pipe_->stats().hot_ticks, 2U);
-    EXPECT_EQ(pipe_->stats().reconcile_ticks, 0U);
+    EXPECT_EQ(pipe_->reconcile_ticks(), 0U);
     EXPECT_EQ(account_.calls, 0U) << "the hot half never touches the account port";
     pipe_->reconcile_tick(g_now += 5);
-    EXPECT_EQ(pipe_->stats().reconcile_ticks, 1U);
+    EXPECT_EQ(pipe_->reconcile_ticks(), 1U);
     EXPECT_EQ(account_.calls, 1U) << "the first reconcile tick fetches at once";
     EXPECT_EQ(sessions_.size(), 1U) << "the reconcile half starts no session";
 }

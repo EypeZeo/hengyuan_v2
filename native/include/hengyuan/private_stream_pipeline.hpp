@@ -114,9 +114,10 @@ struct PipelineParts {
     PipelineRulesLookup rules{};
 };
 
+// The hot thread's counters; read them on that thread. (The reconcile half has its own single counter, reconcile_ticks(), on its own cache line: two threads never
+// store to one line.)
 struct PipelineStats {
     std::uint64_t hot_ticks{0};
-    std::uint64_t reconcile_ticks{0};
     std::uint64_t recoveries_applied{0};  // 0 or 1
     std::uint64_t binding_attempts{0};
 };
@@ -144,7 +145,7 @@ public:
     // `now_ms` is the steady clock (Session::steady_now_ms()); `wall_now_ms` the wall clock in ms, or OrderRecord::kClockUnset (R-10, startup recovery's wall
     // anchor for Ambiguous orders).
     void hot_tick(std::int64_t now_ms, std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
-        ++stats_.hot_ticks;
+        ++hot_.stats.hot_ticks;
         hot_.supervisor.poll(now_ms);
         hot_.holder.poll();
         advance_recovery(now_ms, wall_now_ms);
@@ -156,7 +157,7 @@ public:
     // verdict is remembered; readiness waits for one under which the store may be used. Call it on the hot thread before the loop (or at any time: a refused
     // binding stays refused, an accepted one is re-verified).
     EnsureBindingStatus bind_store(StoreEnvironment environment, std::uint64_t exchange_uid, std::int64_t now_ms) noexcept {
-        ++stats_.binding_attempts;
+        ++hot_.stats.binding_attempts;
         binding_status_ = ensure_store_binding(parts_.sink, parts_.log_path, parts_.key_ring, environment, exchange_uid, now_ms);
         return binding_status_;
     }
@@ -171,7 +172,7 @@ public:
     // ---- the reconcile thread (or the same loop) ---------------------------------------------------------------------------------------------
 
     void reconcile_tick(std::int64_t now_ms, std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
-        ++stats_.reconcile_ticks;
+        ++reconcile_.ticks;
         reconcile_.refresher.tick(now_ms);
         poll_once(reconcile_.tracker, to_reconcile_, reconcile_events_, parts_.query_port, config_.poll, now_ms, wall_now_ms, &reconcile_.job);
     }
@@ -191,7 +192,9 @@ public:
     [[nodiscard]] bool store_bound() const noexcept { return store_may_be_used(binding_status_); }
     [[nodiscard]] bool recovery_applied() const noexcept { return recovery_applied_; }
     [[nodiscard]] const RecoveryApplyResult& recovery_result() const noexcept { return apply_result_; }
-    [[nodiscard]] const PipelineStats& stats() const noexcept { return stats_; }
+    // The hot thread's counters, and the reconcile half's tick count: each is read on the thread that writes it.
+    [[nodiscard]] const PipelineStats& stats() const noexcept { return hot_.stats; }
+    [[nodiscard]] std::uint64_t reconcile_ticks() const noexcept { return reconcile_.ticks; }
 
     // The facts StartupRecovery waits for, read off the live parts right now. The readiness probe and the tick both use this.
     [[nodiscard]] RecoveryObservation observe_recovery(const FeedObservation& feed, std::int64_t now_ms) const noexcept {
@@ -234,6 +237,7 @@ private:
         ReconcileDurablePublisher reconcile_publisher;
         UserDataDurablePublisher user_data_publisher;
         LateFillAlarm late_fill;
+        PipelineStats stats{};
     };
 
     // The reconcile thread's objects.
@@ -244,6 +248,7 @@ private:
         OrderTracker tracker;
         AccountRefresher refresher;
         SweepJob job;
+        std::uint64_t ticks{0};
     };
 
     // The probe functions run on the hot thread (authorize() and the pump's observe() are the hot thread's).
@@ -288,7 +293,7 @@ private:
                 parts_.sink.recovered_checkpoints(), parts_.in_flight, to_reconcile_, parts_.position_truth, parts_.fill_context,
                 [this](std::uint32_t symbol_id) noexcept { return parts_.rules(symbol_id); }, wall_now_ms);
             recovery_applied_ = true;
-            ++stats_.recoveries_applied;
+            ++hot_.stats.recoveries_applied;
             obs = observe_recovery(feed, now_ms);
             (void)hot_.recovery.update(obs, now_ms);
         }
@@ -311,7 +316,6 @@ private:
     EnsureBindingStatus binding_status_{EnsureBindingStatus::NotRun};
     bool recovery_applied_{false};
     bool exchange_info_loaded_{false};
-    PipelineStats stats_{};
 };
 
 }  // namespace hy

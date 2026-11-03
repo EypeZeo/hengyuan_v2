@@ -1666,6 +1666,21 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_ws_api_user_data_session)
         gtest_discover_tests(test_binance_ws_api_user_data_session)
 
+        # M5a-2b: the private-stream pipeline over the REAL WS API session, factory and supervisor against the local TLS WebSocket server: a signed subscription
+        # over TLS ends in a token, a dropped connection takes the process out of readiness and the next (re-signed, re-swept) generation brings it back.
+        add_executable(test_private_stream_pipeline_loopback tests/test_private_stream_pipeline_loopback.cpp)
+        target_link_libraries(test_private_stream_pipeline_loopback PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_private_stream_pipeline_loopback SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_private_stream_pipeline_loopback PRIVATE tests)
+        target_compile_definitions(test_private_stream_pipeline_loopback PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_private_stream_pipeline_loopback)
+        hengyuan_allow_third_party_tsan_fences(test_private_stream_pipeline_loopback)
+        gtest_discover_tests(test_private_stream_pipeline_loopback)
+
         # 批次 6 6b-0f-7: the whole public-feed pipeline (kline + depth supervised feeds, their drivers,
         # gates and the validity verdict) against REAL sessions on the loopback server; only the two REST
         # fetches are scripted. Needs the strategy-spec library for the evaluator/spec loader on top of the
