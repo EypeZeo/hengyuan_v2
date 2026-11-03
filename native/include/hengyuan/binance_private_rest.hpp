@@ -208,8 +208,12 @@ inline bool parse_server_time_response(std::string_view body,
 // snapshot's timestamp and its own HTTP request's timestamp are the same value, not two
 // independent clock reads. A non-positive timestamp is refused as ClockNotFresh before
 // anything is parsed (0 is the "never fetched" value, only a default snapshot has it).
-inline PrivateRestError parse_account_response(std::string_view body, std::int64_t timestamp_ms,
-                                                AccountSnapshot& out) {
+namespace detail {
+
+// The body of both parse_account_response() overloads. `uid_out`, when given, makes the "uid" field REQUIRED (a positive integer; 0 is "no
+// account" for the store binding) and is assigned only on total success, like `out`.
+inline PrivateRestError parse_account_response_impl(std::string_view body, std::int64_t timestamp_ms, AccountSnapshot& out,
+                                                    std::uint64_t* uid_out) {
     if (timestamp_ms <= 0) return PrivateRestError::ClockNotFresh;
 
     auto padded = simdjson::padded_string(body);
@@ -220,6 +224,12 @@ inline PrivateRestError parse_account_response(std::string_view body, std::int64
     bool can_trade = false;
     if (doc["canTrade"].get_bool().get(can_trade) != simdjson::SUCCESS) {
         return PrivateRestError::MalformedResponse;
+    }
+
+    // Read before the balances array is walked: the document is consumed front to back, and "uid" is one field of the same object.
+    std::uint64_t uid = 0;
+    if (uid_out != nullptr) {
+        if (doc["uid"].get_uint64().get(uid) != simdjson::SUCCESS || uid == 0) return PrivateRestError::MalformedResponse;
     }
 
     simdjson::ondemand::array balances;
@@ -277,7 +287,19 @@ inline PrivateRestError parse_account_response(std::string_view body, std::int64
         return PrivateRestError::ClockNotFresh;  // unreachable past the check above; a refusal is never ignored
     }
     out = built;
+    if (uid_out != nullptr) *uid_out = uid;
     return PrivateRestError::None;
+}
+
+}  // namespace detail
+
+inline PrivateRestError parse_account_response(std::string_view body, std::int64_t timestamp_ms, AccountSnapshot& out) {
+    return detail::parse_account_response_impl(body, timestamp_ms, out, nullptr);
+}
+
+// The same, and the account's uid as well (the "uid" field is required here). Both outputs are left UNCHANGED on every failure path.
+inline PrivateRestError parse_account_response(std::string_view body, std::int64_t timestamp_ms, AccountSnapshot& out, std::uint64_t& uid_out) {
+    return detail::parse_account_response_impl(body, timestamp_ms, out, &uid_out);
 }
 
 // TODO 1A.4: listenKey is a ~60-char alphanumeric token; 128 is generous headroom without being
@@ -1382,6 +1404,21 @@ public:
     // assigns to `out` once, on total success, exactly mirroring parse_account_response()'s own
     // build-then-assign discipline.
     PrivateRestError fetch_account(AccountSnapshot& out, const PrivateRestConfig& cfg) {
+        return fetch_account_impl(out, nullptr, cfg);
+    }
+
+    // Private-stream migration M5a-2a: the same fetch, and the account's uid as the exchange reports it for this key ("uid" is required in the
+    // answer). The trading process binds its store to that value (store_binding_writer.hpp::ensure_store_binding()); a configured uid must never
+    // stand in for it. `out` and `uid` are both left UNCHANGED on every failure path.
+    PrivateRestError fetch_account(AccountSnapshot& out, std::uint64_t& uid) {
+        return fetch_account_impl(out, &uid, default_cfg_);
+    }
+    PrivateRestError fetch_account(AccountSnapshot& out, std::uint64_t& uid, const PrivateRestConfig& cfg) {
+        return fetch_account_impl(out, &uid, cfg);
+    }
+
+private:
+    PrivateRestError fetch_account_impl(AccountSnapshot& out, std::uint64_t* uid_out, const PrivateRestConfig& cfg) {
         // The same entry guards as every sibling method. fetch_account() used to be the one public
         // method that went straight to `*creds_` (audit P2-002); the endpoint policy is checked
         // before anything is signed (audit P2-001).
@@ -1439,12 +1476,16 @@ public:
         }
 
         AccountSnapshot parsed{};
-        const PrivateRestError perr =
-            parse_account_response(std::get<std::string>(outcome), clock_token->server_ms(), parsed);
+        std::uint64_t parsed_uid = 0;
+        const PrivateRestError perr = detail::parse_account_response_impl(std::get<std::string>(outcome), clock_token->server_ms(), parsed,
+                                                                          uid_out != nullptr ? &parsed_uid : nullptr);
         if (perr != PrivateRestError::None) return perr;
         out = parsed;
+        if (uid_out != nullptr) *uid_out = parsed_uid;
         return PrivateRestError::None;
     }
+
+public:
 
     // TODO 1A.4: POST/PUT/DELETE /api/v3/userDataStream (listenKey lifecycle). These three are
     // Binance's USER_STREAM-type endpoints -- confirmed against long-stable, version-independent

@@ -44,6 +44,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -588,6 +589,85 @@ TEST(ParseAccountResponse, SyntacticallyInvalidJsonRejectedAtFieldAccess) {
     AccountSnapshot out{};
     const auto err = parse_account_response("not json", kAccountTs, out);
     EXPECT_EQ(err, PrivateRestError::MalformedResponse);
+}
+
+// --- parse_account_response() with the account's uid (private-stream migration M5a-2a) ---
+//
+// The uid is what the store binding records (store_binding_writer.hpp): it must be the number the EXCHANGE reports for the key in use, so the overload that
+// returns it requires the field, and neither output moves unless the whole answer was good.
+
+namespace {
+
+constexpr const char* kUidBody = R"({"uid":354937868,"canTrade":true,"balances":[{"asset":"BTC","free":"1.5","locked":"0.5"}]})";
+
+std::string account_body_with_uid_field(const std::string& uid_field) {
+    return R"({"canTrade":true,)" + uid_field + R"("balances":[{"asset":"BTC","free":"1.5","locked":"0.5"}]})";
+}
+
+}  // namespace
+
+TEST(ParseAccountResponseUid, TheUidIsReturnedWithTheSnapshot) {
+    AccountSnapshot out{};
+    std::uint64_t uid = 0;
+    ASSERT_EQ(parse_account_response(kUidBody, kAccountTs, out, uid), PrivateRestError::None);
+    EXPECT_EQ(uid, 354'937'868U);
+    EXPECT_EQ(out.timestamp_ms(), kAccountTs);
+    ASSERT_NE(out.find("BTC"), nullptr);
+    EXPECT_EQ(out.find("BTC")->free_ticks(), 150'000'000);
+}
+
+TEST(ParseAccountResponseUid, ALongUidSurvivesWithoutLoss) {
+    // The Testnet account measured by the R6 probe has a 19-digit uid; the largest uint64 must come back exactly as well.
+    for (const auto& [text, expected] : std::vector<std::pair<std::string, std::uint64_t>>{
+             {"1234567890123456789", 1'234'567'890'123'456'789ULL}, {"9223372036854775808", 9'223'372'036'854'775'808ULL},
+             {"18446744073709551615", 18'446'744'073'709'551'615ULL}, {"1", 1U}}) {
+        AccountSnapshot out{};
+        std::uint64_t uid = 0;
+        ASSERT_EQ(parse_account_response(account_body_with_uid_field(R"("uid":)" + text + ","), kAccountTs, out, uid), PrivateRestError::None) << text;
+        EXPECT_EQ(uid, expected) << text;
+    }
+}
+
+TEST(ParseAccountResponseUid, TheUidMayComeAfterTheBalancesToo) {
+    AccountSnapshot out{};
+    std::uint64_t uid = 0;
+    ASSERT_EQ(parse_account_response(R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1","locked":"0"}],"uid":77})", kAccountTs, out, uid),
+              PrivateRestError::None);
+    EXPECT_EQ(uid, 77U);
+    ASSERT_NE(out.find("BTC"), nullptr);
+}
+
+TEST(ParseAccountResponseUid, AnAnswerWithoutAUsableUidIsRefusedAndNothingMoves) {
+    for (const std::string& field : std::vector<std::string>{"", R"("uid":0,)", R"("uid":-5,)", R"("uid":1.5,)", R"("uid":"354937868",)", R"("uid":null,)",
+                                                           R"("uid":true,)", R"("uid":18446744073709551616,)", R"("uid":[1],)"}) {
+        SCOPED_TRACE(field);
+        AccountSnapshot out = sentinel_snapshot(2);
+        std::uint64_t uid = 4242;
+        EXPECT_EQ(parse_account_response(account_body_with_uid_field(field), kAccountTs, out, uid), PrivateRestError::MalformedResponse);
+        expect_sentinel_untouched(out, 2);
+        EXPECT_EQ(uid, 4242U);
+    }
+}
+
+TEST(ParseAccountResponseUid, AGoodUidDoesNotRescueABadAnswer) {
+    // The uid is only handed out with a snapshot that was accepted whole.
+    AccountSnapshot out = sentinel_snapshot(2);
+    std::uint64_t uid = 4242;
+    EXPECT_EQ(parse_account_response(R"({"uid":9,"canTrade":true,"balances":[{"asset":"BTC","free":"-1","locked":"0"}]})", kAccountTs, out, uid),
+              PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 2);
+    EXPECT_EQ(uid, 4242U);
+    EXPECT_EQ(parse_account_response(kUidBody, 0, out, uid), PrivateRestError::ClockNotFresh);
+    expect_sentinel_untouched(out, 2);
+    EXPECT_EQ(uid, 4242U);
+}
+
+TEST(ParseAccountResponseUid, TheOverloadWithoutAUidDoesNotCareAboutTheField) {
+    for (const std::string& field : std::vector<std::string>{"", R"("uid":0,)", R"("uid":"x",)", R"("uid":-1,)"}) {
+        SCOPED_TRACE(field);
+        AccountSnapshot out{};
+        EXPECT_EQ(parse_account_response(account_body_with_uid_field(field), kAccountTs, out), PrivateRestError::None);
+    }
 }
 
 // --- FI-033: malformed account data never becomes a malformed snapshot (audit P1-003) ---
@@ -1413,6 +1493,73 @@ TEST_F(BoundCredentialsFixture, FetchAccountRealSuccessPathSignsAndParses) {
     EXPECT_NE(reqs[0].target.find("&signature="), std::string::npos);
 }
 
+TEST_F(BoundCredentialsFixture, FetchAccountWithUidReturnsTheExchangesUid) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        hy::test_helpers::current_server_time_body());
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    hy::test_helpers::TlsResponseAcceptor account_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, kUidBody);
+    PrivateRestConfig fetch_cfg;
+    fetch_cfg.port = std::to_string(account_server.port());
+
+    AccountSnapshot out{};
+    std::uint64_t uid = 0;
+    ASSERT_EQ(client.fetch_account(out, uid, fetch_cfg), PrivateRestError::None);
+    EXPECT_EQ(uid, 354'937'868U);
+    ASSERT_NE(out.find("BTC"), nullptr);
+    EXPECT_GT(out.timestamp_ms(), 0);
+    const auto reqs = account_server.requests();
+    ASSERT_EQ(reqs.size(), 1u);
+    EXPECT_EQ(reqs[0].target.substr(0, 16), "/api/v3/account?") << "the same request as the overload without a uid";
+    EXPECT_NE(reqs[0].target.find("&signature="), std::string::npos);
+}
+
+TEST_F(BoundCredentialsFixture, FetchAccountWithUidRefusesAnAnswerWithoutOneAndMovesNothing) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        hy::test_helpers::current_server_time_body());
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    hy::test_helpers::TlsResponseAcceptor account_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1.5","locked":"0.5"}]})");
+    PrivateRestConfig fetch_cfg;
+    fetch_cfg.port = std::to_string(account_server.port());
+
+    AccountSnapshot out = sentinel_snapshot(3);
+    std::uint64_t uid = 4242;
+    EXPECT_EQ(client.fetch_account(out, uid, fetch_cfg), PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 3);
+    EXPECT_EQ(uid, 4242U);
+    // ... while the overload that does not ask for a uid takes the very same answer.
+    AccountSnapshot plain{};
+    ASSERT_EQ(client.fetch_account(plain, fetch_cfg), PrivateRestError::None);
+    ASSERT_NE(plain.find("BTC"), nullptr);
+}
+
+TEST_F(BoundCredentialsFixture, FetchAccountWithUidFailsClosedWithoutPriorClockSync) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    AccountSnapshot out = sentinel_snapshot(2);
+    std::uint64_t uid = 4242;
+    EXPECT_EQ(client.fetch_account(out, uid), PrivateRestError::ClockNotFresh);
+    expect_sentinel_untouched(out, 2);
+    EXPECT_EQ(uid, 4242U);
+}
+
 TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
     hy::test_helpers::TlsResponseAcceptor time_server(
         fixture_path("test_leaf_cert_testnet_host.pem"),
@@ -2037,6 +2184,16 @@ TEST(FetchAccountEntryGuards, NullCredentialsFailsClosedEvenWithAFreshClock) {
     AccountSnapshot out = sentinel_snapshot(1);
     EXPECT_EQ(client.fetch_account(out), PrivateRestError::SigningFailed);
     expect_sentinel_untouched(out, 1);  // out must be left untouched on every failure path
+}
+
+TEST(FetchAccountEntryGuards, NullCredentialsFailsClosedWithAUidToo) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), nullptr);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    AccountSnapshot out = sentinel_snapshot(1);
+    std::uint64_t uid = 4242;
+    EXPECT_EQ(client.fetch_account(out, uid), PrivateRestError::SigningFailed);
+    expect_sentinel_untouched(out, 1);
+    EXPECT_EQ(uid, 4242U) << "the uid is left untouched on every failure path too";
 }
 
 namespace {

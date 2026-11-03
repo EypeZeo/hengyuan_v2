@@ -261,6 +261,22 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **未接线**：没有任何生产代码创建刷新器、持有者或带步骤的 `SweepJob`（守卫钉住）；屏障在进程里因此仍然不会完成——M5a-2 与 M5b 接线。真实的取账户端口（`PrivateRestClient::fetch_account` 的适配器，
     要捕获异常并回报 `Failed`；交易侧还需要一个带 uid 的重载）也在接线那一片。
   - **证据**：`test_account_refresh.cpp`（40 例：刷新器——首次立即取、周期与重试间隔及其下限、环满丢弃、非正时钟不取、越界结果算失败、清扫步骤总是取并带纪元；持有者——按取数开始时刻保留最新、重新盖章、`refreshed_by()` 只凭标签回答并自己先排空环、`fresh()` 与 `validate_pre_trade()` 同谓词；`poll_once()` 钩子——每个纪元一次、在所有回答之后与标记之前、环满重试的是标记不是步骤、结束的清扫不跑步骤；端到端——屏障只在清扫自己取的账户上完成，周期更新无论早于或晚于请求都不行，步骤失败则保持 `Sweeping` 而下一次清扫恢复）、`test_account_refresh_concurrency.cpp`（2 例，两个真实线程：Reconciled 时持有的账户必须取在该纪元最后一次查询之后；环不满则从无 `reports_account_stale`）、`test_startup_recovery.cpp`（影子计数 +6）、`test_barrier_sweep_guard.cpp`（+5）。MSVC（`/W4 /WX`，Release）全量构建零警告零错误，全量 ctest 3485 个用例：3482 通过、2 个按设计禁用（微基准）、1 个既有的跳过、0 失败；WSL2 GCC-14：`none` 23 个受影响目标 781 例、`address`（ASan+UBSan）19 个目标 580 例全绿，官方 `thread` 层 214/214（跑在补三条单线程测试之前；它们不在 concurrency 清单里），三个负控照常报数据竞争。变异检查 56 个变异体（账户刷新 35、清扫钩子与探针 11、影子计数 7、`poll_once()` 3）：54 个被杀死，2 个等价——AR06（`>` 与 `>=`，观测不可区分）、AR13（`fresh()` 的 `held_` 与默认快照时间戳 0 被 `check_freshness()` 判 `NeverFetched` 重叠）；第一轮存活的 AR25（重试间隔的下限）、AR38（越界结果）、BS07（已结束的清扫不跑步骤）补了测试后杀死，另有 5 个变异体因 `/WX` 编译不过、改写后也被杀死；三个金丝雀先于其余运行，都由语义测试杀死。
+- 真实取账户端口与账户 uid（私网流迁移 M5a-2a，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.2 / §5.5；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B）— 上一条的刷新器通过 `AccountFetchPort`
+  取账户，这一片给出生产一侧：`rest_account_fetcher.hpp` 的 `RestAccountFetcher`（`BinancePrivateRestClient::fetch_account()` 的适配器），以及存储绑定需要的账户 uid。
+  - **uid 是交易所报告的，不是配置的。** `parse_account_response()` 多一个返回 `uid` 的重载：`uid` 字段必需、必须是正整数（0 是 “没有账户”，负数、小数、字符串、超出 `uint64` 的都拒绝），
+    快照与 uid **都**只在整份应答被接受时才赋值（任何失败路径上两个输出都不动）；不要 uid 的旧重载不看这个字段。`BinancePrivateRestClient::fetch_account(out, uid[, cfg])` 与旧重载共用一个实现体
+    （同一个请求、同一道入口守卫、同一份预算），只在是否要求 uid 上不同。`store_binding_writer.hpp` 的头注释早就要求 “接线时传交易所对交易密钥报告的 UID”；这是那个值的来源。
+  - **`account_fetch_outcome_of()`：每个 `PrivateRestError` 一个回答。** “请求没有离开进程”的（`InvalidConfig`、`ClockNotFresh`、`SigningFailed`、`ClockSkewTooLarge`、`RateLimitExhausted`）⇒ `NotSent`；
+    “试过网络或应答不可用”的（解析、连接、TLS、写读、HTTP 状态、JSON、格式、容量）⇒ `Failed`；`None` ⇒ `Fetched`；没人定义的值 ⇒ `Failed`，永远不是成功。逐枚举写全（`-Wswitch`
+    让新枚举不会悄悄落进 `Failed`）。适配器只在整体成功时才给调用方的快照赋值（不管客户端对自己拿到的缓冲区做了什么），异常不出这个 `noexcept` 端口（算 `Failed`，单独计数），
+    计数器与 `last_error` 说明发生了什么。刷新器对 `NotSent` 与 `Failed` 一视同仁（按重试间隔再试），区别只在计数器里。
+  - **线程约束（本片发现）。** `fetch_account()` 要签名，`BoundHmacCredentials` 只在绑定它的线程上应答（F11），客户端的限流追踪器也属于同一个线程（`spot_rate_limit_budget.hpp`：一个文档化的契约，不是强制的）。
+    所以这个适配器只能在拥有凭据的线程上调用。今天的真实线束是**一个循环线程**，热半部与对账半部在同一处 tick（`live_submit_preflight_harness.cpp`）；一个真正独立的对账线程需要在它自己身上绑定的凭据，
+    和两个线程都够得着的限流源——那是一个本片不取的设计分叉（蓝图：待定）。在错误的线程上用，适配器不会做出怪事：签名被拒 ⇒ `SigningFailed` ⇒ `NotSent` ⇒ 屏障停在 `Sweeping`
+    （失败关闭，计数器可见）；有测试（凭据在另一个线程绑定）。
+  - **启动读取 `fetch_exchange_account_uid()`**：启动时调一次，给 `ensure_store_binding()`；与端口分开是有意的——绑定只做一次，周期与清扫的取数用不着 uid。只在应答良好时才给 `uid_out` 赋值，不抛异常（异常算 `Read`）。
+  - **未接线**：没有生产代码创建 `RestAccountFetcher` 或调用启动读取（M5a-2b 的流水线与 M5b 的线束才会）。
+  - **证据**：（干跑）
 
 ### 容量 / 生命周期
 

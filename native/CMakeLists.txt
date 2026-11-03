@@ -1514,6 +1514,21 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_private_rest_raw)
         gtest_discover_tests(test_binance_private_rest_raw)
 
+        # Private-stream migration M5a-2a: the real account port over BinancePrivateRestClient::fetch_account() (the error -> NotSent/Failed mapping,
+        # the exception shield, the startup read of the account uid) against a scripted client and, for the pairing itself, loopback TLS.
+        add_executable(test_rest_account_fetcher tests/test_rest_account_fetcher.cpp)
+        target_link_libraries(test_rest_account_fetcher PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_rest_account_fetcher SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_rest_account_fetcher PRIVATE tests)
+        target_compile_definitions(test_rest_account_fetcher PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_rest_account_fetcher)
+        hengyuan_allow_third_party_tsan_fences(test_rest_account_fetcher)
+        gtest_discover_tests(test_rest_account_fetcher)
+
         # D5 slice R3b-1: the offline operator tool's real exchange port (pacing, the rate-limit latch, the clock refresh, summarize_account)
         # and the whole flow end to end over loopback TLS.
         add_executable(test_operator_resolution_transport tests/test_operator_resolution_transport.cpp)

@@ -66,6 +66,8 @@ public:
 
     [[nodiscard]] bool ok() const noexcept { return creds_ != nullptr; }
     [[nodiscard]] hy::BoundHmacCredentials& get() noexcept { return *creds_; }
+    // Hands the credentials to a client that owns them (BinancePrivateRestClient takes a unique_ptr). They stay bound to the thread that made them.
+    [[nodiscard]] std::unique_ptr<hy::BoundHmacCredentials> release() noexcept { return std::move(creds_); }
 
 private:
     std::string env_path_;
