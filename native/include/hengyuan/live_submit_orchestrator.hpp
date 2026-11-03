@@ -411,9 +411,12 @@ namespace detail {
 
 // --- Core orchestration function ---
 
-inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept {
-    OrchestratorResult result{};
-
+// The hot thread's input drains, in the order every decision needs them: the sweep pump first (the barrier is brought up to date and the sweep request posted),
+// then the reconcile thread's resolutions (a SweepDone marker reaches the barrier at the point the ring puts it), then the WebSocket user-data events. They run
+// ahead of every gate and are the same whether an order is being sent or not, which is why they live here and are called both by orchestrate_submit() and by
+// the private-stream pipeline's hot tick (private_stream_pipeline.hpp): one definition, so the two cannot drift. Each part runs only when its wiring is
+// present in `ctx`; none of them reads an order field.
+inline void drain_hot_inputs(OrchestratorContext& ctx) noexcept {
     // Drain any reconcile-thread resolutions before processing this new order.
     // Unconditional on gates below (even a KillSwitch-halted or audit-unavailable
     // call still owns the only writer access to ctx.in_flight/ctx.audit on this
@@ -447,6 +450,13 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                                 ctx.readiness != nullptr ? &ctx.readiness->barrier() : nullptr,
                                 ctx.late_fill, ctx.user_data_durable);
     }
+}
+
+inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept {
+    OrchestratorResult result{};
+
+    // Everything the hot thread has to drain before it looks at a gate -- unconditional on the gates, see drain_hot_inputs() above for what and why.
+    drain_hot_inputs(ctx);
 
     // Gate 1: Audit available
     if (!ctx.audit || !can_submit_order(*ctx.audit)) {

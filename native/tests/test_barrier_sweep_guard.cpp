@@ -509,24 +509,30 @@ TEST(BarrierSweepGuard, EveryProductionReconcileDrainIsPinnedWithItsSink) {
     EXPECT_TRUE(problems.empty());
 }
 
-// --- 5. nobody runs a sweep job in production yet ----------------------------------------------------------------------------------------------
+// --- 5. one place runs a sweep job in production: the private-stream pipeline -----------------------------------------------------------------
 
-TEST(BarrierSweepGuard, NoProductionPollOnceCallPassesASweepJobYet) {
-    // poll_once(tracker, inbound, outbound, port, policy, now_ms[, wall_now_ms[, sweep]]): six, seven or eight arguments. The live process that runs
-    // a SweepJob is M5's; its call gets pinned there. Until then an eighth argument in production is a wiring nobody reviewed.
-    std::vector<std::string> problems;
+namespace {
+constexpr const char* kPipelineHeader = "include/hengyuan/private_stream_pipeline.hpp";
+}  // namespace
+
+TEST(BarrierSweepGuard, OnlyThePipelinePassesASweepJobToPollOnce) {
+    // poll_once(tracker, inbound, outbound, port, policy, now_ms[, wall_now_ms[, sweep]]): six, seven or eight arguments; eight means the call runs a SweepJob.
+    // The private-stream pipeline (M5a-2b) is the one production site, and the job it passes is the one it owns. The harnesses join it when M5b migrates them --
+    // through the pipeline, not with a job of their own -- so an eighth argument anywhere else is a wiring nobody reviewed.
+    std::vector<std::string> with_job;
     std::size_t calls_seen = 0;
     for (const SourceFile& f : production_sources()) {
         for (const auto& args : call_args(f.code, "poll_once")) {
             ++calls_seen;
             if (args.size() >= 8) {
-                problems.push_back(f.rel + ": poll_once() with " + std::to_string(args.size()) + " arguments passes a sweep job; M5 wires the live one and pins it");
+                with_job.push_back(f.rel);
+                EXPECT_EQ(args.size(), 8u) << f.rel;
+                EXPECT_EQ(args.back(), "&reconcile_.job") << f.rel << ": the job the pipeline owns, nobody else's";
             }
         }
     }
     EXPECT_GE(calls_seen, 5u) << "the scan must see the real poll_once() callers (the harnesses and the dry-run rig)";
-    for (const std::string& s : problems) ADD_FAILURE() << s;
-    EXPECT_TRUE(problems.empty());
+    EXPECT_EQ(with_job, (std::vector<std::string>{kPipelineHeader}));
 }
 
 // --- 6. the account refresh (M5a) -----------------------------------------------------------------------------------------------------------------
@@ -566,7 +572,9 @@ TEST(BarrierSweepGuard, PollOnceRunsTheAccountStepBeforeItMakesTheMarker) {
 
 TEST(BarrierSweepGuard, TheAccountRingHasOneProducerOneConsumerAndTheProbeOneMaker) {
     const std::vector<std::string> only_the_header{"include/hengyuan/account_refresh.hpp"};
-    EXPECT_EQ(files_with("AccountUpdateRing"), only_the_header) << "who touches the account ring";
+    // The pipeline OWNS the ring (it declares it and hands a reference to the refresher and to the holder) and never pushes or pops it: the pusher / popper
+    // checks below are over the call sites, and they stay with the header.
+    EXPECT_EQ(files_with("AccountUpdateRing"), (std::vector<std::string>{"include/hengyuan/account_refresh.hpp", kPipelineHeader})) << "who touches the account ring";
     std::vector<std::string> pushers;
     std::vector<std::string> poppers;
     for (const SourceFile& f : production_sources()) {
@@ -594,17 +602,33 @@ TEST(BarrierSweepGuard, RefreshedByDrainsTheAccountRingBeforeItAnswers) {
     EXPECT_EQ(body.find("fetch_started_ms"), std::string::npos) << "the sweep question is never answered from a clock reading (account_refresh.hpp, \"BY THE SWEEP\")";
 }
 
-TEST(BarrierSweepGuard, NoProductionSourceOutsideTheHeaderBuildsTheAccountPiecesYet) {
-    // M5a-1 builds the refresher, the holder and the job's step; the process wiring that creates and connects them is a later slice, which updates these pins
-    // with the file that does it.
-    const std::vector<std::string> only_the_header{"include/hengyuan/account_refresh.hpp"};
-    EXPECT_EQ(files_with("AccountRefresher"), only_the_header);
-    EXPECT_EQ(files_with("AccountHolder"), only_the_header);
-    EXPECT_EQ(files_with("sweep_step("), only_the_header);
-    EXPECT_EQ(files_with("sweep_probe("), only_the_header);
+TEST(BarrierSweepGuard, OnlyTheHeaderAndThePipelineBuildAndConnectTheAccountPieces) {
+    // M5a-1 built the refresher, the holder and the job's step; the private-stream pipeline (M5a-2b) is the process wiring that creates and connects them,
+    // and nothing else names them -- the harnesses reach them through the pipeline when M5b migrates them.
+    const std::vector<std::string> header_and_pipeline{"include/hengyuan/account_refresh.hpp", kPipelineHeader};
+    EXPECT_EQ(files_with("AccountRefresher"), header_and_pipeline);
+    EXPECT_EQ(files_with("AccountHolder"), header_and_pipeline);
+    EXPECT_EQ(files_with("sweep_step("), header_and_pipeline);
+    EXPECT_EQ(files_with("sweep_probe("), header_and_pipeline);
+
+    // ...and the pipeline connects them the one way the barrier's account question needs: the job gets the refresher's step, the pump the holder's probe, and
+    // refresher and holder share the one ring.
+    const SourceFile* pipeline = find_source(kPipelineHeader);
+    ASSERT_NE(pipeline, nullptr);
+    const std::string squeezed = [&] {
+        std::string s;
+        for (const char c : pipeline->code) {
+            if (c != ' ' && c != '\n' && c != '\r' && c != '\t') s += c;
+        }
+        return s;
+    }();
+    EXPECT_EQ(count_substring(squeezed, "job(sweep_requests,refresher.sweep_step())"), 1u);
+    EXPECT_EQ(count_substring(squeezed, "pump(readiness,sweep_requests,holder.sweep_probe())"), 1u);
+    EXPECT_EQ(count_substring(squeezed, "holder(account_updates)"), 1u);
+    EXPECT_EQ(count_substring(squeezed, "refresher(account_updates,parts.account_port,config.refresh)"), 1u);
 }
 
-TEST(StartupRecoveryShadowTallyGuard, TheHotThreadTallyNamesNeitherTheTrackerNorAnAtomicAndNoProductionCodeCallsItYet) {
+TEST(StartupRecoveryShadowTallyGuard, TheHotThreadTallyNamesNeitherTheTrackerNorAnAtomicAndOnlyThePipelineCallsIt) {
     const SourceFile* f = find_source("include/hengyuan/startup_recovery.hpp");
     ASSERT_NE(f, nullptr);
     const std::size_t at = f->code.find("tally_recovered_orders_by_shadow(");
@@ -619,6 +643,6 @@ TEST(StartupRecoveryShadowTallyGuard, TheHotThreadTallyNamesNeitherTheTrackerNor
     EXPECT_EQ(body.find("tracker"), std::string::npos);
     EXPECT_EQ(body.find("for_each_active"), std::string::npos);
     EXPECT_EQ(body.find("atomic"), std::string::npos) << "it reads hot-thread memory only; nothing crosses a thread boundary";
-    EXPECT_EQ(occurrences("tally_recovered_orders_by_shadow("), (Occ{{"include/hengyuan/startup_recovery.hpp", 1}}))
-        << "the process wiring that calls it is a later slice; it pins its own call site";
+    EXPECT_EQ(occurrences("tally_recovered_orders_by_shadow("), (Occ{{kPipelineHeader, 1}, {"include/hengyuan/startup_recovery.hpp", 1}}))
+        << "the definition, and the pipeline's one call (observe_recovery(), on the hot thread, from the registry and the fill context it was given)";
 }

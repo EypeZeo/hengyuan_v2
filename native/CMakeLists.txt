@@ -1268,6 +1268,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_account_refresh)
     gtest_discover_tests(test_account_refresh)
 
+    # M5a-2b: the composition root of the private stream (private_stream_pipeline.hpp) over a scripted session, a REAL durable store and the real
+    # barrier / recovery / sweep / publisher objects: from nothing to a readiness token, every condition of it necessary, the store binding as a gate,
+    # recovery of an unfinished order, the wiring of the context. Single-threaded and deterministic (both halves ticked from the test thread).
+    add_executable(test_private_stream_pipeline tests/test_private_stream_pipeline.cpp)
+    target_link_libraries(test_private_stream_pipeline PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_private_stream_pipeline)
+    gtest_discover_tests(test_private_stream_pipeline)
+
     # M3b source-text guard: poll_once() takes the sweep request before it drains the ingress ring, a SweepDone marker is made / delivered / applied in
     # one place each, a request is made and pushed only by the pump, every production drain_reconcile_events() call is pinned with its sink argument, and
     # no production poll_once() runs a sweep job yet. It reads the source tree, so the native/ directory is a compile definition (same shape as the
