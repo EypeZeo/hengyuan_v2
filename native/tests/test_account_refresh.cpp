@@ -158,6 +158,19 @@ TEST_F(AccountRefresherTest, AnUnwiredPortIsNotSent) {
     EXPECT_TRUE(drain(ring).empty());
 }
 
+TEST_F(AccountRefresherTest, AnOutcomeNoOneDefinedIsNoSuccess) {
+    fake_.outcomes = {static_cast<AccountFetchOutcome>(200)};  // an enum with a fixed underlying type may hold it; a buggy adapter could return it
+    refresher_.tick(5'000);
+    EXPECT_EQ(fake_.calls, 1U);
+    EXPECT_EQ(refresher_.stats().failed, 1U) << "an answer nobody can interpret is a failure";
+    EXPECT_EQ(refresher_.stats().delivered, 0U);
+    EXPECT_TRUE(drain(ring_).empty()) << "nothing goes on the ring";
+    refresher_.tick(5'000 + kPolicy.retry_ms - 1);
+    EXPECT_EQ(fake_.calls, 1U);
+    refresher_.tick(5'000 + kPolicy.retry_ms);
+    EXPECT_EQ(fake_.calls, 2U) << "...and it is tried again at the retry interval, not after a full period";
+}
+
 TEST(AccountRefresherPolicy, AnInvalidPolicyIsClampedNotLooped) {
     AccountUpdateRing ring;
     FakeAccountPort fake;
@@ -168,6 +181,20 @@ TEST(AccountRefresherPolicy, AnInvalidPolicyIsClampedNotLooped) {
     EXPECT_EQ(fake.calls, 1U) << "even a zero period does not make the same millisecond due again";
     refresher.tick(101);
     EXPECT_EQ(fake.calls, 2U) << "...but the next millisecond is";
+}
+
+TEST(AccountRefresherPolicy, AnInvalidRetryIntervalIsClampedToo) {
+    AccountUpdateRing ring;
+    FakeAccountPort fake;
+    fake.outcomes = {AccountFetchOutcome::Failed, AccountFetchOutcome::Fetched};
+    AccountRefresher refresher{ring, fake.port(), AccountRefreshPolicy{10'000, 0}};
+    refresher.tick(100);  // fails: the next try is due after the retry interval, which a zero must not turn into "now"
+    EXPECT_EQ(fake.calls, 1U);
+    refresher.tick(100);
+    EXPECT_EQ(fake.calls, 1U) << "even a zero retry interval does not make the same millisecond due again";
+    refresher.tick(101);
+    EXPECT_EQ(fake.calls, 2U) << "...but the next millisecond is";
+    EXPECT_EQ(refresher.stats().delivered, 1U);
 }
 
 TEST(AccountRefresherPolicy, TheNextDueTimeSaturatesInsteadOfWrapping) {
@@ -533,6 +560,15 @@ TEST_F(SweepStepTest, WithoutASweepNothingRuns) {
     tick(1'000);
     tick(2'000);
     EXPECT_TRUE(log_.calls.empty());
+}
+
+TEST_F(SweepStepTest, AJobWhoseSweepIsOverDoesNotRunTheStep) {
+    post(1);
+    ASSERT_TRUE(job_.take_requests(1'000));
+    job_.finished();  // the sweep ended without its step having run: poll_once() never does that, and the job must not lean on it
+    job_.before_marker(1'100);
+    EXPECT_TRUE(log_.calls.empty()) << "a step belongs to a sweep in progress";
+    EXPECT_EQ(job_.stats().account_steps, 0U);
 }
 
 TEST(SweepStepAbsent, AJobWithoutAStepSweepsAsBefore) {

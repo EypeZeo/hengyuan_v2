@@ -260,7 +260,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     （进程接线是后续切片，到时更新这条钉子）；影子计数的签名不含 `OrderTracker`、函数体不出现 `tracker` / `for_each_active` / `atomic`，且没有生产调用方。
   - **未接线**：没有任何生产代码创建刷新器、持有者或带步骤的 `SweepJob`（守卫钉住）；屏障在进程里因此仍然不会完成——M5a-2 与 M5b 接线。真实的取账户端口（`PrivateRestClient::fetch_account` 的适配器，
     要捕获异常并回报 `Failed`；交易侧还需要一个带 uid 的重载）也在接线那一片。
-  - **证据**：（干跑）
+  - **证据**：`test_account_refresh.cpp`（40 例：刷新器——首次立即取、周期与重试间隔及其下限、环满丢弃、非正时钟不取、越界结果算失败、清扫步骤总是取并带纪元；持有者——按取数开始时刻保留最新、重新盖章、`refreshed_by()` 只凭标签回答并自己先排空环、`fresh()` 与 `validate_pre_trade()` 同谓词；`poll_once()` 钩子——每个纪元一次、在所有回答之后与标记之前、环满重试的是标记不是步骤、结束的清扫不跑步骤；端到端——屏障只在清扫自己取的账户上完成，周期更新无论早于或晚于请求都不行，步骤失败则保持 `Sweeping` 而下一次清扫恢复）、`test_account_refresh_concurrency.cpp`（2 例，两个真实线程：Reconciled 时持有的账户必须取在该纪元最后一次查询之后；环不满则从无 `reports_account_stale`）、`test_startup_recovery.cpp`（影子计数 +6）、`test_barrier_sweep_guard.cpp`（+5）。MSVC（`/W4 /WX`，Release）全量构建零警告零错误，全量 ctest 3485 个用例：3482 通过、2 个按设计禁用（微基准）、1 个既有的跳过、0 失败；WSL2 GCC-14：`none` 23 个受影响目标 781 例、`address`（ASan+UBSan）19 个目标 580 例全绿，官方 `thread` 层 214/214（跑在补三条单线程测试之前；它们不在 concurrency 清单里），三个负控照常报数据竞争。变异检查 56 个变异体（账户刷新 35、清扫钩子与探针 11、影子计数 7、`poll_once()` 3）：54 个被杀死，2 个等价——AR06（`>` 与 `>=`，观测不可区分）、AR13（`fresh()` 的 `held_` 与默认快照时间戳 0 被 `check_freshness()` 判 `NeverFetched` 重叠）；第一轮存活的 AR25（重试间隔的下限）、AR38（越界结果）、BS07（已结束的清扫不跑步骤）补了测试后杀死，另有 5 个变异体因 `/WX` 编译不过、改写后也被杀死；三个金丝雀先于其余运行，都由语义测试杀死。
 
 ### 容量 / 生命周期
 
