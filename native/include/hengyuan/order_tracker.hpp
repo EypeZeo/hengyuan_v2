@@ -608,7 +608,10 @@ inline bool poll_gate_closed(std::int64_t now_ms, std::int64_t last_poll_ms, std
 // and a definite answer -- the state identified, and its resolution pushed if it changed -- marks it answered for that epoch. When no tracked order is
 // left unanswered, one SweepDone marker is pushed to `outbound` AFTER everything the sweep resolved: the ring is FIFO, so the hot thread only sees the
 // marker once it has published those resolutions. A full `outbound` delays the marker, never loses it. The marker's `unresolved` counts the orders
-// this loop will never ask about again (escalated to the operator) -- they keep the barrier from completing.
+// this loop will never ask about again (escalated to the operator) -- they keep the barrier from completing. Just before the marker is made, the
+// sweep's account step (SweepAccountStep, account_refresh.hpp, M5a) runs once per epoch: the account update it publishes is then in front of the marker
+// in time, and the hot thread, having popped the marker, finds it. A step that delivers nothing (a refused or failed fetch) does not hold the marker
+// back: the hot thread finds no update for this epoch and the barrier asks again.
 //
 // CLOCKS (R-10): `now_ms` is the monotonic reading the backoff runs on, as before.
 // `wall_now_ms` is the wall clock in milliseconds, or OrderRecord::kClockUnset when the
@@ -811,6 +814,9 @@ inline void poll_once(OrderTracker& tracker,
     // The sweep is complete when no tracked order is waiting for a query. The marker goes out AFTER everything pushed above (FIFO), or on a later
     // tick if `outbound` is full.
     if (sweep_epoch != 0 && tracker.count_unanswered(sweep_epoch) == 0) {
+        // M5a: the sweep's account step (barrier_sweep.hpp SweepAccountStep), once per epoch and BEFORE the marker is made, so that the account
+        // update it puts on the account ring is in front of the marker: the hot thread pops the marker and then finds the update.
+        sweep->before_marker(now_ms);
         ReconcileEvent marker{};
         marker.kind = ReconcileEventKind::SweepDone;
         marker.sweep_epoch = sweep_epoch;

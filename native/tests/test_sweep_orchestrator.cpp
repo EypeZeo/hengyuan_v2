@@ -44,9 +44,9 @@ RecoveryObservation read_recovery(void* p) noexcept { return static_cast<Script*
 bool read_clock(void* p) noexcept { return static_cast<Script*>(p)->clock_ready; }
 
 struct Account {
-    std::int64_t refreshed_at_ms{0};
+    bool refreshed{false};
 };
-bool account_fresh(void* p, std::int64_t since) noexcept { return static_cast<Account*>(p)->refreshed_at_ms >= since; }
+bool account_fresh(void* p, std::uint64_t) noexcept { return static_cast<Account*>(p)->refreshed; }
 
 struct Durable {
     std::uint64_t frames{0};
@@ -133,7 +133,7 @@ protected:
         script_.feed.last_activity_ms = kNow;
         script_.feed.sampled_at_ms = kNow;
         ASSERT_EQ(recovery_.update(script_.recovery, kNow), RunState::Ready);
-        account_.refreshed_at_ms = kNow + 1'000'000;  // refreshed after any request this test makes
+        account_.refreshed = true;  // refreshed by any sweep this test makes
     }
 
     OrchestratorContext context(bool with_pump, bool with_publisher) {
@@ -257,7 +257,7 @@ TEST_F(SweepOrchestratorTest, WithoutADurablePublisherTheReconcileRingIsNotDrain
 }
 
 TEST_F(SweepOrchestratorTest, ARefusedAccountKeepsTheOrderBackUntilTheSnapshotIsRefreshedAfterTheRequest) {
-    account_.refreshed_at_ms = 0;  // older than any request
+    account_.refreshed = false;  // not refreshed by the sweep
     OrchestratorContext first = context(true, true);
     ASSERT_EQ(orchestrate_submit(first).gate, OrchestratorGate::NotReady);
     SweepRequest posted{};

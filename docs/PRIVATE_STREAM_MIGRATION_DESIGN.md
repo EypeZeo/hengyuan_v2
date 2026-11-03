@@ -179,7 +179,7 @@ flowchart LR
 - 请求与回报**不是**两个环：热 → 对账是 `SweepRequestRing`（`SpscRing<SweepRequest, 4>`，消费者只留最新的纪元）；对账 → 热是 `SweepDone{epoch, unresolved}` 完成标记，**夹在既有的 `ReconcileEventRing` 里**（`ReconcileEvent::kind == SweepDone`）。草图里的独立回报环需要一个计数器和“先发布 N 条再应用回报”的规则；环是先进先出的，这条规则由构造成立：热线程弹出标记时，清扫产生的每一条裁决已被 `drain_reconcile_events()` 持久化并发布。结果是**没有新的原子协议**，所以 M3b **没有**新增 TSan 负控（本节上一版说会有）；`test_sweep_concurrency` 在三个并发清单里，三个既有负控仍须失败，已核对。
 - `OrderTracker::poll_once(..., SweepJob*)` 在排空入口环**之前**取请求，使请求之前发出的订单已在环里。单线程测试看不出这个次序：`test_barrier_sweep_guard`（源码护栏）、`formal/reconnect_sweep_drain_first_bug.cfg`（必败配置）和概率性的两线程测试各钉一部分。
 - `drain_reconcile_events(..., const SweepSink*)` 是第八个参数（第七个是持久发布者）；没有 sink 时标记被消费并丢弃，屏障得不到回答、超时后再发（失败关闭）。`SweepPump::service()` 在 `ctx.sweep` 非空时于 `orchestrate_submit()` 开头运行（没有主循环，直到 M5）。
-- 清扫完成 = `poll_once()` 能问的每个订单都得到晚于请求的权威明确回答；被升级给操作员的订单永远不再被问，计入 `unresolved`，屏障在其存续期间保持 Sweeping——失败关闭，但操作员的回头路还不存在（蓝图附录 D 的 L-46）。`SweepAccountProbe` 没有接线，账户永远不“新鲜”，屏障至今不会完成；账户刷新器随 M5。
+- 清扫完成 = `poll_once()` 能问的每个订单都得到晚于请求的权威明确回答；被升级给操作员的订单永远不再被问，计入 `unresolved`，屏障在其存续期间保持 Sweeping——失败关闭，但操作员的回头路还不存在（蓝图附录 D 的 L-46）。`SweepAccountProbe` 没有接线，账户永远不“新鲜”，屏障至今不会完成；账户刷新器与持有者在 M5a-1 实现（`account_refresh.hpp`，按清扫纪元回答，见 §5.5），进程接线随 M5。
 - `formal/reconnect_sweep.tla`：5 个开关（任意纪元 `any_epoch`、绕过先进先出 `bypass_fifo`、先排空后取请求 `drain_first`、不降为 Down `no_down`、不观察 `no_observe`），每个有必败配置，另有探针；主配置 5,859,744 个状态；`ci-spec-verification.yml` 新增 `reconnect_sweep` 模型步骤。
 
 ### 5.4 发单就绪令牌
@@ -207,6 +207,22 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 - **Gate 2b 在审计门与熔断门之后**，不是草图写的“最前面（Gate 0）”：审计 sink 必须能记下这次拒绝，熔断被触发时要继续报告自己（`KillSwitchNotNormal`）。`OrchestratorGate::NotReady = 23`；未接线 = 拒单；拒绝落审计环为 `PreflightFailed`，先于任何 durable 写入和发送。
 - 草图里的“夹具用一个测试钩子签发”没有照做：生产代码里没有测试钩子，每个夹具带一个 `SyntheticReadiness` 成员（真实的屏障与启动恢复，由脚本化观察驱动到就绪），所以这些测试里 Gate 2b 是真门；护栏 `test_submit_readiness_guard` 钉住每个生产构造 `OrchestratorContext` 的位置给 `.readiness` 的确切文本、哪些文件可以用 `SyntheticReadiness`、令牌只有一个签发点和一个友元、每个 `drain_user_data_events()` 调用的屏障参数。
 - M3 行里的“`StartupRecovery` 第一次被真正接进线束（预检线束）”**没有做**：预检线束仍跑在已退役的 listenKey 流上，没有 WS API 的代次可读，用合成就绪加横幅明说，真实接线随 M5。
+
+### 5.5 M5a-1 的实现情况与同设计草图的差别（账户刷新，2026-11-03）
+
+落点：`account_refresh.hpp`（`AccountUpdateRing`、`AccountRefresher`、`AccountHolder`）、`barrier_sweep.hpp`（`SweepAccountStep`、`SweepJob::before_marker()`，`SweepAccountProbe` 改为按纪元回答）、
+`order_tracker.hpp`（`poll_once()` 在推标记之前调一次钩子）、`startup_recovery.hpp`（`tally_recovered_orders_by_shadow()`）。“账户快照由对账线程取、经专用 SPSC 环交给热线程” 按 Owner 的决定实施；
+有三处偏离或补充，每一条都是实现时才暴露的事实：
+
+1. **“被这次清扫刷新过” 是纪元标签，不是时钟读数。** 第一版按时钟比较（“取数开始于清扫请求之后？”）。那不够：周期刷新可能恰好落在请求发出之后、清扫最后一个订单被回答之前，其间发生的成交就在清扫里、不在那份账户里，
+   而这正是屏障要防的事；毫秒级时钟下同一毫秒的两件事也无法区分。所以清扫的账户步骤在 `poll_once()` 里、所有订单都已回答之后、`SweepDone` 标记之前运行（同一线程的程序次序），它发布的更新带着清扫的纪元，
+   热线程只凭标签回答 `refreshed_by(epoch)`；周期更新（纪元 0）永远不算数。这推翻了此前 “戳 = 取数开始时刻、必须晚于清扫请求” 的判据——那个判据对**交易用**的新鲜度仍然成立（`fresh(now, limits)`，同一个
+   `check_freshness()`），对清扫不够。代价：`SweepAccountProbe` 的签名由 `fresh_since(时刻)` 改为 `refreshed_by(纪元)`（M3b 的三个测试夹具随之改动）。
+2. **清扫的账户步骤每个纪元都取，不因周期刷新刚做过而跳过。** 草稿里有一个 “已有更晚的更新就不再取” 的捷径；它正是上一条的洞：周期刷新在同一 tick 里先于这个 tick 的查询运行。一次清扫多花一个权重 20 的请求，清扫很少（重连、软屏障）。
+3. **`unconfirmed` 不是对账线程每 tick 发布的原子计数，而是热线程用注册表加持久影子直接数。** `InFlightRegistry` 是热线程独占的普通内存（没有原子量），原来的 `tally_recovered_orders()` 同时读它和对账线程的跟踪器，
+   两线程进程里没有一个线程能安全地调用它；M4 的影子正好记着 “日志对这个订单说了什么”，所以新版不需要任何跨线程量，也就没有新原子量。偏离了此前 Owner “按推荐” 的方案；理由与分类规则见 `docs/SPEC_INVARIANTS.md` 的 “账户刷新”。
+
+没有新的跨线程状态之外的东西：新增的只有一条 `SpscRing<AccountUpdate, 4>`（沿用现有原语），没有新原子量，因此没有新的 TSan 负控；`formal/reconnect_sweep.tla` 不变——它把账户新鲜度建模为不确定的布尔，纪元标签是对这个布尔的实现，不是新的次序。
 
 ## 6. 路径 ③：用户数据流的持久优先
 

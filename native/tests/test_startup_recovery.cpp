@@ -1125,3 +1125,156 @@ TEST_F(DurableReconcileLogTest, SeveralRecoveredOrdersResolvedInOneTickEachGetTh
     EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
     EXPECT_TRUE(after.recovered_checkpoints().empty());
 }
+
+// ================================================================================================
+// Private-stream migration M5a: tally_recovered_orders_by_shadow()
+//
+// tally_recovered_orders() reads the in-flight registry AND the tracker, which a two-thread process keeps on different threads (the registry is plain
+// memory of the hot thread; the tracker is the reconcile thread's). The shadow variant reads only what the hot thread owns: the registry and the
+// DurableShadow of every order in the fill context, which every writer of order frames moves after the durable ACK (M4).
+// ================================================================================================
+
+TEST_F(DurableReconcileLogTest, TheShadowTallyCountsRecoveredOrdersFromTheRegistryAndTheDurableShadows) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        // A: crashed Submitting -> recovered Ambiguous.  B: the last frame is Accepted.
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-B", 100, 10, 1), 1002).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-B", 100, 10, 1), 1003).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-B", 1, 556), 1004).acked());
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    auto life = std::make_unique<Life>();
+    recover(*life, restarted);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 2u);
+
+    // Nothing has been ticked: the tracker has not seen either order, so its tally calls both unconfirmed. The shadows already say what the log holds --
+    // the one difference between the two variants, and a safe one (the sweep asks about every tracked order before the barrier is Reconciled).
+    EXPECT_EQ(tally_recovered_orders(life->in_flight, life->tracker, restarted.recovered_checkpoints()).unconfirmed, 2u);
+    const RecoveredOrderTally before = tally_recovered_orders_by_shadow(life->in_flight, life->fill_context, restarted.recovered_checkpoints());
+    EXPECT_EQ(before.total, 2u);
+    EXPECT_EQ(before.unconfirmed, 1u) << "A: the log says Ambiguous (possibly a Submitting)";
+    EXPECT_EQ(before.known_live, 1u) << "B: the log says Accepted";
+    EXPECT_EQ(before.resolved, 0u);
+
+    // The exchange says Accepted for both; the reconcile publisher makes the resolution of A durable, which moves the shadow of A.
+    ReconcileDurablePublisher publisher(port_of(restarted));
+    exchange_says(OrderState::Accepted, 0);
+    tick_life(*life, publisher, 0);
+    ASSERT_NE(life->fill_context.find("HY-A"), nullptr);
+    EXPECT_EQ(life->fill_context.find("HY-A")->shadow.state, OrderState::Accepted);
+    const RecoveredOrderTally after = tally_recovered_orders_by_shadow(life->in_flight, life->fill_context, restarted.recovered_checkpoints());
+    EXPECT_EQ(after.known_live, 2u);
+    EXPECT_EQ(after.unconfirmed, 0u);
+    EXPECT_EQ(after.resolved, 0u);
+    const RecoveredOrderTally by_tracker = tally_recovered_orders(life->in_flight, life->tracker, restarted.recovered_checkpoints());
+    EXPECT_EQ(by_tracker.known_live, after.known_live) << "once the tracker has seen the orders the two variants agree";
+    EXPECT_EQ(by_tracker.unconfirmed, after.unconfirmed);
+}
+
+TEST_F(DurableReconcileLogTest, AFinishedOrderIsResolvedWhetherItsSlotIsReleasedOrStillWaitsForTheRestConfirmation) {
+    log_a_crash_while_submitting("HY-A");
+    log_a_crash_while_submitting("HY-B", 2000);
+    DurableAuditSink sink(path_, *key_ring_, 1);
+    auto life = std::make_unique<Life>();
+    recover(*life, sink);
+    ASSERT_EQ(sink.recovered_checkpoints().size(), 2u);
+
+    // A: the user-data stream saw it fill and made that durable (M4); the slot is held until the reconcile thread confirms. B: its slot was released.
+    life->fill_context.durable_acked("HY-A", OrderState::Filled, 10);
+    ASSERT_TRUE(life->in_flight.is_in_flight("HY-A"));
+    life->in_flight.mark_resolved("HY-B");
+
+    const RecoveredOrderTally t = tally_recovered_orders_by_shadow(life->in_flight, life->fill_context, sink.recovered_checkpoints());
+    EXPECT_EQ(t.resolved, 2u);
+    EXPECT_EQ(t.unconfirmed, 0u);
+    EXPECT_EQ(t.known_live, 0u);
+}
+
+TEST_F(DurableReconcileLogTest, AnOrderWithNoFillContextEntryIsUnconfirmedAndSoIsEveryUnfinishedState) {
+    log_a_crash_while_submitting("HY-A");
+    log_a_crash_while_submitting("HY-B", 2000);
+    log_a_crash_while_submitting("HY-C", 3000);
+    DurableAuditSink sink(path_, *key_ring_, 1);
+    auto life = std::make_unique<Life>();
+    recover(*life, sink);
+    ASSERT_EQ(sink.recovered_checkpoints().size(), 3u);
+
+    life->fill_context.remove("HY-A");                                             // in flight, but this process holds nothing about it
+    life->fill_context.durable_acked("HY-B", OrderState::EscalatedToOperator, 0);  // handed to the operator: for good unknown to this process
+    life->fill_context.durable_acked("HY-C", OrderState::CancelRequested, 0);      // a cancel in progress is not a positively known state either
+    const RecoveredOrderTally t = tally_recovered_orders_by_shadow(life->in_flight, life->fill_context, sink.recovered_checkpoints());
+    EXPECT_EQ(t.unconfirmed, 3u);
+    EXPECT_EQ(t.known_live, 0u);
+    EXPECT_EQ(t.resolved, 0u);
+}
+
+TEST_F(DurableReconcileLogTest, AnEscalatedRecoveredOrderStaysUnconfirmedAfterTheRealEscalationToo) {
+    log_a_crash_while_submitting("HY-A", kT0);
+    constexpr std::int64_t kRestartWall = kT0 + 3'600'000;  // an hour of downtime, as in the escalation test above
+    DurableAuditSink sink(path_, *key_ring_, 1);
+    auto life = std::make_unique<Life>();
+    recover(*life, sink, kRestartWall);
+    ReconcileDurablePublisher publisher(port_of(sink));
+    exchange_.outcome = QueryOutcome::Inconclusive;
+    tick_life(*life, publisher, 0, kRestartWall);
+    tick_life(*life, publisher, 100, kRestartWall + 100);  // escalated: the frame is durable, the slot is held
+    ASSERT_TRUE(life->in_flight.is_in_flight("HY-A"));
+    ASSERT_NE(life->fill_context.find("HY-A"), nullptr);
+    ASSERT_EQ(life->fill_context.find("HY-A")->shadow.state, OrderState::EscalatedToOperator);
+
+    const RecoveredOrderTally t = tally_recovered_orders_by_shadow(life->in_flight, life->fill_context, sink.recovered_checkpoints());
+    EXPECT_EQ(t.unconfirmed, 1u) << "escalated orders never leave the count: the process may not trade until the operator has dealt with them";
+    EXPECT_EQ(tally_recovered_orders(life->in_flight, life->tracker, sink.recovered_checkpoints()).unconfirmed, 1u) << "...as in the tracker variant";
+}
+
+TEST_F(DurableReconcileLogTest, StartupRecoveryReachesReadyOnTheShadowTallyOnceTheReconcilePublisherHasMadeTheResolutionDurable) {
+    log_a_crash_while_submitting("HY-A");
+    DurableAuditSink sink(path_, *key_ring_, 1);
+    auto life = std::make_unique<Life>();
+    const RecoveryApplyResult applied = apply_recovery(sink.recovered_checkpoints(), life->in_flight, life->to_reconcile, life->truth, life->fill_context,
+                                                       &rules_for_test);
+    ASSERT_TRUE(applied.ok());
+    ReconcileDurablePublisher publisher(port_of(sink));
+
+    const auto observe_by_shadow = [&] {
+        RecoveryObservation o = healthy_env_obs();
+        o.sink_open = sink.is_open();
+        o.sink_fenced = sink.fenced();
+        o.scan_status = sink.recovery_status();
+        o.recovery_applied = true;
+        o.recovered_orders = applied.recovered;
+        o.applied_orders = applied.applied;
+        o.unconfirmed_orders = tally_recovered_orders_by_shadow(life->in_flight, life->fill_context, sink.recovered_checkpoints()).unconfirmed;
+        return o;
+    };
+
+    StartupRecovery sm(60'000);
+    EXPECT_EQ(sm.update(observe_by_shadow(), 0), RunState::Reconciling) << "A is Ambiguous in the log: unconfirmed, so not Ready";
+    exchange_says(OrderState::Accepted, 0);
+    tick_life(*life, publisher, 0);
+    EXPECT_EQ(sm.update(observe_by_shadow(), 1), RunState::Ready) << "the resolution is durable and the shadow says Accepted: known live";
+    EXPECT_TRUE(sm.submit_enabled(observe_by_shadow()));
+    EXPECT_EQ(life->in_flight.count(), 1u) << "a known-live order still holds its slot, so the one-order-at-a-time rule keeps new intents out";
+}
+
+TEST_F(DurableReconcileLogTest, APartiallyFilledRecoveredOrderIsKnownLiveByItsShadow) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-P", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-P", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-P", 1, 556), 1002).acked());
+        ASSERT_TRUE(sink.append_durable(make_partial_fill("HY-P", 1, 556, 4, 100), 1003).acked());
+    }
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    auto life = std::make_unique<Life>();
+    recover(*life, restarted);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 1u);
+    ASSERT_EQ(life->fill_context.find("HY-P")->shadow.state, OrderState::PartialFill);
+
+    const RecoveredOrderTally t = tally_recovered_orders_by_shadow(life->in_flight, life->fill_context, restarted.recovered_checkpoints());
+    EXPECT_EQ(t.known_live, 1u) << "a resting, partly filled order is positively known to be live, like an Accepted one";
+    EXPECT_EQ(t.unconfirmed, 0u);
+    EXPECT_EQ(t.resolved, 0u);
+}
