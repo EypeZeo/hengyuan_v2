@@ -154,8 +154,8 @@ public:
     }
 
     // The startup binding of the store to the exchange account this process trades as. `exchange_uid` is what the exchange reported for the key in use. The
-    // verdict is remembered; readiness waits for one under which the store may be used. Call it on the hot thread before the loop (or at any time: a refused
-    // binding stays refused, an accepted one is re-verified).
+    // verdict is remembered until the next call; readiness waits for one under which the store may be used. Call it on the hot thread before the loop. Every call
+    // judges the store afresh (a bound store is re-verified, one that does not match is refused again), so the verdict is never stronger than the last look.
     EnsureBindingStatus bind_store(StoreEnvironment environment, std::uint64_t exchange_uid, std::int64_t now_ms) noexcept {
         ++hot_.stats.binding_attempts;
         binding_status_ = ensure_store_binding(parts_.sink, parts_.log_path, parts_.key_ring, environment, exchange_uid, now_ms);

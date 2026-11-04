@@ -276,7 +276,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     （失败关闭，计数器可见）；有测试（凭据在另一个线程绑定）。
   - **启动读取 `fetch_exchange_account_uid()`**：启动时调一次，给 `ensure_store_binding()`；与端口分开是有意的——绑定只做一次，周期与清扫的取数用不着 uid。只在应答良好时才给 `uid_out` 赋值，不抛异常（异常算 `Read`）。
   - **未接线**：没有生产代码创建 `RestAccountFetcher` 或调用启动读取（M5a-2b 的流水线与 M5b 的线束才会）。
-  - **证据**：（干跑）
+  - **证据**：test_binance_private_rest.cpp（+10：ParseAccountResponseUid 6 例——uid 随快照返回、19 位与 uint64 最大值不丢失、字段在余额之后也读得到、缺失或不可用的 uid（0、负数、小数、字符串、null、布尔、超出 uint64、数组）一概拒绝且两个输出都不动、好 uid 救不了坏应答、旧重载不看这个字段；FetchAccount 三例走真实客户端对回环 TLS——返回交易所的 uid、没有 uid 的应答被拒且不动任何输出、没有时钟同步时失败关闭；入口守卫一例——空凭据）、test_rest_account_fetcher.cpp（15 例：映射表逐枚举与越界值、适配器只在整体成功时赋值（含恶意写缓冲区的客户端）、异常不出端口、刷新器视角下 NotSent 与 Failed 都按重试间隔再试、启动读取只在好应答时给 uid 且不抛、真实客户端对回环 TLS 的好应答 / HTTP 401 / 无时钟 / 无凭据 / 凭据绑在另一个线程均不发出请求）。MSVC（/W4 /WX）三个 REST 目标（157 + 15 + 32 例）全绿。变异检查 33 个变异体（解析与客户端 13、适配器 20）：32 个被杀死，1 个等价（RU03：uid 为 0 的拒绝已经覆盖 “字段不是 uint64” 的情形，两种写法观测不可区分）；canary 先于其余运行，都由语义测试杀死（适配器的第一个 canary 被 static_assert 在编译期杀死，换成了运行期 canary）；因 /WX 编译不过的变异体改写后也被杀死。
 - 私网流流水线（私网流迁移 M5a-2b，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.6；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B）— `private_stream_pipeline.hpp` 的 `PrivateStreamPipeline<Session>`：
   把 M2–M5a-1 的部件接成一个组合根。**它不新增任何状态机、规则或跨线程原语**——只回答 “谁把什么交给谁、按什么次序跑、哪个线程拥有什么、StartupRecovery 等的那些事实从哪里读”。
   - **两个节拍。** `hot_tick(now)`：监督器 `poll` → 持有者 `poll` → 恢复状态机 `update`（到期时应用一次恢复）→ `drain_hot_inputs()`。`reconcile_tick(now)`：刷新器的周期取数 → 带清扫作业的 `poll_once()`

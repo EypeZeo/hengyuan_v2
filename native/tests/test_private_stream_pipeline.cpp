@@ -244,14 +244,16 @@ protected:
         }  // "crash"
     }
 
-    void build(PipelineRulesLookup rules = PipelineRulesLookup{&rules_for_test, nullptr}) {
+    void build(PipelineRulesLookup rules = PipelineRulesLookup{&rules_for_test, nullptr}, const ClockOffsetPublisher* clock = nullptr) {
         ASSERT_NE(sink_, nullptr);
-        PipelineParts parts{*sink_, path_, *ring_, make_durable_order_audit_port(*sink_), audit_, kill_, truth_, in_flight_, fill_, user_events_, clock_};
+        PipelineParts parts{*sink_, path_, *ring_, make_durable_order_audit_port(*sink_), audit_, kill_, truth_, in_flight_, fill_, user_events_,
+                            clock != nullptr ? *clock : clock_};
         parts.query_port = QueryPort{&fake_query, &exchange_};
         parts.account_port = account_.port();
         parts.rules = rules;
         PipelineConfig config;
         config.exposure_limits.freshness_max_age_ms = 30'000;
+        config.exposure_limits.single_order_notional_cap = 777'000;  // a value nobody else sets: the context must carry the configured limits
         config.reconcile_deadline_ms = 60'000;
         pipe_ = std::make_unique<Pipeline>(parts, config, [this](std::uint64_t) {
             auto s = std::make_shared<FakeSession>();
@@ -430,6 +432,11 @@ TEST_F(PipelineTest, TheBindingIsJudgedAgainstTheStoreOnEveryCall) {
     build();
     EXPECT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
     EXPECT_TRUE(pipe_->store_bound());
+    const StoreBindingRead written = read_store_binding(path_, *ring_, sink_->store_uuid_lo(), sink_->store_uuid_hi());
+    ASSERT_EQ(written.status, StoreBindingStatus::Bound);
+    EXPECT_EQ(written.binding.environment, StoreEnvironment::Testnet);
+    EXPECT_EQ(written.binding.account_uid, kUid);
+    EXPECT_EQ(written.binding.bound_at_ms, kBoundAt) << "the time the caller gave, recorded with the binding";
     EXPECT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt + 1), EnsureBindingStatus::Verified);
     EXPECT_TRUE(pipe_->store_bound());
     EXPECT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid + 1, kBoundAt + 2), EnsureBindingStatus::AccountMismatch) << "another account";
@@ -495,6 +502,8 @@ TEST_F(PipelineTest, AnUnfinishedOrderInTheLogIsRecoveredQueuedAskedAboutAndRead
     EXPECT_FALSE(in_flight_.is_in_flight("HY-A")) << "released once final";
     EXPECT_EQ(truth_.net_qty_ticks(1), 10) << "and the fill is in PositionTruth";
     EXPECT_EQ(pipe_->recovery().state(), RunState::Ready);
+    ASSERT_GE(audit_.count(), 1U) << "the resolution reached the in-memory audit ring after it was durable";
+    EXPECT_GE(audit_.last()->timestamp_ms, 1'000'000) << "stamped with the tick's clock, not with a context nobody set";
 }
 
 TEST_F(PipelineTest, AnUnwiredRulesLookupFailsClosedAndTheStateMachineDegrades) {
@@ -531,6 +540,31 @@ TEST_F(PipelineTest, AFencedStoreDegradesTheStateMachineAtOnce) {
     EXPECT_FALSE(pipe_->readiness().authorize(g_now).ready());
 }
 
+TEST_F(PipelineTest, WithoutAFreshClockNothingIsRecoveredAndNothingIsReady) {
+    open_sink();
+    ClockOffsetPublisher never_published;  // no clock sync has ever run
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, &never_published);
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    for (int i = 0; i < 20; ++i) cycle();
+    EXPECT_EQ(pipe_->recovery().state(), RunState::Bootstrapping) << "recovery waits for a clock the signed requests can use";
+    EXPECT_FALSE(pipe_->recovery_applied());
+    EXPECT_FALSE(pipe_->readiness().authorize(g_now).ready());
+}
+
+TEST_F(PipelineTest, ASinkThatIsNotOpenDegradesTheStateMachine) {
+    DurableAuditSink holder_of_the_lock(path_, *ring_, kKeyId);  // the store is already open in this process: a second open cannot take the lock
+    ASSERT_TRUE(holder_of_the_lock.is_open());
+    open_sink();
+    ASSERT_FALSE(sink_->is_open());
+    build();
+    pipe_->set_exchange_info_loaded(true);
+    EXPECT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::StoreNotUsable);
+    for (int i = 0; i < 5; ++i) cycle();
+    EXPECT_EQ(pipe_->recovery().state(), RunState::Degraded);
+    EXPECT_EQ(pipe_->recovery().degraded_reason(), DegradedReason::SinkNotOpen);
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // the wiring
 // ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -555,6 +589,7 @@ TEST_F(PipelineTest, TheContextCarriesTheWholePrivateStreamWiring) {
     EXPECT_EQ(ctx.fill_context, &fill_);
     EXPECT_EQ(ctx.account, &pipe_->holder().view()) << "wired once; the holder updates the snapshot behind it";
     EXPECT_EQ(ctx.exposure_limits.freshness_max_age_ms, 30'000);
+    EXPECT_EQ(ctx.exposure_limits.single_order_notional_cap, 777'000) << "the limits the pipeline was configured with, not the defaults";
     EXPECT_TRUE(pipe_->late_fill().complete());
     EXPECT_EQ(pipe_->late_fill().watched(), 0U) << "no operator has resolved an order in this store";
 }
