@@ -1331,6 +1331,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_account_refresh_concurrency)
     gtest_discover_tests(test_account_refresh_concurrency PROPERTIES LABELS concurrency)
 
+    # M5a-2b: the private-stream pipeline with its two halves on two real threads (hot: supervisor, holder, recovery, readiness, durable publishers and the real
+    # durable store; reconcile: refresher, tracker, sweep job, the scripted ports). The halves share only the four rings, so any other shared state is a TSan
+    # report: a `concurrency` test, in the same three lists as the other two-thread tests. No negative control of its own (no new atomic protocol).
+    add_executable(test_private_stream_pipeline_concurrency tests/test_private_stream_pipeline_concurrency.cpp)
+    target_link_libraries(test_private_stream_pipeline_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_private_stream_pipeline_concurrency)
+    gtest_discover_tests(test_private_stream_pipeline_concurrency PROPERTIES LABELS concurrency)
+
     # TODO 1A.4: real two-thread stress for the two NEW cross-thread boundaries this batch
     # introduces (UserDataWsEventRing, ListenKeyPublisher) -- the first new cross-thread
     # boundary in this codebase since order_tracker.hpp's own SpscRing pair. Deliberately

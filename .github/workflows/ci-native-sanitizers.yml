@@ -151,6 +151,9 @@ jobs:
       # AccountRefresher fetching through a scripted port, inside poll_once()'s sweep step) and the hot thread (a real AccountHolder behind the sweep
       # pump). Its only new cross-thread edge is one SpscRing<AccountUpdate,4>, so it has no negative control; it checks at the instant the barrier
       # becomes Reconciled that the account it rests on was fetched after the sweep's last query.
+      # test_private_stream_pipeline_concurrency joined with private-stream migration M5a-2b: the whole private-stream pipeline with its hot half (supervisor,
+      # holder, recovery, readiness, durable publishers, a real durable store) and its reconcile half (refresher, tracker, sweep job) on two real threads. The
+      # halves share only the four rings, so it adds no atomic protocol and has no negative control; TSan is what makes it a test of the composition.
       # test_compaction_lease, test_compaction_intent_store, test_seal_journal_store_lease,
       # test_intent_phase_advancer and test_migrated_v2_started_publisher are the file-lease family
       # (the seal-journal subsystem, frozen): CandidateLease / SealJournalStoreLease
@@ -175,6 +178,7 @@ jobs:
             test_seal_journal_store_lease test_intent_phase_advancer \
             test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
             test_sweep_concurrency test_account_refresh_concurrency \
+            test_private_stream_pipeline_concurrency \
             tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
             tsan_control_relaxed_mailbox
 
@@ -305,7 +309,8 @@ jobs:
             test_snapshot_refresh_gate test_public_feed_supervisor_concurrency \
             test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
             test_user_data_ws_concurrency test_ws_api_mailbox_concurrency \
-            test_sweep_concurrency test_account_refresh_concurrency
+            test_sweep_concurrency test_account_refresh_concurrency \
+            test_private_stream_pipeline_concurrency
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the
