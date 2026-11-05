@@ -276,4 +276,46 @@ inline RecoveredOrderTally tally_recovered_orders(const InFlightRegistry& in_fli
     return t;
 }
 
+// The same tally for a process with TWO threads (private-stream migration M5a). tally_recovered_orders() above needs the in-flight registry and the
+// tracker at once, and they belong to different threads: the registry is plain memory of the hot thread (it has no atomics -- the reconcile thread
+// must never read it), the tracker is the reconcile thread's. This variant reads only what the hot thread owns: the registry, and the order fill
+// context whose DurableShadow says what the durable log holds for each order (M4) -- updated, after the durable ACK, by every writer of order frames,
+// the reconcile publisher's resolutions and escalations included. So no value crosses a thread boundary and nothing new is published.
+//
+//   not in flight                                        -> resolved   (the slot was released: the order reached an exchange-final state)
+//   in flight, shadow exchange-final                     -> resolved   (the log already says so; the slot waits for the REST confirmation)
+//   in flight, shadow Accepted / PartialFill             -> known_live
+//   in flight, anything else, or no context entry at all -> unconfirmed (Ambiguous, Submitting, EscalatedToOperator, ...: the fate is unknown to
+//                                                           this process -- an escalated order stays unconfirmed for good, as in the tracker variant)
+//
+// The two differ in one place, on purpose: an order recovered as Accepted is known_live here from the start, where the tracker variant counts it
+// unconfirmed until the reconcile thread has ingested it. That cannot let an order out early: the barrier's sweep (barrier_sweep.hpp) asks about every
+// tracked order, the recovered ones included, before the barrier is Reconciled, and Reconciled is a separate condition of submitting.
+inline RecoveredOrderTally tally_recovered_orders_by_shadow(const InFlightRegistry& in_flight, const OrderFillContext& fill_context,
+                                                            std::span<const OrderRecoveryCheckpoint> checkpoints) noexcept {
+    RecoveredOrderTally t;
+    t.total = checkpoints.size();
+    for (const OrderRecoveryCheckpoint& cp : checkpoints) {
+        const std::string_view coid = cp.client_order_id.view();
+        if (!in_flight.is_in_flight(coid)) {
+            ++t.resolved;
+            continue;
+        }
+        const OrderFillContextEntry* entry = fill_context.find(coid);
+        if (entry == nullptr) {
+            ++t.unconfirmed;
+            continue;
+        }
+        const OrderState state = entry->shadow.state;
+        if (is_exchange_final(state)) {
+            ++t.resolved;
+        } else if (state == OrderState::Accepted || state == OrderState::PartialFill) {
+            ++t.known_live;
+        } else {
+            ++t.unconfirmed;
+        }
+    }
+    return t;
+}
+
 }  // namespace hy

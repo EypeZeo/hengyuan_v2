@@ -108,10 +108,11 @@ FeedObservation read_feed(void* p) noexcept { return static_cast<Script*>(p)->fe
 RecoveryObservation read_recovery(void* p) noexcept { return static_cast<Script*>(p)->recovery; }
 bool read_clock(void* p) noexcept { return static_cast<Script*>(p)->clock_ready; }
 
+// The scripted answer to "was the account refreshed by this sweep?": the hot thread decides, per cycle, whether the account counts as refreshed.
 struct Account {
-    std::int64_t refreshed_at_ms{0};
+    bool refreshed{false};
 };
-bool account_fresh(void* p, std::int64_t since_ms) noexcept { return static_cast<Account*>(p)->refreshed_at_ms >= since_ms; }
+bool account_fresh(void* p, std::uint64_t) noexcept { return static_cast<Account*>(p)->refreshed; }
 
 struct Durable {
     std::uint64_t frames{0};
@@ -293,7 +294,7 @@ TEST(SweepConcurrency, TheBarrierIsReconciledOnlyOnceEveryOrderThatPrecededTheRe
         }
 
         // 3. the account snapshot is refreshed most of the time, not always: some sweeps complete with a stale account and are asked again
-        if ((rng.next() % 4U) != 0U) account.refreshed_at_ms = now;
+        account.refreshed = (rng.next() % 4U) != 0U;
 
         // 4. the pump, then the drain with the checking sink (which forwards to the pump's)
         pump.service();
@@ -417,7 +418,7 @@ TEST(SweepConcurrency, ARequestPostedRightAfterAnOrderAlwaysCoversThatOrder) {
         const std::int64_t now = steady_ms();
         script.feed.last_activity_ms = now;
         script.feed.sampled_at_ms = now;
-        account.refreshed_at_ms = now;
+        account.refreshed = true;
 
         if (round < kRounds && in_flight.count() < 30) {
             char coid[32];

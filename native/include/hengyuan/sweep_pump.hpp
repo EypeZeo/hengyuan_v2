@@ -10,12 +10,12 @@
 //               epoch again at the next call) -- never counted as sent.
 //   sink()      the SweepSink to hand to drain_reconcile_events(). A marker means: the reconcile thread asked the exchange about every order it
 //               holds and every resolution it found has already been popped -- and made durable and published -- in front of this marker. What the
-//               pump adds is the one fact the reconcile thread cannot know, the hot thread's: has the ACCOUNT snapshot been refreshed since the
-//               request went out (SweepAccountProbe)? Only a marker for the epoch that is current can complete the barrier; the barrier itself
-//               drops the rest.
+//               pump adds is the one fact the reconcile thread cannot know, the hot thread's: has the ACCOUNT snapshot been refreshed BY this sweep
+//               (SweepAccountProbe, asked about the marker's epoch)? Only a marker for the epoch that is current can complete the barrier; the
+//               barrier itself drops the rest.
 //
 // The pump holds no state the barrier does not need: which epoch it last posted, and when (the hot thread's steady clock, from the same feed
-// observation the barrier saw), so the account's age is judged against the right request.
+// observation the barrier saw -- kept for the diagnostics and the tests; since M5a the account is judged by the epoch, not by this time).
 //
 // THREAD OWNERSHIP: the hot/submit thread, with the SubmitReadiness it drives. It outlives every call that uses it.
 
@@ -76,7 +76,7 @@ private:
         const std::optional<std::int64_t> now = readiness_.observe();
         if (!now) return;
         const bool current = done.epoch == requested_epoch_;
-        const bool fresh = current && account_.fresh_since(requested_at_ms_);
+        const bool fresh = current && account_.refreshed_by(done.epoch);
         if (current && done.unresolved == 0 && !fresh) ++stats_.reports_account_stale;
         readiness_.barrier().on_sweep_report(SweepReport{done.epoch, done.unresolved, fresh}, *now);
     }

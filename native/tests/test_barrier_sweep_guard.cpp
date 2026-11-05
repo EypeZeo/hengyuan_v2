@@ -13,6 +13,9 @@
 //   4. Every production drain_reconcile_events() call is pinned with its argument count, and the one that serves a barrier (the orchestrator) with the
 //      exact text of its sink argument: a call that leaves the sink out still compiles and quietly drops every marker, so the barrier never completes.
 //   5. No production code runs poll_once() with a sweep job yet (M5 wires the live process and pins its own call).
+//   6. (M5a) poll_once() runs the sweep's account step BEFORE it makes the marker, the account ring has one producer and one consumer, refreshed_by()
+//      reads the ring before it answers, and nothing outside account_refresh.hpp builds the refresher / holder / probe yet; the shadow tally of
+//      recovered orders reads hot-thread memory only.
 //
 // The scan strips comments and the contents of string/char literals first, so prose that mentions a call does not count and a string that contains one
 // cannot hide a real use. (The helpers are copies of the ones in test_submit_readiness_guard.cpp; the guards share no header on purpose, so neither can
@@ -524,4 +527,98 @@ TEST(BarrierSweepGuard, NoProductionPollOnceCallPassesASweepJobYet) {
     EXPECT_GE(calls_seen, 5u) << "the scan must see the real poll_once() callers (the harnesses and the dry-run rig)";
     for (const std::string& s : problems) ADD_FAILURE() << s;
     EXPECT_TRUE(problems.empty());
+}
+
+// --- 6. the account refresh (M5a) -----------------------------------------------------------------------------------------------------------------
+//
+// The account update has to be in front of the marker; the ring has one producer and one consumer; the holder reads the ring before it compares; and
+// nothing outside account_refresh.hpp builds the pieces yet (M5a's process wiring is a later slice and pins its own sites).
+
+namespace {
+
+// The files in which the code mentions `needle` at all.
+std::vector<std::string> files_with(std::string_view needle) {
+    std::vector<std::string> out;
+    for (const SourceFile& f : production_sources()) {
+        if (f.code.find(needle) != std::string::npos) out.push_back(f.rel);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(BarrierSweepGuard, PollOnceRunsTheAccountStepBeforeItMakesTheMarker) {
+    const SourceFile* f = find_source("include/hengyuan/order_tracker.hpp");
+    ASSERT_NE(f, nullptr);
+    const std::string body = function_body(f->code, "poll_once");
+    ASSERT_FALSE(body.empty()) << "poll_once() was not found in order_tracker.hpp";
+    const std::size_t step = body.find("before_marker(");
+    const std::size_t made = body.find("ReconcileEventKind::SweepDone");
+    const std::size_t pushed = body.find("outbound.try_push(marker)");
+    ASSERT_NE(step, std::string::npos) << "poll_once() no longer runs the sweep's account step";
+    ASSERT_NE(made, std::string::npos);
+    ASSERT_NE(pushed, std::string::npos);
+    EXPECT_LT(step, made) << "the account step must run BEFORE the marker is made: the account update it publishes has to be in front of the marker, "
+                             "or the hot thread can pop the marker and find no account behind it";
+    EXPECT_LT(step, pushed);
+    EXPECT_EQ(count_substring(body, "before_marker("), 1u) << "one call per poll_once(); SweepJob makes it once per epoch";
+}
+
+TEST(BarrierSweepGuard, TheAccountRingHasOneProducerOneConsumerAndTheProbeOneMaker) {
+    const std::vector<std::string> only_the_header{"include/hengyuan/account_refresh.hpp"};
+    EXPECT_EQ(files_with("AccountUpdateRing"), only_the_header) << "who touches the account ring";
+    std::vector<std::string> pushers;
+    std::vector<std::string> poppers;
+    for (const SourceFile& f : production_sources()) {
+        for (const auto& args : call_args(f.code, "try_push")) {
+            if (!args.empty() && args[0] == "update") pushers.push_back(f.rel);
+        }
+        if (f.code.find("AccountUpdate") != std::string::npos && f.code.find("in_.try_pop(") != std::string::npos) poppers.push_back(f.rel);
+    }
+    EXPECT_EQ(pushers, only_the_header) << "the account ring is pushed by AccountRefresher only";
+    EXPECT_EQ(poppers, only_the_header) << "...and popped by AccountHolder only";
+    EXPECT_EQ(occurrences("SweepAccountProbe{"), (Occ{{"include/hengyuan/account_refresh.hpp", 1}})) << show(occurrences("SweepAccountProbe{"));
+    EXPECT_EQ(occurrences("SweepAccountStep{"), (Occ{{"include/hengyuan/account_refresh.hpp", 1}})) << show(occurrences("SweepAccountStep{"));
+}
+
+TEST(BarrierSweepGuard, RefreshedByDrainsTheAccountRingBeforeItAnswers) {
+    const SourceFile* f = find_source("include/hengyuan/account_refresh.hpp");
+    ASSERT_NE(f, nullptr);
+    const std::string body = function_body(f->code, "refreshed_by");
+    ASSERT_FALSE(body.empty()) << "AccountHolder::refreshed_by() was not found";
+    const std::size_t drain = body.find("poll()");
+    const std::size_t answer = body.find("refreshed_epoch_ >= epoch");
+    ASSERT_NE(drain, std::string::npos) << "refreshed_by() no longer reads the ring itself";
+    ASSERT_NE(answer, std::string::npos) << "refreshed_by() no longer answers from the epoch tags";
+    EXPECT_LT(drain, answer) << "the marker was just popped: the update that was pushed in front of it must be read BEFORE the epoch is compared";
+    EXPECT_EQ(body.find("fetch_started_ms"), std::string::npos) << "the sweep question is never answered from a clock reading (account_refresh.hpp, \"BY THE SWEEP\")";
+}
+
+TEST(BarrierSweepGuard, NoProductionSourceOutsideTheHeaderBuildsTheAccountPiecesYet) {
+    // M5a-1 builds the refresher, the holder and the job's step; the process wiring that creates and connects them is a later slice, which updates these pins
+    // with the file that does it.
+    const std::vector<std::string> only_the_header{"include/hengyuan/account_refresh.hpp"};
+    EXPECT_EQ(files_with("AccountRefresher"), only_the_header);
+    EXPECT_EQ(files_with("AccountHolder"), only_the_header);
+    EXPECT_EQ(files_with("sweep_step("), only_the_header);
+    EXPECT_EQ(files_with("sweep_probe("), only_the_header);
+}
+
+TEST(StartupRecoveryShadowTallyGuard, TheHotThreadTallyNamesNeitherTheTrackerNorAnAtomicAndNoProductionCodeCallsItYet) {
+    const SourceFile* f = find_source("include/hengyuan/startup_recovery.hpp");
+    ASSERT_NE(f, nullptr);
+    const std::size_t at = f->code.find("tally_recovered_orders_by_shadow(");
+    ASSERT_NE(at, std::string::npos);
+    const std::size_t open = f->code.find('{', at);
+    ASSERT_NE(open, std::string::npos);
+    const std::string signature = f->code.substr(at, open - at);
+    EXPECT_NE(signature.find("OrderFillContext"), std::string::npos);
+    EXPECT_EQ(signature.find("OrderTracker"), std::string::npos) << "the shadow tally must not take the reconcile thread's tracker";
+    const std::string body = function_body(f->code, "tally_recovered_orders_by_shadow");
+    ASSERT_FALSE(body.empty());
+    EXPECT_EQ(body.find("tracker"), std::string::npos);
+    EXPECT_EQ(body.find("for_each_active"), std::string::npos);
+    EXPECT_EQ(body.find("atomic"), std::string::npos) << "it reads hot-thread memory only; nothing crosses a thread boundary";
+    EXPECT_EQ(occurrences("tally_recovered_orders_by_shadow("), (Occ{{"include/hengyuan/startup_recovery.hpp", 1}}))
+        << "the process wiring that calls it is a later slice; it pins its own call site";
 }

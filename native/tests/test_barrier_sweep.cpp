@@ -163,13 +163,13 @@ namespace {
 
 struct ProbeLog {
     int calls{0};
-    std::int64_t since{0};
+    std::uint64_t epoch{0};
     bool answer{true};
 };
-bool probe_answer(void* user, std::int64_t since) noexcept {
+bool probe_answer(void* user, std::uint64_t epoch) noexcept {
     auto* log = static_cast<ProbeLog*>(user);
     ++log->calls;
-    log->since = since;
+    log->epoch = epoch;
     return log->answer;
 }
 
@@ -177,13 +177,13 @@ bool probe_answer(void* user, std::int64_t since) noexcept {
 
 TEST(SweepTransportTypes, AnUnwiredAccountProbeIsNeverFresh) {
     const SweepAccountProbe unwired{};
-    EXPECT_FALSE(unwired.fresh_since(0)) << "nothing refreshes the account yet: fail closed";
+    EXPECT_FALSE(unwired.refreshed_by(1)) << "nothing refreshes the account unless it is wired: fail closed";
     ProbeLog log;
     const SweepAccountProbe wired{&probe_answer, &log};
-    EXPECT_TRUE(wired.fresh_since(77));
-    EXPECT_EQ(log.since, 77);
+    EXPECT_TRUE(wired.refreshed_by(77));
+    EXPECT_EQ(log.epoch, 77U);
     log.answer = false;
-    EXPECT_FALSE(wired.fresh_since(78));
+    EXPECT_FALSE(wired.refreshed_by(78));
 }
 
 // --- the barrier: a request that never left ------------------------------------------------------------------------------------
@@ -366,22 +366,22 @@ TEST_F(SweepPumpTest, ACleanMarkerOfTheCurrentEpochWithAFreshAccountCompletesThe
     EXPECT_EQ(readiness_.barrier().state(), BarrierState::Reconciled);
     EXPECT_EQ(readiness_.barrier().reconciled_generation(), 1U);
     EXPECT_EQ(account_.calls, 1);
-    EXPECT_EQ(account_.since, kNow) << "the account is judged against the moment the request went out";
+    EXPECT_EQ(account_.epoch, epoch) << "the account is asked about the sweep the marker answers";
     EXPECT_EQ(pump_.stats().markers_received, 1U);
     EXPECT_EQ(pump_.stats().reports_account_stale, 0U);
 }
 
-TEST_F(SweepPumpTest, TheAccountIsJudgedAgainstTheRequestAndNotAgainstTheMarkersArrival) {
+TEST_F(SweepPumpTest, TheAccountIsAskedAboutTheEpochOfTheMarkerWhateverTheTimeItArrivesAt) {
     const std::uint64_t epoch = request_posted();
-    // The reconcile thread spent a while asking the exchange; the account was refreshed in the meantime, after the request and before the marker.
+    // The reconcile thread spent a while asking the exchange: the marker arrives long after the request went out. Time plays no part in the question.
     script_.feed = live(1, kNow + 700);
     account_.answer = true;
     pump_.sink().deliver(SweepDone{epoch, 0});
-    EXPECT_EQ(account_.since, kNow) << "the bound is the moment the request went out, not the moment the answer got back";
+    EXPECT_EQ(account_.epoch, epoch);
     EXPECT_EQ(readiness_.barrier().state(), BarrierState::Reconciled);
 }
 
-TEST_F(SweepPumpTest, AnAccountNotRefreshedSinceTheRequestKeepsTheBarrierSweeping) {
+TEST_F(SweepPumpTest, AnAccountNotRefreshedByTheSweepKeepsTheBarrierSweeping) {
     const std::uint64_t epoch = request_posted();
     account_.answer = false;
     pump_.sink().deliver(SweepDone{epoch, 0});

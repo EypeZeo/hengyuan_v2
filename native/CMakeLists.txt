@@ -1260,6 +1260,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_sweep_orchestrator)
     gtest_discover_tests(test_sweep_orchestrator)
 
+    # M5a: the account refresh path (account_refresh.hpp) and its hook in the sweep (SweepAccountStep, poll_once()): the refresher's cadence and stamps,
+    # the holder's newest-wins / re-stamp / freshness rules, the step running once per epoch BEFORE the marker, and the whole path end to end against the
+    # real pump and barrier. Single-threaded and deterministic; the two threads together are test_account_refresh_concurrency below.
+    add_executable(test_account_refresh tests/test_account_refresh.cpp)
+    target_link_libraries(test_account_refresh PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_account_refresh)
+    gtest_discover_tests(test_account_refresh)
+
     # M3b source-text guard: poll_once() takes the sweep request before it drains the ingress ring, a SweepDone marker is made / delivered / applied in
     # one place each, a request is made and pushed only by the pump, every production drain_reconcile_events() call is pinned with its sink argument, and
     # no production poll_once() runs a sweep job yet. It reads the source tree, so the native/ directory is a compile definition (same shape as the
@@ -1305,6 +1313,15 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_sweep_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_sweep_concurrency)
     gtest_discover_tests(test_sweep_concurrency PROPERTIES LABELS concurrency)
+
+    # M5a: the account refresh path across two real threads (account_refresh.hpp / barrier_sweep.hpp / order_tracker.hpp / sweep_pump.hpp): the barrier may
+    # be Reconciled only on an account fetched after the sweep's last answer, and a sweep's account update is on the ring when its marker is popped. The
+    # one new cross-thread edge is an SpscRing<AccountUpdate,4> -- the same primitive, no new atomic protocol -- so it has no negative control of its own;
+    # it is a `concurrency` test like test_sweep_concurrency and sits in the same three lists.
+    add_executable(test_account_refresh_concurrency tests/test_account_refresh_concurrency.cpp)
+    target_link_libraries(test_account_refresh_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_account_refresh_concurrency)
+    gtest_discover_tests(test_account_refresh_concurrency PROPERTIES LABELS concurrency)
 
     # TODO 1A.4: real two-thread stress for the two NEW cross-thread boundaries this batch
     # introduces (UserDataWsEventRing, ListenKeyPublisher) -- the first new cross-thread

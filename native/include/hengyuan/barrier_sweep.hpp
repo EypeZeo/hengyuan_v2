@@ -75,16 +75,34 @@ struct SweepSink {
     }
 };
 
-// Has the account snapshot been refreshed at or after `since_ms` (the hot thread's steady clock)? The barrier's Reconciled condition includes it
-// (design 5.2): balances must not predate the fills the sweep found. NOTHING in the tree refreshes the account yet (that is the live wiring, M5), so an
-// unwired probe answers "no" and the barrier cannot complete -- fail-closed, like an unwired SubmitReadiness.
+// Was the account snapshot refreshed BY the sweep of `epoch`? The barrier's Reconciled condition includes it (design 5.2): balances must not predate the
+// fills the sweep found. "By the sweep" is not a time comparison: it means the account was fetched by the account step (SweepAccountStep above) that
+// ran for that epoch, after the sweep had every answer. (Compared by clock readings, an account fetched by the periodic refresh a moment after the
+// request but before the sweep's last order was answered would pass for fresh, and could predate a fill the sweep then found; the two threads' clocks
+// are only as fine as a millisecond besides.) The real probe is AccountHolder::sweep_probe() (account_refresh.hpp, M5a), fed by an AccountRefresher on
+// the reconcile thread; no process builds either yet (the live wiring is M5), and an unwired probe answers "no" so the barrier cannot complete --
+// fail-closed, like an unwired SubmitReadiness.
 struct SweepAccountProbe {
-    using Fn = bool (*)(void* user_data, std::int64_t since_ms) noexcept;
+    using Fn = bool (*)(void* user_data, std::uint64_t epoch) noexcept;
 
     Fn fn{nullptr};
     void* user_data{nullptr};
 
-    [[nodiscard]] bool fresh_since(std::int64_t since_ms) const noexcept { return fn != nullptr && fn(user_data, since_ms); }
+    [[nodiscard]] bool refreshed_by(std::uint64_t epoch) const noexcept { return fn != nullptr && fn(user_data, epoch); }
+};
+
+// The reconcile thread's step that refreshes the ACCOUNT for a sweep (account_refresh.hpp, private-stream migration M5a). poll_once() runs it once per
+// sweep epoch, right before the epoch's SweepDone marker is made -- that is, AFTER every order of the sweep has had its answer, in the same thread, so
+// the account it reads can only be newer than those answers. It is handed the sweep's epoch (the update it publishes is tagged with it: that tag, not a
+// clock reading, is what tells the hot thread "this account was fetched by this sweep"), the reconcile clock reading at which the sweep began and the
+// current one. What the step puts on the account ring is also in front of the marker in time: the hot thread pops the marker from the event ring
+// (acquire) and finds everything the reconcile thread did before it pushed that marker (release) -- the account update included. Without a step (every
+// caller before M5a) nothing changes.
+struct SweepAccountStep {
+    using Fn = void (*)(void* user_data, std::uint64_t epoch, std::int64_t sweep_started_ms, std::int64_t now_ms) noexcept;
+
+    Fn fn{nullptr};
+    void* user_data{nullptr};
 };
 
 struct SweepJobStats {
@@ -93,13 +111,15 @@ struct SweepJobStats {
     std::uint64_t requests_stale{0};        // popped requests at or below the current epoch (superseded or repeated): ignored
     std::uint64_t sweeps_completed{0};      // SweepDone markers pushed
     std::uint64_t marker_push_failures{0};  // the event ring was full when the marker was due: retried on the next tick
+    std::uint64_t account_steps{0};         // times the account step ran (once per epoch whose sweep reached its marker)
 };
 
 // The reconcile thread's bookkeeping of the sweep in progress. It knows nothing about orders: poll_once() tells it when a tick found the sweep
 // complete and when the marker went out.
 class SweepJob {
 public:
-    explicit SweepJob(SweepRequestRing& requests) noexcept : requests_(requests) {}
+    explicit SweepJob(SweepRequestRing& requests, SweepAccountStep account_step = {}) noexcept
+        : requests_(requests), account_step_(account_step) {}
 
     SweepJob(const SweepJob&) = delete;
     SweepJob& operator=(const SweepJob&) = delete;
@@ -135,6 +155,16 @@ public:
     // The reconcile clock reading at which the sweep in progress began.
     [[nodiscard]] std::int64_t started_ms() const noexcept { return started_ms_; }
 
+    // poll_once() found every order answered and is about to make the marker. Runs the account step -- once per epoch, however many ticks the marker
+    // takes to get out (a full event ring retries the marker, never the step) -- BEFORE the marker, so the account update is ahead of it. A sweep that
+    // restarts under a newer epoch gets a step of its own. No-op without a step, and when no sweep runs.
+    void before_marker(std::int64_t now_ms) noexcept {
+        if (!running_ || account_step_.fn == nullptr || account_stepped_epoch_ == epoch_) return;
+        account_stepped_epoch_ = epoch_;
+        ++stats_.account_steps;
+        account_step_.fn(account_step_.user_data, epoch_, started_ms_, now_ms);
+    }
+
     // poll_once() pushed the marker: this sweep is over.
     void finished() noexcept {
         running_ = false;
@@ -147,7 +177,9 @@ public:
 
 private:
     SweepRequestRing& requests_;
+    SweepAccountStep account_step_;
     std::uint64_t epoch_{0};
+    std::uint64_t account_stepped_epoch_{0};  // the epoch the account step last ran for (0 = never; no sweep has epoch 0)
     std::int64_t started_ms_{0};
     bool running_{false};
     SweepJobStats stats_{};

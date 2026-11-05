@@ -189,7 +189,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     必须失败的配置，CI 的 Model: reconnect_sweep 步骤反向检查它们）：① `poll_once()` **先取请求、后排空入口环**（请求之前发出的订单
     一定已在环里）；② 标记在 FIFO 里排在它之前产生的每个裁决之后，所以 `drain_reconcile_events()` 弹出标记时，之前的裁决都已持久确认
     并发布（持久追加失败时队首阻塞，标记留在环里，没有任何旁路）；③ 回答按 epoch 校验：只有对当前 epoch 的回答才算；
-    ④ 热线程先 `observe()` 再应用回答，`account_fresh` 由热线程用请求发出的时刻求值（`SweepAccountProbe`），不跨线程传谓词。
+    ④ 热线程先 `observe()` 再应用回答，`account_fresh` 由热线程求值（`SweepAccountProbe`），不跨线程传谓词（M5a-1 起按清扫纪元回答、不再按请求发出的时刻，见下面 “账户刷新”）。
   - **失败关闭的几处取舍**（刻意的，不是遗漏）：`SweepAccountProbe` 未接线 ⇒ 账户永不“新鲜” ⇒ 屏障永不完成（M5 之前没有东西刷新账户，
     所以 M3b 本身不会放行任何订单）；升级给操作员的订单永久计入 `unresolved`（`count_unknown_fate()` = 不可轮询的未终态订单 + 已升级
     未平的订单）——有一笔这样的订单，屏障就回不到 `Reconciled`（操作员的回路不存在，设计文档附录 D）；事件环满时裁决推迟、订单保持
@@ -238,6 +238,29 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     能重启回放、每个拒绝要么被扫描判 `Corrupt` 要么是成交量自相矛盾——以及多订单随机游走：重开后的日志与每个未完结订单的影子逐一相等；两个写者共享影子的游走）、
     `test_user_data_durable.cpp`（34 例：次序、合并、失败与重试、`Ambiguous` 前缀、每一种拒绝与它通知屏障）、`test_live_submit_orchestrator.cpp` 里的 LiveSubmitShadowTest
     （每个 ACK 点之后的影子，失败时不动；经 `orchestrate_submit()` 的持久 WS 路径；该路径零分配）、`test_startup_recovery.cpp`（播种）。
+- 账户刷新（私网流迁移 M5a-1，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.2 / §5.3；Owner 2026-11-03 “开始 M5a”；Tier B）— 屏障的 Reconciled 条件里有 “账户快照被这次清扫刷新过”，而
+  `GET /api/v3/account` 是阻塞调用，只能在对账线程上做。**唯一新增的跨线程东西是一条 SPSC 环** `AccountUpdateRing`（沿用 `SpscRing<AccountUpdate, 4>`，没有新原子量、没有新负控）：
+  `AccountRefresher`（对账线程）周期性地取账户（更新带纪元 0，只服务交易），并经 `SweepJob` 的 “推标记前” 钩子（`SweepAccountStep`）在**每个清扫纪元**取一次（更新带该纪元）；
+  `AccountHolder`（热线程）弹出环，保留按取数开始时刻最新的一份，并回答三个问题：`refreshed_by(epoch)`（给 `SweepAccountProbe`）、`fresh(now, limits)`（给 `RecoveryObservation::account_fresh`）、`view()`（给 `OrchestratorContext::account`）。
+  - **“被这次清扫刷新过” 是纪元标签，不是时钟读数。** 步骤在 `poll_once()` 里、**所有订单都已得到回答之后、`SweepDone` 标记之前**运行（同一线程的程序次序），所以它取到的账户一定比清扫找到的一切更新；
+    它发布的更新带着纪元，热线程只凭标签回答。第一版曾按时钟比较（“取数开始于请求之后？”），**那不够**：周期刷新可能恰好落在请求发出之后、清扫最后一个订单被回答之前，
+    其间发生的成交就在清扫里、不在那份账户里；毫秒级时钟下同一毫秒的两件事也无法区分。所以周期更新（纪元 0）永远不算数，早纪元的更新也不回答晚纪元（晚纪元的更新回答早纪元：它的步骤也在早纪元的回答之后）。
+    `SweepAccountProbe` 因此由 `fresh_since(时刻)` 改为 `refreshed_by(纪元)`（M3b 的签名变更；三个旧测试夹具随之改成按纪元回答，`SweepPump` 只多问一句 `done.epoch`）。
+    这也推翻了 Owner 此前 “按推荐” 的 “戳 = 取数开始时刻、必须晚于清扫请求” 的判据——那个判据对**交易用**的新鲜度仍然成立（见下），对**清扫**不够。
+  - **次序**：更新先推账户环、标记后推事件环；热线程弹出标记（acquire）之后才问，`refreshed_by()` 先排空账户环（acquire）——对账线程在推标记之前做的一切（账户更新在内）此时可见。
+    步骤没有交付（限流拒绝、传输失败、环满）不拖住标记：热线程找不到该纪元的更新，屏障保持 `Sweeping`，换新纪元再问。
+  - **戳 = 取数开始的稳态毫秒**（只管交易用的新鲜度，与清扫无关）：更新带取数开始前读的时钟，所以只会让快照看起来比实际旧；全进程一个稳态时钟（`ctx.now_ms`、屏障观察、清扫请求、账户戳），持有者用它重新盖章
+    （`AccountSnapshotBuilder`）。`fresh()` 用的就是 `validate_pre_trade()` 的谓词（`check_freshness()`，同一份 `ExposureLimits`），只有一个 “账户新鲜” 的定义。
+  - **`unconfirmed` 的热线程版**（`tally_recovered_orders_by_shadow()`）：原来的 `tally_recovered_orders()` 同时读在途注册表（热线程独占的普通内存，没有原子量）和跟踪器（对账线程的），两线程进程里没有一个线程能安全地调它。
+    新版只读热线程拥有的东西——注册表和 M4 的持久影子（每个订单帧的写者都在持久 ACK 之后移动它）——所以没有任何值跨线程，也没有新原子量。**这偏离了 Owner 此前 “按推荐” 的 “对账线程每 tick 发布一个原子计数” 的方案**，理由即此。
+    分类：不在途 ⇒ 已结；在途但影子是交易所终态 ⇒ 已结；影子 `Accepted` / `PartialFill` ⇒ 已知存活；其余（没有上下文条目、`Ambiguous`、`EscalatedToOperator`、`CancelRequested`）⇒ 未确认。
+    与跟踪器版唯一的差别：恢复为 `Accepted` 的订单从一开始就算已知存活（跟踪器版要等对账线程接手之后）——这不会让订单提前出去，因为屏障的清扫会问每个被跟踪的订单，`Reconciled` 又是发单的独立条件。
+  - **守卫**（`test_barrier_sweep_guard.cpp` 新增 5 个测试）：`poll_once()` 里 `before_marker(` 恰好一次且先于标记的制造与推送；账户环只有一个生产者（`AccountRefresher`）和一个消费者（`AccountHolder`），`SweepAccountProbe{` / `SweepAccountStep{` 各只有一个制造点；
+    `refreshed_by()` 先 `poll()` 后比较、且函数体里不出现 `fetch_started_ms`（清扫问题永远不凭时钟回答）；`account_refresh.hpp` 之外的生产源文件不命名 `AccountRefresher` / `AccountHolder` / `sweep_step(` / `sweep_probe(`
+    （进程接线是后续切片，到时更新这条钉子）；影子计数的签名不含 `OrderTracker`、函数体不出现 `tracker` / `for_each_active` / `atomic`，且没有生产调用方。
+  - **未接线**：没有任何生产代码创建刷新器、持有者或带步骤的 `SweepJob`（守卫钉住）；屏障在进程里因此仍然不会完成——M5a-2 与 M5b 接线。真实的取账户端口（`PrivateRestClient::fetch_account` 的适配器，
+    要捕获异常并回报 `Failed`；交易侧还需要一个带 uid 的重载）也在接线那一片。
+  - **证据**：`test_account_refresh.cpp`（40 例：刷新器——首次立即取、周期与重试间隔及其下限、环满丢弃、非正时钟不取、越界结果算失败、清扫步骤总是取并带纪元；持有者——按取数开始时刻保留最新、重新盖章、`refreshed_by()` 只凭标签回答并自己先排空环、`fresh()` 与 `validate_pre_trade()` 同谓词；`poll_once()` 钩子——每个纪元一次、在所有回答之后与标记之前、环满重试的是标记不是步骤、结束的清扫不跑步骤；端到端——屏障只在清扫自己取的账户上完成，周期更新无论早于或晚于请求都不行，步骤失败则保持 `Sweeping` 而下一次清扫恢复）、`test_account_refresh_concurrency.cpp`（2 例，两个真实线程：Reconciled 时持有的账户必须取在该纪元最后一次查询之后；环不满则从无 `reports_account_stale`）、`test_startup_recovery.cpp`（影子计数 +6）、`test_barrier_sweep_guard.cpp`（+5）。MSVC（`/W4 /WX`，Release）全量构建零警告零错误，全量 ctest 3485 个用例：3482 通过、2 个按设计禁用（微基准）、1 个既有的跳过、0 失败；WSL2 GCC-14：`none` 23 个受影响目标 781 例、`address`（ASan+UBSan）19 个目标 580 例全绿，官方 `thread` 层 214/214（跑在补三条单线程测试之前；它们不在 concurrency 清单里），三个负控照常报数据竞争。变异检查 56 个变异体（账户刷新 35、清扫钩子与探针 11、影子计数 7、`poll_once()` 3）：54 个被杀死，2 个等价——AR06（`>` 与 `>=`，观测不可区分）、AR13（`fresh()` 的 `held_` 与默认快照时间戳 0 被 `check_freshness()` 判 `NeverFetched` 重叠）；第一轮存活的 AR25（重试间隔的下限）、AR38（越界结果）、BS07（已结束的清扫不跑步骤）补了测试后杀死，另有 5 个变异体因 `/WX` 编译不过、改写后也被杀死；三个金丝雀先于其余运行，都由语义测试杀死。
 
 ### 容量 / 生命周期
 
