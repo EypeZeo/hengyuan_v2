@@ -513,6 +513,11 @@ void print_private_stream_report(PrivatePipeline& pipeline, const WsApiSessionFa
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Unbuffered stdout: the log is the evidence of a Testnet run, and a run that dies half way (an exception, a kill) must not take the lines it already printed
+    // with it. A redirected stdout is fully buffered by default (and "line buffered" does not exist on Windows); stderr is unbuffered already, so the two now
+    // interleave in order when they share a file. One printf per event, a few per second at most: the cost is nothing.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <spec_toml_path> [duration_seconds=60] [interval=1h]\n",
                      argv[0]);
