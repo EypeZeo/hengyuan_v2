@@ -208,7 +208,7 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 - 草图里的“夹具用一个测试钩子签发”没有照做：生产代码里没有测试钩子，每个夹具带一个 `SyntheticReadiness` 成员（真实的屏障与启动恢复，由脚本化观察驱动到就绪），所以这些测试里 Gate 2b 是真门；护栏 `test_submit_readiness_guard` 钉住每个生产构造 `OrchestratorContext` 的位置给 `.readiness` 的确切文本、哪些文件可以用 `SyntheticReadiness`、令牌只有一个签发点和一个友元、每个 `drain_user_data_events()` 调用的屏障参数。
 - M3 行里的“`StartupRecovery` 第一次被真正接进线束（预检线束）”**没有做**：预检线束仍跑在已退役的 listenKey 流上，没有 WS API 的代次可读，用合成就绪加横幅明说，真实接线随 M5。
 
-### 5.5 M5a-1 的实现情况与同设计草图的差别（账户刷新，2026-11-03）
+### 5.5 M5a-1 的实现情况与同设计草图的差别（账户刷新，2026-11-03；PR #228，合并提交 `2777c27`）
 
 落点：`account_refresh.hpp`（`AccountUpdateRing`、`AccountRefresher`、`AccountHolder`）、`barrier_sweep.hpp`（`SweepAccountStep`、`SweepJob::before_marker()`，`SweepAccountProbe` 改为按纪元回答）、
 `order_tracker.hpp`（`poll_once()` 在推标记之前调一次钩子）、`startup_recovery.hpp`（`tally_recovered_orders_by_shadow()`）。“账户快照由对账线程取、经专用 SPSC 环交给热线程” 按 Owner 的决定实施；
@@ -224,9 +224,9 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 
 没有新的跨线程状态之外的东西：新增的只有一条 `SpscRing<AccountUpdate, 4>`（沿用现有原语），没有新原子量，因此没有新的 TSan 负控；`formal/reconnect_sweep.tla` 不变——它把账户新鲜度建模为不确定的布尔，纪元标签是对这个布尔的实现，不是新的次序。
 
-### 5.6 M5a-2 的实现情况：真实取账户端口与私网流流水线（2026-11-03）
+### 5.6 M5a-2 的实现情况：真实取账户端口与私网流流水线（2026-11-03；PR #229，合并提交 `bdbd96b`）
 
-M5a-2 分两个 PR。**a-2a**（`rest_account_fetcher.hpp`、`binance_private_rest.hpp` 的 uid 重载）：`GET /api/v3/account` 的应答里的 `uid`（必需、正整数）连同快照一起交出，`fetch_account(out, uid)` 与旧重载共用一个实现体；
+M5a-2 的两组改动（a-2a、a-2b）合在一个 PR（#229，合并提交 `bdbd96b`）里——工作流只对以 `master` 为目标的 PR 运行，叠起来的分支没有 CI。**a-2a**（`rest_account_fetcher.hpp`、`binance_private_rest.hpp` 的 uid 重载）：`GET /api/v3/account` 的应答里的 `uid`（必需、正整数）连同快照一起交出，`fetch_account(out, uid)` 与旧重载共用一个实现体；
 `RestAccountFetcher` 把 `PrivateRestError` 映射成刷新器的 `NotSent` / `Failed`（逐枚举一张表），异常不出端口；`fetch_exchange_account_uid()` 是存储绑定需要的那次启动读取。
 **a-2b**（`private_stream_pipeline.hpp`）：把 M2–M5a-1 的部件接成一个组合根，两个节拍（热 / 对账），一个函数读 StartupRecovery 等的全部事实，存储绑定作为一道门，`ensure_store_binding()` 的第一个生产调用方。
 设计草图（§5.1–§5.3）里没有的东西有三条，都是实现时才暴露的：
@@ -307,7 +307,8 @@ M5a-2 分两个 PR。**a-2a**（`rest_account_fetcher.hpp`、`binance_private_re
 | **M3a** 屏障与就绪门（纯逻辑）（**已完成 2026-10-19，PR #188，合并提交 `62c4647`**） | `ReconnectBarrier`、`FeedObservation` 适配器、`SubmitReadiness` / `SubmitReadyToken`、`OrchestratorGate::NotReady`（Gate 2b）、排空过滤、合成就绪（真实组件加脚本化观察）、护栏测试；FI-009/011/020/043 的确定性状态机测试（含由真实监督器加假会话和真实回环会话驱动的端到端）；实际没有做“预检线束接真实 `StartupRecovery`”（随 M5） | B（状态机） | MSVC + WSL2 `none` + `address` + `thread`；变异检查；实际：MSVC 2694、GCC 2700、ASan 11 个可执行文件、`thread` 层 210 个并发用例 + 三个负控、手动 Sanitizer 三个作业，变异检查 133 个变异体（124 + 守卫 9）：8 个存活，均为等价或纵深防御 | 估计 2 日；实际 2026-10-18 至 2026-10-19 |
 | **M3b** 清扫的传输（**已完成 2026-10-23，PR #191，合并提交 `ca6ac64`**） | 请求环加夹在对账事件环里的完成标记（不是独立的回报环）、`SweepJob` / `SweepPump` / `SweepSink`、`poll_once` 的取请求次序、`formal/reconnect_sweep.tla` 与 5 个必败配置、护栏与 CI 模型步骤；没有新的原子协议，因此没有新增 TSan 负控（见 §5.3） | B（并发） | MSVC + WSL2 `none` + `address` + `thread`；TLA+ 模型与它的必败配置；变异检查；实际：MSVC 登记 2765 个、运行 2763 个（新增 71 个），GCC 2771 个、0 警告，ASan 18 个可执行文件，`thread` 层 212 个用例（+2）且三个既有负控仍失败，手动 Sanitizer（run 39465113371）三个作业全绿，变异检查 85 个变异体（81 个被杀死、4 个等价，两处真实缺口 SP09 与 OT18 补了测试） | 估计 2 日；实际 2026-10-20 至 2026-10-23 |
 | **M4** 路径 ③ 持久优先（**已完成 2026-11-02，PR #224，合并提交 `9675b6c`**） | `order_durable_path.hpp`（规划器与 `DurableShadow`）、`OrderFillContext` 的影子与 `intended_qty_ticks`、`UserDataDurablePublisher` 与 `drain_user_data_events(..., durable)`、`ReconcileDurablePublisher` 以影子为准、`detail::append_order_frame()`、`apply_recovery()` 播种、`ReconnectBarrier::on_event_refused()`、守卫 `test_order_durable_path_guard`；与上面 §6.4 列出的差别 | B（并发 / 状态机） | WSL2 `address` + `thread`；真实日志重启测试；变异检查；实际：MSVC 登记 3432 个、运行 3430 个（相对 R5 新增 94 个）全部通过，WSL2 `none` 与 `address` 0 失败，`thread` 层 212 个并发用例通过且三个既有负控仍失败，变异检查 113 个变异体 = 108 杀死 + 5 等价，手动 Sanitizer（run 41451980374）：ASan+UBSan 全量 3441/3441 通过、0 报告；TSan 并发测试 212/212，三个负控都如期报告了注入的数据竞争；ARM64 真实弱内存序硬件 96 个并发用例 ×10 轮通过 | 估计 2 日 |
-| **M5** 退役与联调 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），迁移 `live_submit_reconcile_harness_demo` 与预检线束；**Owner 用 Testnet 凭据跑联调**并贴日志 | B | 全量三层 + CI 手动 Sanitizer；Testnet 联调由 Owner 执行 | 2 日（不含联调等待） |
+| **M5a** 接线（**已完成 2026-11-05，PR #228，合并提交 `2777c27`；PR #229，合并提交 `bdbd96b`**） | #228：账户刷新通道（`account_refresh.hpp`、`SweepJob::before_marker()` / `SweepAccountStep`、`SweepAccountProbe` 改按纪元回答）与热线程版的未确认计数；#229：账户 `uid` 重载、真实取账户端口 `rest_account_fetcher.hpp`、私网流流水线 `private_stream_pipeline.hpp`（两个节拍、`observe_recovery()`、存储绑定的门、`ensure_store_binding()` 的第一个生产调用方）、从 `orchestrate_submit()` 抽出的 `drain_hot_inputs()`、七处守卫钉子改成 “只有流水线”、新的两线程流水线并发测试；与 §5.5、§5.6 列出的偏离（纪元标签、热线程计数、线程约束、绑定的门） | B（并发 / 状态机） | MSVC + WSL2 `none` + `address` + `thread`；变异检查；手动 Sanitizer；实际：#228——MSVC 3485 个登记用例 0 失败、变异检查 56 个 = 54 杀死 + 2 等价、手动 Sanitizer ASan+UBSan 3494/3494；#229——MSVC 3525 个登记用例 0 失败、WSL2 `thread` 216/216 且三个负控仍失败、变异检查 73 个 = 69 杀死 + 4 等价、手动 Sanitizer ASan+UBSan 3542/3542、TSan 216/216、ARM64 100/100 | 估计 1.5 日；实际 2026-11-03 至 2026-11-05（含一次用量中断） |
+| **M5b** 退役与联调 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），迁移 `live_submit_reconcile_harness_demo` 与预检线束（按 §5.6：一个循环线程，两个节拍都从那里调；启动时先取交易所对交易密钥报告的 uid 再 `bind_store()`）；**Owner 用 Testnet 凭据跑联调**并贴日志 | B | 全量三层 + CI 手动 Sanitizer；Testnet 联调由 Owner 执行 | 估计 1 日（不含联调等待） |
 
 合计 13.5 日的上限；M0 可以和 M1 并行；M4 与 M3 几乎没有依赖，可以交错。**每一片都是一个独立 PR，每个 PR 都带它自己的变异检查与回归。**
 
@@ -349,6 +350,8 @@ M5a-2 分两个 PR。**a-2a**（`rest_account_fetcher.hpp`、`binance_private_re
 | 新增：环满丢弃 → 软屏障 | 丢弃计数增加 → 同代次回到 `Sweeping`，对账完成后恢复 | M3 |
 | 新增：影子不超前 | ACK 之前影子不变；任一 ACK 点漏更新被护栏/变异体抓到 | M4（已落地：`test_order_durable_path_guard` 逐点钉住，变异检查 113 个中 108 个被杀死、5 个等价） |
 | 新增：WS 路径写出的日志可回放 | 真实 `DurableAuditSink` 重启回放不 `Corrupt`（含 `Submitting` 恢复后收到 `CANCELED`） | M4（已落地：`test_order_durable_path` 的差分、随机游走与两个写者共享影子的游走） |
+| 新增：被清扫刷新过的账户 | 屏障只在清扫自己取的账户上完成：账户步骤在最后一个回答之后、标记之前取，更新带纪元，周期更新不算 | M5a（已落地：PR #228，`2777c27`；`test_account_refresh` 的端到端含周期更新早于或晚于请求的回归，两线程测试检查 “Reconciled 时的账户取在该纪元最后一次查询之后”，变异检查 56 个中 54 个被杀死、2 个等价） |
+| 新增：存储绑定是就绪的门 | 绑定被拒绝（别的环境或账户、读不了、有历史的未绑定 Production 存储、已栅栏）或没有做，进程不就绪；uid 只来自交易所的应答 | M5a（已落地：PR #229，`bdbd96b`；`test_private_stream_pipeline`、守卫钉住整棵树里 `ensure_store_binding()` 只有流水线一处调用、第五个实参是 `exchange_uid`） |
 | P1-002 路径 ③ | `drain_user_data_events` 先持久 ACK 再折进 `PositionTruth` | M4（已合入：PR #224，`9675b6c`）。**P1-002 没有因此转 `CLOSED`**：`live` 类条目的运行期与预算两段仍缺——没有任何进程运行这条排空（M5 接线），同步 fsync 的时延没有测量；台账里 `code` 段改为 PRESENT，状态仍为 `PARTIAL` |
 
 ---
