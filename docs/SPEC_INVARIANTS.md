@@ -238,7 +238,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     能重启回放、每个拒绝要么被扫描判 `Corrupt` 要么是成交量自相矛盾——以及多订单随机游走：重开后的日志与每个未完结订单的影子逐一相等；两个写者共享影子的游走）、
     `test_user_data_durable.cpp`（34 例：次序、合并、失败与重试、`Ambiguous` 前缀、每一种拒绝与它通知屏障）、`test_live_submit_orchestrator.cpp` 里的 LiveSubmitShadowTest
     （每个 ACK 点之后的影子，失败时不动；经 `orchestrate_submit()` 的持久 WS 路径；该路径零分配）、`test_startup_recovery.cpp`（播种）。
-- 账户刷新（私网流迁移 M5a-1，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.2 / §5.3；Owner 2026-11-03 “开始 M5a”；Tier B）— 屏障的 Reconciled 条件里有 “账户快照被这次清扫刷新过”，而
+- 账户刷新（私网流迁移 M5a-1，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.2 / §5.3；Owner 2026-11-03 “开始 M5a”；Tier B；PR #228，合并提交 `2777c27`）— 屏障的 Reconciled 条件里有 “账户快照被这次清扫刷新过”，而
   `GET /api/v3/account` 是阻塞调用，只能在对账线程上做。**唯一新增的跨线程东西是一条 SPSC 环** `AccountUpdateRing`（沿用 `SpscRing<AccountUpdate, 4>`，没有新原子量、没有新负控）：
   `AccountRefresher`（对账线程）周期性地取账户（更新带纪元 0，只服务交易），并经 `SweepJob` 的 “推标记前” 钩子（`SweepAccountStep`）在**每个清扫纪元**取一次（更新带该纪元）；
   `AccountHolder`（热线程）弹出环，保留按取数开始时刻最新的一份，并回答三个问题：`refreshed_by(epoch)`（给 `SweepAccountProbe`）、`fresh(now, limits)`（给 `RecoveryObservation::account_fresh`）、`view()`（给 `OrchestratorContext::account`）。
@@ -261,7 +261,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **接线的状态（M5a-2 起）**：只有私网流流水线创建刷新器、持有者与带步骤的 `SweepJob`（守卫钉住），而没有任何进程创建流水线——屏障在进程里因此仍然不会完成，M5b 的线束迁移才会接上。
     真实的取账户端口与带 uid 的重载是 M5a-2a 的 `RestAccountFetcher` 与 `fetch_account(out, uid)`（见下面 “真实取账户端口与账户 uid”）。
   - **证据**：`test_account_refresh.cpp`（40 例：刷新器——首次立即取、周期与重试间隔及其下限、环满丢弃、非正时钟不取、越界结果算失败、清扫步骤总是取并带纪元；持有者——按取数开始时刻保留最新、重新盖章、`refreshed_by()` 只凭标签回答并自己先排空环、`fresh()` 与 `validate_pre_trade()` 同谓词；`poll_once()` 钩子——每个纪元一次、在所有回答之后与标记之前、环满重试的是标记不是步骤、结束的清扫不跑步骤；端到端——屏障只在清扫自己取的账户上完成，周期更新无论早于或晚于请求都不行，步骤失败则保持 `Sweeping` 而下一次清扫恢复）、`test_account_refresh_concurrency.cpp`（2 例，两个真实线程：Reconciled 时持有的账户必须取在该纪元最后一次查询之后；环不满则从无 `reports_account_stale`）、`test_startup_recovery.cpp`（影子计数 +6）、`test_barrier_sweep_guard.cpp`（+5）。MSVC（`/W4 /WX`，Release）全量构建零警告零错误，全量 ctest 3485 个用例：3482 通过、2 个按设计禁用（微基准）、1 个既有的跳过、0 失败；WSL2 GCC-14：`none` 23 个受影响目标 781 例、`address`（ASan+UBSan）19 个目标 580 例全绿，官方 `thread` 层 214/214（跑在补三条单线程测试之前；它们不在 concurrency 清单里），三个负控照常报数据竞争。变异检查 56 个变异体（账户刷新 35、清扫钩子与探针 11、影子计数 7、`poll_once()` 3）：54 个被杀死，2 个等价——AR06（`>` 与 `>=`，观测不可区分）、AR13（`fresh()` 的 `held_` 与默认快照时间戳 0 被 `check_freshness()` 判 `NeverFetched` 重叠）；第一轮存活的 AR25（重试间隔的下限）、AR38（越界结果）、BS07（已结束的清扫不跑步骤）补了测试后杀死，另有 5 个变异体因 `/WX` 编译不过、改写后也被杀死；三个金丝雀先于其余运行，都由语义测试杀死。
-- 真实取账户端口与账户 uid（私网流迁移 M5a-2a，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.2 / §5.5；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B）— 上一条的刷新器通过 `AccountFetchPort`
+- 真实取账户端口与账户 uid（私网流迁移 M5a-2a，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.2 / §5.5；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B；PR #229，合并提交 bdbd96b）— 上一条的刷新器通过 `AccountFetchPort`
   取账户，这一片给出生产一侧：`rest_account_fetcher.hpp` 的 `RestAccountFetcher`（`BinancePrivateRestClient::fetch_account()` 的适配器），以及存储绑定需要的账户 uid。
   - **uid 是交易所报告的，不是配置的。** `parse_account_response()` 多一个返回 `uid` 的重载：`uid` 字段必需、必须是正整数（0 是 “没有账户”，负数、小数、字符串、超出 `uint64` 的都拒绝），
     快照与 uid **都**只在整份应答被接受时才赋值（任何失败路径上两个输出都不动）；不要 uid 的旧重载不看这个字段。`BinancePrivateRestClient::fetch_account(out, uid[, cfg])` 与旧重载共用一个实现体
@@ -277,7 +277,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **启动读取 `fetch_exchange_account_uid()`**：启动时调一次，给 `ensure_store_binding()`；与端口分开是有意的——绑定只做一次，周期与清扫的取数用不着 uid。只在应答良好时才给 `uid_out` 赋值，不抛异常（异常算 `Read`）。
   - **未接线**：没有生产代码创建 `RestAccountFetcher` 或调用启动读取（M5a-2b 的流水线与 M5b 的线束才会）。
   - **证据**：test_binance_private_rest.cpp（+10：ParseAccountResponseUid 6 例——uid 随快照返回、19 位与 uint64 最大值不丢失、字段在余额之后也读得到、缺失或不可用的 uid（0、负数、小数、字符串、null、布尔、超出 uint64、数组）一概拒绝且两个输出都不动、好 uid 救不了坏应答、旧重载不看这个字段；FetchAccount 三例走真实客户端对回环 TLS——返回交易所的 uid、没有 uid 的应答被拒且不动任何输出、没有时钟同步时失败关闭；入口守卫一例——空凭据）、test_rest_account_fetcher.cpp（15 例：映射表逐枚举与越界值、适配器只在整体成功时赋值（含恶意写缓冲区的客户端）、异常不出端口、刷新器视角下 NotSent 与 Failed 都按重试间隔再试、启动读取只在好应答时给 uid 且不抛、真实客户端对回环 TLS 的好应答 / HTTP 401 / 无时钟 / 无凭据 / 凭据绑在另一个线程均不发出请求）。MSVC（/W4 /WX）三个 REST 目标（157 + 15 + 32 例）全绿。变异检查 33 个变异体（解析与客户端 13、适配器 20）：32 个被杀死，1 个等价（RU03：uid 为 0 的拒绝已经覆盖 “字段不是 uint64” 的情形，两种写法观测不可区分）；canary 先于其余运行，都由语义测试杀死（适配器的第一个 canary 被 static_assert 在编译期杀死，换成了运行期 canary）；因 /WX 编译不过的变异体改写后也被杀死。
-- 私网流流水线（私网流迁移 M5a-2b，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.6；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B）— `private_stream_pipeline.hpp` 的 `PrivateStreamPipeline<Session>`：
+- 私网流流水线（私网流迁移 M5a-2b，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.6；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B；PR #229，合并提交 bdbd96b）— `private_stream_pipeline.hpp` 的 `PrivateStreamPipeline<Session>`：
   把 M2–M5a-1 的部件接成一个组合根。**它不新增任何状态机、规则或跨线程原语**——只回答 “谁把什么交给谁、按什么次序跑、哪个线程拥有什么、StartupRecovery 等的那些事实从哪里读”。
   - **两个节拍。** `hot_tick(now)`：监督器 `poll` → 持有者 `poll` → 恢复状态机 `update`（到期时应用一次恢复）→ `drain_hot_inputs()`。`reconcile_tick(now)`：刷新器的周期取数 → 带清扫作业的 `poll_once()`
     （作业的账户步骤在最后一个回答之后、标记之前运行，见上一条 “账户刷新”）。`drain_hot_inputs()` 是从 `orchestrate_submit()` 顶部**原样**抽出来的三段排空（清扫泵 `service()`、对账排空、用户数据排空），
