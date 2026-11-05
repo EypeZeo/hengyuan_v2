@@ -117,6 +117,9 @@ struct Fixture {
     std::unique_ptr<DurableAuditSink> durable_audit_sink;
 
     explicit Fixture(std::uint32_t rules_version = 7) {
+        // The trap counter is a global: without this a test that reaches the port (BindingConfirmationReachesSubmitPort) leaves 1 behind for every test that runs
+        // after it in the same process (--gtest_shuffle, --gtest_repeat), which then fails its "never called" assertion for a reason that has nothing to do with it.
+        g_submit_call_count.store(0, std::memory_order_relaxed);
         audit.set_available(true);
         kill_switch.operator_reset();
         rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
