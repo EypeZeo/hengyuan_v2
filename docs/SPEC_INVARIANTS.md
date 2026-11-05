@@ -256,11 +256,51 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     分类：不在途 ⇒ 已结；在途但影子是交易所终态 ⇒ 已结；影子 `Accepted` / `PartialFill` ⇒ 已知存活；其余（没有上下文条目、`Ambiguous`、`EscalatedToOperator`、`CancelRequested`）⇒ 未确认。
     与跟踪器版唯一的差别：恢复为 `Accepted` 的订单从一开始就算已知存活（跟踪器版要等对账线程接手之后）——这不会让订单提前出去，因为屏障的清扫会问每个被跟踪的订单，`Reconciled` 又是发单的独立条件。
   - **守卫**（`test_barrier_sweep_guard.cpp` 新增 5 个测试）：`poll_once()` 里 `before_marker(` 恰好一次且先于标记的制造与推送；账户环只有一个生产者（`AccountRefresher`）和一个消费者（`AccountHolder`），`SweepAccountProbe{` / `SweepAccountStep{` 各只有一个制造点；
-    `refreshed_by()` 先 `poll()` 后比较、且函数体里不出现 `fetch_started_ms`（清扫问题永远不凭时钟回答）；`account_refresh.hpp` 之外的生产源文件不命名 `AccountRefresher` / `AccountHolder` / `sweep_step(` / `sweep_probe(`
-    （进程接线是后续切片，到时更新这条钉子）；影子计数的签名不含 `OrderTracker`、函数体不出现 `tracker` / `for_each_active` / `atomic`，且没有生产调用方。
-  - **未接线**：没有任何生产代码创建刷新器、持有者或带步骤的 `SweepJob`（守卫钉住）；屏障在进程里因此仍然不会完成——M5a-2 与 M5b 接线。真实的取账户端口（`PrivateRestClient::fetch_account` 的适配器，
-    要捕获异常并回报 `Failed`；交易侧还需要一个带 uid 的重载）也在接线那一片。
+    `refreshed_by()` 先 `poll()` 后比较、且函数体里不出现 `fetch_started_ms`（清扫问题永远不凭时钟回答）；`account_refresh.hpp` 之外只有私网流流水线（M5a-2b，见下面 “私网流流水线”）命名 `AccountRefresher` / `AccountHolder` / `sweep_step(` / `sweep_probe(`，
+    并按逐字钉住的方式连接；影子计数的签名不含 `OrderTracker`、函数体不出现 `tracker` / `for_each_active` / `atomic`，生产调用方只有流水线一处。
+  - **接线的状态（M5a-2 起）**：只有私网流流水线创建刷新器、持有者与带步骤的 `SweepJob`（守卫钉住），而没有任何进程创建流水线——屏障在进程里因此仍然不会完成，M5b 的线束迁移才会接上。
+    真实的取账户端口与带 uid 的重载是 M5a-2a 的 `RestAccountFetcher` 与 `fetch_account(out, uid)`（见下面 “真实取账户端口与账户 uid”）。
   - **证据**：`test_account_refresh.cpp`（40 例：刷新器——首次立即取、周期与重试间隔及其下限、环满丢弃、非正时钟不取、越界结果算失败、清扫步骤总是取并带纪元；持有者——按取数开始时刻保留最新、重新盖章、`refreshed_by()` 只凭标签回答并自己先排空环、`fresh()` 与 `validate_pre_trade()` 同谓词；`poll_once()` 钩子——每个纪元一次、在所有回答之后与标记之前、环满重试的是标记不是步骤、结束的清扫不跑步骤；端到端——屏障只在清扫自己取的账户上完成，周期更新无论早于或晚于请求都不行，步骤失败则保持 `Sweeping` 而下一次清扫恢复）、`test_account_refresh_concurrency.cpp`（2 例，两个真实线程：Reconciled 时持有的账户必须取在该纪元最后一次查询之后；环不满则从无 `reports_account_stale`）、`test_startup_recovery.cpp`（影子计数 +6）、`test_barrier_sweep_guard.cpp`（+5）。MSVC（`/W4 /WX`，Release）全量构建零警告零错误，全量 ctest 3485 个用例：3482 通过、2 个按设计禁用（微基准）、1 个既有的跳过、0 失败；WSL2 GCC-14：`none` 23 个受影响目标 781 例、`address`（ASan+UBSan）19 个目标 580 例全绿，官方 `thread` 层 214/214（跑在补三条单线程测试之前；它们不在 concurrency 清单里），三个负控照常报数据竞争。变异检查 56 个变异体（账户刷新 35、清扫钩子与探针 11、影子计数 7、`poll_once()` 3）：54 个被杀死，2 个等价——AR06（`>` 与 `>=`，观测不可区分）、AR13（`fresh()` 的 `held_` 与默认快照时间戳 0 被 `check_freshness()` 判 `NeverFetched` 重叠）；第一轮存活的 AR25（重试间隔的下限）、AR38（越界结果）、BS07（已结束的清扫不跑步骤）补了测试后杀死，另有 5 个变异体因 `/WX` 编译不过、改写后也被杀死；三个金丝雀先于其余运行，都由语义测试杀死。
+- 真实取账户端口与账户 uid（私网流迁移 M5a-2a，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.2 / §5.5；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B）— 上一条的刷新器通过 `AccountFetchPort`
+  取账户，这一片给出生产一侧：`rest_account_fetcher.hpp` 的 `RestAccountFetcher`（`BinancePrivateRestClient::fetch_account()` 的适配器），以及存储绑定需要的账户 uid。
+  - **uid 是交易所报告的，不是配置的。** `parse_account_response()` 多一个返回 `uid` 的重载：`uid` 字段必需、必须是正整数（0 是 “没有账户”，负数、小数、字符串、超出 `uint64` 的都拒绝），
+    快照与 uid **都**只在整份应答被接受时才赋值（任何失败路径上两个输出都不动）；不要 uid 的旧重载不看这个字段。`BinancePrivateRestClient::fetch_account(out, uid[, cfg])` 与旧重载共用一个实现体
+    （同一个请求、同一道入口守卫、同一份预算），只在是否要求 uid 上不同。`store_binding_writer.hpp` 的头注释早就要求 “接线时传交易所对交易密钥报告的 UID”；这是那个值的来源。
+  - **`account_fetch_outcome_of()`：每个 `PrivateRestError` 一个回答。** “请求没有离开进程”的（`InvalidConfig`、`ClockNotFresh`、`SigningFailed`、`ClockSkewTooLarge`、`RateLimitExhausted`）⇒ `NotSent`；
+    “试过网络或应答不可用”的（解析、连接、TLS、写读、HTTP 状态、JSON、格式、容量）⇒ `Failed`；`None` ⇒ `Fetched`；没人定义的值 ⇒ `Failed`，永远不是成功。逐枚举写全（`-Wswitch`
+    让新枚举不会悄悄落进 `Failed`）。适配器只在整体成功时才给调用方的快照赋值（不管客户端对自己拿到的缓冲区做了什么），异常不出这个 `noexcept` 端口（算 `Failed`，单独计数），
+    计数器与 `last_error` 说明发生了什么。刷新器对 `NotSent` 与 `Failed` 一视同仁（按重试间隔再试），区别只在计数器里。
+  - **线程约束（本片发现）。** `fetch_account()` 要签名，`BoundHmacCredentials` 只在绑定它的线程上应答（F11），客户端的限流追踪器也属于同一个线程（`spot_rate_limit_budget.hpp`：一个文档化的契约，不是强制的）。
+    所以这个适配器只能在拥有凭据的线程上调用。今天的真实线束是**一个循环线程**，热半部与对账半部在同一处 tick（`live_submit_preflight_harness.cpp`）；一个真正独立的对账线程需要在它自己身上绑定的凭据，
+    和两个线程都够得着的限流源——那是一个本片不取的设计分叉（蓝图：待定）。在错误的线程上用，适配器不会做出怪事：签名被拒 ⇒ `SigningFailed` ⇒ `NotSent` ⇒ 屏障停在 `Sweeping`
+    （失败关闭，计数器可见）；有测试（凭据在另一个线程绑定）。
+  - **启动读取 `fetch_exchange_account_uid()`**：启动时调一次，给 `ensure_store_binding()`；与端口分开是有意的——绑定只做一次，周期与清扫的取数用不着 uid。只在应答良好时才给 `uid_out` 赋值，不抛异常（异常算 `Read`）。
+  - **未接线**：没有生产代码创建 `RestAccountFetcher` 或调用启动读取（M5a-2b 的流水线与 M5b 的线束才会）。
+  - **证据**：test_binance_private_rest.cpp（+10：ParseAccountResponseUid 6 例——uid 随快照返回、19 位与 uint64 最大值不丢失、字段在余额之后也读得到、缺失或不可用的 uid（0、负数、小数、字符串、null、布尔、超出 uint64、数组）一概拒绝且两个输出都不动、好 uid 救不了坏应答、旧重载不看这个字段；FetchAccount 三例走真实客户端对回环 TLS——返回交易所的 uid、没有 uid 的应答被拒且不动任何输出、没有时钟同步时失败关闭；入口守卫一例——空凭据）、test_rest_account_fetcher.cpp（15 例：映射表逐枚举与越界值、适配器只在整体成功时赋值（含恶意写缓冲区的客户端）、异常不出端口、刷新器视角下 NotSent 与 Failed 都按重试间隔再试、启动读取只在好应答时给 uid 且不抛、真实客户端对回环 TLS 的好应答 / HTTP 401 / 无时钟 / 无凭据 / 凭据绑在另一个线程均不发出请求）。MSVC（/W4 /WX）三个 REST 目标（157 + 15 + 32 例）全绿。变异检查 33 个变异体（解析与客户端 13、适配器 20）：32 个被杀死，1 个等价（RU03：uid 为 0 的拒绝已经覆盖 “字段不是 uint64” 的情形，两种写法观测不可区分）；canary 先于其余运行，都由语义测试杀死（适配器的第一个 canary 被 static_assert 在编译期杀死，换成了运行期 canary）；因 /WX 编译不过的变异体改写后也被杀死。
+- 私网流流水线（私网流迁移 M5a-2b，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.6；Owner 2026-11-03 “开始 M5a” 覆盖；Tier B）— `private_stream_pipeline.hpp` 的 `PrivateStreamPipeline<Session>`：
+  把 M2–M5a-1 的部件接成一个组合根。**它不新增任何状态机、规则或跨线程原语**——只回答 “谁把什么交给谁、按什么次序跑、哪个线程拥有什么、StartupRecovery 等的那些事实从哪里读”。
+  - **两个节拍。** `hot_tick(now)`：监督器 `poll` → 持有者 `poll` → 恢复状态机 `update`（到期时应用一次恢复）→ `drain_hot_inputs()`。`reconcile_tick(now)`：刷新器的周期取数 → 带清扫作业的 `poll_once()`
+    （作业的账户步骤在最后一个回答之后、标记之前运行，见上一条 “账户刷新”）。`drain_hot_inputs()` 是从 `orchestrate_submit()` 顶部**原样**抽出来的三段排空（清扫泵 `service()`、对账排空、用户数据排空），
+    `orchestrate_submit()` 与热节拍共用这一个定义，所以 “下单的周期” 与 “不下单的周期” 的排空次序不会分叉（`orchestrate_submit` 的既有测试原样通过；既有守卫按调用点计数，调用点个数不变）。
+  - **谁拥有什么。** 流水线拥有环（to-reconcile、对账事件、清扫请求、账户更新）、订单跟踪器、清扫作业、刷新器、持有者、监督器、恢复状态机、就绪判定（含屏障）、清扫泵、迟到成交告警与两个持久发布者；
+    进程的持久存储、内存审计环、**唯一的** `KillSwitch`、`PositionTruth`、在途注册表、成交上下文、用户数据事件环（会话工厂的 `Deps::ring` 指向它，所以它先于流水线存在）、时钟发布者、限流追踪器，
+    以及所有碰网络的函数指针（查询端口、取账户端口、符号规则）按引用或按值传入（`PipelineParts`）。热半部与对账半部是两个按缓存行对齐的成员组；两半之间唯一共享的是环。流水线不创建线程、不自己连任何东西
+    （监督器在热线程的 `poll()` 里通过工厂连）。
+  - **`observe_recovery()`：StartupRecovery 等待的事实只在一个函数里读，节拍与就绪探针共用**，“就绪” 因此不论在哪里被问都按同样的事实判断：时钟发布者新鲜、exchangeInfo 已载入（进程设置）、存储打开且未栅栏且扫描干净、
+    恢复已应用（只一次，由存储的检查点和进程的规则查询；规则查询没接则按 “未知符号” 失败关闭 ⇒ RepopulateIncomplete）、仍未确认的恢复订单（热线程用注册表加持久影子数，`tally_recovered_orders_by_shadow()`）、
+    账户新鲜**且存储已绑定**、用户数据流已连接并验证。
+  - **存储绑定是一道门。** `bind_store(环境, 交易所报告的 uid, 时刻)` 是 `ensure_store_binding()` 的**第一个生产调用方**（守卫钉住：树里只有这一个生产源包含写侧头文件，它的唯一一次调用的第五个实参就是 `exchange_uid`，
+    不是任何配置字段；uid 来自 `rest_account_fetcher.hpp` 的启动读取）。在得到 “可以使用该存储” 的裁决之前，账户不算新鲜，进程不能就绪。被拒绝的绑定（别的环境或账户、读不了的绑定、有历史的未绑定 Production 存储、
+    已栅栏的存储）让进程一直不就绪，原因在 `binding_status()` 里，由调用方停进程。每次调用都重新对照存储判定（被拒绝不是被记住的状态）。**有意的取舍**：被拒绝的绑定不去拨 `KillSwitch`，也不新增 DegradedReason——
+    绑定是启动前提，不是运行中的事件；门是 `account_fresh`，StartupRecovery 的枚举与状态机因此不变。
+  - **线程。** 今天的真实线束是一个循环线程，它按两个节拍各调一次；这也是真实 REST 适配器唯一允许的排布（凭据与限流追踪器都属于一个线程，见上一条）。两个线程各跑一半也是支持的（两半之间只有环），
+    但真实的取数端口要等 “那条线程上自己的凭据 + 两线程共享的限流源” 的设计之后才能放到对账线程上。
+  - **守卫（七处 “尚无生产接线” 的钉子随之改成 “只有流水线”，每处带理由）**：`poll_once()` 只有流水线传清扫作业（实参 `&reconcile_.job`）；账户更新环由流水线拥有但只有头文件里的刷新器推、持有者弹；
+    刷新器 / 持有者 / `sweep_step(` / `sweep_probe(` 只出现在 `account_refresh.hpp` 和流水线里，且流水线的接法逐字钉住（作业拿刷新器的步骤、泵拿持有者的探针、两者共用一个环）；影子计数的生产调用方只有流水线一处；
+    `OrchestratorContext` 的生产构造点多一处（流水线，`readiness` 取它自己拥有的那个）；迟到成交告警只有流水线造一个，从存储的 `recovered_operator_resolved()` 列表与总数和进程唯一的 `KillSwitch` 造出，上下文的 `kill_switch` 是同一个；
+    存储绑定的写侧只有流水线包含。
+  - **未接线**：没有任何进程创建流水线（M5b 的线束迁移才会）；真实 WS 会话在回环服务端上被证明过，对真实交易所没有证明过。
+  - **证据**：test_private_stream_pipeline.cpp（18 例，脚本化的会话 + 真实持久存储 + 真实屏障 / 恢复 / 清扫 / 发布者：从无到令牌逐步断言；业务上下文通过就绪门；没有存储绑定、没有 exchangeInfo、没有流、没有新鲜时钟、存储未打开、存储已栅栏、清扫的账户被拒、账户过期各自都让进程不就绪或降级；绑定每次重新判定且记录时刻，被拒的绑定让一个完美的进程出局；未完成的订单被恢复、排队、被询问，直到交易所回答才就绪（成交进 PositionTruth、槽位释放、审计记录用 tick 的时钟）；规则查询没接则失败关闭；上下文带着配置的限额承载整套接线；两半互相独立）、test_private_stream_pipeline_loopback.cpp（3 例，真实 WS API 会话 + 真实工厂 + 真实监督器对本地 TLS WebSocket 服务端：签了名的订阅经 TLS 走到令牌；连接被掐断后出局，重新签名、重新清扫的下一代把它带回；线上来的执行报告被流水线的排空取走）、test_private_stream_pipeline_concurrency.cpp（2 例，两个真实线程各跑一半，在 TSan 与 ARM64 清单里，第二例让对账线程问交易所、热线程把回答写成持久帧，重启后日志里没有未完成订单）、三个守卫文件里更新的钉子。MSVC（/W4 /WX）全量构建零警告零错误，全量 ctest 3525 个用例：3522 通过、2 个按设计禁用、1 个既有的跳过、0 失败；WSL2 GCC-14：none 20 个受影响目标 758 例、address（ASan+UBSan）17 个目标 592 例全绿，官方 thread 层 216/216（含新的两线程流水线测试），三个负控照常报数据竞争；变异检查 40 个变异体（流水线 38、抽出的排空 2）：37 个被杀死，3 个等价或不可触发——PL13、PL14（多算或早算一次影子计数：恢复前后、就绪后都数不出任何东西）、PL08（扫描状态恒为干净：扫描失败的存储同时被栅栏，流水线另外读栅栏）；两个 canary 先于其余运行，都由语义测试杀死；变异设计催生了两条测试（时钟从未发布、存储未打开）和三处断言（绑定记录的时刻、排空用的 tick 时钟、上下文带着配置的限额）；gtest 发现步骤的偶发超时（构建环境的已知抖动）重跑后判定。
 
 ### 容量 / 生命周期
 

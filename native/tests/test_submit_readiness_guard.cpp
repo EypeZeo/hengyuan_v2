@@ -280,15 +280,19 @@ struct ContextPin {
 
 constexpr const char* kSyntheticRhs = "&synthetic_readiness.readiness()";
 
-// Every production place that builds an OrchestratorContext, and what it gives it as a readiness. All three have no private stream (the
-// listenKey one is retired and was never wired to the orchestrator's barrier) and say so in their banner or comment.
+// Every production place that builds an OrchestratorContext, and what it gives it as a readiness. Three have no private stream (the
+// listenKey one is retired and was never wired to the orchestrator's barrier) and say so in their banner or comment; the fourth is the private-stream
+// pipeline (M5a-2b), whose readiness is the one it owns, built over the real supervisor, barrier, recovery and account path.
 const ContextPin kContexts[] = {
     {"include/hengyuan/verified_dry_run_evidence.hpp", 1, kSyntheticRhs,
      "DrillRig: the verified dry-run drills run with no private stream; the readiness is the synthetic one (real barrier + startup recovery)"},
     {"src/live_submit_evidence_harness.cpp", 1, kSyntheticRhs,
      "the evidence harness is a mock-submit dry run; its banner says the readiness is synthetic"},
     {"src/live_submit_preflight_harness.cpp", 1, kSyntheticRhs,
-     "the preflight harness still runs on the retired listenKey stream; its banner says the readiness is synthetic and M5 wires the real one"},
+     "the preflight harness still runs on the retired listenKey stream; its banner says the readiness is synthetic and M5b moves it onto the pipeline"},
+    {"include/hengyuan/private_stream_pipeline.hpp", 1, "&hot_.readiness",
+     "the pipeline's wiring context: the one readiness the pipeline owns (its barrier is fed by the real supervisor, its recovery by the live parts); make_context() "
+     "returns a copy of it with `auto`, so the type is named once"},
 };
 
 // The only files allowed to use SyntheticReadiness (by name or by including its header).
@@ -595,23 +599,44 @@ TEST(SubmitReadinessGuard, TheLateFillAlarmSeesAnEventBeforeTheBarrierCanDropIt)
     EXPECT_LT(asks_registry, alarm);
 }
 
-TEST(SubmitReadinessGuard, NoProductionCodeBuildsALateFillAlarmOrWiresItIntoAContextYet) {
-    // The alarm is real and tested, and no process runs the live drain loop before M5 (L-43), so there is nothing to wire it into. Pinned as such:
-    // the day a production file builds one -- or assigns .late_fill -- this fails, and the wiring (which store's list, which KillSwitch) is a review
-    // item and not a side effect. The three OrchestratorContexts of kContexts stay unwired for the same reason as their drains: scratch stores.
+TEST(SubmitReadinessGuard, OnlyThePipelineBuildsALateFillAlarmAndWiresItIntoAContext) {
+    // The alarm is real and tested; the private-stream pipeline (M5a-2b) is the first production code that builds one, and it builds exactly one, over the list the
+    // recovered store holds and the ONE KillSwitch the pipeline's contexts carry. A second construction, or a context that gets an alarm from anywhere else,
+    // is a review item and not a side effect. The three other OrchestratorContexts of kContexts stay unwired for the same reason as their drains: scratch stores.
+    constexpr const char* kPipeline = "include/hengyuan/private_stream_pipeline.hpp";
     std::vector<std::string> problems;
     for (const SourceFile& f : production_sources()) {
         if (f.rel == "include/hengyuan/late_fill_alarm.hpp") continue;  // the definition
         const std::size_t built = constructions_of(f.code, "LateFillAlarm");
+        const std::vector<std::string> wired = member_assignments(f.code, "late_fill");
+        if (f.rel == kPipeline) {
+            if (built != 1) problems.push_back(f.rel + ": " + std::to_string(built) + " LateFillAlarm construction(s), expected the one member");
+            if (wired != std::vector<std::string>{"&hot_.late_fill"}) problems.push_back(f.rel + ": .late_fill must be assigned `&hot_.late_fill` exactly once");
+            continue;
+        }
         if (built != 0) {
             problems.push_back(f.rel + ": builds " + std::to_string(built) +
                                " LateFillAlarm(s); pin it (with the store whose list feeds it and the KillSwitch it trips) or remove it");
         }
-        const std::vector<std::string> wired = member_assignments(f.code, "late_fill");
         if (!wired.empty()) {
             problems.push_back(f.rel + ": assigns .late_fill " + std::to_string(wired.size()) +
                                " time(s); pin the context (and say which alarm it gets) or remove it");
         }
+    }
+    // The pipeline's alarm: the recovered store's own list and total, and the process's one breaker -- the same object the context hands to Gate 2.
+    const SourceFile* pipeline = find_source(kPipeline);
+    if (pipeline == nullptr) {
+        problems.push_back(std::string(kPipeline) + ": not found");
+    } else {
+        std::string squeezed;
+        for (const char c : pipeline->code) {
+            if (c != ' ' && c != '\n' && c != '\r' && c != '\t') squeezed += c;
+        }
+        const auto has = [&](std::string_view needle) { return squeezed.find(needle) != std::string::npos; };
+        if (!has("late_fill(parts.sink.recovered_operator_resolved(),parts.sink.recovered_operator_resolved_total(),parts.kill_switch)")) {
+            problems.push_back("the pipeline's LateFillAlarm must be built from the sink's recovered_operator_resolved() list and total and parts.kill_switch");
+        }
+        if (!has("context_.kill_switch=&parts_.kill_switch;")) problems.push_back("the pipeline's contexts must carry the same KillSwitch the alarm trips");
     }
     for (const std::string& s : problems) ADD_FAILURE() << s;
     EXPECT_TRUE(problems.empty());

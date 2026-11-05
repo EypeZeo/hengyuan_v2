@@ -1071,8 +1071,8 @@ TEST(OperatorResolutionGuard, TheEntryPointIsAThinMainThatNamesNoStoreAndNoKey) 
 
 // --- D5 slice R5: the store's binding (store_binding.hpp reads and judges, store_binding_writer.hpp writes) -----------------------------
 //
-//  21. The tool reads a binding and never makes one. The write side (bind_store(), ensure_store_binding()) is included by no production
-//      source today -- the trading process's wiring (private-stream migration M5) will be the first, and adds its pin here with the reason --
+//  21. The tool reads a binding and never makes one. The write side (bind_store(), ensure_store_binding()) is included by exactly one production
+//      source: the trading process's wiring, the private-stream pipeline (M5a-2b), whose one call passes the store and the uid the EXCHANGE reported --
 //      and none of the offline tool's sources names anything that writes a binding or a tip anchor.
 //  22. The binding is read once, by the tool, with the audit sink's own identity, and judged once, by the flow, right after the account
 //      check and before any wait or evidence read; everything not explicitly allowed is a refusal.
@@ -1083,6 +1083,7 @@ namespace {
 
 constexpr const char* kBinding = "include/hengyuan/store_binding.hpp";
 constexpr const char* kBindingWriter = "include/hengyuan/store_binding_writer.hpp";
+constexpr const char* kPipelineFile = "include/hengyuan/private_stream_pipeline.hpp";
 
 const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kConfirmation, kPorts,        kBundle,
                                       kFlow,  kTransport, kCli,  kTerminal,     kTool,         kRealExchange, kMain};
@@ -1090,9 +1091,11 @@ const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kCon
 }  // namespace
 
 TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
-    expect_named_only_in("store_binding_writer", {});  // the write side is included by no production source yet
-    expect_named_only_in("bind_store", {{kBindingWriter, 2, "the definition and its one call inside ensure_store_binding()"}});
-    expect_named_only_in("ensure_store_binding", {{kBindingWriter, 3, "the two overloads, and the sink overload's call of the value overload"}});
+    expect_named_only_in("store_binding_writer", {{kPipelineFile, 1, "the trading process's wiring includes the write side (M5a-2b): the first and only production includer"}});
+    expect_named_only_in("bind_store", {{kBindingWriter, 2, "the definition and its one call inside ensure_store_binding()"},
+                                        {kPipelineFile, 1, "the pipeline's own method of that name, which calls ensure_store_binding()"}});
+    expect_named_only_in("ensure_store_binding", {{kBindingWriter, 3, "the two overloads, and the sink overload's call of the value overload"},
+                                                  {kPipelineFile, 1, "the pipeline's one call, with the uid the exchange reported"}});
     expect_named_only_in("encode_store_binding", {{kBindingWriter, 2, "the definition and its one call inside bind_store()"}});
     for (const char* f : kOperatorFiles) {
         const SourceFile* src = find_source(f);
@@ -1102,6 +1105,14 @@ TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
             EXPECT_EQ(count_identifier(src->code, name), 0u) << f << " names " << name << ": the tool reads a store's binding and cannot make one";
         }
     }
+    // the pipeline's one call passes the sink, the path and key ring the sink was built with, the environment it was told, the uid it was told, and the clock
+    const SourceFile* pipeline = find_source(kPipelineFile);
+    ASSERT_NE(pipeline, nullptr);
+    const auto binds = call_args(pipeline->code, "ensure_store_binding");
+    ASSERT_EQ(binds.size(), 1u);
+    EXPECT_EQ(binds[0], (std::vector<std::string>{"parts_.sink", "parts_.log_path", "parts_.key_ring", "environment", "exchange_uid", "now_ms"}))
+        << "the uid is the parameter of bind_store(): what the exchange reported for the key in use (rest_account_fetcher.hpp::fetch_exchange_account_uid()), never a "
+           "field of a configuration";
     // and the read side has no way to write one either
     const SourceFile* reader = find_source(kBinding);
     ASSERT_NE(reader, nullptr);

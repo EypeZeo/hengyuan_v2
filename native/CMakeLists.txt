@@ -1268,6 +1268,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_account_refresh)
     gtest_discover_tests(test_account_refresh)
 
+    # M5a-2b: the composition root of the private stream (private_stream_pipeline.hpp) over a scripted session, a REAL durable store and the real
+    # barrier / recovery / sweep / publisher objects: from nothing to a readiness token, every condition of it necessary, the store binding as a gate,
+    # recovery of an unfinished order, the wiring of the context. Single-threaded and deterministic (both halves ticked from the test thread).
+    add_executable(test_private_stream_pipeline tests/test_private_stream_pipeline.cpp)
+    target_link_libraries(test_private_stream_pipeline PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_private_stream_pipeline)
+    gtest_discover_tests(test_private_stream_pipeline)
+
     # M3b source-text guard: poll_once() takes the sweep request before it drains the ingress ring, a SweepDone marker is made / delivered / applied in
     # one place each, a request is made and pushed only by the pump, every production drain_reconcile_events() call is pinned with its sink argument, and
     # no production poll_once() runs a sweep job yet. It reads the source tree, so the native/ directory is a compile definition (same shape as the
@@ -1322,6 +1330,14 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_account_refresh_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
     hengyuan_set_warnings(test_account_refresh_concurrency)
     gtest_discover_tests(test_account_refresh_concurrency PROPERTIES LABELS concurrency)
+
+    # M5a-2b: the private-stream pipeline with its two halves on two real threads (hot: supervisor, holder, recovery, readiness, durable publishers and the real
+    # durable store; reconcile: refresher, tracker, sweep job, the scripted ports). The halves share only the four rings, so any other shared state is a TSan
+    # report: a `concurrency` test, in the same three lists as the other two-thread tests. No negative control of its own (no new atomic protocol).
+    add_executable(test_private_stream_pipeline_concurrency tests/test_private_stream_pipeline_concurrency.cpp)
+    target_link_libraries(test_private_stream_pipeline_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_private_stream_pipeline_concurrency)
+    gtest_discover_tests(test_private_stream_pipeline_concurrency PROPERTIES LABELS concurrency)
 
     # TODO 1A.4: real two-thread stress for the two NEW cross-thread boundaries this batch
     # introduces (UserDataWsEventRing, ListenKeyPublisher) -- the first new cross-thread
@@ -1514,6 +1530,21 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_private_rest_raw)
         gtest_discover_tests(test_binance_private_rest_raw)
 
+        # Private-stream migration M5a-2a: the real account port over BinancePrivateRestClient::fetch_account() (the error -> NotSent/Failed mapping,
+        # the exception shield, the startup read of the account uid) against a scripted client and, for the pairing itself, loopback TLS.
+        add_executable(test_rest_account_fetcher tests/test_rest_account_fetcher.cpp)
+        target_link_libraries(test_rest_account_fetcher PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_rest_account_fetcher SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_rest_account_fetcher PRIVATE tests)
+        target_compile_definitions(test_rest_account_fetcher PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_rest_account_fetcher)
+        hengyuan_allow_third_party_tsan_fences(test_rest_account_fetcher)
+        gtest_discover_tests(test_rest_account_fetcher)
+
         # D5 slice R3b-1: the offline operator tool's real exchange port (pacing, the rate-limit latch, the clock refresh, summarize_account)
         # and the whole flow end to end over loopback TLS.
         add_executable(test_operator_resolution_transport tests/test_operator_resolution_transport.cpp)
@@ -1642,6 +1673,21 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_ws_api_user_data_session)
         hengyuan_allow_third_party_tsan_fences(test_binance_ws_api_user_data_session)
         gtest_discover_tests(test_binance_ws_api_user_data_session)
+
+        # M5a-2b: the private-stream pipeline over the REAL WS API session, factory and supervisor against the local TLS WebSocket server: a signed subscription
+        # over TLS ends in a token, a dropped connection takes the process out of readiness and the next (re-signed, re-swept) generation brings it back.
+        add_executable(test_private_stream_pipeline_loopback tests/test_private_stream_pipeline_loopback.cpp)
+        target_link_libraries(test_private_stream_pipeline_loopback PRIVATE
+            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
+            Threads::Threads GTest::gtest_main)
+        target_include_directories(test_private_stream_pipeline_loopback SYSTEM PRIVATE
+            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+        target_include_directories(test_private_stream_pipeline_loopback PRIVATE tests)
+        target_compile_definitions(test_private_stream_pipeline_loopback PRIVATE
+            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
+        hengyuan_set_warnings(test_private_stream_pipeline_loopback)
+        hengyuan_allow_third_party_tsan_fences(test_private_stream_pipeline_loopback)
+        gtest_discover_tests(test_private_stream_pipeline_loopback)
 
         # 批次 6 6b-0f-7: the whole public-feed pipeline (kline + depth supervised feeds, their drivers,
         # gates and the validity verdict) against REAL sessions on the loopback server; only the two REST
