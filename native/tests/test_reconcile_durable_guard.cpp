@@ -221,8 +221,6 @@ const Pin kDrainCalls[] = {
      "orchestrate_submit(): drains only when ctx.reconcile_durable is wired (no publisher = no drain)"},
     {"include/hengyuan/verified_dry_run_evidence.hpp", 1, kDurableArgCount, "&rig.reconcile_durable",
      "the ambiguity drill reconciles on the drill rig's real scratch log"},
-    {"src/live_submit_preflight_harness.cpp", 2, kDurableArgCount, "&reconcile_durable",
-     "the loop and the shutdown drain, over the harness's real (temp) DurableAuditSink"},
     {"src/live_submit_reconcile_harness_demo.cpp", 2, kMemoryOnlyArgCount, "",
      "MEMORY-ONLY: no DurableAuditSink and nothing is ever submitted, so the ring is always empty"},
     {"src/live_submit_real_credentials_demo.cpp", 2, kMemoryOnlyArgCount, "",

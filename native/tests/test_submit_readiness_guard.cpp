@@ -13,16 +13,22 @@
 //          to .readiness (an explicit `nullptr` there would be a context that can never submit; anything but the pinned text is a readiness
 //          nobody reviewed);
 //        * SyntheticReadiness -- the real barrier and startup recovery driven by scripted observations, a stand-in for a stream that does not
-//          exist -- may be used only by the listed drills and harnesses, each of which says so in its banner; a new use is a review item;
+//          exist -- may be used only by the listed drills and harnesses, each of which says so in its banner; a new use is a review item.
+//          (The preflight harness left the list in M5b-1: it builds no context by name any more, it takes the pipeline's make_context(), whose
+//          readiness is the real one.)
 //        * SubmitReadyToken has exactly one mint site (inside SubmitReadiness::authorize) and exactly one friend;
 //        * every production call of drain_user_data_events() is pinned with its argument count, and for a call that passes a barrier, the
 //          exact text of that argument: a call that leaves it out still compiles and quietly merges events of a generation the sweep
 //          already settled, and never learns that a serverShutdown ended its generation. The memory-only calls are on the retired listenKey
-//          stream, which stamps no generation and has no serverShutdown; M5 removes them together with that stream.
+//          stream, which stamps no generation and has no serverShutdown; M5b-2 removes them together with that stream.
 //        * (D5 slice R4) the same pin carries the late-fill alarm: the orchestrator's call passes ctx.late_fill as its eighth argument, the
 //          listenKey calls pass none (their harnesses open a scratch store that no operator has resolved anything in), the alarm's hook in the
-//          drain sits ahead of the barrier's stale-generation filter, and nothing under include/ or src/ builds a LateFillAlarm or assigns
-//          .late_fill yet -- no process runs the live drain loop before M5, so the day one does, the pins below fail and the wiring is reviewed.
+//          drain sits ahead of the barrier's stale-generation filter, and only the private-stream pipeline builds a LateFillAlarm or assigns
+//          .late_fill -- any other construction is a review item.
+//        * (M5b-1) which production files so much as name a context's `confirmation` or `submit_port` is a short reviewed list, and the
+//          preflight harness -- whose whole point is that it can never submit -- names neither: its confirmation is reset, and its port a mock,
+//          inside fill_preflight_order() (preflight_probe.hpp, tested in test_preflight_probe.cpp); the only submit port it ever hands to that
+//          function is the mock, and the real port it assembles for its diagnostic goes nowhere else.
 //
 // The scan strips comments and the contents of string/char literals first, so prose that mentions a call does not count and a string that
 // contains one cannot hide a real use. (The stripping helpers are copies of the ones in test_reconcile_durable_guard.cpp; the guards share no
@@ -280,16 +286,15 @@ struct ContextPin {
 
 constexpr const char* kSyntheticRhs = "&synthetic_readiness.readiness()";
 
-// Every production place that builds an OrchestratorContext, and what it gives it as a readiness. Three have no private stream (the
-// listenKey one is retired and was never wired to the orchestrator's barrier) and say so in their banner or comment; the fourth is the private-stream
-// pipeline (M5a-2b), whose readiness is the one it owns, built over the real supervisor, barrier, recovery and account path.
+// Every production place that builds an OrchestratorContext, and what it gives it as a readiness. Two have no private stream (a drill rig and a
+// mock-submit dry run) and say so in their banner or comment; the third is the private-stream pipeline (M5a-2b), whose readiness is the one it owns,
+// built over the real supervisor, barrier, recovery and account path. The preflight harness (M5b-1) is not here on purpose: it builds no context by name,
+// it takes the pipeline's make_context() (`auto`) and fills the order into it.
 const ContextPin kContexts[] = {
     {"include/hengyuan/verified_dry_run_evidence.hpp", 1, kSyntheticRhs,
      "DrillRig: the verified dry-run drills run with no private stream; the readiness is the synthetic one (real barrier + startup recovery)"},
     {"src/live_submit_evidence_harness.cpp", 1, kSyntheticRhs,
      "the evidence harness is a mock-submit dry run; its banner says the readiness is synthetic"},
-    {"src/live_submit_preflight_harness.cpp", 1, kSyntheticRhs,
-     "the preflight harness still runs on the retired listenKey stream; its banner says the readiness is synthetic and M5b moves it onto the pipeline"},
     {"include/hengyuan/private_stream_pipeline.hpp", 1, "&hot_.readiness",
      "the pipeline's wiring context: the one readiness the pipeline owns (its barrier is fed by the real supervisor, its recovery by the live parts); make_context() "
      "returns a copy of it with `auto`, so the type is named once"},
@@ -299,7 +304,6 @@ const ContextPin kContexts[] = {
 const char* const kSyntheticUsers[] = {
     "include/hengyuan/verified_dry_run_evidence.hpp",
     "src/live_submit_evidence_harness.cpp",
-    "src/live_submit_preflight_harness.cpp",
 };
 
 struct DrainPin {
@@ -324,10 +328,6 @@ const DrainPin kUserDataDrains[] = {
      "orchestrate_submit(): the barrier of the readiness Gate 2b consults (no readiness: no barrier, and Gate 2b refuses anyway), the late-fill "
      "alarm of the context (unset: the drain ignores a report about a written-off order, as before R4), and the durable publisher of the context "
      "(unset: the memory-first drain, acceptable only where no durable sink exists; a process that has one wires it -- M4)"},
-    {"src/live_submit_preflight_harness.cpp", 3, kNoBarrierArgCount, "", "", "",
-     "NO BARRIER, NO ALARM, MEMORY-FIRST: the listenKey stream stamps no generation (0 = always merged) and has no serverShutdown; retired with that "
-     "stream in M5, which also moves this harness onto the durable publisher; the harness opens a scratch store, so no operator has resolved an "
-     "order in it"},
     {"src/live_submit_real_credentials_demo.cpp", 3, kNoBarrierArgCount, "", "", "",
      "NO BARRIER, NO ALARM, MEMORY-FIRST: the listenKey stream stamps no generation and has no serverShutdown; the SubmitPort is assembled but "
      "never invoked; there is no durable store at all"},
@@ -602,7 +602,7 @@ TEST(SubmitReadinessGuard, TheLateFillAlarmSeesAnEventBeforeTheBarrierCanDropIt)
 TEST(SubmitReadinessGuard, OnlyThePipelineBuildsALateFillAlarmAndWiresItIntoAContext) {
     // The alarm is real and tested; the private-stream pipeline (M5a-2b) is the first production code that builds one, and it builds exactly one, over the list the
     // recovered store holds and the ONE KillSwitch the pipeline's contexts carry. A second construction, or a context that gets an alarm from anywhere else,
-    // is a review item and not a side effect. The three other OrchestratorContexts of kContexts stay unwired for the same reason as their drains: scratch stores.
+    // is a review item and not a side effect. The two other OrchestratorContexts of kContexts stay unwired for the same reason as their drains: scratch stores.
     constexpr const char* kPipeline = "include/hengyuan/private_stream_pipeline.hpp";
     std::vector<std::string> problems;
     for (const SourceFile& f : production_sources()) {
@@ -650,4 +650,89 @@ TEST(SubmitReadinessGuard, OnlyThePipelineBuildsALateFillAlarmAndWiresItIntoACon
     EXPECT_EQ(member_assignments(stripped("ctx.late_fill = &alarm;"), "late_fill"), (std::vector<std::string>{"&alarm"}));
     EXPECT_TRUE(member_assignments(stripped("late_fill->on_execution_report(a, b, c, d);"), "late_fill").empty()) << "a call through it";
     EXPECT_TRUE(member_assignments(stripped("if (ctx.late_fill == nullptr) {}"), "late_fill").empty()) << "a comparison";
+}
+
+// --- M5b-1: the confirmation and the submit port of a context -----------------------------------------------------------------------------------
+//
+// An order gets past the OperatorNotConfirmed gate only with a bound confirmation, and then goes to the context's submit port. Which production files so much as
+// name `ctx.confirmation` / `ctx.submit_port` is therefore a short list somebody reviewed: the orchestrator that reads them, the preflight harness's one fill
+// function (which resets the first to "not confirmed" and installs a mock for the second -- test_preflight_probe.cpp), and the two mock-submit dry-run rigs that
+// bind a confirmation to a scratch port on purpose. The preflight harness itself names neither: that its context can never submit is the fill function's property,
+// pinned in its own tests, and the harness's only way to hand it a port is the mock (pinned below).
+
+namespace {
+
+struct OrderGatePin {
+    const char* file;
+    std::size_t confirmation;  // occurrences of `ctx.confirmation` in the code of the file
+    std::size_t submit_port;   // occurrences of `ctx.submit_port`
+    const char* why;
+};
+
+const OrderGatePin kOrderGates[] = {
+    {"include/hengyuan/live_submit_orchestrator.hpp", 2, 3, "orchestrate_submit(): reads the confirmation (Gate 11) and the port (the rules-version fence, Gate 12, the call)"},
+    {"include/hengyuan/preflight_probe.hpp", 1, 1,
+     "fill_preflight_order(): resets the confirmation to the default (not confirmed) and installs the mock port it is handed"},
+    {"include/hengyuan/verified_dry_run_evidence.hpp", 8, 1,
+     "DrillRig: the dry-run drills bind a confirmation to the drill's own scratch port, on a scratch store"},
+    {"src/live_submit_evidence_harness.cpp", 8, 1, "the evidence harness: a mock-submit dry run that binds a confirmation to its mock port on purpose"},
+};
+
+}  // namespace
+
+TEST(SubmitReadinessGuard, OnlyTheListedFilesNameAContextsConfirmationOrSubmitPort) {
+    std::vector<std::string> problems;
+    for (const SourceFile& f : production_sources()) {
+        const std::size_t confirmations = count_substring(f.code, "ctx.confirmation");
+        const std::size_t ports = count_substring(f.code, "ctx.submit_port");
+        if (confirmations == 0 && ports == 0) continue;
+        const OrderGatePin* pin = nullptr;
+        for (const OrderGatePin& p : kOrderGates) {
+            if (f.rel == p.file) pin = &p;
+        }
+        if (pin == nullptr) {
+            problems.push_back(f.rel + ": names ctx.confirmation " + std::to_string(confirmations) + "x and ctx.submit_port " + std::to_string(ports) +
+                               "x but is not pinned in kOrderGates -- a place that binds a confirmation or installs a submit port is a review item, "
+                               "and the preflight harness must never be one");
+            continue;
+        }
+        if (confirmations != pin->confirmation || ports != pin->submit_port) {
+            problems.push_back(f.rel + ": ctx.confirmation " + std::to_string(confirmations) + "x / ctx.submit_port " + std::to_string(ports) +
+                               "x, expected " + std::to_string(pin->confirmation) + "x / " + std::to_string(pin->submit_port) + "x (" + pin->why + ")");
+        }
+    }
+    for (const OrderGatePin& p : kOrderGates) {
+        if (find_source(p.file) == nullptr) problems.push_back(std::string(p.file) + ": pinned in kOrderGates but not found");
+    }
+    for (const std::string& s : problems) ADD_FAILURE() << s;
+    EXPECT_TRUE(problems.empty());
+}
+
+TEST(SubmitReadinessGuard, ThePreflightHarnessCanOnlyHandItsOrderFillTheMockPort) {
+    const SourceFile* f = find_source("src/live_submit_preflight_harness.cpp");
+    ASSERT_NE(f, nullptr);
+    using Rhs = std::vector<std::string>;
+    EXPECT_EQ(member_assignments(f->code, "submit_port"), (Rhs{"{mock_submit_must_never_be_called, nullptr, mock_current_rules_version}"}))
+        << "the only submit port the harness assigns anywhere is the mock (to the environment of the fill, never to a context)";
+    EXPECT_EQ(count_substring(f->code, "fill_preflight_order("), 1u) << "the one place the harness puts an order into a context";
+    EXPECT_EQ(count_substring(f->code, "orchestrate_submit("), 1u) << "...and the one place it asks the chain";
+    EXPECT_EQ(count_substring(f->code, "real_submit_port_unused"), 3u)
+        << "the real port is assembled for a diagnostic: its declaration and the two reads that print it, nothing else";
+    EXPECT_EQ(count_substring(f->code, "confirmed = true"), 0u);
+    EXPECT_EQ(count_substring(f->code, "confirmed=true"), 0u);
+    EXPECT_EQ(count_substring(f->code, "OrderConfirmation"), 0u) << "the harness builds no confirmation at all";
+
+    // ...and it moves the private stream only through the pipeline's two ticks: no hand-made drain, poll or supervisor poll of its own (a second poller over a
+    // second tracker, or a memory-first drain, is the very drift the pipeline exists to prevent).
+    for (const char* forbidden : {"poll_once(", "drain_hot_inputs(", "drain_reconcile_events(", "drain_user_data_events(", "supervisor().poll(", "ws_supervisor"}) {
+        EXPECT_EQ(count_substring(f->code, forbidden), 0u) << "the preflight harness must not call " << forbidden << " itself";
+    }
+    EXPECT_EQ(count_substring(f->code, "reconcile_tick("), 1u) << "the one loop calls the reconcile half once per cycle";
+    EXPECT_EQ(count_substring(f->code, "hot_tick("), 2u) << "...the hot half once per cycle, and once more after the sessions are gone";
+
+    // The negative controls of this check, on text with known answers.
+    const auto stripped = [](const char* t) { return code_only(t); };
+    EXPECT_EQ(member_assignments(stripped("env.submit_port = {mock, nullptr, version};"), "submit_port"), (Rhs{"{mock, nullptr, version}"}));
+    EXPECT_EQ(member_assignments(stripped("ctx.submit_port = real_port;"), "submit_port"), (Rhs{"real_port"})) << "a real port assigned anywhere is visible";
+    EXPECT_EQ(count_substring(stripped("// ctx.confirmation.confirmed = true;\n"), "ctx.confirmation"), 0u) << "prose";
 }

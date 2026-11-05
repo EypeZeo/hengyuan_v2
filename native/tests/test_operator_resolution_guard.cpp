@@ -1073,7 +1073,8 @@ TEST(OperatorResolutionGuard, TheEntryPointIsAThinMainThatNamesNoStoreAndNoKey) 
 //
 //  21. The tool reads a binding and never makes one. The write side (bind_store(), ensure_store_binding()) is included by exactly one production
 //      source: the trading process's wiring, the private-stream pipeline (M5a-2b), whose one call passes the store and the uid the EXCHANGE reported --
-//      and none of the offline tool's sources names anything that writes a binding or a tip anchor.
+//      and none of the offline tool's sources names anything that writes a binding or a tip anchor. The pipeline's method is called by exactly one
+//      process so far, the preflight harness (M5b-1), once, with the uid it read from the exchange itself.
 //  22. The binding is read once, by the tool, with the audit sink's own identity, and judged once, by the flow, right after the account
 //      check and before any wait or evidence read; everything not explicitly allowed is a refusal.
 //  23. A store's history is decided in one place: the writer asks the sink how many frames it holds, and refuses to bind a Production store
@@ -1084,6 +1085,7 @@ namespace {
 constexpr const char* kBinding = "include/hengyuan/store_binding.hpp";
 constexpr const char* kBindingWriter = "include/hengyuan/store_binding_writer.hpp";
 constexpr const char* kPipelineFile = "include/hengyuan/private_stream_pipeline.hpp";
+constexpr const char* kPreflightHarness = "src/live_submit_preflight_harness.cpp";
 
 const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kConfirmation, kPorts,        kBundle,
                                       kFlow,  kTransport, kCli,  kTerminal,     kTool,         kRealExchange, kMain};
@@ -1093,7 +1095,8 @@ const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kCon
 TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
     expect_named_only_in("store_binding_writer", {{kPipelineFile, 1, "the trading process's wiring includes the write side (M5a-2b): the first and only production includer"}});
     expect_named_only_in("bind_store", {{kBindingWriter, 2, "the definition and its one call inside ensure_store_binding()"},
-                                        {kPipelineFile, 1, "the pipeline's own method of that name, which calls ensure_store_binding()"}});
+                                        {kPipelineFile, 1, "the pipeline's own method of that name, which calls ensure_store_binding()"},
+                                        {kPreflightHarness, 1, "the preflight harness's one call (M5b-1): the first process that creates the pipeline"}});
     expect_named_only_in("ensure_store_binding", {{kBindingWriter, 3, "the two overloads, and the sink overload's call of the value overload"},
                                                   {kPipelineFile, 1, "the pipeline's one call, with the uid the exchange reported"}});
     expect_named_only_in("encode_store_binding", {{kBindingWriter, 2, "the definition and its one call inside bind_store()"}});
@@ -1113,6 +1116,19 @@ TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
     EXPECT_EQ(binds[0], (std::vector<std::string>{"parts_.sink", "parts_.log_path", "parts_.key_ring", "environment", "exchange_uid", "now_ms"}))
         << "the uid is the parameter of bind_store(): what the exchange reported for the key in use (rest_account_fetcher.hpp::fetch_exchange_account_uid()), never a "
            "field of a configuration";
+    // the preflight harness (M5b-1) is the first process that creates the pipeline: its one bind_store() passes the uid it read from the exchange itself
+    // (fetch_exchange_account_uid() on the client that holds the key in use), the Testnet environment it is bound to, and the wall clock
+    const SourceFile* harness = find_source(kPreflightHarness);
+    ASSERT_NE(harness, nullptr);
+    const auto harness_binds = call_args(harness->code, "bind_store");
+    ASSERT_EQ(harness_binds.size(), 1u);
+    EXPECT_EQ(harness_binds[0], (std::vector<std::string>{"StoreEnvironment::Testnet", "exchange_uid", "reconcile_wall_now_ms()"}))
+        << "the uid is what the exchange reported for the key in use, never a field of a configuration";
+    const auto harness_uid_reads = call_args(harness->code, "fetch_exchange_account_uid");
+    ASSERT_EQ(harness_uid_reads.size(), 1u);
+    EXPECT_EQ(harness_uid_reads[0], (std::vector<std::string>{"client", "exchange_uid"}));
+    EXPECT_EQ(count_identifier(harness->code, "exchange_uid"), 4u)
+        << "declared, read from the exchange, counted for the log (the value itself is never printed), handed to bind_store(): nothing else may set it";
     // and the read side has no way to write one either
     const SourceFile* reader = find_source(kBinding);
     ASSERT_NE(reader, nullptr);

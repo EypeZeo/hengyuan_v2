@@ -1,0 +1,80 @@
+# 私网流联调手册（M5b-1）
+
+给 Owner 的一页纸：怎么跑预检线束对 Testnet 的联调、日志里看什么、哪里坏了该怎么读。AI 会话**不运行**这一步（`CLAUDE.md`：AI 会话不处理真实凭据）；本手册只写你需要的命令和判据。
+
+## 这次运行证明什么，不证明什么
+
+- **证明**（如果 `joint-run criteria` 全是 yes）：用你的 Testnet HMAC 密钥，WebSocket API 的签名订阅（`userDataStream.subscribe.signature`）被交易所接受，`session.subscriptions` 恰好列出这一个订阅；屏障对账过（一次真实的清扫，带一次真实的 `GET /api/v3/account`）；
+  启动恢复到 `Ready`；存储绑定到交易所报告的账户；订单路径的 Gate 2b 拿到真实令牌，一直走到 `OperatorNotConfirmed`。
+- **不证明**：真实下单（这个进程不可能下单：提交端口是 mock，确认永不绑定，见 `preflight_probe.hpp`）；订单查询与成交回报的真实形状（运行里没有订单，清扫查询的是空集）；生产环境（线束只认 Testnet）。
+- 回环测试证明“我们的客户端按我们理解的协议行事”；这次运行才有交易所一侧的证据。两个至今没有交易所证据的点会直接出现在日志里：
+  **L-39**（从未 `logon` 的连接上调 `session.subscriptions` 是否返回订阅列表）看 `verify_status` 与 `subscriptions_listed`；
+  **签名订阅需要什么权限**看 `subscribe_status` / `subscribe_error`。
+
+## 准备（一次）
+
+1. 一把 **Testnet 的 HMAC 密钥**，先只开读取权限（USER_DATA / Enable Reading）；不要给交易权限——进程不下单，给了也没用，给了就多一分风险。签名订阅到底要不要更多权限正是要验证的未知项之一：如果交易所因权限拒绝订阅，日志里会有 `subscribe_status` / `subscribe_error`（见下表），那就是证据。Ed25519 密钥不行（这条路径是 HMAC 签名）。
+2. 在**仓库根目录**放 `.env`（`./.env` 相对当前目录读取），两个变量名固定：
+
+   ```
+   HENGYUAN_BINANCE_TESTNET_API_KEY=<你的 Testnet API key>
+   HENGYUAN_BINANCE_TESTNET_SECRET=<你的 Testnet secret>
+   ```
+
+   载入器只认这两个名字；文件权限过宽会被拒绝（`PermissionTooWide`，Linux 下 `chmod 600 .env`）。**不要把 `.env` 的内容贴给任何人**，包括 AI 会话。
+3. 构建（`HY_BUILD_DEMO=ON`，见 `CLAUDE.md` 的 MSVC 运行手册）。目标 `live_submit_preflight_harness`，Windows 下在 `native/build-msvc/Release/`。
+
+## 运行
+
+在仓库根目录，一条命令（Windows 用 `cmd` 重定向得到纯文本日志；PowerShell 5.1 的 `>` 会写成 UTF-16）：
+
+```
+cmd /c "native\build-msvc\Release\live_submit_preflight_harness.exe native\tests\fixtures\strategy_spec\sma_crossover_btc_1h.spec.toml 240 1h > joint_run.log 2>&1"
+```
+
+参数是 `<spec.toml> [秒数=60] [周期=1h]`；spec 必须是 BTCUSDT/1h（线束的订阅固定如此）。240 秒够走完：连接、订阅、校验、清扫、恢复、深度同步、K 线暖机、启动探针。
+`Ctrl+C` 可以提前结束，报告照样打印。第一次只要 240 秒；**第二次**可以跑得更久（几分钟到半小时），中途断一次网看重连（每次重连的固定权重成本只有 6）。
+
+## 日志里看什么
+
+按出现顺序：
+
+| 行 | 期望 |
+| :-- | :-- |
+| `Dry-run drill ... PASSED`（四行）与 `Dry-run evidence earned: ... live_ready=true` | 四个演练都通过 |
+| `Exchange account uid read (N digits; ...)` | N 约 19（R6 探针量过：Testnet 的 uid 是 19 位）；**值不打印** |
+| `Store binding: BoundNew` | 新的临时存储第一次绑定 |
+| `[t=... ms] private stream: supervisor=... generation=... verified=... \| barrier=... \| recovery=...` | 每次状态变化一行。顺序应是：`supervisor=Connecting` → `Connected ... verified=yes` → `barrier=Sweeping` → `barrier=Reconciled`，`recovery=Reconciling` → `Ready` |
+| `Private stream generation N (ended): ...` | 只在一代结束时出现。一代都没有结束过是好事 |
+| `[startup probe] ...` 随后 `[preflight probe #1] (startup) OPEN BUY price=... qty=... -> gate=OperatorNotConfirmed` | 订单路径走到确认门 |
+| `=== Private stream joint-run report ===` 以及最后一行 `joint-run criteria: reconciled_once=yes account_refreshed_by_sweep=yes recovery_ready=yes probe_reached_OperatorNotConfirmed=yes all_met=yes` | 全 yes |
+
+报告里还有：`barrier`（各计数）、`sweep`（作业与泵）、`account`（持有者 / 刷新器 / REST 的计数与 `last_error`）、`supervisor`、`factory`、最后一代的 `Private stream generation N (last): ...`（订阅应答与列表的状态码、错误码、`retry_after_ms`）、
+`readiness`（令牌签发数与按原因的拒绝数）、`durable`、`late_fill`、`pipeline`、`probes`。
+
+## 哪里坏了怎么读
+
+| 看到 | 意思 | 怎么办 |
+| :-- | :-- | :-- |
+| 启动就退出：`ERROR: could not read the account uid ... PrivateRestError=HttpStatus` | 交易所拒绝了 `GET /api/v3/account`：密钥不对、不是 Testnet 的、没有读取权限，或 IP 受限 | 检查密钥；报告 `last_error` |
+| `... PrivateRestError=ClockNotFresh` / `ClockSkewTooLarge` | 时钟同步失败或本机时钟偏得太远 | 校时后重跑 |
+| `stage=subscribe_rejected`，`subscribe_status=4xx`，`subscribe_error=-2015` 一类 | 交易所拒绝了签名订阅：密钥类型 / 权限 / IP / 签名 | **把整行贴回来**，这是权限问题的证据 |
+| `subscribe_status=200` 但 `stage=subscriptions_rejected`，或 `subscriptions_mismatch`（`subscriptions_listed` 不是 1） | **L-39**：未登录的连接上 `session.subscriptions` 与我们的假设不符 | **贴回来**；进程失败关闭（永远不就绪），设计要改 |
+| `stage=stale_subscribe_request` 偶尔出现 | 握手比 4 秒慢，签名过期，下一代重新签 | 偶尔正常；反复出现是网络慢 |
+| `stage=resolve` / `connect` / `ssl_handshake` / `ws_handshake` | 网络、证书或主机 | 检查到 `ws-api.testnet.binance.vision:443` 的连通 |
+| `retry_after_ms` 非 0，或 `factory ... refused_ban` 增长 | 交易所（HTTP 418 / 429）让这个 IP 等；工厂在那个时刻之前不再连 | 别再重跑，等过那个时刻；贴回来 |
+| `ALERT: the private stream gave up (TooManyFailures)` | 连续十次失败 | 看它前面的 `Private stream generation N (ended)` 各行 |
+| `account ... not_sent` 很多，`last_error=SigningFailed` | 取账户的线程没有凭据（线程所有权被破坏） | 贴回来：这不该发生 |
+| `barrier=Sweeping` 一直不变，`sweep ... reports_account_stale` 增长 | 清扫的账户步骤没有送到 | 看 `account` 行里 `rest ... failed` / `not_sent` |
+| `readiness: ... refused_StartupNotReady=...` 一直增长 | 启动恢复没有 Ready，或流不在线 | 看 `recovery:` 行的 `state` 与 `degraded_reason`，`store binding` 行，`supervisor:` 行 |
+| `FATAL: the store binding was refused (...)` | 新建的临时存储不该被拒绝 | 贴回来 |
+
+## 贴回什么
+
+`joint_run.log` 里从 `=== Live Submit Preflight Harness (testnet) ===` 到最后的全部内容。日志里没有密钥、没有 secret；账户 uid 只有位数。`.env` 不要贴。
+
+## 安全边界（再说一遍）
+
+- 提交端口永远是 mock；`ctx.confirmation` 永不绑定；`test_submit_readiness_guard.cpp` 把这两条钉成源码级守卫。
+- 进程对交易所做的写操作只有 WebSocket 的订阅（`userDataStream.subscribe.signature` 与无签名的 `session.subscriptions`）；REST 全是 GET（时钟、exchangeInfo、账户；清扫的订单查询在空存储上没有对象）。
+- 每个探针在确认门之前往**临时**存储写一帧 Intent；存储在退出时删除。

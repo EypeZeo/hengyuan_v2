@@ -28,6 +28,7 @@ python tools/closure_ledger_check.py --self-test
 - 2026-10-25（D5）：被困订单的出口（L-46）有了设计与模型（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`），与 FI-002、FI-003、FI-009、FI-011、FI-043 的状态与证据无关，一律不变；实现 R1（恢复读者）已于 2026-10-25 合入（PR #203，`a4372ba`），R2（证据原语）已于 2026-10-26 合入（PR #205，`99d8cb4`），R3-0（工具的持久层数据源）已于 2026-10-27 合入（PR #207，`f7b964c`），R3a（工具的流程：端口、确认短语与读行器、证据文件、`resolve_order()`，对着回环假交易所）已于 2026-10-29 合入（PR #210，`7b66a62`），R3b-1（离线工具的真实交易所读：客户端的原样回传 GET、`BinanceExchangeReadPort` 与配速 / 限流闩、账户 UID 与密钥所属账户的核对）已于 2026-10-30 合入（PR #212，`f06a3a2`），R3b-2（离线工具的命令行 `hy_operator_resolve`：严格的参数文法、`--list`、KEK 文件与密钥文件、只读专用凭据、终端适配器与证据目录、退出码）已于 2026-10-31 合入（PR #214，`bdaece6`），R3b-3（L-50 的附加防线：一个品种名只对不早于日志首次给出它的时刻发送的订单有效）已于 2026-10-31 合入（PR #216，`8b8ad5f`），R4（迟到成交告警：对已被操作员结清的订单，交易所一开口（该 COID 的任何执行报告）就熔断并写审计）已于 2026-10-31 合入（PR #218，`df9b363`），R5（存储的环境与账户绑定：日志记下它属于哪个交易所环境、哪个账户，离线工具据此核对）已于 2026-11-01 合入（PR #220，`3363115`），R6 的第一步（只读 Testnet 探针 `tools/r6_testnet_probe.py`：账户 `uid` 是否存在、不存在订单的真实应答、三个读端点是否可读；Owner 在 Testnet 上运行并贴回结果）已于 2026-11-01 合入（PR #221，`0ef2b4e`），都不改变上述任何一项的状态与证据，R6 的其余部分（运行手册、崩溃窗口演练、读延迟 L 的测量）未开始。
 - 2026-11-02（私网流迁移 M4）：用户数据流排空（审计 P1-002 的路径 ③）先落持久帧、再折进 `PositionTruth`（PR #224，`9675b6c`）。P1-002 的 `code` 段由 MISSING 改为 PRESENT（判断：持久出口已在代码里，未接发布者时的内存优先由守卫钉住并随 M5 删除；若认为这仍算缺口，改回 MISSING 即可），状态仍为 PARTIAL——`runtime` 与 `budget` 两段仍缺（没有进程运行这条排空，同步 fsync 的时延没有测量）；FI-031 的备注随之更新，状态与结果不变。其余条目的状态与证据不变。
 - 2026-11-05（私网流迁移 M5a）：账户刷新通道、真实取账户端口与私网流流水线接线完成（PR #228，`2777c27`；PR #229，`bdbd96b`）。没有任何进程创建流水线，所以 P1-002 与各 FI 条目的状态、结果与证据均不变——P1-002 的 `runtime` 与 `budget` 两段仍缺；新的缺口 L-53（独立对账线程的凭据与限流）登记在蓝图附录 D。
+- 2026-11-05（私网流迁移 M5b-1）：预检线束迁到私网流流水线（PR 待合并），是**第一个创建流水线的进程**：启动恢复状态机、重连屏障与清扫、账户通道、存储绑定和持久排空在这个冷启动线束里被真正运行。它的存储是每次运行新建的临时存储（固定测试密钥，永远没有上一次运行的订单），线束自述“不是恢复路径”，也还没有对交易所运行过（Owner 的 Testnet 联调手册：`docs/PRIVATE_STREAM_JOINT_RUN.md`）。因此 P1-002 与 FI-001/002/003/004/009/011/020/022/031/043 里 “没有任何 `native/src/*.cpp` 提到 StartupRecovery / SweepJob” 的 `absent:` 断言被推翻（这正是它们存在的目的）：还有别的“尚未”断言的条目直接删去这一条（P1-002、FI-001/002/003/009/011/020/043），只剩它一条的（FI-004、FI-022、FI-031）改成 `open:` 钉住线束的存储是临时存储——它变成持久存储的那天断言失败，迫使这些条目前移；备注里 “未接入任何程序” 的句子改写成 “只有预检线束运行，临时存储，未对交易所运行”。**所有条目的状态、结果与门禁结论不变**：没有运行日志，没有强杀重启，没有对真实端点的验证，`runtime` 段仍缺。
 
 本次只同步合同说明；本表与蓝图状态一致性仍由下列核对工具验证，不能用文档合并关闭未执行的故障用例。
 
@@ -240,7 +241,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 9. **批 2：45 条故障用例没有一条能通过门禁。** 复验后 `PARTIAL` 20、`NOT_TESTABLE_YET` 25、`IMPLEMENTED` 0；三个门禁标签（`PRE_D3` 28 条、`PRE_OWNER_LIVE` 13 条、`CANARY` 4 条）全部 `BLOCKED`。
 10. **批 2 改判六条（`NOT_TESTABLE_YET` → `PARTIAL`）**，每条都有直接断言其不变量一部分的单测：FI-005（`/dev/full` 真实写入失败被分类为 DiskFull 且接收器栅栏）、FI-008（重复成交事件不重复累计）、FI-010（序号缺口检出并重同步）、FI-016（非 TRADING 标的拒绝新订单；撤单一半不存在）、FI-034（撤单中直接转成交、非法回退被拒）、FI-038（容量耗尽后失败关闭、持续接受的订单不耗尽注册表）。其余 39 条状态不变，但“尚未”的断言都改成了可失败的引用。
 11. **FI-041 不关闭。** 出路已落地并实测（纯文档 PR 都得到四个 gate；探针 #140 证明红色 PR 被平台拒绝合并），缺的是闸门判定表的入库回归测试：PR #137 时的 304 种输入自测只在一次性本地脚本里，仓库里没有对应文件。
-12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机没有被任何程序引用（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 在复验基线 `6cb56bd` 时零生产调用点（FI-015、FI-040），已于 2026-10-11 随 PR #165 接到 `sync_clock` 的发布路径；全树没有接入任何程序的“对账屏障”（FI-002、FI-003、FI-009、FI-043 共同的缺口；私网流迁移 M3a/M3b 之后，重连屏障与扫描传输已以库的形式存在，只被单元与并发测试驱动，没有程序运行它们，缺口仍在）。
+12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机只被预检线束运行（M5b-1 起；临时存储、不含上一次运行的订单，线束自述“不是恢复路径”），没有在持久存储上运行的进程（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 在复验基线 `6cb56bd` 时零生产调用点（FI-015、FI-040），已于 2026-10-11 随 PR #165 接到 `sync_clock` 的发布路径；“对账屏障”只被预检线束运行（FI-002、FI-003、FI-009、FI-043 共同的缺口；私网流迁移 M3a/M3b 之后，重连屏障与扫描传输以库的形式存在，M5b-1 起预检线束经流水线运行它们，对本地回环服务端证明过，没有对交易所运行过，也没有强杀重启，缺口仍在）。
 13. **批 3（蓝图 v2.8.0，主干 `58b60d0`）：新增 12 条故障用例同样没有一条能通过门禁。** FI-056、FI-057 判 `PARTIAL`（理由见各自的 note），其余 10 条判 `NOT_TESTABLE_YET`；注册表合计 57 条：`PARTIAL` 24、`NOT_TESTABLE_YET` 29、`IMPLEMENTED` 4，门禁 PASS 仍为 4 条（FI-032、FI-033、FI-037、FI-040）。各条的门禁登记与验证级别依据蓝图 `7.1` 在 v2.8.0 写明的释义（待 R-17 确认）；FI-048、FI-050 偏离输入报告的首个门禁标签，理由见蓝图 `附录 B` 的 B.1。
 
 ## 4 明细
@@ -299,13 +300,13 @@ status: PARTIAL
 task: SAFE-03
 gate: 订单生命周期
 gate_result: BLOCKED
-open: open:native/include/hengyuan/binance_user_data_event.hpp#"UserDataDurablePublisher* durable = nullptr" absent:native/src/*.cpp#StartupRecovery
+open: open:native/include/hengyuan/binance_user_data_event.hpp#"UserDataDurablePublisher* durable = nullptr"
 refs: pr:169@38d59cf pr:224@9675b6c code:native/include/hengyuan/binance_user_data_event.hpp#UserDataDurablePublisher code:native/include/hengyuan/order_durable_path.hpp#plan_observation code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher code:native/include/hengyuan/order_tracker.hpp#drain_reconcile_events code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_reconcile_durable_guard.cpp#EveryProductionDrainCallIsPinnedWithItsDurableArgument
-seg.code: PRESENT code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events code:native/include/hengyuan/binance_user_data_event.hpp#UserDataDurablePublisher code:native/include/hengyuan/order_durable_path.hpp#plan_observation code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher -- 对账排空与用户数据流排空都先持久确认再折进内存：ReconcileDurablePublisher（PR #169）与 UserDataDurablePublisher（经 drain_user_data_events 的 durable 参数，M4，PR #224；规划器 order_durable_path.hpp 与持久影子 DurableShadow）。限度：drain_user_data_events 未接发布者时仍是内存优先（默认参数；编排器的 user_data_durable 字段默认为空），listenKey 线束与演练的调用点就是如此，由守卫钉住并随 M5 删除；接了 WS 环的生产上下文必须同时接发布者（守卫钉住，今天空转）
+seg.code: PRESENT code:native/include/hengyuan/binance_user_data_event.hpp#drain_user_data_events code:native/include/hengyuan/binance_user_data_event.hpp#UserDataDurablePublisher code:native/include/hengyuan/order_durable_path.hpp#plan_observation code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher -- 对账排空与用户数据流排空都先持久确认再折进内存：ReconcileDurablePublisher（PR #169）与 UserDataDurablePublisher（经 drain_user_data_events 的 durable 参数，M4，PR #224；规划器 order_durable_path.hpp 与持久影子 DurableShadow）。限度：drain_user_data_events 未接发布者时仍是内存优先（默认参数；编排器的 user_data_durable 字段默认为空），listenKey 演练的调用点就是如此，由守卫钉住并随 M5b-2 删除；接了 WS 环的上下文必须同时接发布者（守卫钉住；M5b-1 起只有预检线束经流水线接了它，存储是每次运行新建的临时存储，没有对交易所运行过）
 seg.contract: PRESENT doc:docs/SPEC_INVARIANTS.md#drain_reconcile_events bp:"任务 SAFE-03" -- 规格与任务已定义“先持久确认、再释放”
 seg.fault: PRESENT:UT test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderEscalatedToTheOperatorLeavesALogThatReplaysAndKeepsItOpen -- 对账路径的两个崩溃位置在真实日志上注入（FI-031 的单元测试级证据）；用户数据流路径（M4）：持久追加失败时不折进内存、不弹出队头、同一观察重试，每个 Write 计划都能在真实 DurableAuditSink 日志上重启回放，但没有在“交易所已推、持久未确认”的位置杀进程的注入
 seg.test: PRESENT test:native/tests/test_order_tracker.cpp#AResolutionThatStaysUnacknowledgedKeepsBeingRetriedAndNeverPublishesAlone test:native/tests/test_live_submit_orchestrator.cpp#ADurableFailureHoldsTheResolutionAndTheSlotUntilTheSinkAcknowledges test:native/tests/test_reconcile_concurrency.cpp#HotThreadAndReconcileThreadRaceCleanly -- 对账路径：次序在追加调用内部观察、失败不发布且恰好一次地重试、队头阻塞、回放合法性前缀及其边界、编排器失败关闭、两个真实线程之后重放日志；24 个变异体全部被预期用例杀死。用户数据流路径（M4）：次序（ACK 先于每一个内存效果）、合并与丢弃较旧、失败与重试、每一种拒绝并通知屏障、影子不超前（守卫逐点钉住）、对真实 DurableAuditSink 的差分与随机游走；113 个变异体 = 108 杀死 + 5 等价
-seg.runtime: MISSING -- 对账路径的崩溃恢复只有单元测试级证据（真实 DurableAuditSink 日志上的重启，CI 上随全量测试通过），没有端到端的重启运行日志（启动恢复状态机尚未接入任何运行中的程序）；用户数据流路径同样只有单元测试级证据，且没有任何进程运行这条排空（M5 接线）
+seg.runtime: MISSING -- 对账路径的崩溃恢复只有单元测试级证据（真实 DurableAuditSink 日志上的重启，CI 上随全量测试通过），没有端到端的重启运行日志（启动恢复状态机自 M5b-1 起只由预检线束运行，存储是临时存储，不含上一次运行的订单）；用户数据流路径同样只有单元测试级证据，M5b-1 起只有预检线束经流水线运行这条排空，还没有对交易所运行过，联调日志尚未取得
 seg.budget: MISSING -- 同步 fsync 进入对账路径后的时延与成本仍未测量（每个事件一帧，需要前缀时两帧）；用户数据流路径同样未测量（M4 的合并发布者让 fsync 次数与订单数而不是成交数成正比，仍在热线程上）
 closure: SAFE-03 完成；FI-031 的崩溃重启恢复日志取得
 ```
@@ -780,9 +781,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6a3cd87
-open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery
+open: absent:native/tests/*.cpp#SIGKILL
 refs: test:native/tests/test_live_submit_orchestrator.cpp#AuditWriteNotAckedAtIntentGate test:native/tests/test_live_submit_orchestrator.cpp#HappyPathDurableAuditSequence test:native/tests/test_live_submit_orchestrator.cpp#DurableAuditPortNotWiredFailsClosedAtIntentGate test:native/tests/test_durable_audit_sink.cpp#TornTailAfterAnIntentOnlyOrderLeavesAnOrphanNotACheckpoint test:native/tests/test_startup_recovery.cpp#AnIntentOnlyOrderIsNeitherRegisteredNorReconciledAndStartupReachesReady test:native/tests/test_live_submit_orchestrator.cpp#NothingIsSentWhenThePreparedAckFails pr:172@6a3cd87
-note: 发送前的意图落盘、写不进就不发单已有单测；PR #172 起，意图已落盘而 Prepared 帧未落盘的订单（含 Prepared 帧写到一半被撕裂）重启回放为 Clean、不产生检查点、不进在途表、不被询问交易所、启动恢复不等它（真实日志的单元测试），且 Prepared 的 ACK 失败时提交端口一次也不被调用（规则的前提）；没有任何测试强杀进程，启动恢复也未接入任何程序，所以“重启回放保持干净”仍只有单元测试级证据。
+note: 发送前的意图落盘、写不进就不发单已有单测；PR #172 起，意图已落盘而 Prepared 帧未落盘的订单（含 Prepared 帧写到一半被撕裂）重启回放为 Clean、不产生检查点、不进在途表、不被询问交易所、启动恢复不等它（真实日志的单元测试），且 Prepared 的 ACK 失败时提交端口一次也不被调用（规则的前提）；没有任何测试强杀进程，启动恢复自 M5b-1 起只由预检线束运行（临时存储，没有上一次运行的订单），所以“重启回放保持干净”仍只有单元测试级证据。
 ```
 
 ```ledger
@@ -796,8 +797,8 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/src/*.cpp#SweepJob
-note: 无崩溃注入，启动恢复未接线；“对账屏障”只以库的形式存在（私网流迁移 M3a 的重连屏障与 M3b 的扫描传输，只被单元与并发测试驱动），没有任何程序运行 SweepJob，重启后的对账屏障仍无从执行；发送后的歧义态分类（Ambiguous）只在进程内存在。
+open: absent:native/tests/*.cpp#SIGKILL
+note: 无崩溃注入；“对账屏障”以库的形式存在（私网流迁移 M3a 的重连屏障与 M3b 的扫描传输），M5b-1 起预检线束经流水线运行启动恢复与扫描传输（临时存储，没有订单，没有对交易所运行过），其余只被单元与并发测试驱动；重启后的对账屏障仍无从执行（没有持久存储上的重启）；发送后的歧义态分类（Ambiguous）只在进程内存在。
 ```
 
 ```ledger
@@ -811,8 +812,8 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/tests/*.cpp#SIGKILL absent:native/src/*.cpp#StartupRecovery absent:native/src/*.cpp#SweepJob
-note: 同 FI-002：无崩溃注入，重启后的对账屏障没有接线（扫描传输只在库里、没有程序运行它），客户端订单号补全本地状态的路径无从执行。
+open: absent:native/tests/*.cpp#SIGKILL
+note: 同 FI-002：无崩溃注入，重启后的对账屏障无从执行（扫描传输自 M5b-1 起只由预检线束运行，临时存储、没有订单），客户端订单号补全本地状态的路径无从执行。
 ```
 
 ```ledger
@@ -826,9 +827,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 0758969
-open: absent:native/src/*.cpp#StartupRecovery
+open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
 refs: test:native/tests/test_durable_audit_sink.cpp#TornTailWriteDiscardsOnlyTheIncompleteRecord test:native/tests/test_durable_audit_sink.cpp#TornTailUnderSixBytesIsRecoveredNotCorrupt test:native/tests/test_durable_audit_sink.cpp#AnchorAheadOfTruncatedLogIsCorruptTailDeletion test:native/tests/test_startup_recovery.cpp#EachUnhealthyDurableLogConditionDegradesWithItsOwnReason test:native/tests/test_durable_audit_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_audit_sink.cpp#ACompleteButWrongFrameIsCorruptAndNothingBehindItIsCut test:native/tests/test_durable_audit_sink.cpp#AnAnchorAheadOfTheLogTogetherWithATornTailIsCorruptAndNothingIsCut test:native/tests/test_control_plane_log_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_log_store.cpp#DiscardTornTailRefusesATailOfAWholeFrameOrMoreAndLeavesTheBytes pr:177@0758969
-note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；PR #177 起撕裂尾部在锚点校验通过之后被物理截断（真实日志上验证第二帧的每个撕裂前缀长度：截断后下一次追加落在帧边界，再重启仍可回放），完整但错误的帧与锚点超前于日志的尾部删除一字节不动、整本日志 Corrupt，截断被操作系统拒绝则围栏；缺口是“拒绝启动并禁止增仓”要由启动恢复接入进程才成立，且没有恢复报告产物（运行期也没有人读取 recovered_torn_tail_bytes）。
+note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；PR #177 起撕裂尾部在锚点校验通过之后被物理截断（真实日志上验证第二帧的每个撕裂前缀长度：截断后下一次追加落在帧边界，再重启仍可回放），完整但错误的帧与锚点超前于日志的尾部删除一字节不动、整本日志 Corrupt，截断被操作系统拒绝则围栏；缺口是“拒绝启动并禁止增仓”要由在持久存储上运行启动恢复的进程才成立（M5b-1 起预检线束经流水线运行启动恢复，但存储是每次新建的临时存储，不会有撕裂尾部），且没有恢复报告产物（运行期也没有人读取 recovered_torn_tail_bytes）。
 ```
 
 ```ledger
@@ -906,9 +907,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: ca6ac64
-open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation
+open: absent:native/src/*.cpp#make_feed_observation
 refs: test:native/tests/test_durable_control_plane_abi.cpp#StaleGenerationDoesNotReleaseReusedSlot test:native/tests/test_binance_ws_api_user_data_session.cpp#SubscribesOnceAndDeliversEventsStampedWithTheGenerationAndTheSubscription test:native/tests/test_reconnect_barrier.cpp#AnEventOfAnOlderGenerationIsDroppedAndCountedOnceReconciled test:native/tests/test_binance_user_data_event.cpp#AnOlderGenerationsFillIsDroppedOnceTheNewGenerationIsReconciled test:native/tests/test_binance_user_data_event.cpp#ARotationEndToEnd
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：现有“代次”测试里的 `StaleGenerationDoesNotReleaseReusedSlot` 说的是在途槽位的代次，不是连接代次。私网流迁移 M2 起，新的 WS API 会话给每个事件盖上自己的连接代次（`UserDataWsEvent::generation`）；M3a 起，`ReconnectBarrier::admit_event()` 经 `drain_user_data_events()` 在某一代次对账完成（Reconciled）后丢弃更旧代次的事件并计数、完成之前照常合并（状态机表、排空接线与轮换全程测试覆盖）。M3b 起：对账清扫在热线程与对账线程之间的传输已在树里（请求环、夹在对账事件环里的完成标记、热线程的 `SweepPump`；单元、编排器与两线程并发测试覆盖，顺序由 formal/reconnect_sweep.tla 的必须失败的负控钉住），但没有程序运行它。仍缺：任何运行中的进程运行清扫并把真实会话读进屏障（M5），也没有“代次日志”产物，没有对真实端点验证过。
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：现有“代次”测试里的 `StaleGenerationDoesNotReleaseReusedSlot` 说的是在途槽位的代次，不是连接代次。私网流迁移 M2 起，新的 WS API 会话给每个事件盖上自己的连接代次（`UserDataWsEvent::generation`）；M3a 起，`ReconnectBarrier::admit_event()` 经 `drain_user_data_events()` 在某一代次对账完成（Reconciled）后丢弃更旧代次的事件并计数、完成之前照常合并（状态机表、排空接线与轮换全程测试覆盖）。M3b 起：对账清扫在热线程与对账线程之间的传输已在树里（请求环、夹在对账事件环里的完成标记、热线程的 `SweepPump`；单元、编排器与两线程并发测试覆盖，顺序由 formal/reconnect_sweep.tla 的必须失败的负控钉住），M5b-1 起预检线束经流水线运行它，把真实会话读进屏障（对本地回环服务端证明过），状态变化逐行打印。仍缺：对真实端点验证过（Owner 的 Testnet 联调），以及联调日志这一“代次日志”产物。
 ```
 
 ```ledger
@@ -938,9 +939,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: ca6ac64
-open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation
+open: absent:native/src/*.cpp#make_feed_observation
 refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownLeadsToAFreshSignedGeneration test:native/tests/test_binance_ws_api_user_data_session.cpp#AServerShutdownAfterTheSubscriptionIsDeliveredAndEndsTheGeneration test:native/tests/test_binance_ws_api_user_data_session.cpp#ADrainedServerShutdownEndsTheGenerationAtOnceAndTheNextOneNeedsItsOwnSweep test:native/tests/test_reconnect_barrier.cpp#ServerShutdownEndsTheGenerationBeforeTheSupervisorNoticesAnything test:native/tests/test_binance_user_data_event.cpp#ServerShutdownEndsItsGenerationAtOnce
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：旧的 listenKey 会话和公共行情会话都不处理服务端关闭事件。私网流迁移 M2 起，新的 WS API 会话把 serverShutdown 先交付进事件环再结束本代，监督器随后用新的签名请求开新一代（回环测试覆盖）；M3a 起，`drain_user_data_events()` 读到 serverShutdown / eventStreamTerminated 就让 `ReconnectBarrier::on_generation_ended()` 立刻把本代记为结束（监督器还没发现会话停止时屏障已是 Down，且该代次此后不会因会话仍显示已连接而回来），新代次必须自己的清扫完成才放行（状态机表、排空接线与真实回环会话测试覆盖）。M3b 起：清扫的跨线程传输已在树里（见 FI-009），新代次的清扫回报现在能真的从对账线程回到屏障，只被单元、编排器与并发测试驱动。仍缺：进程接线（M5），也没有“重连日志”产物，没有对真实端点验证过。
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：旧的 listenKey 会话和公共行情会话都不处理服务端关闭事件。私网流迁移 M2 起，新的 WS API 会话把 serverShutdown 先交付进事件环再结束本代，监督器随后用新的签名请求开新一代（回环测试覆盖）；M3a 起，`drain_user_data_events()` 读到 serverShutdown / eventStreamTerminated 就让 `ReconnectBarrier::on_generation_ended()` 立刻把本代记为结束（监督器还没发现会话停止时屏障已是 Down，且该代次此后不会因会话仍显示已连接而回来），新代次必须自己的清扫完成才放行（状态机表、排空接线与真实回环会话测试覆盖）。M3b 起：清扫的跨线程传输已在树里（见 FI-009），新代次的清扫回报现在能真的从对账线程回到屏障，只被单元、编排器与并发测试驱动；M5b-1 起预检线束经流水线运行它。仍缺：对真实端点验证过（Owner 的 Testnet 联调），也没有“重连日志”产物（线束逐行打印状态变化，联调后才有）。
 ```
 
 ```ledger
@@ -1079,9 +1080,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 62c4647
-open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation
+open: absent:native/src/*.cpp#make_feed_observation
 refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#PingFramesAreCountedAndKeepTheActivityClockMoving test:native/tests/test_binance_ws_api_user_data_session.cpp#ASilentRealConnectionIsDeclaredDeadStoppedAndReplaced test:native/tests/test_binance_ws_api_user_data_session.cpp#PingsKeepAQuietRealConnectionAlive test:native/tests/test_reconnect_barrier.cpp#ASilentConnectionIsDeadWhateverTcpSaysAndTheLoopIsToldToStopIt test:native/tests/test_submit_readiness.cpp#ASilentConnectionIsRefusedStoppedAndReplacedByAnUnsweptGeneration
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：会话有空闲超时旋钮、监督器有重连退避。私网流迁移 M2 起，新的 WS API 会话暴露 `last_activity_steady_ms()`（数据帧与服务端 ping 控制帧都会刷新）和 ping 计数；M3a 起，`ReconnectBarrier` 以 `stale_after_ms`（默认 60 秒，即三个 ping 间隔）为判据：这么久没有任何帧就判定连接已死、回到 Down，并通过 `take_stop_request()` 让循环停掉这条会话、由监督器开新一代（新一代从“未清扫”开始）；有服务端 ping 的安静账户不会被误判（状态机表、监督器端到端与真实回环会话测试覆盖，含边界与分钟级判据的缩放）。仍缺：主循环里真正执行这一步的进程（M5）与“数据状态日志”产物，没有对真实端点验证过。
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：会话有空闲超时旋钮、监督器有重连退避。私网流迁移 M2 起，新的 WS API 会话暴露 `last_activity_steady_ms()`（数据帧与服务端 ping 控制帧都会刷新）和 ping 计数；M3a 起，`ReconnectBarrier` 以 `stale_after_ms`（默认 60 秒，即三个 ping 间隔）为判据：这么久没有任何帧就判定连接已死、回到 Down，并通过 `take_stop_request()` 让循环停掉这条会话、由监督器开新一代（新一代从“未清扫”开始）；有服务端 ping 的安静账户不会被误判（状态机表、监督器端到端与真实回环会话测试覆盖，含边界与分钟级判据的缩放）。M5b-1 起预检线束的主循环经流水线执行这一步（对本地回环服务端证明过）。仍缺：对真实端点验证过（Owner 的 Testnet 联调）与“数据状态日志”产物。
 ```
 
 ```ledger
@@ -1110,9 +1111,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/src/*.cpp#StartupRecovery
+open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
 refs: test:native/tests/test_startup_recovery.cpp#BootstrapsUntilClockAndExchangeInfoAreReady test:native/tests/test_durable_audit_sink.cpp#RepopulateInFlightRegistryHelperRegistersEveryCheckpoint test:native/tests/test_durable_audit_sink.cpp#SeedPositionTruthFoldsEachRecoveredCheckpointsFilledAmount
-note: 恢复状态机与日志回放辅助函数有单测；启动恢复没有被任何程序引用，预检 harness 自述“不是恢复路径”。
+note: 恢复状态机与日志回放辅助函数有单测；启动恢复自 M5b-1 起由预检线束经流水线运行，但该线束自述“不是恢复路径”：存储是每次运行新建的临时存储、固定测试密钥，永远没有上一次运行的订单。
 ```
 
 ```ledger
@@ -1248,9 +1249,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 38d59cf
-open: absent:native/src/*.cpp#StartupRecovery
+open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
 refs: test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderResolvedToCancelledLeavesALogThatReplaysClean test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_order_tracker.cpp#AnUnacknowledgedAppendPublishesNothingAndTheNextDrainRetriesTheSameResolution code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher pr:169@38d59cf
-note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。用户数据流排空函数的同形缺口由 M4 补上（PR #224，9675b6c：先持久确认再折进持仓真值，规划器保证写出的日志可回放，单元测试级）。仍缺：启动恢复状态机尚未接入任何运行中的程序，所以没有端到端的重启运行日志，判定信号是单元测试。
+note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。用户数据流排空函数的同形缺口由 M4 补上（PR #224，9675b6c：先持久确认再折进持仓真值，规划器保证写出的日志可回放，单元测试级）。仍缺：启动恢复状态机自 M5b-1 起只由预检线束运行，存储是临时存储、没有上一次运行的订单，所以没有端到端的重启运行日志，判定信号是单元测试。
 ```
 
 ```ledger
@@ -1434,9 +1435,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: ca6ac64
-open: absent:native/src/*.cpp#SweepJob absent:native/src/*.cpp#make_feed_observation open:native/include/hengyuan/binance_private_rest.hpp#create_listen_key
+open: absent:native/src/*.cpp#make_feed_observation open:native/include/hengyuan/binance_private_rest.hpp#create_listen_key
 refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#EveryGenerationSignsAgainAndNeverReplaysAnOldRequest test:native/tests/test_reconnect_barrier.cpp#ARotationRunsDownThenSweepingThenReconciledInThatOrder test:native/tests/test_submit_readiness.cpp#ARotationBlocksFromTheMomentTheOldConnectionIsGoneUntilTheNewOneIsSwept test:native/tests/test_live_submit_orchestrator.cpp#AGenerationChangeRefusesEveryOrderUntilItsSweepIsAnswered test:native/tests/test_binance_ws_api_user_data_session.cpp#ADroppedConnectionIsDownAtOnceAndTheNextGenerationNeedsItsOwnSweep test:native/tests/test_sweep_orchestrator.cpp#ARefusedCallPostsTheSweepRequestAndTheNextCallAfterTheAnswerSendsTheOrder test:native/tests/test_sweep_concurrency.cpp#TheBarrierIsReconciledOnlyOnceEveryOrderThatPrecededTheRequestIsResolvedAndPublished
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：私网流迁移 M2 起，树内有订阅式会话（`BinanceWsApiUserDataSession`，签名订阅，每个代次重新签名、不重放旧请求；回环测试覆盖）；M3a 起，`ReconnectBarrier`（Down / Sweeping / Reconciled(G)）与 `SubmitReadiness`/`SubmitReadyToken` 存在，`orchestrate_submit()` 的 Gate 2b 在没有令牌时拒单（`OrchestratorGate::NotReady`，未接线同样拒单）：代次变化时从旧连接消失起就拒单，直到新代次自己的清扫回报（状态机表、监督器端到端、编排器与真实回环会话测试覆盖）。M3b 起，清扫的跨线程传输也在树里（请求环 + 夹在对账事件环里的完成标记 + 热线程的 `SweepPump`：编排器测试里一次被拒的调用发出请求，对账线程回答，下一次调用才放行；两线程测试里屏障只在请求之前发出的每个订单都已裁决并发布之后才变成 Reconciled）。但它们没有接入任何运行中的进程（M5），没有任何程序刷新清扫等待的账户快照（M5），旧的 listenKey 路径仍在树里（M5 删除），也没有“重连屏障轨迹”产物。
+note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：私网流迁移 M2 起，树内有订阅式会话（`BinanceWsApiUserDataSession`，签名订阅，每个代次重新签名、不重放旧请求；回环测试覆盖）；M3a 起，`ReconnectBarrier`（Down / Sweeping / Reconciled(G)）与 `SubmitReadiness`/`SubmitReadyToken` 存在，`orchestrate_submit()` 的 Gate 2b 在没有令牌时拒单（`OrchestratorGate::NotReady`，未接线同样拒单）：代次变化时从旧连接消失起就拒单，直到新代次自己的清扫回报（状态机表、监督器端到端、编排器与真实回环会话测试覆盖）。M3b 起，清扫的跨线程传输也在树里（请求环 + 夹在对账事件环里的完成标记 + 热线程的 `SweepPump`：编排器测试里一次被拒的调用发出请求，对账线程回答，下一次调用才放行；两线程测试里屏障只在请求之前发出的每个订单都已裁决并发布之后才变成 Reconciled）。M5b-1 起预检线束经流水线运行它们，并在清扫里刷新账户快照（对本地回环服务端证明过，没有对交易所运行过）。仍缺：对真实端点验证过（Owner 的 Testnet 联调），旧的 listenKey 路径仍在树里（M5b-2 删除），也没有“重连屏障轨迹”产物。
 ```
 
 ```ledger

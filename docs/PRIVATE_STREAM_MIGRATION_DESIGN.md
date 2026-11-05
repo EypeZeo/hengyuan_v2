@@ -206,7 +206,7 @@ SubmitReadiness::authorize(now_ms) -> std::optional<SubmitReadyToken>
 - `SubmitReadiness::authorize()` 通过 `ReadinessProbe`（三个函数指针，和 `SubmitPort` 同一风格）在做决定的那一刻读事实，**先**用新读到的观察刷新屏障再判断，所以正确性不依赖主循环有没有跑过；拒绝时给出第一个不成立的 `NotReadyReason`，优先级固定（`NoProbe` > `KillSwitchNotNormal` > `StartupNotReady` > `FeedDown` / `BarrierSweeping` > `ClockNotReady`）。`SubmitReadyToken` 不是租约，签发之后不再复查（蓝图附录 D 的 L-40）。
 - **Gate 2b 在审计门与熔断门之后**，不是草图写的“最前面（Gate 0）”：审计 sink 必须能记下这次拒绝，熔断被触发时要继续报告自己（`KillSwitchNotNormal`）。`OrchestratorGate::NotReady = 23`；未接线 = 拒单；拒绝落审计环为 `PreflightFailed`，先于任何 durable 写入和发送。
 - 草图里的“夹具用一个测试钩子签发”没有照做：生产代码里没有测试钩子，每个夹具带一个 `SyntheticReadiness` 成员（真实的屏障与启动恢复，由脚本化观察驱动到就绪），所以这些测试里 Gate 2b 是真门；护栏 `test_submit_readiness_guard` 钉住每个生产构造 `OrchestratorContext` 的位置给 `.readiness` 的确切文本、哪些文件可以用 `SyntheticReadiness`、令牌只有一个签发点和一个友元、每个 `drain_user_data_events()` 调用的屏障参数。
-- M3 行里的“`StartupRecovery` 第一次被真正接进线束（预检线束）”**没有做**：预检线束仍跑在已退役的 listenKey 流上，没有 WS API 的代次可读，用合成就绪加横幅明说，真实接线随 M5。
+- M3 行里的“`StartupRecovery` 第一次被真正接进线束（预检线束）”**没有做**：预检线束仍跑在已退役的 listenKey 流上，没有 WS API 的代次可读，用合成就绪加横幅明说，真实接线随 M5（M5b-1 做了：§5.7）。
 
 ### 5.5 M5a-1 的实现情况与同设计草图的差别（账户刷新，2026-11-03；PR #228，合并提交 `2777c27`）
 
@@ -239,6 +239,23 @@ M5a-2 的两组改动（a-2a、a-2b）合在一个 PR（#229，合并提交 `bdb
    两处共用。语句与注释原样搬走，既有测试与按调用点计数的守卫不受影响。
 3. **存储绑定的门是 `account_fresh`，不是 KillSwitch，也不是新的 `DegradedReason`。** 绑定是启动前提而不是运行中的事件：在得到 “可以使用该存储” 的裁决之前账户不算新鲜，进程不能就绪；被拒绝的绑定让它一直不就绪，
    原因在状态里。这样 StartupRecovery 的枚举与状态机不变，也没有一个 “Degraded 是粘的” 的新来源。
+
+### 5.7 M5b-1 的实现情况：预检线束迁到流水线（2026-11-05；PR 待合并）
+
+预检线束 `live_submit_preflight_harness.cpp` 由 listenKey 加合成就绪迁到 `PrivateStreamPipeline<BinanceWsApiUserDataSession>`，成为流水线的第一个生产创建方。形态按 §5.6：**一个循环线程**，每圈先热节拍、再对账节拍；
+启动次序是时钟同步 → exchangeInfo → 注册表 → 交易所报告的账户 uid → 会话工厂与流水线 → `bind_store()`（被拒绝则进程不启动）→ `set_exchange_info_loaded(true)` → 公共行情与 io 线程 → 循环。实现时暴露的事实：
+
+1. **工厂要自己的凭据绑定。** REST 客户端拥有它那一份 `BoundHmacCredentials`（构造时移入），而会话工厂要一个 `BoundHmacCredentials&` 来签订阅。线束从同一个仍受保护的 `SecureEnvLoader` 在同一线程上再绑一次——同一个密钥在进程里有两份锁定的拷贝；
+   不去给客户端加访问器，是因为那个类是签名纪律的载体，不该为了接线多开一个口子。
+2. **订单进上下文的那一段抽成了 `preflight_probe.hpp`**（纯逻辑，带测试）：线束原来在 `main()` 里内联的 “凭价格和规则造订单、填进上下文” 没有任何测试够得着，旁边的取整 `((q + step - 1) / step) * step` 也没有溢出检查。
+   现在 `preflight_quantity_ticks()`（带检查）、`plan_preflight_probe()` 与 `fill_preflight_order()` 是线束和测试共用的三个函数，线束 “永不确认、永远 mock 端口” 的安全性质落在最后一个里面（把确认重置为默认、安装给定的端口），
+   并有两个新守卫钉住：哪些生产文件可以提到 `ctx.confirmation` / `ctx.submit_port`，以及线束交给它的端口只能是 mock。
+3. **启动探针。** 预检线束原来只在策略翻转时探一次订单路径；1h 的策略很少翻转，默认 60 秒的运行大概率一次也不探，也就不证明 “真实就绪之后链能走到确认门”。所以屏障 Reconciled、恢复 Ready、深度在跟踪的第一刻线束自己问一次
+   （开仓形，最多三次）。任何探针在确认门之前都会往临时存储写一帧 Intent（Gate 10b），这是真实的持久路径，存储随进程删除。
+4. **联调判据以结构化报告输出**（见 SPEC 的 “预检线束迁到私网流流水线”）：Owner 贴回的日志里有一行 `joint-run criteria: ...`，四个条件——屏障至少对账过一次、账户被清扫刷新过、恢复 Ready、有探针停在 `OperatorNotConfirmed`——以及各部件的计数器和最后一代会话的
+   订阅应答 / `session.subscriptions` 状态与错误码。联调要回答的两个未验证项（L-39：从未登录的连接上的 `session.subscriptions`；签名订阅需要什么权限）会直接出现在那一行的 `subscribe_status` / `verify_status` 里。
+
+线程约束不变（F11 / L-53）：线束的所有网络调用都在绑定凭据的那个线程上，会话的 io 线程只跑会话的处理函数。没有新的跨线程状态。
 
 ## 6. 路径 ③：用户数据流的持久优先
 
@@ -308,7 +325,8 @@ M5a-2 的两组改动（a-2a、a-2b）合在一个 PR（#229，合并提交 `bdb
 | **M3b** 清扫的传输（**已完成 2026-10-23，PR #191，合并提交 `ca6ac64`**） | 请求环加夹在对账事件环里的完成标记（不是独立的回报环）、`SweepJob` / `SweepPump` / `SweepSink`、`poll_once` 的取请求次序、`formal/reconnect_sweep.tla` 与 5 个必败配置、护栏与 CI 模型步骤；没有新的原子协议，因此没有新增 TSan 负控（见 §5.3） | B（并发） | MSVC + WSL2 `none` + `address` + `thread`；TLA+ 模型与它的必败配置；变异检查；实际：MSVC 登记 2765 个、运行 2763 个（新增 71 个），GCC 2771 个、0 警告，ASan 18 个可执行文件，`thread` 层 212 个用例（+2）且三个既有负控仍失败，手动 Sanitizer（run 39465113371）三个作业全绿，变异检查 85 个变异体（81 个被杀死、4 个等价，两处真实缺口 SP09 与 OT18 补了测试） | 估计 2 日；实际 2026-10-20 至 2026-10-23 |
 | **M4** 路径 ③ 持久优先（**已完成 2026-11-02，PR #224，合并提交 `9675b6c`**） | `order_durable_path.hpp`（规划器与 `DurableShadow`）、`OrderFillContext` 的影子与 `intended_qty_ticks`、`UserDataDurablePublisher` 与 `drain_user_data_events(..., durable)`、`ReconcileDurablePublisher` 以影子为准、`detail::append_order_frame()`、`apply_recovery()` 播种、`ReconnectBarrier::on_event_refused()`、守卫 `test_order_durable_path_guard`；与上面 §6.4 列出的差别 | B（并发 / 状态机） | WSL2 `address` + `thread`；真实日志重启测试；变异检查；实际：MSVC 登记 3432 个、运行 3430 个（相对 R5 新增 94 个）全部通过，WSL2 `none` 与 `address` 0 失败，`thread` 层 212 个并发用例通过且三个既有负控仍失败，变异检查 113 个变异体 = 108 杀死 + 5 等价，手动 Sanitizer（run 41451980374）：ASan+UBSan 全量 3441/3441 通过、0 报告；TSan 并发测试 212/212，三个负控都如期报告了注入的数据竞争；ARM64 真实弱内存序硬件 96 个并发用例 ×10 轮通过 | 估计 2 日 |
 | **M5a** 接线（**已完成 2026-11-05，PR #228，合并提交 `2777c27`；PR #229，合并提交 `bdbd96b`**） | #228：账户刷新通道（`account_refresh.hpp`、`SweepJob::before_marker()` / `SweepAccountStep`、`SweepAccountProbe` 改按纪元回答）与热线程版的未确认计数；#229：账户 `uid` 重载、真实取账户端口 `rest_account_fetcher.hpp`、私网流流水线 `private_stream_pipeline.hpp`（两个节拍、`observe_recovery()`、存储绑定的门、`ensure_store_binding()` 的第一个生产调用方）、从 `orchestrate_submit()` 抽出的 `drain_hot_inputs()`、七处守卫钉子改成 “只有流水线”、新的两线程流水线并发测试；与 §5.5、§5.6 列出的偏离（纪元标签、热线程计数、线程约束、绑定的门） | B（并发 / 状态机） | MSVC + WSL2 `none` + `address` + `thread`；变异检查；手动 Sanitizer；实际：#228——MSVC 3485 个登记用例 0 失败、变异检查 56 个 = 54 杀死 + 2 等价、手动 Sanitizer ASan+UBSan 3494/3494；#229——MSVC 3525 个登记用例 0 失败、WSL2 `thread` 216/216 且三个负控仍失败、变异检查 73 个 = 69 杀死 + 4 等价、手动 Sanitizer ASan+UBSan 3542/3542、TSan 216/216、ARM64 100/100 | 估计 1.5 日；实际 2026-11-03 至 2026-11-05（含一次用量中断） |
-| **M5b** 退役与联调 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），迁移 `live_submit_reconcile_harness_demo` 与预检线束（按 §5.6：一个循环线程，两个节拍都从那里调；启动时先取交易所对交易密钥报告的 uid 再 `bind_store()`）；**Owner 用 Testnet 凭据跑联调**并贴日志 | B | 全量三层 + CI 手动 Sanitizer；Testnet 联调由 Owner 执行 | 估计 1 日（不含联调等待） |
+| **M5b-1** 预检线束迁移（PR 待合并） | `live_submit_preflight_harness.cpp` 迁到流水线（§5.7）：一个循环线程、先取交易所报告的 uid 再 `bind_store()`、启动探针、联调报告；`preflight_probe.hpp`（订单进上下文的纯逻辑，带溢出检查）；两个新守卫；线束撤出五处旧钉子 | B | MSVC + WSL2 `none` + `address`；变异检查；手动 Sanitizer；Testnet 联调由 Owner 执行 | 估计 0.5 日 |
+| **M5b-2** 退役 | 删除 listenKey 整套（`ListenKeyPublisher`、续期调度器、`BinanceUserDataWsSession`、旧监督器、REST listenKey 调用与端点种类、对应测试），删除 H6 演示 `live_submit_real_credentials_demo.cpp`，`live_submit_reconcile_harness_demo` 去掉 listenKey 与真实会话部分；**建议在 Owner 的 Testnet 联调通过之后再合**（联调是 M5b-1 的证据，退役不可逆） | B | 全量三层 + CI 手动 Sanitizer | 估计 0.5 日 |
 
 合计 13.5 日的上限；M0 可以和 M1 并行；M4 与 M3 几乎没有依赖，可以交错。**每一片都是一个独立 PR，每个 PR 都带它自己的变异检查与回归。**
 
@@ -352,6 +370,8 @@ M5a-2 的两组改动（a-2a、a-2b）合在一个 PR（#229，合并提交 `bdb
 | 新增：WS 路径写出的日志可回放 | 真实 `DurableAuditSink` 重启回放不 `Corrupt`（含 `Submitting` 恢复后收到 `CANCELED`） | M4（已落地：`test_order_durable_path` 的差分、随机游走与两个写者共享影子的游走） |
 | 新增：被清扫刷新过的账户 | 屏障只在清扫自己取的账户上完成：账户步骤在最后一个回答之后、标记之前取，更新带纪元，周期更新不算 | M5a（已落地：PR #228，`2777c27`；`test_account_refresh` 的端到端含周期更新早于或晚于请求的回归，两线程测试检查 “Reconciled 时的账户取在该纪元最后一次查询之后”，变异检查 56 个中 54 个被杀死、2 个等价） |
 | 新增：存储绑定是就绪的门 | 绑定被拒绝（别的环境或账户、读不了、有历史的未绑定 Production 存储、已栅栏）或没有做，进程不就绪；uid 只来自交易所的应答 | M5a（已落地：PR #229，`bdbd96b`；`test_private_stream_pipeline`、守卫钉住整棵树里 `ensure_store_binding()` 只有流水线一处调用、第五个实参是 `exchange_uid`） |
+| 新增：预检线束的订单路径 | 真实就绪（流、清扫、账户、恢复、存储绑定）之后，带订单的上下文停在 EXACTLY `OperatorNotConfirmed`，令牌的代次是在线的那一代，提交端口从未被调用；流不在线时同一个上下文停在 `NotReady` | M5b-1（`test_private_stream_pipeline` 的 APreflightShaped... 两例；`test_preflight_probe` 的订单与上下文填充；对 Testnet 的证据是 Owner 的联调，`docs/PRIVATE_STREAM_JOINT_RUN.md`） |
+| 新增：线束永不确认、永远 mock 端口 | 哪些生产文件可以提到 `ctx.confirmation` / `ctx.submit_port` 是带计数的短名单，线束不在其中；线束交给上下文填充的端口只能是 mock，也不自己排空、不自己 `poll_once` | M5b-1（`test_submit_readiness_guard` +2；变异检查里线束源码的 10 个变异体由守卫杀死） |
 | P1-002 路径 ③ | `drain_user_data_events` 先持久 ACK 再折进 `PositionTruth` | M4（已合入：PR #224，`9675b6c`）。**P1-002 没有因此转 `CLOSED`**：`live` 类条目的运行期与预算两段仍缺——没有任何进程运行这条排空（M5 接线），同步 fsync 的时延没有测量；台账里 `code` 段改为 PRESENT，状态仍为 `PARTIAL` |
 
 ---
