@@ -979,7 +979,7 @@ TEST(ParseAccountResponseScope, EntriesOutsideTheScopeAreNeverConvertedNorNameCh
 TEST(ParseAccountResponseScope, TheShapeOfEveryEntryIsStillJudgedWholeInScopeOrNot) {
     // 4.1 does not bend: the answer's shape is judged whole, so an entry that is not an object with the three string fields fails the fetch even when
     // its asset (if it has one) is outside the scope.
-    for (const std::string entry : std::vector<std::string>{R"(42)", R"(null)", R"("ZZZ")", R"({"asset":"ZZZ","free":5,"locked":"0"})",
+    for (const std::string& entry : std::vector<std::string>{R"(42)", R"(null)", R"("ZZZ")", R"({"asset":"ZZZ","free":5,"locked":"0"})",
                                                              R"({"asset":"ZZZ","free":"1"})", R"({"free":"1","locked":"0"})",
                                                              R"({"asset":7,"free":"1","locked":"0"})", R"({"asset":"ZZZ","free":null,"locked":"0"})"}) {
         SCOPED_TRACE(entry);
@@ -996,7 +996,7 @@ TEST(ParseAccountResponseScope, TheShapeOfEveryEntryIsStillJudgedWholeInScopeOrN
 
 TEST(ParseAccountResponseScope, ADeclaredAssetIsJudgedExactlyAsBefore) {
     // Each of these entries is IN the scope: the full strictness of an unscoped fetch applies, and the answer is refused whole.
-    for (const std::string entry : std::vector<std::string>{R"({"asset":"BTC","free":"-1","locked":"0"})", R"({"asset":"BTC","free":"1","locked":"-0.1"})",
+    for (const std::string& entry : std::vector<std::string>{R"({"asset":"BTC","free":"-1","locked":"0"})", R"({"asset":"BTC","free":"1","locked":"-0.1"})",
                                                              R"({"asset":"BTC","free":"1.123456789","locked":"0"})", R"({"asset":"BTC","free":"1e5","locked":"0"})",
                                                              R"({"asset":"BTC","free":"not-a-number","locked":"0"})",
                                                              R"({"asset":"BTC","free":"92233720368.54775808","locked":"0"})",
@@ -1065,7 +1065,7 @@ TEST(ParseAccountResponseScope, TheScopeDecidesByTheWholeNameAlone) {
 
 TEST(ParseAccountResponseScope, TheUidStaysRequiredAndNothingMovesOnAFailure) {
     const AccountAssetScope scope = scope_of({"BTC"});
-    for (const std::string field : std::vector<std::string>{"", R"("uid":0,)", R"("uid":-5,)", R"("uid":"354937868",)", R"("uid":1.5,)"}) {
+    for (const std::string& field : std::vector<std::string>{"", R"("uid":0,)", R"("uid":-5,)", R"("uid":"354937868",)", R"("uid":1.5,)"}) {
         SCOPED_TRACE(field);
         AccountSnapshot out = sentinel_snapshot(2);
         std::uint64_t uid = 4242;
@@ -1118,7 +1118,9 @@ TEST(ParseAccountResponseScope, SixteenDeclaredAssetsAmongHundredsAreAllKept) {
     for (int i = 0; i < 600; ++i) {
         if (i > 0) body += ",";
         body += "{\"asset\":\"Z" + std::to_string(i) + "\",\"free\":\"" + std::to_string(i + 1) + "\",\"locked\":\"0\"}";
-        if (i % 37 == 0 && scope.size() < AccountAssetScope::kCapacity) ASSERT_TRUE(scope.add("Z" + std::to_string(i)));
+        if (i % 37 == 0 && scope.size() < AccountAssetScope::kCapacity) {
+            ASSERT_TRUE(scope.add("Z" + std::to_string(i)));
+        }
     }
     body += "]}";
     ASSERT_EQ(scope.size(), AccountAssetScope::kCapacity);
@@ -1162,7 +1164,9 @@ TEST(ParseAccountResponseScope, FuzzAScopeOnlyRemovesFailuresAndNeverChangesWhat
         for (std::uint64_t picks = 1 + rng.below(4); picks > 0; --picks) {
             (void)scope.add(rng.below(8) == 0 ? std::string("ABSENT") : names[rng.below(names.size())]);  // a nasty name is simply refused
         }
-        if (!scope.active()) ASSERT_TRUE(scope.add("ABSENT"));
+        if (!scope.active()) {
+            ASSERT_TRUE(scope.add("ABSENT"));
+        }
 
         AccountSnapshot full = sentinel_snapshot(2);
         AccountSnapshot part = sentinel_snapshot(2);
