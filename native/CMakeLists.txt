@@ -816,6 +816,13 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_live_submit_preflight_harness)
     gtest_discover_tests(test_live_submit_preflight_harness)
 
+    # M5b-1: the order the preflight harness asks orchestrate_submit() about -- the overflow-checked quantity rounding, the side and price a suggested action
+    # calls for, and the one function that puts the order into the context with the confirmation unbound and only the mock submit port. Pure logic, no network.
+    add_executable(test_preflight_probe tests/test_preflight_probe.cpp)
+    target_link_libraries(test_preflight_probe PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_preflight_probe)
+    gtest_discover_tests(test_preflight_probe)
+
     # 6b-0e: one-shot operator input and account-bound confirmation logic.
     # No live caller is wired until a verified account identity exists.
     add_executable(test_operator_input_reader tests/test_operator_input_reader.cpp)

@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: proprietary
-// live_submit_preflight_harness.cpp — 批次 6 6b-1: cold-start harness proving
-// orchestrate_submit() can genuinely reach "just missing operator confirmation" against REAL
-// testnet market data, with ZERO real network write side effect.
+// live_submit_preflight_harness.cpp — 批次 6 6b-1, on the private-stream pipeline since M5b-1: cold-start harness
+// proving orchestrate_submit() can genuinely reach "just missing operator confirmation" against REAL testnet market
+// data AND a REAL private user-data stream, with ZERO real network write side effect.
 //
-// Extends H6's live_submit_real_credentials_demo.cpp cold-start chain (credentials/
-// SymbolRegistry/BinancePrivateRestClient/make_binance_submit_port/clock sync/exchangeInfo/
-// listenKey/private user-data WS -- see that file's own header comment, all still accurate here)
-// with three things H6 never had:
+// The cold-start chain (credentials / SymbolRegistry / BinancePrivateRestClient / make_binance_submit_port / clock
+// sync / exchangeInfo / the account's uid as the EXCHANGE reports it) is followed by four things:
 //   1. The public kline stream feeding a loaded StreamingEvaluator (批次 5) + HoldingStateTracker
 //      (批次 6a-2) -- real bar-by-bar signal evaluation.
 //   2. A real public depth stream ("<symbol>@depth@100ms") through DepthManager, so
-//      ctx.depth_synced can genuinely become true (H6 never set this field at all -- confirmed via
-//      grep before this batch's plan was written).
+//      ctx.depth_synced can genuinely become true.
 //   3. A real KillSwitch (Normal) + dry-run evidence that is EARNED at process start: the four
 //      EvidencePath scenarios really run through orchestrate_submit() (VerifiedDryRunEvidence,
 //      批次 6 6b-0b) and only a scenario that reached its expected terminal state is recorded.
@@ -19,6 +16,20 @@
 //      enum -- nothing had run. DryRunEvidenceChain::live_ready() is purely in-memory --
 //      dry_run_evidence.hpp's own reset()/no serialization -- so this must happen fresh every
 //      process start, not "once, ever".)
+//   4. The private stream, for real (M5b-1; it replaces the retired listenKey stream and the synthetic readiness this
+//      file used before): a signed WebSocket API subscription (userDataStream.subscribe.signature) verified with
+//      session.subscriptions, supervised and rolled over like the public feeds; the reconnect barrier and its sweep;
+//      StartupRecovery over this run's scratch store; the account kept fresh through GET /api/v3/account (periodically,
+//      and once per sweep, tagged with the sweep's epoch); and the store bound to the exchange's uid before anything can
+//      be ready. That is one PrivateStreamPipeline (private_stream_pipeline.hpp). Gate 2b of every probe therefore asks a
+//      readiness built over live objects, and "gate=OperatorNotConfirmed" means the whole chain passed -- the stream,
+//      the sweep, the account and the recovery included -- not that a script said so.
+//
+// ONE LOOP THREAD. main() ticks the pipeline's two halves -- hot_tick() (stream, recovery, drains) and reconcile_tick()
+// (periodic account fetch, the sweep's queries) -- from the same loop. That is not a shortcut: the REST adapters sign,
+// and BoundHmacCredentials answers only on the thread that bound it (F11), and the rate-limit tracker belongs to that
+// thread too. The REST client, the stream's session factory and the order path share this thread and ONE tracker; a
+// separate reconcile thread is a design of its own (blueprint L-53).
 //
 // Items 1 and 2 are one PublicFeedPipeline (批次 6b-0f, public_feed_pipeline.hpp): each feed is
 // supervised (reconnect with backoff, a planned rollover before Binance's 24 h connection limit), a
@@ -34,20 +45,25 @@
 // SAFETY PROPERTY THIS FILE EXISTS TO DEMONSTRATE: ctx.submit_port stays pointed at a MOCK
 // SubmitFn for the entire life of this process -- never swapped to the real
 // make_binance_submit_port() result (that real port IS constructed below, proving H5's
-// composite adapters still assemble against a real, freshly-refreshed SymbolRegistry, exactly
-// like H6's own diagnostic -- but it is never assigned to ctx.submit_port). ctx.confirmation is
-// never bound anywhere in this file either. Combined, orchestrate_submit() can therefore reach
-// at most OrchestratorGate::OperatorNotConfirmed and NEVER Gate 12 (SubmitPortInvalid) with a
-// real port, NEVER an actual network POST. This is why 6b-1 needs no ADR-019 D2 "L5 审" before
-// merge -- it produces zero real network writes, unlike 6b-2 (which swaps in the real port AND
-// a real human confirmation gate, and DOES require that review before real execution).
+// composite adapters still assemble against a real, freshly-refreshed SymbolRegistry -- but it
+// is never assigned to ctx.submit_port). ctx.confirmation is never bound anywhere in this file
+// either: fill_preflight_order() (preflight_probe.hpp), the one place this harness puts an
+// order into a context, resets it to "not confirmed" and installs the mock port it is handed.
+// Combined, orchestrate_submit() can therefore reach at most OrchestratorGate::OperatorNotConfirmed
+// and NEVER Gate 12 (SubmitPortInvalid) with a real port, NEVER an actual network POST. This is
+// why 6b-1 needs no ADR-019 D2 "L5 审" before merge -- it produces zero real network writes,
+// unlike 6b-2 (which swaps in the real port AND a real human confirmation gate, and DOES require
+// that review before real execution). The private stream adds reads and a subscription only: the
+// signed WebSocket API request is userDataStream.subscribe.signature, and the REST calls are
+// GETs (clock, exchangeInfo, account; the sweep queries only the orders this run's scratch store
+// holds, and a fresh scratch store holds none).
 //
-// Testnet only -- same posture as H6: no --production flag, .env read from a fixed
-// process-cwd-relative path per ADR-019 D4.
+// Testnet only: no --production flag, .env read from a fixed process-cwd-relative path per
+// ADR-019 D4 (docs/PRIVATE_STREAM_JOINT_RUN.md is the owner's runbook for a Testnet run).
 //
 // Usage: run from the repository root (so ./.env resolves), after `chmod 600 .env`:
 //   ./live_submit_preflight_harness <spec_toml_path> [duration_seconds=60] [interval=1h]
-// Symbol is fixed to BTCUSDT/btcusdt throughout, matching H6's own single-symbol scope.
+// Symbol is fixed to BTCUSDT/btcusdt throughout (a single-symbol scope).
 //
 // Data-level staleness is the pipeline's too: Binance's pings keep the sessions' 90 s idle timeout
 // satisfied, so a connection can stay up while the DATA stops -- a depth feed with no accepted event
@@ -55,25 +71,33 @@
 // overdue on the exchange clock is repaired from REST (and its connection replaced if it was up when
 // the bar was due).
 //
-// NOT covered here, deliberately (each is its own batch): the durable startup recovery and the
-// target-position planner (this file still probes on HoldingStateTracker transitions); operator
-// confirmation. An AI session compiles this file but never runs it with real credentials.
+// A probe does not have to wait for the strategy: a 1h strategy flips rarely, and a run that never probes proves nothing about the order path. Once
+// the private stream is reconciled, startup recovery is Ready and the depth book tracks, the harness asks the chain ONCE with an OPEN-shaped order
+// ("[startup probe]" in the log) and expects the same OperatorNotConfirmed. Every probe, from either source, writes an Intent frame to this run's
+// scratch store before the confirmation gate (Gate 10b) -- that is the real durable path, and the store is deleted at exit.
+//
+// NOT covered here, deliberately (each is its own batch): recovery over a PERSISTENT store (this one is a scratch store with a fixed test key: there
+// is never anything to recover, and the audit key's provisioning is the owner's decision) and the target-position planner (this file still probes
+// on HoldingStateTracker transitions); operator confirmation. An AI session compiles this file but never runs it with real credentials: the
+// Testnet joint run is the owner's, with Testnet credentials.
 
 #include <hengyuan/binance_clock_sync.hpp>
 #include <hengyuan/binance_klines_rest.hpp>
-#include <hengyuan/binance_listen_key_keepalive.hpp>
 #include <hengyuan/binance_rest_snapshot.hpp>
 #include <hengyuan/binance_submit_adapter.hpp>
-#include <hengyuan/binance_user_data_ws_supervisor.hpp>
+#include <hengyuan/binance_ws_api_session_factory.hpp>
 #include <hengyuan/depth_manager.hpp>
 #include <hengyuan/env_loader.hpp>
 #include <hengyuan/feed_validity_gate.hpp>
 #include <hengyuan/holding_state_tracker.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/preflight_probe.hpp>
+#include <hengyuan/private_stream_pipeline.hpp>
 #include <hengyuan/public_feed_pipeline.hpp>
+#include <hengyuan/public_feed_policy.hpp>
+#include <hengyuan/rest_account_fetcher.hpp>
 #include <hengyuan/strategy_spec_evaluator.hpp>
 #include <hengyuan/strategy_spec_toml_parser.hpp>
-#include <hengyuan/synthetic_readiness.hpp>
 #include <hengyuan/verified_dry_run_evidence.hpp>
 
 #include <array>
@@ -86,10 +110,13 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
@@ -176,10 +203,10 @@ SubmitResponse mock_submit_must_never_be_called(const char*, std::uint32_t, Orde
     return SubmitResponse{SubmitOutcome::NetworkError, 0, -1};
 }
 
-// --- DemoControlPlaneSink -- identical shape to live_submit_real_credentials_demo.cpp's own
-// (see that file's header comment for why append_snapshot() is the only real override this
-// class needs); duplicated rather than shared because both are anonymous-namespace, src/-local
-// types and this file must not reach into another translation unit's internals.
+// --- DemoControlPlaneSink -- append_snapshot() is the only real override this class needs:
+// SymbolRegistry::refresh_from_exchange_info() journals its snapshot there, and a fresh cold-start
+// process reaches no other append. An anonymous-namespace, src/-local type on purpose (this file
+// must not reach into another translation unit's internals).
 class DemoControlPlaneSink final : public DurableControlPlaneSink {
 public:
     AuditAppendResult append_snapshot(const SymbolRegistrySnapshotPayload&,
@@ -239,20 +266,258 @@ std::string durable_audit_temp_path() {
 #endif
 }
 
-// Every file a DurableAuditSink derives from its path: the log plus the key-rotation and store-identity sidecars,
-// each with its lock file, tip anchor and the tip's temp file. (Only the first four used to be removed here, which
-// left the sidecars behind on every run.)
+// Every file a DurableAuditSink derives from its path: the log plus the key-rotation and store-identity sidecars and
+// the store binding the pipeline writes beside the log (bind_store()), each with its lock file, tip anchor and the
+// tip's temp file. (Only the first four used to be removed here, which left the sidecars behind on every run.)
 void remove_durable_audit_files(const std::string& base_path) {
     for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".keyrotations", ".keyrotations.lock",
                                ".keyrotations.tip", ".keyrotations.tip.tmp", ".storeid", ".storeid.lock",
-                               ".storeid.tip", ".storeid.tip.tmp"}) {
+                               ".storeid.tip", ".storeid.tip.tmp", ".binding", ".binding.lock", ".binding.tip",
+                               ".binding.tip.tmp"}) {
         std::remove((base_path + suffix).c_str());
     }
+}
+
+// Removes the scratch store's files when main() is left by any road, the early returns included. It is declared
+// BEFORE the objects that hold the store open, so it runs after they are gone (an open file cannot be removed on
+// Windows).
+class ScratchStoreCleanup {
+public:
+    explicit ScratchStoreCleanup(std::string base_path) : base_path_(std::move(base_path)) {}
+    ScratchStoreCleanup(const ScratchStoreCleanup&) = delete;
+    ScratchStoreCleanup& operator=(const ScratchStoreCleanup&) = delete;
+    ~ScratchStoreCleanup() { remove_durable_audit_files(base_path_); }
+
+private:
+    std::string base_path_;
+};
+
+using PrivateSession = BinanceWsApiUserDataSession;
+using PrivatePipeline = PrivateStreamPipeline<PrivateSession>;
+
+// The symbol rules of a recovered order's symbol, for startup recovery (PipelineRulesLookup): the registry's current
+// rules, refreshed from exchangeInfo before the pipeline exists. A symbol id the registry does not hold answers
+// rules_version 0, where recovery stops and the state machine degrades -- fail-closed.
+SymbolRules registry_rules_for(void* registry, std::uint32_t symbol_id) noexcept {
+    return static_cast<const SymbolRegistry*>(registry)->current_rules(symbol_id);
+}
+
+const char* session_end_name(WsApiSessionEnd e) noexcept {
+    switch (e) {
+        case WsApiSessionEnd::None: return "None";
+        case WsApiSessionEnd::Requested: return "Requested";
+        case WsApiSessionEnd::Failed: return "Failed";
+        case WsApiSessionEnd::ServerShutdown: return "ServerShutdown";
+        case WsApiSessionEnd::StreamTerminated: return "StreamTerminated";
+    }
+    return "?";
+}
+
+const char* private_rest_error_name(PrivateRestError e) noexcept {
+    switch (e) {
+        case PrivateRestError::None: return "None";
+        case PrivateRestError::InvalidConfig: return "InvalidConfig";
+        case PrivateRestError::Resolve: return "Resolve";
+        case PrivateRestError::Connect: return "Connect";
+        case PrivateRestError::TlsHandshake: return "TlsHandshake";
+        case PrivateRestError::Write: return "Write";
+        case PrivateRestError::Read: return "Read";
+        case PrivateRestError::HttpStatus: return "HttpStatus";
+        case PrivateRestError::JsonParse: return "JsonParse";
+        case PrivateRestError::MalformedResponse: return "MalformedResponse";
+        case PrivateRestError::CapacityExceeded: return "CapacityExceeded";
+        case PrivateRestError::ClockNotFresh: return "ClockNotFresh";
+        case PrivateRestError::SigningFailed: return "SigningFailed";
+        case PrivateRestError::ClockSkewTooLarge: return "ClockSkewTooLarge";
+        case PrivateRestError::RateLimitExhausted: return "RateLimitExhausted";
+    }
+    return "?";
+}
+
+const char* terminal_reason_name(FeedTerminalReason r) noexcept {
+    switch (r) {
+        case FeedTerminalReason::None: return "None";
+        case FeedTerminalReason::Shutdown: return "Shutdown";
+        case FeedTerminalReason::TooManyFailures: return "TooManyFailures";
+    }
+    return "?";
+}
+
+const char* kill_state_name(KillState s) noexcept {
+    switch (s) {
+        case KillState::Normal: return "Normal";
+        case KillState::Armed: return "Armed";
+        case KillState::Triggered: return "Triggered";
+        case KillState::Latched: return "Latched";
+    }
+    return "?";
+}
+
+// One line about a WS API generation: how it ended (or stands) and what the exchange said. The owner reads these to see WHY a generation failed -- the
+// stage it stopped at, the status of the subscribe answer and of the session.subscriptions listing, a ban's retryAfter -- without a debugger.
+void print_session_line(const char* when, const PrivateSession& session) {
+    const WsApiUserDataSessionStats st = session.stats_snapshot();
+    std::printf("Private stream generation %" PRIu64 " (%s): end=%s connected=%s stage=%s ec=%s | subscribe_status=%d subscribe_error=%" PRId64
+                " verify_status=%d verify_error=%" PRId64 " subscriptions_listed=%u retry_after_ms=%" PRId64 " | messages=%" PRIu64 " events=%" PRIu64
+                " parse_failed=%" PRIu64 " unknown_events=%" PRIu64 " lost_events=%" PRIu64 " push_dropped=%" PRIu64 " foreign=%" PRIu64
+                " server_shutdowns=%" PRIu64 " errors=%" PRIu64 "\n",
+                session.generation(), when, session_end_name(session.end_cause()), session.is_connected() ? "yes" : "no",
+                st.last_error_stage.empty() ? "-" : st.last_error_stage.c_str(),
+                st.last_error_ec ? st.last_error_ec.message().c_str() : "-", st.subscribe_status, st.subscribe_error_code, st.verify_status,
+                st.verify_error_code, st.subscriptions_listed, st.retry_after_ms, st.messages_received, st.events_delivered, st.parse_failed,
+                st.unknown_events, st.lost_events, st.push_dropped, st.foreign_subscription_events, st.server_shutdowns, st.errors);
+}
+
+// Prints one line whenever something the joint run is judged on changes -- the supervisor's state, the generation, whether the session is verified, the
+// barrier, startup recovery -- and one more about a generation when the next one replaces it. It also keeps the last session alive (the supervisor lets go
+// of it at shutdown) for the final report. Hot thread only: it reads the pipeline's single-thread state.
+class PrivateStreamWatch {
+public:
+    void poll(PrivatePipeline& pipeline, std::int64_t at_ms) {
+        const std::shared_ptr<PrivateSession> session = pipeline.supervisor().current();
+        if (session && session != last_session_) {
+            if (last_session_) print_session_line("ended", *last_session_);
+            last_session_ = session;
+        }
+        const FeedState feed = pipeline.supervisor().state();
+        const std::uint64_t generation = pipeline.supervisor().generation();
+        const bool verified = session != nullptr && session->is_connected();
+        const BarrierState barrier = pipeline.readiness().barrier().state();
+        const RunState recovery = pipeline.recovery().state();
+        if (seen_ && feed == feed_ && generation == generation_ && verified == verified_ && barrier == barrier_ && recovery == recovery_) return;
+        seen_ = true;
+        feed_ = feed;
+        generation_ = generation;
+        verified_ = verified;
+        barrier_ = barrier;
+        recovery_ = recovery;
+        std::printf("[t=%" PRId64 " ms] private stream: supervisor=%s generation=%" PRIu64 " verified=%s | barrier=%s | recovery=%s\n", at_ms,
+                    feed_state_name(feed), generation, verified ? "yes" : "no", barrier_state_name(barrier), run_state_name(recovery));
+    }
+
+    [[nodiscard]] const std::shared_ptr<PrivateSession>& last_session() const noexcept { return last_session_; }
+
+private:
+    std::shared_ptr<PrivateSession> last_session_;
+    bool seen_{false};
+    FeedState feed_{FeedState::Idle};
+    std::uint64_t generation_{0};
+    bool verified_{false};
+    BarrierState barrier_{BarrierState::Down};
+    RunState recovery_{RunState::Bootstrapping};
+};
+
+struct ProbeCounters {
+    std::uint64_t total{0};
+    std::uint64_t at_confirmation_gate{0};  // OperatorNotConfirmed: every gate before the operator's confirmation passed
+    std::uint64_t not_ready{0};             // refused at Gate 2b (the private stream's readiness)
+};
+
+// The joint run's report: what the owner pastes back. Plain key=value lines, one concern per line, the counters of every part the pipeline owns, and at the
+// end the criteria a joint run is judged by (the owner decides what they mean; this only states which hold).
+void print_private_stream_report(PrivatePipeline& pipeline, const WsApiSessionFactory& factory, const RestAccountFetcher& fetcher,
+                                 const KillSwitch& kill_switch, const PrivateStreamWatch& watch, const ProbeCounters& probes) {
+    std::printf("\n=== Private stream joint-run report ===\n");
+
+    const std::string_view binding = ensure_binding_status_name(pipeline.binding_status());
+    std::printf("store binding: status=%.*s may_be_used=%s\n", static_cast<int>(binding.size()), binding.data(), pipeline.store_bound() ? "yes" : "no");
+
+    const RecoveryApplyResult& recovered = pipeline.recovery_result();
+    std::printf("recovery: state=%s degraded_reason=%s applied=%s recovered_orders=%zu applied_orders=%zu\n", run_state_name(pipeline.recovery().state()),
+                degraded_reason_name(pipeline.recovery().degraded_reason()), pipeline.recovery_applied() ? "yes" : "no", recovered.recovered,
+                recovered.applied);
+
+    const ReconnectBarrier& barrier = pipeline.readiness().barrier();
+    const BarrierStats& bs = barrier.stats();
+    std::printf("barrier: state=%s generation=%" PRIu64 " reconciled_generation=%" PRIu64 " epoch=%" PRIu64 " | generations_seen=%" PRIu64 " downs=%" PRIu64
+                " sweeps_begun=%" PRIu64 " sweeps_requested=%" PRIu64 " sweeps_undelivered=%" PRIu64 " sweeps_completed=%" PRIu64 " sweeps_unresolved=%" PRIu64
+                " sweep_timeouts=%" PRIu64 " stale_heartbeats=%" PRIu64 " soft_barriers=%" PRIu64 " events_refused=%" PRIu64 " late_events_dropped=%" PRIu64
+                "\n",
+                barrier_state_name(barrier.state()), barrier.generation(), barrier.reconciled_generation(), barrier.epoch(), bs.generations_seen, bs.downs,
+                bs.sweeps_begun, bs.sweeps_requested, bs.sweeps_undelivered, bs.sweeps_completed, bs.sweeps_unresolved, bs.sweep_timeouts, bs.stale_heartbeats,
+                bs.soft_barriers, bs.events_refused, bs.late_events_dropped);
+
+    const SweepJobStats& job = pipeline.sweep_job().stats();
+    const SweepPumpStats& pump = pipeline.sweep_pump().stats();
+    std::printf("sweep: job requests_taken=%" PRIu64 " sweeps_started=%" PRIu64 " sweeps_completed=%" PRIu64 " account_steps=%" PRIu64
+                " marker_push_failures=%" PRIu64 " | pump requests_sent=%" PRIu64 " request_push_failures=%" PRIu64 " markers_received=%" PRIu64
+                " reports_account_stale=%" PRIu64 "\n",
+                job.requests_taken, job.sweeps_started, job.sweeps_completed, job.account_steps, job.marker_push_failures, pump.requests_sent,
+                pump.request_push_failures, pump.markers_received, pump.reports_account_stale);
+
+    // (`auto`: the account pieces are the pipeline's to build and name -- test_barrier_sweep_guard.cpp; the harness only reads their counters.)
+    const auto& held = pipeline.holder().stats();
+    const auto& refresh = pipeline.refresher().stats();
+    const RestAccountFetcherStats& rest = fetcher.stats();
+    std::printf("account: holder has_snapshot=%s applied=%" PRIu64 " stale=%" PRIu64 " rejected=%" PRIu64 " refreshed_epoch=%" PRIu64
+                " | refresher attempts=%" PRIu64 " delivered=%" PRIu64 " not_sent=%" PRIu64 " failed=%" PRIu64 " ring_full=%" PRIu64 " bad_clock=%" PRIu64
+                " sweep_steps=%" PRIu64 " sweep_delivered=%" PRIu64 " | rest calls=%" PRIu64 " fetched=%" PRIu64 " not_sent=%" PRIu64 " failed=%" PRIu64
+                " threw=%" PRIu64 " last_error=%s\n",
+                pipeline.holder().has_snapshot() ? "yes" : "no", held.applied, held.stale, held.rejected, pipeline.holder().refreshed_epoch(),
+                refresh.attempts, refresh.delivered, refresh.not_sent, refresh.failed, refresh.ring_full, refresh.bad_clock, refresh.sweep_steps,
+                refresh.sweep_delivered, rest.calls, rest.fetched, rest.not_sent, rest.failed, rest.threw, private_rest_error_name(rest.last_error));
+
+    const FeedSupervisorStats sup = pipeline.supervisor().stats();
+    std::printf("supervisor: state=%s terminal_reason=%s generation=%" PRIu64 " attempts=%" PRIu64 " failures=%" PRIu64 " consecutive_failures=%u"
+                " rollovers=%" PRIu64 " connect_timeouts=%" PRIu64 "\n",
+                feed_state_name(sup.state), terminal_reason_name(sup.terminal_reason), sup.generation, sup.total_attempts, sup.total_failures,
+                sup.consecutive_failures, sup.rollovers, sup.connect_timeouts);
+
+    const WsApiSessionFactoryStats& fs = factory.stats();
+    std::printf("factory: attempts=%" PRIu64 " created=%" PRIu64 " refused_clock=%" PRIu64 " refused_ban=%" PRIu64 " refused_endpoint=%" PRIu64
+                " refused_budget=%" PRIu64 " sign_failed=%" PRIu64 " create_failed=%" PRIu64 " ban_until_server_ms=%" PRId64 "\n",
+                fs.attempts, fs.created, fs.refused_clock, fs.refused_ban, fs.refused_endpoint, fs.refused_budget, fs.sign_failed, fs.create_failed,
+                fs.ban_until_server_ms);
+
+    // The last generation, if there was one: its counters are that connection's own (the io thread is joined, so they are final).
+    if (const auto& last = watch.last_session()) print_session_line("last", *last);
+
+    const ReadinessStats& rs = pipeline.readiness().stats();
+    std::printf("readiness: authorized=%" PRIu64, rs.authorized);
+    for (std::size_t i = 0; i < rs.refused.size(); ++i) {
+        if (rs.refused[i] != 0) std::printf(" refused_%s=%" PRIu64, not_ready_reason_name(static_cast<NotReadyReason>(i)), rs.refused[i]);
+    }
+    std::printf("\n");
+
+    // The durable publishers are the pipeline's own; the context it makes points at them.
+    const auto wiring = pipeline.make_context();
+    if (wiring.reconcile_durable != nullptr && wiring.user_data_durable != nullptr) {
+        std::printf("durable: reconcile acked_frames=%" PRIu64 " failed_appends=%" PRIu64 " blocked=%s | user_data acked_frames=%" PRIu64
+                    " failed_appends=%" PRIu64 " written=%" PRIu64 " refused_unreadable=%" PRIu64 " refused_untracked=%" PRIu64
+                    " refused_contradiction=%" PRIu64 " blocked=%s\n",
+                    wiring.reconcile_durable->acked_frames(), wiring.reconcile_durable->failed_appends(),
+                    wiring.reconcile_durable->blocked() ? "yes" : "no", wiring.user_data_durable->stats().acked_frames,
+                    wiring.user_data_durable->stats().failed_appends, wiring.user_data_durable->stats().written,
+                    wiring.user_data_durable->stats().refused_unreadable, wiring.user_data_durable->stats().refused_untracked,
+                    wiring.user_data_durable->stats().refused_contradiction, wiring.user_data_durable->blocked() ? "yes" : "no");
+    }
+
+    const LateFillStats& lf = pipeline.late_fill().stats();
+    std::printf("late_fill: reports=%" PRIu64 " alarmed_orders=%" PRIu64 " trips=%" PRIu64 " audit_failed=%" PRIu64 " | kill_switch=%s\n", lf.reports,
+                lf.alarmed_orders, lf.trips, lf.audit_failed, kill_state_name(kill_switch.state()));
+
+    std::printf("pipeline: hot_ticks=%" PRIu64 " reconcile_ticks=%" PRIu64 " recoveries_applied=%" PRIu64 " binding_attempts=%" PRIu64 "\n",
+                pipeline.stats().hot_ticks, pipeline.reconcile_ticks(), pipeline.stats().recoveries_applied, pipeline.stats().binding_attempts);
+    std::printf("probes: total=%" PRIu64 " reached_OperatorNotConfirmed=%" PRIu64 " refused_NotReady=%" PRIu64 "\n", probes.total,
+                probes.at_confirmation_gate, probes.not_ready);
+
+    const bool reconciled_once = bs.sweeps_completed >= 1;
+    const bool account_by_sweep = pipeline.holder().refreshed_epoch() >= 1;
+    const bool recovery_ready = pipeline.recovery().state() == RunState::Ready;
+    const bool order_path = probes.at_confirmation_gate >= 1;
+    std::printf("joint-run criteria: reconciled_once=%s account_refreshed_by_sweep=%s recovery_ready=%s probe_reached_OperatorNotConfirmed=%s all_met=%s\n",
+                reconciled_once ? "yes" : "no", account_by_sweep ? "yes" : "no", recovery_ready ? "yes" : "no", order_path ? "yes" : "no",
+                (reconciled_once && account_by_sweep && recovery_ready && order_path) ? "yes" : "no");
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Unbuffered stdout: the log is the evidence of a Testnet run, and a run that dies half way (an exception, a kill) must not take the lines it already printed
+    // with it. A redirected stdout is fully buffered by default (and "line buffered" does not exist on Windows); stderr is unbuffered already, so the two now
+    // interleave in order when they share a file. One printf per event, a few per second at most: the cost is nothing.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s <spec_toml_path> [duration_seconds=60] [interval=1h]\n",
                      argv[0]);
@@ -308,7 +573,7 @@ int main(int argc, char* argv[]) {
     }
     HoldingStateTracker tracker;
 
-    // --- H6's cold-start chain, unchanged -----------------------------------------------
+    // --- The cold-start chain ------------------------------------------------------------
     SecureEnvLoader loader;
     EnvironmentBinding binding = EnvironmentBinding::testnet();
 
@@ -359,9 +624,10 @@ int main(int argc, char* argv[]) {
     }
 
     // One local rate-limit tracker for the whole run, owned by this (the hot) thread: the cold-start REST calls
-    // below (clock sync, exchangeInfo, listenKey) are charged to its Reconciliation lane through the client, and
-    // the orchestrator further down reserves its order flow on the Strategy lane of the very same tracker
-    // (SAFE-01 slice 4). Declared before the client so it outlives it.
+    // below (clock sync, exchangeInfo, the account read) are charged to its Reconciliation lane through the client,
+    // the private stream's session factory pays for every generation from the very same lane, and the orchestrator
+    // further down reserves its order flow on the Strategy lane of the same tracker (SAFE-01 slice 4). Declared
+    // before everything that points at it.
     SpotRateLimitTracker rate_limiter;
     rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
 
@@ -369,14 +635,12 @@ int main(int argc, char* argv[]) {
     BinancePrivateRestClient client(binding, std::move(creds), &rate_limiter);
     SubmitAdapterContext submit_ctx{&client, &registry};
     // Constructed to prove H5's composite adapters still assemble against a real, freshly
-    // refreshed SymbolRegistry -- exactly like H6's own diagnostic. NEVER assigned to
-    // ctx.submit_port below (see this file's header comment).
+    // refreshed SymbolRegistry. NEVER assigned to ctx.submit_port below (see this file's header
+    // comment).
     SubmitPort real_submit_port_unused = make_binance_submit_port(submit_ctx);
 
     DemoControlPlaneSink cp_sink;
     ParsedExchangeInfo parsed{};
-    std::array<char, kListenKeyBufferLen> listen_key_buf{};
-    std::size_t listen_key_len = 0;
 
     try {
         if (client.sync_clock() != PrivateRestError::None) {
@@ -386,10 +650,6 @@ int main(int argc, char* argv[]) {
         std::array<std::string_view, 1> symbols{"BTCUSDT"};
         if (client.fetch_exchange_info(parsed, symbols) != PrivateRestError::None) {
             std::fprintf(stderr, "ERROR: fetch_exchange_info() failed.\n");
-            return 1;
-        }
-        if (client.create_listen_key(listen_key_buf, listen_key_len) != PrivateRestError::None) {
-            std::fprintf(stderr, "ERROR: create_listen_key() failed.\n");
             return 1;
         }
     } catch (const std::exception& e) {
@@ -402,11 +662,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Read-only diagnostic, same placement/purpose as H6's own (live_submit_real_credentials_
-    // demo.cpp): proves H5's composite adapters genuinely reach a real, freshly refreshed
-    // SymbolRegistry, and (with -Werror=unused-but-set-variable active on the GCC tier) keeps
-    // the compiler from flagging real_submit_port_unused as constructed-but-never-read. Still
-    // never assigned to ctx.submit_port anywhere below.
+    // Read-only diagnostic: proves H5's composite adapters genuinely reach a real, freshly
+    // refreshed SymbolRegistry, and (with -Werror=unused-but-set-variable active on the GCC
+    // tier) keeps the compiler from flagging real_submit_port_unused as constructed-but-never-
+    // read. Still never assigned to ctx.submit_port anywhere below.
     std::printf("Real SubmitPort assembled (never used for ctx.submit_port): rules_version=%u, valid=%d\n",
                 real_submit_port_unused.current_rules_version(),
                 real_submit_port_unused.is_valid() ? 1 : 0);
@@ -428,34 +687,127 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    ListenKeyPublisher listen_key_pub;
-    std::printf("listenKey created: key_len=%zu\n", listen_key_len);
-    listen_key_pub.publish(std::string_view(listen_key_buf.data(), listen_key_len), get_now_ms(),
-                            get_now_ms() + 3600000);
-    ListenKeyKeepaliveScheduler keepalive_scheduler(client, listen_key_pub);
+    // The account this key trades as, as the EXCHANGE reports it (GET /api/v3/account, once): the store binding
+    // below is made against this uid and never against a configured one. Read here, on the thread that bound the
+    // credentials. (The value is an account identifier: only its length goes into the log.)
+    std::uint64_t exchange_uid = 0;
+    if (const PrivateRestError uid_error = fetch_exchange_account_uid(client, exchange_uid); uid_error != PrivateRestError::None) {
+        std::fprintf(stderr, "ERROR: could not read the account uid from the exchange (PrivateRestError=%s).\n",
+                     private_rest_error_name(uid_error));
+        return 1;
+    }
+    std::printf("Exchange account uid read (%zu digits; the value is not printed)\n", std::to_string(exchange_uid).size());
 
     boost::asio::io_context ioc;
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
     hy::configure_binance_ssl_context(ssl_ctx);
 
-    UserDataJsonParser ws_parser;
+    // Real entropy for the reconnect jitter of every supervisor below (the policies' defaults are fixed seeds).
+    std::random_device entropy;
+    auto jitter_seed = [&entropy]() {
+        return (static_cast<std::uint64_t>(entropy()) << 32) | static_cast<std::uint64_t>(entropy());
+    };
+
+    // --- The private stream's parts (M5b-1) -----------------------------------------------------------------------
+    // The ring every generation's session fills and the pipeline's hot tick drains, and the parser memory all
+    // generations share (allocated once, here).
     UserDataWsEventRing user_data_events;
-    UserDataWsSessionConfig ws_cfg;
-    ws_cfg.host = std::string(binding.ws_host());
-    ws_cfg.port = std::string(binding.ws_port());
-    UserDataWsSessionSupervisor ws_supervisor(ioc, ssl_ctx, user_data_events, ws_parser,
-                                               listen_key_pub, ws_cfg);
+    std::unique_ptr<WsApiCodec> ws_codec;
+    try {
+        ws_codec = std::make_unique<WsApiCodec>();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FATAL: the WebSocket API codec could not allocate its parser (%s).\n", e.what());
+        return 1;
+    }
+    // The session factory signs the subscribe request, and the REST client has already taken the first binding of the
+    // key (it owns it), so the factory gets its own: a second bind from the same still-protected loader, on this same
+    // thread -- the only thread BoundHmacCredentials answers on.
+    auto [ws_err, ws_creds] = BoundHmacCredentials::load_and_bind_credentials(binding, loader);
+    if (ws_err != QuerySigningError::Ok) {
+        std::fprintf(stderr, "ERROR: failed to bind the stream's credentials (QuerySigningError=%d).\n",
+                     static_cast<int>(ws_err));
+        return 1;
+    }
+    WsApiSessionFactory ws_factory(
+        WsApiSessionFactory::Deps{ioc, ssl_ctx, user_data_events, *ws_codec, *ws_creds, client.clock_publisher(), rate_limiter},
+        ws_api_endpoint_of(binding));
+    RestAccountFetcher account_fetcher(client);
 
     InFlightRegistry in_flight;
     AuditRingSink audit;
     audit.set_available(true);
-    OrderTracker order_tracker;
-    ToReconcileRing to_reconcile;
-    ReconcileEventRing reconcile_events;
     PositionTruth position_truth;
     OrderFillContext fill_context;
-    ReconcilePollPolicy poll_policy{};
-    QueryPort query_port{&query_order_adapter, &client};
+
+    // --- Real KillSwitch (Normal) ---------------------------------------------------------------------------------
+    KillSwitch kill_switch;
+    kill_switch.operator_reset();
+
+    // Real DurableAuditSink -- every probe writes its Intent frame here before the confirmation gate (Gate 10b), and
+    // nothing else is ever written (confirmation is never bound), so an ephemeral per-run temp file (cleaned at
+    // shutdown, and by ScratchStoreCleanup on every early return) is appropriate here, unlike a genuine production
+    // audit trail.
+    //
+    // DEMO-ONLY, and NOT a recovery path (外部复核 P0-06): the pipeline's StartupRecovery runs over this log (so the
+    // state machine and the store binding are exercised), but a fresh temp log with a fixture KEK can never contain a
+    // previous run's orders, so nothing is ever recovered -- that part of the path runs empty. Anything that may submit
+    // for real must run the same sequence over a PERSISTENT log (6b-0d builds and tests that; the 6b-2 harness wires
+    // it, once the owner has decided how the audit key is provisioned).
+    const std::string durable_audit_path = durable_audit_temp_path();
+    remove_durable_audit_files(durable_audit_path);
+    ScratchStoreCleanup scratch_store_cleanup(durable_audit_path);
+    std::array<std::byte, kKekSize> kek{};
+    for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x20 + i);
+    // unique_ptr, not stack values -- same "explicit reset() before removing the temp file,
+    // never a manual destructor call on a stack object" discipline as
+    // live_submit_evidence_harness.cpp's own Fixture (a stack DurableAuditSink would double-
+    // destruct if this file ever needed to close it before main() returns, which shutdown does).
+    auto key_ring = std::make_unique<KeyRing>(kek);
+    WrappedKeyRecord key_rec{};
+    key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}},
+                       key_rec);
+    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
+
+    // --- The private-stream pipeline (M5b-1, private_stream_pipeline.hpp) ----------------------------------------
+    // Everything below is the process's and outlives it. The pipeline creates no thread and opens no connection by
+    // itself: the supervisor connects on hot_tick(), through ws_factory, on this thread.
+    PipelineParts parts{*durable_audit_sink, durable_audit_path, *key_ring, make_durable_order_audit_port(*durable_audit_sink),
+                        audit, kill_switch, position_truth, in_flight, fill_context, user_data_events,
+                        client.clock_publisher(), &rate_limiter};
+    parts.query_port = QueryPort{&query_order_adapter, &client};
+    parts.account_port = account_fetcher.port();
+    parts.rules = PipelineRulesLookup{&registry_rules_for, &registry};
+
+    PipelineConfig pipeline_cfg;
+    // The supervision the public feeds get: reconnect with backoff, a planned rollover well inside the 24 h limit of
+    // a Binance connection, and an end to the run -- exit code 2, not a silent blind loop -- once ten attempts in a
+    // row have failed.
+    pipeline_cfg.feed = make_public_feed_policy(jitter_seed());
+    // Generous caps -- this harness never reaches a real submit (confirmation is never bound), so these do not gate
+    // any real risk; they only need to not spuriously reject the notional a probe computes. The freshness window is
+    // also the one startup recovery judges the account by.
+    pipeline_cfg.exposure_limits.freshness_max_age_ms = 30000;
+    pipeline_cfg.exposure_limits.single_order_notional_cap = 1'000'000'000;
+    pipeline_cfg.exposure_limits.total_exposure_notional_cap = 1'000'000'000;
+
+    auto private_pipeline = std::make_unique<PrivatePipeline>(
+        parts, pipeline_cfg, [&ws_factory](std::uint64_t generation) { return ws_factory(generation); });
+
+    // The store binding: this run's scratch store, bound to the account the EXCHANGE says this key trades as (this
+    // harness is Testnet-only, like the binding above). The verdict gates readiness -- an unbound store never lets the
+    // process become ready -- and a refusal means the process must not run. Nothing has been started yet, so there is
+    // nothing to undo.
+    const EnsureBindingStatus binding_status =
+        private_pipeline->bind_store(StoreEnvironment::Testnet, exchange_uid, reconcile_wall_now_ms());
+    const std::string_view binding_status_text = ensure_binding_status_name(binding_status);
+    std::printf("Store binding: %.*s\n", static_cast<int>(binding_status_text.size()), binding_status_text.data());
+    if (!store_may_be_used(binding_status)) {
+        std::fprintf(stderr, "FATAL: the store binding was refused (%.*s) -- refusing to start.\n",
+                     static_cast<int>(binding_status_text.size()), binding_status_text.data());
+        return 1;
+    }
+    // exchangeInfo is loaded (above) and registry_rules_for answers: recovery may scale what it recovers.
+    private_pipeline->set_exchange_info_loaded(true);
 
     // --- Both public feeds, supervised (批次 6b-0f) --------------------------------------------
     // The io_context needs a work guard: the sessions are created LATER, by the supervisors'
@@ -500,11 +852,6 @@ int main(int argc, char* argv[]) {
     // Derived above from the real rules: the same scale validate_pre_trade() checks against.
     feed_cfg.price_multiplier = price_mult;
     feed_cfg.qty_multiplier = qty_mult;
-    // Real entropy for the two supervisors' reconnect jitter (the pipeline's defaults are fixed seeds).
-    std::random_device entropy;
-    auto jitter_seed = [&entropy]() {
-        return (static_cast<std::uint64_t>(entropy()) << 32) | static_cast<std::uint64_t>(entropy());
-    };
     feed_cfg.kline_policy = make_public_feed_policy(jitter_seed());
     feed_cfg.depth_policy = make_public_feed_policy(jitter_seed());
 
@@ -524,64 +871,92 @@ int main(int argc, char* argv[]) {
     // (public_feed_pipeline.hpp's lifetime contract).
     std::thread io_thread([&ioc]() { ioc.run(); });
 
-    // --- Real KillSwitch (Normal) --------------------------------------------------------------
-    KillSwitch kill_switch;
-    kill_switch.operator_reset();
-    // Private-stream migration M3a: Gate 2b (SubmitReadyToken) needs a readiness. This harness still runs on the retired listenKey stream, so a
-    // connected, swept WS API generation does not exist here; the readiness is the SYNTHETIC one (the real components driven with scripted
-    // observations, synthetic_readiness.hpp). The stream/sweep part of the gate is exercised by the unit tests, NOT by this run (M5 wires the real one).
-    SyntheticReadiness synthetic_readiness(kill_switch);
-
-    // Real DurableAuditSink -- this harness never gets far enough to write an order-lifecycle
-    // record worth persisting (confirmation is never bound), so an ephemeral per-run temp file
-    // (cleaned at shutdown) is appropriate here, unlike a genuine production audit trail.
-    //
-    // DEMO-ONLY, and NOT a recovery path (外部复核 P0-06): a fresh temp log with a fixture KEK can
-    // never contain a previous run's orders, so this process cannot recover anything. Anything that
-    // may submit for real must run startup_recovery.hpp's Bootstrapping -> Recovering ->
-    // Reconciling -> Ready sequence over a PERSISTENT log first (6b-0d builds and tests that; the
-    // 6b-2 harness wires it, once the owner has decided how the audit key is provisioned).
-    const std::string durable_audit_path = durable_audit_temp_path();
-    remove_durable_audit_files(durable_audit_path);
-    std::array<std::byte, kKekSize> kek{};
-    for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x20 + i);
-    // unique_ptr, not stack values -- same "explicit reset() before removing the temp file,
-    // never a manual destructor call on a stack object" discipline as
-    // live_submit_evidence_harness.cpp's own Fixture (a stack DurableAuditSink would double-
-    // destruct if this file ever needed to close it before main() returns, which shutdown does).
-    auto key_ring = std::make_unique<KeyRing>(kek);
-    WrappedKeyRecord key_rec{};
-    key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}},
-                       key_rec);
-    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
-    // SAFE-03 slice 1: a reconcile resolution is made durable on this sink before it reaches memory. Nothing
-    // is ever submitted here, so the ring stays empty today; the publisher is what keeps the drains below
-    // honest the day it does not.
-    ReconcileDurablePublisher reconcile_durable(make_durable_order_audit_port(*durable_audit_sink));
-
-    AccountSnapshot account{};
-
     std::printf("=== Live Submit Preflight Harness (testnet) ===\n");
-    std::printf("Real credentials, real clock sync, real exchangeInfo, real listenKey, real "
-                "depth+kline WS.\n");
+    std::printf("Real credentials, real clock sync, real exchangeInfo, real account read, real WebSocket API private "
+                "stream, real depth+kline WS.\n");
     std::printf("ctx.submit_port is a MOCK, never the real make_binance_submit_port() result -- "
                 "no real network order write is possible from this process.\n");
-    std::printf("Gate 2b (SubmitReadyToken) uses a SYNTHETIC readiness here: this harness has no private WS API stream "
-                "(it still runs on the retired listenKey one), so that part of the gate is NOT exercised by this run.\n");
+    std::printf("Gate 2b (SubmitReadyToken) asks the REAL readiness: the private stream, its sweep, the account and "
+                "startup recovery are live objects here (store binding: %.*s).\n",
+                static_cast<int>(binding_status_text.size()), binding_status_text.data());
     std::printf("Running for %d seconds (Ctrl+C to stop early).\n\n", duration_s);
 
     std::int64_t next_clock_sync_ms = 60'000;
-    std::int64_t next_account_refresh_ms = 0;  // fetch immediately on the first loop iteration
     const std::int64_t loop_start_ms = get_now_ms();
     std::uint64_t poll_ticks = 0;
     std::uint64_t preflight_probes = 0;
     // Starts at the verdict of a pipeline that has not connected yet, so the first change is logged.
     SupervisedFeedInvalidReason last_feed_validity = SupervisedFeedInvalidReason::KlineDisconnected;
 
+    PrivateStreamWatch watch;
+    ProbeCounters probes;
+    // The startup probe (see the header comment): at most three attempts, five seconds apart, until one reaches the confirmation gate.
+    constexpr int kStartupProbeMaxAttempts = 3;
+    int startup_probe_attempts = 0;
+    bool startup_probe_done = false;
+    std::int64_t next_startup_probe_ms = 0;
+
+    // One probe of the order path: the order a suggested action calls for, put into a copy of the pipeline's context
+    // by fill_preflight_order() (which leaves the confirmation unbound and the submit port a mock), asked of
+    // orchestrate_submit(). Returns the gate it stopped at, or nothing when there was nothing to ask (no book yet, or
+    // no order the symbol's rules allow). `origin` says why it ran ("bar" or "startup"); `steady_ms` is the private
+    // stream's clock, the one the account's stamps are in.
+    auto run_probe = [&](SuggestedAction action, const char* origin, std::int64_t steady_ms) -> std::optional<OrchestratorGate> {
+        ++preflight_probes;
+        const auto tob = pipeline->depth_manager().book().top_of_book();
+        if (!tob) {
+            std::printf("  [preflight probe #%" PRIu64 "] (%s) no book yet -- skipping\n", preflight_probes, origin);
+            return std::nullopt;
+        }
+        // Small, fixed preflight-only quantity, rounded up to this symbol's real min_qty_ticks/step_size_ticks --
+        // NOT the final 6b-2 sizing policy (that batch's own plan text: "数量来自一个固定的小额配置上限"), just
+        // enough for pre-trade validation to see a genuinely valid order shape.
+        const std::optional<PreflightProbe> plan = plan_preflight_probe(action, *tob, rules);
+        if (!plan) {
+            std::printf("  [preflight probe #%" PRIu64 "] (%s) no order to ask about (no usable price or quantity) -- skipping\n",
+                        preflight_probes, origin);
+            return std::nullopt;
+        }
+
+        auto ctx = private_pipeline->make_context();
+        PreflightEnvironment env;
+        env.evidence = &verified_evidence.chain();
+        env.rules = &rules;
+        env.base_asset = "BTC";
+        env.quote_asset = "USDT";
+        env.signer_ready = true;
+        env.depth_synced = (pipeline->depth_manager().state() == DepthState::Tracking);
+        env.symbol_id = 0;
+        env.sequence = static_cast<std::uint32_t>(preflight_probes);
+        env.now_ms = steady_ms;
+        env.submit_port = {mock_submit_must_never_be_called, nullptr, mock_current_rules_version};
+        fill_preflight_order(ctx, *plan, env);
+
+        const auto result = orchestrate_submit(ctx);
+        ++probes.total;
+        std::printf("  [preflight probe #%" PRIu64 "] (%s) %s %s price=%" PRId64 " qty=%" PRId64 " -> gate=%s\n",
+                    preflight_probes, origin, action == SuggestedAction::Open ? "OPEN" : "CLOSE",
+                    plan->side == OrderSide::Buy ? "BUY" : "SELL", plan->price_ticks, plan->qty_ticks,
+                    gate_name(result.gate));
+        if (result.gate == OrchestratorGate::OperatorNotConfirmed) {
+            ++probes.at_confirmation_gate;
+        } else {
+            if (result.gate == OrchestratorGate::NotReady) ++probes.not_ready;
+            std::fprintf(stderr,
+                         "  WARN: expected gate=OperatorNotConfirmed, got %s%s%s -- some "
+                         "prerequisite this harness assembles is not yet ready (this can be "
+                         "normal early in the run, e.g. depth/account/stream not synced yet).\n",
+                         gate_name(result.gate), result.gate == OrchestratorGate::NotReady ? " / reason=" : "",
+                         result.gate == OrchestratorGate::NotReady ? not_ready_reason_name(result.not_ready_reason) : "");
+        }
+        return result.gate;
+    };
+
     while (!g_stop.load()) {
         const std::int64_t now_ms = get_now_ms();
-
-        drain_user_data_events(in_flight, &audit, user_data_events, now_ms, &position_truth, &fill_context);
+        // The private stream's clock: milliseconds of the steady clock since ITS epoch -- what the sessions stamp
+        // their activity with and what the account is stamped in. The pipeline's ticks and every probe use it.
+        const std::int64_t steady_ms = PrivateSession::steady_now_ms();
 
         if (now_ms >= next_clock_sync_ms) {
             try {
@@ -597,40 +972,23 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Real account refresh, well inside the 30s freshness window validate_pre_trade()
-        // checks -- a failed fetch just leaves `account` at its last-known (possibly stale)
-        // state, which correctly fails PreTradeFailed rather than fabricating freshness.
-        if (now_ms >= next_account_refresh_ms) {
-            try {
-                AccountSnapshot fetched{};
-                if (client.fetch_account(fetched) == PrivateRestError::None) {
-                    // fetch_account() stamps the snapshot in the exchange-calibrated epoch time base; this
-                    // loop's ctx.now_ms is steady-clock-since-start, so the same assets are re-stamped into
-                    // THIS time base through the builder (it refuses a non-positive stamp: at t=0 the
-                    // previous snapshot stays, which is the fail-closed outcome).
-                    AccountSnapshotBuilder rebuilt(fetched);
-                    AccountSnapshot restamped{};
-                    if (rebuilt.build(now_ms, restamped) == AccountSnapshotError::None) {
-                        account = restamped;
-                    } else {
-                        std::fprintf(stderr, "WARN: account snapshot could not be re-stamped, keeping the previous one\n");
-                    }
-                } else {
-                    std::fprintf(stderr, "WARN: fetch_account() failed, keeping stale snapshot\n");
-                }
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "WARN: fetch_account() threw (%s)\n", e.what());
-            }
-            next_account_refresh_ms = now_ms + 10'000;
-        }
+        // The pipeline's two halves, from this one thread (the REST adapters sign, and the credentials answer only on
+        // the thread that bound them -- see the header comment). The hot half first: it polls the stream's supervisor
+        // (a new generation is signed and started here), applies the account update, advances startup recovery and
+        // drains the rings. Then the reconcile half: the periodic account fetch, and poll_once() with the sweep.
+        const std::int64_t wall_now_ms = reconcile_wall_now_ms();
+        private_pipeline->hot_tick(steady_ms, wall_now_ms);
+        private_pipeline->reconcile_tick(steady_ms, wall_now_ms);
+        watch.poll(*private_pipeline, now_ms);
 
-        keepalive_scheduler.poll(now_ms);
-        drain_user_data_events(in_flight, &audit, user_data_events, now_ms, &position_truth, &fill_context);
-        poll_once(order_tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms,
-                  reconcile_wall_now_ms());
-        drain_reconcile_events(in_flight, &audit, reconcile_events, now_ms, &position_truth, &fill_context,
-                               &reconcile_durable);
-        ws_supervisor.poll(now_ms);
+        // A private stream whose supervisor has given up is not coming back -- nothing reconnects it -- so the run
+        // cannot reach readiness again. Same end as a public feed that gave up: a non-zero exit code.
+        if (private_pipeline->supervisor().state() == FeedState::Terminal) {
+            std::fprintf(stderr, "ALERT: the private stream gave up (%s) -- stopping. Restart to recover.\n",
+                         terminal_reason_name(private_pipeline->supervisor().stats().terminal_reason));
+            exit_code = 2;
+            break;
+        }
 
         // What a live closed bar does. Called by the pipeline, in order, for every bar that reached the
         // evaluator (a backfill after a gap warms the evaluator without calling it).
@@ -652,70 +1010,7 @@ int main(int argc, char* argv[]) {
                 return;
             }
 
-            ++preflight_probes;
-            const auto tob = pipeline->depth_manager().book().top_of_book();
-            if (!tob) {
-                std::printf("  [preflight probe #%" PRIu64 "] no book yet -- skipping\n", preflight_probes);
-                return;
-            }
-            const OrderSide side = (action == SuggestedAction::Open) ? OrderSide::Buy : OrderSide::Sell;
-            const std::int64_t price_ticks = (side == OrderSide::Buy) ? tob->second : tob->first;
-            // Small, fixed preflight-only quantity, rounded up to this symbol's real
-            // min_qty_ticks/step_size_ticks -- NOT the final 6b-2 sizing policy (that batch's own
-            // plan text: "数量来自一个固定的小额配置上限"), just enough for pre-trade validation
-            // to see a genuinely valid order shape.
-            std::int64_t qty_ticks = rules.min_qty_ticks;
-            if (rules.step_size_ticks > 0) {
-                qty_ticks = ((qty_ticks + rules.step_size_ticks - 1) / rules.step_size_ticks) *
-                            rules.step_size_ticks;
-            }
-
-            OrchestratorContext ctx{};
-            ctx.audit = &audit;
-            ctx.kill_switch = &kill_switch;
-            ctx.readiness = &synthetic_readiness.readiness();
-            ctx.evidence = &verified_evidence.chain();
-            ctx.signer_ready = true;
-            ctx.depth_synced = (pipeline->depth_manager().state() == DepthState::Tracking);
-            ctx.rate_limiter = &rate_limiter;
-            ctx.in_flight = &in_flight;
-            ctx.durable_audit = make_durable_order_audit_port(*durable_audit_sink);
-            ctx.symbol_rules = &rules;
-            ctx.account = &account;
-            ctx.side = side;
-            ctx.order_type = OrderType::Limit;
-            ctx.base_asset = "BTC";
-            ctx.quote_asset = "USDT";
-            ctx.now_ms = now_ms;
-            // Generous caps -- this harness never reaches a real submit (confirmation is never
-            // bound), so these do not gate any real risk; they only need to not spuriously
-            // reject the notional this probe computed.
-            ctx.exposure_limits.freshness_max_age_ms = 30000;
-            ctx.exposure_limits.single_order_notional_cap = 1'000'000'000;
-            ctx.exposure_limits.total_exposure_notional_cap = 1'000'000'000;
-            ctx.price_ticks = price_ticks;
-            ctx.qty_ticks = qty_ticks;
-            ctx.symbol_id = 0;
-            ctx.sequence = static_cast<std::uint32_t>(preflight_probes);
-            ctx.mode = ExecutionMode::Live;
-            ctx.order_weight = 1;
-            // ctx.confirmation is left at its default {confirmed=false} -- deliberately never
-            // bound anywhere in this file (see header comment).
-            ctx.submit_port = {mock_submit_must_never_be_called, nullptr, mock_current_rules_version};
-
-            auto result = orchestrate_submit(ctx);
-            std::printf("  [preflight probe #%" PRIu64 "] %s %s price=%" PRId64 " qty=%" PRId64
-                        " -> gate=%s\n",
-                        preflight_probes, action == SuggestedAction::Open ? "OPEN" : "CLOSE",
-                        side == OrderSide::Buy ? "BUY" : "SELL", price_ticks, qty_ticks,
-                        gate_name(result.gate));
-            if (result.gate != OrchestratorGate::OperatorNotConfirmed) {
-                std::fprintf(stderr,
-                             "  WARN: expected gate=OperatorNotConfirmed, got %s -- some "
-                             "prerequisite this harness assembles is not yet ready (this can be "
-                             "normal early in the run, e.g. depth/account not synced yet).\n",
-                             gate_name(result.gate));
-            }
+            (void)run_probe(action, "bar", steady_ms);
         };
 
         // Both public feeds, one call: the kline supervisor is polled, live bars reach on_bar, the
@@ -760,6 +1055,20 @@ int main(int argc, char* argv[]) {
             break;
         }
 
+        // The startup probe (see the header comment): the first moment the private stream is reconciled, startup recovery is Ready and the book
+        // tracks, ask the order path once with an OPEN-shaped order, so a run proves the whole chain without waiting for the strategy to flip.
+        if (!startup_probe_done && startup_probe_attempts < kStartupProbeMaxAttempts && now_ms >= next_startup_probe_ms &&
+            private_pipeline->readiness().barrier().state() == BarrierState::Reconciled &&
+            private_pipeline->recovery().state() == RunState::Ready && pipeline->depth_manager().state() == DepthState::Tracking &&
+            feed.validity == SupervisedFeedInvalidReason::None) {
+            ++startup_probe_attempts;
+            next_startup_probe_ms = now_ms + 5'000;
+            std::printf("[startup probe] the private stream is reconciled, startup recovery is Ready and the book tracks -- "
+                        "asking the order path once\n");
+            const std::optional<OrchestratorGate> gate = run_probe(SuggestedAction::Open, "startup", steady_ms);
+            if (gate && *gate == OrchestratorGate::OperatorNotConfirmed) startup_probe_done = true;
+        }
+
         ++poll_ticks;
         if (duration_s > 0 && (now_ms - loop_start_ms) >= static_cast<std::int64_t>(duration_s) * 1000) {
             break;
@@ -769,32 +1078,24 @@ int main(int argc, char* argv[]) {
 
     // Shutdown order (public_feed_pipeline.hpp's lifetime contract): tell every feed to stop, release
     // the work guard so run() returns once their pending handlers have finished, join the io thread --
-    // and only then may the pipeline go out of scope.
+    // and only then may the pipeline go out of scope. The private stream's supervisor is told the same
+    // way (it stops its session and lets go of it; `watch` still holds the last one for the report).
     pipeline->shutdown();
-    ws_supervisor.shutdown();
+    private_pipeline->supervisor().shutdown();
     ioc_guard.reset();
     if (io_thread.joinable()) io_thread.join();
 
-    const std::int64_t shutdown_now_ms = get_now_ms();
-    drain_reconcile_events(in_flight, &audit, reconcile_events, shutdown_now_ms, &position_truth, &fill_context,
-                           &reconcile_durable);
-    drain_user_data_events(in_flight, &audit, user_data_events, shutdown_now_ms, &position_truth, &fill_context);
-
-    try {
-        client.close_listen_key(listen_key_pub.load().view());
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "WARN: close_listen_key() threw (%s), ignoring on shutdown\n", e.what());
-    }
+    // One last hot pass on this thread, with no session left that could push anything: whatever the stream delivered while
+    // it was stopping is drained (and made durable, or refused) before the report. No reconcile pass: it would start a REST
+    // round trip nobody waits for.
+    private_pipeline->hot_tick(PrivateSession::steady_now_ms(), reconcile_wall_now_ms());
 
     std::printf("\n=== Stats ===\n");
-    std::printf("Reconcile-loop ticks: %" PRIu64 "  preflight probes: %" PRIu64
+    std::printf("Loop ticks: %" PRIu64 "  preflight probes: %" PRIu64
                 "  final holding state: %s\n",
                 poll_ticks, preflight_probes,
                 tracker.state() == HoldingState::Long ? "LONG" : "FLAT");
     std::printf("Audit records written: %zu\n", audit.count());
-    std::printf("Reconcile durable: acked_frames=%" PRIu64 " failed_appends=%" PRIu64 " blocked=%s\n",
-                reconcile_durable.acked_frames(), reconcile_durable.failed_appends(),
-                reconcile_durable.blocked() ? "yes" : "no");
     const DepthManager& depth_mgr = pipeline->depth_manager();
     const auto ds = depth_mgr.stats();
     std::printf("Depth: snapshots=%" PRIu64 " applied=%" PRIu64 " resyncs=%" PRIu64 " final_state=%s\n",
@@ -828,6 +1129,9 @@ int main(int argc, char* argv[]) {
                     kline_stats.ring_overflow_suspended, kline_session->is_suspended() ? "true" : "false");
     }
 
+    print_private_stream_report(*private_pipeline, ws_factory, account_fetcher, kill_switch, watch, probes);
+
+    private_pipeline.reset();    // it points at the store: let go of it first
     durable_audit_sink.reset();  // close before removing the temp file
     key_ring.reset();
     remove_durable_audit_files(durable_audit_path);

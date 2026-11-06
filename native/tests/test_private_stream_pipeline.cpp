@@ -13,6 +13,7 @@
 //   * the wiring: the context the pipeline makes carries every field the private stream needs, and they are the objects the pipeline itself drains with.
 #include <gtest/gtest.h>
 
+#include <hengyuan/preflight_probe.hpp>
 #include <hengyuan/private_stream_pipeline.hpp>
 
 #include <array>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -75,12 +77,13 @@ AccountSnapshot make_snapshot(std::int64_t usdt) {
 struct FakeAccount {
     std::vector<AccountFetchOutcome> outcomes{AccountFetchOutcome::Fetched};  // the last one repeats
     std::size_t calls{0};
+    std::int64_t usdt{1'000};  // the free USDT of the snapshot it delivers
 
     static AccountFetchOutcome call(void* self, AccountSnapshot& out) noexcept {
         auto* a = static_cast<FakeAccount*>(self);
         const std::size_t i = a->calls < a->outcomes.size() ? a->calls : a->outcomes.size() - 1;
         ++a->calls;
-        if (a->outcomes[i] == AccountFetchOutcome::Fetched) out = make_snapshot(1'000);
+        if (a->outcomes[i] == AccountFetchOutcome::Fetched) out = make_snapshot(a->usdt);
         return a->outcomes[i];
     }
     [[nodiscard]] AccountFetchPort port() { return AccountFetchPort{&FakeAccount::call, this}; }
@@ -189,6 +192,7 @@ protected:
     OrderFillContext fill_;
     UserDataWsEventRing user_events_;
     ClockOffsetPublisher clock_;
+    SpotRateLimitTracker limiter_;
     FakeAccount account_;
     FakeExchange exchange_;
     std::vector<std::shared_ptr<FakeSession>> sessions_;
@@ -212,6 +216,7 @@ protected:
         fresh_path();
         g_now = 1'000'000;
         publish_fresh_clock(clock_);
+        ASSERT_TRUE(limiter_.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10));
     }
 
     void TearDown() override {
@@ -248,6 +253,7 @@ protected:
         ASSERT_NE(sink_, nullptr);
         PipelineParts parts{*sink_, path_, *ring_, make_durable_order_audit_port(*sink_), audit_, kill_, truth_, in_flight_, fill_, user_events_,
                             clock != nullptr ? *clock : clock_};
+        parts.rate_limiter = &limiter_;
         parts.query_port = QueryPort{&fake_query, &exchange_};
         parts.account_port = account_.port();
         parts.rules = rules;
@@ -576,6 +582,7 @@ TEST_F(PipelineTest, TheContextCarriesTheWholePrivateStreamWiring) {
     EXPECT_EQ(ctx.audit, &audit_);
     EXPECT_EQ(ctx.kill_switch, &kill_) << "the ONE breaker";
     EXPECT_EQ(ctx.in_flight, &in_flight_);
+    EXPECT_EQ(ctx.rate_limiter, &limiter_) << "the order path charges POST /order to the process's one tracker (Gate 8 refuses every order without it)";
     EXPECT_TRUE(ctx.durable_audit.is_valid());
     EXPECT_NE(ctx.to_reconcile, nullptr);
     EXPECT_NE(ctx.reconcile_events, nullptr);
@@ -618,4 +625,118 @@ TEST_F(PipelineTest, TheTicksAreCountedAndTheHalvesAreIndependent) {
     EXPECT_EQ(pipe_->reconcile_ticks(), 1U);
     EXPECT_EQ(account_.calls, 1U) << "the first reconcile tick fetches at once";
     EXPECT_EQ(sessions_.size(), 1U) << "the reconcile half starts no session";
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// the preflight harness's order path (M5b-1)
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+int g_trap_submit_calls = 0;
+
+SubmitResponse trap_submit(const char*, std::uint32_t, OrderSide, OrderType, std::int64_t, std::int64_t, const SymbolRules&, void*) noexcept {
+    ++g_trap_submit_calls;
+    return SubmitResponse{SubmitOutcome::NetworkError, 0, -1};
+}
+std::uint32_t trap_rules_version(void*) { return 7; }
+
+// The rules the old preflight Fixture used (test_live_submit_preflight_harness.cpp): scales 2/2, a 10-lot step, a notional of 1e8 at the balance scale for
+// price 1000 x quantity 10.
+SymbolRules preflight_rules() {
+    SymbolRules r{};
+    std::snprintf(r.symbol, sizeof(r.symbol), "BTCUSDT");
+    r.is_trading = true;
+    r.rules_version = 7;
+    r.price_scale = 2;
+    r.qty_scale = 2;
+    r.min_price_ticks = 100;
+    r.max_price_ticks = 10'000'000;
+    r.tick_size_ticks = 100;
+    r.min_qty_ticks = 10;
+    r.max_qty_ticks = 1'000'000;
+    r.step_size_ticks = 10;
+    r.min_notional_ticks = 1000;
+    return r;
+}
+
+}  // namespace
+
+// What live_submit_preflight_harness.cpp does with a pipeline: the context comes from make_context(), the order is put in by plan_preflight_probe() +
+// fill_preflight_order() -- the very functions the harness calls -- and orchestrate_submit() must stop at EXACTLY OperatorNotConfirmed. The stream, the sweep, the
+// account (through the port), startup recovery and the store binding all had to hold for it to get that far, and the submit port was never called.
+TEST_F(PipelineTest, APreflightShapedContextStopsAtOperatorNotConfirmed) {
+    account_.usdt = 1'000'000'000;  // headroom over the notional (1e8 at the balance scale)
+    open_sink();
+    build();
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    ASSERT_TRUE(run_until_ready());
+
+    DryRunEvidenceChain evidence;
+    for (int i = 0; i < static_cast<int>(kEvidencePathCount); ++i) evidence.record(static_cast<EvidencePath>(i), g_now, 0xABCDEF01U, 1);
+    ASSERT_TRUE(evidence.live_ready());
+    const SymbolRules rules = preflight_rules();
+    const std::optional<PreflightProbe> plan = plan_preflight_probe(SuggestedAction::Open, {900, 1000}, rules);
+    ASSERT_TRUE(plan.has_value());
+
+    auto ctx = pipe_->make_context();
+    ctx.exposure_limits.single_order_notional_cap = 1'000'000'000;  // the harness configures these on the PipelineConfig; this fixture's config carries a tiny one
+    ctx.exposure_limits.total_exposure_notional_cap = 1'000'000'000;
+    PreflightEnvironment env;
+    env.evidence = &evidence;
+    env.rules = &rules;
+    env.base_asset = "BTC";
+    env.quote_asset = "USDT";
+    env.signer_ready = true;
+    env.depth_synced = true;
+    env.symbol_id = 1;
+    env.sequence = 1;
+    env.now_ms = g_now;
+    env.submit_port = {&trap_submit, nullptr, &trap_rules_version};
+    fill_preflight_order(ctx, *plan, env);
+
+    g_trap_submit_calls = 0;
+    const OrchestratorResult result = orchestrate_submit(ctx);
+    EXPECT_EQ(result.gate, OrchestratorGate::OperatorNotConfirmed) << "reason " << not_ready_reason_name(result.not_ready_reason) << ", pre-trade "
+                                                                    << static_cast<int>(result.pre_trade_detail);
+    EXPECT_EQ(result.ready_generation, pipe_->supervisor().generation()) << "the token the order path got rests on the live generation";
+    EXPECT_EQ(g_trap_submit_calls, 0) << "the confirmation is unbound: nothing can be submitted";
+}
+
+// The same context before the stream is up: the readiness gate refuses it, and still nothing is submitted. (The negative control of the test above: the
+// OperatorNotConfirmed there is not what a chain that would stop early regardless produces.)
+TEST_F(PipelineTest, APreflightShapedContextBeforeTheStreamIsUpIsRefusedAtTheReadinessGate) {
+    account_.usdt = 1'000'000'000;
+    open_sink();
+    build();
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+
+    DryRunEvidenceChain evidence;
+    for (int i = 0; i < static_cast<int>(kEvidencePathCount); ++i) evidence.record(static_cast<EvidencePath>(i), g_now, 0xABCDEF01U, 1);
+    const SymbolRules rules = preflight_rules();
+    const std::optional<PreflightProbe> plan = plan_preflight_probe(SuggestedAction::Open, {900, 1000}, rules);
+    ASSERT_TRUE(plan.has_value());
+
+    auto ctx = pipe_->make_context();
+    ctx.exposure_limits.single_order_notional_cap = 1'000'000'000;
+    ctx.exposure_limits.total_exposure_notional_cap = 1'000'000'000;
+    PreflightEnvironment env;
+    env.evidence = &evidence;
+    env.rules = &rules;
+    env.base_asset = "BTC";
+    env.quote_asset = "USDT";
+    env.signer_ready = true;
+    env.depth_synced = true;
+    env.symbol_id = 1;
+    env.sequence = 1;
+    env.now_ms = g_now;
+    env.submit_port = {&trap_submit, nullptr, &trap_rules_version};
+    fill_preflight_order(ctx, *plan, env);
+
+    g_trap_submit_calls = 0;
+    const OrchestratorResult result = orchestrate_submit(ctx);
+    EXPECT_EQ(result.gate, OrchestratorGate::NotReady) << "nothing is up yet";
+    EXPECT_EQ(g_trap_submit_calls, 0);
 }

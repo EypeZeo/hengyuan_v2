@@ -299,8 +299,26 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     刷新器 / 持有者 / `sweep_step(` / `sweep_probe(` 只出现在 `account_refresh.hpp` 和流水线里，且流水线的接法逐字钉住（作业拿刷新器的步骤、泵拿持有者的探针、两者共用一个环）；影子计数的生产调用方只有流水线一处；
     `OrchestratorContext` 的生产构造点多一处（流水线，`readiness` 取它自己拥有的那个）；迟到成交告警只有流水线造一个，从存储的 `recovered_operator_resolved()` 列表与总数和进程唯一的 `KillSwitch` 造出，上下文的 `kill_switch` 是同一个；
     存储绑定的写侧只有流水线包含。
-  - **未接线**：没有任何进程创建流水线（M5b 的线束迁移才会）；真实 WS 会话在回环服务端上被证明过，对真实交易所没有证明过。
+  - **接线的状态**：M5a-2b 时没有任何进程创建流水线；M5b-1 起预检线束创建它（见下一条）。真实 WS 会话在回环服务端上被证明过，对真实交易所没有证明过——那是 Owner 的 Testnet 联调。
   - **证据**：test_private_stream_pipeline.cpp（18 例，脚本化的会话 + 真实持久存储 + 真实屏障 / 恢复 / 清扫 / 发布者：从无到令牌逐步断言；业务上下文通过就绪门；没有存储绑定、没有 exchangeInfo、没有流、没有新鲜时钟、存储未打开、存储已栅栏、清扫的账户被拒、账户过期各自都让进程不就绪或降级；绑定每次重新判定且记录时刻，被拒的绑定让一个完美的进程出局；未完成的订单被恢复、排队、被询问，直到交易所回答才就绪（成交进 PositionTruth、槽位释放、审计记录用 tick 的时钟）；规则查询没接则失败关闭；上下文带着配置的限额承载整套接线；两半互相独立）、test_private_stream_pipeline_loopback.cpp（3 例，真实 WS API 会话 + 真实工厂 + 真实监督器对本地 TLS WebSocket 服务端：签了名的订阅经 TLS 走到令牌；连接被掐断后出局，重新签名、重新清扫的下一代把它带回；线上来的执行报告被流水线的排空取走）、test_private_stream_pipeline_concurrency.cpp（2 例，两个真实线程各跑一半，在 TSan 与 ARM64 清单里，第二例让对账线程问交易所、热线程把回答写成持久帧，重启后日志里没有未完成订单）、三个守卫文件里更新的钉子。MSVC（/W4 /WX）全量构建零警告零错误，全量 ctest 3525 个用例：3522 通过、2 个按设计禁用、1 个既有的跳过、0 失败；WSL2 GCC-14：none 20 个受影响目标 758 例、address（ASan+UBSan）17 个目标 592 例全绿，官方 thread 层 216/216（含新的两线程流水线测试），三个负控照常报数据竞争；变异检查 40 个变异体（流水线 38、抽出的排空 2）：37 个被杀死，3 个等价或不可触发——PL13、PL14（多算或早算一次影子计数：恢复前后、就绪后都数不出任何东西）、PL08（扫描状态恒为干净：扫描失败的存储同时被栅栏，流水线另外读栅栏）；两个 canary 先于其余运行，都由语义测试杀死；变异设计催生了两条测试（时钟从未发布、存储未打开）和三处断言（绑定记录的时刻、排空用的 tick 时钟、上下文带着配置的限额）；gtest 发现步骤的偶发超时（构建环境的已知抖动）重跑后判定。
+
+- 预检线束迁到私网流流水线（私网流迁移 M5b-1，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.7；Owner 2026-11-05 “开始 M5b，按推荐” 覆盖；Tier B；PR 待合并）— `live_submit_preflight_harness.cpp`
+  由 listenKey 加合成就绪迁到 `PrivateStreamPipeline<BinanceWsApiUserDataSession>`：它是流水线的**第一个生产创建方**，Gate 2b 第一次问到真实的就绪（真实的屏障、恢复、账户与存储绑定）。
+  - **启动次序**：时钟同步 → exchangeInfo → 注册表刷新 → `fetch_exchange_account_uid()` → 会话工厂与流水线 → `bind_store(Testnet, uid, 墙钟)`，被拒绝则进程不启动（此时没有任何东西需要撤销）→ `set_exchange_info_loaded(true)`
+    → 公共行情流水线与 io 线程 → 循环。线束里的 ScratchStoreCleanup（一个小 RAII 类）让任何一条退出路径都删掉临时存储（含 `.binding*` 四个文件）。账户 uid 只打印位数。
+  - **一个循环线程**：每圈先 `hot_tick(steady)`、再 `reconcile_tick(steady)`，时钟是会话的稳定时钟（账户盖章也用它，`ctx.now_ms` 同一个）；60 秒一次的 `sync_clock()` 仍在这个线程上。REST 客户端、会话工厂和下单路径共用这个线程和**一个**限流追踪器。
+    工厂要自己的 `BoundHmacCredentials`（客户端拥有第一份），所以从同一个仍受保护的加载器在同一线程上再绑一次。监督策略与公共行情相同（`make_public_feed_policy()`：23 小时计划轮换，连续失败十次则终止、线束以退出码 2 结束）。
+  - **安全性质不变，且第一次可测**：`ctx.submit_port` 始终是 mock，`ctx.confirmation` 永不绑定。订单只经 `preflight_probe.hpp` 进入上下文——`plan_preflight_probe()`（开仓 = 以卖一价买，平仓 = 以买一价卖；价格非正、动作不是开平仓、
+    规则给不出数量则不探）、`preflight_quantity_ticks()`（`min_qty_ticks` 向上取整到步长，**带溢出检查**；原来的内联写法没有）、`fill_preflight_order()`（把确认重置为默认、安装给定的 mock 端口，不碰流水线接好的线）。
+    新守卫（`test_submit_readiness_guard.cpp` +2）：哪些生产文件可以提到 `ctx.confirmation` / `ctx.submit_port` 是一张带计数的短名单，线束不在其中；线束里唯一的 `.submit_port` 赋值是 mock，`fill_preflight_order(` 与
+    `orchestrate_submit(` 各一处，真实端口只用于诊断打印。线束从守卫的上下文表（kContexts）、合成就绪使用者名单（kSyntheticUsers）、用户数据排空表（kUserDataDrains）与 `test_reconcile_durable_guard.cpp` 的排空钉子里撤出（它不再按类型名构造上下文，也不再自己排空）。
+  - **启动探针**：1h 的策略很少翻转，一次不探的运行什么也证明不了；屏障 Reconciled、恢复 Ready、深度在跟踪、公共行情有效的第一刻，线束自己问一次链（开仓形，最多三次、间隔五秒，直到停在 `OperatorNotConfirmed`）。
+    每个探针（无论来源）在确认门之前都会往临时存储写一帧 Intent（Gate 10b，真实的持久路径），存储退出时删除。
+  - **联调报告**：运行中，监督器状态、代次、是否已验证、屏障或恢复状态每变一次打一行；一代结束时打一行它的结束原因、失败阶段、订阅应答与 `session.subscriptions` 的状态和错误码、retryAfter、事件与错误计数；
+    退出时打印 `=== Private stream joint-run report ===`（存储绑定、恢复、屏障计数、清扫的作业与泵、账户的持有者 / 刷新器 / REST、监督器、工厂、最后一代会话、就绪拒绝按原因分列、持久发布者、迟到成交告警与熔断、探针结果），
+    最后一行 `joint-run criteria: reconciled_once / account_refreshed_by_sweep / recovery_ready / probe_reached_OperatorNotConfirmed / all_met`。
+  - **未做 / 留给后面**：Owner 的 Testnet 联调本身（AI 会话不运行它）；L-39（从未登录的连接上的 `session.subscriptions`）与签名订阅所需的权限仍是未验证项，联调是它们的证据；独立的对账线程（L-53）；listenKey 整套的退役（M5b-2）。
+  - **证据**：test_preflight_probe.cpp（16 例：数量取整——恰在步长网格上、向上取整、无步长、坏规则无量、溢出无量与恰好落在最后一个能表示的网格点；计划——开仓以卖一买、平仓以买一卖、无动作与枚举外的值、价格非正、各动作只看自己那一侧、没有数量的品种；填充——订单与环境进入上下文、环境的两个标志就是上下文的标志、流水线接好的线不动、被绑定的确认被整个重置、另一个提交端口被换成 mock）、test_private_stream_pipeline.cpp（+2 例，并给 “上下文承载限流追踪器” 加了断言：真实就绪之后带订单的上下文停在 EXACTLY OperatorNotConfirmed、令牌的代次是在线的那一代、提交端口从未被调用；流不在线时同一个上下文停在 NotReady）、test_live_submit_preflight_harness.cpp 的夹具改用同样的两个函数（7 例原样通过；顺带修了它的全局陷阱计数器——原来一个走到提交端口的测试会给同一进程里之后跑的每个测试留下 1，--gtest_shuffle / --gtest_repeat 下后者的 “从未被调用” 断言就失败，现在每个夹具重置它，100 次洗牌重复全过）、test_submit_readiness_guard.cpp（+2 例，线束撤出三张表）、test_reconcile_durable_guard.cpp 与 test_operator_resolution_guard.cpp 的钉子随之更新。MSVC（/W4 /WX，Release）全量构建零警告零错误，全量 ctest 3554 个登记用例：3551 通过、2 个按设计禁用、1 个既有的跳过、0 失败（第一次跑只登记了 3438 个：gtest 的“发现”步骤在 ALL_BUILD 与 WSL 构建并行的负载下静默地只登记了 5 个目标的一部分测试，逐目标核对 `--gtest_list_tests` 并重新发现后重跑）；WSL2 GCC-14（-Wall -Wextra -Wconversion）：none 与 address（ASan+UBSan）各 11 个受影响目标 239 例全绿，线束本身在两层下都编译通过；官方 thread 层没有跑——本片不改任何并发代码。变异检查 52 个变异体（preflight_probe.hpp 38、线束源码 10、流水线上下文接线 4）：全部被杀死、0 个存活；PP26 因 /WX 编译不过（OrderType 只有一个枚举值），改写为 PP26b 后杀死；H10（线束自己 poll_once）第一轮存活，补守卫断言后杀死；E01（上下文丢掉限流追踪器）只有本片的端到端测试能杀死——M5a 的接线测试原先没有钉住的一处。tools/spec_xref_check.py、spec_enum_diff.py、concurrency_targets_check.py 通过；closure_ledger_check.py 原有 13 个发现（线束推翻了十一个条目里 “没有程序运行 StartupRecovery / SweepJob” 的断言），按账本 2026-11-05 M5b-1 备注处理后 0 个发现（状态、结果、门禁结论不变）。
 
 ### 容量 / 生命周期
 

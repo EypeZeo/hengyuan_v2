@@ -18,16 +18,28 @@
 // KillSwitch/DryRunEvidenceChain/SpotRateLimitTracker/InFlightRegistry/KeyRing/DurableAuditSink
 // construction) -- the one deliberate difference is this Fixture never calls
 // bind_confirmation(), which is the entire point of this test.
+//
+// Since M5b-1 the preflight harness gets its wiring (audit, kill switch, readiness, rate limiter,
+// in-flight registry, durable ports, account, exposure limits) from PrivateStreamPipeline::
+// make_context() and puts the ORDER in through plan_preflight_probe() + fill_preflight_order()
+// (preflight_probe.hpp); this Fixture does the second half with those very functions. The first
+// half is set by hand here, with the SYNTHETIC readiness (real barrier and startup recovery driven
+// by scripted observations) standing in for the pipeline's: the chain with the pipeline's own
+// readiness -- a signed subscription over TLS, a real sweep, a real account fetch through a port --
+// is test_private_stream_pipeline.cpp's APreflightShapedContextStopsAtOperatorNotConfirmed.
 
 #include <gtest/gtest.h>
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/preflight_probe.hpp>
 #include <hengyuan/synthetic_readiness.hpp>
 
 #include <array>
 #include <cstring>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -105,6 +117,9 @@ struct Fixture {
     std::unique_ptr<DurableAuditSink> durable_audit_sink;
 
     explicit Fixture(std::uint32_t rules_version = 7) {
+        // The trap counter is a global: without this a test that reaches the port (BindingConfirmationReachesSubmitPort) leaves 1 behind for every test that runs
+        // after it in the same process (--gtest_shuffle, --gtest_repeat), which then fails its "never called" assertion for a reason that has nothing to do with it.
+        g_submit_call_count.store(0, std::memory_order_relaxed);
         audit.set_available(true);
         kill_switch.operator_reset();
         rate_limiter.configure(/*weight*/ 6000, 500, /*raw*/ 60000, 5000, /*orders*/ 100, 10);
@@ -146,38 +161,40 @@ struct Fixture {
 
         g_rules_version_for_test = rules_version;
 
+        // The wiring (what the harness takes from PrivateStreamPipeline::make_context()).
         ctx.audit = &audit;
         ctx.kill_switch = &kill_switch;
         ctx.readiness = &synthetic_readiness.readiness();
-        ctx.evidence = &evidence;
-        ctx.signer_ready = true;
-        ctx.depth_synced = true;
         ctx.rate_limiter = &rate_limiter;
         ctx.in_flight = &in_flight;
-        ctx.symbol_rules = &rules;
         ctx.account = &account;
-        ctx.side = OrderSide::Buy;
-        ctx.order_type = OrderType::Limit;
-        ctx.base_asset = "BTC";
-        ctx.quote_asset = "USDT";
         ctx.now_ms = 1000;
         ctx.exposure_limits.freshness_max_age_ms = 30000;
         // Both caps sized with headroom over the 1e8 rescaled notional (see the account setup
         // comment above for the derivation).
         ctx.exposure_limits.single_order_notional_cap = 1'000'000'000;
         ctx.exposure_limits.total_exposure_notional_cap = 1'000'000'000;
-        ctx.price_ticks = 1000;
-        ctx.qty_ticks = 10;
-        ctx.symbol_id = 1;
-        ctx.sequence = 1;
-        // Live, matching live_submit_preflight_harness.cpp's own ctx.mode -- this Fixture is
-        // proving the same gate-chain recipe that harness uses, not a DryRun-mode scenario.
-        ctx.mode = ExecutionMode::Live;
-        ctx.order_weight = 1;
-        // Mock, but reachable-and-consistent (matching the plan's own requirement that this
-        // harness proves the chain reaches "just missing confirmation", not "fails earlier for
-        // an unrelated reason like a stale rules_version mismatch").
-        ctx.submit_port = {trap_submit_must_never_be_called, nullptr, trap_current_rules_version};
+
+        // The order, put in by the very functions the harness calls: an OPEN against a book
+        // whose best ask is 1000 (the price this Fixture always used), the smallest quantity
+        // the rules allow, the confirmation left unbound, and a submit port that is a mock --
+        // reachable-and-consistent (the chain must reach "just missing confirmation", not fail
+        // earlier for an unrelated reason like a stale rules_version mismatch), live in mode,
+        // matching live_submit_preflight_harness.cpp's own ctx.mode.
+        const std::optional<PreflightProbe> plan = plan_preflight_probe(SuggestedAction::Open, {900, 1000}, rules);
+        if (!plan) throw std::logic_error("the Fixture's rules produce no preflight probe");
+        PreflightEnvironment env;
+        env.evidence = &evidence;
+        env.rules = &rules;
+        env.base_asset = "BTC";
+        env.quote_asset = "USDT";
+        env.signer_ready = true;
+        env.depth_synced = true;
+        env.symbol_id = 1;
+        env.sequence = 1;
+        env.now_ms = ctx.now_ms;
+        env.submit_port = {trap_submit_must_never_be_called, nullptr, trap_current_rules_version};
+        fill_preflight_order(ctx, *plan, env);
 
         // Pre-seed all 4 evidence paths within THIS SAME long-lived chain instance -- matching
         // 批次 6 计划's own emphasis that Gate 3 needs one persistent chain, not a fresh one per
