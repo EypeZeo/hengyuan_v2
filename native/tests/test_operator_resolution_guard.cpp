@@ -1138,6 +1138,41 @@ TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
     }
 }
 
+TEST(OperatorResolutionGuard, TheAccountAssetScopeIsDeclaredByTheTradingSideOnlyAndNeverByTheTool) {
+    // A scope narrows what a fetch KEEPS of the account (account_truth.hpp::AccountAssetScope, L4 spec 4.3, the first Testnet joint run): the process that
+    // reads balances for its pre-trade check declares the assets it trades, once, before its first account read. That is a decision about risk data, so
+    // who makes it is pinned: today the preflight harness alone. The operator tool never builds a snapshot at all (fetch_account_raw -> summarize_account:
+    // the uid and the order, as the exchange answers them), so it has no use for a scope and must not grow one.
+    expect_named_only_in("set_account_scope", {{kClient, 1, "the definition"},
+                                               {kPreflightHarness, 1, "the harness's one declaration, before its first account read (the uid read)"}});
+    for (const char* f : kOperatorFiles) {
+        const SourceFile* src = find_source(f);
+        ASSERT_NE(src, nullptr) << f;
+        for (const char* name : {"set_account_scope", "AccountAssetScope", "AccountParseReport"}) {
+            EXPECT_EQ(count_identifier(src->code, name), 0u) << f << " names " << name << ": the operator tool reads the account raw and never builds a snapshot";
+        }
+    }
+    const SourceFile* harness = find_source(kPreflightHarness);
+    ASSERT_NE(harness, nullptr);
+    const auto declarations = call_args(harness->code, "set_account_scope");
+    ASSERT_EQ(declarations.size(), 1u);
+    EXPECT_EQ(declarations[0], (std::vector<std::string>{"account_scope"}));
+    // the scope is made of the two assets the order path checks (the probe's base and quote asset), nothing else
+    const auto adds = call_args(harness->code, "account_scope.add");
+    ASSERT_EQ(adds.size(), 2u);
+    EXPECT_EQ(adds[0], (std::vector<std::string>{"kProbeBaseAsset"}));
+    EXPECT_EQ(adds[1], (std::vector<std::string>{"kProbeQuoteAsset"}));
+    // the probe's environment names the very same two assets: what the order path checks is what the scope kept
+    EXPECT_NE(harness->code.find("env.base_asset = kProbeBaseAsset;"), std::string::npos);
+    EXPECT_NE(harness->code.find("env.quote_asset = kProbeQuoteAsset;"), std::string::npos);
+    // and the declaration comes before the first account read in the text (the uid read is the first one)
+    const std::size_t declared_at = harness->code.find("set_account_scope");
+    const std::size_t first_read_at = harness->code.find("fetch_exchange_account_uid");
+    ASSERT_NE(declared_at, std::string::npos);
+    ASSERT_NE(first_read_at, std::string::npos);
+    EXPECT_LT(declared_at, first_read_at) << "an account read before the declaration would be an unscoped read";
+}
+
 TEST(OperatorResolutionGuard, TheBindingIsReadByTheToolOnceAndJudgedByTheFlowOnceAfterTheAccountCheck) {
     expect_named_only_in("read_store_binding",
                          {{kBinding, 1, "the definition"},

@@ -221,6 +221,76 @@ struct AssetBalanceInput {
     return builder.build(timestamp_ms, out);
 }
 
+// --- Account asset scope (joint-run finding, 2026-11-06; L4 spec 4.3) ---
+//
+// The assets a process DECLARES it needs balances of: the base and quote asset of every symbol it trades. validate_pre_trade() below reads exactly
+// two of them (the quote asset of a Buy, the base asset of a Sell); nothing else in the snapshot is consulted by any gate.
+//
+// Why it exists: GET /api/v3/account lists every asset the account holds, and the Spot Testnet funds a new account in ALL of them (517 non-zero
+// balances on the first joint run, a few with non-ASCII names). A snapshot holds kMaxAssets (32) assets whose names are kAssetNameLen - 1 printable
+// ASCII bytes at most, and the original contract (spec 4.3) was all-or-fail: more non-zero assets than that, or one name the snapshot cannot hold,
+// failed the whole fetch -- so such an account could never be read at all. With a scope the parser converts, name-checks and stores ONLY the declared
+// assets (every one of them with the full strictness of before) and COUNTS the rest (AccountParseReport, binance_private_rest.hpp) instead of
+// converting them: nothing is dropped silently, and a declared asset can never be skipped, because skipping is decided by the declared name alone.
+//
+// An EMPTY scope is "no scope declared": the parser keeps the original contract. The scope is fixed-capacity (no heap), stores its names by value and
+// is trivially copyable. Names are validated like AccountSnapshotBuilder::add_asset() validates them, so a declared name can always be stored.
+class AccountAssetScope {
+public:
+    static constexpr std::size_t kCapacity = 16;
+
+    constexpr AccountAssetScope() noexcept = default;
+
+    // Declares one asset. False -- and the scope is unchanged -- for a name that is empty, not shorter than kAssetNameLen bytes, not printable ASCII
+    // (0x21..0x7E), already declared, or when kCapacity names are declared already. Never truncates.
+    [[nodiscard]] constexpr bool add(std::string_view name) noexcept {
+        if (name.empty() || name.size() >= kAssetNameLen) return false;
+        for (const char c : name) {
+            const auto b = static_cast<unsigned char>(c);
+            if (b < 0x21 || b > 0x7E) return false;
+        }
+        if (contains(name)) return false;
+        if (count_ >= kCapacity) return false;
+        for (std::size_t i = 0; i < name.size(); ++i) names_[count_][i] = name[i];
+        lens_[count_] = static_cast<std::uint8_t>(name.size());
+        ++count_;
+        return true;
+    }
+
+    [[nodiscard]] constexpr bool active() const noexcept { return count_ > 0; }
+    [[nodiscard]] constexpr std::size_t size() const noexcept { return count_ < kCapacity ? count_ : kCapacity; }
+
+    // The whole name, exactly (case-sensitive; a prefix or an extension is not a match).
+    [[nodiscard]] constexpr bool contains(std::string_view name) const noexcept {
+        const std::size_t n = size();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (name_at(i) == name) return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] constexpr std::string_view name_at(std::size_t i) const noexcept {
+        if (i >= size()) return {};
+        const std::size_t len = lens_[i] < kAssetNameLen ? lens_[i] : kAssetNameLen - 1;
+        return {names_[i].data(), len};
+    }
+
+private:
+    std::array<std::array<char, kAssetNameLen>, kCapacity> names_{};
+    std::array<std::uint8_t, kCapacity> lens_{};
+    std::size_t count_{0};
+};
+
+// What the account parser saw in one accepted answer (binance_private_rest.hpp). Every balances[] entry of an accepted answer passed the schema check,
+// so entries == represented + zero_balances + out_of_scope.
+struct AccountParseReport {
+    std::uint32_t entries{0};        // balances[] entries in the answer
+    std::uint32_t represented{0};    // non-zero assets stored in the snapshot
+    std::uint32_t zero_balances{0};  // converted entries whose free and locked are both zero (they take no slot)
+    std::uint32_t out_of_scope{0};   // entries outside the declared scope: counted, not converted, not name-checked, not stored (0 without a scope)
+    bool scoped{false};              // a scope was declared for this parse
+};
+
 // --- Freshness gate ---
 
 enum class FreshnessStatus : std::uint8_t {

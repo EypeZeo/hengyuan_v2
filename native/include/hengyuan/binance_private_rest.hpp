@@ -210,11 +210,19 @@ inline bool parse_server_time_response(std::string_view body,
 // anything is parsed (0 is the "never fetched" value, only a default snapshot has it).
 namespace detail {
 
-// The body of both parse_account_response() overloads. `uid_out`, when given, makes the "uid" field REQUIRED (a positive integer; 0 is "no
+// The body of every parse_account_response() overload. `uid_out`, when given, makes the "uid" field REQUIRED (a positive integer; 0 is "no
 // account" for the store binding) and is assigned only on total success, like `out`.
+//
+// `scope`, when given and non-empty (account_truth.hpp::AccountAssetScope, spec 4.3 "declared scope"): a balances[] entry whose asset is NOT in it
+// is counted and otherwise left alone -- no decimal conversion, no name check, no slot -- while every entry, in scope or not, still has to be an
+// object with the three string fields (4.1: the shape of the answer is judged whole). Every in-scope entry is judged exactly as before. Without a
+// scope (nullptr or empty) the original all-or-fail contract holds: every non-zero asset must be representable. `report`, when given, is assigned
+// only on total success, like `out`.
 inline PrivateRestError parse_account_response_impl(std::string_view body, std::int64_t timestamp_ms, AccountSnapshot& out,
-                                                    std::uint64_t* uid_out) {
+                                                    std::uint64_t* uid_out, const AccountAssetScope* scope = nullptr,
+                                                    AccountParseReport* report = nullptr) {
     if (timestamp_ms <= 0) return PrivateRestError::ClockNotFresh;
+    const bool scoped = scope != nullptr && scope->active();
 
     auto padded = simdjson::padded_string(body);
     simdjson::ondemand::parser parser;
@@ -240,6 +248,10 @@ inline PrivateRestError parse_account_response_impl(std::string_view body, std::
     AccountSnapshotBuilder builder;
     builder.set_can_trade(can_trade);
 
+    // The answer is bounded by the SignedJson response cap (256 KiB, transport_policy.hpp), a few thousand entries at most: 32 bits cannot wrap.
+    AccountParseReport counts{};
+    counts.scoped = scoped;
+
     for (auto entry_result : balances) {
         simdjson::ondemand::object entry;
         if (entry_result.get_object().get(entry) != simdjson::SUCCESS) {
@@ -256,6 +268,15 @@ inline PrivateRestError parse_account_response_impl(std::string_view body, std::
         if (entry["locked"].get_string().get(locked_sv) != simdjson::SUCCESS) {
             return PrivateRestError::MalformedResponse;
         }
+        ++counts.entries;
+
+        // An asset the caller did not declare (AccountAssetScope): counted, never converted, name-checked or stored. The decision is made on the
+        // name alone, so a declared asset cannot be skipped by anything else about its entry, and an undeclared one cannot fail the fetch by being
+        // unrepresentable (a name the snapshot cannot hold, a balance past int64, a 33rd slot) -- which is the whole point.
+        if (scoped && !scope->contains(asset_sv)) {
+            ++counts.out_of_scope;
+            continue;
+        }
 
         std::int64_t free_ticks = 0, locked_ticks = 0;
         if (!parse_balance_decimal_to_ticks(free_sv, free_ticks)) {
@@ -269,17 +290,22 @@ inline PrivateRestError parse_account_response_impl(std::string_view body, std::
         // raw string) so this is correct regardless of which zero spelling Binance sends
         // ("0", "0.0", "0.00000000", ...), not just the one example spelling the spec text
         // happens to use.
-        if (free_ticks == 0 && locked_ticks == 0) continue;
+        if (free_ticks == 0 && locked_ticks == 0) {
+            ++counts.zero_balances;
+            continue;
+        }
 
         // The builder refuses an empty, overlong (it never truncates into the fixed buffer: that
         // would misattribute this balance to an ambiguous/wrong asset), unprintable or duplicate
         // name and a negative or overflowing balance -- all of them MalformedResponse, same
         // philosophy as every other check in this function. §4.3: more nonzero-balance assets than
         // kMaxAssets -> reject the whole fetch (CapacityExceeded), never silently truncate to the
-        // first kMaxAssets entries.
+        // first kMaxAssets entries. (With a declared scope only the declared assets get here: at most
+        // AccountAssetScope::kCapacity of them, so the capacity cannot be the reason any more.)
         const AccountSnapshotError add_err = builder.add_asset(asset_sv, free_ticks, locked_ticks);
         if (add_err == AccountSnapshotError::CapacityExceeded) return PrivateRestError::CapacityExceeded;
         if (add_err != AccountSnapshotError::None) return PrivateRestError::MalformedResponse;
+        ++counts.represented;
     }
 
     AccountSnapshot built{};
@@ -288,6 +314,7 @@ inline PrivateRestError parse_account_response_impl(std::string_view body, std::
     }
     out = built;
     if (uid_out != nullptr) *uid_out = uid;
+    if (report != nullptr) *report = counts;
     return PrivateRestError::None;
 }
 
@@ -300,6 +327,19 @@ inline PrivateRestError parse_account_response(std::string_view body, std::int64
 // The same, and the account's uid as well (the "uid" field is required here). Both outputs are left UNCHANGED on every failure path.
 inline PrivateRestError parse_account_response(std::string_view body, std::int64_t timestamp_ms, AccountSnapshot& out, std::uint64_t& uid_out) {
     return detail::parse_account_response_impl(body, timestamp_ms, out, &uid_out);
+}
+
+// The same with a declared asset scope (account_truth.hpp::AccountAssetScope; an empty scope is "none declared"): only the declared assets are
+// converted and stored, the others are counted into `report` (when given). `out` and `report` are left UNCHANGED on every failure path.
+inline PrivateRestError parse_account_response(std::string_view body, std::int64_t timestamp_ms, AccountSnapshot& out, const AccountAssetScope& scope,
+                                               AccountParseReport* report = nullptr) {
+    return detail::parse_account_response_impl(body, timestamp_ms, out, nullptr, &scope, report);
+}
+
+// Scope and uid together. `out`, `uid_out` and `report` are left UNCHANGED on every failure path.
+inline PrivateRestError parse_account_response(std::string_view body, std::int64_t timestamp_ms, AccountSnapshot& out, std::uint64_t& uid_out,
+                                               const AccountAssetScope& scope, AccountParseReport* report = nullptr) {
+    return detail::parse_account_response_impl(body, timestamp_ms, out, &uid_out, &scope, report);
 }
 
 // TODO 1A.4: listenKey is a ~60-char alphanumeric token; 128 is generous headroom without being
@@ -1417,6 +1457,22 @@ public:
         return fetch_account_impl(out, &uid, cfg);
     }
 
+    // Declares the assets balances are wanted for (account_truth.hpp::AccountAssetScope, L4 spec 4.3): the base and quote asset of every symbol this
+    // process trades. Every fetch_account() from now on converts and stores only those (each with the full strictness of an unscoped fetch) and counts
+    // the rest (last_account_report()); without a declaration the original all-or-fail contract holds, and an account that holds more non-zero assets
+    // than a snapshot can (the Spot Testnet funds every asset) is refused whole. Call once at startup, before the first fetch_account(), on the thread
+    // that owns this client (the class is not thread-safe). An EMPTY scope is refused: false, and the client stays as it was.
+    [[nodiscard]] bool set_account_scope(const AccountAssetScope& scope) noexcept {
+        if (!scope.active()) return false;
+        account_scope_ = scope;
+        return true;
+    }
+    [[nodiscard]] const AccountAssetScope& account_scope() const noexcept { return account_scope_; }
+
+    // What the most recent SUCCESSFUL fetch_account() saw: entries, stored, zero and out-of-scope counts. All zero until one succeeded; a failed fetch
+    // leaves it untouched, like it leaves `out`.
+    [[nodiscard]] const AccountParseReport& last_account_report() const noexcept { return last_account_report_; }
+
 private:
     PrivateRestError fetch_account_impl(AccountSnapshot& out, std::uint64_t* uid_out, const PrivateRestConfig& cfg) {
         // The same entry guards as every sibling method. fetch_account() used to be the one public
@@ -1477,11 +1533,14 @@ private:
 
         AccountSnapshot parsed{};
         std::uint64_t parsed_uid = 0;
+        AccountParseReport report{};
         const PrivateRestError perr = detail::parse_account_response_impl(std::get<std::string>(outcome), clock_token->server_ms(), parsed,
-                                                                          uid_out != nullptr ? &parsed_uid : nullptr);
+                                                                          uid_out != nullptr ? &parsed_uid : nullptr,
+                                                                          account_scope_.active() ? &account_scope_ : nullptr, &report);
         if (perr != PrivateRestError::None) return perr;
         out = parsed;
         if (uid_out != nullptr) *uid_out = parsed_uid;
+        last_account_report_ = report;
         return PrivateRestError::None;
     }
 
@@ -2085,6 +2144,9 @@ private:
     PrivateRestConfig default_cfg_{};
     // Empty in production: nothing but the friend hook above can fill it (rest_test_seam.hpp).
     RestTestSeam test_seam_{};
+    // The declared asset scope of fetch_account() (empty = none declared) and what the last accepted answer held.
+    AccountAssetScope account_scope_{};
+    AccountParseReport last_account_report_{};
 };
 
 // Bridges BinancePrivateRestClient::query_order() to QueryPort::QueryFn's plain

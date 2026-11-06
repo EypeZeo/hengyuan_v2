@@ -136,6 +136,13 @@ using namespace hy;
 
 namespace {
 
+// The symbol this harness trades is fixed (BTCUSDT), so the assets it needs balances of are fixed too: the base and quote asset the order path
+// checks (Buy: quote, Sell: base). They are declared to the REST client as the account's asset scope (account_truth.hpp::AccountAssetScope, L4 spec
+// 4.3) and handed to every probe's environment, from these two constants only. The Spot Testnet funds an account in EVERY asset (517 non-zero balances,
+// a few with non-ASCII names, on the first joint run): without the declaration the account answer is refused whole -- the snapshot holds 32 assets.
+constexpr std::string_view kProbeBaseAsset = "BTC";
+constexpr std::string_view kProbeQuoteAsset = "USDT";
+
 std::atomic<bool> g_stop{false};
 void signal_handler(int) { g_stop.store(true); }
 
@@ -633,6 +640,14 @@ int main(int argc, char* argv[]) {
 
     SymbolRegistry registry;
     BinancePrivateRestClient client(binding, std::move(creds), &rate_limiter);
+    {
+        // Before the first account read (the uid read below, then the refresher's fetches): the declared scope, set once on the thread that owns the client.
+        AccountAssetScope account_scope;
+        if (!account_scope.add(kProbeBaseAsset) || !account_scope.add(kProbeQuoteAsset) || !client.set_account_scope(account_scope)) {
+            std::fprintf(stderr, "FATAL: the account asset scope could not be declared.\n");
+            return 1;
+        }
+    }
     SubmitAdapterContext submit_ctx{&client, &registry};
     // Constructed to prove H5's composite adapters still assemble against a real, freshly
     // refreshed SymbolRegistry. NEVER assigned to ctx.submit_port below (see this file's header
@@ -697,6 +712,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::printf("Exchange account uid read (%zu digits; the value is not printed)\n", std::to_string(exchange_uid).size());
+    {
+        // What the account answer held and what of it was kept: the entries outside the declared scope are counted here, never silently dropped.
+        const AccountParseReport& read = client.last_account_report();
+        std::printf("Exchange account read: entries=%" PRIu32 " represented=%" PRIu32 " zero_in_scope=%" PRIu32 " out_of_scope=%" PRIu32
+                    " (scope: %.*s, %.*s; the others are counted, not converted)\n",
+                    read.entries, read.represented, read.zero_balances, read.out_of_scope, static_cast<int>(kProbeBaseAsset.size()), kProbeBaseAsset.data(),
+                    static_cast<int>(kProbeQuoteAsset.size()), kProbeQuoteAsset.data());
+    }
 
     boost::asio::io_context ioc;
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
@@ -922,8 +945,8 @@ int main(int argc, char* argv[]) {
         PreflightEnvironment env;
         env.evidence = &verified_evidence.chain();
         env.rules = &rules;
-        env.base_asset = "BTC";
-        env.quote_asset = "USDT";
+        env.base_asset = kProbeBaseAsset;
+        env.quote_asset = kProbeQuoteAsset;
         env.signer_ready = true;
         env.depth_synced = (pipeline->depth_manager().state() == DepthState::Tracking);
         env.symbol_id = 0;
