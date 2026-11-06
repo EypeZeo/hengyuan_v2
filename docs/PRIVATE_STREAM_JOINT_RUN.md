@@ -43,6 +43,7 @@ cmd /c "native\build-msvc\Release\live_submit_preflight_harness.exe native\tests
 | :-- | :-- |
 | `Dry-run drill ... PASSED`（四行）与 `Dry-run evidence earned: ... live_ready=true` | 四个演练都通过 |
 | `Exchange account uid read (N digits; ...)` | N 约 19（R6 探针量过：Testnet 的 uid 是 19 位）；**值不打印** |
+| `Exchange account read: entries=… represented=… zero_in_scope=… out_of_scope=… (scope: BTC, USDT; ...)` | `represented=2`（BTC 与 USDT 都在账户里）。`entries` 是账户答复的条目总数：Testnet 给每个账户发了所有资产（首次联调是 517 个，全部非零），线束只声明 BTC 与 USDT，其余条目只计数、不转换（L4 规范 §4.3.1）；`entries = represented + zero_in_scope + out_of_scope` |
 | `Store binding: BoundNew` | 新的临时存储第一次绑定 |
 | `[t=... ms] private stream: supervisor=... generation=... verified=... \| barrier=... \| recovery=...` | 每次状态变化一行。顺序应是：`supervisor=Connecting` → `Connected ... verified=yes` → `barrier=Sweeping` → `barrier=Reconciled`，`recovery=Reconciling` → `Ready` |
 | `Private stream generation N (ended): ...` | 只在一代结束时出现。一代都没有结束过是好事 |
