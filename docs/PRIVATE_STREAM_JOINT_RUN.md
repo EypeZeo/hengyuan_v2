@@ -44,10 +44,11 @@ cmd /c "native\build-msvc\Release\live_submit_preflight_harness.exe native\tests
 | `Dry-run drill ... PASSED`（四行）与 `Dry-run evidence earned: ... live_ready=true` | 四个演练都通过 |
 | `Exchange account uid read (N digits; ...)` | N 约 19（R6 探针量过：Testnet 的 uid 是 19 位）；**值不打印** |
 | `Exchange account read: entries=… represented=… zero_in_scope=… out_of_scope=… (scope: BTC, USDT; ...)` | `represented=2`（BTC 与 USDT 都在账户里）。`entries` 是账户答复的条目总数：Testnet 给每个账户发了所有资产（首次联调是 517 个，全部非零），线束只声明 BTC 与 USDT，其余条目只计数、不转换（L4 规范 §4.3.1）；`entries = represented + zero_in_scope + out_of_scope` |
+| `Symbol rules (as the exchange reports them): price_scale=… qty_scale=… \| tick=… min_price=… max_price=… \| step=… min_qty=… max_qty=… \| min_notional=… (balance scale 8)` | 交易所对 BTCUSDT 的过滤器，已换成整数 tick（公开数据，没有凭据）。价格 = `price_ticks / 10^price_scale`，数量 = `qty_ticks / 10^qty_scale`，`min_notional` 在余额刻度（8 位小数）上。首次联调的 Testnet：`price_scale=2 qty_scale=5`，`min_qty=1`（0.00001 BTC），`min_notional=500000000`（5.0 USDT） |
 | `Store binding: BoundNew` | 新的临时存储第一次绑定 |
 | `[t=... ms] private stream: supervisor=... generation=... verified=... \| barrier=... \| recovery=...` | 每次状态变化一行。顺序应是：`supervisor=Connecting` → `Connected ... verified=yes` → `barrier=Sweeping` → `barrier=Reconciled`，`recovery=Reconciling` → `Ready` |
 | `Private stream generation N (ended): ...` | 只在一代结束时出现。一代都没有结束过是好事 |
-| `[startup probe] ...` 随后 `[preflight probe #1] (startup) OPEN BUY price=... qty=... -> gate=OperatorNotConfirmed` | 订单路径走到确认门 |
+| `[startup probe] ...` 随后 `[preflight probe #1] (startup) OPEN BUY price=... qty=... -> gate=OperatorNotConfirmed` | 订单路径走到确认门。探针的数量按**交易所的最小名义金额**定：满足 LOT_SIZE 的最小数量里，第一个名义金额（价格 × 数量）够 `min_notional` 的（首次联调的价格 75 920.32 上是 `qty=7`，即 0.00007 BTC ≈ 5.31 USDT；最小单位 0.00001 BTC 只有 0.76 USDT，会被拒） |
 | `=== Private stream joint-run report ===` 以及最后一行 `joint-run criteria: reconciled_once=yes account_refreshed_by_sweep=yes recovery_ready=yes probe_reached_OperatorNotConfirmed=yes all_met=yes` | 全 yes |
 
 报告里还有：`barrier`（各计数）、`sweep`（作业与泵）、`account`（持有者 / 刷新器 / REST 的计数与 `last_error`）、`supervisor`、`factory`、最后一代的 `Private stream generation N (last): ...`（订阅应答与列表的状态码、错误码、`retry_after_ms`）、
@@ -68,6 +69,7 @@ cmd /c "native\build-msvc\Release\live_submit_preflight_harness.exe native\tests
 | `account ... not_sent` 很多，`last_error=SigningFailed` | 取账户的线程没有凭据（线程所有权被破坏） | 贴回来：这不该发生 |
 | `barrier=Sweeping` 一直不变，`sweep ... reports_account_stale` 增长 | 清扫的账户步骤没有送到 | 看 `account` 行里 `rest ... failed` / `not_sent` |
 | `readiness: ... refused_StartupNotReady=...` 一直增长 | 启动恢复没有 Ready，或流不在线 | 看 `recovery:` 行的 `state` 与 `degraded_reason`，`store binding` 行，`supervisor:` 行 |
+| 探针行 `-> gate=PreTradeFailed`，随后 `WARN: expected gate=OperatorNotConfirmed, got PreTradeFailed / reason=<名字>` | 订单路径在预交易检查被拒，`reason` 就是检查的名字：`BelowMinNotional`（价格 × 数量低于交易所的最小名义金额；探针本该按它定量，对照 `Symbol rules` 行）、`InsufficientBalance`（买入的计价资产可用余额不够）、`AccountCannotTrade`（账户 `canTrade` 为 false）、`BalanceStale` / `BalanceFromFuture`（账户快照的时间戳与线束的时钟不符）、`ExceedsSingleOrderCap` / `ExceedsTotalExposureCap`（线束给的 10 USDT 上限）、`Ok`（链在检查之前就停了：规则或账户没接上） | 贴回这一行和 `Symbol rules` 行 |
 | `FATAL: the store binding was refused (...)` | 新建的临时存储不该被拒绝 | 贴回来 |
 
 ## 贴回什么

@@ -350,6 +350,23 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     CI 的 sanitizer 作业会在最终头上编译它）。变异检查 43 个变异体（AccountAssetScope 13、范围解析 16、客户端 6、线束源码 8）：40 个被杀死、3 个存活——AS11 与 AS12 是两处防御性夹紧（`size()` 与 `name_at()` 的长度夹紧：`add()` 保证
     它们永远不会越界，经公开接口不可观察，与快照里同形的夹紧一样，只是这里没有破坏用的测试钩子）、H08 是线束里一行日志（`main()` 没有测试）。5 个变异体第一轮因 /WX 的 “未引用的形参” 编译不过（不算检出），加 `(void)x;` 改写后全部杀死；
     三个 canary 先于其余运行，都由语义测试杀死，AS05、AS08、AS09 由测试里的编译期断言杀死。tools/spec_xref_check.py、spec_enum_diff.py、concurrency_targets_check.py、closure_ledger_check.py 通过。
+- 预检探针按交易所的最小名义金额定量（首次 Testnet 联调的第二个发现，`PRIVATE_STREAM_JOINT_RUN.md`；Owner 2026-11-07 “合并 233，重新跑了你看看” 之后的修复；Tier A；PR 待合并）— `preflight_probe.hpp`（`preflight_quantity_ticks(rules, price_ticks)`、`pre_trade_check_name()`）、`live_submit_preflight_harness.cpp`：
+  - **发现**：#233 合入后 Owner 第一次对 Testnet 完整跑通（`joint_run.log`；设定 240 秒，3094 圈 × 50 毫秒约 155 秒时提前结束）：公共行情（深度 1 次快照、K 线回填 52 根）、签名订阅（`subscribe_status=200`，`verify_status=200`，`subscriptions_listed=1`）、清扫（1 次开始 1 次完成、0 个超时）、账户刷新（25 次送达）、
+    启动恢复（`Ready`）、令牌（`readiness: authorized=3`）全部在线，四个判据里三个满足；唯独三次启动探针都停在 `gate=PreTradeFailed`，不是预期的 `OperatorNotConfirmed`（`probe_reached_OperatorNotConfirmed=no`）。
+  - **原因**：探针的数量是 LOT_SIZE 的最小单位（`qty=1`，0.00001 BTC）。价格 75 920.32 上这是 0.7592 USDT，而 Testnet 的 BTCUSDT `NOTIONAL.minNotional` 是 5.0 USDT（公开的 `exchangeInfo`，2026-11-07 读取：tick 0.01、step 与 minQty 0.00001、maxQty 9000），
+    预交易检查的 `BelowMinNotional` 必然拒绝这个订单。所有的测试夹具都躲过了它：夹具的规则带着 `min_notional_ticks = 1000`（0.00001 USDT），与任何真实品种的最小名义金额毫无关系。
+    **日志本身没有写出是哪个检查**：线束只打印门的名字，没有打印结果里的 `pre_trade_detail`；审计环在内存里，随进程消失。所以这次运行只能证明 “探针过不了 `BelowMinNotional`”（算术；`Audit records written: 3` 与每次探针恰写一条拒绝记录相符，
+    也就是链是在检查里被拒、不是在 “没接规则或账户” 的早退里，但这个计数不是证明），不能排除排在它前面的检查（`AccountCannotTrade`、账户时间戳新鲜度）也同时拒绝；下一次联调会直接打印出来。
+  - **修复**：`preflight_quantity_ticks(rules, price_ticks)`（新重载）：LOT_SIZE 的网格（`min_qty_ticks` 向上取整到步长）上，第一个名义金额也够 `min_notional_ticks` 的点。名义金额与 `validate_pre_trade()` 用同一套带检查的算术
+    （`checked_notional` 的乘积、`rescale_notional_ceil` 向上取整到 `kBalanceScale`），所以两者在边界上不会分歧——名义金额恰好等于最小值就够，少一点就不够。名义金额随数量单调不降，所以先按步数加倍找到上界、再二分：最多约 124 次求值，答案离下界多远都一样。
+    没有最小名义金额（`<= 0`）时就是下界本身；没有可表示的数量够得着最小值（乘积或缩放先溢出）、价格非正、下界给不出数量、或答案超过 `max_qty_ticks`（与门一样，只对带步长的规则判）时返回无，从不返回回绕的值。
+    `plan_preflight_probe()` 在探针自己的价格上定量（开仓是卖一价，平仓是买一价：同一个最小名义金额，卖在买一价上可能要多一个单位）。首次联调的价格 75 920.32 上是 7 个单位（0.00007 BTC，5.3144 USDT；6 个是 4.5552）。
+  - **可诊断**：`pre_trade_check_name()`（17 个裁决各有名字，`switch` 没有 `default`：新增裁决是编译错误）；线束在 `PreTradeFailed` 时把裁决名打进 WARN 行（`... got PreTradeFailed / reason=BelowMinNotional`，与 `NotReady` 的 `reason=` 同形），
+    并在启动时打印一行 `Symbol rules (as the exchange reports them): ...`（交易所的过滤器，公开数据）。
+  - **已知、未改**：`preflight_quantity_ticks(rules)`（单参数）把下界取整到 “步长的倍数”，而 `validate_pre_trade()`（以及交易所的公式）把网格锚在 `min_qty` 上（`(qty - minQty) % stepSize == 0`）。两者只在 `min_qty` 不是步长的整数倍时分歧；
+    没有已知的 Binance 品种如此，BTCUSDT 是 1 比 1。头文件注释写明了这个假设；真遇到时，门会以 `QtyStepViolation` 拒绝，现在日志里看得见。
+  - **未做 / 留给后面**：真正的下单数量策略（6b-2，“数量来自一个固定的小额配置上限”）；线束里其他从未对真实交易所运行过的路径（深度之外的 `Close` 方向探针、签名订阅的最小权限）仍待联调。
+  - **证据**：test_preflight_probe.cpp（16 → 36 例，+20：新重载 16 例——没有最小名义金额时就是下界；首次联调的真实规则与价格（7 个单位，6 个不够，下界单独是 `BelowMinNotional`）；恰等于最小值够、少一点不够；原生刻度低于、等于、高于 8 三种缩放（高于时向上取整，含一个向下取整会差一个单位的例子）；只取步长网格上的点；无步长则每个 tick 都是数量；下界已经够；离下界约九百亿步的答案；答案紧贴溢出边缘（加倍一步就溢出，二分仍要找到它）；没有可表示的数量够得着；最小值永远够不着；答案超过最大数量、以及最大数量只对带步长的规则判；非正的价格；没有下界的规则；外加一个固定种子的差分模糊测试——2000 轮随机规则、价格与贴着边界的最小名义金额，以 `validate_pre_trade()` 自己的裁决为裁判，从下界往上逐点走到第一个 `Ok`，要求新函数与它一致）；计划 +3 例（在探针自己的价格上定量；首次联调的盘口给出门接受的开仓与平仓订单；够不着最小值则不探）；`pre_trade_check_name()` 1 例（17 个名字互不相同，枚举范围内没有 Unknown，枚举外是 Unknown）；test_live_submit_preflight_harness.cpp +2 例（夹具可选真实的 Testnet 规则与首次联调的盘口：整条链停在恰好 `OperatorNotConfirmed`；老探针——最小单位——停在 `PreTradeFailed`，裁决是 `BelowMinNotional`）。MSVC（/W4 /WX，Release）零警告零错误，相关 ctest（探针、线束、两个守卫、流水线、账户真相与预交易）135/135；WSL2 GCC-14（-Wall -Wextra -Wconversion -Werror）none 与 address（ASan+UBSan）各 5 个受影响目标共 112 例全绿，线束本身在 none 层编译通过；GCC 抓出我辅助函数里的一处 dangling-else（`if` 包着 gtest 的 EXPECT_NE 宏），已修。变异检查 33 个变异体（PP01–PP29 是计划与定量函数，PN01–PN04 是名字函数）：29 个被杀死，4 个存活——PP08、PP18、PP28 等价（零最小值走搜索也立即达到；加倍从 2 起步、或忘记上一个不够的步数，二分只是范围更宽，结果相同），PP20 是去掉加倍上限后的有符号溢出（未定义行为，MSVC 不拦；这条路径由测试走到，UBSan 层是它的拦截处，address 层已跑过）。变异设计催生了两条测试（答案紧贴溢出边缘；下界已够但超过最大数量）和一处代码简化（二分里跟踪的上界状态是冗余的，最终重算已经裁决）；PN03（少一个 case）被测试而不是编译器杀死：MSVC 的 C4062 默认关闭，只有 GCC 的 -Wswitch 保证完整，头文件注释已据实改正。tools/spec_xref_check.py（它抓到我写的一个代码里不存在的限定名，已改）、spec_enum_diff.py、concurrency_targets_check.py、closure_ledger_check.py 通过。
 
 ### 容量 / 生命周期
 

@@ -692,6 +692,13 @@ int main(int argc, char* argv[]) {
     const SymbolRules rules = registry.current_rules(0);
     g_mock_rules_version.store(rules.rules_version, std::memory_order_relaxed);
 
+    // What the exchange says about this symbol, once (public exchange metadata, no credential involved), so a probe the pre-trade check refuses can be read
+    // against the numbers it was judged by. price = price_ticks / 10^price_scale, qty = qty_ticks / 10^qty_scale; min_notional is at the balance scale.
+    std::printf("Symbol rules (as the exchange reports them): price_scale=%u qty_scale=%u | tick=%" PRId64 " min_price=%" PRId64 " max_price=%" PRId64
+                " | step=%" PRId64 " min_qty=%" PRId64 " max_qty=%" PRId64 " | min_notional=%" PRId64 " (balance scale %d)\n",
+                static_cast<unsigned>(rules.price_scale), static_cast<unsigned>(rules.qty_scale), rules.tick_size_ticks, rules.min_price_ticks,
+                rules.max_price_ticks, rules.step_size_ticks, rules.min_qty_ticks, rules.max_qty_ticks, rules.min_notional_ticks, kBalanceScale);
+
     // price_mult/qty_mult MUST be derived from the real rules.price_scale/qty_scale, not a
     // hardcoded 1e8 -- otherwise the depth book's ticks (BinanceJsonParser::register_symbol())
     // and the REST snapshot's ticks (SnapshotRequest) would silently disagree with what
@@ -931,9 +938,10 @@ int main(int argc, char* argv[]) {
             std::printf("  [preflight probe #%" PRIu64 "] (%s) no book yet -- skipping\n", preflight_probes, origin);
             return std::nullopt;
         }
-        // Small, fixed preflight-only quantity, rounded up to this symbol's real min_qty_ticks/step_size_ticks --
-        // NOT the final 6b-2 sizing policy (that batch's own plan text: "数量来自一个固定的小额配置上限"), just
-        // enough for pre-trade validation to see a genuinely valid order shape.
+        // Small preflight-only quantity: the smallest one this symbol's rules accept at the probe's price (LOT_SIZE's
+        // minimum on its step grid, and at least MIN_NOTIONAL) -- NOT the final 6b-2 sizing policy (that batch's own
+        // plan text: "数量来自一个固定的小额配置上限"), just enough for pre-trade validation to see a genuinely valid
+        // order shape. The bare minimum lot is not one: on the Testnet's BTCUSDT it is under 1 USDT against a 5 USDT minimum.
         const std::optional<PreflightProbe> plan = plan_preflight_probe(action, *tob, rules);
         if (!plan) {
             std::printf("  [preflight probe #%" PRIu64 "] (%s) no order to ask about (no usable price or quantity) -- skipping\n",
@@ -965,12 +973,22 @@ int main(int argc, char* argv[]) {
             ++probes.at_confirmation_gate;
         } else {
             if (result.gate == OrchestratorGate::NotReady) ++probes.not_ready;
+            // Which verdict stopped the chain, for the two gates that carry one: the gate's name alone does not say, and the audit ring that holds the
+            // detail code is gone when the process exits.
+            const char* detail_label = "";
+            const char* detail = "";
+            if (result.gate == OrchestratorGate::NotReady) {
+                detail_label = " / reason=";
+                detail = not_ready_reason_name(result.not_ready_reason);
+            } else if (result.gate == OrchestratorGate::PreTradeFailed) {
+                detail_label = " / reason=";
+                detail = pre_trade_check_name(result.pre_trade_detail);
+            }
             std::fprintf(stderr,
                          "  WARN: expected gate=OperatorNotConfirmed, got %s%s%s -- some "
                          "prerequisite this harness assembles is not yet ready (this can be "
                          "normal early in the run, e.g. depth/account/stream not synced yet).\n",
-                         gate_name(result.gate), result.gate == OrchestratorGate::NotReady ? " / reason=" : "",
-                         result.gate == OrchestratorGate::NotReady ? not_ready_reason_name(result.not_ready_reason) : "");
+                         gate_name(result.gate), detail_label, detail);
         }
         return result.gate;
     };
