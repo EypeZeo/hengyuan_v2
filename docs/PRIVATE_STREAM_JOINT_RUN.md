@@ -7,13 +7,14 @@
 - **证明**（如果 `joint-run criteria` 全是 yes）：用你的 Testnet HMAC 密钥，WebSocket API 的签名订阅（`userDataStream.subscribe.signature`）被交易所接受，`session.subscriptions` 恰好列出这一个订阅；屏障对账过（一次真实的清扫，带一次真实的 `GET /api/v3/account`）；
   启动恢复到 `Ready`；存储绑定到交易所报告的账户；订单路径的 Gate 2b 拿到真实令牌，一直走到 `OperatorNotConfirmed`。
 - **不证明**：真实下单（这个进程不可能下单：提交端口是 mock，确认永不绑定，见 `preflight_probe.hpp`）；订单查询与成交回报的真实形状（运行里没有订单，清扫查询的是空集）；生产环境（线束只认 Testnet）。
-- 回环测试证明“我们的客户端按我们理解的协议行事”；这次运行才有交易所一侧的证据。两个至今没有交易所证据的点会直接出现在日志里：
-  **L-39**（从未 `logon` 的连接上调 `session.subscriptions` 是否返回订阅列表）看 `verify_status` 与 `subscriptions_listed`；
-  **签名订阅需要什么权限**看 `subscribe_status` / `subscribe_error`。
+- 回环测试证明“我们的客户端按我们理解的协议行事”；这次运行才有交易所一侧的证据。**首次通过：2026-11-07**（第 4 次尝试，见文末“首次联调记录”）。当时没有交易所证据的两个点，答案是：
+  **L-39**（从未 `logon` 的连接上调 `session.subscriptions` 是否返回订阅列表）：返回，`verify_status=200`、`subscriptions_listed=1`——Testnet 上保留“恰好一个”的严格判定；
+  **签名订阅需要什么权限**：带 USER_DATA 与 USER_STREAM 的密钥被接受（`subscribe_status=200`）；只有 USER_DATA 的密钥没有试过，官方文档说这个方法需要 USER_STREAM，所以按 USER_DATA + USER_STREAM 准备。
+  生产端点没有证据。之后每次运行日志里仍然有这两个字段。
 
 ## 准备（一次）
 
-1. 一把 **Testnet 的 HMAC 密钥**，先只开读取权限（USER_DATA / Enable Reading）；不要给交易权限——进程不下单，给了也没用，给了就多一分风险。签名订阅到底要不要更多权限正是要验证的未知项之一：如果交易所因权限拒绝订阅，日志里会有 `subscribe_status` / `subscribe_error`（见下表），那就是证据。Ed25519 密钥不行（这条路径是 HMAC 签名）。
+1. 一把 **Testnet 的 HMAC 密钥**，权限开 **USER_DATA 与 USER_STREAM**（读取账户、订阅用户数据流）；不要给交易权限（TRADE）——进程不下单，给了也没用，给了就多一分风险。签名订阅是 USER_STREAM 方法（官方文档），只有 USER_DATA 的密钥应该会在订阅这一步被拒（`subscribe_status` / `subscribe_error`，见下表；这个情形没有试过，只来自文档）。2026-11-07 通过的那次联调用的就是带这两个权限的密钥。Ed25519 密钥不行（这条路径是 HMAC 签名）。**别用 R6 探针那把只读密钥**：它没有 USER_STREAM。
 2. 在**仓库根目录**放 `.env`（`./.env` 相对当前目录读取），两个变量名固定：
 
    ```
@@ -22,9 +23,18 @@
    ```
 
    载入器只认这两个名字；文件权限过宽会被拒绝（`PermissionTooWide`，Linux 下 `chmod 600 .env`）。**不要把 `.env` 的内容贴给任何人**，包括 AI 会话。
+   **两套变量名，别混**：R6 探针（`tools/r6_testnet_probe.py --env-file`）与 `hy_operator_resolve --credentials-file` 读的文件用 `HENGYUAN_OPERATOR_TESTNET_API_KEY` / `HENGYUAN_OPERATOR_TESTNET_API_SECRET`；这个线束只认上面两个名字。
+   载入器整份文件拒绝任何其他变量名（包括那一对）、没有 `=` 的行和重复的键，日志里是 `ERROR: failed to load .env (status=6)`（`ParseError`）。所以线束用单独的一份 `.env`；R6 的那份改名为 `.env.operator` 留着给探针，两份不要合并。
 3. 构建（`HY_BUILD_DEMO=ON`，见 `CLAUDE.md` 的 MSVC 运行手册）。目标 `live_submit_preflight_harness`，Windows 下在 `native/build-msvc/Release/`。
 
 ## 运行
+
+**Windows 上先做这一步**（同一个 PowerShell 窗口里，每开一个新窗口都要再做一次）：这台机器上 vcpkg 的 OpenSSL 编进去的默认 CA 目录 `C:\Program Files\Common Files\SSL` 不存在，不设的话每次 TLS 握手都失败（日志里是 `ERROR: sync_clock() failed.` 一类）。
+把 `SSL_CERT_FILE` 指向 Git for Windows 自带的 Mozilla 根证书包（`cmd /c` 会继承环境变量）：
+
+```
+$env:SSL_CERT_FILE = 'C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt'
+```
 
 在仓库根目录，一条命令（Windows 用 `cmd` 重定向得到纯文本日志；PowerShell 5.1 的 `>` 会写成 UTF-16）：
 
@@ -58,6 +68,11 @@ cmd /c "native\build-msvc\Release\live_submit_preflight_harness.exe native\tests
 
 | 看到 | 意思 | 怎么办 |
 | :-- | :-- | :-- |
+| 启动就退出：`ERROR: failed to load .env (status=6)` | `ParseError`：`.env` 里有载入器不认的变量名（最常见：R6 探针的 `HENGYUAN_OPERATOR_TESTNET_*`）、没有 `=` 的行或重复的键。注释行没关系 | 只留 `HENGYUAN_BINANCE_TESTNET_API_KEY` / `HENGYUAN_BINANCE_TESTNET_SECRET` 两个变量；不要把内容贴出来，只贴名字（不含值）和这一行 |
+| 启动就退出：`ERROR: sync_clock() failed.` 或每次握手都失败（Windows） | 没有受信任的根证书（OpenSSL 的默认 CA 目录不存在） | 见上面“运行”里的 `SSL_CERT_FILE` |
+| 启动就退出：`could not read the account uid ... PrivateRestError=MalformedResponse` | 账户答复被解析器整份拒绝。首次联调是 Testnet 账户有 517 个非零资产（含多字节名字），快照放不下；#233 之后线束只声明 BTC 与 USDT，其余只计数 | 如果 #233 之后还出现：运行 `python tools/r6_account_shape_probe.py --env-file .env.operator`（只读，只打印字段名 / 类型 / 计数），把输出贴回来 |
+| `WARN: periodic clock resync failed, retrying sooner`（偶发） | 周期性时钟同步（每 60 秒）失败一次，10 秒后重试；这条线路上 REST 的 TLS 握手大约每 25 次失败 1 次 | 偶发正常；每次都出现才是问题（线束还不打印错误名） |
+| `account ... failed=1 last_error=TlsHandshake`（偶发） | 同上，账户刷新器吸收了一次失败（首次联调两次运行都是 1 / 26） | 偶发正常；`stale` 增长或 `failed` 占多数才是问题 |
 | 启动就退出：`ERROR: could not read the account uid ... PrivateRestError=HttpStatus` | 交易所拒绝了 `GET /api/v3/account`：密钥不对、不是 Testnet 的、没有读取权限，或 IP 受限 | 检查密钥；报告 `last_error` |
 | `... PrivateRestError=ClockNotFresh` / `ClockSkewTooLarge` | 时钟同步失败或本机时钟偏得太远 | 校时后重跑 |
 | `stage=subscribe_rejected`，`subscribe_status=4xx`，`subscribe_error=-2015` 一类 | 交易所拒绝了签名订阅：密钥类型 / 权限 / IP / 签名 | **把整行贴回来**，这是权限问题的证据 |
@@ -71,6 +86,17 @@ cmd /c "native\build-msvc\Release\live_submit_preflight_harness.exe native\tests
 | `readiness: ... refused_StartupNotReady=...` 一直增长 | 启动恢复没有 Ready，或流不在线 | 看 `recovery:` 行的 `state` 与 `degraded_reason`，`store binding` 行，`supervisor:` 行 |
 | 探针行 `-> gate=PreTradeFailed`，随后 `WARN: expected gate=OperatorNotConfirmed, got PreTradeFailed / reason=<名字>` | 订单路径在预交易检查被拒，`reason` 就是检查的名字：`BelowMinNotional`（价格 × 数量低于交易所的最小名义金额；探针本该按它定量，对照 `Symbol rules` 行）、`InsufficientBalance`（买入的计价资产可用余额不够）、`AccountCannotTrade`（账户 `canTrade` 为 false）、`BalanceStale` / `BalanceFromFuture`（账户快照的时间戳与线束的时钟不符）、`ExceedsSingleOrderCap` / `ExceedsTotalExposureCap`（线束给的 10 USDT 上限）、`Ok`（链在检查之前就停了：规则或账户没接上） | 贴回这一行和 `Symbol rules` 行 |
 | `FATAL: the store binding was refused (...)` | 新建的临时存储不该被拒绝 | 贴回来 |
+
+## 首次联调记录（2026-11-07 通过）
+
+| 次 | 日期 | 现象 | 原因 | 修复 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | 2026-11-06 | `ERROR: failed to load .env (status=6)` | `.env` 里是 R6 探针的变量名（`HENGYUAN_OPERATOR_TESTNET_*`），线束只认 `HENGYUAN_BINANCE_TESTNET_API_KEY` / `_SECRET`，载入器整份文件拒绝其他名字 | 线束用单独的 `.env`；R6 的那份改名为 `.env.operator` |
+| 2 | 2026-11-06 | `ERROR: could not read the account uid ... PrivateRestError=MalformedResponse` | Testnet 账户有 517 个非零资产、含多字节名字，快照放不下，规范 §4.3 要求整份失败 | PR #233：线束声明 BTC 与 USDT，其余条目只计数（L4 规范 §4.3.1） |
+| 3 | 2026-11-07 | 三次启动探针 `gate=PreTradeFailed`（四个判据三个满足） | 探针数量是最小单位 0.00001 BTC = 0.76 USDT，低于 BTCUSDT 的最小名义金额 5 USDT | PR #234：数量按最小名义金额定；日志打印 `reason=` 与 `Symbol rules` |
+| 4 | 2026-11-07 | `joint-run criteria: ... all_met=yes`；`OPEN BUY price=7602001 qty=7 -> gate=OperatorNotConfirmed` | — | — |
+
+Windows 的 CA 包（`SSL_CERT_FILE`）是第 1 次之后预先查出来的，没有成为一次失败。第 4 次的密钥带 USER_DATA 与 USER_STREAM 权限。第 4 次大约 150 秒：账户 25 次送达（26 次尝试中 1 次 `TlsHandshake` 失败），清扫 1 次完成，深度 1116 个事件，K 线回填 52 根。
 
 ## 贴回什么
 

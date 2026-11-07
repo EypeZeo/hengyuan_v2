@@ -29,6 +29,7 @@ python tools/closure_ledger_check.py --self-test
 - 2026-11-02（私网流迁移 M4）：用户数据流排空（审计 P1-002 的路径 ③）先落持久帧、再折进 `PositionTruth`（PR #224，`9675b6c`）。P1-002 的 `code` 段由 MISSING 改为 PRESENT（判断：持久出口已在代码里，未接发布者时的内存优先由守卫钉住并随 M5 删除；若认为这仍算缺口，改回 MISSING 即可），状态仍为 PARTIAL——`runtime` 与 `budget` 两段仍缺（没有进程运行这条排空，同步 fsync 的时延没有测量）；FI-031 的备注随之更新，状态与结果不变。其余条目的状态与证据不变。
 - 2026-11-05（私网流迁移 M5a）：账户刷新通道、真实取账户端口与私网流流水线接线完成（PR #228，`2777c27`；PR #229，`bdbd96b`）。没有任何进程创建流水线，所以 P1-002 与各 FI 条目的状态、结果与证据均不变——P1-002 的 `runtime` 与 `budget` 两段仍缺；新的缺口 L-53（独立对账线程的凭据与限流）登记在蓝图附录 D。
 - 2026-11-05（私网流迁移 M5b-1）：预检线束迁到私网流流水线（PR #231，`dd333c3`），是**第一个创建流水线的进程**：启动恢复状态机、重连屏障与清扫、账户通道、存储绑定和持久排空在这个冷启动线束里被真正运行。它的存储是每次运行新建的临时存储（固定测试密钥，永远没有上一次运行的订单），线束自述“不是恢复路径”，也还没有对交易所运行过（Owner 的 Testnet 联调手册：`docs/PRIVATE_STREAM_JOINT_RUN.md`）。因此 P1-002 与 FI-001/002/003/004/009/011/020/022/031/043 里 “没有任何 `native/src/*.cpp` 提到 StartupRecovery / SweepJob” 的 `absent:` 断言被推翻（这正是它们存在的目的）：还有别的“尚未”断言的条目直接删去这一条（P1-002、FI-001/002/003/009/011/020/043），只剩它一条的（FI-004、FI-022、FI-031）改成 `open:` 钉住线束的存储是临时存储——它变成持久存储的那天断言失败，迫使这些条目前移；备注里 “未接入任何程序” 的句子改写成 “只有预检线束运行，临时存储，未对交易所运行”。**所有条目的状态、结果与门禁结论不变**：没有运行日志，没有强杀重启，没有对真实端点的验证，`runtime` 段仍缺。
+- 2026-11-07（预检线束的 Testnet 联调通过）：Owner 在自己的机器上用自己的 Testnet 密钥运行预检线束，`joint-run criteria` 四项全 yes（`all_met=yes`）——这是**第一次对真实交易所的证据**：签名订阅被接受、`session.subscriptions` 恰好列出那一个订阅（蓝图 L-39 在 Testnet 上的答案）、屏障对账一次（清扫 1 次，空的临时存储、没有订单）、账户由清扫刷新、启动恢复 Ready、订单路径走到 `OperatorNotConfirmed`；联调里修了两个问题（PR #233 账户资产范围，`657a072`；PR #234 探针按最小名义金额定量，`7b221ca`）。下面各条里 “没有对交易所运行过” 的说法，对预检线束自此应读作 “只对 Testnet 运行过一次完整的启动（空的临时存储、没有订单、没有强杀重启、没有重连）”，对生产进程仍然成立。**所有条目的状态、结果与门禁结论不变**：`runtime` 段仍缺（没有持久存储上的运行日志、没有强杀重启、没有订单与成交），FI-057 仍为 PARTIAL（`CAPABILITY_UNSUPPORTED` 分类与降级状态仍不存在，生产端点没有证据）。
 
 本次只同步合同说明；本表与蓝图状态一致性仍由下列核对工具验证，不能用文档合并关闭未执行的故障用例。
 
@@ -1281,7 +1282,7 @@ result: PASS
 gate_result: PASS
 baseline: 2a7e383
 refs: test:native/tests/test_binance_private_rest.cpp#FI033MalformedAccountDataNeverBecomesAMalformedSnapshot test:native/tests/test_account_snapshot_boundary.cpp#FI033NoSequenceOfAssetsMakesABrokenSnapshotOrDisturbsABuilderThatRefused code:native/include/hengyuan/account_truth.hpp#AccountSnapshotBuilder run:"38123300184@2a7e3833/ci-native.yml[native-build-test]"
-note: PR #163 之后账户快照的字段全部私有，唯一的构造路径是 AccountSnapshotBuilder，畸形资产（空/超长/不可见字节的名称、重名、负数或溢出的余额、超过 32 个）被拒绝而不是截断，读取侧按容量再钳一次；判定信号是单元测试失败（含固定种子的模糊测试），主干 CI Native 的全量构建与测试已成功。2026-11-06 首次 Testnet 联调读到一个有 517 个非零资产的账户，按这条默认合同整份被拒；L4 规范 §4.3.1 增加了可选的资产范围（AccountAssetScope）：声明了范围的读取只转换并存储声明的资产、其余只计数，未声明时默认合同不变，本条的状态与结果不变（范围的模糊测试 FuzzAScopeOnlyRemovesFailuresAndNeverChangesWhatItKeeps 在 test_binance_private_rest.cpp）。
+note: PR #163 之后账户快照的字段全部私有，唯一的构造路径是 AccountSnapshotBuilder，畸形资产（空/超长/不可见字节的名称、重名、负数或溢出的余额、超过 32 个）被拒绝而不是截断，读取侧按容量再钳一次；判定信号是单元测试失败（含固定种子的模糊测试），主干 CI Native 的全量构建与测试已成功。2026-11-06 首次 Testnet 联调读到一个有 517 个非零资产的账户，按这条默认合同整份被拒；L4 规范 §4.3.1（PR #233，合并提交 657a072）增加了可选的资产范围（AccountAssetScope）：声明了范围的读取只转换并存储声明的资产、其余只计数，未声明时默认合同不变，本条的状态与结果不变（范围的模糊测试 FuzzAScopeOnlyRemovesFailuresAndNeverChangesWhatItKeeps 在 test_binance_private_rest.cpp）。
 ```
 
 ```ledger
@@ -1652,5 +1653,5 @@ gate_result: BLOCKED
 baseline: 58b60d0
 open: absent:native/include/hengyuan/*.hpp#CapabilityUnsupported absent:native/include/hengyuan/*.hpp#CAPABILITY_UNSUPPORTED
 refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#TheStreamIsConnectedOnlyOnceTheListingNamesExactlyTheConfirmedSubscription test:native/tests/test_binance_ws_api_user_data_session.cpp#AListingThatIsNotExactlyTheConfirmedSubscriptionEndsTheSession test:native/tests/test_binance_ws_api_user_data_session.cpp#ARefusedListingEndsTheSessionAndKeepsStatusCodeAndRetryAfter
-note: PARTIAL：回环单测断言只有订阅列表恰好列出刚确认的订阅时流才算已连接，列表不符或列表请求被拒答时会话结束并保留状态码（不以订阅确认推定就绪）；能力不受支持的单独分类与私网流降级状态不存在，从未对真实端点验证（蓝图 L-39）。
+note: PARTIAL：回环单测断言只有订阅列表恰好列出刚确认的订阅时流才算已连接，列表不符或列表请求被拒答时会话结束并保留状态码（不以订阅确认推定就绪）；能力不受支持的单独分类与私网流降级状态不存在；2026-11-07 起 Testnet 上有了交易所一侧的证据（蓝图 L-39：未登录的连接上 `session.subscriptions` 回 200 并恰好列出那一个订阅），生产端点仍无。
 ```
