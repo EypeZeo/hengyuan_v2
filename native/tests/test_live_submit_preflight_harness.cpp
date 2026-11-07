@@ -116,7 +116,10 @@ struct Fixture {
     std::unique_ptr<KeyRing> key_ring;
     std::unique_ptr<DurableAuditSink> durable_audit_sink;
 
-    explicit Fixture(std::uint32_t rules_version = 7) {
+    // `testnet_btcusdt_rules`: the rules the Testnet really reports for BTCUSDT and the book of the first joint run (2026-11-07) instead of the synthetic ones --
+    // the synthetic rules carry a minimum notional (1000 ticks = 0.00001 USDT) nothing like a real symbol's (5 USDT), which is how a probe that sent the bare
+    // minimum lot passed every test here and stopped at PreTradeFailed on the first real run.
+    explicit Fixture(std::uint32_t rules_version = 7, bool testnet_btcusdt_rules = false) {
         // The trap counter is a global: without this a test that reaches the port (BindingConfirmationReachesSubmitPort) leaves 1 behind for every test that runs
         // after it in the same process (--gtest_shuffle, --gtest_repeat), which then fails its "never called" assertion for a reason that has nothing to do with it.
         g_submit_call_count.store(0, std::memory_order_relaxed);
@@ -153,6 +156,18 @@ struct Fixture {
         rules.max_qty_ticks = 1'000'000;
         rules.step_size_ticks = 10;
         rules.min_notional_ticks = 1000;
+        if (testnet_btcusdt_rules) {
+            // PRICE_FILTER tickSize/minPrice 0.01, maxPrice 1000000; LOT_SIZE stepSize/minQty 0.00001, maxQty 9000; NOTIONAL minNotional 5.0 (at kBalanceScale).
+            rules.price_scale = 2;
+            rules.min_price_ticks = 1;
+            rules.max_price_ticks = 100'000'000;
+            rules.tick_size_ticks = 1;
+            rules.qty_scale = 5;
+            rules.min_qty_ticks = 1;
+            rules.max_qty_ticks = 900'000'000;
+            rules.step_size_ticks = 1;
+            rules.min_notional_ticks = 500'000'000;
+        }
 
         // Must cover the rescaled notional: price_ticks(1000) * qty_ticks(10) at native scale
         // (price_scale+qty_scale=4) = 10000, rescaled to kBalanceScale(8) = 10000 * 10^4 = 1e8.
@@ -181,7 +196,11 @@ struct Fixture {
         // reachable-and-consistent (the chain must reach "just missing confirmation", not fail
         // earlier for an unrelated reason like a stale rules_version mismatch), live in mode,
         // matching live_submit_preflight_harness.cpp's own ctx.mode.
-        const std::optional<PreflightProbe> plan = plan_preflight_probe(SuggestedAction::Open, {900, 1000}, rules);
+        // (The Testnet profile: the book of the joint run, best bid 75 920.31, best ask 75 920.32. Its probe is 7 lots, 5.3144224 USDT -- inside the account's
+        // 10 USDT and the 10 USDT caps below, as in the harness.)
+        const std::pair<std::int64_t, std::int64_t> book = testnet_btcusdt_rules ? std::pair<std::int64_t, std::int64_t>{7'592'031, 7'592'032}
+                                                                                  : std::pair<std::int64_t, std::int64_t>{900, 1000};
+        const std::optional<PreflightProbe> plan = plan_preflight_probe(SuggestedAction::Open, book, rules);
         if (!plan) throw std::logic_error("the Fixture's rules produce no preflight probe");
         PreflightEnvironment env;
         env.evidence = &evidence;
@@ -235,6 +254,36 @@ TEST(LiveSubmitPreflightHarness, FullyAssembledContextWithoutConfirmationStopsAt
     // bound to something rather than staying at its default {confirmed=false}.
     EXPECT_NE(result.gate, OrchestratorGate::ConfirmationMismatch);
     EXPECT_EQ(g_submit_call_count.load(), 0);  // submit_port.call() must never have run
+}
+
+// The first joint run on the Testnet (2026-11-07), as a test. Every probe stopped at PreTradeFailed: the probe was the bare minimum lot, 0.00001 BTC, which at
+// 75 920.32 is 0.76 USDT against the symbol's 5 USDT minimum notional. With the symbol's real rules the probe is sized to reach the minimum and the chain stops
+// where the harness expects it to.
+TEST(LiveSubmitPreflightHarness, TheTestnetsRealBtcusdtRulesStopAtOperatorNotConfirmed) {
+    Fixture fx(7, /*testnet_btcusdt_rules=*/true);
+    EXPECT_EQ(fx.ctx.price_ticks, 7'592'032);
+    EXPECT_EQ(fx.ctx.qty_ticks, 7) << "7 lots reach the 5 USDT minimum at this price, 6 do not";
+    ASSERT_FALSE(fx.ctx.confirmation.confirmed);
+
+    const auto result = orchestrate_submit(fx.ctx);
+
+    EXPECT_EQ(result.gate, OrchestratorGate::OperatorNotConfirmed) << "pre-trade verdict: " << pre_trade_check_name(result.pre_trade_detail);
+    EXPECT_EQ(result.pre_trade_detail, PreTradeCheck::Ok);
+    EXPECT_EQ(g_submit_call_count.load(), 0);
+}
+
+// And the old probe on the same rules: the bare minimum lot. The gate said BelowMinNotional; the harness's log said only PreTradeFailed, because it did not print
+// the detail (it does now).
+TEST(LiveSubmitPreflightHarness, TheBareMinimumLotOnTheTestnetsRulesIsBelowMinNotional) {
+    Fixture fx(7, /*testnet_btcusdt_rules=*/true);
+    fx.ctx.qty_ticks = 1;  // what the probe was before it was sized at its price
+
+    const auto result = orchestrate_submit(fx.ctx);
+
+    EXPECT_EQ(result.gate, OrchestratorGate::PreTradeFailed);
+    EXPECT_EQ(result.pre_trade_detail, PreTradeCheck::BelowMinNotional);
+    EXPECT_STREQ(pre_trade_check_name(result.pre_trade_detail), "BelowMinNotional");
+    EXPECT_EQ(g_submit_call_count.load(), 0);
 }
 
 // Negative control: if ANY of the prerequisites this harness is responsible for assembling is
