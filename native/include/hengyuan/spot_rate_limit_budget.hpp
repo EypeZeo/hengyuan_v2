@@ -25,7 +25,7 @@
 // BOTH a 10s and a 1-day window; only the 10s one is tracked here, a named residual
 // risk), EndpointWeightConfig operator-reload, and bootstrap/FreezeProbeCredit/
 // TimeResyncCredit/Retry-After handling. (The private REST client's own calls -- clock
-// sync, account, exchangeInfo, order query, listenKey -- are counted on the
+// sync, account, exchangeInfo, order query -- are counted on the
 // Reconciliation lane since SAFE-01 slice 4, through the RateLimitPermit below; with no
 // TimeResyncCredit lane yet, the clock sync shares that lane.)
 //
@@ -340,10 +340,10 @@ public:
     // PrivateRestEndpoint (docs/BINANCE_PRIVATE_REST_L4_SPEC.md:2313) as a FULL enum block (no
     // "... existing ... unchanged ..." delta marker), so any enumerator the code adds that the
     // spec doesn't already list is a build-failing NAME_CONFLICT, not a warning -- confirmed by
-    // direct read of that tool's diff() logic. listenKey management (POST/PUT/DELETE
-    // /api/v3/userDataStream, binance_private_rest.hpp) has no spec-pinned weight to transcribe
-    // (this repo's two accepted specs predate the WS user-data-stream design entirely), so it
-    // must never be added as a new PrivateRestEndpoint enumerator -- this method is the
+    // direct read of that tool's diff() logic. A call with no spec-pinned weight to transcribe
+    // (the listenKey management calls, retired in M5b-2, were the first; the offline operator
+    // tool's allOrders/openOrders reads in binance_private_rest.hpp are the current ones) must
+    // never be added as a new PrivateRestEndpoint enumerator -- this method is the
     // structurally-safe way to give it rate-limit coverage without touching that spec-verified
     // enum at all. `weight` is expected to be a caller-supplied, conservative constant (see the
     // call site's own comment for provenance), not looked up from any table.

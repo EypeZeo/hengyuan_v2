@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: proprietary
 // binance_ws_api_user_data_session.hpp — private-stream migration M2 (docs/PRIVATE_STREAM_MIGRATION_DESIGN.md §3, §4, §5.1): the
 // Boost.Beast async WebSocket session for the spot WebSocket API's USER DATA stream
-// (wss://<ws_api_host>:<port>/ws-api/v3, blueprint 5.7 P-24 to P-31). It replaces BinanceUserDataWsSession (binance_user_data_ws_session.hpp),
-// whose /ws/<listenKey> path no longer exists on production spot (P-07) nor on the testnet (P-32); that class and its supervisor stay
-// until the listenKey stack is retired (M5).
+// (wss://<ws_api_host>:<port>/ws-api/v3, blueprint 5.7 P-24 to P-31). It replaced BinanceUserDataWsSession (binance_user_data_ws_session.hpp),
+// whose /ws/<listenKey> path no longer exists on production spot (P-07) nor on the testnet (P-32); that class and its supervisor were
+// retired with the rest of the listenKey stack (M5b-2).
 //
 // Governance: L4 (real network I/O). This session NEVER touches credentials and never signs: the subscribe request is signed on the thread
 // that owns BoundHmacCredentials (binance_ws_api_signing.hpp) and handed over through a one-shot mailbox (ws_api_subscribe_mailbox.hpp).
@@ -43,7 +43,7 @@
 //   8. serverShutdown and eventStreamTerminated are delivered to the ring FIRST and then end the generation (end_cause()), so the consumer
 //      sees why; the supervisor starts the next one.
 //   9. Any other failure (DNS, TCP, TLS, upgrade, read error or idle timeout, oversized message, write error, answer timeout) is fail-stop,
-//      exactly like BinanceUserDataWsSession: no reconnect logic inside this class.
+//      exactly like BinanceWsSession (and the retired listenKey session): no reconnect logic inside this class.
 //
 // is_connected() means "the subscription is confirmed by both answers" (the subscribe answer and the session.subscriptions listing), NOT
 // "the TCP/WebSocket handshake is done" (that is handshake_done()): a connection that has not subscribed carries no events, and
@@ -55,8 +55,9 @@
 // codec, so they must share that thread — see public_feed_supervisor.hpp). Callable from any thread: stop(), stopped(), is_connected(),
 // handshake_done(), subscription_id(), end_cause(), lost_events(), ring_drops(), pings_received(), last_activity_steady_ms(),
 // stats_snapshot(). deposit_subscribe() is the producer side of the mailbox: call it from the credential-owning thread, before start() or
-// after it. Shutdown contract identical to BinanceUserDataWsSession: stop() then join the thread driving the io_context; do not call
-// io_context::stop() as part of that sequence.
+// after it. Shutdown contract identical to BinanceWsSession's (binance_ws_session.hpp): stop() then join the thread driving the io_context; do not call
+// io_context::stop() as part of that sequence (stop() posts its cancellation onto this session's strand, and io_context::stop() can make run()
+// return before that posted work executes, leaving pending operations -- and this object, kept alive via shared_from_this() -- in limbo).
 
 #pragma once
 

@@ -342,20 +342,8 @@ inline PrivateRestError parse_account_response(std::string_view body, std::int64
     return detail::parse_account_response_impl(body, timestamp_ms, out, &uid_out, &scope, report);
 }
 
-// TODO 1A.4: listenKey is a ~60-char alphanumeric token; 128 is generous headroom without being
-// unbounded, matching kApiKeyLen's own "fixed, not unbounded" philosophy (binance_environment.hpp).
-inline constexpr std::size_t kListenKeyLen = 128;
-
-// Weight charged to the Reconciliation lane for each of POST/PUT/DELETE /api/v3/userDataStream. There is no
-// spec-pinned weight for them (this repo's accepted specs predate the user-data-stream design, and
-// PrivateRestEndpoint must not gain an enumerator, see try_reserve_weight_only_explicit()); 2 is Binance's
-// long-documented spot weight for all three. The exchange removed these REST endpoints on 2026-02-20, so the
-// three listenKey methods go away with the private-stream migration -- until then they get the same budget
-// gate as every other method.
-inline constexpr std::uint32_t kListenKeyCallWeight = 2;
-
 // D5 R3b-1 (the offline operator tool, docs/OPERATOR_RESOLUTION_DESIGN.md 6): the two reads that have no PrivateRestEndpoint slot -- the enum
-// is the L4 spec's transcription and stays closed -- are charged explicitly, like the listenKey calls above. Binance's documented IP weights
+// is the L4 spec's transcription and stays closed -- are charged explicitly (reserve_budget_explicit(), the Reconciliation lane). Binance's documented IP weights
 // for GET /api/v3/allOrders and for GET /api/v3/openOrders without a symbol.
 inline constexpr std::uint32_t kAllOrdersCallWeight = 20;
 inline constexpr std::uint32_t kOpenOrdersAllSymbolsCallWeight = 80;
@@ -367,27 +355,6 @@ struct RawHttpAnswer {
     std::uint16_t http_status{0};
     std::string body;
 };
-
-// POST /api/v3/userDataStream's `{"listenKey": "..."}` response. PUT/DELETE return `{}` on
-// success and need no body parsing at all -- fetch_signed_body_coro()'s own HttpStatus check
-// (non-200 -> PrivateRestError::HttpStatus) is already the complete success/failure signal for
-// those two, so only the create path needs a parser. `out_buf` is left COMPLETELY UNCHANGED on
-// any failure path, matching parse_account_response()'s own build-then-assign discipline.
-inline bool parse_listen_key_response(std::string_view body, std::span<char> out_buf,
-                                       std::size_t& out_len) noexcept {
-    auto padded = simdjson::padded_string(body);
-    simdjson::ondemand::parser parser;
-    simdjson::ondemand::document doc;
-    if (parser.iterate(padded).get(doc)) return false;
-
-    std::string_view key_sv;
-    if (doc["listenKey"].get_string().get(key_sv) != simdjson::SUCCESS) return false;
-    if (key_sv.empty() || key_sv.size() >= out_buf.size()) return false;
-
-    std::memcpy(out_buf.data(), key_sv.data(), key_sv.size());
-    out_len = key_sv.size();
-    return true;
-}
 
 // L4 §5: real Binance symbols are uppercase alphanumeric only (e.g. "BTCUSDT") -- rejecting
 // anything else here means build_exchange_info_target() never has to build a request target
@@ -636,7 +603,7 @@ inline PrivateRestError parse_exchange_info_response(std::string_view body,
 }
 
 // map_binance_order_status() moved to order_lifecycle.hpp (TODO 1A.4 batch 2) so
-// binance_user_data_ws_session.hpp can reuse it without depending on this heavy L4 file --
+// the user-data codec (binance_ws_api_codec.hpp) can reuse it without depending on this heavy L4 file --
 // still inline, still reachable here transparently since order_lifecycle.hpp is already
 // included above.
 
@@ -1546,85 +1513,6 @@ private:
 
 public:
 
-    // TODO 1A.4: POST/PUT/DELETE /api/v3/userDataStream (listenKey lifecycle). These three are
-    // Binance's USER_STREAM-type endpoints -- confirmed against long-stable, version-independent
-    // Binance API behavior (cross-checked, not this repo's own spec; see the 1A.4 plan's own
-    // caveat about which specifics still want a final live-docs check): X-MBX-APIKEY header
-    // only, NO HMAC signature/timestamp/recvWindow. That means none of the three calls
-    // build_canonical_query()/build_signed_query()/issue_clock_ready_token() -- there is no
-    // `timestamp` parameter to sign, and gating this on clock freshness would fail-closed a call
-    // that was never time-sensitive in the first place. Structurally simpler than
-    // fetch_account()/query_order(), not a bigger reuse: just copy_api_key() + a plain target
-    // string + fetch_signed_body_coro() (which only cares that a target and an api_key were
-    // supplied, not whether the target carries a signature).
-    //
-    // No-cfg overload -- Batch H, H2 (see sync_clock()'s own overload comment above).
-    PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len) {
-        return create_listen_key(out_buf, out_len, default_cfg_);
-    }
-
-    // create_listen_key(): `out_buf`/`out_len` are left COMPLETELY UNCHANGED on any failure path,
-    // matching fetch_account()'s own build-then-assign discipline.
-    PrivateRestError create_listen_key(std::span<char> out_buf, std::size_t& out_len,
-                                        const PrivateRestConfig& cfg) {
-        if (!creds_) return PrivateRestError::SigningFailed;
-        const auto permit = endpoint_permit(ResponseKind::SignedJson);
-        if (!permit) return PrivateRestError::InvalidConfig;
-        const auto budget = reserve_budget_explicit(kListenKeyCallWeight);
-        if (!budget) return PrivateRestError::RateLimitExhausted;
-
-        std::array<char, kApiKeyLen> key_buf{};
-        std::size_t key_len = 0;
-        if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
-            return PrivateRestError::SigningFailed;
-        }
-
-        net::io_context ioc;
-        std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
-        net::co_spawn(
-            ioc,
-            detail::fetch_signed_body_coro(*permit, *budget, "/api/v3/userDataStream",
-                                            std::string(key_buf.data(), key_len), cfg, test_seam_,
-                                            http::verb::post),
-            [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
-                if (eptr) std::rethrow_exception(eptr);
-                outcome = std::move(r);
-            });
-        ioc.run();
-
-        if (std::holds_alternative<PrivateRestError>(outcome)) {
-            return std::get<PrivateRestError>(outcome);
-        }
-        if (!parse_listen_key_response(std::get<std::string>(outcome), out_buf, out_len)) {
-            return PrivateRestError::MalformedResponse;
-        }
-        return PrivateRestError::None;
-    }
-
-    // No-cfg overloads -- Batch H, H2 (see sync_clock()'s own overload comment above). H3's
-    // ListenKeyKeepaliveScheduler is the intended real caller of the no-cfg
-    // keepalive_listen_key() -- it never had a PrivateRestConfig to thread through in the
-    // first place, so it now automatically gets whatever default_cfg_ this client was
-    // constructed with instead of the compiled-in literal defaults.
-    PrivateRestError keepalive_listen_key(std::string_view listen_key) {
-        return keepalive_listen_key(listen_key, default_cfg_);
-    }
-    PrivateRestError close_listen_key(std::string_view listen_key) {
-        return close_listen_key(listen_key, default_cfg_);
-    }
-
-    // keepalive_listen_key()/close_listen_key(): both return `{}` on success -- fetch_signed_body_coro()'s
-    // own non-200 -> HttpStatus check is the complete success/failure signal, no body to parse.
-    PrivateRestError keepalive_listen_key(std::string_view listen_key,
-                                           const PrivateRestConfig& cfg) {
-        return call_listen_key_endpoint(listen_key, http::verb::put, cfg);
-    }
-
-    PrivateRestError close_listen_key(std::string_view listen_key,
-                                       const PrivateRestConfig& cfg) {
-        return call_listen_key_endpoint(listen_key, http::verb::delete_, cfg);
-    }
-
     // §5: unauthenticated, like sync_clock() -- never signs anything, never touches creds_.
     //
     // `symbols` should almost always be non-empty in production: Binance's unfiltered
@@ -2003,7 +1891,7 @@ private:
     // network coroutines require -- so a request path that skipped the accounting does not compile. Every
     // method below that is not POST /api/v3/order charges the Reconciliation lane, the one
     // spot_rate_limit_budget.hpp reserves for GetOrder polling and the GetAccount/GetExchangeInfo refreshes
-    // (the clock sync and listenKey calls are rare and tiny, and the Emergency lane stays reachable only
+    // (the clock sync is rare and tiny, and the Emergency lane stays reachable only
     // for emergency exits). nullopt = the lane refused: the caller returns RateLimitExhausted/NotSent and
     // nothing has been resolved or connected. With no tracker wired in (this class's pre-H1 default)
     // the permit says so explicitly: Unaccounted. The tracker has no internal synchronization and is
@@ -2089,46 +1977,6 @@ private:
         } catch (...) {
             return PrivateRestError::Read;
         }
-    }
-
-    // Shared by keepalive_listen_key()/close_listen_key() -- identical shape (percent-encode the
-    // listenKey into the query string, copy_api_key(), fetch_signed_body_coro(), no body to
-    // parse on success), differing only in HTTP verb.
-    PrivateRestError call_listen_key_endpoint(std::string_view listen_key, http::verb verb,
-                                               const PrivateRestConfig& cfg) {
-        if (!creds_) return PrivateRestError::SigningFailed;
-        const auto permit = endpoint_permit(ResponseKind::SignedJson);
-        if (!permit) return PrivateRestError::InvalidConfig;
-        if (listen_key.empty()) return PrivateRestError::InvalidConfig;
-        const auto budget = reserve_budget_explicit(kListenKeyCallWeight);
-        if (!budget) return PrivateRestError::RateLimitExhausted;
-
-        std::array<char, kApiKeyLen> key_buf{};
-        std::size_t key_len = 0;
-        if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
-            return PrivateRestError::SigningFailed;
-        }
-
-        std::string target = "/api/v3/userDataStream?listenKey=";
-        percent_encode_append(listen_key, target);
-
-        net::io_context ioc;
-        std::variant<std::string, PrivateRestError> outcome = PrivateRestError::None;
-        net::co_spawn(
-            ioc,
-            detail::fetch_signed_body_coro(*permit, *budget, target,
-                                            std::string(key_buf.data(), key_len), cfg, test_seam_,
-                                            verb),
-            [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> r) {
-                if (eptr) std::rethrow_exception(eptr);
-                outcome = std::move(r);
-            });
-        ioc.run();
-
-        if (std::holds_alternative<PrivateRestError>(outcome)) {
-            return std::get<PrivateRestError>(outcome);
-        }
-        return PrivateRestError::None;
     }
 
     // Test-only (tests/binance_private_rest_test_hooks.hpp): publishes a snapshot that is fresh right

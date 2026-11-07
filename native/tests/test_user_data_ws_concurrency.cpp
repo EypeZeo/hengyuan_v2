@@ -1,6 +1,8 @@
-// Real two-thread stress tests for TODO 1A.4's new cross-thread boundaries:
-// UserDataWsEventRing (WS I/O thread -> hot thread) and ListenKeyPublisher (hot thread ->
-// WS I/O thread). Mirrors test_spsc_concurrency.cpp's own SpscRingConcurrency/
+// Real two-thread stress test for TODO 1A.4's cross-thread boundary:
+// UserDataWsEventRing (WS I/O thread -> hot thread). Its sibling boundary, ListenKeyPublisher
+// (hot thread -> WS I/O thread), was retired with the listenKey stack in M5b-2; the ring is shared
+// with the WebSocket API session, which is why this file stays on the TSan and ARM64 lists.
+// Mirrors test_spsc_concurrency.cpp's own SpscRingConcurrency/
 // IntentChannelConcurrency pattern -- a green run here proves the LOGICAL contract across the
 // boundary; ThreadSanitizer (-DHY_SANITIZER=thread, see native/cmake/Sanitizers.cmake and
 // tools/wsl_verify.sh) is what actually proves no missing acquire/release edge, and is
@@ -14,7 +16,6 @@
 // Governance: L1, no network/token/order. GTest only.
 
 #include <gtest/gtest.h>
-#include <hengyuan/binance_listen_key_publisher.hpp>
 #include <hengyuan/binance_user_data_event.hpp>
 
 #include <cstring>
@@ -95,55 +96,4 @@ TEST(UserDataWsEventRingConcurrency, NoLossNoDuplicationStrictFifo) {
     EXPECT_EQ(torn_payload_count, 0u)
         << "torn/partially-visible slot observed at seq " << first_torn_seq
         << " -- this is what a missing release/acquire pair looks like on weak-memory hardware";
-}
-
-TEST(ListenKeyPublisherConcurrency, LoadNeverObservesATornSnapshot) {
-    ListenKeyPublisher pub;
-    constexpr std::uint64_t kPublishes = 100'000;
-
-    std::atomic<bool> producer_done{false};
-    std::uint64_t torn_count = 0;
-    std::uint64_t observed_count = 0;
-    std::uint64_t max_seq_seen = 0;
-
-    std::thread producer([&pub, &producer_done] {
-        for (std::uint64_t i = 1; i <= kPublishes; ++i) {
-            const std::string key = "K" + std::to_string(i);
-            // issued_at_ms/expires_at_ms are DERIVED from the same i the key encodes -- a
-            // torn/inconsistent snapshot is one where these three fields don't agree, not
-            // merely unlikely to occur by chance.
-            EXPECT_TRUE(pub.publish(key, static_cast<std::int64_t>(i),
-                                     static_cast<std::int64_t>(i) * 2));
-        }
-        producer_done.store(true, std::memory_order_release);
-    });
-
-    std::thread reader([&pub, &producer_done, &torn_count, &observed_count, &max_seq_seen] {
-        // Loops until the producer is done AND at least one load has observed the final
-        // publish -- otherwise this thread could exit before ever exercising a genuinely
-        // concurrent load.
-        for (;;) {
-            const ListenKeySnapshot snap = pub.load();
-            if (snap.seq > 0) {
-                ++observed_count;
-                if (snap.seq > max_seq_seen) max_seq_seen = snap.seq;
-                const std::string expected_key = "K" + std::to_string(snap.issued_at_ms);
-                const bool consistent = (snap.view() == expected_key) &&
-                                         (snap.expires_at_ms == snap.issued_at_ms * 2);
-                if (!consistent) ++torn_count;
-            }
-            if (producer_done.load(std::memory_order_acquire) && max_seq_seen >= kPublishes) {
-                break;
-            }
-        }
-    });
-
-    producer.join();
-    reader.join();
-
-    EXPECT_EQ(torn_count, 0u)
-        << "load() observed a snapshot whose key/issued_at_ms/expires_at_ms disagreed -- this "
-           "is what a missing mutex lock looks like";
-    EXPECT_GT(observed_count, 0u) << "reader thread never observed a single published snapshot";
-    EXPECT_EQ(max_seq_seen, kPublishes);
 }

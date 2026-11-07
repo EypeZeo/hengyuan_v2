@@ -211,7 +211,8 @@ TEST(SpotRateLimitTracker, TryReserveWeightOnlyRejectsUnknownEndpoint) {
     EXPECT_FALSE(tr.try_reserve_weight_only(RateLimitLane::Strategy, bogus, table));
 }
 
-// TODO 1A.4: try_reserve_weight_only_explicit() -- listenKey calls' rate-limit path, deliberately
+// TODO 1A.4: try_reserve_weight_only_explicit() -- the rate-limit path of calls with no spec-pinned weight (first the listenKey calls, now retired; today the offline
+// operator tool's allOrders/openOrders reads), deliberately
 // NOT routed through PrivateRestEndpoint (see the function's own header comment: adding a
 // PrivateRestEndpoint enumerator with no spec basis is a build-failing NAME_CONFLICT per
 // tools/spec_enum_diff.py).

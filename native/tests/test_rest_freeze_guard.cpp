@@ -214,7 +214,6 @@ constexpr Pinned kPinned[] = {
     {"include/hengyuan/binance_klines_rest.hpp", 1, 1, Kind::EndpointPermit},
     {"include/hengyuan/binance_ws_session.hpp", 1, 1, Kind::WebSocket},
     {"include/hengyuan/binance_kline_ws_session.hpp", 1, 1, Kind::WebSocket},
-    {"include/hengyuan/binance_user_data_ws_session.hpp", 1, 1, Kind::WebSocket},
     {"include/hengyuan/binance_ws_api_user_data_session.hpp", 1, 1, Kind::WsEndpointPermit},
 };
 
@@ -433,7 +432,7 @@ TEST(RestFreezeGuardClockToken, EveryTimestampASignedRequestIsSignedWithWasIssue
 // --- D5 R3b-1: the raw GET of the offline operator tool stays a GET, and stays behind one door ---------------
 
 TEST(RestFreezeGuardRawRead, TheRawCoroutineIsGetOnlyAndTakesNoVerb) {
-    // fetch_signed_body_coro() takes the verb as a parameter because POST /api/v3/order and the listenKey calls share it. This one returns the
+    // fetch_signed_body_coro() takes the verb as a parameter because POST /api/v3/order needs POST (the listenKey calls that used to share it are retired). This one returns the
     // answer of ANY status, so it must not be able to carry an order: the verb is not a parameter and the only verb the body names is GET.
     const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
     ASSERT_NE(f, nullptr);

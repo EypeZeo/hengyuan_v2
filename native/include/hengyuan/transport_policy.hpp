@@ -153,7 +153,7 @@ enum class ResponseKind : std::uint8_t {
 // Body cap per kind, in bytes. 0 = not a kind this build knows (no permit is ever issued for it).
 //   ServerTime     the answer is 27 bytes; 64 KiB is slack, not an expected size.
 //   SignedJson     the account answer lists every asset the account has ever held (a few hundred entries,
-//                  tens of KiB); order and listenKey answers are a few hundred bytes.
+//                  tens of KiB); order answers are a few hundred bytes.
 //   ExchangeInfo   a filtered call (the only supported production shape, see fetch_exchange_info()) names a
 //                  handful of symbols at about 3 KiB each, and kMaxSymbols bounds the rest; the unfiltered
 //                  answer (several MiB) is not a production shape and is refused here by design.

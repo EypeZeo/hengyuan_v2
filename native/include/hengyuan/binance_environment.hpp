@@ -111,14 +111,15 @@ enum class BinanceEnvironment : std::uint8_t {
 // below stops compiling), no default value on the private constructor, and each factory
 // passes its own string-literal values explicitly (static storage duration, valid for the
 // whole process). ws_port_ is a string_view rather than e.g. uint16_t specifically because
-// UserDataWsSessionConfig::port (binance_user_data_ws_session.hpp) is itself a std::string --
+// the public WebSocket session configs (binance_ws_session.hpp, binance_kline_ws_session.hpp)
+// take the port as a std::string --
 // a string_view converts into that with no extra allocation, whereas a numeric port would
 // need its own std::to_string() first (CLAUDE.md Engineering Mandate §1: zero heap
 // allocation on this kind of wiring path).
 //
 // ws_host_/ws_port_ are DELIBERATELY NOT part of transport_policy_'s endpoint_allowlist --
-// BinanceUserDataWsSession connects directly via its own resolver call on the raw host, it
-// never consults this allowlist, and production_transport_policy()'s allowlist
+// the public WebSocket sessions connect directly via their own resolver call on the raw host,
+// they never consult this allowlist, and production_transport_policy()'s allowlist
 // (binance_default_endpoints()) already uses all 4 of TransportPolicy::kMaxEndpoints's slots
 // for REST hosts. Adding a WS host there would silently overflow that fixed-size array; WS
 // and REST transport policy are two independent mechanisms and must stay that way.

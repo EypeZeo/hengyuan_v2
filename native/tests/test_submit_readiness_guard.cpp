@@ -19,10 +19,11 @@
 //        * SubmitReadyToken has exactly one mint site (inside SubmitReadiness::authorize) and exactly one friend;
 //        * every production call of drain_user_data_events() is pinned with its argument count, and for a call that passes a barrier, the
 //          exact text of that argument: a call that leaves it out still compiles and quietly merges events of a generation the sweep
-//          already settled, and never learns that a serverShutdown ended its generation. The memory-only calls are on the retired listenKey
-//          stream, which stamps no generation and has no serverShutdown; M5b-2 removes them together with that stream.
-//        * (D5 slice R4) the same pin carries the late-fill alarm: the orchestrator's call passes ctx.late_fill as its eighth argument, the
-//          listenKey calls pass none (their harnesses open a scratch store that no operator has resolved anything in), the alarm's hook in the
+//          already settled, and never learns that a serverShutdown ended its generation. The memory-only calls were on the listenKey
+//          stream, which stamped no generation and had no serverShutdown; M5b-2 removed them together with that stream, and
+//          NoUserDataDrainWithoutABarrierAnAlarmAndADurablePublisherIsLeft keeps it that way.
+//        * (D5 slice R4) the same pin carries the late-fill alarm: the orchestrator's call passes ctx.late_fill as its eighth argument (the
+//          retired listenKey calls passed none), the alarm's hook in the
 //          drain sits ahead of the barrier's stale-generation filter, and only the private-stream pipeline builds a LateFillAlarm or assigns
 //          .late_fill -- any other construction is a review item.
 //        * (M5b-1) which production files so much as name a context's `confirmation` or `submit_port` is a short reviewed list, and the
@@ -319,7 +320,6 @@ struct DrainPin {
 constexpr std::size_t kDurableArgCount = 9;
 constexpr std::size_t kLateFillArgCount = 8;
 constexpr std::size_t kBarrierArgCount = 7;
-constexpr std::size_t kNoBarrierArgCount = 6;
 
 // Every production call of drain_user_data_events(), and what kind it is.
 const DrainPin kUserDataDrains[] = {
@@ -328,12 +328,6 @@ const DrainPin kUserDataDrains[] = {
      "orchestrate_submit(): the barrier of the readiness Gate 2b consults (no readiness: no barrier, and Gate 2b refuses anyway), the late-fill "
      "alarm of the context (unset: the drain ignores a report about a written-off order, as before R4), and the durable publisher of the context "
      "(unset: the memory-first drain, acceptable only where no durable sink exists; a process that has one wires it -- M4)"},
-    {"src/live_submit_real_credentials_demo.cpp", 3, kNoBarrierArgCount, "", "", "",
-     "NO BARRIER, NO ALARM, MEMORY-FIRST: the listenKey stream stamps no generation and has no serverShutdown; the SubmitPort is assembled but "
-     "never invoked; there is no durable store at all"},
-    {"src/live_submit_reconcile_harness_demo.cpp", 2, kNoBarrierArgCount, "", "", "",
-     "NO BARRIER, NO ALARM, MEMORY-FIRST: the listenKey stream stamps no generation and has no serverShutdown; nothing is ever submitted; there is "
-     "no durable store at all"},
 };
 
 }  // namespace
@@ -558,6 +552,39 @@ TEST(SubmitReadinessGuard, EveryProductionUserDataDrainIsPinnedWithItsBarrierArg
     }
     for (const std::string& s : problems) ADD_FAILURE() << s;
     EXPECT_TRUE(problems.empty());
+}
+
+// M5b-2: the memory-only drains belonged to the two listenKey demos (no generation to filter by, no serverShutdown, no durable store). They went with
+// that stream, so a pin that passes no barrier, no late-fill alarm or no durable publisher is no longer "a demo exception": it would be a new hole
+// and needs a conversation, not a row.
+namespace {
+
+// A row of kUserDataDrains is complete when its call passes all nine arguments and the row names the barrier, the late-fill alarm and the durable publisher.
+bool drain_row_is_complete(const DrainPin& p) {
+    return p.args == kDurableArgCount && !std::string_view(p.barrier_arg).empty() && !std::string_view(p.late_fill_arg).empty() &&
+           !std::string_view(p.durable_arg).empty();
+}
+
+}  // namespace
+
+TEST(SubmitReadinessGuard, NoUserDataDrainWithoutABarrierAnAlarmAndADurablePublisherIsLeft) {
+    std::size_t rows = 0;
+    for (const DrainPin& p : kUserDataDrains) {
+        ++rows;
+        EXPECT_TRUE(drain_row_is_complete(p)) << p.file << ": a drain passes all nine arguments and names the barrier it filters by, the late-fill alarm and its "
+                                                          "durable publisher";
+    }
+    EXPECT_GE(rows, 1u) << "an empty table would pass this for the wrong reason";
+}
+
+TEST(SubmitReadinessGuard, ARowThatLeavesOutAnArgumentIsNotComplete) {
+    // The negative control of the test above: rows with known answers.
+    EXPECT_TRUE(drain_row_is_complete({"f", 1, kDurableArgCount, "b", "l", "d", "why"}));
+    EXPECT_FALSE(drain_row_is_complete({"f", 1, kLateFillArgCount, "b", "l", "d", "why"})) << "eight arguments: no durable publisher in the call";
+    EXPECT_FALSE(drain_row_is_complete({"f", 1, kBarrierArgCount, "b", "", "", "why"})) << "seven arguments: no alarm and no publisher in the call";
+    EXPECT_FALSE(drain_row_is_complete({"f", 1, kDurableArgCount, "", "l", "d", "why"})) << "the row names no barrier";
+    EXPECT_FALSE(drain_row_is_complete({"f", 1, kDurableArgCount, "b", "", "d", "why"})) << "the row names no alarm";
+    EXPECT_FALSE(drain_row_is_complete({"f", 1, kDurableArgCount, "b", "l", "", "why"})) << "the row names no publisher";
 }
 
 TEST(SubmitReadinessGuard, TheOrchestratorOrdersGate2bAfterTheKillSwitchAndBeforeTheEvidence) {

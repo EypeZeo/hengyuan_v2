@@ -173,7 +173,7 @@ public:
 
     // True once the WebSocket handshake has completed and the read loop has started -- NOT merely
     // when TCP/TLS came up. A plain relaxed flag, same as BinanceKlineWsSession::is_connected() and
-    // BinanceUserDataWsSession::is_connected(): it is how PublicFeedSupervisor (public_feed_supervisor.hpp)
+    // BinanceWsApiUserDataSession::is_connected(): it is how PublicFeedSupervisor (public_feed_supervisor.hpp)
     // tells "still connecting" from "healthy" from any thread. Never cleared again -- a session that
     // later fails reports stopped(), and a replacement is a NEW session object.
     bool is_connected() const { return connected_.load(std::memory_order_relaxed); }

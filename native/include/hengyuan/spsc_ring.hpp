@@ -95,7 +95,7 @@ public:
         // -Werror=stringop-overflow= here once T grows large enough (first observed with
         // UserDataWsEvent, ~200 bytes with six embedded char[24] fields) AND this call gets
         // deeply inlined through several layers of caller (a test helper calling
-        // drain_user_data_events()-adjacent code, or BinanceUserDataWsSession::on_read()) --
+        // drain_user_data_events()-adjacent code, or a session's on_read()) --
         // the diagnostic's own reported "destination object" is a totally unrelated
         // std::atomic<size_t>'s 8-byte _M_i member from an unrelated header pulled in
         // transitively (e.g. gtest's own <memory> include), not this array -- a clear

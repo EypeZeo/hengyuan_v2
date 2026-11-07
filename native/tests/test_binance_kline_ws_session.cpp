@@ -1,7 +1,7 @@
 // 批次 6 6a-1: binance_kline_ws_session.hpp unit tests.
 //
 // No real network access -- connection-failure tests use the local blackhole TCP fixture,
-// mirroring test_binance_user_data_ws_session.cpp's own pattern exactly.
+// the pattern the (retired, M5b-2) user-data session test used as well.
 //
 // Coverage map for the two external-review-driven safety requirements (this file's own header
 // comment in binance_kline_ws_session.hpp):
@@ -10,7 +10,7 @@
 //      handle_closed_bar()/the ring). Combined with on_read()'s own trivial `if (pr == Ok)` glue,
 //      this fully establishes the property without needing a live mock WS server -- same
 //      "test the parser's classification directly, not full message flow through a real socket"
-//      philosophy test_binance_user_data_ws_session.cpp already uses for UserDataJsonParser.
+//      philosophy the (retired) test_binance_user_data_ws_session.cpp used for UserDataJsonParser.
 //   2. "跳空检测触发挂起" -- proven directly by the KlineBarGapGuard tests below, which exercise
 //      the exact same accept()/is_suspended()/resume() state machine BinanceKlineWsSession's
 //      handle_closed_bar()/resume_after_gap() delegate to, with no Boost/Beast/network
@@ -196,7 +196,7 @@ static_assert(hy::KlineFeedSession<hy::BinanceKlineWsSession>);
 TEST(KlineJsonParser, ReusedAcrossCallsWithDifferentBodySizes) {
     // Exercises the reused padded copy buffer (binance_json_parser.hpp's own AUDIT
     // PERF-ALLOC-012 discipline), same test shape as
-    // UserDataJsonParser.ReusedAcrossCallsWithDifferentBodySizes. (That parse() allocates
+    // the retired UserDataJsonParser.ReusedAcrossCallsWithDifferentBodySizes. (That parse() allocates
     // nothing is test_ws_parser_allocation.cpp's job.)
     KlineJsonParser parser;
     KlineWsEvent ev{};

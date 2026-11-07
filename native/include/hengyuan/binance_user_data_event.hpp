@@ -3,7 +3,8 @@
 // live_submit_orchestrator.hpp needs to consume Binance user-data-stream WS events on the
 // hot/submit thread, WITHOUT pulling in Boost.Asio/Beast/OpenSSL/simdjson.
 //
-// Deliberately split out of binance_user_data_ws_session.hpp, mirroring this codebase's own
+// Deliberately split out of the session headers (binance_ws_api_user_data_session.hpp; before M5b-2 also the
+// listenKey session's), mirroring this codebase's own
 // existing precedent: binance_market_event.hpp (lightweight event struct, zero Boost/simdjson
 // dependency) vs. binance_ws_session.hpp (the actual Beast session, depends on it) vs.
 // binance_json_parser.hpp (depends on simdjson, not Boost). live_submit_orchestrator.hpp's own
@@ -16,7 +17,7 @@
 // Governance: L1 (pure data + orchestration glue, no I/O of its own).
 //
 // TODO 1A.4 batch 2: ExecutionType (below) lives here rather than in the heavier
-// binance_user_data_ws_session.hpp, even though it is WS-event-only vocabulary with no REST
+// session headers (binance_ws_api_user_data_session.hpp), even though it is WS-event-only vocabulary with no REST
 // counterpart -- UserDataWsEvent::exec_type needs the type visible at struct-definition time,
 // and this light file cannot include the heavy session header back (that header already
 // includes THIS one, for UserDataWsEvent itself; the reverse direction would be circular). Its
@@ -50,7 +51,7 @@ enum class UserDataEventKind : std::uint8_t {
     Unknown = 0,
     ExecutionReport = 1,
     OutboundAccountPosition = 2,
-    ListenKeyExpired = 3,  // listenKey stream only; retired together with that stream (private-stream migration M5)
+    ListenKeyExpired = 3,  // RESERVED: the listenKey stream is retired (M5b-2); nothing produces or consumes this kind, the value stays so the kinds below keep their numbers
     // The WebSocket API user data stream (private-stream migration M1; blueprint 5.7 P-28, P-29):
     BalanceUpdate = 4,           // balanceUpdate: a deposit, withdrawal or transfer between accounts
     ExternalLockUpdate = 5,      // externalLockUpdate: an external system locked or unlocked part of the spot balance
@@ -120,7 +121,7 @@ struct UserDataWsEvent {
     std::int64_t exchange_order_id{0};    // "i" -- only meaningful when kind == ExecutionReport
     std::int64_t transaction_time_ms{0};  // "T" (executionReport, balanceUpdate, externalLockUpdate, listStatus);
                                            // "u", the time of the last account update (outboundAccountPosition)
-    // --- WebSocket API user data stream (private-stream migration M1). The listenKey parser leaves all of these at their defaults. ---
+    // --- WebSocket API user data stream (private-stream migration M1). The retired listenKey parser left all of these at their defaults. ---
     std::uint64_t generation{0};          // the connection generation that received the frame: stamped by the session (M2), never by the
                                            // parser; 0 = not stamped
     std::int64_t subscription_id{-1};     // the wrapper's "subscriptionId"; -1 = the frame carried none (serverShutdown never does)

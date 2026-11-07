@@ -6,8 +6,8 @@
 // no token/HMAC/credentials of any kind, no SymbolRegistry access.
 //
 // Deliberately a SEPARATE class from BinanceWsSession, not that class genericized in place --
-// the same precedent binance_user_data_ws_session.hpp's own header comment already established
-// for the private user-data stream applies here nearly verbatim:
+// the same reasoning that kept the (since retired) listenKey user-data session apart from
+// BinanceWsSession applies here nearly verbatim:
 //   - BinanceWsSession is hard-wired to BinanceJsonParser (binance_json_parser.hpp), which only
 //     recognizes trade/aggTrade/depthUpdate payload shapes -- no kline support.
 //   - binance_ws_session.hpp's own detail::is_valid_stream_name() (confirmed via direct read,
@@ -18,13 +18,13 @@
 //     validate_ws_config()/is_valid_stream_name() at all -- it does not include
 //     binance_ws_session.hpp.
 //
-// Same fail-stop discipline as BinanceWsSession/BinanceUserDataWsSession, deliberately NOT
+// Same fail-stop discipline as BinanceWsSession/BinanceWsApiUserDataSession, deliberately NOT
 // relaxed here: any failure (resolve/connect/TLS/WS-handshake/read error, idle timeout, explicit
 // stop()) permanently stops this session -- no reconnect state machine inside this class.
 //
 // Shutdown contract: IDENTICAL to BinanceWsSession's -- call stop() then join the thread
 // driving this session's io_context. Do NOT call io_context::stop() as part of that sequence
-// (see binance_user_data_ws_session.hpp's own header comment for why).
+// (see binance_ws_session.hpp's own header comment for why).
 //
 // Two safety-critical design requirements, both from 批次 6 计划's first external-review round
 // (verified independently before adoption -- see the plan's "第一轮外部（Gemini）复核意见处理
@@ -39,7 +39,7 @@
 //      to filter it back out. A consumer-side filter would let a high-frequency stream of
 //      unclosed updates fill and overwrite this session's deliberately small ring before the one
 //      closed-candle event a consumer actually needs ever gets read. Same discipline
-//      UserDataJsonParser already applies ("classify first, only push what the consumer needs"),
+//      the retired UserDataJsonParser applied ("classify first, only push what the consumer needs"),
 //      applied here to a much higher-frequency stream where it is load-bearing, not incidental.
 //
 //   2. Bar-gap (跳空) detection + suspend. A WS reconnect does not replay missed candles -- if
@@ -120,7 +120,7 @@ enum class KlineParseResult : std::uint8_t {
     MissingFields = 3,   // wrong/absent "e", absent "k", or a required field inside "k" missing
 };
 
-// Zero allocation in parse(), matching UserDataJsonParser/binance_json_parser.hpp's own AUDIT
+// Zero allocation in parse(), matching binance_json_parser.hpp's own AUDIT
 // PERF-ALLOC-012 / Appendix D L-38 discipline exactly: everything is sized once, in the
 // constructor, for the largest frame a session can deliver (kWsReadMessageMaxBytes) -- simdjson's
 // arrays and string buffer via allocate(), and one fixed padded copy buffer -- never a fresh
@@ -429,8 +429,8 @@ private:
         if (is_expected_stop(ec)) return;
         if (ec || stop_) return fail(ec, "ssl_handshake");
         beast::get_lowest_layer(ws_).expires_never();
-        // Same idle-timeout/max-message-size knobs as BinanceWsSession/BinanceUserDataWsSession's
-        // own call sites -- fixed here too, not exposed via the config struct. The size is the one
+        // Same idle-timeout/max-message-size knobs as BinanceWsSession's
+        // own call site -- fixed here too, not exposed via the config struct. The size is the one
         // number the frame parsers size their memory from (ws_frame_limits.hpp).
         hy::configure_ws_stream(ws_, std::chrono::seconds(90), hy::kWsReadMessageMaxBytes);
         ws_.async_handshake(config_.host, target_,
@@ -537,7 +537,7 @@ private:
         stop_.store(true, std::memory_order_relaxed);
     }
 
-    // Runs on strand_ (posted via stop()). Identical to BinanceUserDataWsSession::do_stop() --
+    // Runs on strand_ (posted via stop()). Identical to BinanceWsSession::do_stop() --
     // see that function's own comment for why cancelling here (not just setting a flag) bounds
     // shutdown latency.
     void do_stop() {

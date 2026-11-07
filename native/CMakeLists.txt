@@ -176,9 +176,9 @@ if(HY_BUILD_DEMO)
     hengyuan_allow_third_party_tsan_fences(binance_feed_demo)
 
     # TODO 1A.4 prerequisite: first process in native/src/ that actually runs
-    # poll_once()/drain_reconcile_events() in a continuous loop (previously test-only),
-    # alongside a real BinanceUserDataWsSession on a second thread. See the file's own
-    # header comment for exactly what's real vs. simulated here.
+    # poll_once()/drain_reconcile_events() in a continuous loop (previously test-only).
+    # Until M5b-2 it ran next to a real listenKey session on a second thread; that stack is
+    # retired and what is left is the network-free loop. See the file's own header comment.
     add_executable(live_submit_reconcile_harness_demo src/live_submit_reconcile_harness_demo.cpp)
     target_link_libraries(live_submit_reconcile_harness_demo PRIVATE
         hengyuan_dataplane
@@ -192,23 +192,6 @@ if(HY_BUILD_DEMO)
     )
     hengyuan_set_warnings(live_submit_reconcile_harness_demo)
     hengyuan_allow_third_party_tsan_fences(live_submit_reconcile_harness_demo)
-
-    # Batch H, H6: cold-start harness wiring H1-H5 against a real (owner-supplied,
-    # testnet-only) credential -- same Boost/Beast/OpenSSL dependency shape as the mock-
-    # credential harness above.
-    add_executable(live_submit_real_credentials_demo src/live_submit_real_credentials_demo.cpp)
-    target_link_libraries(live_submit_real_credentials_demo PRIVATE
-        hengyuan_dataplane
-        Boost::system
-        OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
-        Threads::Threads
-    )
-    target_include_directories(live_submit_real_credentials_demo SYSTEM PRIVATE
-        ${Boost_INCLUDE_DIRS}
-        ${OPENSSL_INCLUDE_DIR}
-    )
-    hengyuan_set_warnings(live_submit_real_credentials_demo)
-    hengyuan_allow_third_party_tsan_fences(live_submit_real_credentials_demo)
 
     # 批次 6 6a-2: public kline feed -> StreamingEvaluator -> HoldingStateTracker, log only --
     # zero order-related code anywhere in this target. Needs hengyuan_strategy_spec (loads specs
@@ -231,7 +214,7 @@ if(HY_BUILD_DEMO)
     # 批次 6 6b-1: H6's cold-start chain + 6a-1 kline stream + new depth stream + real
     # KillSwitch + dry-run evidence replay -- ctx.submit_port stays mock throughout (see the
     # file's own header comment), so this produces zero real network writes and needs no L5
-    # review. Same dependency shape as live_submit_real_credentials_demo + live_bar_feed_signal_demo.
+    # review. Same dependency shape as live_bar_feed_signal_demo.
     add_executable(live_submit_preflight_harness src/live_submit_preflight_harness.cpp)
     target_link_libraries(live_submit_preflight_harness PRIVATE
         hengyuan_dataplane
@@ -973,6 +956,14 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_rest_freeze_guard)
     gtest_discover_tests(test_rest_freeze_guard)
 
+    # M5b-2: the listenKey stack stays retired. A source scan of include/ and src/ (no Boost, no network), same shape as the guards above.
+    add_executable(test_listenkey_retirement_guard tests/test_listenkey_retirement_guard.cpp)
+    target_link_libraries(test_listenkey_retirement_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_listenkey_retirement_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_listenkey_retirement_guard)
+    gtest_discover_tests(test_listenkey_retirement_guard)
+
     # 批次 6 6b-0f-3b: consumer side of the kline feed -- the only path by which a bar reaches
     # StreamingEvaluator::step() (duplicate filter + continuity guard + rebuild from backfill). Pure
     # logic over the strategy-spec evaluator and kline_bar.hpp; loads its spec via load_strategy_spec(),
@@ -1052,13 +1043,6 @@ if(HY_BUILD_TESTS)
     target_include_directories(test_binance_clock_sync PRIVATE tests)
     hengyuan_set_warnings(test_binance_clock_sync)
     gtest_discover_tests(test_binance_clock_sync)
-
-    # TODO 1A.4: listenKey cross-thread publisher -- offline pure logic only, same
-    # no-OpenSSL/no-network dependency shape as test_binance_clock_sync above.
-    add_executable(test_listen_key_publisher tests/test_listen_key_publisher.cpp)
-    target_link_libraries(test_listen_key_publisher PRIVATE hengyuan_core GTest::gtest_main)
-    hengyuan_set_warnings(test_listen_key_publisher)
-    gtest_discover_tests(test_listen_key_publisher)
 
     # Layer 2 of docs/SPEC_INVARIANTS.md: durable_control_plane.hpp ABI surface
     add_executable(test_durable_control_plane_abi tests/test_durable_control_plane_abi.cpp)
@@ -1346,10 +1330,10 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_private_stream_pipeline_concurrency)
     gtest_discover_tests(test_private_stream_pipeline_concurrency PROPERTIES LABELS concurrency)
 
-    # TODO 1A.4: real two-thread stress for the two NEW cross-thread boundaries this batch
-    # introduces (UserDataWsEventRing, ListenKeyPublisher) -- the first new cross-thread
-    # boundary in this codebase since order_tracker.hpp's own SpscRing pair. Deliberately
-    # Boost-free (binance_listen_key_publisher.hpp/binance_user_data_event.hpp both are), same
+    # TODO 1A.4: real two-thread stress for the cross-thread boundary this batch introduced
+    # (UserDataWsEventRing; its sibling ListenKeyPublisher was retired in M5b-2) -- the first new
+    # cross-thread boundary in this codebase since order_tracker.hpp's own SpscRing pair. Deliberately
+    # Boost-free (binance_user_data_event.hpp is), same
     # "concurrency" label/reasoning as test_spsc_concurrency/test_reconcile_concurrency above.
     add_executable(test_user_data_ws_concurrency tests/test_user_data_ws_concurrency.cpp)
     target_link_libraries(test_user_data_ws_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
@@ -1607,23 +1591,9 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_ws_session)
         gtest_discover_tests(test_binance_ws_session)
 
-        # TODO 1A.4: user-data-stream WS session -- same Boost/Beast/OpenSSL/simdjson
-        # dependency shape as test_binance_ws_session above, same blackhole-acceptor
-        # no-real-network fixture pattern.
-        add_executable(test_binance_user_data_ws_session tests/test_binance_user_data_ws_session.cpp)
-        target_link_libraries(test_binance_user_data_ws_session PRIVATE
-            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
-            Threads::Threads GTest::gtest_main)
-        target_include_directories(test_binance_user_data_ws_session SYSTEM PRIVATE
-            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
-        target_include_directories(test_binance_user_data_ws_session PRIVATE tests)
-        hengyuan_set_warnings(test_binance_user_data_ws_session)
-        hengyuan_allow_third_party_tsan_fences(test_binance_user_data_ws_session)
-        gtest_discover_tests(test_binance_user_data_ws_session)
-
         # 批次 6 6a-1: public kline/candlestick WS session -- same Boost/Beast/OpenSSL/simdjson
         # dependency shape and blackhole-acceptor no-real-network fixture pattern as
-        # test_binance_user_data_ws_session above.
+        # test_binance_ws_session above.
         add_executable(test_binance_kline_ws_session tests/test_binance_kline_ws_session.cpp)
         target_link_libraries(test_binance_kline_ws_session PRIVATE
             hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
@@ -1635,8 +1605,9 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_binance_kline_ws_session)
         gtest_discover_tests(test_binance_kline_ws_session)
 
-        # Appendix D L-38: UserDataJsonParser and KlineJsonParser (both live in the session headers) allocate nothing once the parser exists.
-        # Same Boost/Beast/OpenSSL include shape as the two session tests above; same counting probe as test_binance_json_parser_allocation.
+        # Appendix D L-38: KlineJsonParser (it lives in the session header) allocates nothing once the parser exists. (The retired UserDataJsonParser was
+        # measured here too; the WebSocket API codec is measured in test_binance_ws_api_codec.)
+        # Same Boost/Beast/OpenSSL include shape as the session tests above; same counting probe as test_binance_json_parser_allocation.
         add_executable(test_ws_parser_allocation tests/test_ws_parser_allocation.cpp)
         target_link_libraries(test_ws_parser_allocation PRIVATE
             hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
@@ -1713,47 +1684,12 @@ if(HY_BUILD_TESTS)
         hengyuan_allow_third_party_tsan_fences(test_public_feed_pipeline)
         gtest_discover_tests(test_public_feed_pipeline)
 
-        # TODO 1A.4 batch 2: the reconnect supervisor -- constructs real
-        # BinanceUserDataWsSession instances (via the same blackhole-acceptor no-real-network
-        # fixture pattern as test_binance_user_data_ws_session above), so it needs the same
-        # Boost/Beast/OpenSSL/simdjson dependency shape. Single-threaded (poll() is called
-        # directly, not from a real io_context-driving thread, for most of this file's tests) --
-        # not labelled concurrency.
-        add_executable(test_binance_user_data_ws_supervisor tests/test_binance_user_data_ws_supervisor.cpp)
-        target_link_libraries(test_binance_user_data_ws_supervisor PRIVATE
-            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
-            Threads::Threads GTest::gtest_main)
-        target_include_directories(test_binance_user_data_ws_supervisor SYSTEM PRIVATE
-            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
-        target_include_directories(test_binance_user_data_ws_supervisor PRIVATE tests)
-        hengyuan_set_warnings(test_binance_user_data_ws_supervisor)
-        hengyuan_allow_third_party_tsan_fences(test_binance_user_data_ws_supervisor)
-        gtest_discover_tests(test_binance_user_data_ws_supervisor)
-
-        # Batch H, H3: listenKey keepalive/expiry scheduler -- constructs a real
-        # BinancePrivateRestClient against a local TlsResponseAcceptor (test_binance_private_rest
-        # above's own no-real-network fixture pattern), so it needs the same Boost/Beast/
-        # OpenSSL/simdjson dependency shape and the same HY_TEST_FIXTURE_DIR compile definition
-        # (set once above, reused here).
-        add_executable(test_binance_listen_key_keepalive tests/test_binance_listen_key_keepalive.cpp)
-        target_link_libraries(test_binance_listen_key_keepalive PRIVATE
-            hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
-            Threads::Threads GTest::gtest_main)
-        target_include_directories(test_binance_listen_key_keepalive SYSTEM PRIVATE
-            ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
-        target_include_directories(test_binance_listen_key_keepalive PRIVATE tests)
-        target_compile_definitions(test_binance_listen_key_keepalive PRIVATE
-            HY_TEST_FIXTURE_DIR="${HY_TEST_FIXTURE_DIR}")
-        hengyuan_set_warnings(test_binance_listen_key_keepalive)
-        hengyuan_allow_third_party_tsan_fences(test_binance_listen_key_keepalive)
-        gtest_discover_tests(test_binance_listen_key_keepalive)
-
         # Batch H, H5: binance_submit_adapter.hpp -- composite SubmitPort wiring combining
         # BinancePrivateRestClient (Boost/Beast/OpenSSL, same as test_binance_private_rest
         # above) with SymbolRegistry (hengyuan_core only). Registered in this Boost-linked
         # group, not test_symbol_registry's lightweight one, since it needs the union of both
         # dependency sets. Same TlsResponseAcceptor/HY_TEST_FIXTURE_DIR fixture pattern as
-        # test_binance_private_rest/test_binance_listen_key_keepalive above.
+        # test_binance_private_rest above.
         add_executable(test_binance_submit_adapter tests/test_binance_submit_adapter.cpp)
         target_link_libraries(test_binance_submit_adapter PRIVATE
             hengyuan_dataplane Boost::system OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS}
