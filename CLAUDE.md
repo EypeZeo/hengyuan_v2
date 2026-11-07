@@ -248,9 +248,9 @@ ceremony. Much of L4 §10's ABI surface is already ported into
 **Current honest state:** the authenticated REST client (`binance_private_rest.hpp`) and the real
 `POST /api/v3/order` adapter composed into a `SubmitPort` (`binance_submit_adapter.hpp`) are
 implemented and unit-tested, but nothing calls that `SubmitPort` against the exchange: every
-harness that reaches `orchestrate_submit()` injects a mock, and the two testnet-only cold-start
-harnesses (`live_submit_real_credentials_demo.cpp`, `live_submit_preflight_harness.cpp`;
-owner-supplied `.env`) assemble the real one without ever calling it. No real testnet or
+harness that reaches `orchestrate_submit()` injects a mock, and the one testnet-only cold-start
+harness (`live_submit_preflight_harness.cpp`;
+owner-supplied `.env`) assembles the real one without ever calling it. No real testnet or
 production credentials have ever been used against this code.
 
 **What remains true regardless of any file in this repo:** nobody but the account owner can

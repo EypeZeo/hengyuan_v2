@@ -517,7 +517,7 @@ constexpr const char* kPipelineHeader = "include/hengyuan/private_stream_pipelin
 
 TEST(BarrierSweepGuard, OnlyThePipelinePassesASweepJobToPollOnce) {
     // poll_once(tracker, inbound, outbound, port, policy, now_ms[, wall_now_ms[, sweep]]): six, seven or eight arguments; eight means the call runs a SweepJob.
-    // The private-stream pipeline (M5a-2b) is the one production site, and the job it passes is the one it owns. The harnesses join it when M5b migrates them --
+    // The private-stream pipeline (M5a-2b) is the one production site, and the job it passes is the one it owns. The preflight harness joined it in M5b-1 --
     // through the pipeline, not with a job of their own -- so an eighth argument anywhere else is a wiring nobody reviewed.
     std::vector<std::string> with_job;
     std::size_t calls_seen = 0;
@@ -531,7 +531,9 @@ TEST(BarrierSweepGuard, OnlyThePipelinePassesASweepJobToPollOnce) {
             }
         }
     }
-    EXPECT_GE(calls_seen, 5u) << "the scan must see the real poll_once() callers (the harnesses and the dry-run rig)";
+    // Three callers exist: the pipeline, the dry-run rig and the reconcile demo (one call). It was five while the H6 demo and the demo's final-drain call
+    // were in the tree (both went with the listenKey stack, M5b-2); the floor is a canary against a scanner gone blind, so it follows the real count.
+    EXPECT_GE(calls_seen, 3u) << "the scan must see the real poll_once() callers (the private-stream pipeline, the dry-run rig and the reconcile demo)";
     EXPECT_EQ(with_job, (std::vector<std::string>{kPipelineHeader}));
 }
 

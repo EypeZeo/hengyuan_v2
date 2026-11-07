@@ -161,7 +161,7 @@ TEST(EnvironmentBinding, WsHostDiffersAcrossEnvironments) {
 }
 
 // ws_host_/ws_port_ must never be folded into transport_policy().endpoint_allowlist --
-// BinanceUserDataWsSession connects directly on the raw host, never consults this allowlist,
+// the public WebSocket sessions connect directly on the raw host, never consult this allowlist,
 // and production's allowlist already uses all 4 of its fixed slots for REST hosts (see this
 // class's own header comment). This is a regression guard against a future "helpful" edit
 // that tries to add ws_host_ there.

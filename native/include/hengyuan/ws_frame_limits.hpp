@@ -4,10 +4,12 @@
 //
 // kWsReadMessageMaxBytes is the largest WebSocket MESSAGE (all fragments reassembled) a Binance session of this system accepts. Every
 // session passes it to hy::configure_ws_stream() (binance_tls.hpp), i.e. to Beast's read_message_max(): a message above it fails the
-// connection, a message of exactly this size is delivered. The three frame parsers -- BinanceJsonParser, UserDataJsonParser and
+// connection, a message of exactly this size is delivered. The two frame parsers of the public sessions -- BinanceJsonParser and
 // KlineJsonParser -- take ALL of their memory from the same number in their constructors (simdjson's working arrays and string buffer,
 // and the padded copy of the frame), so a frame a session can deliver never makes a parser allocate (Appendix D L-38), and parse() refuses
 // a body above it BEFORE copying it.
+// (The WebSocket API codec of the private stream has a much smaller bound of its own, kWsApiMaxMessageBytes in
+// transport_policy.hpp, carried by its WsEndpointPermit.)
 //
 // That makes the limit a memory decision as well as a protocol one: each parser holds about 28 MB of address space at 4 MiB (the padded
 // copy, 4 MiB of it, is touched; simdjson's arrays are only committed as far as a frame uses them). Which is why it is one constant and not

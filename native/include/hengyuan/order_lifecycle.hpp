@@ -218,7 +218,7 @@ inline TransitionResult validate_operator_resolution(OrderState from, OrderState
 // text documents this as a deliberate simplification, not an oversight.
 //
 // TODO 1A.4 batch 2: relocated here (verbatim, still inline) from binance_private_rest.hpp so
-// binance_user_data_ws_session.hpp's executionReport "X" field parsing can reuse it without
+// the user-data codec's executionReport "X" field parsing (binance_ws_api_codec.hpp) can reuse it without
 // pulling in that file's Boost.Beast/Asio/OpenSSL/simdjson weight -- same "no real reason for
 // a light consumer to drag in the heavy L4 REST client" reasoning binance_user_data_event.hpp's
 // own header comment already gives for keeping the event/ring types Boost-free.

@@ -136,7 +136,8 @@ jobs:
       # test_kline_feed_driver -- SnapshotRefreshGate's real worker thread under a real
       # PublicFeedSupervisor/DepthManager/InputValidator/ring.
       # test_user_data_ws_concurrency is the eighth (TODO 1A.4): UserDataWsEventRing (WS I/O thread ->
-      # hot thread, an SpscRing with self-checking payloads) and ListenKeyPublisher (the other way).
+      # hot thread, an SpscRing with self-checking payloads); its sibling ListenKeyPublisher (the other way)
+      # went with the listenKey stack in M5b-2, the ring stays because the WebSocket API session shares it.
       # test_symbol_registry_concurrency is the ninth (L4 5.3): SymbolRegistry's multi-reader /
       # single-writer std::shared_mutex snapshot publication.
       # test_ws_api_mailbox_concurrency joined with private-stream migration M2: the one-shot

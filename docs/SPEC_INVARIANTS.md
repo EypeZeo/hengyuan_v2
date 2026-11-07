@@ -179,7 +179,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     case——上一条的 GCC `-Wswitch` 硬约束，这次在写代码时就核对了，没有等 GCC 来报。
   - `test_submit_readiness_guard.cpp`：每个构造 `OrchestratorContext` 的生产位置都被固定（个数 + 给 `.readiness` 的确切文本，
     显式 `nullptr` 会被抓到）；`SyntheticReadiness` 只允许三个演练/线束文件使用；`SubmitReadyToken` 只有一个铸造点和一个友元；
-    每个 `drain_user_data_events()` 调用的屏障参数被固定（旧 listenKey 流的三个无屏障调用点写明理由，M5 随该流一起删除）。
+    每个 `drain_user_data_events()` 调用的屏障参数被固定（旧 listenKey 流的三个无屏障调用点已随 M5b-2 删除，之后守卫不再允许无屏障的调用点）。
 - 屏障的扫描传输（私网流迁移 M3b，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §5.3）— **没有新的跨线程原语、没有新的原子量**：请求走一条
   `SweepRequestRing`（`SpscRing<SweepRequest,4>`，热线程写、对账线程读，最新的 epoch 胜出）；回答是 `ReconcileEventKind::SweepDone`
   标记，**夹在既有的 `ReconcileEventRing` 里**，不是设计文档草案里的第二条报告环（偏离了批准的 5 行计划，理由：FIFO 让“标记排在它之前
@@ -232,7 +232,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     订单仍走 `prior_state` 路径。
   - **编排器**：`OrchestratorContext` 的 `user_data_durable` 字段（`UserDataDurablePublisher*`）原样传给排空；**未接发布者时排空仍是旧的内存优先行为**（只允许没有持久
     sink 的场景），不像对账环那样失败关闭——现有 7 个以上测试靠它测屏障联动，生产里没有任何地方构造带 WS 环的上下文（M5 接线）。`test_submit_readiness_guard.cpp`
-    把每个生产 `drain_user_data_events()` 的第 9 个参数钉住（编排器必须传 `ctx.user_data_durable`，listenKey 线束 6 个参数且写明理由），
+    把每个生产 `drain_user_data_events()` 的第 9 个参数钉住（编排器必须传 `ctx.user_data_durable`；原来 6 个参数的 listenKey 线束已随 M5b-2 删除），
     `test_order_durable_path_guard.cpp` 钉住“凡是给上下文接了 `user_data_events` 的生产文件也必须接 `user_data_durable`”（今天空转，M5 接线时生效）。
   - **证据**：`test_order_durable_path.cpp`（规划器的逐格表、对恢复扫描规则的性质测试与“拒绝无遗漏”的暴力路由搜索、对真实 `DurableAuditSink` 的差分——每个 Write 计划都
     能重启回放、每个拒绝要么被扫描判 `Corrupt` 要么是成交量自相矛盾——以及多订单随机游走：重开后的日志与每个未完结订单的影子逐一相等；两个写者共享影子的游走）、
@@ -374,6 +374,33 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     没有已知的 Binance 品种如此，BTCUSDT 是 1 比 1。头文件注释写明了这个假设；真遇到时，门会以 `QtyStepViolation` 拒绝，现在日志里看得见。
   - **未做 / 留给后面**：真正的下单数量策略（6b-2，“数量来自一个固定的小额配置上限”）；线束里其他还没有交易所证据的路径（`Close` 方向的探针、只有 USER_DATA 的密钥能否订阅、重连与断网、订单与成交的真实形状）仍待联调。
   - **证据**：test_preflight_probe.cpp（16 → 36 例，+20：新重载 16 例——没有最小名义金额时就是下界；首次联调的真实规则与价格（7 个单位，6 个不够，下界单独是 `BelowMinNotional`）；恰等于最小值够、少一点不够；原生刻度低于、等于、高于 8 三种缩放（高于时向上取整，含一个向下取整会差一个单位的例子）；只取步长网格上的点；无步长则每个 tick 都是数量；下界已经够；离下界约九百亿步的答案；答案紧贴溢出边缘（加倍一步就溢出，二分仍要找到它）；没有可表示的数量够得着；最小值永远够不着；答案超过最大数量、以及最大数量只对带步长的规则判；非正的价格；没有下界的规则；外加一个固定种子的差分模糊测试——2000 轮随机规则、价格与贴着边界的最小名义金额，以 `validate_pre_trade()` 自己的裁决为裁判，从下界往上逐点走到第一个 `Ok`，要求新函数与它一致）；计划 +3 例（在探针自己的价格上定量；首次联调的盘口给出门接受的开仓与平仓订单；够不着最小值则不探）；`pre_trade_check_name()` 1 例（17 个名字互不相同，枚举范围内没有 Unknown，枚举外是 Unknown）；test_live_submit_preflight_harness.cpp +2 例（夹具可选真实的 Testnet 规则与首次联调的盘口：整条链停在恰好 `OperatorNotConfirmed`；老探针——最小单位——停在 `PreTradeFailed`，裁决是 `BelowMinNotional`）。MSVC（/W4 /WX，Release）零警告零错误，相关 ctest（探针、线束、两个守卫、流水线、账户真相与预交易）135/135；WSL2 GCC-14（-Wall -Wextra -Wconversion -Werror）none 与 address（ASan+UBSan）各 5 个受影响目标共 112 例全绿，线束本身在 none 层编译通过；GCC 抓出我辅助函数里的一处 dangling-else（`if` 包着 gtest 的 EXPECT_NE 宏），已修。变异检查 33 个变异体（PP01–PP29 是计划与定量函数，PN01–PN04 是名字函数）：29 个被杀死，4 个存活——PP08、PP18、PP28 等价（零最小值走搜索也立即达到；加倍从 2 起步、或忘记上一个不够的步数，二分只是范围更宽，结果相同），PP20 是去掉加倍上限后的有符号溢出（未定义行为，MSVC 不拦；这条路径由测试走到，UBSan 层是它的拦截处，address 层已跑过）。变异设计催生了两条测试（答案紧贴溢出边缘；下界已够但超过最大数量）和一处代码简化（二分里跟踪的上界状态是冗余的，最终重算已经裁决）；PN03（少一个 case）被测试而不是编译器杀死：MSVC 的 C4062 默认关闭，只有 GCC 的 -Wswitch 保证完整，头文件注释已据实改正。tools/spec_xref_check.py（它抓到我写的一个代码里不存在的限定名，已改）、spec_enum_diff.py、concurrency_targets_check.py、closure_ledger_check.py 通过。
+- listenKey 整套的退役（私网流迁移 M5b-2，`PRIVATE_STREAM_MIGRATION_DESIGN.md` §7；Owner 2026-11-05 “开始 M5b，按推荐” 与 2026-11-07 “开始 M5b-2” 覆盖；Tier B；PR 待合并）— `binance_private_rest.hpp`、`binance_user_data_event.hpp`，守卫 test_listenkey_retirement_guard.cpp：
+  - **为什么现在**：官方现货变更日志（2026-01-21 条目，蓝图 `5.7` 的 P-07）确认 REST 的 userDataStream 三个端点与 WS API 的 userDataStream.start / ping / stop 自 2026-02-20 起不再提供（Testnet 更早，P-32）。迁移的 M0 至 M5b-1 造出了替代路径
+    （签名订阅的 WS API 会话、重连屏障、发单就绪令牌、流水线），Owner 的 Testnet 联调（2026-11-07，`all_met=yes`）在真实交易所上走通了它。旧栈从那以后只是不可能成功的死代码——而且在回环测试里仍然会“通过”，这是它留在树里最糟的地方。
+  - **删了什么**（约 3300 行）：四个头——listenKey 发布者、续期调度器、listenKey 的 WebSocket 会话、旧监督器——和各自的测试；`binance_private_rest.hpp` 里的三个 REST 调用（创建 / 续期 / 关闭 listenKey）连同响应解析、两个常量
+    （长度与权重）和它们共用的调用助手；H6 演示（真实凭据加 listenKey 的冷启动线束）；live_submit_reconcile_harness_demo 里的真实 listenKey 会话、io 线程、TLS 上下文和用户数据排空（剩下一个无网络的对账循环：它不再有独特的用途，只因守卫钉着它的排空调用而留着，
+    删不删是另一个决定）；test_user_data_ws_concurrency 去掉 listenKey 发布者那一半（事件环那一半被 WS API 会话共用，所以仍在 TSan 与 ARM64 清单里），test_ws_parser_allocation 去掉旧解析器那一半（取代它的 WsApiCodec 在 test_binance_ws_api_codec.cpp 里量）。
+  - **没删的**：共用的事件类型 `UserDataWsEvent` 与事件环 `UserDataWsEventRing`、`map_binance_order_status`（WS API 会话与编解码器在用）；ListenKeyExpired 是**保留的枚举值**——数值 3 不动，后面的种类不挪号，
+    生产里没有任何东西产生或消费它；`PrivateRestEndpoint` 不动（listenKey 的三个调用走显式权重，本来就没有端点种类，显式权重的路径由操作员工具的两个原始读继续使用和测试）；重连屏障对 “世代 0 = 未盖章” 的合并规则不动——
+    旧会话是唯一产生未盖章事件的来源，之后没有生产者；要不要把它收紧成失败关闭是另一个决定。
+  - **守卫**：新增 test_listenkey_retirement_guard.cpp（8 例）：生产树（include/ 与 src/）按两个视图扫描——代码视图（去注释、字面量内容置空）与字面量视图（去注释、字面量保留）；被退役的文件不存在；代码视图里没有任何带 listenKey / listen_key 的标识符（任何大小写）
+    和旧会话、旧监督器、旧解析器及其配置 / 统计类型的名字，也没有对被退役头的 include；字面量里没有 “/api/v3/userDataStream”、“userDataStream.start / ping / stop”、“listenKey”（活着的 userDataStream.subscribe.signature 与 unsubscribe 不被匹配）；
+    唯一的幸存者是 ListenKeyExpired = 3，在 binance_user_data_event.hpp 里恰好一次。扫描器自带负控（注释里的、字面量里的、活的会话 / 方法名、保留枚举值只在它的家里豁免一次、改了数值就是命中）。
+    test_submit_readiness_guard.cpp：用户数据排空的表只剩编排器一行，新增 NoUserDataDrainWithoutABarrierAnAlarmAndADurablePublisherIsLeft（表里每一行必须传满九个参数并写明屏障、告警与发布者，“演示例外” 不再存在；判断本身是个小函数，
+    新增的负控 ARowThatLeavesOutAnArgumentIsNotComplete 对六种缺口各给一行已知答案）；test_rest_freeze_guard.cpp 去掉旧会话的连接点一行；test_reconcile_durable_guard.cpp 去掉 H6 演示的一行，对账演示的排空调用数 2 → 1；
+    test_barrier_sweep_guard.cpp 里 “poll_once() 的调用者至少 5 个” 的金丝雀（扫描器有没有失明）降到 3——H6 演示与对账演示的最终排空各去掉一个，剩流水线、干跑装置与对账演示。
+    退役守卫的扫描器负控另有：标识符左右词边界各一例，两个视图的接线（活着的方法名 userDataStream.subscribe.signature 只在字面量视图里）。
+  - **账本与文档**：P0-001 现在只被一个不调用它的程序装配（预检线束），open 钉子去掉 H6 演示；FI-043 的 open 钉子去掉 create_listen_key，备注改为 “旧路径已删；重连（换代）在真实端点上仍未验证，联调只经历了一代”；账本另一处 “限度” 句更新；
+    NATIVE_ARCHITECTURE 的网络传输、公共行情、演示 / 线束三行与 “只有两个冷启动线束” 一句；L4 规范文件头列出的已实现方法去掉三个 listenKey 方法。没有改任何 FI 条目的状态与结果。
+    CLAUDE.md “Current honest state” 里 “两个冷启动线束（含 H6 演示）” 一句按事实改成一个，ci-native-sanitizers.yml 里 test_user_data_ws_concurrency 的注释去掉已删的发布者（只有这两处文字，没有规则、没有步骤被改）。
+  - **未做 / 留给后面**：重连屏障对世代 0 的收紧（上面）；对账演示本身的去留；线束的启动诊断（`.env` 解析状态与行号、`sync_clock()` / `fetch_exchange_info()` 失败的错误名、信任库检查——一个 Tier A）；L-53、L-50 的根治。
+  - **证据**：MSVC（`/W4 /WX`，Release）全树构建零警告，全量 ctest 3541 例全绿（登记 3543，2 个 Disabled、1 个 Skipped，与此前相同）。第一次全量跑出过一个失败：test_barrier_sweep_guard 里 “poll_once() 的调用者至少 5 个” 的金丝雀，
+    删掉 H6 演示与对账演示的最终排空后只剩 3 个——改成 3，重跑全绿。WSL2 两次建不出虚拟机（HCS 0x800705aa），按 CLAUDE.md 的规则改在 tokyo-vps（2 vCPU，GCC-14.2，`-Werror`）上验证同一份工作树：none 层 15 个受影响目标共 427 例 + 两个线束编译通过并全绿，
+    address 层（ASan + UBSan）同样 15 个目标 427 例全绿，thread 层是官方的 wsl_verify.sh thread——concurrency_targets_check 0 个发现，并发清单 227 例全绿（含 UserDataWsEventRingConcurrency），三个负控（宽松环、导出工作者双消费者、宽松邮箱）仍然各报出一次数据竞争。
+    变异检查 66 个变异体：63 个被杀死，3 个对照按设计存活（注释里提到被退役的名字；字面量里是活着的 userDataStream.subscribe.signature；活着的会话类名），0 个构建失败，金丝雀被语义测试杀死——证明守卫读的确实是被变异的树。
+    三组：退役守卫对树 39 个（每个数据表项一个：6 个带 listenKey 的标识符、9 个旧类型与函数名、3 个对旧头的 include、8 个被退役的字面量、5 个被退役文件的回归、5 个对保留枚举值的破坏；另 3 个对照），已改的表对树 6 个，
+    扫描器自身与表的判断 21 个（词边界、两个视图的接线、豁免的范围与数值、扫描根与后缀、字面量检查反向等）。动手前按分析补强了三处——标识符左右词边界各一个负控、两个视图的接线断言、排空表的判断函数与它的负控——补强前的版本没有跑过变异。
+    其它：spec_xref_check、spec_enum_diff、concurrency_targets_check、closure_ledger_check、doc_site 的 build_site.py --check 通过。没有对交易所做任何事：被删的代码本来就不能对它成功。
 
 ### 容量 / 生命周期
 
@@ -462,7 +489,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - **编排器**：`reconcile_durable` 是 `OrchestratorContext` 的指针字段（并发测试每轮新建 ctx，待定事件不能放在
       ctx 里）；接了 `reconcile_events` 却没接发布者 → 失败关闭，`orchestrate_submit()` 根本不排空（结果留在
       环里、槽位保持），因为另一种选择就是不留持久记录地发布到内存。`drain_reconcile_events()` 的尾部默认参数
-      `durable = nullptr` 保留“仅内存”的旧行为，只允许用于没有持久接收器、永远不会有事件的两个演示线束，
+      `durable = nullptr` 保留“仅内存”的旧行为，只允许用于没有持久接收器、永远不会有事件的演示线束（原来两个，H6 演示已随 M5b-2 删除，剩对账演示一个），
       以及只测内存半边的测试；`test_reconcile_durable_guard.cpp` 钉死每个生产调用点的参数个数（7 = 持久，
       6 = 仅内存，附理由表）、持久调用第七个参数的确切文本（显式 `nullptr` 也是七个参数）以及 `next_acked()`
       的唯一调用者。
@@ -720,7 +747,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       （`/api/v3/allOrders` 的一页，`limit` 1..1000，权重 20）、`fetch_open_orders_raw()`（`/api/v3/openOrders` 不带品种，权重 80）、`fetch_account_raw()`（`/api/v3/account?omitZeroBalances=true`，权重 20）、
       `read_server_time()`（与 `sync_clock()` 同一次往返、同样发布时钟快照与同样的拒绝，并把交易所的 `serverTime` 交出来）。共用私有的 `signed_get_raw()`，顺序与兄弟方法一致：入口守卫 → 许可
       → 时钟门（`ClockNotFresh`：不签名不发送）→ 预算（在时钟门之后：过期的时钟不烧预算）→ 签名 → 网络；本地拒绝一律不发送、不赋值。`PrivateRestEndpoint` 是 L4 spec 的转录、封闭的，
-      **没有 `allOrders` / `openOrders` 的槽位**，所以这两个用显式权重（20、80，Binance 文档的 IP 权重），与 listenKey 的先例同型；都记在 Reconciliation 车道。
+      **没有 `allOrders` / `openOrders` 的槽位**，所以这两个用显式权重（20、80，Binance 文档的 IP 权重），与曾经的 listenKey 调用（M5b-2 已退役）同型；都记在 Reconciliation 车道。
     - **ResponseKind 新档 OrderList = 1 MiB**（`allOrders` 的一页与 `openOrders`；等于默认策略上限，`static_assert` 钉住不超过它）；点查询与账户仍用 SignedJson（256 KiB）——两档的接线由测试钉住（300 KiB 的答案：
       页可以、点查询与账户不行）。
     - **传输头**（`operator_resolution_transport.hpp`，仅离线工具）：`BinanceExchangeReadPort`（实现 `ExchangeReadPort` 的五个读）、`RealSleeper`、`summarize_account()`。端口多做四件事：

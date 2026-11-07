@@ -6,8 +6,8 @@
 //   * a response to a request: {"id":N,"status":200,"result":{...}} or {"id":N,"status":4xx,"error":{"code":C,"msg":"..."}};
 //   * a user data event: {"subscriptionId":N,"event":{"e":"executionReport",...}} -- and serverShutdown, a CONNECTION event,
 //     {"event":{"e":"serverShutdown","E":T}} with no subscriptionId at all (so that field is optional here).
-// WsApiCodec::parse() tells them apart and fills ONE WsApiFrame. It replaces UserDataJsonParser (the listenKey stream's
-// unwrapped events), which stays until the listenKey stack is retired (M5).
+// WsApiCodec::parse() tells them apart and fills ONE WsApiFrame. It replaced UserDataJsonParser (the listenKey stream's
+// unwrapped events), which was retired with the rest of the listenKey stack (M5b-2).
 //
 // Why simdjson's DOM parser and not the on-demand one the old parsers use: on-demand reads only the fields it is asked for, so a frame
 // that is cut off after the part that was read (a missing closing brace) still "parses". A DOM parse validates the WHOLE document first --

@@ -4,7 +4,7 @@
 // with zero reconnect logic inside the class, which left a single dropped connection as the end of
 // the feed (外部复核 P0-05); this is the layer that was missing.
 //
-// SHAPE: the same as UserDataWsSessionSupervisor (binance_user_data_ws_supervisor.hpp), which this
+// SHAPE: the same as the supervisor of the (since retired, M5b-2) listenKey user-data session, which this
 // follows on purpose -- a brand-new session per attempt, no per-attempt join (a dropped session
 // object stays alive through its own shared_from_this() until its posted handlers finish), and
 // everything owned by ONE thread, the hot/submit thread that calls poll(). The only cross-thread
@@ -21,7 +21,7 @@
 //   * planned rollover: Binance closes a single connection after 24h, so a healthy session older than
 //     max_connection_age_ms is replaced at the next moment the consumer approves, with no failure
 //     counted and no backoff;
-//   * an optional terminal state after N consecutive failures. UserDataWsSessionSupervisor never gives
+//   * an optional terminal state after N consecutive failures. The retired listenKey supervisor never gave
 //     up (a silent user-data stream is worse than a retrying one); a market-data feed that stays dead
 //     means the strategy is blind, and the operator must be told -- the harness turns Terminal into
 //     a non-zero exit instead of trading on nothing.
@@ -69,7 +69,7 @@ concept SupervisedFeedSession = requires(S& s, const S& cs) {
     { cs.is_connected() } -> std::convertible_to<bool>;
 };
 
-// Like UserDataWsReconnectPolicy, these numbers have no spec/doc basis and are a starting point to
+// Like the retired listenKey supervisor's reconnect policy, these numbers have no spec/doc basis and are a starting point to
 // revisit against real operational experience -- but a public WS handshake against a rate-limit-
 // sensitive exchange wants the same slow, gentle curve, so the same base values.
 struct FeedSupervisorPolicy {
@@ -156,7 +156,7 @@ inline constexpr std::int64_t feed_elapsed_ms(std::int64_t later, std::int64_t e
 }
 
 // initial * multiplier^attempt, saturating at max_ms -- the same check-before-multiply loop shape as
-// reconcile_backoff_delay_ms() (order_tracker.hpp) and ws_reconnect_backoff_delay_ms(); never
+// reconcile_backoff_delay_ms() (order_tracker.hpp) and the retired listenKey supervisor's loop; never
 // `initial << attempt`, which is undefined for a large enough shift. `attempt` 0 = the first retry.
 // multiplier 1 (no growth) returns before the loop so a huge attempt count cannot spin.
 inline constexpr std::int64_t saturating_backoff_ms(std::int64_t initial_ms, std::uint32_t multiplier,

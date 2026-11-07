@@ -30,7 +30,7 @@
 //     on the ring to the reconcile thread is rescinded with on_sweep_request_undelivered(epoch).
 //   * admit_event(g): an event stamped with a generation OLDER than the Reconciled one is dropped (and counted): the sweep already reflects
 //     whatever it said. Before Reconciled -- Down or Sweeping -- old events are merged: OrderFillContext::consume_delta() only ever applies a
-//     positive delta, so a late duplicate is harmless there. Generation 0 means "not stamped" (the retired listenKey session) and is always merged.
+//     positive delta, so a late duplicate is harmless there. Generation 0 means "not stamped" (what the retired listenKey session delivered; the WS API session always stamps its generation, which starts at 1) and is always merged.
 //   * on_event_refused() (M4): the user-data publisher refused an event it drained -- one it could not record without breaking the durable log, or
 //     that contradicts it. Not knowing what it said is what a lost event is, so it is a soft barrier too.
 //
