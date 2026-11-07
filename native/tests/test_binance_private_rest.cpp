@@ -36,9 +36,11 @@
 #include "test_helpers/tls_response_acceptor.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <span>
 #include <string>
@@ -825,6 +827,391 @@ TEST(AccountSnapshotFuzz, FI033MalformedAccountDataNeverBecomesAMalformedSnapsho
     EXPECT_GT(capacity, 100u);
 }
 
+// --- parse_account_response() with a declared asset scope (the first Testnet joint run, 2026-11-06; L4 spec 4.3) ---
+//
+// GET /api/v3/account on the Spot Testnet listed 517 balances, every one of them non-zero (the Testnet funds an account in all assets), and a few
+// asset names no snapshot can hold. The original contract -- every non-zero asset represented, or the whole fetch fails -- could never read such an
+// account, and the process (the uid read at startup, then the account refresher behind the reconnect barrier) never got past it. With a declared
+// scope only the declared assets are converted and stored, each exactly as before; every other entry is counted. These tests pin that.
+
+namespace {
+
+using hy::AccountAssetScope;
+using hy::AccountParseReport;
+
+AccountAssetScope scope_of(std::initializer_list<std::string_view> names) {
+    AccountAssetScope s;
+    for (const std::string_view n : names) {
+        if (!s.add(n)) ADD_FAILURE() << "the scope refused " << n;
+    }
+    return s;
+}
+
+// A report that no parse wrote: every field is something a parse would never leave (the sentinel of "assigned only on total success").
+AccountParseReport sentinel_report() {
+    AccountParseReport r;
+    r.entries = 7;
+    r.represented = 6;
+    r.zero_balances = 5;
+    r.out_of_scope = 4;
+    r.scoped = true;
+    return r;
+}
+
+void expect_report_untouched(const AccountParseReport& r) {
+    const AccountParseReport s = sentinel_report();
+    EXPECT_EQ(r.entries, s.entries);
+    EXPECT_EQ(r.represented, s.represented);
+    EXPECT_EQ(r.zero_balances, s.zero_balances);
+    EXPECT_EQ(r.out_of_scope, s.out_of_scope);
+    EXPECT_EQ(r.scoped, s.scoped);
+}
+
+// The answer the first joint run read, in shape and field order: the commission block first, uid LAST (after the balances and the permissions), and
+// balances in the order the exchange gave them -- two names no snapshot can hold at the very front (5 characters = 15 UTF-8 bytes, and 2 characters =
+// 6 bytes, neither ASCII), a digit-only name, BNB, BTC, USDT, and `filler` more assets that each hold a few thousand units. Every entry is non-zero.
+// `odd_names` false leaves the two non-ASCII names out: an answer that is only too long.
+std::string testnet_shaped_account_body(std::size_t filler, bool odd_names = true) {
+    std::string body =
+        R"({"makerCommission":0,"takerCommission":0,"buyerCommission":0,"sellerCommission":0,)"
+        R"("commissionRates":{"maker":"0.00000000","taker":"0.00000000","buyer":"0.00000000","seller":"0.00000000"},)"
+        R"("canTrade":true,"canWithdraw":true,"canDeposit":true,"brokered":false,"requireSelfTradePrevention":false,"preventSor":false,)"
+        R"("updateTime":1762400000000,"accountType":"SPOT","balances":[)";
+    const auto entry = [&body](std::string_view asset_json, std::string_view free_text) {
+        if (body.back() != '[') body += ",";
+        body += R"({"asset":)";
+        body += asset_json;
+        body += R"(,"free":")";
+        body += free_text;
+        body += R"(","locked":"0.00000000"})";
+    };
+    if (odd_names) {
+        entry(R"("测试币种字")", "10000.00000000");
+        entry(R"("测试")", "10000.00000000");
+    }
+    entry(R"("456")", "10000.00000000");
+    entry(R"("BNB")", "1000.00000000");
+    entry(R"("BTC")", "1.50000000");
+    entry(R"("USDT")", "10000.12345678");
+    for (std::size_t i = 0; i < filler; ++i) entry("\"X" + std::to_string(i) + "\"", "12345.00000000");
+    body += R"(],"permissions":["SPOT"],"uid":1234567890123456789})";
+    return body;
+}
+
+constexpr std::uint64_t kTestnetShapedUid = 1'234'567'890'123'456'789ULL;
+constexpr std::size_t kTestnetShapedFiller = 511;  // 6 + 511 = the 517 entries of the first joint run
+
+}  // namespace
+
+TEST(ParseAccountResponseScope, TheTestnetShapedAnswerIsRefusedWholeWithoutAScope) {
+    // the original contract, which a scope is the explicit way out of: the first entry's name cannot be held ...
+    AccountSnapshot out = sentinel_snapshot(3);
+    EXPECT_EQ(parse_account_response(testnet_shaped_account_body(kTestnetShapedFiller), kAccountTs, out), PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 3);
+    // ... and with every name ASCII it is the 33rd non-zero asset
+    EXPECT_EQ(parse_account_response(testnet_shaped_account_body(kTestnetShapedFiller, /*odd_names=*/false), kAccountTs, out), PrivateRestError::CapacityExceeded);
+    expect_sentinel_untouched(out, 3);
+    // an EMPTY scope declares nothing: the same refusal
+    AccountParseReport report = sentinel_report();
+    EXPECT_EQ(parse_account_response(testnet_shaped_account_body(kTestnetShapedFiller), kAccountTs, out, AccountAssetScope{}, &report),
+              PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 3);
+    expect_report_untouched(report);
+}
+
+TEST(ParseAccountResponseScope, TheTestnetShapedAnswerIsReadWithTheDeclaredScopeAndTheRestIsCounted) {
+    const std::string body = testnet_shaped_account_body(kTestnetShapedFiller);
+    AccountSnapshot out{};
+    std::uint64_t uid = 0;
+    AccountParseReport report{};
+    ASSERT_EQ(parse_account_response(body, kAccountTs, out, uid, scope_of({"BTC", "USDT"}), &report), PrivateRestError::None);
+    EXPECT_EQ(uid, kTestnetShapedUid);
+    EXPECT_TRUE(out.can_trade());
+    EXPECT_EQ(out.timestamp_ms(), kAccountTs);
+    ASSERT_EQ(out.asset_count(), 2u);
+    ASSERT_NE(out.find("BTC"), nullptr);
+    ASSERT_NE(out.find("USDT"), nullptr);
+    EXPECT_EQ(out.find("BTC")->free_ticks(), 150'000'000);
+    EXPECT_EQ(out.find("BTC")->locked_ticks(), 0);
+    EXPECT_EQ(out.find("USDT")->free_ticks(), 1'000'012'345'678LL);
+    for (const char* other : {"BNB", "456", "X0", "X510"}) EXPECT_EQ(out.find(other), nullptr) << other << " is not in the scope: never stored";
+    EXPECT_EQ(report.entries, 517u);
+    EXPECT_EQ(report.represented, 2u);
+    EXPECT_EQ(report.zero_balances, 0u);
+    EXPECT_EQ(report.out_of_scope, 515u);
+    EXPECT_TRUE(report.scoped);
+
+    // the overload without a uid takes the same answer, and the report is optional
+    AccountSnapshot plain{};
+    ASSERT_EQ(parse_account_response(body, kAccountTs, plain, scope_of({"BTC", "USDT"})), PrivateRestError::None);
+    EXPECT_EQ(plain.asset_count(), 2u);
+}
+
+TEST(ParseAccountResponseScope, EntriesOutsideTheScopeAreNeverConvertedNorNameChecked) {
+    // Every one of these entries would fail an unscoped fetch (or take the 33rd slot); none of them is declared.
+    const std::string body = R"({"canTrade":true,"balances":[
+        {"asset":"BTC","free":"1.5","locked":"0"},
+        {"asset":"NEG","free":"-5","locked":"0"},
+        {"asset":"FRAC","free":"1.123456789","locked":"0"},
+        {"asset":"EXP","free":"1e5","locked":"0"},
+        {"asset":"HUGE","free":"99999999999999999999","locked":"0"},
+        {"asset":"OVERFLOW","free":"92233720368.54775807","locked":"0.00000001"},
+        {"asset":"AVERYLONGASSETNAMEOFFORTYBYTES0123456789","free":"1","locked":"0"},
+        {"asset":"A B","free":"1","locked":"0"},
+        {"asset":"NUL\u0000X","free":"1","locked":"0"},
+        {"asset":"","free":"1","locked":"0"},
+        {"asset":"DUP","free":"1","locked":"0"},
+        {"asset":"DUP","free":"2","locked":"0"}
+    ]})";
+    AccountSnapshot unscoped{};
+    EXPECT_EQ(parse_account_response(body, kAccountTs, unscoped), PrivateRestError::MalformedResponse) << "the positive control: unscoped, this answer is refused";
+
+    AccountSnapshot out{};
+    AccountParseReport report{};
+    ASSERT_EQ(parse_account_response(body, kAccountTs, out, scope_of({"BTC"}), &report), PrivateRestError::None);
+    ASSERT_EQ(out.asset_count(), 1u);
+    EXPECT_EQ(out.find("BTC")->free_ticks(), 150'000'000);
+    EXPECT_EQ(report.entries, 12u);
+    EXPECT_EQ(report.represented, 1u);
+    EXPECT_EQ(report.out_of_scope, 11u);
+}
+
+TEST(ParseAccountResponseScope, TheShapeOfEveryEntryIsStillJudgedWholeInScopeOrNot) {
+    // 4.1 does not bend: the answer's shape is judged whole, so an entry that is not an object with the three string fields fails the fetch even when
+    // its asset (if it has one) is outside the scope.
+    for (const std::string& entry : std::vector<std::string>{R"(42)", R"(null)", R"("ZZZ")", R"({"asset":"ZZZ","free":5,"locked":"0"})",
+                                                             R"({"asset":"ZZZ","free":"1"})", R"({"free":"1","locked":"0"})",
+                                                             R"({"asset":7,"free":"1","locked":"0"})", R"({"asset":"ZZZ","free":null,"locked":"0"})"}) {
+        SCOPED_TRACE(entry);
+        const std::string body = R"({"canTrade":true,"uid":9,"balances":[{"asset":"BTC","free":"1","locked":"0"},)" + entry + "]}";
+        AccountSnapshot out = sentinel_snapshot(2);
+        std::uint64_t uid = 4242;
+        AccountParseReport report = sentinel_report();
+        EXPECT_EQ(parse_account_response(body, kAccountTs, out, uid, scope_of({"BTC"}), &report), PrivateRestError::MalformedResponse);
+        expect_sentinel_untouched(out, 2);
+        EXPECT_EQ(uid, 4242U);
+        expect_report_untouched(report);
+    }
+}
+
+TEST(ParseAccountResponseScope, ADeclaredAssetIsJudgedExactlyAsBefore) {
+    // Each of these entries is IN the scope: the full strictness of an unscoped fetch applies, and the answer is refused whole.
+    for (const std::string& entry : std::vector<std::string>{R"({"asset":"BTC","free":"-1","locked":"0"})", R"({"asset":"BTC","free":"1","locked":"-0.1"})",
+                                                             R"({"asset":"BTC","free":"1.123456789","locked":"0"})", R"({"asset":"BTC","free":"1e5","locked":"0"})",
+                                                             R"({"asset":"BTC","free":"not-a-number","locked":"0"})",
+                                                             R"({"asset":"BTC","free":"92233720368.54775808","locked":"0"})",
+                                                             R"({"asset":"BTC","free":"92233720368.54775807","locked":"0.00000001"})",
+                                                             R"({"asset":"BTC","free":"","locked":"0"})"}) {
+        SCOPED_TRACE(entry);
+        const std::string body = R"({"canTrade":true,"balances":[{"asset":"ETH","free":"3","locked":"0"},)" + entry + "]}";
+        AccountSnapshot out = sentinel_snapshot(2);
+        AccountParseReport report = sentinel_report();
+        EXPECT_EQ(parse_account_response(body, kAccountTs, out, scope_of({"BTC", "ETH"}), &report), PrivateRestError::MalformedResponse);
+        expect_sentinel_untouched(out, 2);
+        expect_report_untouched(report);
+    }
+    // a declared asset that appears twice is a duplicate, however many other entries are skipped
+    {
+        AccountSnapshot out = sentinel_snapshot(2);
+        EXPECT_EQ(parse_account_response(R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1","locked":"0"},{"asset":"X","free":"1","locked":"0"},)"
+                                         R"({"asset":"BTC","free":"2","locked":"0"}]})",
+                                         kAccountTs, out, scope_of({"BTC"})),
+                  PrivateRestError::MalformedResponse);
+        expect_sentinel_untouched(out, 2);
+    }
+    // a declared asset whose balance is zero takes no slot (and is counted as zero), exactly as without a scope
+    {
+        AccountSnapshot out{};
+        AccountParseReport report{};
+        ASSERT_EQ(parse_account_response(R"({"canTrade":true,"balances":[{"asset":"BTC","free":"0","locked":"0.00000000"},{"asset":"USDT","free":"5","locked":"0"},)"
+                                         R"({"asset":"OTHER","free":"9","locked":"0"}]})",
+                                         kAccountTs, out, scope_of({"BTC", "USDT"}), &report),
+                  PrivateRestError::None);
+        EXPECT_EQ(out.asset_count(), 1u);
+        EXPECT_EQ(out.find("BTC"), nullptr);
+        EXPECT_NE(out.find("USDT"), nullptr);
+        EXPECT_EQ(report.entries, 3u);
+        EXPECT_EQ(report.represented, 1u);
+        EXPECT_EQ(report.zero_balances, 1u);
+        EXPECT_EQ(report.out_of_scope, 1u);
+    }
+    // a declared asset the answer does not list is simply absent (a balance that is not there is not an error; the pre-trade check then finds none)
+    {
+        AccountSnapshot out{};
+        ASSERT_EQ(parse_account_response(R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1","locked":"0"}]})", kAccountTs, out,
+                                         scope_of({"BTC", "USDT", "ETH"})),
+                  PrivateRestError::None);
+        EXPECT_EQ(out.asset_count(), 1u);
+        EXPECT_EQ(out.find("USDT"), nullptr);
+        EXPECT_EQ(out.find("ETH"), nullptr);
+    }
+}
+
+TEST(ParseAccountResponseScope, TheScopeDecidesByTheWholeNameAlone) {
+    // Nothing but the name decides whether an entry is kept: a look-alike is out of scope and a declared name is never skipped.
+    AccountSnapshot out{};
+    AccountParseReport report{};
+    ASSERT_EQ(parse_account_response(R"({"canTrade":true,"balances":[
+                  {"asset":"BTCX","free":"1","locked":"0"}, {"asset":"BT","free":"1","locked":"0"}, {"asset":"btc","free":"1","locked":"0"},
+                  {"asset":"XBTC","free":"1","locked":"0"}, {"asset":"BTC ","free":"1","locked":"0"}, {"asset":"BTC","free":"2","locked":"1"}]})",
+                                     kAccountTs, out, scope_of({"BTC"}), &report),
+              PrivateRestError::None);
+    ASSERT_EQ(out.asset_count(), 1u);
+    EXPECT_EQ(out.find("BTC")->free_ticks(), 200'000'000);
+    EXPECT_EQ(out.find("BTC")->locked_ticks(), 100'000'000);
+    EXPECT_EQ(report.represented, 1u);
+    EXPECT_EQ(report.out_of_scope, 5u);
+}
+
+TEST(ParseAccountResponseScope, TheUidStaysRequiredAndNothingMovesOnAFailure) {
+    const AccountAssetScope scope = scope_of({"BTC"});
+    for (const std::string& field : std::vector<std::string>{"", R"("uid":0,)", R"("uid":-5,)", R"("uid":"354937868",)", R"("uid":1.5,)"}) {
+        SCOPED_TRACE(field);
+        AccountSnapshot out = sentinel_snapshot(2);
+        std::uint64_t uid = 4242;
+        AccountParseReport report = sentinel_report();
+        EXPECT_EQ(parse_account_response(account_body_with_uid_field(field), kAccountTs, out, uid, scope, &report), PrivateRestError::MalformedResponse);
+        expect_sentinel_untouched(out, 2);
+        EXPECT_EQ(uid, 4242U);
+        expect_report_untouched(report);
+    }
+    // a clock that was never calibrated is refused before anything is read, scope or not
+    AccountSnapshot out = sentinel_snapshot(2);
+    AccountParseReport report = sentinel_report();
+    EXPECT_EQ(parse_account_response(kUidBody, 0, out, scope, &report), PrivateRestError::ClockNotFresh);
+    expect_sentinel_untouched(out, 2);
+    expect_report_untouched(report);
+}
+
+TEST(ParseAccountResponseScope, TheReportAddsUpAndSaysWhetherAScopeWasDeclared) {
+    {
+        AccountSnapshot out{};
+        AccountParseReport report = sentinel_report();
+        ASSERT_EQ(parse_account_response(R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1","locked":"0"},{"asset":"ETH","free":"0","locked":"0"},)"
+                                         R"({"asset":"USDT","free":"2","locked":"0"}]})",
+                                         kAccountTs, out, AccountAssetScope{}, &report),
+                  PrivateRestError::None);
+        EXPECT_FALSE(report.scoped) << "an empty scope declares nothing";
+        EXPECT_EQ(report.entries, 3u);
+        EXPECT_EQ(report.represented, 2u);
+        EXPECT_EQ(report.zero_balances, 1u);
+        EXPECT_EQ(report.out_of_scope, 0u);
+        EXPECT_EQ(report.entries, report.represented + report.zero_balances + report.out_of_scope);
+    }
+    {
+        AccountSnapshot out{};
+        AccountParseReport report{};
+        const std::string body = testnet_shaped_account_body(40);
+        ASSERT_EQ(parse_account_response(body, kAccountTs, out, scope_of({"BTC", "USDT", "BNB", "X7"}), &report), PrivateRestError::None);
+        EXPECT_TRUE(report.scoped);
+        EXPECT_EQ(report.entries, 46u);
+        EXPECT_EQ(report.represented, 4u);
+        EXPECT_EQ(report.entries, report.represented + report.zero_balances + report.out_of_scope);
+        EXPECT_EQ(report.represented, out.asset_count());
+    }
+}
+
+TEST(ParseAccountResponseScope, SixteenDeclaredAssetsAmongHundredsAreAllKept) {
+    // the scope's capacity (16) is within a snapshot's (32): a scoped parse can never be refused for capacity
+    std::string body = R"({"canTrade":true,"balances":[)";
+    AccountAssetScope scope;
+    for (int i = 0; i < 600; ++i) {
+        if (i > 0) body += ",";
+        body += "{\"asset\":\"Z" + std::to_string(i) + "\",\"free\":\"" + std::to_string(i + 1) + "\",\"locked\":\"0\"}";
+        if (i % 37 == 0 && scope.size() < AccountAssetScope::kCapacity) {
+            ASSERT_TRUE(scope.add("Z" + std::to_string(i)));
+        }
+    }
+    body += "]}";
+    ASSERT_EQ(scope.size(), AccountAssetScope::kCapacity);
+    AccountSnapshot out{};
+    AccountParseReport report{};
+    ASSERT_EQ(parse_account_response(body, kAccountTs, out, scope, &report), PrivateRestError::None);
+    EXPECT_EQ(out.asset_count(), AccountAssetScope::kCapacity);
+    EXPECT_EQ(report.out_of_scope, 600u - AccountAssetScope::kCapacity);
+    for (int i = 0; i < 592; i += 37) {  // 16 declared names: 0, 37, ... 555 (592 would be the 17th, which the scope refused)
+        const AssetBalance* a = out.find("Z" + std::to_string(i));
+        ASSERT_NE(a, nullptr) << i;
+        EXPECT_EQ(a->free_ticks(), static_cast<std::int64_t>(i + 1) * 100'000'000);
+    }
+}
+
+// The property that makes a scope safe to add: it can only ever REMOVE failures, never add one, and what it keeps is exactly what the unscoped parse
+// holds for those names. Deterministic (fixed seed), over the same adversarial bodies as FI-033 plus long, mostly valid ones.
+TEST(ParseAccountResponseScope, FuzzAScopeOnlyRemovesFailuresAndNeverChangesWhatItKeeps) {
+    Xorshift64 rng{0xBB67AE8584CAA73BULL};
+    std::size_t both_ok = 0, rescued = 0, both_failed = 0;
+    for (int iter = 0; iter < 30'000; ++iter) {
+        std::string body = R"({"canTrade":true,"balances":[)";
+        const bool adversarial = rng.below(2) == 0;
+        const std::uint64_t entries = adversarial ? 1 + rng.below(8) : 20 + rng.below(20);  // the long ones overrun the 32 slots
+        std::vector<std::string> names;
+        for (std::uint64_t e = 0; e < entries; ++e) {
+            if (e > 0) body += ",";
+            const bool nasty = adversarial || rng.below(25) == 0;
+            names.push_back(nasty ? random_name(rng, names) : "Q" + std::to_string(rng.below(1'000'000)));
+            body += R"({"asset":)";
+            append_json_string(body, names.back());
+            body += R"(,"free":)";
+            append_json_string(body, nasty ? random_decimal(rng) : std::string("1.5"));
+            body += R"(,"locked":)";
+            append_json_string(body, nasty ? random_decimal(rng) : std::string("0"));
+            body += "}";
+        }
+        body += "]}";
+
+        AccountAssetScope scope;
+        for (std::uint64_t picks = 1 + rng.below(4); picks > 0; --picks) {
+            (void)scope.add(rng.below(8) == 0 ? std::string("ABSENT") : names[rng.below(names.size())]);  // a nasty name is simply refused
+        }
+        if (!scope.active()) {
+            ASSERT_TRUE(scope.add("ABSENT"));
+        }
+
+        AccountSnapshot full = sentinel_snapshot(2);
+        AccountSnapshot part = sentinel_snapshot(2);
+        AccountParseReport report = sentinel_report();
+        const PrivateRestError err_full = parse_account_response(body, kAccountTs, full);
+        const PrivateRestError err_part = parse_account_response(body, kAccountTs, part, scope, &report);
+
+        if (err_full == PrivateRestError::None) {
+            ASSERT_EQ(err_part, PrivateRestError::None) << "a scope must never add a failure: " << body;
+        }
+        if (err_part == PrivateRestError::None) {
+            ASSERT_TRUE(parsed_snapshot_is_well_formed(part, kAccountTs)) << body;
+            for (const AssetBalance& a : part.assets()) ASSERT_TRUE(scope.contains(a.asset_name())) << "an asset outside the scope was stored: " << body;
+            ASSERT_TRUE(report.scoped);
+            ASSERT_EQ(report.entries, entries) << body;
+            ASSERT_EQ(report.entries, report.represented + report.zero_balances + report.out_of_scope) << body;
+            ASSERT_EQ(report.represented, part.asset_count()) << body;
+            if (err_full == PrivateRestError::None) {
+                ++both_ok;
+                std::size_t kept = 0;
+                for (const AssetBalance& a : full.assets()) {
+                    if (!scope.contains(a.asset_name())) continue;
+                    ++kept;
+                    const AssetBalance* b = part.find(a.asset_name());
+                    ASSERT_NE(b, nullptr) << "a declared asset was skipped: " << body;
+                    ASSERT_EQ(b->free_ticks(), a.free_ticks()) << body;
+                    ASSERT_EQ(b->locked_ticks(), a.locked_ticks()) << body;
+                }
+                ASSERT_EQ(part.asset_count(), kept) << body;
+            } else {
+                ++rescued;
+            }
+        } else {
+            ++both_failed;
+            expect_sentinel_untouched(part, 2);
+            expect_report_untouched(report);
+        }
+        if (::testing::Test::HasFailure()) return;
+    }
+    // The generator must reach every outcome, or the properties above were checked on nothing.
+    EXPECT_GT(both_ok, 500u);
+    EXPECT_GT(rescued, 5000u) << "answers the scope reads and the original contract refuses (the whole point)";
+    EXPECT_GT(both_failed, 500u);
+}
+
 // --- map_binance_order_status() -- L4 §6.5's status-string table ---
 
 TEST(MapBinanceOrderStatus, EveryKnownStatusMapsToItsDocumentedState) {
@@ -1580,6 +1967,127 @@ TEST_F(BoundCredentialsFixture, FetchAccountHttpErrorStatusRejected) {
     AccountSnapshot out = sentinel_snapshot(9);
     EXPECT_EQ(client.fetch_account(out, fetch_cfg), PrivateRestError::HttpStatus);
     expect_sentinel_untouched(out, 9);
+}
+
+// --- BinancePrivateRestClient::set_account_scope() / fetch_account() with a declared asset scope (the first joint run, 2026-11-06) ---
+
+TEST_F(BoundCredentialsFixture, AnEmptyAccountScopeIsRefusedAndTheClientKeepsWhatItHad) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    EXPECT_FALSE(client.account_scope().active()) << "a client starts with no scope: the original all-or-fail contract";
+    EXPECT_EQ(client.last_account_report().entries, 0u);
+    EXPECT_FALSE(client.set_account_scope(AccountAssetScope{}));
+    EXPECT_FALSE(client.account_scope().active());
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "USDT"})));
+    EXPECT_EQ(client.account_scope().size(), 2u);
+    EXPECT_TRUE(client.account_scope().contains("USDT"));
+    EXPECT_FALSE(client.set_account_scope(AccountAssetScope{})) << "an empty scope never replaces a declared one";
+    EXPECT_EQ(client.account_scope().size(), 2u);
+    ASSERT_TRUE(client.set_account_scope(scope_of({"ETH"}))) << "a later declaration replaces it";
+    EXPECT_EQ(client.account_scope().size(), 1u);
+    EXPECT_FALSE(client.account_scope().contains("BTC"));
+}
+
+TEST_F(BoundCredentialsFixture, FetchAccountReadsTheTestnetShapedAnswerOnlyOnceAScopeIsDeclared) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        hy::test_helpers::current_server_time_body());
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+
+    hy::test_helpers::TlsResponseAcceptor account_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, testnet_shaped_account_body(kTestnetShapedFiller));
+    PrivateRestConfig fetch_cfg;
+    fetch_cfg.port = std::to_string(account_server.port());
+
+    // 1. no scope declared: the original contract refuses the answer whole, and nothing moves (not even the report)
+    AccountSnapshot out = sentinel_snapshot(3);
+    std::uint64_t uid = 4242;
+    EXPECT_EQ(client.fetch_account(out, uid, fetch_cfg), PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(out, 3);
+    EXPECT_EQ(uid, 4242U);
+    EXPECT_EQ(client.last_account_report().entries, 0u);
+
+    // 2. the scope declared: the same answer is read, the uid comes back, the rest of the account is counted
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "USDT"})));
+    ASSERT_EQ(client.fetch_account(out, uid, fetch_cfg), PrivateRestError::None);
+    EXPECT_EQ(uid, kTestnetShapedUid);
+    ASSERT_EQ(out.asset_count(), 2u);
+    EXPECT_EQ(out.find("BTC")->free_ticks(), 150'000'000);
+    EXPECT_EQ(out.find("USDT")->free_ticks(), 1'000'012'345'678LL);
+    EXPECT_GT(out.timestamp_ms(), 0);
+    const AccountParseReport first = client.last_account_report();
+    EXPECT_EQ(first.entries, 517u);
+    EXPECT_EQ(first.represented, 2u);
+    EXPECT_EQ(first.out_of_scope, 515u);
+    EXPECT_TRUE(first.scoped);
+
+    // the overload without a uid (the account refresher's) reads the same answer with the same scope
+    AccountSnapshot refreshed{};
+    ASSERT_EQ(client.fetch_account(refreshed, fetch_cfg), PrivateRestError::None);
+    EXPECT_EQ(refreshed.asset_count(), 2u);
+
+    // the request is the same one either way: the scope only decides what is KEPT of the answer
+    const auto reqs = account_server.requests();
+    ASSERT_EQ(reqs.size(), 3u);
+    for (const auto& r : reqs) EXPECT_EQ(r.target.substr(0, 16), "/api/v3/account?");
+    EXPECT_EQ(reqs[0].target.find("omitZeroBalances"), std::string::npos);
+}
+
+TEST_F(BoundCredentialsFixture, AFailedFetchLeavesTheLastAccountReportAlone) {
+    hy::test_helpers::TlsResponseAcceptor time_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        hy::test_helpers::current_server_time_body());
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    PrivateRestConfig sync_cfg;
+    sync_cfg.port = std::to_string(time_server.port());
+    ASSERT_EQ(client.sync_clock(sync_cfg), PrivateRestError::None);
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "ZZZ"})));  // ZZZ is declared and holds nothing; ETH is not declared
+
+    hy::test_helpers::TlsResponseAcceptor good_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        R"({"canTrade":true,"balances":[{"asset":"BTC","free":"1.5","locked":"0"},{"asset":"ETH","free":"2","locked":"0"},{"asset":"ZZZ","free":"0","locked":"0"}]})");
+    PrivateRestConfig good_cfg;
+    good_cfg.port = std::to_string(good_server.port());
+    AccountSnapshot out{};
+    ASSERT_EQ(client.fetch_account(out, good_cfg), PrivateRestError::None);
+    const AccountParseReport before = client.last_account_report();
+    EXPECT_EQ(before.entries, 3u);
+    EXPECT_EQ(before.represented, 1u);
+    EXPECT_EQ(before.zero_balances, 1u);
+    EXPECT_EQ(before.out_of_scope, 1u);
+
+    // an HTTP error, then an answer whose shape is wrong: neither is a read, neither moves the report
+    hy::test_helpers::TlsResponseAcceptor denied_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 401, R"({"code":-2015,"msg":"denied"})");
+    PrivateRestConfig denied_cfg;
+    denied_cfg.port = std::to_string(denied_server.port());
+    AccountSnapshot kept = sentinel_snapshot(2);
+    EXPECT_EQ(client.fetch_account(kept, denied_cfg), PrivateRestError::HttpStatus);
+    expect_sentinel_untouched(kept, 2);
+
+    hy::test_helpers::TlsResponseAcceptor odd_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"),
+        fixture_path("test_leaf_key_testnet_host.pem"), 200, R"({"canTrade":true,"balances":[7]})");
+    PrivateRestConfig odd_cfg;
+    odd_cfg.port = std::to_string(odd_server.port());
+    EXPECT_EQ(client.fetch_account(kept, odd_cfg), PrivateRestError::MalformedResponse);
+    expect_sentinel_untouched(kept, 2);
+
+    const AccountParseReport after = client.last_account_report();
+    EXPECT_EQ(after.entries, before.entries);
+    EXPECT_EQ(after.represented, before.represented);
+    EXPECT_EQ(after.zero_balances, before.zero_balances);
+    EXPECT_EQ(after.out_of_scope, before.out_of_scope);
+    EXPECT_EQ(after.scoped, before.scoped);
 }
 
 // --- BinancePrivateRestClient::query_order() -- L4 §6, network-layer ---

@@ -1281,7 +1281,7 @@ result: PASS
 gate_result: PASS
 baseline: 2a7e383
 refs: test:native/tests/test_binance_private_rest.cpp#FI033MalformedAccountDataNeverBecomesAMalformedSnapshot test:native/tests/test_account_snapshot_boundary.cpp#FI033NoSequenceOfAssetsMakesABrokenSnapshotOrDisturbsABuilderThatRefused code:native/include/hengyuan/account_truth.hpp#AccountSnapshotBuilder run:"38123300184@2a7e3833/ci-native.yml[native-build-test]"
-note: PR #163 之后账户快照的字段全部私有，唯一的构造路径是 AccountSnapshotBuilder，畸形资产（空/超长/不可见字节的名称、重名、负数或溢出的余额、超过 32 个）被拒绝而不是截断，读取侧按容量再钳一次；判定信号是单元测试失败（含固定种子的模糊测试），主干 CI Native 的全量构建与测试已成功。
+note: PR #163 之后账户快照的字段全部私有，唯一的构造路径是 AccountSnapshotBuilder，畸形资产（空/超长/不可见字节的名称、重名、负数或溢出的余额、超过 32 个）被拒绝而不是截断，读取侧按容量再钳一次；判定信号是单元测试失败（含固定种子的模糊测试），主干 CI Native 的全量构建与测试已成功。2026-11-06 首次 Testnet 联调读到一个有 517 个非零资产的账户，按这条默认合同整份被拒；L4 规范 §4.3.1 增加了可选的资产范围（AccountAssetScope）：声明了范围的读取只转换并存储声明的资产、其余只计数，未声明时默认合同不变，本条的状态与结果不变（范围的模糊测试 FuzzAScopeOnlyRemovesFailuresAndNeverChangesWhatItKeeps 在 test_binance_private_rest.cpp）。
 ```
 
 ```ledger

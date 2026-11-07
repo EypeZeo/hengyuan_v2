@@ -320,6 +320,37 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **未做 / 留给后面**：Owner 的 Testnet 联调本身（AI 会话不运行它）；L-39（从未登录的连接上的 `session.subscriptions`）与签名订阅所需的权限仍是未验证项，联调是它们的证据；独立的对账线程（L-53）；listenKey 整套的退役（M5b-2）。
   - **证据**：test_preflight_probe.cpp（16 例：数量取整——恰在步长网格上、向上取整、无步长、坏规则无量、溢出无量与恰好落在最后一个能表示的网格点；计划——开仓以卖一买、平仓以买一卖、无动作与枚举外的值、价格非正、各动作只看自己那一侧、没有数量的品种；填充——订单与环境进入上下文、环境的两个标志就是上下文的标志、流水线接好的线不动、被绑定的确认被整个重置、另一个提交端口被换成 mock）、test_private_stream_pipeline.cpp（+2 例，并给 “上下文承载限流追踪器” 加了断言：真实就绪之后带订单的上下文停在 EXACTLY OperatorNotConfirmed、令牌的代次是在线的那一代、提交端口从未被调用；流不在线时同一个上下文停在 NotReady）、test_live_submit_preflight_harness.cpp 的夹具改用同样的两个函数（7 例原样通过；顺带修了它的全局陷阱计数器——原来一个走到提交端口的测试会给同一进程里之后跑的每个测试留下 1，--gtest_shuffle / --gtest_repeat 下后者的 “从未被调用” 断言就失败，现在每个夹具重置它，100 次洗牌重复全过）、test_submit_readiness_guard.cpp（+2 例，线束撤出三张表）、test_reconcile_durable_guard.cpp 与 test_operator_resolution_guard.cpp 的钉子随之更新。MSVC（/W4 /WX，Release）全量构建零警告零错误，全量 ctest 3554 个登记用例：3551 通过、2 个按设计禁用、1 个既有的跳过、0 失败（第一次跑只登记了 3438 个：gtest 的“发现”步骤在 ALL_BUILD 与 WSL 构建并行的负载下静默地只登记了 5 个目标的一部分测试，逐目标核对 `--gtest_list_tests` 并重新发现后重跑）；WSL2 GCC-14（-Wall -Wextra -Wconversion）：none 与 address（ASan+UBSan）各 11 个受影响目标 239 例全绿，线束本身在两层下都编译通过；官方 thread 层没有跑——本片不改任何并发代码。变异检查 52 个变异体（preflight_probe.hpp 38、线束源码 10、流水线上下文接线 4）：全部被杀死、0 个存活；PP26 因 /WX 编译不过（OrderType 只有一个枚举值），改写为 PP26b 后杀死；H10（线束自己 poll_once）第一轮存活，补守卫断言后杀死；E01（上下文丢掉限流追踪器）只有本片的端到端测试能杀死——M5a 的接线测试原先没有钉住的一处。tools/spec_xref_check.py、spec_enum_diff.py、concurrency_targets_check.py 通过；closure_ledger_check.py 原有 13 个发现（线束推翻了十一个条目里 “没有程序运行 StartupRecovery / SweepJob” 的断言），按账本 2026-11-05 M5b-1 备注处理后 0 个发现（状态、结果、门禁结论不变）。
 
+- 账户快照的资产范围（首次 Testnet 联调的发现，`BINANCE_PRIVATE_REST_L4_SPEC.md` §4.3.1；Owner 2026-11-06 “开始” 覆盖；Tier B；PR 待合并）— `account_truth.hpp`（`AccountAssetScope`、`AccountParseReport`）、
+  `binance_private_rest.hpp`（`parse_account_response_impl()` 的范围参数、`BinancePrivateRestClient::set_account_scope()` 与 `last_account_report()`）、`live_submit_preflight_harness.cpp`：
+  - **发现**：Owner 的第一次 Testnet 联调停在启动的 uid 读取（`PrivateRestError=MalformedResponse`）。`GET /api/v3/account` 在 Spot Testnet 上列出 **517 个余额，全部非零**（Testnet 给每个账户发了所有资产），其中有多字节的名字
+    （一个 5 个字符共 15 字节，一个 2 个字符共 6 字节）。快照最多 `kMaxAssets`（32）个资产，名字至多 `kAssetNameLen` 减一个可见 ASCII 字节；原合同（§4.3）是 “每个非零资产都必须表示，否则整次读取失败”，
+    这样的账户永远读不了。账户刷新（屏障的 Reconciled 条件）读的是同一份答复，所以问题不止启动时读 uid 那一次。tools/r6_account_shape_probe.py（Owner 跑，只打印字段名、类型和计数，不打印密钥、uid 的值与任何金额；
+    它按解析器的检查顺序逐项复核同一份答复）把原因定位到第 0 个条目的名字，其次才是容量。
+  - **合同**：未声明范围时合同不变（默认仍是全部或失败，容量仍是 `kMaxAssets`）。调用方可以声明自己需要的资产，即它交易的每个品种的基础资产与计价资产：`validate_pre_trade()` 读的恰好就是它们（买查计价资产，卖查基础资产；
+    敞口上限来自 `ExposureLimits`，不来自快照）。声明之后：（a）每个 `balances[]` 条目的形状照旧整体判定，条目必须是对象且 `asset`、`free`、`locked` 是字符串（§4.1）；
+    （b）名字不在范围内的条目只被计数，不转换、不查名字、不占槽，所以它既不会让读取失败，也不会挤掉声明过的资产；
+    （c）范围内的资产照旧逐项严格判定（转换、名字、重名、容量，零余额不占槽，非零必须表示）；范围内但答复里没有的资产就是不存在，下单前的检查因找不到余额而拒绝（失败关闭）；
+    （d）是否保留只由完整的名字决定（逐字节、区分大小写），条目的其他性质不会让声明过的资产被跳过。范围是固定容量（16 个名字，不超过快照的槽数）的值类型，名字按值存放、校验与 `AccountSnapshotBuilder::add_asset()` 一致；
+    空范围就是 “没有声明”。快照、uid 与报告都只在整体成功时才被赋值（§4.4 不变）。
+  - **不静默**：每个被跳过的条目都进报告：条目数 = 已表示 + 零余额 + 范围外（对每一份被接受的答复成立）。线束在启动读完 uid 之后打印一行
+    `Exchange account read: entries=… represented=… zero_in_scope=… out_of_scope=…`。
+  - **声明的位置**：`set_account_scope()` 在客户端上设置一次，在第一次账户读取（线束的 uid 读取）之前，由拥有客户端的线程调用；空范围被拒绝。今天只有预检线束声明，两个名字就是订单路径用的基础资产与计价资产（线束里的两个常量，同一份）；
+    operator 工具读原始答复、从不建快照，不需要也不可以有范围。守卫（`test_operator_resolution_guard.cpp` +1 例）：`set_account_scope` 只出现在定义和线束的那一处调用里，线束的调用在 uid 读取之前，
+    两次 `add` 的实参就是那两个常量，operator 工具的文件一个都不提这几个名字。
+  - **未做 / 留给后面**：生产组合根（M5 还没接线）要从注册表里的品种派生范围；快照的容量不变（517 个资产会破坏审计定下的快照体积预算、每次账户刷新都要复制、`find()` 变成扫描全部）；不加 `omitZeroBalances`
+    （这个账户的 517 个全部非零，没用）；线束里其他从未对真实交易所运行过的路径（签名订阅的权限与 L-39、深度、K 线）仍待 Owner 的联调。
+  - **证据**：test_account_snapshot_boundary.cpp（+7 例：范围类型——默认为空、什么也不声明；名字按值存放、按完整名字查找；十一个字符可以、十二个被拒绝而不截断；空 / 不可见 / 重复的名字被拒绝且什么也不改；
+    十六个名字可以、第十七个被拒绝而不扰动其余；平凡可复制的小值类型且拷贝互相独立；外加一个固定种子、与朴素参考模型比对的模糊测试）、test_binance_private_rest.cpp（+13 例：ParseAccountResponseScope 10 例——首次联调形状的答复
+    （517 个条目、多字节名字、uid 在最后）在没有范围时整份被拒绝（先是名字，全 ASCII 时是容量），声明 BTC 与 USDT 后读通并报告 517 / 2 / 0 / 515；范围外条目从不转换也不查名字；每个条目的形状在范围内外都照旧整体判定；
+    范围内的资产照旧逐项严格（负数、小数过多、指数、溢出、重名、零余额、不在答复里）；只由完整的名字决定；uid 仍然必需、失败时什么都不动；报告相加且说明有没有声明范围；六百个条目里十六个声明的资产全部保留；
+    外加一个固定种子的差分模糊测试——范围只会去掉失败、从不改变它保留的东西；BoundCredentialsFixture 3 例——空范围被拒绝、TLS 回环上同一份答复在没有范围时被拒绝而声明后读通且 uid 返回、失败的读取不动报告）、
+    test_operator_resolution_guard.cpp（+1 例）。MSVC（/W4 /WX，Release）全量构建零警告零错误，全量 ctest 3574 个登记用例（我新增的 21 个都在）、0 失败，2 个按设计禁用、1 个既有的跳过；这一次 CMake 4.4 的 gtest “发现” 步骤的竞争
+    让 ALL_BUILD 连死两次，改成 PRE_TEST 发现（ctest 时才发现，不再有构建时步骤）后一次通过，登记数与各可执行文件自报的 3573 个加 1 个自定义用例一致。WSL2 GCC-14（-Wall -Wextra -Wconversion -Werror）：none 与 address（ASan+UBSan）
+    各 10 个受影响目标全绿；GCC 抓出我新测试里 5 处 MSVC 看不到的告警（三个 range-for 复制、两个 dangling else），已修。线束在 none 层编译通过；address 层没有编译它（ASan 下它的编译峰值超过 5 GB，把 7.6 GB 的虚拟机拖住 40 多分钟，
+    CI 的 sanitizer 作业会在最终头上编译它）。变异检查 43 个变异体（AccountAssetScope 13、范围解析 16、客户端 6、线束源码 8）：40 个被杀死、3 个存活——AS11 与 AS12 是两处防御性夹紧（`size()` 与 `name_at()` 的长度夹紧：`add()` 保证
+    它们永远不会越界，经公开接口不可观察，与快照里同形的夹紧一样，只是这里没有破坏用的测试钩子）、H08 是线束里一行日志（`main()` 没有测试）。5 个变异体第一轮因 /WX 的 “未引用的形参” 编译不过（不算检出），加 `(void)x;` 改写后全部杀死；
+    三个 canary 先于其余运行，都由语义测试杀死，AS05、AS08、AS09 由测试里的编译期断言杀死。tools/spec_xref_check.py、spec_enum_diff.py、concurrency_targets_check.py、closure_ledger_check.py 通过。
+
 ### 容量 / 生命周期
 
 - `InFlightRegistry` / `kMaxInFlight` — 容量 64，`register_submit()` 在满时**失败关闭**（拒绝第 65 笔，

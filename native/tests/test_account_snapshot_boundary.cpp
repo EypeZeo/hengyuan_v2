@@ -657,6 +657,164 @@ TEST(AccountSnapshotFuzz, FI033ReadersStayInsideTheirArraysWhateverTheStoredCoun
     }
 }
 
+// ================================================================== the declared asset scope (joint-run finding, L4 spec 4.3)
+
+namespace {
+
+constexpr bool constexpr_scope_works() {
+    hy::AccountAssetScope s;
+    if (!s.add("BTC") || !s.add("USDT")) return false;
+    if (s.add("BTC")) return false;  // a duplicate
+    return s.active() && s.size() == 2 && s.contains("BTC") && s.contains("USDT") && !s.contains("ETH") && s.name_at(1) == "USDT";
+}
+static_assert(constexpr_scope_works(), "the scope is a literal type: it can be built and queried at compile time");
+
+}  // namespace
+
+TEST(AccountAssetScopeRules, ADefaultScopeIsEmptyAndDeclaresNothing) {
+    const hy::AccountAssetScope s;
+    EXPECT_FALSE(s.active());
+    EXPECT_EQ(s.size(), 0u);
+    EXPECT_FALSE(s.contains("BTC"));
+    EXPECT_FALSE(s.contains(""));
+    EXPECT_TRUE(s.name_at(0).empty());
+    const hy::AccountParseReport r;
+    EXPECT_EQ(r.entries, 0u);
+    EXPECT_EQ(r.represented, 0u);
+    EXPECT_EQ(r.zero_balances, 0u);
+    EXPECT_EQ(r.out_of_scope, 0u);
+    EXPECT_FALSE(r.scoped);
+}
+
+TEST(AccountAssetScopeRules, NamesAreStoredByValueAndFoundByTheWholeNameOnly) {
+    hy::AccountAssetScope s;
+    {
+        const std::string temporary = "BTC";  // the scope must not keep a view of its argument
+        ASSERT_TRUE(s.add(temporary));
+    }
+    ASSERT_TRUE(s.add("USDT"));
+    EXPECT_TRUE(s.active());
+    EXPECT_EQ(s.size(), 2u);
+    EXPECT_EQ(s.name_at(0), "BTC");
+    EXPECT_EQ(s.name_at(1), "USDT");
+    EXPECT_TRUE(s.name_at(2).empty()) << "past the end is empty, never a read of an unused slot";
+    EXPECT_TRUE(s.contains("BTC"));
+    EXPECT_TRUE(s.contains("USDT"));
+    for (const char* other : {"BT", "BTCX", "XBTC", "btc", "Btc", "USD", "USDTX", "", " BTC", "BTC "}) {
+        EXPECT_FALSE(s.contains(other)) << '"' << other << '"';
+    }
+}
+
+TEST(AccountAssetScopeRules, ElevenCharactersFitAndTwelveAreRefusedNotTruncated) {
+    hy::AccountAssetScope s;
+    ASSERT_TRUE(s.add("ABCDEFGHIJK"));  // kAssetNameLen - 1
+    EXPECT_FALSE(s.add("ABCDEFGHIJKL"));
+    EXPECT_FALSE(s.add(std::string(40, 'Z')));
+    EXPECT_EQ(s.size(), 1u);
+    EXPECT_EQ(s.name_at(0), "ABCDEFGHIJK");
+    EXPECT_FALSE(s.contains("ABCDEFGHIJKL"));
+}
+
+TEST(AccountAssetScopeRules, EmptyUnprintableAndRepeatedNamesAreRefusedAndChangeNothing) {
+    hy::AccountAssetScope s;
+    ASSERT_TRUE(s.add("BTC"));
+    EXPECT_FALSE(s.add(""));
+    EXPECT_FALSE(s.add("A B"));
+    EXPECT_FALSE(s.add(std::string_view("A\0B", 3)));
+    EXPECT_FALSE(s.add("A\x1f"));
+    EXPECT_FALSE(s.add("\x7f"));
+    EXPECT_FALSE(s.add("\xC3\xA9TH"));  // non-ASCII bytes
+    EXPECT_FALSE(s.add("BTC")) << "a name declared twice";
+    EXPECT_EQ(s.size(), 1u);
+    EXPECT_EQ(s.name_at(0), "BTC");
+    EXPECT_TRUE(s.add("ETH")) << "the scope keeps working after refusals";
+    EXPECT_EQ(s.size(), 2u);
+}
+
+TEST(AccountAssetScopeRules, SixteenNamesFitAndTheSeventeenthIsRefusedWithoutDisturbingTheRest) {
+    hy::AccountAssetScope s;
+    for (std::size_t i = 0; i < hy::AccountAssetScope::kCapacity; ++i) {
+        ASSERT_TRUE(s.add("N" + std::to_string(i))) << i;
+    }
+    EXPECT_EQ(s.size(), hy::AccountAssetScope::kCapacity);
+    EXPECT_FALSE(s.add("ONEMORE"));
+    EXPECT_EQ(s.size(), hy::AccountAssetScope::kCapacity);
+    EXPECT_FALSE(s.contains("ONEMORE"));
+    for (std::size_t i = 0; i < hy::AccountAssetScope::kCapacity; ++i) {
+        EXPECT_TRUE(s.contains("N" + std::to_string(i))) << i;
+        EXPECT_EQ(s.name_at(i), "N" + std::to_string(i));
+    }
+    // the scope never asks for more slots than a snapshot has: a scoped parse can never be refused for capacity
+    static_assert(hy::AccountAssetScope::kCapacity <= kMaxAssets);
+}
+
+TEST(AccountAssetScopeRules, AScopeIsAPlainSmallValueAndCopiesAreIndependent) {
+    static_assert(std::is_trivially_copyable_v<hy::AccountAssetScope>);
+    static_assert(std::is_trivially_destructible_v<hy::AccountAssetScope>);
+    static_assert(sizeof(hy::AccountAssetScope) <= 256, "16 names of 12 bytes, their lengths and a count");
+    hy::AccountAssetScope a;
+    ASSERT_TRUE(a.add("BTC"));
+    hy::AccountAssetScope b = a;
+    ASSERT_TRUE(a.add("USDT"));
+    EXPECT_EQ(a.size(), 2u);
+    EXPECT_EQ(b.size(), 1u);
+    EXPECT_FALSE(b.contains("USDT"));
+    EXPECT_TRUE(b.contains("BTC"));
+}
+
+// Whatever sequence of names is declared, the scope agrees with a plain reference model: a name is accepted exactly when the model says so (non-empty,
+// shorter than kAssetNameLen, printable ASCII, not yet declared, room left), and contains() answers by the whole name.
+TEST(AccountAssetScopeFuzz, AgreesWithAPlainReferenceModelWhateverIsDeclared) {
+    Xorshift64 rng{0x6A09E667F3BCC909ULL};
+    std::size_t accepted = 0, refused = 0, full_refusals = 0;
+    for (int round = 0; round < 3000; ++round) {
+        hy::AccountAssetScope s;
+        std::vector<std::string> model;
+        // Half the rounds are adversarial (names from the nasty generator); the other half are mostly valid and run past the capacity of 16.
+        const bool adversarial = rng.below(2) == 0;
+        const std::uint64_t adds = adversarial ? 1 + rng.below(12) : 14 + rng.below(12);
+        for (std::uint64_t i = 0; i < adds; ++i) {
+            const std::string name = (adversarial || rng.below(12) == 0) ? random_name(rng, model) : "Q" + std::to_string(rng.below(1'000'000));
+            bool valid_name = !name.empty() && name.size() < kAssetNameLen;
+            for (const char ch : name) {
+                const auto c = static_cast<unsigned char>(ch);
+                if (c < 0x21 || c > 0x7E) valid_name = false;
+            }
+            for (const std::string& m : model) {
+                if (m == name) valid_name = false;
+            }
+            const bool expect = valid_name && model.size() < hy::AccountAssetScope::kCapacity;
+            if (valid_name && model.size() >= hy::AccountAssetScope::kCapacity) ++full_refusals;
+            const std::size_t before = s.size();
+            const bool got = s.add(name);
+            ASSERT_EQ(got, expect) << "name of " << name.size() << " byte(s), model size " << model.size();
+            if (got) {
+                ++accepted;
+                model.push_back(name);
+                ASSERT_EQ(s.size(), before + 1);
+            } else {
+                ++refused;
+                ASSERT_EQ(s.size(), before) << "a refusal must change nothing";
+            }
+            ASSERT_EQ(s.active(), !model.empty());
+        }
+        ASSERT_EQ(s.size(), model.size());
+        for (std::size_t i = 0; i < model.size(); ++i) {
+            ASSERT_EQ(s.name_at(i), model[i]);
+            ASSERT_TRUE(s.contains(model[i]));
+        }
+        for (const std::string& probe : {std::string("BTC"), random_name(rng, model), std::string()}) {
+            bool in_model = false;
+            for (const std::string& m : model) in_model = in_model || m == probe;
+            ASSERT_EQ(s.contains(probe), in_model);
+        }
+    }
+    // the generator must reach the interesting outcomes, or the checks above ran on nothing
+    EXPECT_GT(accepted, 5000u);
+    EXPECT_GT(refused, 2000u);
+    EXPECT_GT(full_refusals, 20u);
+}
+
 // ================================================================== budget (SAFE-02 evidence, not a gate)
 
 // Run with --gtest_also_run_disabled_tests to print the numbers quoted in the PR. A timing assertion would be
