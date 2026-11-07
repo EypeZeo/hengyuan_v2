@@ -317,10 +317,10 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **联调报告**：运行中，监督器状态、代次、是否已验证、屏障或恢复状态每变一次打一行；一代结束时打一行它的结束原因、失败阶段、订阅应答与 `session.subscriptions` 的状态和错误码、retryAfter、事件与错误计数；
     退出时打印 `=== Private stream joint-run report ===`（存储绑定、恢复、屏障计数、清扫的作业与泵、账户的持有者 / 刷新器 / REST、监督器、工厂、最后一代会话、就绪拒绝按原因分列、持久发布者、迟到成交告警与熔断、探针结果），
     最后一行 `joint-run criteria: reconciled_once / account_refreshed_by_sweep / recovery_ready / probe_reached_OperatorNotConfirmed / all_met`。
-  - **未做 / 留给后面**：Owner 的 Testnet 联调本身（AI 会话不运行它）；L-39（从未登录的连接上的 `session.subscriptions`）与签名订阅所需的权限仍是未验证项，联调是它们的证据；独立的对账线程（L-53）；listenKey 整套的退役（M5b-2）。
+  - **未做 / 留给后面**：Owner 的 Testnet 联调本身（AI 会话不运行它；2026-11-07 已通过，见 “预检探针按交易所的最小名义金额定量” 条目的联调结果）；L-39（从未登录的连接上的 `session.subscriptions`）与签名订阅所需的权限当时是未验证项，联调回答了它们；独立的对账线程（L-53）；listenKey 整套的退役（M5b-2）。
   - **证据**：test_preflight_probe.cpp（16 例：数量取整——恰在步长网格上、向上取整、无步长、坏规则无量、溢出无量与恰好落在最后一个能表示的网格点；计划——开仓以卖一买、平仓以买一卖、无动作与枚举外的值、价格非正、各动作只看自己那一侧、没有数量的品种；填充——订单与环境进入上下文、环境的两个标志就是上下文的标志、流水线接好的线不动、被绑定的确认被整个重置、另一个提交端口被换成 mock）、test_private_stream_pipeline.cpp（+2 例，并给 “上下文承载限流追踪器” 加了断言：真实就绪之后带订单的上下文停在 EXACTLY OperatorNotConfirmed、令牌的代次是在线的那一代、提交端口从未被调用；流不在线时同一个上下文停在 NotReady）、test_live_submit_preflight_harness.cpp 的夹具改用同样的两个函数（7 例原样通过；顺带修了它的全局陷阱计数器——原来一个走到提交端口的测试会给同一进程里之后跑的每个测试留下 1，--gtest_shuffle / --gtest_repeat 下后者的 “从未被调用” 断言就失败，现在每个夹具重置它，100 次洗牌重复全过）、test_submit_readiness_guard.cpp（+2 例，线束撤出三张表）、test_reconcile_durable_guard.cpp 与 test_operator_resolution_guard.cpp 的钉子随之更新。MSVC（/W4 /WX，Release）全量构建零警告零错误，全量 ctest 3554 个登记用例：3551 通过、2 个按设计禁用、1 个既有的跳过、0 失败（第一次跑只登记了 3438 个：gtest 的“发现”步骤在 ALL_BUILD 与 WSL 构建并行的负载下静默地只登记了 5 个目标的一部分测试，逐目标核对 `--gtest_list_tests` 并重新发现后重跑）；WSL2 GCC-14（-Wall -Wextra -Wconversion）：none 与 address（ASan+UBSan）各 11 个受影响目标 239 例全绿，线束本身在两层下都编译通过；官方 thread 层没有跑——本片不改任何并发代码。变异检查 52 个变异体（preflight_probe.hpp 38、线束源码 10、流水线上下文接线 4）：全部被杀死、0 个存活；PP26 因 /WX 编译不过（OrderType 只有一个枚举值），改写为 PP26b 后杀死；H10（线束自己 poll_once）第一轮存活，补守卫断言后杀死；E01（上下文丢掉限流追踪器）只有本片的端到端测试能杀死——M5a 的接线测试原先没有钉住的一处。tools/spec_xref_check.py、spec_enum_diff.py、concurrency_targets_check.py 通过；closure_ledger_check.py 原有 13 个发现（线束推翻了十一个条目里 “没有程序运行 StartupRecovery / SweepJob” 的断言），按账本 2026-11-05 M5b-1 备注处理后 0 个发现（状态、结果、门禁结论不变）。
 
-- 账户快照的资产范围（首次 Testnet 联调的发现，`BINANCE_PRIVATE_REST_L4_SPEC.md` §4.3.1；Owner 2026-11-06 “开始” 覆盖；Tier B；PR 待合并）— `account_truth.hpp`（`AccountAssetScope`、`AccountParseReport`）、
+- 账户快照的资产范围（首次 Testnet 联调的发现，`BINANCE_PRIVATE_REST_L4_SPEC.md` §4.3.1；Owner 2026-11-06 “开始” 覆盖，2026-11-07 “合并 233”；Tier B；PR #233，合并提交 657a072）— `account_truth.hpp`（`AccountAssetScope`、`AccountParseReport`）、
   `binance_private_rest.hpp`（`parse_account_response_impl()` 的范围参数、`BinancePrivateRestClient::set_account_scope()` 与 `last_account_report()`）、`live_submit_preflight_harness.cpp`：
   - **发现**：Owner 的第一次 Testnet 联调停在启动的 uid 读取（`PrivateRestError=MalformedResponse`）。`GET /api/v3/account` 在 Spot Testnet 上列出 **517 个余额，全部非零**（Testnet 给每个账户发了所有资产），其中有多字节的名字
     （一个 5 个字符共 15 字节，一个 2 个字符共 6 字节）。快照最多 `kMaxAssets`（32）个资产，名字至多 `kAssetNameLen` 减一个可见 ASCII 字节；原合同（§4.3）是 “每个非零资产都必须表示，否则整次读取失败”，
@@ -338,7 +338,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     operator 工具读原始答复、从不建快照，不需要也不可以有范围。守卫（`test_operator_resolution_guard.cpp` +1 例）：`set_account_scope` 只出现在定义和线束的那一处调用里，线束的调用在 uid 读取之前，
     两次 `add` 的实参就是那两个常量，operator 工具的文件一个都不提这几个名字。
   - **未做 / 留给后面**：生产组合根（M5 还没接线）要从注册表里的品种派生范围；快照的容量不变（517 个资产会破坏审计定下的快照体积预算、每次账户刷新都要复制、`find()` 变成扫描全部）；不加 `omitZeroBalances`
-    （这个账户的 517 个全部非零，没用）；线束里其他从未对真实交易所运行过的路径（签名订阅的权限与 L-39、深度、K 线）仍待 Owner 的联调。
+    （这个账户的 517 个全部非零，没用）；线束里其他从未对真实交易所运行过的路径（签名订阅的权限与 L-39、深度、K 线）当时仍待 Owner 的联调，2026-11-07 的联调回答了它们（见 “预检探针按交易所的最小名义金额定量” 条目的联调结果）。
   - **证据**：test_account_snapshot_boundary.cpp（+7 例：范围类型——默认为空、什么也不声明；名字按值存放、按完整名字查找；十一个字符可以、十二个被拒绝而不截断；空 / 不可见 / 重复的名字被拒绝且什么也不改；
     十六个名字可以、第十七个被拒绝而不扰动其余；平凡可复制的小值类型且拷贝互相独立；外加一个固定种子、与朴素参考模型比对的模糊测试）、test_binance_private_rest.cpp（+13 例：ParseAccountResponseScope 10 例——首次联调形状的答复
     （517 个条目、多字节名字、uid 在最后）在没有范围时整份被拒绝（先是名字，全 ASCII 时是容量），声明 BTC 与 USDT 后读通并报告 517 / 2 / 0 / 515；范围外条目从不转换也不查名字；每个条目的形状在范围内外都照旧整体判定；
@@ -350,7 +350,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     CI 的 sanitizer 作业会在最终头上编译它）。变异检查 43 个变异体（AccountAssetScope 13、范围解析 16、客户端 6、线束源码 8）：40 个被杀死、3 个存活——AS11 与 AS12 是两处防御性夹紧（`size()` 与 `name_at()` 的长度夹紧：`add()` 保证
     它们永远不会越界，经公开接口不可观察，与快照里同形的夹紧一样，只是这里没有破坏用的测试钩子）、H08 是线束里一行日志（`main()` 没有测试）。5 个变异体第一轮因 /WX 的 “未引用的形参” 编译不过（不算检出），加 `(void)x;` 改写后全部杀死；
     三个 canary 先于其余运行，都由语义测试杀死，AS05、AS08、AS09 由测试里的编译期断言杀死。tools/spec_xref_check.py、spec_enum_diff.py、concurrency_targets_check.py、closure_ledger_check.py 通过。
-- 预检探针按交易所的最小名义金额定量（首次 Testnet 联调的第二个发现，`PRIVATE_STREAM_JOINT_RUN.md`；Owner 2026-11-07 “合并 233，重新跑了你看看” 之后的修复；Tier A；PR 待合并）— `preflight_probe.hpp`（`preflight_quantity_ticks(rules, price_ticks)`、`pre_trade_check_name()`）、`live_submit_preflight_harness.cpp`：
+- 预检探针按交易所的最小名义金额定量（首次 Testnet 联调的第二个发现，`PRIVATE_STREAM_JOINT_RUN.md`；Owner 2026-11-07 “合并 233，重新跑了你看看” 之后的修复，同日 “合并 234”；Tier A；PR #234，合并提交 7b221ca）— `preflight_probe.hpp`（`preflight_quantity_ticks(rules, price_ticks)`、`pre_trade_check_name()`）、`live_submit_preflight_harness.cpp`：
   - **发现**：#233 合入后 Owner 第一次对 Testnet 完整跑通（`joint_run.log`；设定 240 秒，3094 圈 × 50 毫秒约 155 秒时提前结束）：公共行情（深度 1 次快照、K 线回填 52 根）、签名订阅（`subscribe_status=200`，`verify_status=200`，`subscriptions_listed=1`）、清扫（1 次开始 1 次完成、0 个超时）、账户刷新（25 次送达）、
     启动恢复（`Ready`）、令牌（`readiness: authorized=3`）全部在线，四个判据里三个满足；唯独三次启动探针都停在 `gate=PreTradeFailed`，不是预期的 `OperatorNotConfirmed`（`probe_reached_OperatorNotConfirmed=no`）。
   - **原因**：探针的数量是 LOT_SIZE 的最小单位（`qty=1`，0.00001 BTC）。价格 75 920.32 上这是 0.7592 USDT，而 Testnet 的 BTCUSDT `NOTIONAL.minNotional` 是 5.0 USDT（公开的 `exchangeInfo`，2026-11-07 读取：tick 0.01、step 与 minQty 0.00001、maxQty 9000），
@@ -363,9 +363,16 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     `plan_preflight_probe()` 在探针自己的价格上定量（开仓是卖一价，平仓是买一价：同一个最小名义金额，卖在买一价上可能要多一个单位）。首次联调的价格 75 920.32 上是 7 个单位（0.00007 BTC，5.3144 USDT；6 个是 4.5552）。
   - **可诊断**：`pre_trade_check_name()`（17 个裁决各有名字，`switch` 没有 `default`：新增裁决是编译错误）；线束在 `PreTradeFailed` 时把裁决名打进 WARN 行（`... got PreTradeFailed / reason=BelowMinNotional`，与 `NotReady` 的 `reason=` 同形），
     并在启动时打印一行 `Symbol rules (as the exchange reports them): ...`（交易所的过滤器，公开数据）。
+  - **联调结果**（Owner 在 #234 合入当天重跑；设定 240 秒，2982 圈 × 50 毫秒，约 150 秒以上时结束；密钥带 USER_DATA 与 USER_STREAM 权限，这是 Owner 的说法）：`joint-run criteria` 四项全 yes（`all_met=yes`）。启动探针第一次就停在 `OperatorNotConfirmed`：
+    `OPEN BUY price=7602001 qty=7`（76 020.01，7 个单位 = 0.00007 BTC = 5.3214 USDT；6 个单位是 4.5612）。上一次拒绝同一条链的就是最小名义金额：账户与链都没变，只有数量变了，探针就走到了确认门。`Symbol rules` 一行与公开的 exchangeInfo 逐项一致
+    （price_scale=2、qty_scale=5、step=min_qty=1、min_notional=500000000）。账户读取 `entries=517 represented=2 zero_in_scope=0 out_of_scope=515`；签名订阅 `subscribe_status=200`，`verify_status=200`，`subscriptions_listed=1`
+    （**L-39 在 Testnet 上的答案：未登录的连接上 `session.subscriptions` 回答，恰好列出那一个订阅，“恰好一个”的严格判定通过，这一步保留**）；清扫 1 次开始 1 次完成，账户 25 次送达，恢复 Ready，令牌签发 1 次，深度 1 次快照、1116 个事件、0 次重同步，K 线回填 52 根。
+    **签名订阅需要什么权限**：带 USER_DATA 与 USER_STREAM 的密钥被接受；只有 USER_DATA 的密钥没有试过（官方文档说这个方法需要 USER_STREAM），所以手册写 “USER_DATA + USER_STREAM，不要 TRADE”，不写 “USER_DATA 就够”。
+    **噪声（不是缺陷）**：26 次账户 REST 里有 1 次 TLS 握手失败，两次运行都是 1 / 26，被刷新器吸收（stale=0）；一次周期性时钟重同步失败（线束不打印错误名，10 秒后重试）；单线程循环里的 REST 调用是同步的，Owner 的线路上每次约 2 秒，
+    状态行里 Connecting 与 verified=yes 同时出现是显示滞后（L-53 的现象）。**没有证明的**：真实订单与成交的形状（清扫查询的是空集）、重连与断网、几分钟以上的运行、强杀重启、生产环境、只有 USER_DATA 的密钥。
   - **已知、未改**：`preflight_quantity_ticks(rules)`（单参数）把下界取整到 “步长的倍数”，而 `validate_pre_trade()`（以及交易所的公式）把网格锚在 `min_qty` 上（`(qty - minQty) % stepSize == 0`）。两者只在 `min_qty` 不是步长的整数倍时分歧；
     没有已知的 Binance 品种如此，BTCUSDT 是 1 比 1。头文件注释写明了这个假设；真遇到时，门会以 `QtyStepViolation` 拒绝，现在日志里看得见。
-  - **未做 / 留给后面**：真正的下单数量策略（6b-2，“数量来自一个固定的小额配置上限”）；线束里其他从未对真实交易所运行过的路径（深度之外的 `Close` 方向探针、签名订阅的最小权限）仍待联调。
+  - **未做 / 留给后面**：真正的下单数量策略（6b-2，“数量来自一个固定的小额配置上限”）；线束里其他还没有交易所证据的路径（`Close` 方向的探针、只有 USER_DATA 的密钥能否订阅、重连与断网、订单与成交的真实形状）仍待联调。
   - **证据**：test_preflight_probe.cpp（16 → 36 例，+20：新重载 16 例——没有最小名义金额时就是下界；首次联调的真实规则与价格（7 个单位，6 个不够，下界单独是 `BelowMinNotional`）；恰等于最小值够、少一点不够；原生刻度低于、等于、高于 8 三种缩放（高于时向上取整，含一个向下取整会差一个单位的例子）；只取步长网格上的点；无步长则每个 tick 都是数量；下界已经够；离下界约九百亿步的答案；答案紧贴溢出边缘（加倍一步就溢出，二分仍要找到它）；没有可表示的数量够得着；最小值永远够不着；答案超过最大数量、以及最大数量只对带步长的规则判；非正的价格；没有下界的规则；外加一个固定种子的差分模糊测试——2000 轮随机规则、价格与贴着边界的最小名义金额，以 `validate_pre_trade()` 自己的裁决为裁判，从下界往上逐点走到第一个 `Ok`，要求新函数与它一致）；计划 +3 例（在探针自己的价格上定量；首次联调的盘口给出门接受的开仓与平仓订单；够不着最小值则不探）；`pre_trade_check_name()` 1 例（17 个名字互不相同，枚举范围内没有 Unknown，枚举外是 Unknown）；test_live_submit_preflight_harness.cpp +2 例（夹具可选真实的 Testnet 规则与首次联调的盘口：整条链停在恰好 `OperatorNotConfirmed`；老探针——最小单位——停在 `PreTradeFailed`，裁决是 `BelowMinNotional`）。MSVC（/W4 /WX，Release）零警告零错误，相关 ctest（探针、线束、两个守卫、流水线、账户真相与预交易）135/135；WSL2 GCC-14（-Wall -Wextra -Wconversion -Werror）none 与 address（ASan+UBSan）各 5 个受影响目标共 112 例全绿，线束本身在 none 层编译通过；GCC 抓出我辅助函数里的一处 dangling-else（`if` 包着 gtest 的 EXPECT_NE 宏），已修。变异检查 33 个变异体（PP01–PP29 是计划与定量函数，PN01–PN04 是名字函数）：29 个被杀死，4 个存活——PP08、PP18、PP28 等价（零最小值走搜索也立即达到；加倍从 2 起步、或忘记上一个不够的步数，二分只是范围更宽，结果相同），PP20 是去掉加倍上限后的有符号溢出（未定义行为，MSVC 不拦；这条路径由测试走到，UBSan 层是它的拦截处，address 层已跑过）。变异设计催生了两条测试（答案紧贴溢出边缘；下界已够但超过最大数量）和一处代码简化（二分里跟踪的上界状态是冗余的，最终重算已经裁决）；PN03（少一个 case）被测试而不是编译器杀死：MSVC 的 C4062 默认关闭，只有 GCC 的 -Wswitch 保证完整，头文件注释已据实改正。tools/spec_xref_check.py（它抓到我写的一个代码里不存在的限定名，已改）、spec_enum_diff.py、concurrency_targets_check.py、closure_ledger_check.py 通过。
 
 ### 容量 / 生命周期
