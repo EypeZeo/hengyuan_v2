@@ -216,6 +216,39 @@ trials         = 1
     EXPECT_FALSE(evaluator.is_initialized());
 }
 
+// Audit F-A-008. EMA and RSI are not window-class (no history pool slice) but count their seed observations in a uint16_t. A window
+// of 65536 or more used to pass init(): the counter wrapped before reaching the window, the indicator stayed NaN for ever, and
+// warmup_complete() still turned true after `window` bars.
+namespace {
+std::string seed_counter_spec(std::string_view op, int window) {
+    return std::string("spec_version = 1\nname = \"seed_counter_width\"\n\n[market]\nmarket = \"crypto_spot\"\nsymbol = \"BTCUSDT\"\n"
+                       "timeframe = \"1h\"\n\n[[indicators]]\nid = \"ind\"\nop = \"") +
+           std::string(op) + "\"\ninput = \"close\"\nwindow = " + std::to_string(window) +
+           "\n\n[signal]\nnode = \"ind\"\nmode = \"scaled\"\n\n[validation]\nvalidated_at   = \"2026-09-15T08:30:00Z\"\n"
+           "validated_by   = \"x\"\ndata_start_utc = \"2021-01-01T00:00:00Z\"\ndata_end_utc   = \"2026-06-30T00:00:00Z\"\n"
+           "data_digest    = \"sha256:0\"\noos_sharpe     = 1.0\npbo            = 0.1\ntrials         = 1\n";
+}
+}  // namespace
+
+TEST(StrategySpecEvaluator, InitRejectsEmaAndRsiWindowsThatDoNotFitTheirUint16SeedCounter) {
+    for (const std::string_view op : {"ema", "rsi"}) {
+        for (const int window : {65536, 70000}) {
+            const std::string text = seed_counter_spec(op, window);
+            const auto load = load_strategy_spec(text);
+            ASSERT_TRUE(load.ok()) << op << " window " << window << ": the load gate has no bound tied to the counter width";
+            StreamingEvaluator evaluator;
+            EXPECT_FALSE(evaluator.init(load.dag)) << op << " window " << window;
+            EXPECT_FALSE(evaluator.is_initialized()) << op << " window " << window;
+        }
+        // The largest window the counter can hold is still accepted: this is a width check, not a new cap.
+        const std::string text = seed_counter_spec(op, 65535);
+        const auto load = load_strategy_spec(text);
+        ASSERT_TRUE(load.ok());
+        StreamingEvaluator evaluator;
+        EXPECT_TRUE(evaluator.init(load.dag)) << op << " window 65535";
+    }
+}
+
 TEST(StrategySpecEvaluator, InitRejectsWindowExceedingUint16Range) {
     constexpr std::string_view kSpec = R"(
 spec_version = 1
