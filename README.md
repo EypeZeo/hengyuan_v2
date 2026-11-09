@@ -89,8 +89,11 @@ fault-injection matrices passing against real code.
 Current state: the adapters exist, but `live_submit_orchestrator.hpp`'s `SubmitPort`/
 `QueryPort` are still mock dependency-injection seams in every runnable harness — nothing in
 `native/src/` has wired the real adapters up with real credentials and run them as a live
-process yet. `create_listen_key()`/`keepalive_listen_key()` have likewise never been called
-outside tests. No real testnet/production credentials have ever been used against this code.
+process yet. The one exception is the Testnet-only cold-start harness
+(`live_submit_preflight_harness.cpp`), which the owner ran once on 2026-11-07 with his own
+Testnet key (reads, the signed private user-data stream and a reconcile sweep; a mock submit port,
+no order). No order has ever been submitted to any Binance environment, and no production
+credential has ever been used against this code.
 Creating real API keys, configuring IP allowlists, and the go/no-go for the first live order
 remain the account owner's own actions. See `CLAUDE.md`'s "Live-trading direction & boundary"
 and `docs/NATIVE_ARCHITECTURE.md`'s "Live-readiness status".
