@@ -31,6 +31,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include "test_helpers/cxx_source_view.hpp"
 
 #ifndef HY_NATIVE_SOURCE_DIR
 #error "HY_NATIVE_SOURCE_DIR must name the native/ directory (see native/CMakeLists.txt)"
@@ -40,72 +41,11 @@ namespace fs = std::filesystem;
 
 namespace {
 
-enum class Literals { Blank, Keep };
+using hy::test_helpers::Literals;
 
-// Source text with comments removed; the contents of string and char literals either blanked (the CODE view) or kept (the LITERAL view).
-std::string strip(const std::string& s, Literals literals) {
-    enum class State { Code, LineComment, BlockComment, String, Char };
-    std::string out;
-    out.reserve(s.size());
-    State st = State::Code;
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        const char c = s[i];
-        const char next = i + 1 < s.size() ? s[i + 1] : '\0';
-        switch (st) {
-            case State::Code:
-                if (c == '/' && next == '/') {
-                    st = State::LineComment;
-                    ++i;
-                } else if (c == '/' && next == '*') {
-                    st = State::BlockComment;
-                    ++i;
-                } else if (c == '"') {
-                    st = State::String;
-                    out.push_back(c);
-                } else if (c == '\'' && !out.empty() && (std::isalnum(static_cast<unsigned char>(out.back())) != 0 || out.back() == '_')) {
-                    out.push_back(c);  // a digit separator (1'000) or a literal prefix, not a char literal
-                } else if (c == '\'') {
-                    st = State::Char;
-                    out.push_back(c);
-                } else {
-                    out.push_back(c);
-                }
-                break;
-            case State::LineComment:
-                if (c == '\n') {
-                    st = State::Code;
-                    out.push_back(c);
-                }
-                break;
-            case State::BlockComment:
-                if (c == '*' && next == '/') {
-                    st = State::Code;
-                    ++i;
-                } else if (c == '\n') {
-                    out.push_back(c);
-                }
-                break;
-            case State::String:
-            case State::Char: {
-                const char quote = st == State::String ? '"' : '\'';
-                if (c == '\\') {
-                    if (literals == Literals::Keep) {
-                        out.push_back(c);
-                        if (i + 1 < s.size()) out.push_back(s[i + 1]);
-                    }
-                    ++i;  // skip the escaped character
-                } else if (c == quote) {
-                    st = State::Code;
-                    out.push_back(c);
-                } else if (literals == Literals::Keep) {
-                    out.push_back(c);
-                }
-                break;
-            }
-        }
-    }
-    return out;
-}
+// Source text with comments removed; the contents of string, char and raw string literals either blanked (the CODE view) or kept (the LITERAL view).
+// The scanner is the shared one (test_helpers/cxx_source_view.hpp), which knows raw string literals (audit F-B-001).
+std::string strip(const std::string& s, Literals literals) { return hy::test_helpers::strip_cxx_source(s, literals); }
 
 std::string lowered(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

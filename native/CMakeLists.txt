@@ -964,6 +964,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_listenkey_retirement_guard)
     gtest_discover_tests(test_listenkey_retirement_guard)
 
+    # Audit F-B-001 / F-B-010 / F-D-007: the ONE source scanner behind the guards above (test_helpers/cxx_source_view.hpp). It knows raw string literals,
+    # which each guard's own copy did not, and this test keeps it identical to the old copies everywhere else (a walk over the whole native/ tree).
+    add_executable(test_cxx_source_view tests/test_cxx_source_view.cpp)
+    target_link_libraries(test_cxx_source_view PRIVATE GTest::gtest_main)
+    target_compile_definitions(test_cxx_source_view PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_cxx_source_view)
+    gtest_discover_tests(test_cxx_source_view)
+
     # 批次 6 6b-0f-3b: consumer side of the kline feed -- the only path by which a bar reaches
     # StreamingEvaluator::step() (duplicate filter + continuity guard + rebuild from backfill). Pure
     # logic over the strategy-spec evaluator and kline_bar.hpp; loads its spec via load_strategy_spec(),
