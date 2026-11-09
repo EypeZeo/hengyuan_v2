@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string_view>
 #include <system_error>
 
@@ -81,6 +82,12 @@ inline constexpr const char* klines_parse_error_name(KlinesParseError e) noexcep
 }
 
 namespace detail {
+
+// The largest bar time (ms since the epoch) the parser accepts. Bar times come straight from the peer's JSON and
+// are then added to, subtracted from and compared (`close - open + 1`, `previous close + 1`); a quarter of
+// INT64_MAX leaves room for those operations, and is still some 29 million years past any real timestamp.
+// Audit F-B-006: without a bound, a row with open = INT64_MIN + 1 and close = INT64_MAX was signed-overflow UB.
+inline constexpr std::int64_t kMaxKlineTimeMs = std::numeric_limits<std::int64_t>::max() / 4;
 
 // std::from_chars is allocation-free and locale-independent (same choice as KlineJsonParser).
 // Prices must be > 0 and volume >= 0, both finite.
@@ -161,6 +168,11 @@ inline KlinesParseError parse_klines_response(std::string_view body, std::int64_
             return KlinesParseError::BadNumber;
         }
 
+        // Both times inside [0, kMaxKlineTimeMs] before any arithmetic on them (see the constant); close > open then
+        // keeps `close - open + 1` and `previous close + 1` below inside int64.
+        if (open_time < 0 || close_time < 0 || open_time > detail::kMaxKlineTimeMs || close_time > detail::kMaxKlineTimeMs) {
+            return KlinesParseError::BadBarShape;
+        }
         if (close_time <= open_time) return KlinesParseError::BadBarShape;
         if (expected_span_ms > 0 && close_time - open_time + 1 != expected_span_ms) {
             return KlinesParseError::BadBarShape;
