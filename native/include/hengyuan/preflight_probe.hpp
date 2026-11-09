@@ -62,8 +62,8 @@ namespace hy {
 
 // The smallest quantity the symbol accepts for a Limit at `price_ticks`: the smallest point of the lot grid above whose notional also reaches
 // rules.min_notional_ticks. The notional is computed exactly as validate_pre_trade() computes it -- the overflow-checked product price * qty at the native scale
-// (price_scale + qty_scale), rescaled UP to kBalanceScale -- so the two cannot disagree at the boundary: a notional equal to the minimum passes, one tick less
-// does not. Without a minimum notional (min_notional_ticks <= 0) this is the lot.
+// (price_scale + qty_scale) and judged against the minimum at kBalanceScale on the value rounded DOWN, as the gate judges it -- so the two cannot disagree at
+// the boundary: a notional equal to the minimum passes, one tick less does not. Without a minimum notional (min_notional_ticks <= 0) this is the lot.
 //
 // Nothing when the lot is nothing, when the price is not positive, when no representable quantity reaches the minimum (the product or the rescale would
 // overflow first -- validate_pre_trade() answers NotionalOverflow there), or when the quantity that does is above max_qty_ticks (judged, like there, only for rules
@@ -91,8 +91,13 @@ namespace hy {
         if (!checked_notional(steps, grid, offset) || !checked_add_i64(*lot, offset, qty)) return Reach::Unrepresentable;
         std::int64_t native = 0;
         if (!checked_notional(price_ticks, qty, native)) return Reach::Unrepresentable;
+        // Representable exactly when the gate can represent it (the rounded-up value is what the gate's caps and balance use, and what it
+        // answers NotionalOverflow on), but REACHED exactly when the gate says so: the minimum is judged on the rounded-DOWN value, a
+        // lower bound being the one comparison where rounding up would let a product just under the minimum through (audit F-A-001).
+        std::int64_t notional_up = 0;
+        if (!rescale_notional_ceil(native, native_scale, kBalanceScale, notional_up)) return Reach::Unrepresentable;
         std::int64_t notional = 0;
-        if (!rescale_notional_ceil(native, native_scale, kBalanceScale, notional)) return Reach::Unrepresentable;
+        if (!rescale_notional_floor(native, native_scale, kBalanceScale, notional)) return Reach::Unrepresentable;
         return notional >= rules.min_notional_ticks ? Reach::Reaches : Reach::Short;
     };
 
