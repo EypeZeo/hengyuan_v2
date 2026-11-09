@@ -7,7 +7,7 @@
 | 报告 | 审计者（按 Owner 的说明） | 发现数 | 核实后 |
 | :--- | :--- | :---: | :--- |
 | A（`HengYuan_v2_Audit_A_GPT-6-Astra.md`） | GPT-6 Astra | 12 | 12 条属实（级别有调整），其中 8 条已修，4 条排入队列或待 Owner 决策 |
-| B（`..._B_DeepSeek-V4.1-Flash.md`） | DeepSeek V4.1 Flash（Max） | 12 | 12 条属实（级别有调整），其中 4 条已修，其余为队列、Owner 决策或待做 |
+| B（`..._B_DeepSeek-V4.1-Flash.md`） | DeepSeek V4.1 Flash（Max） | 12 | 12 条属实（级别有调整），其中 6 条已修（4 条在 #238，2 条在 #240），其余为队列、Owner 决策或待做 |
 | C（`..._C_Claude-Opus-5.5.md`） | **实际由 GPT-6 Astra（High）产出**，文件名沿用了旧的模型名 | 5 | 5 条属实（级别下调 4 条），其中 3 条已修或已改注释，2 条排入队列 |
 | D（`..._D_Gemini-3.8-Flash.md`） | Gemini 3.8 Flash（High） | 14 | 6 条属实（其中 2 条只是部分属实），3 条是 Owner 已作出的设计或策略决定，**3 条不成立，2 条是增强项/信息项**；D-001 引用了仓库里不存在的函数、成员与工作流文件，应当整条作废 |
 
@@ -38,7 +38,7 @@
 
 | ID | 级别 | 判定 | 处置 |
 | :--- | :--- | :--- | :--- |
-| F-B-001 守卫扫描器不认原始字符串 | P2 | 属实（读代码确认 `code_only()` 只有 `String` 状态、没有原始字符串；并在新的 `test_cxx_source_view` 里用报告的同一输入复现：旧扫描器在奇数引号的原始字符串之后丢掉全部代码） | 已修（独立 PR）：共享头 `test_helpers/cxx_source_view.hpp` + 原始字符串负控；与 B-010、D-007 同一件事 |
+| F-B-001 守卫扫描器不认原始字符串 | P2 | 属实（读代码确认 `code_only()` 只有 `String` 状态、没有原始字符串；并在新的 `test_cxx_source_view` 里用报告的同一输入复现：旧扫描器在奇数引号的原始字符串之后丢掉全部代码） | 已修（PR #240）：共享头 `test_helpers/cxx_source_view.hpp` + 原始字符串负控；与 B-010、D-007 同一件事 |
 | F-B-002 HMAC 密钥栈副本不擦除 | P2 | 属实（`append_impl` 的 `key_block` 在所有返回路径上都没有擦除） | 队列（Tier B 级的安全卫生，需 Owner 同意热路径上的擦除成本） |
 | F-B-003 `ExportOutboxRing` 契约矛盾 | P2 | 属实：环的注释说“硬滞后围栏”，`append_impl` 与导出 worker 写成静默丢弃；目前没有进程接线该环 | Owner 决策（围栏还是尽力而为） |
 | F-B-004 恢复扫描 RSS | P2 | 潜在风险，属实的推演 | 登记为 L-63，不修 |
@@ -47,7 +47,7 @@
 | F-B-007 供应链固定不足 | P3 | 属实 | Owner 决策 |
 | F-B-008 Windows 单次 `ReadFile` | P3 | 属实（失败关闭，所以只是不一致） | 已修：`read_exact()` |
 | F-B-009 `SetFilePointer` 返回值 | P3 | 属实 | 已修：`SetFilePointerEx` |
-| F-B-010 扫描器副本漂移 | P3 | 属实：六份逐字节相同、一份格式变体、一份两视图的 `strip()` | 已修（独立 PR，同 B-001） |
+| F-B-010 扫描器副本漂移 | P3 | 属实：六份逐字节相同、一份格式变体、一份两视图的 `strip()` | 已修（PR #240，同 B-001） |
 | F-B-011 容量注释 255 | INFO | 属实（`kOrderEventFrameSize == 256`） | 已修 |
 | F-B-012 `u < U` 不校验 | P3 | 属实（防御性缺口，只会造成多余的重同步） | 待做 |
 
@@ -71,7 +71,7 @@
 | F-D-004 自动 revert 受阻于规则集 | P1 → 决策 | `CLAUDE.md` 已写明：规则集下该 push 预期被拒，红色守卫是警报而不是自愈 | Owner 决策（可选：改为自动开 revert PR） |
 | F-D-005 维保任务 3 小时时限 | P2 | 属实：仓库脚本 `PT3H`，已部署任务 `PT10H`（2026-11-02 起，实测 `PT10H`） | 已修：参数化，默认 10 |
 | F-D-006 脚本未入 CI | P2 | 部分属实：`concurrency_targets_check.py` 只在 `wsl_verify.sh thread` 里跑，`closure_ledger_check.py` 不在任何 CI；报告点名的 `ci-pr-gate.yml` 不存在 | 已修：新作业 `repo-consistency` |
-| F-D-007 守卫词法扫描器 | P2 | 同 F-B-001 | 已修（独立 PR，同 B-001） |
+| F-D-007 守卫词法扫描器 | P2 | 同 F-B-001 | 已修（PR #240，同 B-001） |
 | F-D-008 供应链 | P2 | 同 F-B-007 | Owner 决策 |
 | F-D-009 CODEOWNERS 未强制 | P2 → 决策 | 与“0 个批准、单人所有者”的设置一致；开启后他自己的 PR 无人可批 | 不做 |
 | F-D-010 文档基线滞后 | P2 | 部分属实：README 仍提 `create_listen_key()`、仍说没用过真实凭据 | 已修（README 等）；路书头部表格的基线按其自述是历史基线，不动 |
