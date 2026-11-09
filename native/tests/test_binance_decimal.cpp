@@ -136,6 +136,17 @@ TEST(ParseDecimalToTicksWithScale, ScaleAboveEighteenIsRejected) {
     EXPECT_FALSE(parse_decimal_to_ticks_with_scale("1", 19, out));
 }
 
+TEST(ParseDecimalToTicksWithScale, OutOfDomainScaleWithLongFractionIsRejectedBeforeAnyDigitIsAccumulated) {
+    // Audit F-A-011. With scale 255 and more than 19 non-zero fractional digits the accumulator used to
+    // overflow int64 (UBSan: signed integer overflow) before the scale was ever judged. The domain check now
+    // comes first, so this is a plain refusal -- and a refused parse leaves the output untouched.
+    std::int64_t out = -1;
+    EXPECT_FALSE(parse_decimal_to_ticks_with_scale("0.1234567890123456789012345", 255, out));
+    EXPECT_FALSE(parse_decimal_to_ticks_with_scale("0.9999999999999999999999", 19, out));
+    EXPECT_FALSE(parse_decimal_to_ticks_with_scale("1234567890123456789.1234567890123456789", 200, out));
+    EXPECT_EQ(out, -1);
+}
+
 TEST(ParseDecimalToTicksWithScale, OverflowIsRejected) {
     std::int64_t out = -1;
     // integer_part * 10^18 overflows int64 for any integer_part > 9.
