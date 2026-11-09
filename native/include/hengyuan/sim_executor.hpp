@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 
 namespace hy {
 
@@ -97,35 +98,24 @@ public:
             return fill;
         }
 
-        // Simulated fee = ref * qty * fee_ppm / 1_000_000 (overflow-guarded).
-        // At BTC prices (ref ~6e12, qty ~1e5, ppm=750) the naive product
-        // overflows int64. Three-tier fallback keeps precision:
-        //   1. exact:  notional * fee_ppm / 1M  (if both muls fit)
-        //   2. split:  (notional / 1000) * fee_ppm / 1000  (if ref*qty fits)
-        //   3. reorder: (ref * fee_ppm / 1M) * qty  (if ref*qty doesn't fit)
-        std::int64_t fee = 0;
+        // Simulated fee = ref * qty * fee_ppm / 1_000_000. At BTC prices (ref ~6e12, qty ~1e5, ppm=750)
+        // the naive product overflows int64, so there are two tiers (compute_fee()). The notional itself
+        // (ref * qty) must be representable: the average entry price below is built from it.
+        //
+        // Audit F-A-006. Every step of the fill -- the fee, the position, the cost basis, the realized PnL --
+        // is computed on a COPY of the position and committed only if all of it was representable. The
+        // checked multiplications used to be ignored: an overflow left a zero where a price belonged, the
+        // fill was still reported as Filled, and the position carried an average entry price of 0. A fill
+        // whose arithmetic does not fit is now refused whole, with the position untouched.
         std::int64_t notional = 0;
-        if (safe_mul_i64(ref, intent.qty_lots, notional)) {
-            std::int64_t fee_num = 0;
-            if (safe_mul_i64(notional, config_.fee_ppm, fee_num)) {
-                fee = fee_num / 1'000'000;
-            } else {
-                fee = (notional / 1000) * config_.fee_ppm / 1000;
-            }
-        } else {
-            std::int64_t ref_fee = 0;
-            if (safe_mul_i64(ref, config_.fee_ppm, ref_fee)) {
-                std::int64_t fee_per = ref_fee / 1'000'000;
-                if (!safe_mul_i64(fee_per, intent.qty_lots, fee)) {
-                    ++stats_.overflow_guard;
-                }
-            } else {
-                ++stats_.overflow_guard;
-            }
+        std::int64_t fee = 0;
+        Position next = pos;
+        if (!safe_mul_i64(ref, intent.qty_lots, notional) || !compute_fee(notional, fee) ||
+            !apply_fill(next, intent.side, intent.qty_lots, ref) ||
+            !safe_sub_i64(next.realized_pnl, fee, next.realized_pnl)) {  // the fee is a realized cost
+            return refuse_unrepresentable(fill);
         }
-
-        apply_fill(pos, intent.side, intent.qty_lots, ref);
-        pos.realized_pnl -= fee;  // fee is a realized cost
+        pos = next;
 
         fill.status = FillStatus::Filled;
         fill.filled_qty_lots = intent.qty_lots;
@@ -133,11 +123,18 @@ public:
         fill.fee_ticks = fee;
         ++stats_.filled;
 
-        // Drawdown check → arm kill switch (never auto-rearm).
+        // Drawdown check → arm kill switch (never auto-rearm). An equity that cannot be computed is itself
+        // a reason to arm: the one thing it must not do is read as "no loss".
         if (config_.max_drawdown > 0) {
-            const std::int64_t mark = (best_bid_ticks + best_ask_ticks) / 2;
-            const std::int64_t equity = pos.realized_pnl + unrealized_pnl(pos, mark);
-            if (equity < -config_.max_drawdown) {
+            std::int64_t mark_sum = 0;
+            std::int64_t unrealized = 0;
+            std::int64_t equity = 0;
+            if (!safe_add_i64(best_bid_ticks, best_ask_ticks, mark_sum) ||
+                !unrealized_pnl(pos, mark_sum / 2, unrealized) ||
+                !safe_add_i64(pos.realized_pnl, unrealized, equity)) {
+                ++stats_.overflow_guard;
+                kill_.arm();
+            } else if (equity < -config_.max_drawdown) {
                 kill_.arm();
             }
         }
@@ -146,41 +143,68 @@ public:
     }
 
 private:
-    std::int64_t unrealized_pnl(const Position& pos, std::int64_t mark_ticks) const noexcept {
-        if (pos.net_qty_lots == 0 || mark_ticks <= 0) return 0;
-        const std::int64_t diff = mark_ticks - pos.avg_entry_price_ticks;
-        std::int64_t pnl = 0;
-        if (!safe_mul_i64(diff, pos.net_qty_lots, pnl)) {
-            return 0;  // overflow-guard
+    // fee = notional * fee_ppm / 1_000_000. Exact while the product fits; otherwise the notional is divided
+    // first ((notional / 1000) * fee_ppm / 1000), which keeps the leading digits at the cost of the lowest
+    // three of the notional. false when even that overflows (a fee_ppm that large is a configuration error).
+    bool compute_fee(std::int64_t notional, std::int64_t& fee) const noexcept {
+        std::int64_t fee_num = 0;
+        if (safe_mul_i64(notional, config_.fee_ppm, fee_num)) {
+            fee = fee_num / 1'000'000;
+            return true;
         }
-        return pnl;
+        if (!safe_mul_i64(notional / 1000, config_.fee_ppm, fee_num)) return false;
+        fee = fee_num / 1000;
+        return true;
     }
 
-    void apply_fill(Position& pos, OrderSide side, std::int64_t qty, std::int64_t price) noexcept {
-        const std::int64_t signed_qty = (side == OrderSide::Buy) ? qty : -qty;
+    SimFill& refuse_unrepresentable(SimFill& fill) noexcept {
+        fill.status = FillStatus::Rejected;
+        ++stats_.rejected;
+        ++stats_.overflow_guard;
+        return fill;
+    }
+
+    // false (out untouched) when the unrealized PnL does not fit int64.
+    static bool unrealized_pnl(const Position& pos, std::int64_t mark_ticks, std::int64_t& out) noexcept {
+        if (pos.net_qty_lots == 0 || mark_ticks <= 0) {
+            out = 0;
+            return true;
+        }
+        std::int64_t diff = 0;
+        return safe_sub_i64(mark_ticks, pos.avg_entry_price_ticks, diff) && safe_mul_i64(diff, pos.net_qty_lots, out);
+    }
+
+    // Applies one fill to `pos` (a copy the caller commits only on success). false when any step does not fit
+    // int64 -- `pos` is then partly written and must be discarded.
+    static bool apply_fill(Position& pos, OrderSide side, std::int64_t qty, std::int64_t price) noexcept {
+        constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+        const std::int64_t signed_qty = (side == OrderSide::Buy) ? qty : -qty;  // qty > 0 here: execute() refused anything else
         const std::int64_t old_net = pos.net_qty_lots;
-        const std::int64_t new_net = old_net + signed_qty;
+        std::int64_t new_net = 0;
+        // INT64_MIN has no magnitude in int64, and the cost basis below is built from magnitudes.
+        if (old_net == kMin || !safe_add_i64(old_net, signed_qty, new_net) || new_net == kMin) return false;
 
         const bool same_dir = (old_net == 0) || ((old_net > 0) == (signed_qty > 0));
         if (same_dir) {
             // Opening or increasing: weighted-average entry price.
             std::int64_t old_notional = 0;
             std::int64_t add_notional = 0;
-            safe_mul_i64(pos.avg_entry_price_ticks, abs_i64(old_net), old_notional);
-            safe_mul_i64(price, qty, add_notional);
+            std::int64_t total_notional = 0;
+            if (!safe_mul_i64(pos.avg_entry_price_ticks, abs_i64(old_net), old_notional) ||
+                !safe_mul_i64(price, qty, add_notional) || !safe_add_i64(old_notional, add_notional, total_notional)) {
+                return false;
+            }
             const std::int64_t abs_new = abs_i64(new_net);
-            pos.avg_entry_price_ticks = (abs_new != 0) ? (old_notional + add_notional) / abs_new : 0;
+            pos.avg_entry_price_ticks = (abs_new != 0) ? total_notional / abs_new : 0;
         } else {
             // Reducing or flipping: realize PnL on the closed quantity.
             const std::int64_t closing = (qty < abs_i64(old_net)) ? qty : abs_i64(old_net);
-            const std::int64_t pnl_per =
-                (old_net > 0) ? (price - pos.avg_entry_price_ticks)
-                              : (pos.avg_entry_price_ticks - price);
+            std::int64_t pnl_per = 0;
             std::int64_t realized = 0;
-            if (safe_mul_i64(pnl_per, closing, realized)) {
-                pos.realized_pnl += realized;
-            } else {
-                ++stats_.overflow_guard;
+            if (!(old_net > 0 ? safe_sub_i64(price, pos.avg_entry_price_ticks, pnl_per)
+                              : safe_sub_i64(pos.avg_entry_price_ticks, price, pnl_per)) ||
+                !safe_mul_i64(pnl_per, closing, realized) || !safe_add_i64(pos.realized_pnl, realized, pos.realized_pnl)) {
+                return false;
             }
             if (abs_i64(signed_qty) > abs_i64(old_net)) {
                 // Flipped past zero: remaining quantity opens at fill price.
@@ -188,6 +212,7 @@ private:
             }
         }
         pos.net_qty_lots = new_net;
+        return true;
     }
 
     SimConfig config_;
