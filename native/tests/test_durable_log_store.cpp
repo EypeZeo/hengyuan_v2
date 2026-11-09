@@ -67,6 +67,43 @@ protected:
     }
 };
 
+#ifdef _WIN32
+// Audit F-B-008 / F-B-009. The Windows read primitives: read_exact() fills the whole buffer or fails (never reports a prefix as success), and seek_to()
+// goes through SetFilePointerEx so its answer is a real success flag, not a 32-bit position that doubles as an error code.
+TEST_F(DurableLogStoreTest, WindowsReadExactFillsTheBufferOrFailsAndSeekToReportsSuccessProperly) {
+    const std::string payload = "0123456789abcdef";
+    {
+        HANDLE w = CreateFileA(base_path_.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ASSERT_NE(w, INVALID_HANDLE_VALUE);
+        DWORD written = 0;
+        ASSERT_TRUE(WriteFile(w, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr));
+        ASSERT_EQ(written, payload.size());
+        CloseHandle(w);
+    }
+    HANDLE h = CreateFileA(base_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_NE(h, INVALID_HANDLE_VALUE);
+
+    std::vector<std::byte> buf(payload.size());
+    ASSERT_TRUE(detail::read_exact(h, buf.data(), buf.size()));
+    EXPECT_EQ(std::memcmp(buf.data(), payload.data(), payload.size()), 0);
+
+    // At the end of the file there is nothing left: asking for even one more byte is a failure, not a success with a short count.
+    std::byte one{};
+    EXPECT_FALSE(detail::read_exact(h, &one, 1));
+
+    // Back to the start: a request for more than the file holds fails, and so does one that is only one byte too long.
+    ASSERT_TRUE(detail::seek_to(h, 0, FILE_BEGIN));
+    std::vector<std::byte> too_big(payload.size() + 1);
+    EXPECT_FALSE(detail::read_exact(h, too_big.data(), too_big.size()));
+
+    // An empty request is trivially satisfied, a seek to the end succeeds, a seek to a negative position from the start does not.
+    EXPECT_TRUE(detail::read_exact(h, nullptr, 0));
+    EXPECT_TRUE(detail::seek_to(h, 0, FILE_END));
+    EXPECT_FALSE(detail::seek_to(h, -1, FILE_BEGIN));
+    CloseHandle(h);
+}
+#endif
+
 TEST_F(DurableLogStoreTest, AcquireLockThenOpenLogSucceeds) {
     auto store = make_store();
     ASSERT_TRUE(store.acquire_lock());
