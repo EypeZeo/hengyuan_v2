@@ -40,6 +40,7 @@
 #include <hengyuan/durable_audit_sink.hpp>  // tip anchor / store identity decoders, DurableAuditSink's file naming
 #include <hengyuan/durable_frame_codec.hpp>
 #include <hengyuan/key_ring.hpp>
+#include <hengyuan/secure_wipe.hpp>
 
 #include <array>
 #include <cstddef>
@@ -249,6 +250,7 @@ inline AuditLogVerification verify_audit_log(std::span<const std::byte> log, con
     if (anchor_present) {
         std::uint32_t anchor_key_id = 0;
         std::array<std::byte, kKeyBlockSize> anchor_key{};
+        ScopedSecureWipe wipe_anchor_key(anchor_key);
         if (!detail::peek_tip_anchor_key_id(anchor_bytes, anchor_key_id) || !ring.active_key(anchor_key_id, anchor_key) ||
             !detail::decode_tip_anchor(anchor_bytes, std::span<const std::byte>(anchor_key.data(), anchor_key.size()),
                                        anchor)) {
@@ -271,6 +273,7 @@ inline AuditLogVerification verify_audit_log(std::span<const std::byte> log, con
         // torn tail, and decode_order_event_frame's own length check classifies it as Truncated.
         std::uint32_t frame_key_id = 0;
         std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
         if (peek_frame_key_id(remaining, frame_key_id)) {
             if (!ring.active_key(frame_key_id, key_block)) {
                 v.status = ExportStatus::UnknownKeyId;
@@ -367,6 +370,7 @@ inline AuditLogVerification verify_audit_log(std::span<const std::byte> log, con
     if (identity_present) {
         std::uint32_t identity_key_id = 0;
         std::array<std::byte, kKeyBlockSize> identity_key{};
+        ScopedSecureWipe wipe_identity_key(identity_key);
         detail::DecodedStoreIdentity identity{};
         if (!detail::peek_store_identity_key_id(identity_bytes, identity_key_id) ||
             !ring.active_key(identity_key_id, identity_key) ||
@@ -496,6 +500,7 @@ bool emit_audit_export(std::span<const std::byte> log, const KeyRing& ring, cons
         const std::span<const std::byte> remaining = log.subspan(offset);
         std::uint32_t key_id = 0;
         std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
         if (!peek_frame_key_id(remaining, key_id) || !ring.active_key(key_id, key_block)) return false;
         DecodedOrderFrame frame{};
         std::size_t frame_size = 0;
