@@ -1492,6 +1492,65 @@ TEST(ParseSubmitOrderResponse, UnrecognizedStatusIsNetworkError) {
     EXPECT_EQ(resp.outcome, SubmitOutcome::NetworkError);
 }
 
+// Audit F-A-012 / L-54 (TB-1). A reply to a NEW limit order can only be NEW (nothing executed), PARTIALLY_FILLED (some, not all, of
+// what was sent) or FILLED (all of it). Every other combination of status and executed quantity is a reply the caller must not act
+// on as a result -- it collapses to NetworkError, i.e. "unknown result": Ambiguous, then reconcile asks the exchange. The sent quantity
+// here is 0.100000 (100'000 ticks at qty scale 6). The two counterexamples of the audit report are in the table: executedQty above
+// origQty with PARTIALLY_FILLED, and FILLED with nothing executed; and the status that no state-machine edge from Submitting leads
+// to -- EXPIRED_IN_MATCH (self-trade prevention) first of all.
+TEST(ParseSubmitOrderResponse, AReplysStatusAndExecutedQuantityMustAgreeWithEachOtherAndWithWhatWasSent) {
+    const auto rules = make_btcusdt_rules();
+    struct Case {
+        const char* status;
+        const char* executed;
+        const char* quote;  // cumulative quote quantity; only read for a fill
+        bool usable;
+        const char* label;
+    };
+    const Case kCases[] = {
+        // the three replies a new limit order can get
+        {"NEW", "0.000000", "0.00000000", true, "NEW with nothing executed"},
+        {"PARTIALLY_FILLED", "0.000001", "0.05000012", true, "the smallest partial fill"},
+        {"PARTIALLY_FILLED", "0.050000", "2500.00000000", true, "half matched at once"},
+        {"PARTIALLY_FILLED", "0.099999", "4999.95001200", true, "all but one tick matched"},
+        {"FILLED", "0.100000", "5000.01200000", true, "all of it matched"},
+        // an executed quantity the status cannot have
+        {"PARTIALLY_FILLED", "0.100001", "5000.06200000", false, "PARTIALLY_FILLED above what was sent (the audit's over-position)"},
+        {"FILLED", "0.100001", "5000.06200000", false, "FILLED above what was sent"},
+        {"FILLED", "0.000000", "0.00000000", false, "FILLED with nothing executed (the audit's slot-release case)"},
+        {"FILLED", "0.099999", "4999.95001200", false, "FILLED with less than was sent"},
+        {"PARTIALLY_FILLED", "0.000000", "0.00000000", false, "PARTIALLY_FILLED with nothing executed"},
+        {"PARTIALLY_FILLED", "0.100000", "5000.01200000", false, "PARTIALLY_FILLED with everything executed"},
+        {"NEW", "0.000001", "0.05000012", false, "NEW with a fill"},
+        {"NEW", "0.050000", "2500.00000000", false, "NEW with half executed"},
+        // statuses no reply to a new order can carry, with and without a fill
+        {"EXPIRED_IN_MATCH", "0.000000", "0.00000000", false, "EXPIRED_IN_MATCH: the taker order expired against the account's own order"},
+        {"EXPIRED_IN_MATCH", "0.050000", "2500.00000000", false, "EXPIRED_IN_MATCH after a partial match"},
+        {"EXPIRED", "0.000000", "0.00000000", false, "EXPIRED"},
+        {"CANCELED", "0.000000", "0.00000000", false, "CANCELED"},
+        {"CANCELED", "0.050000", "2500.00000000", false, "CANCELED after a partial match"},
+        {"PENDING_CANCEL", "0.000000", "0.00000000", false, "PENDING_CANCEL"},
+        {"REJECTED", "0.000000", "0.00000000", false, "REJECTED (a rejection is an HTTP error, never a 200 reply)"},
+    };
+    for (const Case& c : kCases) {
+        const std::string body =
+            std::string(R"({"symbol":"BTCUSDT","orderId":900,"clientOrderId":"submit-coid-008",)") +
+            R"("transactTime":1700000000000,"price":"50000.12","origQty":"0.100000","executedQty":")" + c.executed +
+            R"(","cummulativeQuoteQty":")" + c.quote + R"(","status":")" + c.status +
+            R"(","side":"BUY","type":"LIMIT","timeInForce":"GTC"})";
+        const auto resp = parse_submit_order_response(body, "submit-coid-008", rules, OrderSide::Buy, OrderType::Limit,
+                                                        5'000'012, 100'000);
+        if (c.usable) {
+            EXPECT_EQ(resp.outcome, SubmitOutcome::Accepted) << c.label;
+            EXPECT_EQ(resp.exchange_order_id, 900) << c.label;
+        } else {
+            EXPECT_EQ(resp.outcome, SubmitOutcome::NetworkError) << c.label;
+            EXPECT_EQ(resp.exchange_order_id, 0) << c.label << ": nothing of an unusable reply is passed on";
+            EXPECT_EQ(resp.filled_qty_ticks, 0) << c.label;
+        }
+    }
+}
+
 // --- build_exchange_info_target() -- L4 §5's `symbols` filter query construction ---
 
 TEST(BuildExchangeInfoTarget, EmptyFilterReturnsUnfilteredPath) {

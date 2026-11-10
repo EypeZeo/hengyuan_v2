@@ -722,7 +722,10 @@ inline QueryResult parse_order_query_response(std::string_view body,
 // SubmitOutcome::NetworkError (routing into the orchestrator's existing Ambiguous path,
 // same as any other network-layer failure) -- a 2xx response whose content disagrees with
 // what was sent is not trustworthy evidence about whether the order actually went through;
-// never fabricate Accepted or Rejected from it. avg_fill_price_ticks reuses the exact same
+// never fabricate Accepted or Rejected from it. That includes a reply whose status or executed
+// quantity cannot be what a NEW limit order's reply says (only NEW / PARTIALLY_FILLED / FILLED, each
+// with the executed quantity it implies: see reply_is_possible below -- audit F-A-012, L-54).
+// avg_fill_price_ticks reuses the exact same
 // checked_scaled_mul_div() formula §6.1.1/parse_order_query_response() already establish --
 // one formula, one implementation, for both code paths that compute a fill's average price
 // (spec §4.2's own requirement).
@@ -826,11 +829,6 @@ inline SubmitResponse parse_submit_order_response(std::string_view body,
         return {SubmitOutcome::NetworkError, 0, -1};
     }
 
-    SubmitResponse resp{};
-    resp.outcome = SubmitOutcome::Accepted;
-    resp.exchange_order_id = order_id;
-    resp.exchange_status = exchange_status;
-
     // §4.2/§6.1.1 -- avg_fill_price_ticks, only when executed_qty_ticks > 0 (never divide by
     // zero, never fabricate a price for a fill that didn't happen).
     std::int64_t executed_qty_ticks = 0;
@@ -838,6 +836,35 @@ inline SubmitResponse parse_submit_order_response(std::string_view body,
                                             executed_qty_ticks)) {
         return {SubmitOutcome::NetworkError, 0, -1};
     }
+
+    // Audit F-A-012 / L-54 (TB-1). The reply to a NEW limit order can say exactly three things, and each
+    // fixes the executed quantity against the quantity that was sent (== orig_qty_ticks, checked above):
+    //   NEW              nothing executed yet                 executed == 0
+    //   PARTIALLY_FILLED part of it matched at once           0 < executed < sent
+    //   FILLED           all of it matched at once            executed == sent
+    // Anything else is a reply this function cannot vouch for, and the caller must not act on it as a
+    // result: an executed quantity above what was sent (an over-position), FILLED with nothing or too
+    // little executed (a slot released for an order that may still rest), NEW with a fill, and every
+    // other status map_binance_order_status() knows -- CANCELED, EXPIRED, EXPIRED_IN_MATCH,
+    // PENDING_CANCEL, REJECTED -- which no state-machine edge from Submitting leads to (an
+    // EXPIRED_IN_MATCH reply, which self-trade prevention produces for the taker, used to become a
+    // Submitting -> Expired frame that the recovery scan calls Corrupt for the whole log). They all
+    // collapse to NetworkError like every other disagreement: unknown result, Ambiguous, and the
+    // reconcile loop asks the exchange, whose answer takes the legal edges (Ambiguous -> Expired ...).
+    const bool reply_is_possible =
+        (exchange_status == OrderState::Accepted && executed_qty_ticks == 0) ||
+        (exchange_status == OrderState::PartialFill && executed_qty_ticks > 0 &&
+         executed_qty_ticks < expected_qty_ticks) ||
+        (exchange_status == OrderState::Filled && executed_qty_ticks == expected_qty_ticks);
+    if (!reply_is_possible) {
+        return {SubmitOutcome::NetworkError, 0, -1};
+    }
+
+    SubmitResponse resp{};
+    resp.outcome = SubmitOutcome::Accepted;
+    resp.exchange_order_id = order_id;
+    resp.exchange_status = exchange_status;
+
     if (executed_qty_ticks == 0) {
         return resp;  // filled_qty_ticks/avg_fill_price_ticks stay at their default 0
     }
