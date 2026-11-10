@@ -400,6 +400,42 @@ TEST(RescaleNotionalCeil, ScaleUpOverflowFailsClosed) {
     EXPECT_FALSE(hy::rescale_notional_ceil(std::numeric_limits<std::int64_t>::max(), 0, 8, out));
 }
 
+// --- audit F-A-001: rescale_notional_floor, the rounding a LOWER bound needs ---
+
+TEST(RescaleNotionalFloor, ScalesDownByTruncationWhereTheCeilingRoundsUp) {
+    std::int64_t floor_out = 0;
+    std::int64_t ceil_out = 0;
+    // 4.999999991 at scale 9 -> scale 8: the product has a digit the target scale cannot hold.
+    ASSERT_TRUE(hy::rescale_notional_floor(4'999'999'991, 9, 8, floor_out));
+    ASSERT_TRUE(hy::rescale_notional_ceil(4'999'999'991, 9, 8, ceil_out));
+    EXPECT_EQ(floor_out, 499'999'999);
+    EXPECT_EQ(ceil_out, 500'000'000);
+
+    ASSERT_TRUE(hy::rescale_notional_floor(150, 2, 0, floor_out));
+    EXPECT_EQ(floor_out, 1);  // 1.5 -> 1; the ceiling gives 2
+    ASSERT_TRUE(hy::rescale_notional_floor(100, 2, 0, floor_out));
+    EXPECT_EQ(floor_out, 1);  // an exact division is exact in both directions
+}
+
+TEST(RescaleNotionalFloor, ScalingUpIsExactAndIdentical) {
+    std::int64_t out = 0;
+    ASSERT_TRUE(hy::rescale_notional_floor(100, 4, 8, out));
+    EXPECT_EQ(out, 1'000'000);
+    ASSERT_TRUE(hy::rescale_notional_floor(12345, 8, 8, out));
+    EXPECT_EQ(out, 12345);
+    EXPECT_FALSE(hy::rescale_notional_floor(std::numeric_limits<std::int64_t>::max(), 0, 8, out));  // overflow still fails closed
+}
+
+TEST(RescaleNotionalFloor, RefusesWhatTheCeilingRefuses) {
+    std::int64_t out = 0;
+    EXPECT_FALSE(hy::rescale_notional_floor(-1, 4, 8, out));
+    EXPECT_FALSE(hy::rescale_notional_floor(100, -1, 8, out));
+    EXPECT_FALSE(hy::rescale_notional_floor(100, 19, 8, out));
+    EXPECT_FALSE(hy::rescale_notional_floor(100, 8, -1, out));
+    EXPECT_FALSE(hy::rescale_notional_floor(100, 8, 19, out));
+    EXPECT_FALSE(hy::rescale_notional_floor(100, 200 + 200, 8, out));
+}
+
 // --- L4 §6.1.1: checked_scaled_mul_div ---
 
 TEST(CheckedScaledMulDiv, ZeroExponentIsPlainDivision) {
@@ -507,6 +543,33 @@ TEST(PreTradeScaleMismatch, NativeScaleAboveTargetPreviouslyMaskedBelowMinNotion
     // The real order is $0.50 < the $1.00 minimum and must be rejected once rescaled
     // (5e11 ceiling-divided by 10^4 = 5e7 = $0.50000000 < $1.00 minimum).
     EXPECT_EQ(r, PreTradeCheck::BelowMinNotional);
+}
+
+// Audit F-A-001. The minimum is a LOWER bound, so the order must reach it on its exact product; the round-up that is right for the caps and the
+// balance made 4.999999991 look like 5.00000000 and let it through a 5.0 minimum. Needs price_scale + qty_scale above kBalanceScale (here 4 + 5 = 9).
+TEST(PreTradeScaleMismatch, MinNotionalIsJudgedOnTheExactProductNotOnTheRoundedUpOne) {
+    auto rules = make_btcusdt_rules();
+    rules.price_scale = 4;
+    rules.qty_scale = 5;
+    rules.min_notional_ticks = 500'000'000;  // 5.0 at kBalanceScale=8
+    rules.tick_size_ticks = 0;               // PRICE_FILTER off: not what this test is about
+    rules.step_size_ticks = 0;               // LOT_SIZE off
+    auto account = make_account(1000, true, /*usdt_free=*/10'000'000'000);  // 100 USDT: the balance is not the question here
+    auto limits = make_limits();
+    limits.single_order_notional_cap = 0;
+    limits.total_exposure_notional_cap = 0;
+
+    // qty 1 (0.00001) x price 499999.9991 = 4.999999991 at scale 9: under the minimum by 9e-9.
+    EXPECT_EQ(validate_pre_trade(rules, hy::OrderSide::Buy, 4'999'999'991, 1, account, "BTC", "USDT", 1010, limits),
+              PreTradeCheck::BelowMinNotional);
+    // 5.000000000 exactly (price 500000.0000, qty 0.00001) reaches it; so does everything above it.
+    EXPECT_EQ(validate_pre_trade(rules, hy::OrderSide::Buy, 5'000'000'000, 1, account, "BTC", "USDT", 1010, limits), PreTradeCheck::Ok);
+    EXPECT_EQ(validate_pre_trade(rules, hy::OrderSide::Buy, 5'000'000'001, 1, account, "BTC", "USDT", 1010, limits), PreTradeCheck::Ok);
+    // The scale-up side (native scale below kBalanceScale) is exact and unchanged: 4.9999999 is under 5.0, 5.0000000 is not.
+    rules.price_scale = 2;
+    rules.qty_scale = 5;  // native 7
+    EXPECT_EQ(validate_pre_trade(rules, hy::OrderSide::Buy, 49'999'999, 1, account, "BTC", "USDT", 1010, limits), PreTradeCheck::BelowMinNotional);
+    EXPECT_EQ(validate_pre_trade(rules, hy::OrderSide::Buy, 50'000'000, 1, account, "BTC", "USDT", 1010, limits), PreTradeCheck::Ok);
 }
 
 TEST(PreTradeScaleMismatch, NativeScaleBelowTargetPreviouslyMaskedExceedsSingleOrderCap) {

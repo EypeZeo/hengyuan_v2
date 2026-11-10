@@ -240,10 +240,14 @@ TerminalOrderReleasesSlotOnceDrained ==
 (* Never exceed the registry's capacity. *)
 SlotsWithinCapacity == Cardinality(slots) =< MaxSlots
 
-(* A live order is never queryable without being tracked, so it can never  *)
-(* silently regress. Guards against a future edit making Query* reachable  *)
-(* for untracked orders.                                                   *)
-NoUntrackedProgress == \A c \in COIDs : (state[c] \in Live) => (c \notin slots \/ TRUE)
+(* A predicate named NoUntrackedProgress used to stand here. Its body ended   *)
+(* in `\/ TRUE`, so it held in every state (a conjunct that cannot fail), and *)
+(* no .cfg ever listed it under INVARIANTS: it checked nothing while its      *)
+(* comment said it guarded against Query* being reachable for untracked      *)
+(* orders. It was removed rather than rewritten (audit F-C-005); that         *)
+(* property, if wanted, needs its own definition over the Query* actions and *)
+(* a negative control, and NoLiveOrderIsUntracked above already covers the    *)
+(* reachability half of it.                                                   *)
 
 (***************************************************************************)
 (* LIVENESS                                                                *)

@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -154,6 +155,23 @@ TEST(KlinesCodec, InconsistentOhlcIsRefused) {
 TEST(KlinesCodec, CloseTimeNotAfterOpenTimeIsRefused) {
     EXPECT_EQ(parse("[" + row(60'000, 60'000) + "]", kFarFuture, 0), KlinesParseError::BadBarShape);
     EXPECT_EQ(parse("[" + row(60'000, 1) + "]", kFarFuture, 0), KlinesParseError::BadBarShape);
+}
+
+// Audit F-B-006. The bar times are the peer's own numbers and are added to and subtracted from before they are compared
+// (`close - open + 1`, `previous close + 1`); an out-of-range one used to be signed-overflow UB (UBSan), now it is a refusal.
+TEST(KlinesCodec, BarTimesOutsideTheSupportedRangeAreRefusedBeforeAnyArithmeticOnThem) {
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+    // close - open overflows int64 (open very negative, close very positive); with span 0 the span check would not even run, but
+    // the subtraction in it is not the only operation: the range check must come first either way.
+    EXPECT_EQ(parse("[" + row(-9'000'000'000'000'000'000LL, kMax) + "]", kFarFuture, kOneMinute), KlinesParseError::BadBarShape);
+    EXPECT_EQ(parse("[" + row(-9'000'000'000'000'000'000LL, kMax) + "]", kFarFuture, 0), KlinesParseError::BadBarShape);
+    EXPECT_EQ(parse("[" + row(-1, 59'998) + "]", kFarFuture, kOneMinute), KlinesParseError::BadBarShape);  // a negative time
+    // close_time == INT64_MAX makes `previous close + 1` overflow for the next row.
+    EXPECT_EQ(parse("[" + row(kMax - 59'999, kMax) + "," + row(0, 59'999) + "]", kFarFuture, kOneMinute), KlinesParseError::BadBarShape);
+    // Just inside the bound still parses: the check is a range, not a different rule for large numbers.
+    constexpr std::int64_t kBound = kMax / 4;
+    EXPECT_EQ(parse("[" + row(kBound - 59'999, kBound) + "]", kBound + 1, kOneMinute), KlinesParseError::None);
+    EXPECT_EQ(parse("[" + row(kBound - 59'998, kBound + 1) + "]", kFarFuture, kOneMinute), KlinesParseError::BadBarShape);
 }
 
 TEST(KlinesCodec, BadNumbersAreRefused) {

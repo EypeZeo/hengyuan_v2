@@ -8,7 +8,8 @@
 // 静态算出，加载时就报给调用方"). init() is also where the one aggregate capacity check this
 // batch's plan calls for lives: if the sum of every window-class node's window/lag size
 // exceeds kHistoryPoolCapacity (strategy_spec_operators.hpp), or any single node's window/lag
-// doesn't fit a uint16_t, init() returns false and the evaluator must not be stepped.
+// doesn't fit a uint16_t (EMA and RSI included: they keep no history, but their seed counters are
+// uint16_t too), init() returns false and the evaluator must not be stepped.
 //
 // Hot path (every bar): step() walks dag_.nodes in declared order — already a valid
 // topological order by construction, per 5a's forward-reference-only DAG (see
@@ -114,7 +115,14 @@ public:
         std::size_t pool_used = 0;
         for (std::size_t i = 0; i < dag_.node_count; ++i) {
             const SpecNode& node = dag_.nodes[i];
-            if (!detail::is_window_class_op(node.op)) continue;
+            if (!detail::is_window_class_op(node.op)) {
+                // Audit F-A-008. EMA and RSI take no slice of the history pool, but EmaState/RsiState count their seed
+                // observations in a uint16_t: with a window past 65535 that counter wraps before it reaches the window, the
+                // indicator never seeds and stays NaN, while compute_effective_warmup() (uint32) still declares warm-up
+                // complete after `window` bars. Refused here, like every other window that does not fit its storage.
+                if ((node.op == SpecOp::Ema || node.op == SpecOp::Rsi) && (node.param <= 0 || node.param > 0xffff)) return false;
+                continue;
+            }
             if (node.param <= 0 || node.param > 0xffff) return false;
             const std::size_t capacity = static_cast<std::size_t>(node.param);
             if (pool_used + capacity > kHistoryPoolCapacity) return false;

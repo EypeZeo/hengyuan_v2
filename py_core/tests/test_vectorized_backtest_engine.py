@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
+import pytest
 
 from py_core.backtests.models import BacktestConfig
 from py_core.backtests.vectorized_engine import (
@@ -204,6 +205,87 @@ def test_validation_report_non_monotonic_timestamps() -> None:
     assert vr.timestamp_monotonic is False
     assert vr.is_valid is False
     assert len(vr.issues) > 0
+
+
+def _frame(open_: list[float], close: list[float] | None = None) -> pd.DataFrame:
+    dates = [_BASE_DT + timedelta(days=i) for i in range(len(open_))]
+    closes = close if close is not None else open_
+    return pd.DataFrame(
+        {
+            "open": open_,
+            "high": [max(o, c) for o, c in zip(open_, closes, strict=True)],
+            "low": [min(o, c) for o, c in zip(open_, closes, strict=True)],
+            "close": closes,
+            "volume": [1000.0] * len(open_),
+        },
+        index=pd.DatetimeIndex(dates),
+    )
+
+
+def test_infinite_signal_is_reported_invalid_and_the_backtest_refuses_it() -> None:
+    """审计 F-A-005：信号 [inf, 0, 0, 0] 此前通过校验，得到 inf 持仓、NaN 收益与 NaN 净值，仍是 is_valid=True。"""
+    df = _frame([100.0, 101.0, 102.0, 103.0])
+    signals: pd.Series[Any] = pd.Series([float("inf"), 0.0, 0.0, 0.0], index=df.index)
+
+    vr = validate_inputs(df, signals)
+    assert vr.signals_finite is False
+    assert vr.is_valid is False
+    assert any("inf" in issue for issue in vr.issues)
+
+    records = [_rec(i, p) for i, p in enumerate([100.0, 101.0, 102.0, 103.0])]
+    with pytest.raises(ValueError, match="输入校验失败"):
+        run_vectorized_backtest(_cfg(), records, _make_signals(records, [float("inf"), 0.0, 0.0, 0.0]))
+    with pytest.raises(ValueError, match="输入校验失败"):
+        run_vectorized_backtest(_cfg(), records, _make_signals(records, [0.0, float("-inf"), 0.0, 0.0]))
+
+
+def test_nan_signal_stays_the_documented_flat_not_an_error() -> None:
+    """NaN 信号的语义是“缺失 = 空仓”，修复 inf 校验不得把它改成错误。"""
+    records = [_rec(i, p) for i, p in enumerate([100.0, 101.0, 102.0, 103.0])]
+    result = run_vectorized_backtest(_cfg(), records, _make_signals(records, [float("nan"), 1.0, float("nan"), 0.0]))
+    assert all(math.isfinite(v) for v in result.equity_curve)
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low", "close"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_non_finite_or_non_positive_prices_are_reported_invalid(column: str, bad: float) -> None:
+    df = _frame([100.0, 101.0, 102.0, 103.0])
+    df.loc[df.index[1], column] = bad
+    signals: pd.Series[Any] = pd.Series([0.0, 0.0, 0.0, 0.0], index=df.index)
+
+    vr = validate_inputs(df, signals)
+
+    assert vr.prices_finite_positive is False
+    assert vr.is_valid is False
+    assert any(column in issue for issue in vr.issues)
+
+
+def test_a_clean_frame_still_validates() -> None:
+    df = _frame([100.0, 101.0, 102.0, 103.0])
+    vr = validate_inputs(df, pd.Series([0.0, 1.0, 1.0, 0.0], index=df.index))
+    assert vr.is_valid is True
+    assert vr.prices_finite_positive is True and vr.signals_finite is True
+    assert vr.issues == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"initial_capital": float("nan")},
+        {"initial_capital": float("inf")},
+        {"fee_bps": float("nan")},
+        {"fee_bps": float("inf")},
+        {"slippage_bps": float("nan")},
+        {"risk_free_rate": float("nan")},
+        {"risk_free_rate": float("inf")},
+        {"annualization_factor": float("nan")},
+        {"annualization_factor": float("inf")},
+    ],
+)
+def test_backtest_config_rejects_non_finite_numbers(kwargs: dict[str, Any]) -> None:
+    """审计 F-A-005：NaN 与所有比较都为 False，此前 ``nan <= 0`` / ``nan < 0 or nan > 500`` 让 NaN 配置原样通过。"""
+    with pytest.raises(ValueError):
+        _cfg(**kwargs)
 
 
 def test_validation_report_nan_close() -> None:

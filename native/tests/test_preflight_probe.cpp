@@ -169,8 +169,19 @@ TEST(PreflightQuantityNotional, TheNotionalIsRescaledTheWayTheGateRescalesIt) {
     expect_smallest(scaled_rules(0, 0, 1, 1, 10'000'000'000), 7, 15);  // 7 * 14 * 1e8 = 9.8e9 is short, 7 * 15 * 1e8 = 1.05e10 reaches
     // At it: no rescale.
     expect_smallest(scaled_rules(3, 5, 1, 1, 1000), 125, 8);  // 125 * 8 = 1000 exactly
-    // Above it: divided down and rounded UP, as the gate rounds -- the conservative direction, and the one that decides this case.
-    expect_smallest(scaled_rules(6, 5, 1, 1, 5000), 1500, 3333);  // ceil(1500 * 3333 / 1000) = ceil(4999.5) = 5000 reaches; a floor would have needed 3334
+    // Above it: divided down and judged on the value rounded DOWN, as the gate judges a minimum (audit F-A-001: a lower bound must be reached by the exact
+    // product, and rounding up lets a product just under it through). This case used to expect 3333 "because the ceiling reaches 5000"; the exact product of 3333
+    // lots, 4999.5 ticks, is below the 5000 minimum, so the exchange would have refused that order. The first quantity that really reaches it is 3334.
+    expect_smallest(scaled_rules(6, 5, 1, 1, 5000), 1500, 3334);  // floor(1500 * 3333 / 1000) = 4999 is short; floor(1500 * 3334 / 1000) = 5001 reaches
+}
+
+// Audit F-A-001, the case the report gave: price_scale 4 + qty_scale 5 = 9 above kBalanceScale, a product of 4.999999991 against a minimum of 5.0. Rounded up it
+// read as 5.00000000 and the lot of 1 passed; the exact product is under the minimum, so the smallest quantity that reaches it is 2.
+TEST(PreflightQuantityNotional, AProductJustUnderTheMinimumIsShortEvenWhenItRoundsUpToIt) {
+    const SymbolRules rules = scaled_rules(4, 5, 1, 1, 500'000'000);
+    EXPECT_EQ(gate_verdict(rules, OrderSide::Buy, 4'999'999'991, 1), PreTradeCheck::BelowMinNotional);
+    expect_smallest(rules, 4'999'999'991, 2);
+    expect_smallest(rules, 5'000'000'000, 1);  // 5.000000000 exactly: reaches
 }
 
 TEST(PreflightQuantityNotional, OnlyPointsOfTheStepGridAreAnswers) {

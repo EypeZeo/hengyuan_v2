@@ -25,6 +25,7 @@ from py_core.manual_ohlcv import (
 from py_core.strategy_spec.evaluator import (
     compute_effective_warmup,
     evaluate_spec,
+    evaluate_spec_nodes,
     validate_market_binding,
 )
 from py_core.strategy_spec.schema import StrategySpecError, parse_spec
@@ -217,6 +218,52 @@ mode = "boolean"
     )
     signal = evaluate_spec(spec, df)
     assert signal.tolist() == [0.0, 0.0, 1.0]
+
+
+def test_two_literal_operands_evaluate_to_a_constant_series_as_the_cpp_evaluator_does() -> None:
+    """审计 F-A-010：``add(left=1, right=2)`` 通过 parse_spec 与 C++ 求值，Python 求值却在 operators._align() 抛 TypeError
+    （两侧都不是 Series，没有索引可挂）。两个字面量应当得到每根 bar 都等于常数的 Series。"""
+    text = """
+spec_version = 1
+name = "const_only"
+
+[market]
+market = "crypto_spot"
+symbol = "BTCUSDT"
+timeframe = "1h"
+
+[[indicators]]
+id = "three"
+op = "add"
+left = 1.0
+right = 2.0
+
+[[indicators]]
+id = "ratio"
+op = "div"
+left = 1.0
+right = 4.0
+
+[[indicators]]
+id = "above"
+op = "gt"
+left = 3.0
+right = 2.5
+
+[signal]
+node = "above"
+mode = "boolean"
+"""
+    spec = parse_spec(text)
+    df = pd.DataFrame(
+        {"open": [90.0, 100.0, 110.0], "high": [90.0, 100.0, 110.0], "low": [90.0, 100.0, 110.0], "close": [90.0, 100.0, 110.0], "volume": [1.0, 1.0, 1.0]},
+        index=pd.date_range("2024-01-01", periods=3, freq="h"),
+    )
+    nodes = evaluate_spec_nodes(spec, df)
+    assert nodes["three"].tolist() == [3.0, 3.0, 3.0]
+    assert nodes["ratio"].tolist() == [0.25, 0.25, 0.25]
+    assert nodes["three"].index.equals(df.index)
+    assert evaluate_spec(spec, df).tolist() == [1.0, 1.0, 1.0]
 
 
 def test_crosses_above_with_literal_right_operand() -> None:

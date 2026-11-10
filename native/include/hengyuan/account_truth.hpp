@@ -590,6 +590,29 @@ inline bool rescale_notional_ceil(std::int64_t raw_notional_native_scale,
     return true;
 }
 
+// The floor counterpart of rescale_notional_ceil(): the same domain and the same refusals, but when scaling DOWN it rounds
+// toward zero instead of up. Scaling up (target_scale >= native_scale) is exact, so there it IS rescale_notional_ceil().
+//
+// Which of the two a comparison needs follows from which way it must fail. Every CAP and every BALANCE check asks "could this
+// order exceed what is allowed / covered?", and rounding up can only answer yes more often: the fail-closed side. A LOWER bound
+// asks the opposite -- "does the true notional reach the minimum?" -- and rounding up answers yes too often: a notional of
+// 4.999999991 rounded up to 5.00000000 would pass a minimum of 5.0 that it does not reach (audit F-A-001; it needs a symbol whose
+// price_scale + qty_scale exceeds kBalanceScale, so the product has digits the 8-digit scale cannot hold). For an integer
+// minimum m and a product n / d, "n / d >= m" holds exactly when floor(n / d) >= m, which is what this returns.
+inline bool rescale_notional_floor(std::int64_t raw_notional_native_scale,
+                                    int native_scale, int target_scale,
+                                    std::int64_t& out) noexcept {
+    if (raw_notional_native_scale < 0) return false;
+    if (native_scale < 0 || native_scale > 18) return false;
+    if (target_scale < 0 || target_scale > 18) return false;
+    if (target_scale >= native_scale) return rescale_notional_ceil(raw_notional_native_scale, native_scale, target_scale, out);
+
+    std::int64_t divisor = 0;
+    if (!pow10_i64(static_cast<std::uint8_t>(native_scale - target_scale), divisor)) return false;
+    out = raw_notional_native_scale / divisor;  // divisor >= 10 here; both operands non-negative, so this is the floor
+    return true;
+}
+
 // L4 §6.1.1: computes (value * 10^exponent) / divisor as a single checked
 // operation, where `exponent` may be negative (meaning "divide by 10^|exponent|
 // first," pure integer arithmetic throughout, never a floating-point
@@ -797,9 +820,10 @@ inline PreTradeCheck validate_pre_trade(
 
     // L4 §5.1.1: notional_native is symbol-dependent scale; min_notional_ticks/the two
     // ExposureLimits caps/AssetBalance::free_ticks (§4.2) are all fixed at kBalanceScale.
-    // Rescale exactly once, here, and use ONLY `notional` (never notional_native again)
-    // for every comparison below -- including the Buy-side balance check further down,
+    // Rescale here (rounding UP) and use ONLY `notional` (never notional_native again)
+    // for every cap and balance comparison below -- including the Buy-side balance check further down,
     // which also compares against a kBalanceScale-denominated AssetBalance::free_ticks.
+    // The one exception is MIN_NOTIONAL, a lower bound, which is judged on the rounded-DOWN value.
     std::int64_t notional = 0;
     if (!rescale_notional_ceil(notional_native,
                                static_cast<int>(rules.price_scale) + static_cast<int>(rules.qty_scale),
@@ -807,9 +831,18 @@ inline PreTradeCheck validate_pre_trade(
         return PreTradeCheck::NotionalOverflow;
     }
 
-    // MIN_NOTIONAL
-    if (rules.min_notional_ticks > 0 && notional < rules.min_notional_ticks) {
-        return PreTradeCheck::BelowMinNotional;
+    // MIN_NOTIONAL -- a LOWER bound, so it is judged on the notional rounded DOWN (rescale_notional_floor()): `notional` above is
+    // rounded up, the right direction for the caps and the balance but one that would let a product just under the minimum
+    // through (audit F-A-001). The ceiling call above has already succeeded for these inputs, and the floor cannot fail where
+    // the ceiling did not, so a refusal here is the same NotionalOverflow.
+    if (rules.min_notional_ticks > 0) {
+        std::int64_t notional_floor = 0;
+        if (!rescale_notional_floor(notional_native,
+                                    static_cast<int>(rules.price_scale) + static_cast<int>(rules.qty_scale),
+                                    kBalanceScale, notional_floor)) {
+            return PreTradeCheck::NotionalOverflow;
+        }
+        if (notional_floor < rules.min_notional_ticks) return PreTradeCheck::BelowMinNotional;
     }
 
     // Single order cap

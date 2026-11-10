@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import pandas as pd
 
 from py_core.backtests.annualization import annualization_factor_for_records
@@ -88,6 +89,8 @@ def validate_inputs(
        引用 df 之外的时间戳都会因此被拒绝）。稀疏子集（只给了部分 bar 的信号）允许，其余 bar
        视为空仓。**必须在 reindex 之前调用**：SAFE-05 之前两个引擎都先 reindex 再调用本函数，
        比较的是已被对齐到 df.index 的索引，该项恒为真。
+    4. 数值域（审计 F-A-005）：open/high/low/close 全为有限正数（引擎按 open 成交）；signal 不含 ±inf。
+       signal 里的 NaN 不算问题：文档化语义是“缺失 = 空仓（0）”。
 
     本函数只做索引/时间戳层面的检查，所以报告里的 causal_check 为 "index_only"；只有调用方
     传入 causal_evidence（信号来自 checked_signals()）时才记为 "prefix_differential"。
@@ -127,6 +130,22 @@ def validate_inputs(
                 )
                 no_future_shift_detected = False
 
+    # 4. 数值域（审计 F-A-005）。引擎按 open 价格成交，收益 = (next_open - open) / open：open 为 NaN/inf/0/负数，
+    #    或信号含 ±inf，都会在向量化计算里产生 NaN 持仓/收益/净值，而此前报告仍是 is_valid=True、issues 为空
+    #    （上面只查了 close 的 NaN）。NaN 信号不在此列：引擎的文档化语义是“缺失 = 空仓（0）”。
+    prices_finite_positive = True
+    for column in ("open", "high", "low", "close"):
+        values = df[column].to_numpy(dtype=float, na_value=float("nan"))
+        if not bool(np.all(np.isfinite(values) & (values > 0.0))):
+            prices_finite_positive = False
+            issues.append(f"{column} 列含非有限值或非正价格（NaN、±inf、0、负数）")
+    signals_finite = True
+    if len(signals) > 0:
+        signal_values = signals.to_numpy(dtype=float, na_value=float("nan"))
+        if bool(np.any(np.isinf(signal_values))):
+            signals_finite = False
+            issues.append("signal 含 ±inf（NaN 按“无信号 = 空仓”处理，inf 不被接受）")
+
     if causal_evidence is not None:
         causal_check = "prefix_differential"
         causal_points = causal_evidence.points_compared
@@ -145,6 +164,8 @@ def validate_inputs(
         causal_check=causal_check,
         causal_points=causal_points,
         causal_context=causal_context,
+        prices_finite_positive=prices_finite_positive,
+        signals_finite=signals_finite,
     )
 
 

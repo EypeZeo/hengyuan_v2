@@ -97,6 +97,11 @@ def _evaluate_node(node: schema.IndicatorNode, node_values: dict[str, pd.Series]
     if op in _BINARY_FUNCS:
         left = _resolve_operand(node.operands["left"], node_values, df)
         right = _resolve_operand(node.operands["right"], node_values, df)
+        if not isinstance(left, pd.Series) and not isinstance(right, pd.Series):
+            # Two literals. The spec grammar allows the shape and the C++ StreamingEvaluator evaluates it (a constant per
+            # bar); operators._align() deliberately refuses a pair with no index to attach to, which made this spec load
+            # in Python and then fail at run time. Give the left literal the frame's index, so both sides agree. Audit F-A-010.
+            left = pd.Series(left, index=df.index, dtype=np.float64)
         return _BINARY_FUNCS[op](left, right)
     if op == "if_then_else":
         cond = _resolve_series(node.operands["cond"], node_values, df)

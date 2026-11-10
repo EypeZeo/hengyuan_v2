@@ -57,6 +57,34 @@ TEST(RiskGate, AllowsReducingWhenArmed) {
     EXPECT_EQ(g.check(sell(10), 20, 50000, ks), RiskDecision::Allow);
 }
 
+// Audit F-A-007 / F-C-003. While ARMED only a reduction may pass, and "reducing" is the opposite side of the position AND not more than it holds: a larger
+// order flattens the position and opens the other side with the excess.
+TEST(RiskGate, ArmedAllowsFlatteningButNotFlippingThePosition) {
+    RiskGate g(RiskLimits{.max_position_lots = 0, .max_notional_ticks = 0});  // limits off: only the ARMED rule is in play
+    KillSwitch ks;
+    ks.arm();
+    EXPECT_EQ(g.check(sell(10), 10, 50000, ks), RiskDecision::Allow) << "exactly flat is a reduction";
+    EXPECT_EQ(g.check(sell(9), 10, 50000, ks), RiskDecision::Allow);
+    EXPECT_EQ(g.check(sell(11), 10, 50000, ks), RiskDecision::BlockKillSwitch) << "one lot past flat opens a short";
+    EXPECT_EQ(g.check(sell(100), 10, 50000, ks), RiskDecision::BlockKillSwitch);
+    EXPECT_EQ(g.check(buy(10), -10, 50000, ks), RiskDecision::Allow);
+    EXPECT_EQ(g.check(buy(11), -10, 50000, ks), RiskDecision::BlockKillSwitch) << "the mirror image: one lot past flat opens a long";
+    // The same-side order is an increase, whatever its size, and a flat book has nothing to reduce.
+    EXPECT_EQ(g.check(buy(1), 10, 50000, ks), RiskDecision::BlockKillSwitch);
+    EXPECT_EQ(g.check(sell(1), 0, 50000, ks), RiskDecision::BlockKillSwitch);
+}
+
+TEST(RiskGate, ArmedFlatteningAtTheInt64BoundaryDoesNotWrap) {
+    RiskGate g(RiskLimits{.max_position_lots = 0, .max_notional_ticks = 0});
+    KillSwitch ks;
+    ks.arm();
+    constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+    // |INT64_MIN| = INT64_MAX + 1: the largest buy that still only flattens it is INT64_MAX (a buy of |INT64_MIN| itself cannot be expressed).
+    EXPECT_EQ(g.check(buy(kMax), kMin, 50000, ks), RiskDecision::Allow);
+    EXPECT_EQ(g.check(sell(kMax), kMax, 50000, ks), RiskDecision::Allow);
+}
+
 TEST(RiskGate, BlocksAllWhenTriggered) {
     RiskGate g(RiskLimits{.max_position_lots = 100, .max_notional_ticks = 0});
     KillSwitch ks;

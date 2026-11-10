@@ -118,6 +118,62 @@ def test_run_walk_forward_analysis_rejects_non_contiguous_split() -> None:
         )
 
 
+_SMA = "py_core.strategies.sma_crossover:SmaCrossoverStrategy"
+
+
+def test_run_walk_forward_analysis_rejects_overlapping_test_windows() -> None:
+    """Audit F-A-004. ``walk_forward_splits(step < test_window)`` is a legitimate way to get overlapping folds, but
+    the OOS returns are concatenated into ONE compounded path: a bar in two test windows would be counted twice and
+    the stitch point would run backwards. The analysis must refuse them up front, not average them silently."""
+    records = _records_from_prices(_random_walk_prices(300, seed=1))
+    config = BacktestConfig(initial_capital=100_000.0)
+    overlapping = walk_forward_splits(300, train_window=100, test_window=50, step=25)
+    assert len(overlapping) > 1 and overlapping[1].test_indices[0] <= overlapping[0].test_indices[-1]
+    with pytest.raises(ValueError, match="stitches"):
+        run_walk_forward_analysis(config, records, _SMA, _sma_param_grid(), overlapping)
+
+
+def test_run_walk_forward_analysis_rejects_out_of_order_and_repeated_folds() -> None:
+    records = _records_from_prices(_random_walk_prices(300, seed=1))
+    config = BacktestConfig(initial_capital=100_000.0)
+    ordered = walk_forward_splits(300, train_window=100, test_window=50)
+    assert len(ordered) >= 3
+    with pytest.raises(ValueError, match="stitches"):
+        run_walk_forward_analysis(config, records, _SMA, _sma_param_grid(), list(reversed(ordered)))
+    with pytest.raises(ValueError, match="stitches"):
+        run_walk_forward_analysis(config, records, _SMA, _sma_param_grid(), [ordered[0], ordered[0]])
+
+
+def test_run_walk_forward_analysis_rejects_a_train_window_that_reaches_its_test_window() -> None:
+    records = _records_from_prices(_random_walk_prices(300, seed=1))
+    config = BacktestConfig(initial_capital=100_000.0)
+    leaky = Split(train_indices=np.arange(0, 120, dtype=np.int64), test_indices=np.arange(110, 160, dtype=np.int64))
+    with pytest.raises(ValueError, match="must end before the test window"):
+        run_walk_forward_analysis(config, records, _SMA, _sma_param_grid(), [leaky])
+
+
+def test_run_walk_forward_analysis_rejects_indices_outside_the_data() -> None:
+    records = _records_from_prices(_random_walk_prices(300, seed=1))
+    config = BacktestConfig(initial_capital=100_000.0)
+    negative = Split(train_indices=np.arange(-20, 80, dtype=np.int64), test_indices=np.arange(80, 130, dtype=np.int64))
+    with pytest.raises(ValueError, match="negative row index"):
+        run_walk_forward_analysis(config, records, _SMA, _sma_param_grid(), [negative])
+    past_the_end = Split(train_indices=np.arange(200, 280, dtype=np.int64), test_indices=np.arange(280, 330, dtype=np.int64))
+    with pytest.raises(ValueError, match="the data has 300 rows"):
+        run_walk_forward_analysis(config, records, _SMA, _sma_param_grid(), [past_the_end])
+
+
+def test_run_walk_forward_analysis_still_accepts_adjacent_folds_with_a_purge_gap_and_expanding_windows() -> None:
+    """The guard is about overlap and order, not about any layout the splitter itself produces by default."""
+    records = _records_from_prices(_random_walk_prices(300, seed=1))
+    config = BacktestConfig(initial_capital=100_000.0, fee_bps=5.0, slippage_bps=2.0)
+    for kwargs in ({"purge_bars": 3}, {"expanding": True}, {"purge_bars": 2, "expanding": True}):
+        splits = walk_forward_splits(300, train_window=100, test_window=50, **kwargs)
+        report = run_walk_forward_analysis(config, records, _SMA, _sma_param_grid(), splits)
+        assert len(report.fold_results) == len(splits)
+        assert len(report.oos_returns) == sum(len(s.test_indices) for s in splits)
+
+
 def test_fold_results_carry_the_actual_selected_params_used_for_test(tmp_path=None) -> None:
     records = _records_from_prices(_random_walk_prices(300, seed=1))
     config = BacktestConfig(initial_capital=100_000.0, fee_bps=5.0, slippage_bps=2.0)

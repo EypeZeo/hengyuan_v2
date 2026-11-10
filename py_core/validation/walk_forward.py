@@ -83,6 +83,41 @@ class WalkForwardReport:
     oos_metrics: BacktestMetrics
 
 
+def _require_stitchable(splits: list[Split], n_rows: int) -> None:
+    """The OOS returns of every fold are concatenated into ONE continuous path and compounded, so the folds must
+    describe one forward-moving history: each train window ends before its own test window starts, the test
+    windows are in time order and share no bar, and every index is a real row.
+
+    ``walk_forward_splits()`` produces exactly that by default (``step == test_window``), but its ``step`` may be
+    smaller than ``test_window`` -- legitimate for judging each fold on its own, not for stitching: bars covered by
+    two test windows would be counted twice, the stitch point would run backwards in time, and different folds can
+    have picked different parameters for the same bar, so no deduplication can say which return to keep. Hand-built
+    ``Split`` lists are checked by the same rules. Audit F-A-004.
+    """
+    previous_test_end = -1
+    for fold, split in enumerate(splits):
+        train, test = split.train_indices, split.test_indices
+        _require_contiguous(train, "train")
+        _require_contiguous(test, "test")
+        if int(train[0]) < 0 or int(test[0]) < 0:
+            raise ValueError(f"fold {fold}: negative row index (train starts {int(train[0])}, test starts {int(test[0])})")
+        if int(test[-1]) >= n_rows:
+            raise ValueError(f"fold {fold}: test window ends at row {int(test[-1])} but the data has {n_rows} rows")
+        if int(train[-1]) >= int(test[0]):
+            raise ValueError(
+                f"fold {fold}: the train window (rows {int(train[0])}..{int(train[-1])}) must end before the test window "
+                f"starts (row {int(test[0])})"
+            )
+        if int(test[0]) <= previous_test_end:
+            raise ValueError(
+                f"fold {fold}: the test window starts at row {int(test[0])}, but the previous fold's test window already "
+                f"covers up to row {previous_test_end} -- run_walk_forward_analysis() stitches the folds' OOS returns into "
+                "one path, which needs test windows in time order that share no bar (use walk_forward_splits() with "
+                "step == test_window, or evaluate overlapping folds one at a time)"
+            )
+        previous_test_end = int(test[-1])
+
+
 def run_walk_forward_analysis(
     config: BacktestConfig,
     records: list[NormalizedOhlcvRecord],
@@ -111,8 +146,11 @@ def run_walk_forward_analysis(
     fold) but its direction is not known in advance and must not be described as conservative.
 
     Raises:
-        ValueError: param_grid or splits is empty, or a split's train/test indices are not
-            contiguous (see module docstring).
+        ValueError: param_grid or splits is empty, a split's train/test indices are not
+            contiguous (see module docstring), or the folds cannot be stitched into one path
+            (a test window overlaps or precedes the previous one, a train window does not end
+            before its test window, an index is negative or past the data -- see
+            ``_require_stitchable()``).
     """
     if not param_grid:
         raise ValueError("param_grid 不能为空")
@@ -120,6 +158,7 @@ def run_walk_forward_analysis(
         raise ValueError("splits 不能为空")
 
     df = records_to_dataframe(records)
+    _require_stitchable(splits, len(df))
     annualization_factor = resolve_annualization_factor(config, records)
 
     # SAFE-05：每组候选参数先在全量数据上做一次因果核验；各 fold 的训练/合并窗口都是这份数据的

@@ -250,8 +250,11 @@ ceremony. Much of L4 §10's ABI surface is already ported into
 implemented and unit-tested, but nothing calls that `SubmitPort` against the exchange: every
 harness that reaches `orchestrate_submit()` injects a mock, and the one testnet-only cold-start
 harness (`live_submit_preflight_harness.cpp`;
-owner-supplied `.env`) assembles the real one without ever calling it. No real testnet or
-production credentials have ever been used against this code.
+owner-supplied `.env`) assembles the real one without ever calling it. That harness has run
+once against the real Testnet, on the owner's own Testnet key (2026-11-07: account and
+exchangeInfo reads, the signed private user-data stream, a reconcile sweep; mock submit port, no
+order). No order has ever been submitted to any Binance environment, and no production
+credential has ever been used against this code.
 
 **What remains true regardless of any file in this repo:** nobody but the account owner can
 create a real Binance API key, decide to risk real money, or do the physical/legal things

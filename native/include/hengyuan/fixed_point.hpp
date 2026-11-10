@@ -56,6 +56,19 @@ inline bool safe_add_i64(std::int64_t a, std::int64_t b, std::int64_t& out) noex
     return true;
 }
 
+// Overflow-checked signed subtraction, a - b. Returns false (leaving out untouched) when the
+// result would not fit int64. Written out rather than as safe_add_i64(a, -b): -b is itself
+// signed-overflow UB for b == INT64_MIN.
+inline bool safe_sub_i64(std::int64_t a, std::int64_t b, std::int64_t& out) noexcept {
+    if (b >= 0) {
+        if (a < std::numeric_limits<std::int64_t>::min() + b) return false;
+    } else {
+        if (a > std::numeric_limits<std::int64_t>::max() + b) return false;
+    }
+    out = a - b;
+    return true;
+}
+
 // Overflow-checked signed multiply. Returns false (and leaves out untouched)
 // when a*b would overflow int64. Checks BEFORE multiplying to avoid signed UB.
 inline bool safe_mul_i64(std::int64_t a, std::int64_t b, std::int64_t& out) noexcept {
