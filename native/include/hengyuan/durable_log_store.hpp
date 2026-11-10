@@ -62,7 +62,8 @@ namespace hy {
 // note), the log grows without limit in normal operation, which makes that
 // reachable by ordinary use rather than only by corruption.
 //
-// 1 GiB is roughly 4.2 million OrderEvent frames (255 bytes each). It is a
+// 1 GiB is roughly 4.2 million OrderEvent frames (256 bytes each: kOrderEventFrameSize,
+// durable_frame_codec.hpp; test_durable_audit_sink.cpp pins it). It is a
 // diagnostic tripwire, not a design capacity: a log approaching it means
 // compaction is genuinely needed, and failing closed with IoError says so, where
 // terminate() said nothing at all.
@@ -82,7 +83,35 @@ inline bool try_resize(std::vector<std::byte>& v, std::size_t n) noexcept {
     }
 }
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+// Reads exactly `n` bytes from the handle's current position, or fails: an error, or the end of the file before `n`
+// bytes (a short read here means the file is not the size it was just measured to be). ReadFile takes a DWORD
+// length and may return fewer bytes than asked for, so this loops -- the same contract the POSIX read_whole_log() /
+// read_tip_anchor() already give with their read() loops, and read_chunk() below gives on this platform (audit
+// IO-READCHUNK-036). Audit F-B-008: read_whole_log() and read_tip_anchor() each made ONE ReadFile call and compared
+// the count; that failed closed on a short read, but turned a legal short read into a recovery failure.
+inline bool read_exact(HANDLE h, std::byte* dst, std::size_t n) noexcept {
+    std::size_t total = 0;
+    while (total < n) {
+        const std::size_t left = n - total;
+        const DWORD chunk = left > 0x40000000u ? DWORD{0x40000000u} : static_cast<DWORD>(left);  // 1 GiB per call: well inside a DWORD
+        DWORD read_bytes = 0;
+        if (!ReadFile(h, dst + total, chunk, &read_bytes, nullptr)) return false;
+        if (read_bytes == 0) return false;  // end of file before `n` bytes
+        total += static_cast<std::size_t>(read_bytes);
+    }
+    return true;
+}
+
+// Positions the handle with SetFilePointerEx. The legacy SetFilePointer reports failure as INVALID_SET_FILE_POINTER
+// (0xFFFFFFFF) in its 32-bit return value, which is also a legitimate position (4 GiB - 1) when the high word is not
+// passed -- an error code that is a valid answer. The Ex form returns a real success flag (audit F-B-009).
+inline bool seek_to(HANDLE h, std::int64_t offset, DWORD method) noexcept {
+    LARGE_INTEGER pos{};
+    pos.QuadPart = offset;
+    return SetFilePointerEx(h, pos, nullptr, method) != 0;
+}
+#else
 // AUDIT IO-EINTR-021: read/write/fsync/pread can all return -1/EINTR when a signal
 // is delivered without SA_RESTART, and every one of them here treated that as a
 // hard failure. In this codebase a "hard failure" on the append path permanently
@@ -204,14 +233,12 @@ public:
         if (static_cast<std::uint64_t>(size.QuadPart) > kMaxDurableLogBytes) return false;
         if (!detail::try_resize(out, static_cast<std::size_t>(size.QuadPart))) return false;
         if (out.empty()) return true;
-        if (SetFilePointer(log_handle_, 0, nullptr, FILE_BEGIN) == INVALID_SET_FILE_POINTER) return false;
-        DWORD read_bytes = 0;
-        BOOL ok = ReadFile(log_handle_, out.data(), static_cast<DWORD>(out.size()), &read_bytes, nullptr);
-        return ok && static_cast<std::size_t>(read_bytes) == out.size();
+        if (!detail::seek_to(log_handle_, 0, FILE_BEGIN)) return false;
+        return detail::read_exact(log_handle_, out.data(), out.size());
     }
     bool append_and_fsync(std::span<const std::byte> bytes) noexcept {
         last_write_status_ = IoWriteStatus::Ok;
-        if (SetFilePointer(log_handle_, 0, nullptr, FILE_END) == INVALID_SET_FILE_POINTER) {
+        if (!detail::seek_to(log_handle_, 0, FILE_END)) {
             record_write_failure();
             return false;
         }
@@ -360,12 +387,7 @@ public:
             CloseHandle(h);
             return false;
         }
-        bool ok = true;
-        if (!out.empty()) {
-            DWORD read_bytes = 0;
-            ok = ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &read_bytes, nullptr) &&
-                 static_cast<std::size_t>(read_bytes) == out.size();
-        }
+        const bool ok = out.empty() || detail::read_exact(h, out.data(), out.size());
         CloseHandle(h);
         return ok;
     }

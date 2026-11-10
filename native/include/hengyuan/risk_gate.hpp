@@ -109,11 +109,15 @@ public:
     const RiskLimits& limits() const noexcept { return limits_; }
 
 private:
+    // Reducing = the opposite side of the open position AND no more than the position holds. The direction alone is not enough
+    // (audit F-A-007): an order for more than the position flattens it and opens the OTHER side with the excess, which is the
+    // opening of exposure that ARMED exists to stop. The magnitude is taken in the unsigned domain, where |INT64_MIN| is
+    // representable; check() has already refused qty_lots <= 0, so the cast of the quantity cannot wrap.
     static bool is_reducing_position(const ExecutionIntent& intent,
                                      std::int64_t current_net) noexcept {
-        if (current_net > 0 && intent.side == OrderSide::Sell) return true;
-        if (current_net < 0 && intent.side == OrderSide::Buy) return true;
-        return false;
+        const bool opposite = (current_net > 0 && intent.side == OrderSide::Sell) ||
+                              (current_net < 0 && intent.side == OrderSide::Buy);
+        return opposite && static_cast<std::uint64_t>(intent.qty_lots) <= abs_magnitude_u64(current_net);
     }
 
     RiskLimits limits_;

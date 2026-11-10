@@ -110,10 +110,13 @@ inline bool derive_scale_from_decimal_string(std::string_view s, std::uint8_t& o
 //     truncating that excess precision and reporting a smaller number than the field actually
 //     specifies.
 //
-// `scale` itself must be in [0,18] (rescale_notional_ceil()'s own valid domain, account_truth.hpp)
-// — pow10_i64() fails closed beyond that range, which this function fails through as `false`.
+// `scale` itself must be in [0,18] (rescale_notional_ceil()'s own valid domain, account_truth.hpp).
+// It is checked FIRST, before any digit is read: the fractional accumulator below holds at most `scale`
+// digits, which fits an int64 only up to 18, so a larger scale used to let it run past INT64_MAX
+// (signed-overflow UB, reported by UBSan) before pow10_i64() refused the scale much further down.
 inline bool parse_decimal_to_ticks_with_scale(std::string_view s, std::uint8_t scale,
                                                std::int64_t& out_ticks) noexcept {
+    if (scale > 18) return false;
     if (s.empty()) return false;
     if (s[0] == '-') return false;  // price/qty ticks are never negative
 

@@ -10,13 +10,19 @@
   triggers from doing the work twice. pythonw has no console window: everything the run knows is in
   <Ops>\logs (latest.txt, status.json, maint-*.log) and in the task's last result (0 ok, 1 WARN, 2 CRIT).
 
+  -TimeLimitHours is the task's ExecutionTimeLimit: Task Scheduler stops the run when it is reached. A full run (pull
+  plus verify of the whole lake) took about 4.2 h on the owner's PC in November 2026, so the original 3 h limit killed
+  it mid-pull and left unregistered segments behind; the task has run with 10 h since 2026-11-02, and that is the
+  default here so that re-registering the task does not silently bring the old limit back (audit F-D-005).
+
   Remove with:  Unregister-ScheduledTask -TaskName HengYuan-D0-Maintenance -Confirm:$false
   See recorder/MAINTENANCE.md for the layout and what to do with each finding.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Ops,
     [string]$At = '06:00',
-    [string]$TaskName = 'HengYuan-D0-Maintenance'
+    [string]$TaskName = 'HengYuan-D0-Maintenance',
+    [ValidateRange(1, 72)][int]$TimeLimitHours = 10
 )
 $ErrorActionPreference = 'Stop'
 
@@ -34,7 +40,7 @@ $daily = New-ScheduledTaskTrigger -Daily -At $At
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $user
 $logon.Delay = 'PT5M'
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 3) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    -ExecutionTimeLimit (New-TimeSpan -Hours $TimeLimitHours) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($daily, $logon) -Settings $settings `

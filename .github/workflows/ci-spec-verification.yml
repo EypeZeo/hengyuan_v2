@@ -163,6 +163,39 @@ jobs:
       - name: Diff spec enum definitions against the real headers
         run: python tools/spec_enum_diff.py
 
+  # Two cheap, offline consistency checks that used to run only by hand (audit F-D-006). They read files from all over
+  # the tree -- native/CMakeLists.txt and the sanitizer workflow for the first, every code:/test:/doc: reference of
+  # docs/AUDIT_CLOSURE_LEDGER.md for the second -- so no path list could say when they are due; they run on every pull
+  # request instead (a few seconds each), and `gate` below requires them unconditionally. A change that renames a
+  # symbol the ledger cites, or adds a concurrency-labelled test target the sanitizer jobs do not build, now fails
+  # the pull request that makes it instead of being found weeks later.
+  repo-consistency:
+    name: "L2: sanitizer target lists and closure ledger"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      # Every `LABELS concurrency` target of native/CMakeLists.txt must be named in the TSan and ARM64 jobs'
+      # explicit --target lists of ci-native-sanitizers.yml (or be exempt there with a written reason): a target
+      # missing from the list is never built, so `ctest -L concurrency` silently never runs it. Seven tests went
+      # unobserved by TSan that way until 2026-10-08. The self-test runs the negative control of every rule.
+      - name: Every concurrency-labelled test target is built by the sanitizer jobs
+        run: |
+          python tools/concurrency_targets_check.py
+          python tools/concurrency_targets_check.py --self-test
+
+      # The closure ledger against the working tree and the blueprint (offline: --online needs the GitHub API).
+      # Exit 1 = a cited symbol/test/doc is gone or moved, or a status word does not follow from its evidence.
+      - name: Closure ledger is consistent with the repository and the blueprint
+        run: python tools/closure_ledger_check.py
+
   tla-model-check-all:
     name: "L3: TLA+ model checking (all models)"
     needs: changes
@@ -682,7 +715,7 @@ jobs:
   # fails it.
   gate:
     name: "spec: gate"
-    needs: [changes, spec-invariant-xref, tla-model-check-all]
+    needs: [changes, spec-invariant-xref, tla-model-check-all, repo-consistency]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -693,10 +726,13 @@ jobs:
           RUN: ${{ needs.changes.outputs.run }}
           XREF: ${{ needs.spec-invariant-xref.result }}
           TLA: ${{ needs.tla-model-check-all.result }}
+          CONSISTENCY: ${{ needs.repo-consistency.result }}
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
           [ "$CHANGES" = "success" ] || fail "the changes job ended as '$CHANGES', not 'success'"
+          # repo-consistency has no path decision (it reads the whole tree): it must always have succeeded.
+          [ "$CONSISTENCY" = "success" ] || fail "repo-consistency ended as '$CONSISTENCY', expected 'success'"
           case "$RUN" in
             true)  want=success ;;
             false) want=skipped ;;

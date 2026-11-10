@@ -42,6 +42,16 @@
 // regression risk beyond this file's scope. Documented here so this stays an
 // honestly "minimal" PositionTruth rather than one that quietly implies more
 // completeness than it has.
+//
+// What softens it (audit F-C-001, checked against the code): drain_reconcile_events() and the
+// other fill sources do not apply the tracker's own delta when an OrderFillContext is wired --
+// they call consume_delta() with the CUMULATIVE fill against the SHARED baseline, so a
+// growth the same-state branch swallowed is added back by the order's next report (a state
+// change, a terminal answer, or a user-data execution report, each of which carries the
+// cumulative quantity). Between the growth and that report this class is behind by the
+// swallowed amount, and the durable log has no frame for it; without a wired fill_context
+// (the sink-less demos) the amount is lost for good. Nothing reads net_qty_ticks() to decide
+// anything today.
 
 #pragma once
 

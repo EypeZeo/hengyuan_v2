@@ -83,6 +83,37 @@ TEST(FixedPoint, AbsI64AtInt64MinIsDefinedNotUB) {
     EXPECT_EQ(r, std::numeric_limits<std::int64_t>::min());  // defined, still not "correct"
 }
 
+TEST(FixedPoint, SafeSubI64Boundaries) {
+    constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+    std::int64_t out = 0;
+
+    EXPECT_TRUE(hy::safe_sub_i64(5, 3, out));
+    EXPECT_EQ(out, 2);
+    EXPECT_TRUE(hy::safe_sub_i64(3, 5, out));
+    EXPECT_EQ(out, -2);
+    EXPECT_TRUE(hy::safe_sub_i64(kMax, 0, out));
+    EXPECT_EQ(out, kMax);
+    EXPECT_TRUE(hy::safe_sub_i64(kMin, 0, out));
+    EXPECT_EQ(out, kMin);
+    EXPECT_TRUE(hy::safe_sub_i64(kMin + 1, 1, out));
+    EXPECT_EQ(out, kMin);
+    EXPECT_TRUE(hy::safe_sub_i64(kMax - 1, -1, out));
+    EXPECT_EQ(out, kMax);
+    EXPECT_TRUE(hy::safe_sub_i64(-1, kMin, out)) << "-1 - INT64_MIN = INT64_MAX: representable, though -INT64_MIN is not";
+    EXPECT_EQ(out, kMax);
+    EXPECT_TRUE(hy::safe_sub_i64(kMin, kMin, out));
+    EXPECT_EQ(out, 0);
+
+    out = 12345;  // a refused subtraction leaves the output alone
+    EXPECT_FALSE(hy::safe_sub_i64(kMin, 1, out));
+    EXPECT_FALSE(hy::safe_sub_i64(kMax, -1, out));
+    EXPECT_FALSE(hy::safe_sub_i64(0, kMin, out));
+    EXPECT_FALSE(hy::safe_sub_i64(kMax, kMin, out));
+    EXPECT_FALSE(hy::safe_sub_i64(kMin, kMax, out));
+    EXPECT_EQ(out, 12345);
+}
+
 TEST(FixedPoint, SafeAddI64Boundaries) {
     constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
     constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -34,13 +35,20 @@ class BacktestConfig:
     output_label: str = BACKTEST_ESTIMATES_LABEL
 
     def __post_init__(self) -> None:
-        if self.initial_capital <= 0:
-            raise ValueError(f"initial_capital 必须为正数，当前值: {self.initial_capital}")
-        if self.fee_bps < 0 or self.fee_bps > 500:
-            raise ValueError(f"fee_bps 必须在 [0, 500] 范围内，当前值: {self.fee_bps}")
-        if self.slippage_bps < 0 or self.slippage_bps > 500:
-            raise ValueError(f"slippage_bps 必须在 [0, 500] 范围内，当前值: {self.slippage_bps}")
-        if self.annualization_factor is not None and self.annualization_factor <= 0:
+        # 每个数值字段先判有限，再判范围：NaN 与所有比较都为 False，``nan <= 0`` / ``nan < 0 or nan > 500``
+        # 都不会触发下面的范围检查，会让 NaN 配置原样通过并污染整条净值曲线（审计 F-A-005）；``inf`` 则能通过
+        # ``<= 0`` 的下限检查。
+        if not math.isfinite(self.initial_capital) or self.initial_capital <= 0:
+            raise ValueError(f"initial_capital 必须为正数（且为有限值），当前值: {self.initial_capital}")
+        if not math.isfinite(self.fee_bps) or self.fee_bps < 0 or self.fee_bps > 500:
+            raise ValueError(f"fee_bps 必须在 [0, 500] 范围内（且为有限值），当前值: {self.fee_bps}")
+        if not math.isfinite(self.slippage_bps) or self.slippage_bps < 0 or self.slippage_bps > 500:
+            raise ValueError(f"slippage_bps 必须在 [0, 500] 范围内（且为有限值），当前值: {self.slippage_bps}")
+        if not math.isfinite(self.risk_free_rate):
+            raise ValueError(f"risk_free_rate 必须为有限值，当前值: {self.risk_free_rate}")
+        if self.annualization_factor is not None and (
+            not math.isfinite(self.annualization_factor) or self.annualization_factor <= 0
+        ):
             raise ValueError(
                 f"annualization_factor 必须为正数（或 None 表示自动推导），"
                 f"当前值: {self.annualization_factor}"
@@ -95,10 +103,21 @@ class ValidationReport:
     causal_check: str = "not_run"
     causal_points: int = 0
     causal_context: dict[str, Any] = field(default_factory=dict)
+    # 审计 F-A-005：数值域检查。默认 True 让既有的直接构造保持可用；validate_inputs() 会如实填写。
+    # prices_finite_positive：执行价格列（open，回测按它成交）与 high/low/close 全为有限正数。
+    # signals_finite：信号里没有 ±inf（NaN 是文档化的“无信号 = 空仓”，仍按 0 处理，不算问题）。
+    prices_finite_positive: bool = True
+    signals_finite: bool = True
 
     @property
     def is_valid(self) -> bool:
-        return self.timestamp_monotonic and self.no_nan_close and self.no_future_shift_detected
+        return (
+            self.timestamp_monotonic
+            and self.no_nan_close
+            and self.no_future_shift_detected
+            and self.prices_finite_positive
+            and self.signals_finite
+        )
 
 
 @dataclass
