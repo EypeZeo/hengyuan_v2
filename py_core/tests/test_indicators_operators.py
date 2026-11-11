@@ -87,6 +87,74 @@ def test_ema_all_nan_input_stays_all_nan() -> None:
     assert result.isna().all()
 
 
+# Audit F-A-009. A NaN in the MIDDLE of a stream (a ``div`` by zero upstream is enough) used to make ema() recurse through its own previous
+# NaN and stay NaN for ever, while the native step_ema kept its state and carried on: the two sides then disagreed on every bar after the
+# gap. Both now behave the way the native side always did, and native/tests/test_strategy_spec_operators.cpp pins the SAME sequences.
+
+
+def test_ema_mid_stream_nan_costs_that_bar_only() -> None:
+    result = op.ema(_series([1.0, 2.0, np.nan, 4.0, 5.0]), 2)  # alpha = 2/3
+    assert np.isnan(result.iloc[0]) and np.isnan(result.iloc[2])
+    assert result.iloc[1] == pytest.approx(1.5)
+    assert result.iloc[3] == pytest.approx(2.0 / 3.0 * 4.0 + 1.0 / 3.0 * 1.5)  # 3.1666666667: the recursion resumed from 1.5
+    assert result.iloc[4] == pytest.approx(2.0 / 3.0 * 5.0 + 1.0 / 3.0 * result.iloc[3])  # 4.3888888889
+
+
+def test_ema_nan_before_the_seed_is_complete_is_not_counted_in_the_seed() -> None:
+    result = op.ema(_series([1.0, np.nan, 3.0, 5.0]), 2)
+    assert result.iloc[:2].isna().all()
+    assert result.iloc[2] == pytest.approx(2.0)  # mean of the first two NON-NaN values, 1 and 3
+    assert result.iloc[3] == pytest.approx(2.0 / 3.0 * 5.0 + 1.0 / 3.0 * 2.0)  # 4.0
+
+
+def test_ema_a_nan_never_counts_towards_a_longer_seed() -> None:
+    # With window 2 a NaN wrongly COUNTED as a seed observation happens to give the same seed; with window 3 the seed would complete a value early.
+    result = op.ema(_series([1.0, np.nan, 2.0, 3.0, 4.0]), 3)  # alpha = 0.5
+    assert result.iloc[:3].isna().all()  # at index 2 only two non-NaN values have arrived
+    assert result.iloc[3] == pytest.approx(2.0)  # the mean of 1, 2 and 3
+    assert result.iloc[4] == pytest.approx(0.5 * 4.0 + 0.5 * 2.0)  # 3.0
+
+
+def test_ema_trailing_and_repeated_nans() -> None:
+    result = op.ema(_series([2.0, 4.0, np.nan, np.nan, 6.0, np.nan]), 2)
+    assert np.isnan(result.iloc[0])
+    assert result.iloc[1] == pytest.approx(3.0)
+    assert result.iloc[2:4].isna().all()
+    assert result.iloc[4] == pytest.approx(2.0 / 3.0 * 6.0 + 1.0 / 3.0 * 3.0)  # 5.0: state held over a two-bar gap
+    assert np.isnan(result.iloc[5])
+
+
+def test_ema_window_one_is_the_input_itself_with_nan_where_the_input_is_nan() -> None:
+    result = op.ema(_series([5.0, np.nan, 7.0]), 1)  # alpha = 1
+    assert result.iloc[0] == pytest.approx(5.0) and np.isnan(result.iloc[1]) and result.iloc[2] == pytest.approx(7.0)
+
+
+def _legacy_ema(x: pd.Series, window: int) -> pd.Series:
+    """The previous implementation, kept ONLY as the reference for input whose NaNs are a leading prefix."""
+    values = x.to_numpy(dtype=np.float64)
+    result = np.full(len(values), np.nan)
+    start = int(np.argmax(~np.isnan(values))) if (~np.isnan(values)).any() else len(values)
+    seed_position = start + window - 1
+    if seed_position >= len(values):
+        return pd.Series(result, index=x.index)
+    alpha = 2.0 / (window + 1)
+    result[seed_position] = float(np.mean(values[start : start + window]))
+    for i in range(seed_position + 1, len(values)):
+        result[i] = alpha * values[i] + (1.0 - alpha) * result[i - 1]
+    return pd.Series(result, index=x.index)
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_ema_is_bit_identical_to_the_previous_result_when_nans_are_only_a_prefix(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    n = int(rng.integers(5, 60))
+    values = rng.normal(100.0, 5.0, n)
+    values[: int(rng.integers(0, 4))] = np.nan  # a leading NaN run only
+    for window in (1, 2, 3, 7, 12):
+        x = pd.Series(values, index=pd.RangeIndex(n))
+        np.testing.assert_array_equal(op.ema(x, window).to_numpy(), _legacy_ema(x, window).to_numpy())
+
+
 # ---------------------------------------------------------------------------
 # stddev
 # ---------------------------------------------------------------------------
