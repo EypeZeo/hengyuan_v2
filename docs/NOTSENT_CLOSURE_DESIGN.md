@@ -53,7 +53,7 @@
 ### 4.3 NotSent 何时写、写什么
 
 - 写者：只有**取得 `Rejecting` 的那个进程实例**（类 B），或经过类 A 拒绝路径的实例。**恢复不得为 `Prepared` 之后没有终局帧的订单写 NotSent**——那是 `Ambiguous`，交给对账（模型的 `RecoveryNeverClosesPrepared` 开关）。
-- 内容：`AuditRecord`，新事件类型、`resulting_state` = 新终态、COID、价格数量原样、成交为 0、`side` 保持；**拒绝原因放 `detail_code`**（不放 `detail_msg`，不占用其它字段）。原因集合（至少）：类 A —— 确认缺失、确认不符、端口无效、在途表不可用、限流耗尽、重复在途；类 B —— 就绪纪元变化、屏障未处于签发代次的 `Reconciled`、订阅失效或收到 `serverShutdown`、熔断锁存、时钟令牌过期、授权截止、槽位或代次不符、预留丢失。类 A / 类 B 由前驱帧区分，不另设字段。
+- 内容：`AuditRecord`，新事件类型、`resulting_state` = 新终态、COID、价格数量原样、成交为 0、`side` 保持；**拒绝原因放 `detail_code`**（不放 `detail_msg`，不占用其它字段）。原因集合（至少）：类 A —— 确认缺失、确认不符、端口无效、在途表不可用、限流耗尽、重复在途；类 B —— 就绪纪元变化、屏障未处于签发代次的 `Reconciled`、订阅失效或收到 `serverShutdown`、熔断锁存、时钟令牌过期、授权截止、槽位或代次不符、预留丢失（R-25 的范围批准另增一个：范围不再存活——撤销、被替换、过期、熔断终结，见 `docs/SCOPE_APPROVAL_DESIGN.md` §6）。类 A / 类 B 由前驱帧区分，不另设字段。
 - 一个 COID 至多一个 NotSent 帧，且是它的最后一帧。
 
 ### 4.4 释放
