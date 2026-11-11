@@ -74,6 +74,13 @@ struct FakeDurableAudit {
     bool outcome_should_fail{false};
     std::uint64_t next_sequence{0};
     bool is_fenced{false};
+    // Every frame the port acknowledged, in order (TB-1): the states they claim and their event types, so a test can replay the
+    // sequence against validate_transition() the way the recovery scan will. Fixed storage, NOT vectors: this runs inside
+    // orchestrate_submit(), and the allocation-probe tests there count every operator new, the test double's included.
+    static constexpr std::size_t kMaxFrames = 64;
+    std::array<OrderState, kMaxFrames> frame_states{};
+    std::array<AuditEventType, kMaxFrames> frame_events{};
+    std::size_t frame_count{0};
 };
 
 static AuditAppendResult fake_durable_append(void* user_data, const AuditRecord& rec, std::int64_t) noexcept {
@@ -88,6 +95,11 @@ static AuditAppendResult fake_durable_append(void* user_data, const AuditRecord&
         f->is_fenced = true;
         r.status = AuditAppendResult::Status::Failed;
         return r;
+    }
+    if (f->frame_count < FakeDurableAudit::kMaxFrames) {
+        f->frame_states[f->frame_count] = rec.resulting_state;
+        f->frame_events[f->frame_count] = rec.event_type;
+        ++f->frame_count;
     }
     r.status = AuditAppendResult::Status::Acked;
     r.sequence = f->next_sequence++;
@@ -1511,6 +1523,116 @@ TEST_F(LiveSubmitOutcomeAckTest, AnOrderStuckInSubmittingIsNeverSubmittedAgain) 
     EXPECT_EQ(in_flight_.count(), 1u);
 }
 
+// --- TB-1 / audit F-A-012, L-54: a reply that CLAIMS Accepted but names a state no new order can be in ---
+//
+// Three states are legal first steps for an order the exchange has taken: Accepted, PartialFill, Filled. A SubmitPort that answers
+// outcome Accepted with any other state -- the real one cannot any more (parse_submit_order_response() refuses it), but this function
+// decides what frame to write, so it must not trust that -- used to have it written as the order's next durable frame: for
+// EXPIRED_IN_MATCH (self-trade prevention) a Submitting -> Expired frame, an edge validate_transition() does not have, which the
+// next start's recovery scan answers for the WHOLE log with Corrupt; and for a final state the in-flight slot was released too. The
+// reply is now an unknown result like any other the port could not vouch for: an Ambiguous frame, the slot held, the order handed
+// to the reconcile loop, no fill folded into anything.
+
+class LiveSubmitUnusableReplyTest : public LiveSubmitReconcileTest {
+protected:
+    PositionTruth truth_;
+    OrderFillContext fill_context_;
+    std::uint32_t sequence_{100};  // OrchestratorContext::sequence is 32 bits
+
+    void SetUp() override {
+        LiveSubmitReconcileTest::SetUp();
+        ctx_.position_truth = &truth_;
+        ctx_.fill_context = &fill_context_;
+    }
+
+    // One submit whose reply claims Accepted but carries `state` (and `filled` executed ticks).
+    OrchestratorResult submit_with_reply(OrderState state, std::int64_t filled) {
+        g_mock_response = SubmitResponse{};
+        g_mock_response.outcome = SubmitOutcome::Accepted;
+        g_mock_response.exchange_order_id = 4242;
+        g_mock_response.exchange_status = state;
+        g_mock_response.filled_qty_ticks = filled;
+        g_mock_response.avg_fill_price_ticks = filled > 0 ? 1000 : 0;
+        ctx_.sequence = ++sequence_;
+        return orchestrate_submit(ctx_);
+    }
+};
+
+TEST_F(LiveSubmitUnusableReplyTest, AReplyThatNamesAStateNoNewOrderCanBeInIsAnUnknownResultNotADurableFrame) {
+    const OrderState kBad[] = {OrderState::Intent,        OrderState::Submitting, OrderState::Rejected,
+                               OrderState::CancelRequested, OrderState::Cancelled,  OrderState::Expired,
+                               OrderState::Reconciled,    OrderState::EscalatedToOperator};
+    for (const OrderState bad : kBad) {
+        SCOPED_TRACE(std::string("reply state: ") + order_state_name(bad));
+        const std::size_t frames_before = fake_durable_audit_.frame_count;
+
+        const OrchestratorResult r = submit_with_reply(bad, /*filled=*/0);
+
+        EXPECT_EQ(r.gate, OrchestratorGate::SubmitNetworkError) << "an unknown result, not a result";
+        EXPECT_EQ(r.order.state, OrderState::Ambiguous);
+        EXPECT_EQ(r.order.exchange_order_id, 0) << "nothing of the reply is written back";
+        EXPECT_TRUE(in_flight_.is_in_flight(r.order.client_order_id.view())) << "even for a final state the slot stays held: the order may be resting";
+
+        // The durable frames this submit made: Intent, Prepared (Submitting), then ONE outcome frame -- Ambiguous. Replayed the way the
+        // recovery scan will replay them, every step is a legal edge.
+        ASSERT_EQ(fake_durable_audit_.frame_count, frames_before + 3u);
+        const OrderState* frames = &fake_durable_audit_.frame_states[frames_before];
+        EXPECT_EQ(frames[0], OrderState::Intent);
+        EXPECT_EQ(frames[1], OrderState::Submitting);
+        EXPECT_EQ(frames[2], OrderState::Ambiguous);
+        EXPECT_EQ(validate_transition(frames[0], frames[1]), TransitionResult::Ok);
+        EXPECT_EQ(validate_transition(frames[1], frames[2]), TransitionResult::Ok);
+        EXPECT_EQ(fake_durable_audit_.frame_events[fake_durable_audit_.frame_count - 1], AuditEventType::OrderAmbiguous);
+
+        // Handed to the reconcile loop, which asks the exchange (its answer takes the legal edges out of Ambiguous).
+        ReconcileIngress in{};
+        ASSERT_TRUE(to_reconcile_.try_pop(in));
+        EXPECT_EQ(in.record.client_order_id.view(), r.order.client_order_id.view());
+        EXPECT_EQ(in.record.state, OrderState::Ambiguous);
+
+        EXPECT_EQ(truth_.net_qty_ticks(ctx_.symbol_id), 0) << "no fill reaches PositionTruth";
+        EXPECT_EQ(truth_.tracked_symbol_count(), 0u);
+
+        // The audit ring says why, and has no Accepted / Filled record for the order.
+        bool found_ambiguous = false;
+        for (std::size_t i = 0; i < audit_.count(); ++i) {
+            const AuditRecord* ar = audit_.at(i);
+            ASSERT_NE(ar, nullptr);
+            if (std::string_view(ar->client_order_id) != r.order.client_order_id.view()) continue;
+            EXPECT_NE(ar->event_type, AuditEventType::OrderAccepted);
+            EXPECT_NE(ar->event_type, AuditEventType::OrderPartialFill);
+            EXPECT_NE(ar->event_type, AuditEventType::OrderFilled);
+            if (ar->event_type == AuditEventType::OrderAmbiguous) {
+                found_ambiguous = true;
+                EXPECT_NE(std::string_view(ar->detail_msg).find("no new order can be in"), std::string_view::npos);
+            }
+        }
+        EXPECT_TRUE(found_ambiguous);
+    }
+}
+
+TEST_F(LiveSubmitUnusableReplyTest, AnUnusableReplyKeepsItsFillOutOfEverythingEvenWhenItCarriesOne) {
+    // CANCELED after a partial match, say: the quantity is real exchange data, but the state is not one the first reply can have.
+    const OrchestratorResult r = submit_with_reply(OrderState::Cancelled, /*filled=*/4);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitNetworkError);
+    EXPECT_EQ(r.order.filled_qty_ticks, 0);
+    EXPECT_EQ(truth_.net_qty_ticks(ctx_.symbol_id), 0);
+    EXPECT_EQ(fill_context_.find(r.order.client_order_id.view())->shadow.state, OrderState::Ambiguous);
+    EXPECT_EQ(fill_context_.find(r.order.client_order_id.view())->shadow.filled_qty_ticks, 0)
+        << "the shadow of what the log holds: Ambiguous, nothing filled -- exactly the frames above";
+}
+
+TEST_F(LiveSubmitUnusableReplyTest, TheThreeUsableRepliesAreUnchanged) {
+    // The positive controls: this guard must not turn a real result into an unknown one.
+    EXPECT_EQ(submit_with_reply(OrderState::Accepted, 0).gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(submit_with_reply(OrderState::PartialFill, 4).gate, OrchestratorGate::SubmitPartialFill);
+    EXPECT_EQ(submit_with_reply(OrderState::Filled, static_cast<std::int64_t>(ctx_.qty_ticks)).gate, OrchestratorGate::SubmitFilled);
+    // ... and a reply with no status at all (every pre-1A.3 mock) is still Accepted.
+    g_mock_response = SubmitResponse{SubmitOutcome::Accepted, 12345, 0};
+    ctx_.sequence = ++sequence_;
+    EXPECT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::SubmitAccepted);
+}
+
 // --- Phase 3: real-file-I/O integration (durable persistence, not just gate
 // logic -- the fake port above covers gate logic; this proves the port
 // adapter wiring and the actual on-disk frame sequence are correct). ---
@@ -1598,6 +1720,32 @@ TEST_F(LiveSubmitDurableIntegrationTest, RejectedPathReleasesInFlightOnlyAfterRe
     EXPECT_EQ(restarted->recovery_status(), RecoveryScanStatus::Clean)
         << "Rejected is exchange-final -- nothing should need recovering";
     EXPECT_TRUE(restarted->recovered_checkpoints().empty());
+}
+
+// TB-1 / audit F-A-012, L-54, on a REAL log. The reply is what self-trade prevention gives the taker: outcome Accepted, state Expired
+// (EXPIRED_IN_MATCH). The old Accepted branch wrote it as the next frame -- Submitting -> Expired, an edge the state machine does not
+// have -- and the append side judges no transitions, so the damage showed only at the NEXT START, where run_recovery_scan() called
+// the whole log Corrupt and the process could not come up. Now the order is an unknown result: the log holds Intent, Prepared,
+// Ambiguous, and the next start recovers it as one open (Ambiguous) order.
+TEST_F(LiveSubmitDurableIntegrationTest, AnExpiredInMatchReplyLeavesALogTheNextStartCanRecoverFrom) {
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = SubmitOutcome::Accepted;
+    g_mock_response.exchange_order_id = 4242;
+    g_mock_response.exchange_status = OrderState::Expired;
+
+    const auto r = orchestrate_submit(ctx_);
+    ASSERT_EQ(r.gate, OrchestratorGate::SubmitNetworkError);
+    EXPECT_EQ(in_flight_.count(), 1u) << "the slot stays held: nothing proved the order is gone";
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    ASSERT_EQ(restarted->recovery_status(), RecoveryScanStatus::Recovered)
+        << "not Corrupt: the log holds only legal edges, and an Ambiguous order is an open checkpoint";
+    const auto cps = restarted->recovered_checkpoints();
+    ASSERT_EQ(cps.size(), 1u);
+    EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_STREQ(cps[0].client_order_id.id, r.order.client_order_id.id);
 }
 
 // --- SAFE-03 slice 1 on a REAL durable log: what the drain wrote must replay ---
