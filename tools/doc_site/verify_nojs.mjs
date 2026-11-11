@@ -41,7 +41,7 @@ try {
     `图解=${r.diagrams} 公式=${r.math}`);
   check("无 JS 时卡片与任务全部可见", r.cards === 26 && r.tasks === 62 && r.hiddenCards === 0,
     `${r.cards}/${r.tasks}/隐藏${r.hiddenCards}`);
-  check("无 JS 时故障表完整", r.fiRows === 57, String(r.fiRows));
+  check("无 JS 时故障表完整", r.fiRows === 58, String(r.fiRows));
   check("无 JS 时无 JS 才创建的残留空态", r.unused === 0, String(r.unused));
   check("无 JS 时悬浮层不可见", r.tipVisible === "hidden", r.tipVisible);
   check("无 JS 时回到顶部按钮不可见", r.topVisible === "0", r.topVisible);
