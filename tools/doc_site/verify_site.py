@@ -201,7 +201,7 @@ def main() -> int:
     hset = {(s["id"], s["status"], s["due"], s["anchor"]) for s in data["stations"]}
     check("D1 站点逐项一致", mset == hset,
           "Markdown %d / HTML %d / 差集 %s" % (len(mset), len(hset), sorted(mset ^ hset)[:3]))
-    check("D2 站点数量 26", len(stations) == 26, str(len(stations)))
+    check("D2 站点数量 27", len(stations) == 27, str(len(stations)))
     check("D3 图内站点节点齐备",
           all(page.count('data-station="%s"' % s["id"]) >= 2 for s in stations),
           "缺失：" + str([s["id"] for s in stations if page.count('data-station="%s"' % s["id"]) < 2][:4]))
@@ -213,12 +213,12 @@ def main() -> int:
     check("D6 任务清单逐项一致",
           {(t["id"], t["priority"], t["status"]) for t in tasks}
           == {(t["id"], t["priority"], t["status"]) for t in data["tasks"]})
-    check("D7 任务数量 62", len(tasks) == 62, str(len(tasks)))
+    check("D7 任务数量 71", len(tasks) == 71, str(len(tasks)))
     check("D8 任务卡片全部渲染", sum(page.count('class="task ') for _ in [0]) == len(tasks),
           "卡片 %d / 任务 %d" % (page.count('class="task '), len(tasks)))
     check("D9 站点卡片全部渲染", page.count('class="card c-') == len(stations),
           "卡片 %d / 站点 %d" % (page.count('class="card c-'), len(stations)))
-    check("D10 标注副本一致", len(annotations) == 29 and page.count("&lt;!--") == 29,
+    check("D10 标注副本一致", len(annotations) == 30 and page.count("&lt;!--") == 30,
           "Markdown %d / HTML %d" % (len(annotations), page.count("&lt;!--")))
 
     # 1.2 线路总览的类名与节点内联标记，必须与 1.3 明细表的状态列一致
