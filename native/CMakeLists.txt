@@ -457,6 +457,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_key_ring)
     gtest_discover_tests(test_key_ring)
 
+    # Audit F-B-002 / L-60: ScopedSecureWipe wipes on every way out of a scope, and every local key block in the durable sinks and in the audit export
+    # has one (a source scan: it reads the headers, so the native/ directory is a compile definition, same shape as the other guards).
+    add_executable(test_key_copy_wipe_guard tests/test_key_copy_wipe_guard.cpp)
+    target_link_libraries(test_key_copy_wipe_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_key_copy_wipe_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_key_copy_wipe_guard)
+    gtest_discover_tests(test_key_copy_wipe_guard)
+
     # Phase 1: DurableLogStore 共享平台 I/O 层 (L2, 真实文件 I/O -- 跨平台锁/
     # fsync/tip-anchor 原子替换/流式 read_chunk。DurableAuditSink 与
     # ControlPlaneLogSink 共用同一份实现，见 durable_log_store.hpp 头部注释)

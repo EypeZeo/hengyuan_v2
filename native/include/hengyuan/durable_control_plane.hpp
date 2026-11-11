@@ -2045,13 +2045,13 @@ public:
     // path) is meant to treat it as the fence, NOT as a reason to drop the tuple.
     //
     // That fence is NOT built (audit F-B-003). The one caller, DurableAuditSink::append_impl(),
-    // discards the answer -- a full ring drops the tuple and the local append goes on --
+    // only counts the answer (export_outbox_dropped()) -- a full ring drops the tuple and the local append goes on --
     // and export_worker.hpp says the same. docs/SPEC_INVARIANTS.md's Phase 5 entry
     // records it as a deliberate scope exclusion (the "back-pressure fence on the append
     // path") and forbids using the outbox as rollback- or hard-lag evidence until the start-up
     // rebuild and that fence exist. So today a ring that stays full while the exporter is
-    // blocked LOSES the newest tuples silently: the remote's last acknowledged tip then
-    // shows "no new tip", not "256 frames behind".
+    // blocked LOSES the newest tuples: the remote's last acknowledged tip then shows "no new tip",
+    // not "256 frames behind" -- the loss is no longer silent, only that counter shows it.
     bool try_push(const ExportTuple& t) noexcept {
         const std::size_t tail = tail_.value.load(std::memory_order_relaxed);
         const std::size_t head = head_.value.load(std::memory_order_acquire);

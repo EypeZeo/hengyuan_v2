@@ -3379,6 +3379,10 @@ AskUserQuestion 里已经明确排除的范围。被判定为"改动面明显超
   正确性，只是那条 tuple 的导出/baseline 记录可能重复或延后。**这个通道的输出不得被未来任何代码
   当作 rollback 检测或 hard-lag 判定的输入，除非启动重建和背压围栏先被建出来**——这是本轮对
   "best-effort telemetry, not a safety mechanism"这个定性的直接可执行约束，不是免责声明。
+  **满环丢弃不再是静默的**（审计 F-B-003，Owner 2026-11-10 定：保持 best-effort，不建围栏）：ring 已满时
+  `append_impl()` 仍照常落盘并返回 Acked，被拒的那条 tuple 记入 `DurableAuditSink::export_outbox_dropped()`
+  （普通计数器，由 append 线程读取，不是原子量）。计数只让丢失看得见，不改变上面那条约束：它依然不是
+  hard-lag 证据。
 - 不做 `OperatorOverrideSidecar` 真实实现 + 准入算法——需要离线 operator 工具 + 实时 `/time`
   探测，这两样都不存在，属于独立基础设施工作。
 - `ExternalAnchorUnavailable` 依然没有任何代码设置/检查它——设置它需要上面

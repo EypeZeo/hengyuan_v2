@@ -635,6 +635,7 @@ private:
         // Unknown/retired active_key_id is a correctable configuration
         // mistake, not corruption: Failed, but do NOT fence.
         std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
         if (!key_ring_.active_key(active_key_id_, key_block)) {
             result.status = AuditAppendResult::Status::Failed;
             return result;
@@ -704,7 +705,10 @@ private:
             t.key_id = active_key_id_;
             t.enqueued_utc_ms = now_ms;
             t.time_kind = static_cast<std::uint8_t>(FrameTimeKind::ServerCorrectedUtc);
-            (void)export_outbox_->try_push(t);
+            // A full ring refuses the tuple. That stays best-effort (SPEC_INVARIANTS Phase 5: the hard-lag fence is not built), but it is
+            // no longer SILENT: the count is how anyone learns that the remote's last acknowledged tip is behind for a reason other than
+            // "nothing new to export" (audit F-B-003).
+            if (!export_outbox_->try_push(t)) ++export_outbox_dropped_;
         }
 
         return result;
@@ -722,6 +726,12 @@ public:
     // while a worker may still be reading it -- this class holds a raw,
     // non-owning pointer and does no lifetime tracking of its own.
     void set_export_outbox(ExportOutboxRing* ring) noexcept { export_outbox_ = ring; }
+
+    // How many tip tuples a FULL export ring has refused since this sink was constructed. Best-effort export loses each of them for good -- the local
+    // append that produced it is durable regardless -- so a non-zero value means the remote's last acknowledged tip can lag the local log by more
+    // than the ring holds, which "no new tip" alone would not show. A plain counter: read it from the thread that appends (the ring's producer
+    // thread), like every other accessor of this class.
+    std::uint64_t export_outbox_dropped() const noexcept { return export_outbox_dropped_; }
 
     // Phase 4 (docs/SPEC_INVARIANTS.md): safely switches active_key_id_ to
     // new_key_id without a process restart. Caller must have already loaded
@@ -760,6 +770,7 @@ public:
         if (rotation_fenced_ || !rotation_log_open_) return false;
 
         std::array<std::byte, kKeyBlockSize> new_key_block{};
+        ScopedSecureWipe wipe_new_key_block(new_key_block);
         if (!key_ring_.active_key(new_key_id, new_key_block)) return false;  // "prepare" not done yet
         std::span<const std::byte> new_hmac_key(new_key_block.data(), new_key_block.size());
 
@@ -774,7 +785,6 @@ public:
                                                   rotation_tip_mac_, new_hmac_key);
         if (rn != kKeyRotatedFrameSize || !rotation_log_store_.append_and_fsync(rot_buf)) {
             rotation_fenced_ = true;
-            secure_wipe(new_key_block.data(), new_key_block.size());
             return false;
         }
         std::array<std::byte, kMacLen> rot_mac{};
@@ -783,7 +793,6 @@ public:
         detail::encode_tip_anchor(rot_anchor, rotation_next_sequence_, rot_mac, new_key_id, new_hmac_key);
         if (!rotation_log_store_.write_tip_anchor(rot_anchor)) {
             rotation_fenced_ = true;
-            secure_wipe(new_key_block.data(), new_key_block.size());
             return false;
         }
         rotation_tip_mac_ = rot_mac;
@@ -799,12 +808,10 @@ public:
                 fence_reason_ = (log_store_.last_write_status() == IoWriteStatus::DiskFull)
                                      ? FenceReason::DiskFull
                                      : FenceReason::IoError;
-                secure_wipe(new_key_block.data(), new_key_block.size());
                 return false;
             }
         }
 
-        secure_wipe(new_key_block.data(), new_key_block.size());
         active_key_id_ = new_key_id;
         return true;
     }
@@ -981,6 +988,7 @@ private:
             // "signing key unresolvable in this environment" Corrupt.
             std::uint32_t frame_key_id = 0;
             std::array<std::byte, kKeyBlockSize> frame_key_block{};
+            ScopedSecureWipe wipe_frame_key_block(frame_key_block);
             if (peek_frame_key_id(remaining, frame_key_id)) {
                 if (!key_ring_.active_key(frame_key_id, frame_key_block)) return RecoveryScanStatus::Corrupt;
                 note_observed_key_id(frame_key_id);
@@ -1124,10 +1132,10 @@ private:
         // cleanly through the ordinary path instead of hitting this branch again.
         if (interrupted_rotation_) {
             std::array<std::byte, kKeyBlockSize> key_block{};
+            ScopedSecureWipe wipe_key_block(key_block);
             if (!key_ring_.active_key(active_key_id_, key_block)) return RecoveryScanStatus::Corrupt;
             const bool ok = write_tip_anchor(next_sequence_ - 1, tip_mac_, active_key_id_,
                                               std::span<const std::byte>(key_block.data(), key_block.size()));
-            secure_wipe(key_block.data(), key_block.size());
             if (!ok) return RecoveryScanStatus::IoError;
             completed_interrupted_rotation_ = true;
         }
@@ -1229,6 +1237,7 @@ private:
         if (!detail::peek_tip_anchor_key_id(anchor_bytes, anchor_key_id)) return RecoveryScanStatus::Corrupt;
 
         std::array<std::byte, kKeyBlockSize> anchor_key_block{};
+        ScopedSecureWipe wipe_anchor_key_block(anchor_key_block);
         if (!key_ring_.active_key(anchor_key_id, anchor_key_block)) return RecoveryScanStatus::Corrupt;
 
         detail::DecodedTipAnchor anchor{};
@@ -1332,6 +1341,7 @@ private:
             // the correctly-offset counterpart.
             std::uint32_t frame_key_id = 0;
             std::array<std::byte, kKeyBlockSize> frame_key_block{};
+            ScopedSecureWipe wipe_frame_key_block(frame_key_block);
             if (peek_key_rotated_record_key_id(remaining, frame_key_id)) {
                 if (!key_ring_.active_key(frame_key_id, frame_key_block)) return false;
             }
@@ -1376,6 +1386,7 @@ private:
         std::uint32_t anchor_key_id = 0;
         if (!detail::peek_tip_anchor_key_id(anchor_bytes, anchor_key_id)) return false;
         std::array<std::byte, kKeyBlockSize> anchor_key_block{};
+        ScopedSecureWipe wipe_anchor_key_block(anchor_key_block);
         if (!key_ring_.active_key(anchor_key_id, anchor_key_block)) return false;
 
         detail::DecodedTipAnchor anchor{};
@@ -1433,6 +1444,7 @@ private:
         if (store_identity_store_.read_tip_anchor(raw)) {
             std::uint32_t file_key_id = 0;
             std::array<std::byte, kKeyBlockSize> file_key_block{};
+            ScopedSecureWipe wipe_file_key_block(file_key_block);
             if (!detail::peek_store_identity_key_id(raw, file_key_id) ||
                 !key_ring_.active_key(file_key_id, file_key_block)) {
                 // Too short to even contain a key_id, or the key_id it names
@@ -1483,6 +1495,7 @@ private:
         std::memcpy(&hi, random_bytes.data() + 8, 8);
 
         std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
         if (!key_ring_.active_key(active_key_id_, key_block)) {
             store_identity_degraded_ = true;
             return;
@@ -1587,6 +1600,7 @@ private:
     std::uint64_t rotation_torn_tail_bytes_{0};
 
     ExportOutboxRing* export_outbox_{nullptr};
+    std::uint64_t export_outbox_dropped_{0};
 
     // Phase 4: KeyRotated sidecar state. Independent of log_open_/fenced_
     // above -- a sidecar problem gates ONLY rotate_active_key(), never

@@ -229,6 +229,7 @@ public:
         if (fenced_ || !log_store_.is_log_open()) return false;
 
         std::array<std::byte, kKeyBlockSize> new_key_block{};
+        ScopedSecureWipe wipe_new_key_block(new_key_block);
         if (!key_ring_.active_key(new_key_id, new_key_block)) return false;  // "prepare" not done yet
         std::span<const std::byte> new_hmac_key(new_key_block.data(), new_key_block.size());
 
@@ -241,12 +242,10 @@ public:
                                                  now_ms, payload, tip_mac_, new_hmac_key);
         if (n != kKeyRotatedFrameSize) {
             fenced_ = true;  // encode failure at a fixed, always-sufficient buffer size is a real bug, not input shape
-            secure_wipe(new_key_block.data(), new_key_block.size());
             return false;
         }
         auto result = finish_append(std::span<const std::byte>(buf.data(), n), new_key_block,
                                      /*key_id_for_anchor=*/new_key_id);
-        secure_wipe(new_key_block.data(), new_key_block.size());
         if (!result.acked()) return false;  // finish_append() already fenced on genuine I/O failure
 
         active_key_id_ = new_key_id;
@@ -279,6 +278,7 @@ public:
         if (fenced_ || !log_store_.is_log_open()) return failed_result();
 
         std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
         if (!key_ring_.active_key(active_key_id_, key_block)) return failed_result();
 
         std::array<std::byte, kMaxSnapshotFrameSize> buf{};
@@ -476,6 +476,7 @@ private:
         if (fenced_ || !log_store_.is_log_open()) return failed_result();
 
         std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
         if (!key_ring_.active_key(active_key_id_, key_block)) return failed_result();
 
         std::array<std::byte, kMaxFixedFrameBytes> buf{};
@@ -645,6 +646,7 @@ private:
             if (peek_is_key_rotated_record(view)) {
                 std::uint32_t rot_key_id = 0;
                 std::array<std::byte, kKeyBlockSize> rot_key_block{};
+                ScopedSecureWipe wipe_rot_key_block(rot_key_block);
                 if (peek_key_rotated_record_key_id(view, rot_key_id)) {
                     if (!key_ring_.active_key(rot_key_id, rot_key_block)) return RecoveryScanStatus::Corrupt;
                 }
@@ -675,6 +677,7 @@ private:
             if (hdr_status != FrameDecodeStatus::Ok) return RecoveryScanStatus::Corrupt;
 
             std::array<std::byte, kKeyBlockSize> key_block{};
+            ScopedSecureWipe wipe_key_block(key_block);
             if (!key_ring_.active_key(hdr.key_id, key_block)) return RecoveryScanStatus::Corrupt;
             std::span<const std::byte> key(key_block.data(), key_block.size());
 
@@ -926,6 +929,7 @@ private:
         if (!log_tip_valid) return RecoveryScanStatus::Corrupt;
 
         std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
         if (!key_ring_.active_key(active_key_id_, key_block)) return RecoveryScanStatus::Corrupt;
 
         detail::DecodedTipAnchor anchor{};
