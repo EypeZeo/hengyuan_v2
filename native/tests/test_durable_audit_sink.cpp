@@ -1237,6 +1237,59 @@ TEST_F(DurableAuditSinkTest, AppendDurableExportTuplePopulatesRealStoreUuid) {
     EXPECT_TRUE(t.store_uuid_lo != 0 || t.store_uuid_hi != 0);
 }
 
+// Audit F-B-003 (Owner decision 2026-11-10): the export outbox stays best-effort -- a full ring never fails or fences the local append -- but the
+// refusal is no longer silent. Nothing consumes the ring here, so it fills; the sink counts every tuple it refuses.
+TEST_F(DurableAuditSinkTest, AFullExportRingRefusesTheTupleCountsItAndNeverFailsTheLocalAppend) {
+    ExportOutboxRing ring;
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
+    ASSERT_FALSE(sink.store_identity_degraded());
+    sink.set_export_outbox(&ring);
+    EXPECT_EQ(sink.export_outbox_dropped(), 0u);
+
+    ExportTuple filler{};
+    for (std::size_t i = 0; i < ExportOutboxRing::kCapacity; ++i) ASSERT_TRUE(ring.try_push(filler)) << "slot " << i;
+
+    // The ring is full: the append still succeeds (local durability is the correctness-critical part) and the refusal is counted.
+    ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+    EXPECT_EQ(sink.export_outbox_dropped(), 1u);
+    EXPECT_FALSE(sink.fenced());
+    ASSERT_TRUE(sink.append_durable(make_intent("HY-B", 200, 20, 2), 1001).acked());
+    EXPECT_EQ(sink.export_outbox_dropped(), 2u);
+    EXPECT_EQ(sink.frame_count(), 2u) << "both frames are in the log; only their export tuples were lost";
+
+    // The oldest slot is consumed: the next tuple fits and the count stays where it was ...
+    ring.pop_after_remote_ack();
+    ASSERT_TRUE(sink.append_durable(make_intent("HY-C", 300, 30, 3), 1002).acked());
+    EXPECT_EQ(sink.export_outbox_dropped(), 2u) << "a tuple that fit is not a drop";
+    // ... and the ring is full again, so the next one is counted.
+    ASSERT_TRUE(sink.append_durable(make_intent("HY-D", 400, 40, 4), 1003).acked());
+    EXPECT_EQ(sink.export_outbox_dropped(), 3u);
+    EXPECT_EQ(sink.frame_count(), 4u);
+}
+
+TEST_F(DurableAuditSinkTest, TheExportDropCounterStaysZeroWhileTheRingHasRoomAndWithoutAnyRing) {
+    {
+        ExportOutboxRing ring;
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        sink.set_export_outbox(&ring);
+        for (int i = 0; i < 3; ++i) {
+            const std::string coid = "HY-R" + std::to_string(i);
+            ASSERT_TRUE(sink.append_durable(make_intent(coid.c_str(), 100, 10, 1), 1000 + i).acked());
+        }
+        EXPECT_EQ(sink.export_outbox_dropped(), 0u) << "tuples that were accepted are not drops";
+    }
+    // The same store, restarted with no outbox wired: nothing is pushed, so nothing can be refused.
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.is_open());
+        for (int i = 0; i < 3; ++i) {
+            const std::string coid = "HY-N" + std::to_string(i);
+            ASSERT_TRUE(sink.append_durable(make_intent(coid.c_str(), 100, 10, 1), 2000 + i).acked());
+        }
+        EXPECT_EQ(sink.export_outbox_dropped(), 0u);
+    }
+}
+
 TEST_F(DurableAuditSinkTest, TamperedStoreIdentityFileDisablesExportWithoutFencingMainLog) {
     {
         DurableAuditSink sink(base_path_, *key_ring_, 1);

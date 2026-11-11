@@ -52,10 +52,14 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 
 # --- simdjson (IO-01: Binance JSON parser) ---
+# Both FetchContent dependencies are pinned to a COMMIT (the tag it was on 2026-11-10 is the trailing comment): a tag can be moved or re-pointed
+# upstream, a commit cannot (audit F-B-007, L-64). tools/wsl_deps_mirror.sh reads the second word of each GIT_REPOSITORY / GIT_TAG line and stops
+# reading a block at the first line that holds a closing parenthesis, so keep the hash right after GIT_TAG and put no closing parenthesis in a
+# comment inside a FetchContent_Declare block.
 FetchContent_Declare(
     simdjson
     GIT_REPOSITORY https://github.com/simdjson/simdjson.git
-    GIT_TAG        v3.12.3
+    GIT_TAG        7382dc2be88e53fbc35cb50369b831855656f0fd  # v3.12.3
 )
 FetchContent_MakeAvailable(simdjson)
 
@@ -296,10 +300,11 @@ endif()
 option(HY_BUILD_TESTS "Build native unit tests" ON)
 
 if(HY_BUILD_TESTS)
+    # A commit, not the tag; see the note at the simdjson declaration for why and for the format tools/wsl_deps_mirror.sh relies on.
     FetchContent_Declare(
         googletest
         GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG        v1.15.2
+        GIT_TAG        b514bdc898e2951020cbdca1304b75f5950d1f59  # v1.15.2
     )
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
@@ -451,6 +456,15 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_key_ring PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_key_ring)
     gtest_discover_tests(test_key_ring)
+
+    # Audit F-B-002 / L-60: ScopedSecureWipe wipes on every way out of a scope, and every local key block in the durable sinks and in the audit export
+    # has one (a source scan: it reads the headers, so the native/ directory is a compile definition, same shape as the other guards).
+    add_executable(test_key_copy_wipe_guard tests/test_key_copy_wipe_guard.cpp)
+    target_link_libraries(test_key_copy_wipe_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_key_copy_wipe_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_key_copy_wipe_guard)
+    gtest_discover_tests(test_key_copy_wipe_guard)
 
     # Phase 1: DurableLogStore 共享平台 I/O 层 (L2, 真实文件 I/O -- 跨平台锁/
     # fsync/tip-anchor 原子替换/流式 read_chunk。DurableAuditSink 与

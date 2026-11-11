@@ -132,6 +132,59 @@ TEST(StrategySpecOperators, EmaWindow3SeedsWithSmaThenRecurses) {
     EXPECT_DOUBLE_EQ(step_ema(state, window, 5.0), 4.0);
 }
 
+// Audit F-A-009. A NaN input leaves that bar's output NaN and the state where it was -- before the seed is complete as much as after it.
+// py_core/tests/test_indicators_operators.py pins the SAME sequences against operators.ema(); the two used to disagree after the gap.
+TEST(StrategySpecOperators, EmaMidStreamNanCostsThatBarOnly) {
+    EmaState state{};
+    const double window = 2.0;  // alpha = 2/3
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_TRUE(std::isnan(step_ema(state, window, 1.0)));
+    EXPECT_DOUBLE_EQ(step_ema(state, window, 2.0), 1.5);  // seed = mean(1, 2)
+    EXPECT_TRUE(std::isnan(step_ema(state, window, nan)));
+    const double after_gap = step_ema(state, window, 4.0);
+    EXPECT_NEAR(after_gap, 2.0 / 3.0 * 4.0 + 1.0 / 3.0 * 1.5, 1e-12);  // 3.1666666667: resumed from 1.5
+    EXPECT_NEAR(step_ema(state, window, 5.0), 2.0 / 3.0 * 5.0 + 1.0 / 3.0 * after_gap, 1e-12);  // 4.3888888889
+}
+
+TEST(StrategySpecOperators, EmaNanBeforeTheSeedIsCompleteIsNotCountedInTheSeed) {
+    EmaState state{};
+    const double window = 2.0;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_TRUE(std::isnan(step_ema(state, window, 1.0)));
+    EXPECT_TRUE(std::isnan(step_ema(state, window, nan)));
+    EXPECT_DOUBLE_EQ(step_ema(state, window, 3.0), 2.0);  // mean of the first two NON-NaN values, 1 and 3
+    EXPECT_NEAR(step_ema(state, window, 5.0), 2.0 / 3.0 * 5.0 + 1.0 / 3.0 * 2.0, 1e-12);  // 4.0
+}
+
+// With window 2 a NaN that was wrongly COUNTED as a seed observation happens to give the same seed (the count is already past the window when the
+// next value arrives); with window 3 it does not -- the seed would complete one value early.
+TEST(StrategySpecOperators, EmaNanNeverCountsTowardsALongerSeed) {
+    EmaState state{};
+    const double window = 3.0;  // alpha = 0.5
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_TRUE(std::isnan(step_ema(state, window, 1.0)));
+    EXPECT_TRUE(std::isnan(step_ema(state, window, nan)));
+    EXPECT_TRUE(std::isnan(step_ema(state, window, 2.0)));  // only two non-NaN values so far
+    EXPECT_DOUBLE_EQ(step_ema(state, window, 3.0), 2.0);  // the mean of 1, 2 and 3
+    EXPECT_NEAR(step_ema(state, window, 4.0), 0.5 * 4.0 + 0.5 * 2.0, 1e-12);  // 3.0
+}
+
+TEST(StrategySpecOperators, EmaHoldsItsStateOverATwoBarGapAndWindowOneFollowsTheInput) {
+    EmaState state{};
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_TRUE(std::isnan(step_ema(state, 2.0, 2.0)));
+    EXPECT_DOUBLE_EQ(step_ema(state, 2.0, 4.0), 3.0);
+    EXPECT_TRUE(std::isnan(step_ema(state, 2.0, nan)));
+    EXPECT_TRUE(std::isnan(step_ema(state, 2.0, nan)));
+    EXPECT_NEAR(step_ema(state, 2.0, 6.0), 2.0 / 3.0 * 6.0 + 1.0 / 3.0 * 3.0, 1e-12);  // 5.0
+    EXPECT_TRUE(std::isnan(step_ema(state, 2.0, nan)));
+
+    EmaState one{};
+    EXPECT_DOUBLE_EQ(step_ema(one, 1.0, 5.0), 5.0);
+    EXPECT_TRUE(std::isnan(step_ema(one, 1.0, nan)));
+    EXPECT_DOUBLE_EQ(step_ema(one, 1.0, 7.0), 7.0);
+}
+
 // --- rsi ---
 
 TEST(StrategySpecOperators, RsiWindow3SeedsFromFirstThreeDeltas) {
