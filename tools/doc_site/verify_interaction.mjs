@@ -324,7 +324,7 @@ try {
       q:document.getElementById('q').value,
       cards:document.querySelectorAll('.card:not(.hidden)').length,
       marks:document.querySelectorAll('mark').length}),250));`);
-  check("一键清除恢复全部结果", cleared.cards === 26 && cleared.q === "", JSON.stringify(cleared));
+  check("一键清除恢复全部结果", cleared.cards === 27 && cleared.q === "", JSON.stringify(cleared));
   check("清除后命中高亮一并撤下", cleared.marks === 0, String(cleared.marks));
 
   // ---------- 7 浅色主题 ----------
