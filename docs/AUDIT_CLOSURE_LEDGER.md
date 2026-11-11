@@ -236,7 +236,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 3. **SUPP-003、SUPP-005 的描述更正（状态不变）。** 冻结原文把 `L4-LOCK-ORDER-003` 写成“ClockSync 内部锁”、把 `L4-BINDING-REF-005` 写成“pybind11 绑定”。PR #60 在这两个标签下实际修的是凭据缓冲区必须先加锁再写入密钥（`binance_signer.hpp`、`binance_environment.hpp`），以及 `EnvironmentBinding` 的引用悬挂（`binance_environment.hpp`）。本仓库的历史里没有出现过 pybind11 绑定源文件。顺带观察（不在本次裁定范围）：`ClockOffsetPublisher` 是单互斥量、无嵌套加锁，`test_binance_clock_sync.cpp` 没有并发用例，冻结原文所写“并发压力测试通过”找不到对应的测试。
 4. **SUPP-006、SUPP-007 的归属更正（状态不变）。** PR #60 对 L4 规格的改动只有标题与状态行（11 行补丁），冻结原文所写“PR #60 文档校准”不成立。现行规格与代码在可核对的细节上一致（TTL、`recvWindow`、发布机制、非保留字符集）：字符集规则由 PR #5 引入，发布机制的措辞由 PR #8 引入。
 5. **冻结原文的“PR #60（`25528c3`）”哈希是错的。** `25528c3` 是 PR #61 的合并提交；PR #60 的合并提交是 `b1107a291`。
-6. **P3-002 的描述更正（状态不变）。** `py_core/requirements.txt` 是 `==` 精确钉死，只是没有哈希；浮动区间在 `py_core/pyproject.toml` 与 `recorder/pyproject.toml` 的声明里。GitHub Actions 全部按主版本标签引用，Dependabot 只监控 `github-actions`。
+6. **P3-002 的描述更正（状态不变）。** `py_core/requirements.txt` 是 `==` 精确钉死，只是没有哈希；浮动区间在 `py_core/pyproject.toml` 与 `recorder/pyproject.toml` 的声明里。GitHub Actions 全部按主版本标签引用，Dependabot 只监控 `github-actions`。**2026-11-10 更新**（Owner 决定固定供应链；审计 F-B-007、F-D-008，路书 L-64）：Actions 现在按提交摘要引用（行尾 `# vX.Y.Z` 注释记着确切版本；Dependabot 仍会为它们开升级 PR，改的是摘要与注释），`FetchContent` 的 simdjson 与 googletest 按提交摘要，`py_core/requirements.txt` 逐文件带 sha256（pip 因此自动进入 `--require-hashes`）。仍然浮动的：CI 里不带版本的 `pip install ruff`（`ci-python.yml`）、录制器 CI 的 `pytest>=8 ruff`（`ci-recorder.yml`）、apt 包、两个 `pyproject.toml` 里的浮动区间；Dependabot 的监控范围仍只有 `github-actions`；没有校验固定状态的检查。所以状态仍是 `DEFERRED`，探针换成了仍然成立的缺口。
 7. **P0-001 的现状。** 真实 POST 适配器只被一个不调用它的程序装配：`live_submit_preflight_harness.cpp` 装配后不使用（原来的第二个，H6 演示 `live_submit_real_credentials_demo.cpp` 装配后“刻意从不 `.call()`”，已于 M5b-2（PR #236）随 listenKey 整套删除）；`orchestrate_submit` 没有任何可运行的调用者。
 8. **Sanitizer 凭据。** run `37258555091`（`CI Native Sanitizers`，定时触发，提交 `d401ed78e`）三个作业全部成功：ASan+UBSan 28.5 分钟（上限 90）；TSan 1.0 分钟（上限 25，只构建十个并发目标，构建 25 秒、并发测试 3 秒，随后两个负控步骤均成功，即 TSan 报出了被注入的竞争）；ARM64 1.4 分钟。同一 workflow 的 run `35556436339`、`34801501343`、`34078573391` 是被取消的，`36810545639` 是失败的（TSan 负控当时依赖调度）；它们不是证据，`--online` 会先用这四个真实 run 证明核对工具拒收它们。
 9. **批 2：45 条故障用例没有一条能通过门禁。** 复验后 `PARTIAL` 20、`NOT_TESTABLE_YET` 25、`IMPLEMENTED` 0；三个门禁标签（`PRE_D3` 28 条、`PRE_OWNER_LIVE` 13 条、`CANARY` 4 条）全部 `BLOCKED`。
@@ -592,10 +592,10 @@ gate: 供应链安全
 gate_result: DEFERRED
 bkl: BKL-005
 trigger: 执行生产环境供应链依赖锁死时激活
-open: open:.github/workflows/ci-native.yml#"actions/checkout@v7" open:.github/workflows/ci-python.yml#"actions/setup-python@v7" absent:py_core/requirements.txt#--hash
+open: open:.github/workflows/ci-python.yml#"pip install ruff" open:.github/workflows/ci-recorder.yml#"pytest>=8"
 refs: code:.github/dependabot.yml#github-actions
-seg.code: MISSING -- 全部 GitHub Actions 按主版本标签引用而非提交摘要；py_core/requirements.txt 是 == 精确钉死但没有哈希；Dependabot 只监控 github-actions
-seg.contract: MISSING -- 尚无依赖锁死策略文件
+seg.code: MISSING -- GitHub Actions、FetchContent 依赖与 py_core/requirements.txt 已固定到摘要；CI 里不带版本的 pip install ruff（ci-python.yml）与 pytest>=8 ruff（ci-recorder.yml）仍浮动，apt 包与两个 pyproject.toml 的浮动区间也是；Dependabot 只监控 github-actions
+seg.contract: MISSING -- 只有 py_core/requirements.txt 头部注释写了哈希的选取与升级办法，没有覆盖 Actions 与 FetchContent 的依赖锁死策略文件
 seg.fault: NA -- 供应链配置缺陷，没有运行期故障路径
 seg.test: MISSING -- 没有校验锁死状态的检查
 seg.runtime: MISSING -- 未排期

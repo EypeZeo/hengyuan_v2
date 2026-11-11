@@ -7,12 +7,13 @@
 # by the code. With the mirrors in place tools/wsl_verify.sh points git at them for its own process (GIT_CONFIG_* environment variables, see --env; no
 # global git config is touched), so a configure needs no network at all.
 #
-# The URL and the tag of each dependency are READ from native/CMakeLists.txt (the FetchContent_Declare blocks), so the mirrors can never silently
+# The URL and the pin of each dependency are READ from native/CMakeLists.txt (the FetchContent_Declare blocks), so the mirrors can never silently
 # disagree with CI; a bumped pin simply makes the mirror stale (wsl_verify.sh then falls back to the network, as before) until this script is run again.
+# A pin is a commit hash since the supply-chain pinning of 2026-11-10 (audit F-B-007, L-64); a tag name still works.
 #
 # Usage (inside WSL2):
 #   bash tools/wsl_deps_mirror.sh           create or refresh what is missing
-#   bash tools/wsl_deps_mirror.sh --check   exit 0 if both mirrors hold their pinned tag, 1 otherwise; changes nothing
+#   bash tools/wsl_deps_mirror.sh --check   exit 0 if both mirrors hold their pinned revision, 1 otherwise; changes nothing
 #   bash tools/wsl_deps_mirror.sh --env     print the `export GIT_CONFIG_*` lines that make git use the mirrors (nothing at all unless BOTH mirrors are
 #                                           complete); `eval "$(bash tools/wsl_deps_mirror.sh --env)"`
 # Mirrors live in ${HY_DEPS_MIRROR:-$HOME/.cache/hy_deps}/<name>.git. Creating one tries, in order: a populated checkout left by an earlier build
@@ -33,7 +34,7 @@ case "${1:-}" in
     *) echo "usage: $0 [--check|--env]" >&2; exit 2 ;;
 esac
 
-# pin <name> <GIT_REPOSITORY|GIT_TAG>: that field of the FetchContent_Declare(<name> ...) block. A copy synced from a Windows working tree has CRLF line
+# pin <name> <GIT_REPOSITORY|GIT_TAG>: the second word of that line of the FetchContent_Declare(<name> ...) block (a trailing comment is ignored). A copy synced from a Windows working tree has CRLF line
 # ends (tools/wsl_sync.sh copies the bytes as they are): the first rule strips the CR, or every field would end in one and no name would ever match.
 pin() {
     awk -v name="$1" -v key="$2" '
@@ -45,29 +46,31 @@ pin() {
     ' "${CMAKELISTS}"
 }
 
-has_tag() { git -C "$1" rev-parse --verify -q "refs/tags/$2^{commit}" >/dev/null 2>&1; }
+# has_rev <mirror> <pin>: the mirror holds that commit. "<pin>^{commit}" resolves a commit hash and a tag name alike (the old "refs/tags/<pin>" form
+# could only ever resolve a tag, so a hash pin would have looked absent for ever).
+has_rev() { git -C "$1" rev-parse --verify -q "$2^{commit}" >/dev/null 2>&1; }
 
 missing=0
 env_lines=()
 env_n="${GIT_CONFIG_COUNT:-0}"
 for name in "${DEPS[@]}"; do
     url="$(pin "${name}" GIT_REPOSITORY)"
-    tag="$(pin "${name}" GIT_TAG)"
-    if [[ -z "${url}" || -z "${tag}" ]]; then
+    rev="$(pin "${name}" GIT_TAG)"
+    if [[ -z "${url}" || -z "${rev}" ]]; then
         echo "cannot read the pin of ${name} from ${CMAKELISTS}" >&2
         exit 2
     fi
     mirror="${MIRROR_ROOT}/${name}.git"
 
-    if has_tag "${mirror}" "${tag}"; then
-        [[ "${mode}" == "env" ]] || echo "${name}: ${tag} already mirrored (${mirror})"
+    if has_rev "${mirror}" "${rev}"; then
+        [[ "${mode}" == "env" ]] || echo "${name}: ${rev} already mirrored (${mirror})"
         env_lines+=("export GIT_CONFIG_KEY_${env_n}='url.file://${mirror}.insteadOf'" "export GIT_CONFIG_VALUE_${env_n}='${url}'")
         env_n=$((env_n + 1))
         continue
     fi
     missing=1
     if [[ "${mode}" != "make" ]]; then
-        [[ "${mode}" == "env" ]] || echo "${name}: ${tag} NOT mirrored"
+        [[ "${mode}" == "env" ]] || echo "${name}: ${rev} NOT mirrored"
         continue
     fi
 
@@ -75,7 +78,7 @@ for name in "${DEPS[@]}"; do
     rm -rf "${mirror}"
     done_one=0
     while IFS= read -r d; do
-        if has_tag "${d}" "${tag}" && git clone --bare --quiet "${d}" "${mirror}"; then
+        if has_rev "${d}" "${rev}" && git clone --bare --quiet "${d}" "${mirror}"; then
             echo "${name}: mirrored from ${d}"
             done_one=1
             break
@@ -97,8 +100,8 @@ for name in "${DEPS[@]}"; do
         echo "${name}: could not be mirrored" >&2
         exit 3
     fi
-    if ! has_tag "${mirror}" "${tag}"; then
-        echo "${name}: the mirror does not hold ${tag}" >&2
+    if ! has_rev "${mirror}" "${rev}"; then
+        echo "${name}: the mirror does not hold ${rev}" >&2
         exit 4
     fi
     missing=0
