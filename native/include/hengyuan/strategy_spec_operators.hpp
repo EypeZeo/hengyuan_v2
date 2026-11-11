@@ -185,9 +185,10 @@ inline double step_lag(WindowState& state, double* pool, double input) noexcept 
 
 inline double step_ema(EmaState& state, double window, double input) noexcept {
     if (std::isnan(input)) {
-        // operators.py's ema() skips a NaN prefix via _first_valid_position() before seeding,
-        // then never sees NaN again post-seed (the NaN-prefix invariant). Stay defensive:
-        // a NaN input never advances or corrupts the accumulator either way.
+        // A NaN input leaves this bar's output NaN and the state where it was -- before the seed is
+        // complete (the seed is the mean of the first `window` NON-NaN inputs) as much as after it.
+        // NaN is not only a prefix: div and roc produce it mid-stream (audit F-A-009). operators.py's
+        // ema() behaves the same since 2026-11-10; both test suites pin the same reference sequences.
         return kNaN;
     }
     if (state.seeded) {

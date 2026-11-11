@@ -16,18 +16,26 @@ in ``add``/``gt``/etc., ``then``/``otherwise`` in ``if_then_else``) may be eithe
 reference (always resolved to a ``pd.Series`` by round 2's evaluator before reaching here) or
 a literal number straight from the spec.
 
-**NaN-prefix invariant, relied on by ``ema()``/``rsi()``'s warm-up composition:** every
-operator here produces NaN only as a *contiguous prefix* of its output, never a NaN appearing
-after the first non-NaN value -- true by construction for every operator in this module
-(rolling ops via pandas' ``min_periods`` semantics, which count non-NaN *observations* in the
-window rather than window length, so a NaN-prefixed input composes correctly automatically;
-elementwise ops via NaN-if-any-input-NaN, which preserves "prefix" under union). §6's warm-up
-formula ("自身 warm-up + 输入 warm-up 的最大值，逐层向上累加") is only well-defined if this
-invariant holds throughout the DAG -- ``ema()``/``rsi()`` explicitly find and skip their
-input's own leading NaN run (via ``_first_valid_position()``) rather than assuming the input
-starts at position 0, specifically so the invariant keeps holding through operators that
-can't use pandas' built-in rolling ``min_periods`` machinery (their own state is a genuine
-recursion, not a pandas-native rolling reduction).
+**NaN-prefix composition, relied on by ``ema()``/``rsi()``'s warm-up:** the window and lag
+operators produce NaN as a *contiguous prefix* of their output (rolling ops via pandas'
+``min_periods`` semantics, which count non-NaN *observations* in the window rather than window
+length, so a NaN-prefixed input composes correctly automatically; elementwise ops via
+NaN-if-any-input-NaN, which preserves "prefix" under union). §6's warm-up formula ("自身 warm-up
++ 输入 warm-up 的最大值，逐层向上累加") is only well-defined if that holds -- ``ema()``/``rsi()``
+explicitly find and skip their input's own leading NaN run (via ``_first_valid_position()``)
+rather than assuming the input starts at position 0, specifically so it keeps holding through
+operators that can't use pandas' built-in rolling ``min_periods`` machinery (their own state is
+a genuine recursion, not a pandas-native rolling reduction).
+
+**But NaN is not only ever a prefix (audit F-A-009).** ``div`` and ``roc`` (below) produce NaN
+wherever their right operand is 0, in the middle of a stream, and that NaN reaches whatever
+consumes it. ``ema()`` treats it the way the native evaluator does (``step_ema`` in
+native/include/hengyuan/strategy_spec_operators.hpp; both test suites pin the same reference
+sequence): a NaN input leaves that bar's output NaN and leaves the state where it was -- before
+the seed is complete as much as after it. The seed is the mean of the first ``window`` NON-NaN
+observations, and after seeding the next valid bar continues the recursion from the last valid
+value. (It used to recurse through its own previous NaN and stay NaN for ever, which is where the
+two sides diverged.) ``rsi()`` has not been aligned yet (blueprint appendix D, L-59).
 
 **Division and ratio operators never produce ``inf``**: §5.3 mandates ``div`` produce NaN
 (not raise, not inf) when the right operand is 0 -- "两侧行为必须一致，NaN 会被 `[signal]`
@@ -90,21 +98,33 @@ def sma(x: pd.Series, window: int) -> pd.Series:
 def ema(x: pd.Series, window: int) -> pd.Series:
     """§2.2: ``ema[t] = alpha*x[t] + (1-alpha)*ema[t-1]``, ``alpha = 2/(window+1)``, seeded
     with ``SMA(x[0..warmup-1])`` (NOT ``x[0]``) -- both pinned exactly by the spec since seed
-    choice is the most common source of divergence between EMA implementations."""
+    choice is the most common source of divergence between EMA implementations.
+
+    NaN input (§2.2, audit F-A-009), identical to the native ``step_ema``: the bar's output is
+    NaN and the state does not move. Until the seed is complete a NaN is not counted (the seed is
+    the mean of the first ``window`` non-NaN values); afterwards the recursion simply continues
+    from the last valid value at the next valid bar. For input whose NaNs are only a leading
+    prefix this is exactly the previous result, bit for bit."""
     if window < 1:
         raise ValueError(f"window must be >= 1, got {window}")
     values = x.to_numpy(dtype=np.float64)
-    n = len(values)
-    result = np.full(n, np.nan)
-    start = _first_valid_position(values)
-    seed_position = start + window - 1
-    if seed_position >= n:
-        return pd.Series(result, index=x.index)
-
+    result = np.full(len(values), np.nan)
     alpha = 2.0 / (window + 1)
-    result[seed_position] = float(np.mean(values[start : start + window]))
-    for i in range(seed_position + 1, n):
-        result[i] = alpha * values[i] + (1.0 - alpha) * result[i - 1]
+    seed: list[float] = []  # the first `window` non-NaN observations, in arrival order
+    previous = np.nan  # the last EMA value, once seeded
+    seeded = False
+    for i, value in enumerate(values):
+        if np.isnan(value):
+            continue  # this bar stays NaN, the state stays where it was
+        if seeded:
+            previous = alpha * value + (1.0 - alpha) * previous
+            result[i] = previous
+            continue
+        seed.append(float(value))
+        if len(seed) == window:
+            previous = float(np.mean(seed))
+            seeded = True
+            result[i] = previous
     return pd.Series(result, index=x.index)
 
 
