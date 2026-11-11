@@ -1,6 +1,6 @@
 # 四模型全仓只读审计（2026-11-09）：分诊与处置
 
-> 状态：由主线会话逐条对照代码核实后写成；基点 `a61d100a2d84e00a7e0fc645d00ce4cdcd48d695`（PR #237）。审计报告是**未经核实的主张**，本表给的是核实后的裁定，不是报告原文的转述。
+> 状态：由主线会话逐条对照代码核实后写成；基点 `a61d100a2d84e00a7e0fc645d00ce4cdcd48d695`（PR #237）。审计报告是**未经核实的主张**，本表给的是核实后的裁定，不是报告原文的转述。**2026-11-11 更新**：§3 的决定与各 PR 的合并提交见 §4，TB-1 已合入。
 
 ## 1. 输入与总览
 
@@ -92,8 +92,22 @@
 
 ## 4. 代码与文档的处置
 
-PR [#238](https://github.com/EypeZeo/hengyuan_v2/pull/238)（分支 `fix/audit-2026-11-09-native-tier-a`，每个发现一个提交，提交信息带发现编号；合并提交待填）。
+PR [#238](https://github.com/EypeZeo/hengyuan_v2/pull/238)（分支 `fix/audit-2026-11-09-native-tier-a`，每个发现一个提交，提交信息带发现编号；合并提交 `288dedf`，2026-11-10）。
+
+2026-11-10 起 Owner 对 §3 的回复与其后的合入（路书 B.0 的 2026-11-11 条目有证据）：
+
+| 事项 | Owner 的决定 | 处置 |
+| :--- | :--- | :--- |
+| EMA 中段 NaN（F-A-009） | 以 C++ 的“保持状态”为准（2026-11-10） | PR #242（`200a9ca`）：`operators.ema()` 对齐，两侧同一组参考序列；RSI 未对齐（L-59），等 Owner 说“开始” |
+| 密钥栈副本（F-B-002） | 同意热路径多一次 64 字节擦除 | PR #244（`e0eba54`）：`ScopedSecureWipe`，19 个局部密钥块，守卫测试带源码扫描 |
+| `ExportOutboxRing` 满环（F-B-003） | 保持尽力而为，加丢弃计数 | PR #244：`DurableAuditSink::export_outbox_dropped()` |
+| 供应链固定（F-B-007、F-D-008） | 按推荐做 | PR #243（`756bdf8`）：Actions 与 FetchContent 固定到提交，`requirements.txt` 带 sha256；剩余见路书 L-64 |
+| B3 置 `[DONE]` | 按推荐做 | 路书 `1.2`、`1.3` 与附录 D 的 L-29 |
+| Sanitizer 列为必需检查（F-D-003） | 未在回复里 | 未动（规则集由 Owner 管理） |
+| 格点起点（F-A-002） | 未在回复里 | 仍等 Owner（TB-5 的前置） |
+
+PR #240（守卫共用的源码扫描器，`f02b715`，2026-11-10）、PR #239（本文档与路书的上一次同步，`563a1f0`）。**TB-1 已合入**：PR #241（`1e104d7`），登记为路书 FI-058。TB-2 至 TB-5 仍待 Owner 逐个说“开始”。
 
 ## 5. 核实中新发现、四份报告都没有写到的一条
 
-**POST 回报的状态集**。`parse_submit_order_response()` 校验了 COID、品种、方向、类型、有效期、价格和原始数量之后，用 `map_binance_order_status()` 映射状态——这个函数认全部八种状态（`NEW`、`PARTIALLY_FILLED`、`FILLED`、`PENDING_CANCEL`、`CANCELED`、`REJECTED`、`EXPIRED`、`EXPIRED_IN_MATCH`）。`orchestrate_submit()` 的 Accepted 分支把这个状态原样写成持久帧、忽略 `OrderRecord::transition_to()` 的返回值，并在 `is_exchange_final()` 时释放在途槽。而 `validate_transition(Submitting, …)` 只允许 `Accepted / Rejected / Ambiguous / Filled / PartialFill`。结果：一份带 `EXPIRED_IN_MATCH`（自成交防护让吃单方到期）的 POST 回报会被写成 `Submitting → Expired` 的帧；追加一侧不校验转移，下次启动时 `run_recovery_scan_impl()`（`durable_audit_sink.hpp` 第 1059 行）把整份日志判为 Corrupt，进程起不来。现货默认的自成交防护模式下这不常见，但这条路径一旦有真实调用者，它就是一个“一次异常回报让进程不能重启”的缺口。与 F-A-012 同一个修法（只认 `NEW / PARTIALLY_FILLED / FILLED`，其余按未知结果走 Ambiguous 与查询），放进 TB-1。
+**POST 回报的状态集**。`parse_submit_order_response()` 校验了 COID、品种、方向、类型、有效期、价格和原始数量之后，用 `map_binance_order_status()` 映射状态——这个函数认全部八种状态（`NEW`、`PARTIALLY_FILLED`、`FILLED`、`PENDING_CANCEL`、`CANCELED`、`REJECTED`、`EXPIRED`、`EXPIRED_IN_MATCH`）。`orchestrate_submit()` 的 Accepted 分支把这个状态原样写成持久帧、忽略 `OrderRecord::transition_to()` 的返回值，并在 `is_exchange_final()` 时释放在途槽。而 `validate_transition(Submitting, …)` 只允许 `Accepted / Rejected / Ambiguous / Filled / PartialFill`。结果：一份带 `EXPIRED_IN_MATCH`（自成交防护让吃单方到期）的 POST 回报会被写成 `Submitting → Expired` 的帧；追加一侧不校验转移，下次启动时 `run_recovery_scan_impl()`（`durable_audit_sink.hpp` 第 1059 行）把整份日志判为 Corrupt，进程起不来。现货默认的自成交防护模式下这不常见，但这条路径一旦有真实调用者，它就是一个“一次异常回报让进程不能重启”的缺口。与 F-A-012 同一个修法（只认 `NEW / PARTIALLY_FILLED / FILLED`，其余按未知结果走 Ambiguous 与查询），放进 TB-1——已于 2026-11-11 随 PR #241（`1e104d7`）合入。

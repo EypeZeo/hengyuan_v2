@@ -219,14 +219,15 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-055** | PRE_D3 | L3 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-056** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-057** | PRE_D3 | L2 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-058** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 1e104d7 |
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 37 | 4 | 21 | 12 | BLOCKED |
+| PRE_D3 | 38 | 4 | 22 | 12 | BLOCKED |
 | PRE_OWNER_LIVE | 14 | 0 | 3 | 11 | BLOCKED |
 | CANARY | 6 | 0 | 0 | 6 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 29，PARTIAL 24，IMPLEMENTED 4，合计 57，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 29，PARTIAL 25，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -244,6 +245,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 11. **FI-041 不关闭。** 出路已落地并实测（纯文档 PR 都得到四个 gate；探针 #140 证明红色 PR 被平台拒绝合并），缺的是闸门判定表的入库回归测试：PR #137 时的 304 种输入自测只在一次性本地脚本里，仓库里没有对应文件。
 12. **系统性发现。** 全树没有撤单路径（FI-016、FI-034 的“撤单”一半只能在状态机层面验证）；启动恢复状态机只被预检线束运行（M5b-1 起；临时存储、不含上一次运行的订单，线束自述“不是恢复路径”），没有在持久存储上运行的进程（FI-001、FI-004、FI-022 共同的缺口）；`check_clock_skew` 在复验基线 `6cb56bd` 时零生产调用点（FI-015、FI-040），已于 2026-10-11 随 PR #165 接到 `sync_clock` 的发布路径；“对账屏障”只被预检线束运行（FI-002、FI-003、FI-009、FI-043 共同的缺口；私网流迁移 M3a/M3b 之后，重连屏障与扫描传输以库的形式存在，M5b-1 起预检线束经流水线运行它们，对本地回环服务端证明过，没有对交易所运行过，也没有强杀重启，缺口仍在）。
 13. **批 3（蓝图 v2.8.0，主干 `58b60d0`）：新增 12 条故障用例同样没有一条能通过门禁。** FI-056、FI-057 判 `PARTIAL`（理由见各自的 note），其余 10 条判 `NOT_TESTABLE_YET`；注册表合计 57 条：`PARTIAL` 24、`NOT_TESTABLE_YET` 29、`IMPLEMENTED` 4，门禁 PASS 仍为 4 条（FI-032、FI-033、FI-037、FI-040）。各条的门禁登记与验证级别依据蓝图 `7.1` 在 v2.8.0 写明的释义（待 R-17 确认）；FI-048、FI-050 偏离输入报告的首个门禁标签，理由见蓝图 `附录 B` 的 B.1。
+14. **补登 FI-058（POST 回复的状态集与成交量不自洽），判 `PARTIAL`（2026-11-11，主干 `1e104d7`）。** 缺口来自 2026-11-09 审计分诊核实时的发现（蓝图附录 D 的 L-54），PR #241 关闭了它的代码一侧：解析器与编排器守卫都有单测，真实日志上一份过期回复之后重开恢复为 `Recovered`；没有强杀注入，也从未对真实交易所观察过这类回复。注册表合计 58 条：`PARTIAL` 25、`NOT_TESTABLE_YET` 29、`IMPLEMENTED` 4，门禁 PASS 仍为 4 条。
 
 ## 4 明细
 
@@ -1654,4 +1656,20 @@ baseline: 58b60d0
 open: absent:native/include/hengyuan/*.hpp#CapabilityUnsupported absent:native/include/hengyuan/*.hpp#CAPABILITY_UNSUPPORTED
 refs: test:native/tests/test_binance_ws_api_user_data_session.cpp#TheStreamIsConnectedOnlyOnceTheListingNamesExactlyTheConfirmedSubscription test:native/tests/test_binance_ws_api_user_data_session.cpp#AListingThatIsNotExactlyTheConfirmedSubscriptionEndsTheSession test:native/tests/test_binance_ws_api_user_data_session.cpp#ARefusedListingEndsTheSessionAndKeepsStatusCodeAndRetryAfter
 note: PARTIAL：回环单测断言只有订阅列表恰好列出刚确认的订阅时流才算已连接，列表不符或列表请求被拒答时会话结束并保留状态码（不以订阅确认推定就绪）；能力不受支持的单独分类与私网流降级状态不存在；2026-11-07 起 Testnet 上有了交易所一侧的证据（蓝图 L-39：未登录的连接上 `session.subscriptions` 回 200 并恰好列出那一个订阅），生产端点仍无。
+```
+
+```ledger
+id: FI-058
+title: POST 回复的状态集与成交量不自洽
+gate_tag: PRE_D3
+scope: 现货
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 1e104d7
+open: absent:native/tests/*.cpp#SIGKILL
+refs: test:native/tests/test_binance_private_rest.cpp#AReplysStatusAndExecutedQuantityMustAgreeWithEachOtherAndWithWhatWasSent test:native/tests/test_live_submit_orchestrator.cpp#AReplyThatNamesAStateNoNewOrderCanBeInIsAnUnknownResultNotADurableFrame test:native/tests/test_live_submit_orchestrator.cpp#AnExpiredInMatchReplyLeavesALogTheNextStartCanRecoverFrom pr:241@1e104d7
+note: PARTIAL：解析器只认 NEW（成交为零）、PARTIALLY_FILLED（严格居中）、FILLED（等于发出量），编排器另有守卫把不是 Submitting 合法后继的回复按未知结果处理，真实日志上一份过期回复之后重开恢复为 Recovered（均为单测，PR #241）；没有任何测试强杀进程，也从未对真实交易所观察过这类回复。
 ```

@@ -458,8 +458,8 @@ try {
             rows:boxes.reduce((n,b)=>n+b.querySelectorAll('tbody tr').length,0),
             scrollable:document.querySelector('.tw.tall').scrollHeight
                        >document.querySelector('.tw.tall').clientHeight};`);
-  check("三张故障用例表均启用容器内滚动，合计 57 行",
-    sticky0.boxes === 3 && sticky0.rows === 57 && sticky0.scrollable, JSON.stringify(sticky0));
+  check("三张故障用例表均启用容器内滚动，合计 58 行",
+    sticky0.boxes === 3 && sticky0.rows === 58 && sticky0.scrollable, JSON.stringify(sticky0));
   const sticky1 = await b.eval(`
     const box=document.querySelector('.tw.tall');
     box.scrollTop=900;
