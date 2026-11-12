@@ -14,7 +14,7 @@ audit — see its own section at the bottom). Each has its own config table and 
 run separately. Two further models closed the audit's remaining named gaps:
 `key_rotation.tla` (the two-step key rotation crash protocol, KEY-ROTATE-008) and
 `depth_snapshot_bootstrap.tla` (the Binance depth snapshot bootstrap state machine,
-MD-BOOK-002) — see their sections below. Three later models: `reconnect_sweep.tla` (the reconnect barrier and its sweep, private-stream migration M3a/M3b), `notsent_closure.tla` (the final send claim and the NotSent closure, Q23 slice 1) and `operator_resolution.tla` (the operator's way back for an order nothing else can close, D5).
+MD-BOOK-002) — see their sections below. Four later models: `reconnect_sweep.tla` (the reconnect barrier and its sweep, private-stream migration M3a/M3b), `notsent_closure.tla` (the final send claim and the NotSent closure, Q23 slice 1), `operator_resolution.tla` (the operator's way back for an order nothing else can close, D5) and `scope_approval.tla` (a signed scope in place of the per-order CONFIRM, R-25).
 
 ## Setup (one-time)
 
@@ -987,3 +987,136 @@ an unresolved order, and the exclusive log keeps it so).
 
 - `operator_resolution.tla` — the model.
 - `operator_resolution*.cfg` — see the table above.
+
+---
+
+## `scope_approval.tla` — a signed scope in place of the per-order CONFIRM (R-25, design `docs/SCOPE_APPROVAL_DESIGN.md`)
+
+The stateful part of the contract that would replace the operator's per-order confirmation (`OrderConfirmation`, Gate 11 of
+`live_submit_orchestrator.hpp`) once it has passed its own acceptance: a grant the Owner signs on his own machine (serial number, absolute
+expiry, a budget), the executor that installs it, charges orders against it and consumes it at the final send gate (task 1A.6,
+`notsent_closure.tla`), and everything that can happen to that grant meanwhile — revocation, replacement by a newer grant, expiry, the kill latch,
+a crash, a clock fault, the durable store being wiped. It reuses this directory's conventions (boolean switches, one must-fail config per
+switch, reachability probes) and is a separate module. **Nothing it models is implemented**, and the per-order CONFIRM gate stays until the new
+contract passes its own acceptance.
+
+**What it checks** (the design config must satisfy all of them)
+
+- `BudgetNeverExceeded`: the number of orders that may have crossed under one grant never exceeds its budget — across crashes, recovery,
+  replayed grants and a wiped store.
+- `NoClaimAfterRevokeAck`, `NoClaimUnderSuperseded`, `NoClaimUnderKilledScope`, `NoClaimWhileKilled`: once the Owner was told "revoked", once a
+  newer grant is installed, once a kill latched while the grant was live, or while the kill latch is set, no new order is claimed under it.
+- `NoClaimAfterExpiry`: no claim after the expiry instant, by TRUE time — not by what the executor believes.
+- `ClosedImpliesNeverCrossed`: a charge is given back only against a proof that the order never crossed. `LiveGrantsAreSigned`: only what the
+  Owner signed is ever live.
+- Three structural invariants behind the above: `CrossedImpliesDurableCharge`, `MemoryCountsMatchOrders`, `HWMCoversStatuses`.
+
+**The twelve switches** (`TRUE` = the design; **a config that turns one off MUST fail**)
+
+| Switch | `FALSE` means | Why the design has it |
+|---|---|---|
+| `AtomicScopeClaim` | "is the grant still live?" and the claim are two steps | the same shape as `AtomicClaim` in `notsent_closure.tla`: a stale answer is not a proof |
+| `ChargeBeforeClaim` | the charge is appended after the send | the charge rides on the `Prepared` frame: durable before any claim, no extra append |
+| `RebuildFromLog` | after a restart the counters start from zero | recovery recomputes the used budget from the durable charges |
+| `ChargeHeldUntilResolved` | a "leak guard" refunds an `Ambiguous` order | an order that may have filled must keep its charge until it is closed with proof |
+| `ReplayGuard` | any validly signed grant installs | serial strictly above the durable high-water mark; a revocation raises the mark |
+| `BindStore` | the grant does not name the store | a wiped store has a new identity and refuses the old grants |
+| `LatestWins` | a newer grant does not retire the older | narrowing by re-signing must be effective |
+| `RevokeAckAfterDurable` | "revoked" is reported as soon as memory has it | the Owner relies on the acknowledgement: it must be durable |
+| `KillInvalidatesScope` | the kill latch only blocks claims | clearing the latch must not bring back a grant signed before the incident |
+| `AbsoluteExpiry` | expiry becomes "valid for N", re-armed after a restart | the expiry is the instant the Owner signed |
+| `RequireClockToken` | the expiry check uses the local clock when the token is invalid | fail closed on an untrusted clock |
+| `PessimisticExpiry` | the raw reading is compared with the expiry | a valid token still allows a clock skew: use the upper bound |
+
+**Environment assumptions, not switches**: A1 the signature scheme is sound; A2 a truncated durable log is detected by the tip anchor (a restore
+of an older, internally consistent copy of the whole store is NOT detected — a declared limit, design §9); A3 the durable kill latch exists
+(SAFE-04; the tree has an in-memory one); A4 one executor at a time (task 6.7); A5 the D5 tool certifies "never crossed" only for an order that
+really never crossed.
+
+### The configs, and what each one MUST report
+
+| Config | Expected result |
+|---|---|
+| `scope_approval.cfg` | **No error found** — the design |
+| `scope_approval_saturation.cfg` | **No error found** — two crashes instead of one, manual only |
+| `scope_approval_stale_claim_bug.cfg` | **`NoClaimAfterRevokeAck` violated** — `AtomicScopeClaim = FALSE` |
+| `scope_approval_late_charge_bug.cfg` | **`BudgetNeverExceeded` violated** — `ChargeBeforeClaim = FALSE` |
+| `scope_approval_memory_counters_bug.cfg` | **`BudgetNeverExceeded` violated** — `RebuildFromLog = FALSE` |
+| `scope_approval_leak_release_bug.cfg` | **`ClosedImpliesNeverCrossed` violated** — `ChargeHeldUntilResolved = FALSE` |
+| `scope_approval_replay_bug.cfg` | **`NoClaimAfterRevokeAck` violated** — `ReplayGuard = FALSE` |
+| `scope_approval_store_wipe_bug.cfg` | **`BudgetNeverExceeded` violated** — `BindStore = FALSE` |
+| `scope_approval_old_scopes_bug.cfg` | **`NoClaimUnderSuperseded` violated** — `LatestWins = FALSE` |
+| `scope_approval_early_revoke_ack_bug.cfg` | **`NoClaimAfterRevokeAck` violated** — `RevokeAckAfterDurable = FALSE` |
+| `scope_approval_kill_resume_bug.cfg` | **`NoClaimUnderKilledScope` violated** — `KillInvalidatesScope = FALSE` |
+| `scope_approval_restart_expiry_bug.cfg` | **`NoClaimAfterExpiry` violated** — `AbsoluteExpiry = FALSE` |
+| `scope_approval_untrusted_clock_bug.cfg` | **`NoClaimAfterExpiry` violated** — `RequireClockToken = FALSE` |
+| `scope_approval_skew_expiry_bug.cfg` | **`NoClaimAfterExpiry` violated** — `PessimisticExpiry = FALSE` |
+| `scope_approval_probe.cfg` | **`SentNeverHappens` violated** — an order can be sent under a live grant |
+| `scope_approval_probe_second.cfg` | **`SecondGrantSentNeverHappens` violated** — ... under the second grant (the Owner re-signed) |
+| `scope_approval_probe_inflight.cfg` | **`SentThenRevokedNeverHappens` violated** — claim first, revoke second: in flight, no recall |
+| `scope_approval_probe_refund.cfg` | **`NoRefundNeverHappens` violated** — a charge can be given back |
+| `scope_approval_probe_recovered.cfg` | **`NoAmbiguousNeverHappens` violated** — an order can recover as `Ambiguous` and hold its charge |
+
+```bash
+cd formal
+java -cp tools/tla2tools.jar tlc2.TLC -workers auto -config scope_approval.cfg scope_approval.tla
+```
+
+TLC exits `0` on success and `12` on an invariant violation. The model has no liveness config on purpose: a system that refuses everything
+satisfies every invariant here, which is what the probes are for. Wired into `.github/workflows/ci-spec-verification.yml` (one run that must
+pass, the design; seventeen that must fail; the saturation run is manual).
+
+### Recorded results (2026-11-11, TLC 2.19, Java 25, 16 workers)
+
+| Config | States (distinct) | Result |
+|---|---|---|
+| main | 4,185,049 (depth 40) | no error — exhaustive, 26 s |
+| saturation | 13,057,720 (depth 42) | no error — 90 s |
+| stale_claim | 15,520 | `NoClaimAfterRevokeAck` violated ✓ (11-state trace: observe, revoke durably, claim) |
+| late_charge | 49,481 | `BudgetNeverExceeded` violated ✓ (11: claim, send, crash, recover, a second order) |
+| memory_counters | 64,442 | `BudgetNeverExceeded` violated ✓ (13) |
+| leak_release | 20,362 | `ClosedImpliesNeverCrossed` violated ✓ (10: claim, crash, recover as `Ambiguous`, the guard closes it) |
+| replay | 35,965 | `NoClaimAfterRevokeAck` violated ✓ (10) |
+| store_wipe | 258,469 | `BudgetNeverExceeded` violated ✓ (13: claim, crash, wipe, recover, the old grant installs again; with `NoClaimAfterRevokeAck` as the checked invariant it also reports the revoked grant that comes back) |
+| old_scopes | 6,394 | `NoClaimUnderSuperseded` violated ✓ (9) |
+| early_revoke_ack | 22,684 | `NoClaimAfterRevokeAck` violated ✓ (9: note in memory, told, crash, recover, claim) |
+| kill_resume | 9,950 | `NoClaimUnderKilledScope` violated ✓ (8: kill, operator clears it, claim) |
+| restart_expiry | 7,043 | `NoClaimAfterExpiry` violated ✓ (9) |
+| untrusted_clock | 6,993 | `NoClaimAfterExpiry` violated ✓ (11) |
+| skew_expiry | 5,500 | `NoClaimAfterExpiry` violated ✓ (9) |
+| probe / second / inflight / refund / recovered | 4,425 / 8,040 / 20,023 / 2,034 / 5,332 | each violated ✓ (9 / 10 / 10 / 7 / 8) |
+
+The counts of the violating runs vary with worker scheduling (TLC stops at the first hit). Bounds: 2 orders, 2 grant serials, 1 store wipe, 1 clock
+fault, 1 kill, true time 0..3 with a skew of 1, 1 crash (the control configs allow 2, the saturation run 2).
+
+### Mutation check
+
+Twenty-two one-line mutations of the design actions, each run against the design config on a scratch copy. Eighteen are killed, by the invariant
+that is meant to guard the line: a claim that ignores the kill latch (`NoClaimWhileKilled`); no budget check at admission, a charge recorded
+against the wrong grant (`BudgetNeverExceeded`); recovery that treats revoked grants as live (`NoClaimAfterRevokeAck` or `NoClaimUnderSuperseded`,
+whichever TLC reaches first), that forgets a charged order or counts a closed one (`MemoryCountsMatchOrders`); a revocation that does not raise
+the high-water mark (`HWMCoversStatuses`); a kill that revokes in memory only (`NoClaimUnderKilledScope`); an install that accepts what the Owner
+never signed (`LiveGrantsAreSigned`); an install that retires the higher serials, or only in memory (`NoClaimUnderSuperseded`); a D5 certification
+without proof, or a closed client-order-id admitted again (`ClosedImpliesNeverCrossed`); a claim before the `Prepared` frame
+(`CrossedImpliesDurableCharge`); no expiry check, or an expiry limit off by one (`NoClaimAfterExpiry` — the boundary is tight); a reservation or a
+charge that is never given back (`MemoryCountsMatchOrders`, a leak in the safe direction that the strict counter equality still catches). Four
+survive and are equivalent under the model's claims: the in-memory revocation mark no longer checked in `Live` (the Owner is told only after the
+durable write, which also removes the grant from the live set, so the mark only shortens the window before the acknowledgement); a refusal at the
+final gate that gives the charge back in memory without writing the durable `NotSent` (after a restart the order is `Ambiguous` and keeps its
+charge: safe, only conservative); an install of a serial whose revocation is still being made durable (the revocation then finishes the job); a
+wipe that keeps the old set of closed orders.
+
+### What is deliberately NOT in this model
+
+- The signature itself (a grant is valid iff the Owner signed it), the grant's static limits (symbol set, per-order cap, price deviation,
+  exposure: pure functions of the order, no state), the frame layout, more than one executor (task 6.7).
+- The decision word and the `NotSent` protocol (`notsent_closure.tla`): here a refused order is closed in one step. The non-atomic append and the
+  late fsync likewise: a charge that lands late can only tighten the budget.
+- The unit of the budget (the model counts orders; the code counts notional) and the clock itself (time is a small integer; `Skew` and the readings
+  model the clock token, not the clock).
+- Restoring an older, internally consistent copy of the whole store: not detectable by the executor, declared in design §9.
+
+### Files
+
+- `scope_approval.tla` — the model.
+- `scope_approval*.cfg` — see the table above.

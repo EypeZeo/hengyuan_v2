@@ -37,8 +37,8 @@ name: CI Spec Verification
 # minutes go DOWN, which is the actual constraint being optimized against here.
 #
 # Model count (2026-10 note): the paragraphs above describe the 7 models that existed when
-# this was consolidated. The job now runs 12 (one "Model:" step each; reconnect_sweep joined
-# with private-stream migration M3b, notsent_closure with Q23 slice 1, operator_resolution with D5). formal/ holds 13 .tla files: RoundEFDesignReceiptVerified.tla
+# this was consolidated. The job now runs 13 (one "Model:" step each; reconnect_sweep joined
+# with private-stream migration M3b, notsent_closure with Q23 slice 1, operator_resolution with D5, scope_approval with R-25). formal/ holds 14 .tla files: RoundEFDesignReceiptVerified.tla
 # is a research fork whose own header says its placement is deliberately unset until a design
 # freeze, so it is intentionally not run here.
 
@@ -201,7 +201,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
-    # Sum-ceiling across 12 sequential models (7 when consolidated), was 7 x independent 20-min caps
+    # Sum-ceiling across 13 sequential models (7 when consolidated), was 7 x independent 20-min caps
     # possible in parallel before this consolidation -- see this file's header
     # comment for why billed minutes (not wall-clock) is the thing being
     # optimized here.
@@ -218,7 +218,7 @@ jobs:
 
       # tla2tools.jar is gitignored (a 2MB binary does not belong in the tree),
       # so CI fetches the pinned release the same way the local setup does.
-      # ONE fetch for all 12 models below, not 12.
+      # ONE fetch for all 13 models below, not 13.
       - name: Cache TLA+ tools
         id: cache-tla
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -685,6 +685,62 @@ jobs:
           done
           exit $fail
 
+      - name: "Model: scope_approval (a signed scope in place of the per-order CONFIRM, R-25)"
+        id: m_scope_approval
+        continue-on-error: true
+        working-directory: formal
+        # One run MUST pass: the design (about 4.2 million states; the manual saturation run with two crashes is not run here). Seventeen MUST fail, each
+        # with the invariant named: twelve turn one design decision OFF (the claim and the liveness test as two steps, a charge appended after the send,
+        # counters that are not rebuilt from the log, a leak guard that refunds an Ambiguous order, no replay guard, a grant that does not name the
+        # store, a newer grant that does not retire the older, a revocation acknowledged before it is durable, a kill latch that does not end the grant,
+        # an expiry re-armed after a restart, an untrusted clock, a raw clock reading), five are reachability probes that keep the invariants from
+        # holding vacuously. No liveness is claimed. See formal/README.md and docs/SCOPE_APPROVAL_DESIGN.md.
+        run: |
+          set -u
+          # Must pass: the design.
+          java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC -workers auto -config scope_approval.cfg scope_approval.tla || exit 1
+
+          # Must fail, each with the named message.
+          fail=0
+          for pair in \
+            "scope_approval_stale_claim_bug.cfg|Invariant NoClaimAfterRevokeAck is violated|the liveness test and the claim are two steps (the claim trusts a stale answer)" \
+            "scope_approval_late_charge_bug.cfg|Invariant BudgetNeverExceeded is violated|the charge is appended after the send, so a crash can lose it" \
+            "scope_approval_memory_counters_bug.cfg|Invariant BudgetNeverExceeded is violated|the counters start from zero after a restart instead of being rebuilt from the durable charges" \
+            "scope_approval_leak_release_bug.cfg|Invariant ClosedImpliesNeverCrossed is violated|a leak guard refunds an Ambiguous order without proof that it never crossed" \
+            "scope_approval_replay_bug.cfg|Invariant NoClaimAfterRevokeAck is violated|any validly signed grant installs: a revoked grant is live again" \
+            "scope_approval_store_wipe_bug.cfg|Invariant BudgetNeverExceeded is violated|the grant does not name the store: after a wipe the old grant's spent budget is new again" \
+            "scope_approval_old_scopes_bug.cfg|Invariant NoClaimUnderSuperseded is violated|a newer grant does not retire the older live one" \
+            "scope_approval_early_revoke_ack_bug.cfg|Invariant NoClaimAfterRevokeAck is violated|the Owner is told 'revoked' before the revocation is durable" \
+            "scope_approval_kill_resume_bug.cfg|Invariant NoClaimUnderKilledScope is violated|the kill latch does not end the grant: clearing it brings the grant back" \
+            "scope_approval_restart_expiry_bug.cfg|Invariant NoClaimAfterExpiry is violated|the expiry is a duration re-armed after a restart or a late install" \
+            "scope_approval_untrusted_clock_bug.cfg|Invariant NoClaimAfterExpiry is violated|the expiry check uses the local clock when the clock token is invalid" \
+            "scope_approval_skew_expiry_bug.cfg|Invariant NoClaimAfterExpiry is violated|the raw clock reading is compared with the expiry (no allowance for the skew)" \
+            "scope_approval_probe.cfg|Invariant SentNeverHappens is violated|reachability probe (an order can be sent under a live grant)" \
+            "scope_approval_probe_second.cfg|Invariant SecondGrantSentNeverHappens is violated|reachability probe (an order can be sent under the second grant)" \
+            "scope_approval_probe_inflight.cfg|Invariant SentThenRevokedNeverHappens is violated|reachability probe (claim first, revoke second: in flight)" \
+            "scope_approval_probe_refund.cfg|Invariant NoRefundNeverHappens is violated|reachability probe (a charge can be given back)" \
+            "scope_approval_probe_recovered.cfg|Invariant NoAmbiguousNeverHappens is violated|reachability probe (an order can recover as Ambiguous and hold its charge)"
+          do
+            cfg="${pair%%|*}"; rest="${pair#*|}"
+            msg="${rest%%|*}"; desc="${rest#*|}"
+            echo "::group::$cfg — expecting '$msg'"
+            echo "  control: $desc"
+            if java -XX:+UseParallelGC -cp tools/tla2tools.jar tlc2.TLC \
+                 -workers auto -config "$cfg" scope_approval.tla > "/tmp/$cfg.log" 2>&1; then
+              echo "::error::$cfg PASSED but was expected to report '$msg'. The model has stopped discriminating; do not trust the safety run until this is fixed."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            elif grep -q "$msg" "/tmp/$cfg.log"; then
+              echo "  OK: '$msg' as expected"
+            else
+              echo "::error::$cfg failed, but NOT with the expected '$msg'. It may be erroring for an unrelated reason (parse error, missing constant), which would silently disable this control."
+              tail -30 "/tmp/$cfg.log"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
       # Aggregate: turns any individual model's failure into an overall job
       # failure. `if: always()` so this runs even though every model step
       # above is `continue-on-error: true`. Each model's own pass/fail is
@@ -707,6 +763,7 @@ jobs:
           [ "${{ steps.m_reconnect_sweep.outcome }}" = "failure" ] && { echo "::error::reconnect_sweep failed"; fail=1; }
           [ "${{ steps.m_notsent_closure.outcome }}" = "failure" ] && { echo "::error::notsent_closure failed"; fail=1; }
           [ "${{ steps.m_operator_resolution.outcome }}" = "failure" ] && { echo "::error::operator_resolution failed"; fail=1; }
+          [ "${{ steps.m_scope_approval.outcome }}" = "failure" ] && { echo "::error::scope_approval failed"; fail=1; }
           exit $fail
 
   # Always runs and is the only check of this workflow meant to be a required status check: it passes only if
