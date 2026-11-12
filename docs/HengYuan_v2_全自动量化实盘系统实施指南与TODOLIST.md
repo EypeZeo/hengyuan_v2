@@ -2424,6 +2424,14 @@ $$
 - 没有改：任何实现、枚举取值、日志字节、授权、站点、任务或 FI 的状态与计数（任务仍是 71，FI 仍是 58，站点仍是 27）；逐单 CONFIRM 门保持；首笔实盘订单仍由 Owner 本人执行。设计里的 D3 至 D10 是起草者的默认值：Owner 合并了 PR，但没有逐条对它们表态，所以它们仍是默认值、待他逐条确认。
 - 仍然开放：验签库选型与硬件密钥的设备能力核实（外部事实，未核）；整份旧副本恢复的缓解（交易所侧见证，S-I）；两份日志的耦合方式（D9，S-B）；实现切片 S-A 至 S-I 都需要 Owner 选定与“开始”，它们的启用与验收依赖任务 1A.6、SAFE-04 与 1A.7。
 
+**2026-11-12 Q23 切片 S2/S3：NotSent 闭合的读者侧**（Owner 于 2026-11-12 对计划说“开始，命名按你的建议”，对提交说“验证通过就提交并开 PR”，对 PR #250 说“合并 250，然后继续自主推进”；Tier B；PR #250 于 2026-11-12 合入，合并提交 `979a94b`）：
+
+- 合入的内容：S2（codec 读者）与 S3（状态机与恢复）合为一片，只做**读者侧**。事件 `AuditEventType::OrderNeverSent` = 23 与订单状态 `OrderState::NeverSent` = 12 只在 v6 帧里合法（v5 的两个上界不动，今天所有存储仍写 v5，日志字节不变）；`validate_transition()` 新增两条边 `Intent` → `NeverSent`、`Submitting` → `NeverSent`（没有 `Ambiguous` → `NeverSent`），`is_resolved()` 是 `is_exchange_final()` 或 `NeverSent`（`is_exchange_final()` 一字未改）；恢复扫描按 `docs/NOTSENT_CLOSURE_DESIGN.md` §4.6 读取并校验，闭合的订单只计数（`recovered_never_sent()`），不进检查点、不算 `Intent` 孤儿；规则在新头文件 `never_sent_rules.hpp`（`check_closure()`），读者现在用，S4、S6 的写者以后调用同一个函数。**树里没有任何生产代码能写这个帧**，`test_never_sent_guard` 钉死这一点。命名：设计里的 “NotSent” 在代码里叫 `OrderNeverSent` / `NeverSent`，因为 `QueryOutcome::NotSent`（R-10）已经表示“对账查询没有离开进程”。
+- 我在片内定的决定（Owner 合并 PR 时没有逐条表态，仍是我的默认值）：`detail_code`（拒绝原因）不检查；被闭合的订单只计数、不留列表；`append_durable()` 不改；sink 里不加“已闭合”标志位（`NeverSent` 是终态，其后一切帧都被现有规则拒绝）。
+- 证据：MSVC（`/W4 /WX`）全量零警告、ctest 3658/3658；57 个变异体全部被杀死（规则 18、状态机 9、codec 8、sink 15、`audit_trail` 1、守卫 6），没有等价变异体；四个静态检查（`spec_xref_check`、`spec_enum_diff`、`concurrency_targets_check`、`closure_ledger_check`）0 发现；本地 WSL2 连续失败两次（16 路并行把 7.6 GB 的虚拟机内存耗尽；`Wsl/Service/E_UNEXPECTED`），按 `CLAUDE.md` 改在 tokyo-vps 上跑 GCC-14 `none` 与 `address`（ASan+UBSan）18 个目标，全过、零警告；CI 的 `native-build-test` 全量通过；手动 `CI Native Sanitizers` run `43225788623`：三个任务全部成功（ASan+UBSan 全量、TSan 并发测试与负控、ARM64 弱内存序硬件）。`address` 层抓到我自己一个测试里的 GCC `-Werror=stringop-truncation`（96 字符字面量传给 64 字节缓冲区的 `set_detail()`），在同一个 PR 里修掉。
+- 同步的文档：`docs/SPEC_INVARIANTS.md`（新条目）、`docs/NOTSENT_CLOSURE_DESIGN.md`（头部、§4.6、§8）、`docs/NATIVE_ARCHITECTURE.md`（都在 PR #250 里）；本条、主题表 Q23 一行、`docs/AUDIT_CLOSURE_LEDGER.md` 一行与设计文档头部的合入记录（本次状态补录）。FI-055、FI-056 的状态、门禁结论与证据不变：读者不是写者，发送路径上还没有任何代码写这个帧。
+- 仍然开放：写者 S4（sink 追加，故障注入）、S5（最终门，任务 1A.6、FI-055，要新增一个 TSan 负控）、S6（类 A 闭合，SAFE-07、FI-056，Q19 先量成本）、S7（迁移与“写 v6”的开关，仅当存在真实日志）；每一片都是 Tier B，须 Owner 选定、计划与“开始”。风险（PR #250 里写明）：读者证明不了“写者不会写出读者拒绝的帧”，那是 S4 与 S6 的证据；`is_terminal()` 现在含 `NeverSent`，但它在生产里只有 `validate_transition()` 自己调用，没有行为变化——真正要在写者切片里改的是 `is_exchange_final()` 的消费者（`order_tracker.hpp` 的在途槽位遍历与 `mark_resolved` 的触发、`live_submit_orchestrator.hpp` 的终态分支、`startup_recovery.hpp` 的检查点判断），它们看不见被 `NeverSent` 闭合的订单，S4、S6 要让它们认 `is_resolved()` 并按设计 §4.4 的顺序释放；旧二进制读到含事件 23 的日志会 `MalformedEnum`（失败关闭），S7 的迁移清单要列这一点。
+
 ### B.1 v2.9.0（2026-10-23 学术工程复核；含其后至 2026-11-11 的状态补录）
 
 - 基点 `72a3f18`，v2.8.0 按原字节归档并校验 SHA-256（0.1）；以下 B.2/B.3 均为历史记录，不是现行协议裁定。本次只改文档、ADR 补充与生成 HTML，未修改任何实现或授权配置。
@@ -3565,7 +3573,7 @@ CS = alpha_perp/(ones' * alpha_perp)
 | Q20 自动围栏实现 | 仍开放：Owner 选定有限自动恢复目标，不是已实现/已授权运行。 | R-20、F.5、S-14、ADR 补充；真实旧发送能力隔离、在途排空/对账、危险锁存、全门恢复及 FI-047 正负控后才可生效。 |
 | Q21 R2 权限/费用/恢复 | 仍开放：产品、180 天与 5 美元预算已选；无 DELETE 保证、保留例外、实际费用和恢复均未验。 | F.7、S-11；权限负控、全内容读回/清单、冻结集、预算告警及恢复演练；不能以锁可配置或 PUT 成功关闭整项。 |
 | Q22 撤单工作流/FI | 仍开放：协议文字确认不证明取消闭环。 | F.7/F.9；验应答丢失/部分成交/更名 alias/-2011/预算/其他 sender/普通与算法域、存储故障审计；不自动清仓，未知不释放。 |
-| Q23 NotSent 与迁移 | 仍开放：OWNER_APPROVED_DESIGN；2026-10-25 语义已冻结（`docs/NOTSENT_CLOSURE_DESIGN.md`）并有 TLA+ 协议模型（`formal/notsent_closure.tla`：设计配置无反例，8 个开关各有必败配置），现代码仍未实现新事件/格式。 | R-18/R-22、F.5/F.9；语义与协议模型已冻结（设计文档 4 至 7），剩余：严格 v5/v6 读者与迁移崩溃、持久失败/晚 ACK 的实现测试、唯一发送 claim 的并发实现与 TSan 负控、旧 AbortedPreSend 负控的实现侧用例、恢复验收。 |
+| Q23 NotSent 与迁移 | 仍开放：OWNER_APPROVED_DESIGN；2026-10-25 语义已冻结（`docs/NOTSENT_CLOSURE_DESIGN.md`）并有 TLA+ 协议模型（`formal/notsent_closure.tla`：设计配置无反例，8 个开关各有必败配置），**读者侧已于 2026-11-12 实现**（PR #250，`979a94b`：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12、v6 的合法集合、恢复表 §4.6、`never_sent_rules.hpp`），写者没有（树里没有任何代码写这个帧）。 | R-18/R-22、F.5/F.9；语义与协议模型已冻结（设计文档 4 至 7），读者侧已落地，剩余：写者（S4 sink 追加、S5 最终门、S6 类 A 闭合）、迁移崩溃（S7）、持久失败/晚 ACK 的实现测试、唯一发送 claim 的并发实现与 TSan 负控、旧 AbortedPreSend 负控的实现侧用例、恢复验收。 |
 
 前轮最小公开观察的可追溯摘要（不是本次新增抓帧，也不是完整原始 fixture）：
 
