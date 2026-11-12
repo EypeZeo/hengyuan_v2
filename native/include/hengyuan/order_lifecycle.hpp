@@ -45,6 +45,13 @@ enum class OrderState : std::uint8_t {
                           // state the query discovered (Filled/Cancelled/Rejected/Expired),
                           // never to this generic bucket. Do not add a transition into it.
     EscalatedToOperator = 11, // Ambiguous could not be resolved → human takeover
+    // Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 3 and 4.6): the order PROVABLY never crossed -- a durable frame, written by
+    // the owner that had decided not to send, says so. Terminal, but NOT an exchange state (the exchange never heard of
+    // it): is_exchange_final() stays false for it and is_resolved() is the predicate that holds. Reached only from Intent
+    // (refused before its Prepared frame, class A) and Submitting (refused by the final gate after it, class B) -- never
+    // from Ambiguous: recovery cannot close an order that may have crossed. Legal ONLY in v6 frames. In this build only the
+    // recovery reader knows it; nothing live moves an order into it (test_never_sent_guard.cpp pins that).
+    NeverSent = 12,
 };
 
 inline const char* order_state_name(OrderState s) noexcept {
@@ -61,6 +68,7 @@ inline const char* order_state_name(OrderState s) noexcept {
         case OrderState::Expired: return "Expired";
         case OrderState::Reconciled: return "Reconciled";
         case OrderState::EscalatedToOperator: return "EscalatedToOperator";
+        case OrderState::NeverSent: return "NeverSent";
     }
     return "Unknown";
 }
@@ -79,7 +87,8 @@ constexpr bool is_terminal(OrderState s) noexcept {
            s == OrderState::Cancelled ||
            s == OrderState::Expired ||
            s == OrderState::Reconciled ||
-           s == OrderState::EscalatedToOperator;
+           s == OrderState::EscalatedToOperator ||
+           s == OrderState::NeverSent;
 }
 
 // is_terminal(EscalatedToOperator) is true (no further automatic transition ever
@@ -98,6 +107,17 @@ inline bool is_exchange_final(OrderState s) noexcept {
            s == OrderState::Expired;
 }
 
+// Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6): "nothing is left to recover for this order" -- an exchange-final state, or
+// the durable proof that it never crossed (NeverSent). A NEW predicate on purpose: is_exchange_final()'s comment above says
+// what it means ("the exchange can no longer be holding this order") and NeverSent is not an exchange state at all, so
+// widening it would make every caller that asks the exchange question answer a different one. The recovery scan (skip an
+// order that needs neither a checkpoint nor an orphan count) is the first and, in this slice, only caller; the slot release
+// and the retention filters join it when the writers do (S4, S6). Reconciliation targets are NOT derived from it: no
+// reconcile or query result can name NeverSent (order_tracker.hpp lists its legal targets explicitly).
+inline bool is_resolved(OrderState s) noexcept {
+    return is_exchange_final(s) || s == OrderState::NeverSent;
+}
+
 // constexpr (M4): order_durable_path.hpp derives which frames make a WebSocket observation replayable from this very
 // function, at compile time, so its table can be static_assert-ed and can never drift from the state machine.
 constexpr TransitionResult validate_transition(OrderState from, OrderState to) noexcept {
@@ -106,8 +126,15 @@ constexpr TransitionResult validate_transition(OrderState from, OrderState to) n
     switch (from) {
         case OrderState::Intent:
             if (to == OrderState::Submitting) return TransitionResult::Ok;
+            // Q23 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6, class A): refused after its Intent frame and before its Prepared frame
+            // -- the durable proof that nothing was ever sent. Only the recovery reader replays this edge in this build.
+            if (to == OrderState::NeverSent) return TransitionResult::Ok;
             break;
         case OrderState::Submitting:
+            // Q23 (class B): refused by the final gate after the Prepared frame, by the owner that had not yet claimed the
+            // send. NOT from Ambiguous below: an order that may have crossed is closed by the exchange or by the operator
+            // tool (D5), never by the process's own say-so after the fact.
+            if (to == OrderState::NeverSent) return TransitionResult::Ok;
             if (to == OrderState::Accepted ||
                 to == OrderState::Rejected ||
                 to == OrderState::Ambiguous ||

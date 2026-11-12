@@ -702,6 +702,29 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_operator_resolution_guard)
     gtest_discover_tests(test_operator_resolution_guard)
 
+    # Q23 slices S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3, 4.6 and 8): the NeverSent reader. The closure rule on its own
+    # (never_sent_rules.hpp, pure logic: no logs), the recovery reader's handling of OrderNeverSent frames and of the state
+    # NeverSent -- crafted logs, since the writers are slices S4 and S6, but every frame is made by the production encoder
+    # and every log is read by the production sink and verifier -- and the guard that nothing live names the event or the
+    # state. The guard reads the source tree, so the native/ directory is a compile definition (same shape as
+    # test_operator_resolution_guard above).
+    add_executable(test_never_sent_rules tests/test_never_sent_rules.cpp)
+    target_link_libraries(test_never_sent_rules PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_never_sent_rules)
+    gtest_discover_tests(test_never_sent_rules)
+
+    add_executable(test_never_sent_reader tests/test_never_sent_reader.cpp)
+    target_link_libraries(test_never_sent_reader PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_never_sent_reader)
+    gtest_discover_tests(test_never_sent_reader)
+
+    add_executable(test_never_sent_guard tests/test_never_sent_guard.cpp)
+    target_link_libraries(test_never_sent_guard PRIVATE hengyuan_core GTest::gtest_main)
+    target_compile_definitions(test_never_sent_guard PRIVATE
+        HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    hengyuan_set_warnings(test_never_sent_guard)
+    gtest_discover_tests(test_never_sent_guard)
+
     # D5 slice R2 (docs/OPERATOR_RESOLUTION_DESIGN.md 5, 6 and 10): the decisions behind an OrderOperatorResolved
     # frame's evidence (operator_resolution_evidence.hpp) -- the fence arithmetic, the allOrders windows, the client order
     # id's timestamp and the rules that turn the exchange's verdicts into a conclusion. Pure logic: it links no JSON

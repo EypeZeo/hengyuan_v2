@@ -600,7 +600,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       sink，控制面仍是 `kFrameFormatVersion`。`validate_transition()` 对 `EscalatedToOperator` 出发的每条边仍是 `AlreadyTerminal`
       （`test_order_lifecycle.cpp`）。导出器（`durable_audit_export.hpp`）同读 v5/v6、同样拒绝版本回退，清单报告日志里最高的版本。
     - **仍未覆盖**：写事件 22 的一方（切片 R3 的离线工具）；证据原语（R2，已落地，见下一条）；迟到成交告警（R4）；环境与账户绑定
-      （R5，生产启用的前置）；NotSent 的状态与事件（`docs/NOTSENT_CLOSURE_DESIGN.md` S2/S3，会在同一个 v6 里再追加）；迁移（没有真实
+      （R5，生产启用的前置）；NotSent 的状态与事件（`docs/NOTSENT_CLOSURE_DESIGN.md` S2/S3，**已落地**，见下面的 “Q23 切片 S2/S3” 条目：在同一个 v6 里追加了事件 23 与状态 12）；迁移（没有真实
       日志之前不需要）。
 
   - **[D5 切片 R2 已落地：证据原语——栅栏算术、查询结果分类、`allOrders` 窗口、结论函数]**（`docs/OPERATOR_RESOLUTION_DESIGN.md` §5、
@@ -932,6 +932,37 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - **没有量出的**：`allOrders` 的读延迟 L（需要在 Testnet 下几张单，Owner 的动作，探针不含）；`-2026`（订单存在过但已归档）的真实表现（需要一张已归档的订单）；真实的 `hy_operator_resolve` 对 Testnet 的一次运行（运行手册一节与崩溃窗口订单的演练，R6 的其余部分）；Production 的 `uid` 与 -2013 表现（只读的 Production 凭据 `HENGYUAN_OPERATOR_LIVE_*` 至今没有用过）。Owner 到 Testnet 的链路慢（往返 1.7 至 3.4 秒），从那台机器量的任何延迟都会有噪声。
     - **关闭了的开放问题**：上面 R3b-1、R3b-2、R3b-3 与 R4 条目的 “仍未覆盖” 把 “Testnet 的 `/api/v3/account` 是否带 `uid`（若不带，流程会以 `AccountUnverified` 挡住演练）” 与 “`-2013` 的真实状态码” 记为未量，设计 §9 把 “`-2013` 的状态是声明的一部分、真实表现由 R6 测量” 当作假设；这两件现已量过：Testnet 带 `uid`，工具不会挡住演练；不存在的订单就是 HTTP 400 / -2013。那几个条目保持写作当时的原文，答案在这里。
     - **验证**：py_compile、ruff check（E、F、W）通过；离线自检（假传输）覆盖恰好 5 个 GET、请求头带密钥且查询带 `timestamp` / `recvWindow` / `signature`、输出里没有密钥 / 密钥串 / `uid` 的值、`uid` 存在与缺失两条路径、没有凭据时退出码 2 且不发任何请求、`.env` 解析。没有触碰 `native/`，所以原生 CI 没有运行。
+
+  - **[Q23 切片 S2/S3 已落地：读者先行——`OrderNeverSent` 帧与订单状态 `NeverSent`]**（`docs/NOTSENT_CLOSURE_DESIGN.md` §4.3、§4.6、§8；
+    Owner 2026-11-12 看过计划说“开始，命名按你的建议”；Tier B）：“这个订单从未越过发送边界”的持久闭合帧，恢复读者现在能读、能校验，
+    但**没有任何生产代码能写它**：写者是 S4（最终门的拒绝，类 B）与 S6（`Prepared` 之前的拒绝，类 A），本片只让读者先行（设计 §5 第 4 条）。
+    - **新增符号**：`AuditEventType::OrderNeverSent` = 23（只在 v6 帧里合法）；`OrderState::NeverSent` = 12（只在 v6 帧里合法；终态，
+      **不是**交易所终态）；`is_legal_order_state_for_version()`（与事件类型的版本界同形：v5 的界仍是 `EscalatedToOperator`，v6 多一个值）；
+      `encode_order_event_frame()` 对该版本里非法的状态同样返回 0、什么都不写；`is_resolved()`（`is_exchange_final()` 或 `NeverSent`，
+      `is_exchange_final()` 的含义一字未改）；`validate_transition()` 的两条新边 `Intent` → `NeverSent` 与 `Submitting` → `NeverSent`（
+      **没有** `Ambiguous` → `NeverSent`）；`never_sent_rules.hpp`（`ClosureTarget`、`ClosureCheck`、`check_closure()`、`pairing_holds()`，
+      读者现在用、写者以后用同一条规则）；`DurableAuditSink::recovered_never_sent()`。**命名**：设计文档里的 “NotSent” 在代码里叫
+      `OrderNeverSent` / `NeverSent`，因为 `QueryOutcome::NotSent`（`order_tracker.hpp`）已经表示“对账**查询**没有离开进程”，两者不能混。
+    - **帧格式**：v6 与 v5 布局完全相同（256 字节）；v6 的合法事件上界由 22 升到 23、合法状态上界由 11 升到 12；v5 帧里出现事件 23 或状态 12
+      各自都是 `MalformedEnum`（事件与状态分别检查，只查一个的读者会放过另一个）。
+    - **读者规则**（`run_recovery_scan_impl()`，设计 §4.6；任何一条不满足 = 整本日志 `Corrupt`，接收器围栏）：① 订单此前的状态只能是
+      `Intent`（类 A）或 `Submitting`（类 B，`Prepared` 之后），经共享状态机——`Ambiguous` 及其后的任何状态都不行（恢复不能闭合可能已越过发送
+      边界的订单）；② 订单此前没有出现过交易所订单号或成交；③ 事件类型与结果状态是同一个事实说两遍——只说一半的帧在日志的任何位置都是
+      `Corrupt`，作为某订单号的首帧也是；④ 帧不带交易所订单号、成交与均价，且品种、方向、价格、数量、模式与 Intent 帧一致；⑤ 它是该订单号的
+      **最后一帧**（之后任何帧，重复的闭合与操作员的闭合也算，都是 `Corrupt`；先被操作员结清的订单也不能再被闭合）；⑥ 只在 v6 帧里合法。
+      `detail_code` 是拒绝原因，**不检查**（未知的值不是损坏：帧有 MAC，读者不该让一个说明性字段变成让存储打不开的办法）。
+      读者无法核实“它真的没有越过边界”——只有写者知道它是否取得了发送 claim——这条保证在协议里（`formal/notsent_closure.tla` 的
+      `NotSentImpliesNeverCrossed`）与写者里；读者能做的，是拒绝一切与日志已经显示的事实相矛盾的帧。
+    - **产物**：被闭合的订单既不进 `recovered_checkpoints()`、也不算 Intent 孤儿，不占在途表与孤儿预算，`StartupRecovery` 不等它；只计数
+      （`recovered_never_sent()`），不留列表——后续阶段是否要再认出这类订单（像迟到成交告警认操作员结清的订单那样）是写者切片的问题：类 A 闭合
+      跟在每一次本地拒绝之后，集合可能很大。导出器（`durable_audit_export.hpp`）同读 v6 帧，事件名 `ORDER_NEVER_SENT`、状态名 `NeverSent`。
+    - **守卫**（`test_never_sent_guard.cpp`，读源码）：事件 23 只被定义处、编解码、闭合规则与读者提及（逐文件钉次数）；状态 `NeverSent` 只被状态
+      机、编解码、规则与读者提及；编排器、跟踪器、各发布者、启动恢复与 `src/` 一个都不提；`check_closure()` 与 `is_resolved()` 只有恢复扫描调用；
+      `recovered_never_sent()` 没有生产读者。`validate_transition()` 的 13×13 全表（`test_order_lifecycle.cpp`）钉死两条新边与“没有任何边离开它”，
+      `test_order_durable_path.cpp` 的表里新增 `NeverSent` 一行（对它的任何交易所报告都是矛盾）。
+    - **仍未覆盖**：写事件 23 的一方（S4：最终门与决定字；S6：类 A 闭合与 SAFE-07 的孤儿）；槽位释放与压实保留改用 `is_resolved()`（写者切片，
+      对账目标集合不含新状态：`order_tracker.hpp` 的合法目标是显式列表，没有改）；迁移清单与读者先行开关（S7，没有真实日志之前不需要）；晚到成交
+      对已闭合订单的告警（写者切片决定是否需要、怎样认出这些订单）。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 

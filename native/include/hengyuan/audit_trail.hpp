@@ -56,6 +56,14 @@ enum class AuditEventType : std::uint8_t {
     // that document's 7.2 and nowhere else. Nothing in the live process may construct one
     // (test_operator_resolution_guard.cpp pins that), and in R1 nothing at all does: the writer is slice R3.
     OrderOperatorResolved = 22,
+    // Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 and 4.6): the durable closing frame of an order that PROVABLY never
+    // crossed -- refused before its request could leave the process, by a writer that had decided not to send. Appended at
+    // the end like every prior addition. Legal ONLY in a v6 frame (durable_frame_codec.hpp), and READ-ONLY in this build:
+    // the recovery scan accepts it under the rules of that document's 4.6 and nowhere else, and nothing constructs one
+    // (test_never_sent_guard.cpp pins that); the writers are slices S4 (class B, the final gate) and S6 (class A).
+    // Named "NeverSent" and not "NotSent" on purpose: QueryOutcome::NotSent (order_tracker.hpp) already means "a reconcile
+    // QUERY never left this process", a statement about a query, and the two must never be mistaken for each other.
+    OrderNeverSent = 23,
 };
 
 inline const char* audit_event_name(AuditEventType t) noexcept {
@@ -83,6 +91,7 @@ inline const char* audit_event_name(AuditEventType t) noexcept {
         case AuditEventType::OrderSubmitPrepared: return "ORDER_SUBMIT_PREPARED";
         case AuditEventType::UserDataStreamEventObserved: return "USER_DATA_STREAM_EVENT_OBSERVED";
         case AuditEventType::OrderOperatorResolved: return "ORDER_OPERATOR_RESOLVED";
+        case AuditEventType::OrderNeverSent: return "ORDER_NEVER_SENT";
     }
     return "UNKNOWN";
 }

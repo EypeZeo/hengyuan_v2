@@ -436,16 +436,21 @@ void set_version_and_resign(std::vector<std::byte>& frame, std::uint8_t version,
 
 TEST(AuditEventTypeBounds, EachVersionHasItsOwnNewestEventType) {
     constexpr auto kNewestV5 = static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
-    constexpr auto kNewestV6 = static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved);
-    static_assert(kNewestV5 == 21 && kNewestV6 == 22, "the wire values are ABI; renumbering reinterprets every frame");
+    constexpr auto kOperatorV6 = static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved);
+    constexpr auto kNewestV6 = static_cast<std::uint8_t>(AuditEventType::OrderNeverSent);
+    static_assert(kNewestV5 == 21 && kOperatorV6 == 22 && kNewestV6 == 23,
+                  "the wire values are ABI; renumbering reinterprets every frame");
 
     EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV5, kFrameFormatVersion));
-    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kNewestV6, kFrameFormatVersion))
+    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kOperatorV6, kFrameFormatVersion))
         << "the operator event must not exist in a v5 frame";
+    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kNewestV6, kFrameFormatVersion))
+        << "the NeverSent event must not exist in a v5 frame (Q23 S2/S3)";
     EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV5, kFrameFormatVersionV6));
+    EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kOperatorV6, kFrameFormatVersionV6));
     EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV6, kFrameFormatVersionV6));
     EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kNewestV6 + 1, kFrameFormatVersionV6))
-        << "v6 raises the bound by exactly one value";
+        << "v6 raises the bound by exactly the two values it adds";
     for (std::uint8_t e = 0; e <= kNewestV5; ++e) {
         EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(e, kFrameFormatVersion)) << unsigned{e};
         EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(e, kFrameFormatVersionV6)) << unsigned{e};
@@ -457,6 +462,7 @@ TEST(AuditEventTypeBounds, EachVersionHasItsOwnNewestEventType) {
     }
     // The pre-v6 one-argument form is the v5 bound, unchanged.
     EXPECT_TRUE(detail::is_legal_audit_event_type(kNewestV5));
+    EXPECT_FALSE(detail::is_legal_audit_event_type(kOperatorV6));
     EXPECT_FALSE(detail::is_legal_audit_event_type(kNewestV6));
 }
 
@@ -481,7 +487,7 @@ TEST(AuditRecordCodecV6, EventTypeOneAboveTheV6BoundIsStillRejected) {
     AuditRecord rec = make_sample_record();
     std::array<std::byte, kAuditRecordWireSize> buf{};
     encode_audit_record(buf, rec);
-    buf[8] = std::byte{23};  // event_type is payload offset 8; 23 is one past OrderOperatorResolved
+    buf[8] = std::byte{24};  // event_type is payload offset 8; 24 is one past OrderNeverSent (23), the newest v6 event
     AuditRecord decoded{};
     EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersionV6));
 }
@@ -585,7 +591,7 @@ TEST(OrderEventFrameCodecV6, EncoderRefusesVersionsAndEventTypesTheReaderWouldRe
             << "version " << unsigned{version};
     }
     AuditRecord beyond = make_sample_record();
-    beyond.event_type = static_cast<AuditEventType>(23);  // one past the v6 bound
+    beyond.event_type = static_cast<AuditEventType>(24);  // one past the v6 bound (OrderNeverSent = 23)
     EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, beyond, kZeroMac, key,
                                        kFrameFormatVersionV6),
               0u);
@@ -621,4 +627,183 @@ TEST(OrderEventFrameCodecV6, ARelabelledVersionWithoutResigningIsAChecksumMismat
     DecodedOrderFrame decoded{};
     std::size_t frame_size = 0;
     EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::ChecksumMismatch);
+}
+
+// --- Q23 S2/S3: the NeverSent event (23) and state (12) live in v6 frames only (docs/NOTSENT_CLOSURE_DESIGN.md 4.6, 5) -------
+//
+// Two new wire values, and each is checked on its own: a reader that bounded only the event type would let a v5 frame carry
+// resulting_state 12, and one that bounded only the state would let it carry event 23. The layout of a v6 frame is the same
+// as v5's; the closing frame's CONTENT rules (one order, never after a Prepared-and-claimed frame, last of its COID ...) are
+// the recovery reader's, tested in test_never_sent_reader.cpp.
+
+namespace {
+
+AuditRecord make_never_sent_record() {
+    AuditRecord rec = make_sample_record();
+    rec.event_type = AuditEventType::OrderNeverSent;
+    rec.resulting_state = OrderState::NeverSent;
+    rec.exchange_order_id = 0;
+    rec.filled_qty_ticks = 0;
+    rec.avg_fill_price_ticks = 0;
+    rec.detail_code = 7;  // a reason code: informational, the codec does not look at it
+    rec.set_detail("final gate refused");
+    return rec;
+}
+
+// The record with ONE of the two new values only: the event, or the state.
+AuditRecord make_record_with_only_the_never_sent_event() {
+    AuditRecord rec = make_sample_record();
+    rec.event_type = AuditEventType::OrderNeverSent;
+    return rec;
+}
+AuditRecord make_record_with_only_the_never_sent_state() {
+    AuditRecord rec = make_sample_record();
+    rec.resulting_state = OrderState::NeverSent;
+    return rec;
+}
+
+constexpr std::size_t kStateByteOffset = kAuditRecordWireSize - 8 - 8 - 1 - 1;  // see OutOfRangeResultingStateRejected
+
+}  // namespace
+
+TEST(OrderStateBounds, EachVersionHasItsOwnNewestState) {
+    constexpr auto kNewestV5 = static_cast<std::uint8_t>(OrderState::EscalatedToOperator);
+    constexpr auto kNewestV6 = static_cast<std::uint8_t>(OrderState::NeverSent);
+    static_assert(kNewestV5 == 11 && kNewestV6 == 12, "the wire values are ABI; renumbering reinterprets every frame");
+
+    EXPECT_TRUE(detail::is_legal_order_state_for_version(kNewestV5, kFrameFormatVersion));
+    EXPECT_FALSE(detail::is_legal_order_state_for_version(kNewestV6, kFrameFormatVersion))
+        << "NeverSent must not exist in a v5 frame";
+    EXPECT_TRUE(detail::is_legal_order_state_for_version(kNewestV5, kFrameFormatVersionV6));
+    EXPECT_TRUE(detail::is_legal_order_state_for_version(kNewestV6, kFrameFormatVersionV6));
+    EXPECT_FALSE(detail::is_legal_order_state_for_version(kNewestV6 + 1, kFrameFormatVersionV6))
+        << "v6 raises the bound by exactly one value";
+    for (std::uint8_t s = 0; s <= kNewestV5; ++s) {
+        EXPECT_TRUE(detail::is_legal_order_state_for_version(s, kFrameFormatVersion)) << unsigned{s};
+        EXPECT_TRUE(detail::is_legal_order_state_for_version(s, kFrameFormatVersionV6)) << unsigned{s};
+    }
+    // A version this build does not read has no legal state at all.
+    constexpr std::array<std::uint8_t, 4> kUnread = {0, 4, 7, 255};
+    for (const std::uint8_t version : kUnread) {
+        EXPECT_FALSE(detail::is_legal_order_state_for_version(0, version)) << unsigned{version};
+    }
+    // The one-argument form is the v5 bound, unchanged.
+    EXPECT_TRUE(detail::is_legal_order_state(kNewestV5));
+    EXPECT_FALSE(detail::is_legal_order_state(kNewestV6));
+}
+
+TEST(AuditRecordCodecV6, NeverSentEventAndStateDecodeOnlyWhenTheFrameIsV6) {
+    const AuditRecord rec = make_never_sent_record();
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+
+    AuditRecord decoded{};
+    ASSERT_TRUE(decode_audit_record(buf, decoded, kFrameFormatVersionV6));
+    EXPECT_EQ(decoded.event_type, AuditEventType::OrderNeverSent);
+    EXPECT_EQ(decoded.resulting_state, OrderState::NeverSent);
+    EXPECT_EQ(decoded.detail_code, rec.detail_code);
+    EXPECT_STREQ(decoded.detail_msg, rec.detail_msg);
+
+    EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersion)) << "v5 must refuse event 23 and state 12";
+    EXPECT_FALSE(decode_audit_record(buf, decoded)) << "the two-argument form is the v5 bound";
+    EXPECT_FALSE(decode_audit_record(buf, decoded, 7));
+}
+
+TEST(AuditRecordCodecV6, TheNeverSentEventAloneAndTheStateAloneAreEachRefusedByV5) {
+    for (const AuditRecord& rec : {make_record_with_only_the_never_sent_event(), make_record_with_only_the_never_sent_state()}) {
+        std::array<std::byte, kAuditRecordWireSize> buf{};
+        encode_audit_record(buf, rec);
+        AuditRecord decoded{};
+        EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersion))
+            << "event " << unsigned{static_cast<std::uint8_t>(rec.event_type)} << " state "
+            << unsigned{static_cast<std::uint8_t>(rec.resulting_state)};
+        EXPECT_TRUE(decode_audit_record(buf, decoded, kFrameFormatVersionV6))
+            << "the codec bounds each field on its own; whether the PAIR is a legal frame is the reader's rule";
+    }
+}
+
+TEST(AuditRecordCodecV6, AResultingStateOneAboveTheV6BoundIsStillRejected) {
+    const AuditRecord rec = make_never_sent_record();
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+    buf[kStateByteOffset] = std::byte{13};  // one past NeverSent (12), the newest v6 state
+    AuditRecord decoded{};
+    EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersionV6));
+    buf[kStateByteOffset] = std::byte{12};
+    EXPECT_TRUE(decode_audit_record(buf, decoded, kFrameFormatVersionV6)) << "the offset is the state byte";
+}
+
+TEST(OrderEventFrameCodecV6, NeverSentFrameRoundTripsAndReportsItsVersion) {
+    const AuditRecord rec = make_never_sent_record();
+    auto key = as_key("test-hmac-key");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    ASSERT_EQ(encode_order_event_frame(buf, 7, 5, FrameTimeKind::ServerCorrectedUtc, 1'700'000'000'000, rec, kZeroMac, key,
+                                       kFrameFormatVersionV6),
+              kOrderEventFrameSize);
+    EXPECT_EQ(buf[0], std::byte{6});
+
+    DecodedOrderFrame decoded{};
+    std::size_t frame_size = 0;
+    ASSERT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::Ok);
+    EXPECT_EQ(decoded.format_version, kFrameFormatVersionV6);
+    EXPECT_EQ(decoded.record.event_type, AuditEventType::OrderNeverSent);
+    EXPECT_EQ(decoded.record.resulting_state, OrderState::NeverSent);
+    EXPECT_EQ(decoded.record.detail_code, rec.detail_code);
+    EXPECT_STREQ(decoded.record.detail_msg, rec.detail_msg);
+}
+
+TEST(OrderEventFrameCodecV6, EncoderRefusesTheNeverSentEventOrStateInAV5Frame) {
+    auto key = as_key("k");
+    for (const AuditRecord& rec : {make_never_sent_record(), make_record_with_only_the_never_sent_event(),
+                                   make_record_with_only_the_never_sent_state()}) {
+        std::vector<std::byte> buf(kOrderEventFrameSize, std::byte{0xAB});
+        EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                           kFrameFormatVersion),
+                  0u);
+        EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key), 0u)
+            << "the default version is 5";
+        for (const std::byte b : buf) ASSERT_EQ(b, std::byte{0xAB}) << "a refused encode must not write anything";
+        EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                           kFrameFormatVersionV6),
+                  kOrderEventFrameSize)
+            << "the same record is fine at v6";
+    }
+}
+
+TEST(OrderEventFrameCodecV6, EncoderRefusesAStateTheReaderWouldRefuse) {
+    auto key = as_key("k");
+    std::vector<std::byte> buf(kOrderEventFrameSize);
+    AuditRecord beyond = make_sample_record();
+    beyond.resulting_state = static_cast<OrderState>(13);  // one past the v6 bound (NeverSent = 12)
+    EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, beyond, kZeroMac, key,
+                                       kFrameFormatVersionV6),
+              0u);
+    constexpr std::array<std::uint8_t, 4> kUnread = {0, 4, 7, 255};
+    for (const std::uint8_t version : kUnread) {
+        EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, make_never_sent_record(),
+                                           kZeroMac, key, version),
+                  0u)
+            << "version " << unsigned{version};
+    }
+}
+
+TEST(OrderEventFrameCodecV6, NeverSentInAV5FrameIsMalformedEnumEvenWithAValidMac) {
+    auto key = as_key("test-hmac-key");
+    for (const AuditRecord& rec : {make_never_sent_record(), make_record_with_only_the_never_sent_event(),
+                                   make_record_with_only_the_never_sent_state()}) {
+        std::vector<std::byte> buf(kOrderEventFrameSize);
+        ASSERT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, rec, kZeroMac, key,
+                                           kFrameFormatVersionV6),
+                  kOrderEventFrameSize);
+        // Relabel it v5 and sign it again: structurally perfect, wrongly paired.
+        set_version_and_resign(buf, kFrameFormatVersion, key);
+        DecodedOrderFrame decoded{};
+        std::size_t frame_size = 0;
+        EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::MalformedEnum)
+            << "event " << unsigned{static_cast<std::uint8_t>(rec.event_type)} << " state "
+            << unsigned{static_cast<std::uint8_t>(rec.resulting_state)};
+        // And relabelled v6 again it is fine.
+        set_version_and_resign(buf, kFrameFormatVersionV6, key);
+        EXPECT_EQ(decode_order_event_frame(buf, key, decoded, frame_size), FrameDecodeStatus::Ok);
+    }
 }

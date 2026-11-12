@@ -26,6 +26,10 @@
 //     carry AuditEventType::OrderOperatorResolved, the offline operator tool's closure of an order nothing else
 //     can close. The store's version never goes back; this class writes the version its own tip has (5 today).
 //     See durable_frame_codec.hpp's FORMAT v5 -> v6 note and AuditSinkOpenMode below.
+//   - Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6): a v6 frame may also carry AuditEventType::OrderNeverSent, the
+//     durable proof that an order never crossed. The recovery scan READS it (never_sent_rules.hpp; closed orders are
+//     neither checkpoints nor orphans); nothing in this class or the live process WRITES one -- the writers are slices
+//     S4 and S6.
 //   - Real KeyRing-backed key_id selection (Phase 2, docs/SPEC_INVARIANTS.md) --
 //     every append does a live KeyRing::active_key(active_key_id_, ...) lookup
 //     (never cached), and recovery resolves each frame's OWN key_id via
@@ -49,6 +53,7 @@
 #include <hengyuan/durable_frame_codec.hpp>
 #include <hengyuan/durable_log_store.hpp>
 #include <hengyuan/key_ring.hpp>
+#include <hengyuan/never_sent_rules.hpp>
 #include <hengyuan/operator_resolution_frame.hpp>
 #include <hengyuan/operator_resolution_rules.hpp>
 #include <hengyuan/order_lifecycle.hpp>
@@ -488,6 +493,12 @@ public:
     // the log for audit. max_intent_orphans() is their budget (kMaxIntentOrphans unless a test tightened it);
     // one more than that is CapacityExceeded.
     std::size_t recovered_intent_orphans() const noexcept { return intent_orphan_count_; }
+    // Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6): how many orders an OrderNeverSent frame closed, as the scan saw them. They
+    // are FINAL: not in recovered_checkpoints(), not counted as Intent orphans, nothing for apply_recovery() /
+    // StartupRecovery to wait for. A count and nothing else, on purpose: whether a later stage needs to RECOGNISE such an
+    // order again (the way the operator-resolved list serves the late-fill alarm) is a question for the slices that write
+    // the frames -- a class A closure follows every local refusal, so the set can be large -- and nothing reads it yet.
+    std::size_t recovered_never_sent() const noexcept { return never_sent_count_; }
     std::size_t max_intent_orphans() const noexcept { return max_intent_orphans_; }
 
     // D5 / R1 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.3): the orders an OrderOperatorResolved frame closed, in log
@@ -887,6 +898,7 @@ private:
         ExecutionMode mode{ExecutionMode::DryRun};
         // D5 / R1: an OrderOperatorResolved frame was accepted for this COID. It must be that COID's last frame.
         bool operator_resolved{false};
+        // (No flag for an accepted OrderNeverSent frame: see the scan, where the state NeverSent does that job.)
         // R-10 / L-30: the header time of the FIRST frame that put this order in Submitting and in
         // Ambiguous, kept only when that frame's time is a ServerCorrectedUtc reading (anything
         // else is no wall time). The `*_seen` flags say "first frame already seen", so a later
@@ -920,6 +932,22 @@ private:
     // a v5 frame never decodes) and "the last frame of its COID" by the caller (rs.operator_resolved).
     static bool accepts_operator_resolution(const ReplayState& rs, const AuditRecord& rec) noexcept {
         return operator_resolution::check_resolution(target_of(rs), rec) == operator_resolution::ResolutionCheck::Ok;
+    }
+
+    // Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6): the order an OrderNeverSent frame is held against, from the replay
+    // state of the scan. The rules live in never_sent_rules.hpp because the writers (slices S4, S6) will apply exactly the
+    // same ones: what they let through, this reader accepts.
+    static never_sent::ClosureTarget closure_target_of(const ReplayState& rs) noexcept {
+        never_sent::ClosureTarget t{};
+        t.state = rs.state;
+        t.exchange_order_id = rs.exchange_order_id;
+        t.filled_qty_ticks = rs.filled_qty_ticks;
+        t.symbol_id = rs.symbol_id;
+        t.side = rs.side;
+        t.mode = rs.mode;
+        t.price_ticks = rs.intended_price_ticks;
+        t.qty_ticks = rs.intended_qty_ticks;
+        return t;
     }
 
     // Equality of two client order ids that live in fixed arrays: bounded, and two arrays that are not terminated within
@@ -1030,10 +1058,23 @@ private:
             // after it -- another resolution, a stray Rejected, a second Intent -- is Corrupt, the same-state
             // repeat of a final order included (the generic branch below would let it through).
             if (rs.operator_resolved) return RecoveryScanStatus::Corrupt;
+            // Q23 S2/S3 (design 4.6): an OrderNeverSent frame is the LAST frame of its COID as well -- anything after it (a
+            // Prepared frame, an outcome, a second Intent, a repeated closure, an operator resolution) is Corrupt, since the
+            // order was proven never sent and nothing may follow that treats it as sent. It needs no flag of its own, because
+            // the state NeverSent already refuses all of those: it is terminal, so validate_transition() refuses every
+            // frame that would leave it (a repeated closure is routed to check_closure() below, which asks the same
+            // question), and the operator rule refuses it as "not in a resolvable state". The reader tests pin each.
+            // The event type and the resulting state of a closure are one fact said twice. A frame that says only half of
+            // it -- event 23 with another state, or state 12 under another event -- is refused wherever it stands in the
+            // log, the first frame of a COID included (the generic branches below would otherwise route it as an
+            // ordinary transition).
+            if (!never_sent::pairing_holds(frame.record)) return RecoveryScanStatus::Corrupt;
             const bool operator_frame = frame.record.event_type == AuditEventType::OrderOperatorResolved;
+            const bool never_sent_frame = frame.record.event_type == AuditEventType::OrderNeverSent;
             if (!rs.established) {
                 // A COID starts with its Intent frame. The operator event is never one: refused even when it
-                // claims resulting_state Intent.
+                // claims resulting_state Intent. (The OrderNeverSent event is refused by the pairing rule above and the
+                // Intent requirement below: it cannot carry the state Intent, and the state NeverSent is not Intent.)
                 if (operator_frame) return RecoveryScanStatus::Corrupt;
                 if (frame.record.resulting_state != OrderState::Intent) return RecoveryScanStatus::Corrupt;
                 rs.established = true;
@@ -1060,6 +1101,16 @@ private:
                 } else {
                     ++recovery_overflow_.operator_resolved;
                 }
+            } else if (never_sent_frame) {
+                // Q23 S2/S3: the order never crossed -- closed by the owner that had decided not to send. Only from Intent
+                // (class A) or from Submitting after Prepared (class B), never from Ambiguous, and held against what the log
+                // already shows of the order (never_sent_rules.hpp). The closed order is neither a checkpoint nor an orphan
+                // (see the loop below); it is counted, and nothing else is kept.
+                if (never_sent::check_closure(closure_target_of(rs), frame.record) != never_sent::ClosureCheck::Ok) {
+                    return RecoveryScanStatus::Corrupt;
+                }
+                rs.state = OrderState::NeverSent;
+                ++never_sent_count_;
             } else if (frame.record.resulting_state == rs.state) {
                 if (frame.record.filled_qty_ticks < rs.filled_qty_ticks) return RecoveryScanStatus::Corrupt;
                 if (frame.record.filled_qty_ticks > rs.intended_qty_ticks) return RecoveryScanStatus::Corrupt;
@@ -1154,7 +1205,9 @@ private:
         // versions (audit REC-DETERM-007).
         for (const auto& coid : coid_scan_order) {
             const ReplayState& rs = per_coid.at(coid);
-            if (is_exchange_final(rs.state)) continue;  // nothing to recover (an operator-resolved order is Rejected)
+            // Nothing to recover: an order the exchange has finished (an operator-resolved one is Rejected), or one the log
+            // proves never crossed (Q23 S2/S3: is_resolved(), not is_exchange_final(), which says something else).
+            if (is_resolved(rs.state)) continue;
             if (rs.state == OrderState::Intent) {
                 // SUBMITPORT spec round 9 ("Intent-only orphans"): the last durable frame is Intent, so
                 // OrderSubmitPrepared never landed and nothing was ever sent. Not a checkpoint -- it would be
@@ -1596,6 +1649,7 @@ private:
     std::size_t operator_resolved_count_{0};
     RecoveryOverflow recovery_overflow_{};
     std::size_t intent_orphan_count_{0};
+    std::size_t never_sent_count_{0};  // Q23 S2/S3: orders an OrderNeverSent frame closed (see recovered_never_sent())
     std::uint64_t torn_tail_bytes_{0};
     std::uint64_t rotation_torn_tail_bytes_{0};
 

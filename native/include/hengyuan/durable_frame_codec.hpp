@@ -59,14 +59,16 @@
 //
 // FORMAT v5 -> v6 (D5 slice R1, docs/OPERATOR_RESOLUTION_DESIGN.md 7 and docs/NOTSENT_CLOSURE_DESIGN.md 5): the
 // layout is IDENTICAL (256-byte frame, 165-byte payload); what v6 adds is a larger set of legal event types
-// (AuditEventType::OrderOperatorResolved = 22). This build READS order-event frames at version 5 and 6 and WRITES
-// only the version the store's own tip already has (5 for every store that exists today -- DurableAuditSink adopts
-// the tip's version after its recovery scan), so no existing log changes by a byte. An event type that is not legal
-// for the frame's own version is MalformedEnum: a v5 frame that carries event 22 is corrupt, not "early". Versions
-// never go back inside one store (a v5 frame after a v6 one is Corrupt) -- that rule needs the whole sequence, so
-// it lives in the scans (DurableAuditSink::run_recovery_scan_impl, verify_audit_log), not in the single-frame
-// decode here. kFrameFormatVersion itself stays 5 on purpose: control_plane_frame_codec.hpp writes and strictly
-// checks every control-plane record against it, and those stores never get v6.
+// (AuditEventType::OrderOperatorResolved = 22, and -- Q23 S2/S3 -- AuditEventType::OrderNeverSent = 23) and of legal
+// order states (OrderState::NeverSent = 12, the resulting_state of that frame). This build READS order-event frames at
+// version 5 and 6 and WRITES only the version the store's own tip already has (5 for every store that exists today --
+// DurableAuditSink adopts the tip's version after its recovery scan), so no existing log changes by a byte. An event
+// type or a resulting state that is not legal for the frame's own version is MalformedEnum: a v5 frame that carries
+// event 22 or 23, or state 12, is corrupt, not "early". Versions never go back inside one store (a v5 frame after a v6
+// one is Corrupt) -- that rule needs the whole sequence, so it lives in the scans (DurableAuditSink::
+// run_recovery_scan_impl, verify_audit_log), not in the single-frame decode here. kFrameFormatVersion itself stays 5 on
+// purpose: control_plane_frame_codec.hpp writes and strictly checks every control-plane record against it, and those
+// stores never get v6.
 
 #pragma once
 
@@ -191,11 +193,18 @@ inline bool is_readable_order_event_version(std::uint8_t version) noexcept {
 // ExecutionJournal research; unrelated to that decision, fixed here since it's a one-line
 // bound correction with an existing regression-test template to extend.
 //
-// v6 (D5 / R1) raises the bound to OrderOperatorResolved (22) and nothing else; any version this build does
-// not read has no legal event at all.
+// v6 (D5 / R1) raises the bound to OrderOperatorResolved (22), and (Q23 S2/S3) to OrderNeverSent (23) -- the two events
+// only a v6 frame may carry; any version this build does not read has no legal event at all.
 inline bool is_legal_audit_event_type_for_version(std::uint8_t v, std::uint8_t version) noexcept {
     if (version == kFrameFormatVersion) return v <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
-    if (version == kFrameFormatVersionV6) return v <= static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved);
+    if (version == kFrameFormatVersionV6) {
+        // The two events only a v6 frame may carry are consecutive, so ONE bound covers exactly them (an enumerator is only
+        // ever appended): a v6-only event inserted between them would have to be handled here on purpose.
+        static_assert(static_cast<std::uint8_t>(AuditEventType::OrderNeverSent) ==
+                          static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved) + 1,
+                      "v6's event bound must cover exactly OrderOperatorResolved and OrderNeverSent");
+        return v <= static_cast<std::uint8_t>(AuditEventType::OrderNeverSent);
+    }
     return false;
 }
 
@@ -208,8 +217,18 @@ inline bool is_legal_execution_mode(std::uint8_t v) noexcept {
     return v <= static_cast<std::uint8_t>(ExecutionMode::Live);
 }
 
+// Is `v` an OrderState a frame of format `version` may carry as its resulting_state? (Q23 S2/S3.) v5's bound is
+// EscalatedToOperator (11) and stays; v6 adds exactly one value, NeverSent (12), the state of an OrderNeverSent frame. A
+// version this build does not read has no legal state at all -- the same shape as the event-type bound above.
+inline bool is_legal_order_state_for_version(std::uint8_t v, std::uint8_t version) noexcept {
+    if (version == kFrameFormatVersion) return v <= static_cast<std::uint8_t>(OrderState::EscalatedToOperator);
+    if (version == kFrameFormatVersionV6) return v <= static_cast<std::uint8_t>(OrderState::NeverSent);
+    return false;
+}
+
+// The v5 bound -- what every frame written today is held to.
 inline bool is_legal_order_state(std::uint8_t v) noexcept {
-    return v <= static_cast<std::uint8_t>(OrderState::EscalatedToOperator);
+    return is_legal_order_state_for_version(v, kFrameFormatVersion);
 }
 
 inline bool is_legal_order_side(std::uint8_t v) noexcept {
@@ -253,8 +272,9 @@ inline void encode_audit_record(std::span<std::byte, kAuditRecordWireSize> out,
 // its legal range -- never trusts the byte to already be a valid enumerator,
 // matching this codebase's decode-time range-check discipline throughout.
 //
-// `format_version` is the version of the frame that carries the payload: the legal event types depend on it (the
-// FORMAT v5 -> v6 note at the top). Defaults to v5, so a caller that never learned about v6 keeps the old bound.
+// `format_version` is the version of the frame that carries the payload: the legal event types AND the legal resulting
+// states depend on it (the FORMAT v5 -> v6 note at the top). Defaults to v5, so a caller that never learned about v6
+// keeps the old bounds.
 inline bool decode_audit_record(std::span<const std::byte, kAuditRecordWireSize> in,
                                  AuditRecord& out, std::uint8_t format_version = kFrameFormatVersion) noexcept {
     const std::byte* p = in.data();
@@ -283,7 +303,7 @@ inline bool decode_audit_record(std::span<const std::byte, kAuditRecordWireSize>
     out.detail_msg[sizeof(out.detail_msg) - 1] = '\0';
 
     const std::uint8_t resulting_state_raw = detail::read_u8(p);
-    if (!detail::is_legal_order_state(resulting_state_raw)) return false;
+    if (!detail::is_legal_order_state_for_version(resulting_state_raw, format_version)) return false;
     out.resulting_state = static_cast<OrderState>(resulting_state_raw);
 
     out.filled_qty_ticks = detail::read_i64_le(p);
@@ -316,9 +336,10 @@ inline constexpr std::size_t kOrderEventFrameSize =
 //
 // `format_version` (D5 / R1) is the version byte written into the frame; the only production caller,
 // DurableAuditSink::append_durable(), passes its store's own write version. It also returns 0 -- writes nothing --
-// for a version this build does not read, and for a record whose event type is not legal for that version: a frame
-// the reader would call MalformedEnum is never produced in the first place (a v5 store asked to append
-// OrderOperatorResolved fences instead of laying down a log its own next start would reject).
+// for a version this build does not read, and for a record whose event type or resulting state is not legal for that
+// version: a frame the reader would call MalformedEnum is never produced in the first place (a v5 store asked to append
+// OrderOperatorResolved, OrderNeverSent or a NeverSent state fences instead of laying down a log its own next start
+// would reject).
 inline std::size_t encode_order_event_frame(
     std::span<std::byte> out,
     std::uint32_t key_id,
@@ -330,8 +351,12 @@ inline std::size_t encode_order_event_frame(
     std::span<const std::byte> hmac_key,
     std::uint8_t format_version = kFrameFormatVersion) noexcept {
     if (out.size() < kOrderEventFrameSize) return 0;
-    // One check covers both refusals: a version this build does not read has no legal event type at all.
+    // One check per field covers both refusals: a version this build does not read has no legal event type and no legal
+    // resulting state at all.
     if (!detail::is_legal_audit_event_type_for_version(static_cast<std::uint8_t>(record.event_type), format_version)) {
+        return 0;
+    }
+    if (!detail::is_legal_order_state_for_version(static_cast<std::uint8_t>(record.resulting_state), format_version)) {
         return 0;
     }
 

@@ -1,6 +1,6 @@
 # NotSent 闭合与发送前最终授权 —— 语义冻结与协议模型（Q23 切片 1）
 
-状态：**设计，语义已冻结；没有任何实现**。无代码、无枚举取值、无日志字节变化。起草 2026-10-25；Owner 在 2026-10-24 对计划说“开始”。
+状态：**设计，语义已冻结；读者侧已实现（切片 S2 与 S3 合为一片，2026-11-12：事件 `OrderNeverSent` = 23、状态 `OrderState::NeverSent` = 12、v6 的合法集合、§4.6 的恢复表、闭合规则 `never_sent_rules.hpp`），写者（S4、S6）没有**。原先的“无代码、无枚举取值、无日志字节变化”到这一片为止：枚举值已分配，今天所有存储仍写 v5、一字节不变。起草 2026-10-25；Owner 在 2026-10-24 对计划说“开始”，2026-11-12 对 S2/S3 说“开始，命名按你的建议”。
 依据：蓝图 v2.9.0 的 `5.9.2`、F.5、F.9、R-18 / R-22（Owner 已选统一 NotSent）、Q23、FI-055、FI-056、任务 SAFE-07 与 1A.6。
 模型：`formal/notsent_closure.tla`（结果见 §7）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值不在本文分配**，随实现 PR 同步分配，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。
 
@@ -80,6 +80,8 @@
 
 对状态机的要求：新终态 `NotSent`；边只有 `Intent → NotSent` 与 `Submitting → NotSent`，**不得**有 `Ambiguous → NotSent`（恢复不能闭合 Ambiguous）；`is_terminal(NotSent)` 为真。恢复扫描、压实保留和槽位释放用一个**新的谓词** `is_resolved = is_exchange_final ∨ NotSent`，不改 `is_exchange_final` 的含义（它的注释明确“只有交易所终局”）。对账目标集合（`order_tracker.hpp` 的 `is_legal_ambiguous_target`、`is_legal_query_target`）**不得**包含 NotSent。
 
+**读者规则（已实现，S2/S3）**：除上表之外，恢复扫描对一个闭合帧还要求（任何一条不满足 = 整本日志 `Corrupt`；规则在 `never_sent_rules.hpp`，写者以后调用同一个函数）：① 订单此前没有出现过交易所订单号或成交；② 事件类型与结果状态是同一个事实说两遍，只说一半的帧在任何位置都是 `Corrupt`（作为某订单号的首帧也是）；③ 帧不带交易所订单号、成交与均价，品种、方向、价格、数量、模式与 Intent 帧一致；④ 闭合帧是该订单号的最后一帧，其后的任何帧（含操作员的闭合）都是 `Corrupt`；⑤ 只在 v6 帧里合法。`detail_code`（拒绝原因）**不检查**：未知的值不是损坏。读者无法核实“它真的没有越过边界”，这条保证在协议（模型 `NotSentImpliesNeverCrossed`）与写者里。命名：代码里的事件与状态叫 `OrderNeverSent` / `NeverSent`，以区别 `QueryOutcome::NotSent`。
+
 ### 4.7 不在本设计内
 
 - 跨越之后的 NotSent（“端口证明在第一个字节之前失败”）。claim 之后的失败一律沿用现有的 `Ambiguous` 路径；以后若要，端口必须返回一个定义极窄的 `NeverWritten` 结论，另开设计。
@@ -138,8 +140,8 @@
 
 | 片 | 内容 | 验证与负控 |
 | :-- | :-- | :-- |
-| S2 codec 读者 | `format_version` 6 与两套合法集合，只读不写；未知版本、v5 帧里的 v6 值、版本回退各有明确状态 | MSVC + GCC `none`；codec 表驱动用例 |
-| S3 状态机与恢复 | `NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料；**命名**：`order_tracker.hpp` 已有 `QueryOutcome::NotSent`（R-10，意思是对账**查询**没有离开进程），订单状态与事件的新名字要与它区分（实现 PR 里定），否则 grep 和读者都会混 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
+| S2 codec 读者 | **已实现（与 S3 合为一片，2026-11-12）**：`format_version` 6 与两套合法集合（事件 ≤ 23、状态 ≤ 12），只读不写；未知版本、v5 帧里的 v6 值、版本回退各有明确状态（`format_version` 6 本身与事件 22 已由 D5 R1 落地） | MSVC + GCC `none`；codec 表驱动用例 |
+| S3 状态机与恢复 | **已实现（与 S2 合为一片，2026-11-12；命名已定：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12，规则在 `never_sent_rules.hpp`，读者与写者共用）**：`NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料；**命名**：`order_tracker.hpp` 已有 `QueryOutcome::NotSent`（R-10，意思是对账**查询**没有离开进程），订单状态与事件的新名字要与它区分（实现 PR 里定），否则 grep 和读者都会混 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
 | S4 写入 | sink 追加 NotSent（沿用 `append_durable`）、故障注入：Failed、迟到、撕裂尾 | `address`；旧 `AbortedPreSend` 双发场景作为必败 / 必拒用例保留 |
 | S5 最终门（1A.6、FI-055） | 决定字与门；撤销者与所有者的两种次序；`ServerShutdown`、代次变化、熔断、授权截止注入 | `thread` + arm64 重复；**新增一个 TSan 负控**（把决定字的配对降成 relaxed 必须被抓到）；变异检查 |
 | S6 类 A 闭合（SAFE-07、FI-056） | 各拒绝路径写 NotSent；孤儿计数；纯静态预检前移只作减量优化 | 孤儿预算与告警；拒绝循环的日志规模有界；Q19 先量出每次拒绝多一条持久链的成本 |

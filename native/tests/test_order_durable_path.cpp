@@ -56,9 +56,10 @@ namespace {
 constexpr std::int64_t kIntended = 10;
 constexpr std::int64_t kNowMs = 1'700'000'000'000;
 
-constexpr std::array<OrderState, 12> kAllStates{OrderState::Intent,    OrderState::Submitting,      OrderState::Accepted,  OrderState::Rejected,
+constexpr std::array<OrderState, 13> kAllStates{OrderState::Intent,    OrderState::Submitting,      OrderState::Accepted,  OrderState::Rejected,
                                                 OrderState::Ambiguous, OrderState::PartialFill,     OrderState::Filled,    OrderState::CancelRequested,
-                                                OrderState::Cancelled, OrderState::Expired,         OrderState::Reconciled, OrderState::EscalatedToOperator};
+                                                OrderState::Cancelled, OrderState::Expired,         OrderState::Reconciled, OrderState::EscalatedToOperator,
+                                                OrderState::NeverSent};
 
 // The seven states a WebSocket execution report can name (map_binance_order_status()), in the column order of the table below.
 constexpr std::array<OrderState, 7> kObservable{OrderState::Accepted, OrderState::PartialFill, OrderState::Filled,  OrderState::CancelRequested,
@@ -88,7 +89,7 @@ struct TableRow {
     const char* cells;
 };
 
-constexpr std::array<TableRow, 13> kTable{{
+constexpr std::array<TableRow, 14> kTable{{
     {OrderState::Intent, false, "......."},               // nothing was sent: an observation of it is a contradiction
     {OrderState::Submitting, false, "WWWAAWA"},           // Cancelled / Expired / CancelRequested are only reachable from Ambiguous
     {OrderState::Accepted, false, "WWWWW.W"},             // never Rejected (a submit-time status), never an Ambiguous frame (not true of it)
@@ -101,6 +102,7 @@ constexpr std::array<TableRow, 13> kTable{{
     {OrderState::Expired, false, "......W"},
     {OrderState::Reconciled, false, "......."},           // unreachable by design: nothing ever targets it
     {OrderState::EscalatedToOperator, false, "......."},  // terminal for validate_transition(): only the operator tool leaves it
+    {OrderState::NeverSent, false, "......."},            // Q23 S2/S3: proven never sent -- an exchange report about it is a contradiction, and nothing leaves it
     {OrderState::Ambiguous, true, "WWWAAWA"},             // a recovered order: Submitting or Ambiguous -- what replays from BOTH goes as it stands
 }};
 
@@ -410,6 +412,7 @@ AuditEventType natural_event(OrderState s) {
         case OrderState::Expired: return AuditEventType::OrderExpired;
         case OrderState::Reconciled: return AuditEventType::OrderReconciled;
         case OrderState::EscalatedToOperator: return AuditEventType::OrderEscalated;
+        case OrderState::NeverSent: return AuditEventType::OrderNeverSent;  // Q23 S2/S3 (never used here: this log is a v5 store)
     }
     return AuditEventType::OrderIntentCreated;
 }
