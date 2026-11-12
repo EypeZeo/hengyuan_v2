@@ -32,7 +32,9 @@ struct ExecutionIntent {
 
 enum class FillStatus : std::uint8_t {
     Filled = 0,
-    Rejected = 1,    // risk gate / kill switch blocked it
+    // The risk gate or the kill switch blocked it, OR the fill's arithmetic (notional, fee, position, cost basis, realized
+    // PnL) does not fit int64: sim_executor.hpp refuses such a fill whole and leaves the position untouched (audit F-A-006).
+    Rejected = 1,
     NoLiquidity = 2, // empty book or limit not marketable
     NoFill = 3,      // zero/invalid qty
 };
