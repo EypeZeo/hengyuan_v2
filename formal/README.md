@@ -1086,6 +1086,9 @@ pass, the design; seventeen that must fail; the saturation run is manual).
 | skew_expiry | 5,500 | `NoClaimAfterExpiry` violated ✓ (9) |
 | probe / second / inflight / refund / recovered | 4,425 / 8,040 / 20,023 / 2,034 / 5,332 | each violated ✓ (9 / 10 / 10 / 7 / 8) |
 
+The CI step (JDK 21, the same `tla2tools.jar` v1.7.4) passed on PR #248, merged as `9208552` on 2026-11-12; the whole `L3` job (all 13 models) took about
+4 min 44 s.
+
 The counts of the violating runs vary with worker scheduling (TLC stops at the first hit). Bounds: 2 orders, 2 grant serials, 1 store wipe, 1 clock
 fault, 1 kill, true time 0..3 with a skew of 1, 1 crash (the control configs allow 2, the saturation run 2).
 
