@@ -394,8 +394,9 @@ inline std::string audit_export_manifest_line(const AuditLogVerification& v) {
     s += "{\"type\":\"manifest\",\"format\":";
     detail::export_json_string(s, kAuditExportFormat.data(), kAuditExportFormat.size());
     s += ",\"frame_format_version\":";
-    // The highest version present (5 for every log that exists today, 6 once an OrderOperatorResolved frame is in
-    // it); an empty log reports the version a writer would start it at.
+    // The highest version present (5 for every log that exists today, 6 once a frame only v6 can carry -- an
+    // OrderOperatorResolved or an OrderNeverSent frame -- is in it); an empty log reports the version a writer would
+    // start it at.
     s += std::to_string(static_cast<unsigned>(v.max_frame_version != 0 ? v.max_frame_version : kFrameFormatVersion));
     s += ",\"frames\":";
     s += std::to_string(v.frames);

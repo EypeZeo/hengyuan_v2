@@ -12,6 +12,8 @@ using hy::OrderState;
 using hy::ReconcileAction;
 using hy::TransitionResult;
 using hy::determine_reconcile_action;
+using hy::is_exchange_final;
+using hy::is_resolved;
 using hy::is_terminal;
 using hy::make_client_order_id;
 using hy::order_state_name;
@@ -21,9 +23,18 @@ using hy::validate_transition;
 // --- State names ---
 
 TEST(OrderLifecycle, StateNamesNotNull) {
-    for (int i = 0; i <= 11; ++i) {
+    for (int i = 0; i <= 12; ++i) {
         EXPECT_NE(order_state_name(static_cast<OrderState>(i)), nullptr);
     }
+}
+
+// Q23 S2/S3: the wire values of OrderState are ABI (they are written into every durable frame); NeverSent is the newest.
+TEST(OrderLifecycle, NeverSentIsTheThirteenthStateAndHasItsOwnName) {
+    static_assert(static_cast<int>(OrderState::EscalatedToOperator) == 11 && static_cast<int>(OrderState::NeverSent) == 12,
+                  "renumbering reinterprets every frame already on disk");
+    EXPECT_STREQ(order_state_name(OrderState::NeverSent), "NeverSent");
+    EXPECT_STRNE(order_state_name(static_cast<OrderState>(13)), "NeverSent");
+    EXPECT_STREQ(order_state_name(static_cast<OrderState>(13)), "Unknown") << "one past the newest state names nothing";
 }
 
 // --- Terminal states ---
@@ -35,6 +46,7 @@ TEST(OrderLifecycle, TerminalStates) {
     EXPECT_TRUE(is_terminal(OrderState::Expired));
     EXPECT_TRUE(is_terminal(OrderState::Reconciled));
     EXPECT_TRUE(is_terminal(OrderState::EscalatedToOperator));
+    EXPECT_TRUE(is_terminal(OrderState::NeverSent));
 }
 
 TEST(OrderLifecycle, NonTerminalStates) {
@@ -516,9 +528,10 @@ TEST(RecoveredOrder, AnOrderWhoseAnchorWasNotRecoveredIsUnaffected) {
 // accompanied by a deliberate change here.
 //
 // Expected values are derived from order_lifecycle.hpp's own contract:
-//   * is_terminal(from) short-circuits to AlreadyTerminal for all 12 targets,
-//     regardless of `to`. Six terminal states x 12 = 72 pairs.
-//   * The 24 Ok transitions are listed explicitly in kValidTransitions below.
+//   * is_terminal(from) short-circuits to AlreadyTerminal for all 13 targets,
+//     regardless of `to`. Seven terminal states x 13 = 91 pairs (NeverSent, Q23 S2/S3,
+//     is the seventh).
+//   * The 28 Ok transitions are listed explicitly in kValidTransitions below.
 //   * Everything else is InvalidTransition.
 namespace {
 
@@ -529,8 +542,9 @@ constexpr OrderState kAllStates[] = {
     OrderState::Filled,          OrderState::CancelRequested,
     OrderState::Cancelled,       OrderState::Expired,
     OrderState::Reconciled,      OrderState::EscalatedToOperator,
+    OrderState::NeverSent,
 };
-static_assert(sizeof(kAllStates) / sizeof(kAllStates[0]) == 12,
+static_assert(sizeof(kAllStates) / sizeof(kAllStates[0]) == 13,
               "OrderState gained or lost a value — update this table deliberately, "
               "do not just resize it");
 
@@ -543,6 +557,11 @@ struct Transition {
 // InvalidTransition.
 constexpr Transition kValidTransitions[] = {
     {OrderState::Intent,          OrderState::Submitting},
+    // Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6): refused before its Prepared frame (class A) -- the durable proof
+    // that nothing was ever sent.
+    {OrderState::Intent,          OrderState::NeverSent},
+    // Q23 S2/S3 (class B): refused by the final gate after the Prepared frame. From Submitting and from Intent ONLY.
+    {OrderState::Submitting,      OrderState::NeverSent},
     // Submitting: exchange responded, or the response was ambiguous.
     {OrderState::Submitting,      OrderState::Accepted},
     {OrderState::Submitting,      OrderState::Rejected},
@@ -585,8 +604,9 @@ constexpr std::size_t kValidCount = sizeof(kValidTransitions) / sizeof(kValidTra
 // 22 -> 24 (audit STATE-TRANS-011 -- Accepted->Cancelled and PartialFill->Cancelled,
 // operator/exchange cancel with no local CancelRequested) -> 25 (L4 §6.5 --
 // Ambiguous->CancelRequested, confirmed PENDING_CANCEL discovered via reconciliation)
-// -> 26 (TODO 1A.3 -- Submitting->PartialFill, immediate partial fill on POST response).
-static_assert(kValidCount == 26, "the Ok set changed size — update deliberately");
+// -> 26 (TODO 1A.3 -- Submitting->PartialFill, immediate partial fill on POST response)
+// -> 28 (Q23 S2/S3 -- Intent->NeverSent and Submitting->NeverSent).
+static_assert(kValidCount == 28, "the Ok set changed size — update deliberately");
 
 bool is_listed_valid(OrderState from, OrderState to) {
     for (std::size_t i = 0; i < kValidCount; ++i) {
@@ -602,7 +622,7 @@ TransitionResult expected_result(OrderState from, OrderState to) {
 
 }  // namespace
 
-TEST(TransitionRelation, EveryOneOf144PairsMatchesTheTable) {
+TEST(TransitionRelation, EveryPairOfStatesMatchesTheTable) {
     int ok_count = 0, invalid_count = 0, terminal_count = 0;
     for (OrderState from : kAllStates) {
         for (OrderState to : kAllStates) {
@@ -620,13 +640,14 @@ TEST(TransitionRelation, EveryOneOf144PairsMatchesTheTable) {
     }
     // Guards against the table silently going vacuous (e.g. a future edit that
     // empties kAllStates would otherwise "pass" with zero comparisons).
-    EXPECT_EQ(ok_count + invalid_count + terminal_count, 144);
+    EXPECT_EQ(ok_count + invalid_count + terminal_count, 169) << "13 x 13";
     // 22 -> 24: Accepted->Cancelled and PartialFill->Cancelled (audit STATE-TRANS-011).
     // 24 -> 25: Ambiguous->CancelRequested (L4 §6.5, confirmed PENDING_CANCEL).
     // 25 -> 26: Submitting->PartialFill (TODO 1A.3, immediate partial fill on POST response).
-    EXPECT_EQ(ok_count, 26);
-    EXPECT_EQ(terminal_count, 72) << "6 terminal states x 12 targets";
-    EXPECT_EQ(invalid_count, 46);
+    // 26 -> 28: Intent->NeverSent and Submitting->NeverSent (Q23 S2/S3).
+    EXPECT_EQ(ok_count, 28);
+    EXPECT_EQ(terminal_count, 91) << "7 terminal states x 13 targets";
+    EXPECT_EQ(invalid_count, 50);
 }
 
 // Called out separately because these four were the specific blind spot: no test
@@ -673,6 +694,7 @@ constexpr OrderState kAllOrderStates[] = {
     OrderState::Intent,   OrderState::Submitting, OrderState::Accepted,        OrderState::Rejected,
     OrderState::Ambiguous, OrderState::PartialFill, OrderState::Filled,        OrderState::CancelRequested,
     OrderState::Cancelled, OrderState::Expired,     OrderState::Reconciled,    OrderState::EscalatedToOperator,
+    OrderState::NeverSent,
 };
 
 }  // namespace
@@ -709,4 +731,80 @@ TEST(OperatorResolutionEdge, AnOrderRecordCannotUseTheOperatorEdge) {
     rec.state = OrderState::EscalatedToOperator;
     EXPECT_EQ(rec.transition_to(OrderState::Rejected), TransitionResult::AlreadyTerminal);
     EXPECT_EQ(rec.state, OrderState::EscalatedToOperator);
+}
+
+// --- Q23 S2/S3: the NeverSent edges and the predicates around them (docs/NOTSENT_CLOSURE_DESIGN.md 4.6) ----------------
+//
+// NeverSent is the durable proof that an order never crossed. The shared state machine lets exactly two states reach it
+// -- Intent (refused before its Prepared frame, class A) and Submitting (refused by the final gate after it, class B) --
+// and lets nothing leave it. NOT Ambiguous: an order that may have crossed is closed by the exchange or by the operator
+// tool, never by the process's own say-so after the fact (the model: RecoveryNeverClosesPrepared).
+
+TEST(NeverSentEdge, OnlyIntentAndSubmittingReachIt) {
+    for (const OrderState from : kAllOrderStates) {
+        const TransitionResult expected = (from == OrderState::Intent || from == OrderState::Submitting)
+                                              ? TransitionResult::Ok
+                                              : (is_terminal(from) ? TransitionResult::AlreadyTerminal
+                                                                   : TransitionResult::InvalidTransition);
+        EXPECT_EQ(validate_transition(from, OrderState::NeverSent), expected) << "from " << order_state_name(from);
+    }
+}
+
+TEST(NeverSentEdge, AnOrderThatMayHaveCrossedCanNeverBeClosedThisWay) {
+    for (const OrderState from : {OrderState::Ambiguous, OrderState::Accepted, OrderState::PartialFill,
+                                  OrderState::CancelRequested}) {
+        EXPECT_EQ(validate_transition(from, OrderState::NeverSent), TransitionResult::InvalidTransition)
+            << "from " << order_state_name(from);
+    }
+}
+
+TEST(NeverSentEdge, NothingLeavesIt) {
+    for (const OrderState to : kAllOrderStates) {
+        EXPECT_EQ(validate_transition(OrderState::NeverSent, to), TransitionResult::AlreadyTerminal)
+            << "to " << order_state_name(to);
+        EXPECT_EQ(validate_operator_resolution(OrderState::NeverSent, to), TransitionResult::AlreadyTerminal)
+            << "the operator edge is not a way out of it either: to " << order_state_name(to);
+    }
+}
+
+TEST(NeverSentEdge, TheOperatorEdgeDoesNotReachItEither) {
+    for (const OrderState from : kAllOrderStates) {
+        EXPECT_NE(validate_operator_resolution(from, OrderState::NeverSent), TransitionResult::Ok)
+            << "from " << order_state_name(from);
+    }
+}
+
+TEST(NeverSentPredicates, TerminalButNotAnExchangeFinalStateAndResolved) {
+    EXPECT_TRUE(is_terminal(OrderState::NeverSent));
+    EXPECT_FALSE(is_exchange_final(OrderState::NeverSent))
+        << "is_exchange_final() answers 'can the exchange still hold this order'; the exchange never heard of it";
+    EXPECT_TRUE(is_resolved(OrderState::NeverSent));
+    for (const OrderState s : kAllOrderStates) {
+        const bool exchange_final = s == OrderState::Filled || s == OrderState::Cancelled || s == OrderState::Rejected ||
+                                    s == OrderState::Expired;
+        EXPECT_EQ(is_exchange_final(s), exchange_final) << "is_exchange_final(" << order_state_name(s) << ") must not move";
+        EXPECT_EQ(is_resolved(s), exchange_final || s == OrderState::NeverSent) << order_state_name(s);
+    }
+}
+
+TEST(NeverSentPredicates, EscalatedAndReconciledAreNotResolved) {
+    // The two terminal states that are NOT final for the exchange question stay unresolved for this one too.
+    EXPECT_FALSE(is_resolved(OrderState::EscalatedToOperator));
+    EXPECT_FALSE(is_resolved(OrderState::Reconciled));
+}
+
+TEST(NeverSentEdge, AnOrderRecordCanTakeTheEdgeAndThenNothingElse) {
+    // The live door (transition_to) goes through the shared state machine, so the edge exists for the writers of S4 and S6;
+    // in this slice nothing calls it (test_never_sent_guard.cpp pins that).
+    OrderRecord rec{};
+    ASSERT_EQ(rec.state, OrderState::Intent);
+    EXPECT_EQ(rec.transition_to(OrderState::NeverSent), TransitionResult::Ok);
+    EXPECT_EQ(rec.state, OrderState::NeverSent);
+    EXPECT_EQ(rec.transition_to(OrderState::Submitting), TransitionResult::AlreadyTerminal);
+    EXPECT_EQ(rec.state, OrderState::NeverSent);
+
+    OrderRecord amb{};
+    amb.state = OrderState::Ambiguous;
+    EXPECT_EQ(amb.transition_to(OrderState::NeverSent), TransitionResult::InvalidTransition);
+    EXPECT_EQ(amb.state, OrderState::Ambiguous);
 }
