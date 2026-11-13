@@ -1,8 +1,9 @@
 // Q23 slices S2/S3: the recovery reader's handling of OrderNeverSent frames and of the order state NeverSent
 // (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 and 4.6, 5).
 //
-// There is deliberately NO production writer of event 23 in this slice (the writers are S4, the final gate's refusal, and S6,
-// a refusal before the Prepared frame), so the logs here are CRAFTED, the way test_operator_resolution_reader.cpp crafts the
+// There was deliberately NO writer of event 23 in this slice (the sink's writer is slice S4, and its callers are S5, the final
+// gate's refusal, and S6, a refusal before the Prepared frame), so the logs here are CRAFTED, the way
+// test_operator_resolution_reader.cpp crafts the
 // operator's: every frame is made by the production encoder (encode_order_event_frame with an explicit version), chained and
 // anchored the way DurableAuditSink does it, and every log is then read by the production sink and verifier. The one pairing
 // the encoder refuses (event 23 or state 12 in a v5 frame) is made by relabelling a frame and signing it again, so the ONLY

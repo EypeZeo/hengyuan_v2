@@ -410,25 +410,30 @@ TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedByTheRecoveryScanAndByThe
         }
     }
     for (const std::string& f : elsewhere) ADD_FAILURE() << f << " names write_version_";
-    EXPECT_EQ(assignments, 2u)
-        << "write_version_ is set exactly twice: from the highest version the recovery scan saw, and to 6 right after "
-           "append_operator_resolution() has had an operator frame acknowledged. A third assignment is a way to write "
-           "the first v6 frame of a store without a v6 frame ever having been there (or to go back to v5 after one)";
+    EXPECT_EQ(assignments, 3u)
+        << "write_version_ is set exactly three times: from the highest version the recovery scan saw, and to 6 right after "
+           "append_operator_resolution() has had an operator frame acknowledged, and to 6 right after append_never_sent() has "
+           "had a closure frame acknowledged (Q23 S4: this was two until then, and moving it is a reviewed edit of this "
+           "test). A fourth assignment is a way to write the first v6 frame of a store without a v6 frame ever having been "
+           "there (or to go back to v5 after one)";
     const std::string scan = function_body(sink->code, "run_recovery_scan_impl");
     ASSERT_FALSE(scan.empty());
     EXPECT_EQ(count_assignments(scan, "write_version_"), 1u) << "the first assignment belongs to the recovery scan";
-    const std::string append = function_body(sink->code, "append_operator_resolution");
-    ASSERT_FALSE(append.empty());
-    EXPECT_EQ(count_assignments(append, "write_version_"), 1u) << "the second belongs to append_operator_resolution()";
-    // ...and it comes AFTER the append was acknowledged, never before: a refused or failed append leaves the version alone.
-    const std::size_t acked_at = append.find("acked()");
-    const std::size_t assigned_at = append.find("write_version_ =");
-    ASSERT_NE(acked_at, std::string::npos);
-    ASSERT_NE(assigned_at, std::string::npos);
-    EXPECT_LT(acked_at, assigned_at);
+    // ...and each of the other two comes AFTER its append was acknowledged, never before: a refused or failed append leaves
+    // the version alone.
+    for (const char* writer : {"append_operator_resolution", "append_never_sent"}) {
+        const std::string append = function_body(sink->code, writer);
+        ASSERT_FALSE(append.empty()) << writer;
+        EXPECT_EQ(count_assignments(append, "write_version_"), 1u) << "one assignment belongs to " << writer << "()";
+        const std::size_t acked_at = append.find("acked()");
+        const std::size_t assigned_at = append.find("write_version_ =");
+        ASSERT_NE(acked_at, std::string::npos) << writer;
+        ASSERT_NE(assigned_at, std::string::npos) << writer;
+        EXPECT_LT(acked_at, assigned_at) << writer;
+    }
 }
 
-TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAndHasTwoCallers) {
+TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAndHasThreeCallers) {
     std::size_t total_calls = 0;
     for (const SourceFile& f : production_sources()) {
         const std::vector<std::vector<std::string>> calls = call_args(f.code, "encode_order_event_frame");
@@ -444,11 +449,11 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAnd
     EXPECT_EQ(total_calls, 1u);
 
     // append_impl() is where that version comes from: the store's write version for append_durable(), 6 for the operator
-    // frame -- and the 6 is passed only from inside append_operator_resolution().
+    // frame and for the Q23 closure frame -- and each 6 is passed only from inside its own writer.
     const SourceFile* sink = find_source(kSink);
     ASSERT_NE(sink, nullptr);
     const std::vector<std::vector<std::string>> impl_calls = call_args(sink->code, "append_impl");
-    ASSERT_EQ(impl_calls.size(), 2u);
+    ASSERT_EQ(impl_calls.size(), 3u);
     std::size_t with_write_version = 0;
     std::size_t with_v6 = 0;
     for (const std::vector<std::string>& args : impl_calls) {
@@ -457,9 +462,11 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAnd
         if (args.back() == "kFrameFormatVersionV6") ++with_v6;
     }
     EXPECT_EQ(with_write_version, 1u);
-    EXPECT_EQ(with_v6, 1u);
-    EXPECT_EQ(count_identifier(function_body(sink->code, "append_operator_resolution"), "kFrameFormatVersionV6"), 2u)
-        << "the append call and the assignment after it";
+    EXPECT_EQ(with_v6, 2u);
+    for (const char* writer : {"append_operator_resolution", "append_never_sent"}) {
+        EXPECT_EQ(count_identifier(function_body(sink->code, writer), "kFrameFormatVersionV6"), 2u)
+            << writer << ": the append call and the assignment after it";
+    }
     EXPECT_EQ(count_identifier(function_body(sink->code, "append_durable"), "write_version_"), 1u);
 }
 

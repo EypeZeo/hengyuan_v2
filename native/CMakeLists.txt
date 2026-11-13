@@ -704,7 +704,7 @@ if(HY_BUILD_TESTS)
 
     # Q23 slices S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3, 4.6 and 8): the NeverSent reader. The closure rule on its own
     # (never_sent_rules.hpp, pure logic: no logs), the recovery reader's handling of OrderNeverSent frames and of the state
-    # NeverSent -- crafted logs, since the writers are slices S4 and S6, but every frame is made by the production encoder
+    # NeverSent -- crafted logs, since the writer came later (slice S4, below), but every frame is made by the production encoder
     # and every log is read by the production sink and verifier -- and the guard that nothing live names the event or the
     # state. The guard reads the source tree, so the native/ directory is a compile definition (same shape as
     # test_operator_resolution_guard above).
@@ -724,6 +724,16 @@ if(HY_BUILD_TESTS)
         HY_NATIVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     hengyuan_set_warnings(test_never_sent_guard)
     gtest_discover_tests(test_never_sent_guard)
+
+    # Q23 slice S4 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 to 4.5, 5.4 and 8): the closure WRITER, DurableAuditSink::append_never_sent(),
+    # behind the NeverSentWrites constructor switch (default off, and nothing in the tree turns it on or calls it yet -- the
+    # guard above pins that). Real sinks on real files: the refusals, the successful closure and the version it moves the store
+    # to, the fault injections of design 4.5 (an append that fails, a frame that lands late, a frame that never lands, a torn
+    # tail), and the check that what the writer accepts is exactly what the next start accepts.
+    add_executable(test_never_sent_writer tests/test_never_sent_writer.cpp)
+    target_link_libraries(test_never_sent_writer PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_never_sent_writer)
+    gtest_discover_tests(test_never_sent_writer)
 
     # D5 slice R2 (docs/OPERATOR_RESOLUTION_DESIGN.md 5, 6 and 10): the decisions behind an OrderOperatorResolved
     # frame's evidence (operator_resolution_evidence.hpp) -- the fence arithmetic, the allOrders windows, the client order

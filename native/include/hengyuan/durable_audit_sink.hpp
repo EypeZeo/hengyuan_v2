@@ -28,8 +28,9 @@
 //     See durable_frame_codec.hpp's FORMAT v5 -> v6 note and AuditSinkOpenMode below.
 //   - Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6): a v6 frame may also carry AuditEventType::OrderNeverSent, the
 //     durable proof that an order never crossed. The recovery scan READS it (never_sent_rules.hpp; closed orders are
-//     neither checkpoints nor orphans); nothing in this class or the live process WRITES one -- the writers are slices
-//     S4 and S6.
+//     neither checkpoints nor orphans). Q23 S4: append_never_sent() is the ONLY way such a frame gets into a log. It exists
+//     only on a sink the constructor was told NeverSentWrites::Enabled (default Disabled) and opened for trading, and
+//     nothing in the tree passes Enabled or calls it yet -- the callers are slices S5 (the final gate) and S6.
 //   - Real KeyRing-backed key_id selection (Phase 2, docs/SPEC_INVARIANTS.md) --
 //     every append does a live KeyRing::active_key(active_key_id_, ...) lookup
 //     (never cached), and recovery resolves each frame's OWN key_id via
@@ -371,6 +372,39 @@ struct OperatorResolutionAppend {
     AuditAppendResult append{};  // set when status is Appended or AppendFailed
 };
 
+// Q23 S4 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 and 5.4): may this sink write the OrderNeverSent frame -- the first frame a trading
+// process writes that exists only at format v6? Off by default, and a CONSTRUCTOR argument on purpose (Owner decision,
+// 2026-11-13): one explicit, visible choice at the one place that builds the sink, not a flag a store carries and not an
+// environment variable. No store worth keeping holds a v6 frame yet (Owner decision, 2026-11-13: the logs of the 2026-11-07
+// Testnet run are not kept), so there is no migration manifest to wait for (design 5.7). test_never_sent_guard.cpp pins that no
+// production source outside this header names Enabled: turning it on in a process is a reviewed edit of that guard.
+enum class NeverSentWrites : std::uint8_t {
+    Disabled = 0,
+    Enabled = 1,
+};
+
+// Q23 S4: what DurableAuditSink::append_never_sent() did. 0 is "nothing was appended". Every status other than Appended and
+// AppendFailed is a refusal decided BEFORE anything touched the log: nothing was written and the sink is not fenced (the
+// caller asked for something this sink does not do; the store is undamaged). AppendFailed means the append itself failed:
+// the sink is fenced if the failure was an I/O one, exactly as for append_durable() -- and the frame MAY be on the disk
+// anyway (a late fsync), which is why a failed closure releases nothing (design 4.5).
+enum class NeverSentAppendStatus : std::uint8_t {
+    NotAttempted = 0,
+    Appended = 1,             // durable and acknowledged; the store's tip is v6 now
+    NotEnabled = 2,           // the sink was not constructed with NeverSentWrites::Enabled
+    NotTradingOpen = 3,       // only a trading open writes this frame; the offline operator tool never does
+    SinkFenced = 4,           // the sink is fenced or its log is not open
+    EmptyClientOrderId = 5,   // an empty id names no order (and a closure never opens one: the reader calls it Corrupt)
+    Refused = 6,              // never_sent::check_closure() said no: see NeverSentAppend::check
+    AppendFailed = 7,
+};
+
+struct NeverSentAppend {
+    NeverSentAppendStatus status{NeverSentAppendStatus::NotAttempted};
+    never_sent::ClosureCheck check{never_sent::ClosureCheck::NotChecked};  // NotChecked unless the call got as far as check_closure()
+    AuditAppendResult append{};  // set when status is Appended or AppendFailed
+};
+
 class DurableAuditSink {
 public:
     // path: base path for the log (e.g. "state/audit.log"); the lock sidecar
@@ -382,16 +416,19 @@ public:
     // value is clamped to kMaxIntentOrphans -- so a test can reach the boundary without writing 4096 frames and
     // no caller can lift the bound. Production passes nothing.
     // open_mode (D5 / R1): see AuditSinkOpenMode. Production passes nothing (Trading).
+    // never_sent_writes (Q23 S4): see NeverSentWrites. Production passes nothing (Disabled): append_never_sent() refuses.
     DurableAuditSink(const std::string& path, KeyRing& key_ring, std::uint32_t active_key_id,
                      std::size_t max_intent_orphans = kMaxIntentOrphans,
-                     AuditSinkOpenMode open_mode = AuditSinkOpenMode::Trading) noexcept
+                     AuditSinkOpenMode open_mode = AuditSinkOpenMode::Trading,
+                     NeverSentWrites never_sent_writes = NeverSentWrites::Disabled) noexcept
         : log_store_(path, path + ".lock", path + ".tip"),
           rotation_log_store_(path + ".keyrotations", path + ".keyrotations.lock", path + ".keyrotations.tip"),
           store_identity_store_(path + ".storeid", path + ".storeid.lock", path + ".storeid.tip"),
           key_ring_(key_ring),
           active_key_id_(active_key_id),
           max_intent_orphans_(max_intent_orphans < kMaxIntentOrphans ? max_intent_orphans : kMaxIntentOrphans),
-          open_mode_(open_mode) {
+          open_mode_(open_mode),
+          never_sent_writes_(never_sent_writes) {
         if (!acquire_lock()) {
             recovery_status_ = RecoveryScanStatus::IoError;
             return;
@@ -517,10 +554,12 @@ public:
     // What an OperatorOpen scan counted past the capacity of the three recovery lists (all zero otherwise).
     const RecoveryOverflow& recovery_overflow() const noexcept { return recovery_overflow_; }
     AuditSinkOpenMode open_mode() const noexcept { return open_mode_; }
+    NeverSentWrites never_sent_writes() const noexcept { return never_sent_writes_; }
 
     // The format version append_durable() writes: always the store's own tip version (D5 / R1, see the FORMAT
     // v5 -> v6 note in durable_frame_codec.hpp). 5 for every store that exists today -- an empty one included -- and 6
-    // for a store whose tip is v6, which includes the moment append_operator_resolution() has had its frame acknowledged.
+    // for a store whose tip is v6, which includes the moment append_operator_resolution() or append_never_sent() has had
+    // its frame acknowledged.
     std::uint8_t write_format_version() const noexcept { return write_version_; }
 
     // SAFE-03 crash-window slice (blueprint L-36): how many bytes of a torn tail -- the partial frame a crash in the
@@ -618,6 +657,60 @@ public:
         return out;
     }
 
+    // Q23 S4 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 to 4.5): the ONLY way an OrderNeverSent frame gets into a log -- the durable,
+    // positive fact "this order never crossed the send boundary", written by the owner that DECIDED not to send. Nothing in
+    // this sink can know that; the CALLER does, and says so by passing the order as it knows it: `target` is that account
+    // (state, exchange id, fill, and the Intent's symbol, side, mode, price and quantity). What the sink does is hold the
+    // frame to it with never_sent::check_closure() -- the very function the recovery scan applies when it reads the frame --
+    // so a frame this call accepts is a frame the next start accepts, never a Corrupt store. In particular only an order in
+    // Intent (class A) or in Submitting after Prepared (class B) is closable, never Ambiguous, and never one that showed an
+    // exchange id or a fill.
+    //   * it exists only on a sink constructed with NeverSentWrites::Enabled and opened for trading (the offline operator
+    //     tool writes its own frame, not this one);
+    //   * every refusal is decided BEFORE anything touches the log: nothing is written and the sink is NOT fenced;
+    //   * only the append itself can fence, as in append_durable(). A FAILED append is not "nothing happened": the frame
+    //     may be on the disk anyway (a late fsync). The caller must leave the order exactly where it is -- no release, no
+    //     rollback, no second attempt under the same id -- and the next start decides: a frame that landed closes the order
+    //     (it never crossed, so that is still true), a frame that did not leaves it Prepared, which is Ambiguous (4.5);
+    //   * on success the frame is durable and acknowledged and write_format_version() becomes 6 (the store's tip IS v6 now,
+    //     and the monotone version rule means everything that follows must be v6 too).
+    // The sink does NOT track which ids it has closed, and it cannot know that the id has an Intent frame in the log or that
+    // nothing follows the closure. The closure must be the LAST frame of its order, and keeping that is the caller's job: the
+    // order's in-flight slot is released after the acknowledgement (design 4.4), so nothing writes for the order again.
+    NeverSentAppend append_never_sent(const never_sent::ClosureTarget& target, const AuditRecord& rec,
+                                      std::int64_t now_ms) noexcept {
+        NeverSentAppend out{};
+        if (never_sent_writes_ != NeverSentWrites::Enabled) {
+            out.status = NeverSentAppendStatus::NotEnabled;
+            return out;
+        }
+        if (open_mode_ != AuditSinkOpenMode::Trading) {
+            out.status = NeverSentAppendStatus::NotTradingOpen;
+            return out;
+        }
+        if (fenced_ || !log_open_) {
+            out.status = NeverSentAppendStatus::SinkFenced;
+            return out;
+        }
+        if (rec.client_order_id[0] == '\0') {
+            out.status = NeverSentAppendStatus::EmptyClientOrderId;
+            return out;
+        }
+        out.check = never_sent::check_closure(target, rec);
+        if (out.check != never_sent::ClosureCheck::Ok) {
+            out.status = NeverSentAppendStatus::Refused;
+            return out;
+        }
+        out.append = append_impl(rec, now_ms, kFrameFormatVersionV6);
+        if (!out.append.acked()) {
+            out.status = NeverSentAppendStatus::AppendFailed;
+            return out;
+        }
+        write_version_ = kFrameFormatVersionV6;  // the third and last assignment (the others: the recovery scan's, the operator frame's)
+        out.status = NeverSentAppendStatus::Appended;
+        return out;
+    }
+
     // Is there room for one more operator-resolved order in the table a trading start needs to be complete? (A scan that
     // overflowed the table has operator_resolved_count_ saturated at the capacity, so that case answers false too.) The
     // writer asks it before every append, and the operator tool asks it before it spends four and a half minutes on an order.
@@ -634,7 +727,8 @@ public:
 
 private:
     // The one place a frame is appended. `version` is the format version of THIS frame: append_durable() passes the
-    // store's write version, append_operator_resolution() passes 6. (test_operator_resolution_guard.cpp pins both callers.)
+    // store's write version, append_operator_resolution() and append_never_sent() pass 6. (test_operator_resolution_guard.cpp
+    // pins all three callers.)
     AuditAppendResult append_impl(const AuditRecord& rec, std::int64_t now_ms, std::uint8_t version) noexcept {
         AuditAppendResult result{};
         if (fenced_ || !log_open_) {
@@ -935,8 +1029,8 @@ private:
     }
 
     // Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.6): the order an OrderNeverSent frame is held against, from the replay
-    // state of the scan. The rules live in never_sent_rules.hpp because the writers (slices S4, S6) will apply exactly the
-    // same ones: what they let through, this reader accepts.
+    // state of the scan. The rules live in never_sent_rules.hpp because the writer (append_never_sent(), slice S4) applies
+    // exactly the same ones: what it lets through, this reader accepts.
     static never_sent::ClosureTarget closure_target_of(const ReplayState& rs) noexcept {
         never_sent::ClosureTarget t{};
         t.state = rs.state;
@@ -1639,12 +1733,15 @@ private:
     std::array<bool, kMaxInFlight> checkpoint_resolved_{};
     std::size_t session_resolved_count_{0};  // how many append_operator_resolution() has acknowledged in this session
     std::size_t max_intent_orphans_{kMaxIntentOrphans};
-    // D5 / R1 + R3-0. open_mode_ is fixed at construction. write_version_ starts at 5 and is assigned exactly TWICE in
-    // this file (test_operator_resolution_guard.cpp pins both): by the recovery scan, to the highest version the store's
-    // frames carry; and by append_operator_resolution(), to 6, only after it has durably appended an operator frame. So
-    // no other code path can write the first v6 frame of a store, and a store that has v6 in it is never written at v5.
+    // D5 / R1 + R3-0 + Q23 S4. open_mode_ and never_sent_writes_ are fixed at construction. write_version_ starts at 5 and
+    // is assigned exactly THREE times in this file (test_operator_resolution_guard.cpp pins all three): by the recovery
+    // scan, to the highest version the store's frames carry; by append_operator_resolution(), to 6, only after it has
+    // durably appended an operator frame; and by append_never_sent(), to 6, only after it has durably appended a
+    // closure frame. So no other code path can write the first v6 frame of a store, and a store that has v6 in it is
+    // never written at v5.
     AuditSinkOpenMode open_mode_{AuditSinkOpenMode::Trading};
     std::uint8_t write_version_{kFrameFormatVersion};
+    NeverSentWrites never_sent_writes_{NeverSentWrites::Disabled};
     std::array<OperatorResolvedOrder, kMaxOperatorResolved> operator_resolved_{};
     std::size_t operator_resolved_count_{0};
     RecoveryOverflow recovery_overflow_{};

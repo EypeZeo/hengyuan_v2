@@ -59,8 +59,9 @@ enum class AuditEventType : std::uint8_t {
     // Q23 S2/S3 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 and 4.6): the durable closing frame of an order that PROVABLY never
     // crossed -- refused before its request could leave the process, by a writer that had decided not to send. Appended at
     // the end like every prior addition. Legal ONLY in a v6 frame (durable_frame_codec.hpp), and READ-ONLY in this build:
-    // the recovery scan accepts it under the rules of that document's 4.6 and nowhere else, and nothing constructs one
-    // (test_never_sent_guard.cpp pins that); the writers are slices S4 (class B, the final gate) and S6 (class A).
+    // the recovery scan accepts it under the rules of that document's 4.6 and nowhere else, and the only code that writes
+    // one is DurableAuditSink::append_never_sent() (slice S4), which nothing calls yet (test_never_sent_guard.cpp pins both);
+    // its callers are slices S5 (class B, the final gate) and S6 (class A).
     // Named "NeverSent" and not "NotSent" on purpose: QueryOutcome::NotSent (order_tracker.hpp) already means "a reconcile
     // QUERY never left this process", a statement about a query, and the two must never be mistaken for each other.
     OrderNeverSent = 23,
