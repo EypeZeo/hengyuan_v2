@@ -2432,6 +2432,15 @@ $$
 - 同步的文档：`docs/SPEC_INVARIANTS.md`（新条目）、`docs/NOTSENT_CLOSURE_DESIGN.md`（头部、§4.6、§8）、`docs/NATIVE_ARCHITECTURE.md`（都在 PR #250 里）；本条、主题表 Q23 一行、`docs/AUDIT_CLOSURE_LEDGER.md` 一行与设计文档头部的合入记录（本次状态补录）。FI-055、FI-056 的状态、门禁结论与证据不变：读者不是写者，发送路径上还没有任何代码写这个帧。
 - 仍然开放：写者 S4（sink 追加，故障注入）、S5（最终门，任务 1A.6、FI-055，要新增一个 TSan 负控）、S6（类 A 闭合，SAFE-07、FI-056，Q19 先量成本）、S7（迁移与“写 v6”的开关，仅当存在真实日志）；每一片都是 Tier B，须 Owner 选定、计划与“开始”。风险（PR #250 里写明）：读者证明不了“写者不会写出读者拒绝的帧”，那是 S4 与 S6 的证据；`is_terminal()` 现在含 `NeverSent`，但它在生产里只有 `validate_transition()` 自己调用，没有行为变化——真正要在写者切片里改的是 `is_exchange_final()` 的消费者（`order_tracker.hpp` 的在途槽位遍历与 `mark_resolved` 的触发、`live_submit_orchestrator.hpp` 的终态分支、`startup_recovery.hpp` 的检查点判断），它们看不见被 `NeverSent` 闭合的订单，S4、S6 要让它们认 `is_resolved()` 并按设计 §4.4 的顺序释放；旧二进制读到含事件 23 的日志会 `MalformedEnum`（失败关闭），S7 的迁移清单要列这一点。
 
+**2026-11-13 Q23 切片 S4：NotSent 闭合的写入口**（Owner 于 2026-11-13 对 S4 的计划答“不保留审计日志，显式的构造配置，继续下一步操作”——我把这条回复读作“开始”，并在回复里说明了——对 PR #252 说“合并 252，然后继续自主推进”；Tier B；PR #252 于 2026-11-13 合入，合并提交 `5bbbf43`）：
+
+- 合入的内容：`DurableAuditSink::append_never_sent()`——事件 23 进入日志的唯一入口——与默认关闭的构造开关 `NeverSentWrites`（`DurableAuditSink` 构造函数里排在 `open_mode` 之后的参数）。判断顺序：开关、打开方式（离线操作员工具永不写这个帧）、围栏、空订单号、`never_sent::check_closure()`（与恢复读者是同一个函数，写者放行的帧下一次启动必接受）；所有拒绝都在写之前、不围栏；只有追加本身会围栏，而追加失败不等于没写（帧可能已落盘，调用者必须让订单原地不动，下一次启动：帧落了读成闭合、没落读成 `Ambiguous`、撕裂的尾部被切掉）；成功之后 `write_version_` 才升到 6（第三处赋值）。调用者给出 `ClosureTarget`（sink 没有在途订单）；sink 不跟踪闭合过的订单号（“闭合帧是最后一帧”由调用者的槽位生命周期保证，违反它的后果是下一次启动 `Corrupt`，旧 `AbortedPreSend` 双发场景作为必拒用例保留）。**树里没有任何调用者，也没有任何进程打开开关**，`test_never_sent_guard` 钉死这两点；今天所有存储仍写 v5。
+- Owner 的决定（2026-11-13，对计划里两个待定点的回答）：不保留 2026-11-07 Testnet 联调留下的审计日志——设计 §5.7 / D2 的“直接升 v6”适用，不做迁移清单；写 v6 的开关是显式的构造配置（不是 `AuditSinkOpenMode` 的新值、存储里的标志或环境变量）。
+- 我在片内定的决定（Owner 合并 PR 时没有逐条表态，仍是我的默认值）：写入口收调用者的 `ClosureTarget`；sink 不跟踪闭合过的订单号；开关与存储的版本无关（`Disabled` 的 sink 重开一个 v6 存储照样拒绝）；空订单号单独拒绝（`EmptyClientOrderId`）。S2/S3 留下的几处注释把 S4 说成“最终门的写者”，已按设计 §8 改正：S4 是 sink 的写入，S5 是最终门，S6 是类 A 闭合。
+- 证据：MSVC（`/W4 /WX`）全量零警告、ctest 3678/3678（之后写者测试加了 2 个用例，21/21）；27 个变异体全部被杀死（写入口 17、构造开关 4、守卫 6），没有等价变异体；四个静态检查（`spec_xref_check`、`spec_enum_diff`、`concurrency_targets_check`、`closure_ledger_check`）0 发现；WSL2 GCC-14 `none` 全量 3690 个测试 0 失败、`address`（ASan+UBSan）18 个目标 0 失败；CI 的 `native-build-test` 全量通过；手动 `CI Native Sanitizers` run `43385045781`：三个任务全部成功（ASan+UBSan 全量、TSan 并发测试与负控、ARM64 弱内存序硬件）。故障注入用“`<log>.tip.tmp` 这个名字被目录占住”造出“帧已落盘、anchor 没写”的窗口（Windows 与 Linux 上都是写文件失败）。
+- 同步的文档：`docs/SPEC_INVARIANTS.md`（新条目，并改正 S2/S3 条目里“写者是 S4/S6”的说法）、`docs/NOTSENT_CLOSURE_DESIGN.md`（头部、§8 的 S4 行、§9 D2 的记录）、`docs/NATIVE_ARCHITECTURE.md`（都在 PR #252 里）；本条、主题表 Q23 一行、`docs/AUDIT_CLOSURE_LEDGER.md` 一行与设计文档头部的合入记录（本次状态补录）。FI-055、FI-056 的状态、门禁结论与证据不变：写入口没有调用者，发送路径上还没有任何代码写这个帧。
+- 仍然开放：调用者 S5（最终门，任务 1A.6、FI-055，要新增一个 TSan 负控）、S6（类 A 闭合，SAFE-07、FI-056，Q19 先量出每次拒绝多一条持久链的成本）；`is_exchange_final()` 的消费者（`order_tracker.hpp`、`live_submit_orchestrator.hpp`、`startup_recovery.hpp`）要随调用者学会 `is_resolved()`；S7（迁移与读者先行开关，仅当存在要保留的真实日志）。风险（PR #252 里写明）：sink 证明不了“订单从未越过边界”，这是调用者的责任；sink 不跟踪闭合过的订单号；打开开关的第一次闭合会把 v5 存储推到 v6，不可逆，没有迁移清单；`write_version_` 与 `append_impl()` 两条守卫的钉子被有意改过。
+
 ### B.1 v2.9.0（2026-10-23 学术工程复核；含其后至 2026-11-11 的状态补录）
 
 - 基点 `72a3f18`，v2.8.0 按原字节归档并校验 SHA-256（0.1）；以下 B.2/B.3 均为历史记录，不是现行协议裁定。本次只改文档、ADR 补充与生成 HTML，未修改任何实现或授权配置。
@@ -3573,7 +3582,7 @@ CS = alpha_perp/(ones' * alpha_perp)
 | Q20 自动围栏实现 | 仍开放：Owner 选定有限自动恢复目标，不是已实现/已授权运行。 | R-20、F.5、S-14、ADR 补充；真实旧发送能力隔离、在途排空/对账、危险锁存、全门恢复及 FI-047 正负控后才可生效。 |
 | Q21 R2 权限/费用/恢复 | 仍开放：产品、180 天与 5 美元预算已选；无 DELETE 保证、保留例外、实际费用和恢复均未验。 | F.7、S-11；权限负控、全内容读回/清单、冻结集、预算告警及恢复演练；不能以锁可配置或 PUT 成功关闭整项。 |
 | Q22 撤单工作流/FI | 仍开放：协议文字确认不证明取消闭环。 | F.7/F.9；验应答丢失/部分成交/更名 alias/-2011/预算/其他 sender/普通与算法域、存储故障审计；不自动清仓，未知不释放。 |
-| Q23 NotSent 与迁移 | 仍开放：OWNER_APPROVED_DESIGN；2026-10-25 语义已冻结（`docs/NOTSENT_CLOSURE_DESIGN.md`）并有 TLA+ 协议模型（`formal/notsent_closure.tla`：设计配置无反例，8 个开关各有必败配置），**读者侧已于 2026-11-12 实现**（PR #250，`979a94b`：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12、v6 的合法集合、恢复表 §4.6、`never_sent_rules.hpp`），写者没有（树里没有任何代码写这个帧）。 | R-18/R-22、F.5/F.9；语义与协议模型已冻结（设计文档 4 至 7），读者侧已落地，剩余：写者（S4 sink 追加、S5 最终门、S6 类 A 闭合）、迁移崩溃（S7）、持久失败/晚 ACK 的实现测试、唯一发送 claim 的并发实现与 TSan 负控、旧 AbortedPreSend 负控的实现侧用例、恢复验收。 |
+| Q23 NotSent 与迁移 | 仍开放：OWNER_APPROVED_DESIGN；2026-10-25 语义已冻结（`docs/NOTSENT_CLOSURE_DESIGN.md`）并有 TLA+ 协议模型（`formal/notsent_closure.tla`：设计配置无反例，8 个开关各有必败配置），**读者侧已于 2026-11-12 实现**（PR #250，`979a94b`：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12、v6 的合法集合、恢复表 §4.6、`never_sent_rules.hpp`），sink 的写入口已于 2026-11-13 实现（PR #252，`5bbbf43`：`append_never_sent()` 与默认关闭的构造开关 `NeverSentWrites`），调用者没有（树里没有任何代码调用它或打开开关）。 | R-18/R-22、F.5/F.9；语义与协议模型已冻结（设计文档 4 至 7），读者侧与 sink 的写入口已落地，剩余：调用者（S5 最终门、S6 类 A 闭合）、迁移崩溃（S7）、调用者一侧的持久失败/晚 ACK 的实现测试、唯一发送 claim 的并发实现与 TSan 负控、旧 AbortedPreSend 负控的实现侧用例、恢复验收。 |
 
 前轮最小公开观察的可追溯摘要（不是本次新增抓帧，也不是完整原始 fixture）：
 
