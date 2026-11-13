@@ -935,7 +935,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
 
   - **[Q23 切片 S2/S3 已落地：读者先行——`OrderNeverSent` 帧与订单状态 `NeverSent`]**（`docs/NOTSENT_CLOSURE_DESIGN.md` §4.3、§4.6、§8；
     Owner 2026-11-12 看过计划说“开始，命名按你的建议”；Tier B）：“这个订单从未越过发送边界”的持久闭合帧，恢复读者现在能读、能校验，
-    但**没有任何生产代码能写它**：写者是 S4（最终门的拒绝，类 B）与 S6（`Prepared` 之前的拒绝，类 A），本片只让读者先行（设计 §5 第 4 条）。
+    但**没有任何生产代码能写它**：写入口是 S4（sink 的 `append_never_sent()`，见下面的 “Q23 切片 S4” 条目），它的调用者是 S5（最终门的拒绝，类 B）与 S6（`Prepared` 之前的拒绝，类 A）；本片只让读者先行（设计 §5 第 4 条）。
     - **新增符号**：`AuditEventType::OrderNeverSent` = 23（只在 v6 帧里合法）；`OrderState::NeverSent` = 12（只在 v6 帧里合法；终态，
       **不是**交易所终态）；`is_legal_order_state_for_version()`（与事件类型的版本界同形：v5 的界仍是 `EscalatedToOperator`，v6 多一个值）；
       `encode_order_event_frame()` 对该版本里非法的状态同样返回 0、什么都不写；`is_resolved()`（`is_exchange_final()` 或 `NeverSent`，
@@ -960,10 +960,31 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       机、编解码、规则与读者提及；编排器、跟踪器、各发布者、启动恢复与 `src/` 一个都不提；`check_closure()` 与 `is_resolved()` 只有恢复扫描调用；
       `recovered_never_sent()` 没有生产读者。`validate_transition()` 的 13×13 全表（`test_order_lifecycle.cpp`）钉死两条新边与“没有任何边离开它”，
       `test_order_durable_path.cpp` 的表里新增 `NeverSent` 一行（对它的任何交易所报告都是矛盾）。
-    - **仍未覆盖**：写事件 23 的一方（S4：最终门与决定字；S6：类 A 闭合与 SAFE-07 的孤儿）；槽位释放与压实保留改用 `is_resolved()`（写者切片，
+    - **仍未覆盖**：写事件 23 的调用者（S5：最终门与决定字；S6：类 A 闭合与 SAFE-07 的孤儿；S4 的写入口已落地，见下一条）；槽位释放与压实保留改用 `is_resolved()`（写者切片，
       对账目标集合不含新状态：`order_tracker.hpp` 的合法目标是显式列表，没有改）；迁移清单与读者先行开关（S7，没有真实日志之前不需要）；晚到成交
       对已闭合订单的告警（写者切片决定是否需要、怎样认出这些订单）。
 
+  - **[Q23 切片 S4 已落地：闭合帧的写入口——`append_never_sent()` 与 `NeverSentWrites` 开关]**（`docs/NOTSENT_CLOSURE_DESIGN.md` §4.3 至 §4.5、§5.4、§8；
+    Owner 2026-11-13 对计划里的两个待定点答“不保留审计日志，显式的构造配置，继续下一步操作”；Tier B）：持久闭合帧现在有了**唯一**的写入口，但没有任何调用者：
+    - **新增符号**：`NeverSentWrites`（`Disabled` / `Enabled`，默认 `Disabled`，`DurableAuditSink` 的构造参数，排在 `open_mode` 之后）、
+      `DurableAuditSink::append_never_sent()`（返回 `NeverSentAppend`：`NeverSentAppendStatus`、`ClosureCheck`、`AuditAppendResult`）、
+      `DurableAuditSink::never_sent_writes()`。
+    - **开关是显式的构造配置**（Owner 的决定：不是存储里的标志，也不是环境变量）：默认关；`test_never_sent_guard.cpp` 钉死“sink 头文件之外没有任何生产源文件提到
+      `NeverSentWrites`”——要在一个进程里打开它，就得有意地改那条守卫。**2026-11-07 Testnet 联调留下的审计日志不保留**（Owner 的决定），所以按设计 §5.7 与 D2
+      直接升 v6，没有迁移清单；v6 的第一帧由 `append_never_sent()` 写下，此后 `write_format_version()` 为 6。
+    - **写入口的判断顺序**（全部在写之前，拒绝时不写、不围栏）：开关（`NotEnabled`）、打开方式（`NotTradingOpen`：离线操作员工具永远不写这个帧）、围栏（`SinkFenced`）、
+      客户端订单号（`EmptyClientOrderId`）、最后 `never_sent::check_closure()`（`Refused`，附具体的 `ClosureCheck`）。最后一步与恢复读者用的是**同一个函数**，所以写者放行的帧，
+      下一次启动必接受。目标订单 `ClosureTarget` 由调用者给出：sink 没有在途订单，核实不了它，只核对帧与它一致。
+    - **失败的语义**（设计 §4.5）：追加本身失败 = `AppendFailed`，I/O 失败照 `append_durable()` 围栏，**帧可能已经落盘**（测试用“tip anchor 写不进去”造出这个窗口）：调用者必须让订单
+      原地不动——不释放、不回卷、不在同一个 id 下再来一次；围栏保证这个 sink 之后什么都写不进去。下一次启动：帧落了 → 读到闭合（订单从未越过边界，所以仍然正确）；帧没落 →
+      订单停在 `Prepared`，即 `Ambiguous`，走对账或操作员；撕裂的尾部 → 被切掉，订单不被闭合。成功之后 `write_version_` 才升到 6（第三处赋值，在确认之后）。
+    - **sink 不做的事**：不跟踪它闭合过哪些订单号，也不知道该订单号有 Intent 帧、之后没有任何帧——“闭合帧是最后一帧”由调用者的在途槽位生命周期保证（设计 §4.4：确认之后才释放槽位）；
+      违反它的后果是下一次启动 `Corrupt`、存储拒绝打开（`test_never_sent_writer.cpp` 里“旧 AbortedPreSend 双发场景”的用例钉死这一点，是 round 13 那个设计的必拒用例）。
+    - **守卫**：`write_version_` 恰好三处赋值（恢复扫描、操作员帧确认之后、闭合帧确认之后），`append_impl()` 三个调用者（`test_operator_resolution_guard.cpp` 有意改过）；`check_closure()` 只在恢复扫描与
+      `append_never_sent()` 里；`append_never_sent()` 在生产里没有调用者（`test_never_sent_guard.cpp`）。
+    - **仍未覆盖**：调用者（S5：最终门与决定字，任务 `1A.6`、FI-055；S6：类 A 闭合与 SAFE-07 的孤儿，FI-056）；槽位释放与压实保留改用 `is_resolved()`（`order_tracker.hpp`、
+      `live_submit_orchestrator.hpp`、`startup_recovery.hpp` 里 `is_exchange_final()` 的消费者，随调用者一起改；`is_terminal()` 在生产里只有 `validate_transition()` 自己用，没有行为变化）；
+      迁移清单与读者先行开关（S7，仅当存在要保留的真实日志）。
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/

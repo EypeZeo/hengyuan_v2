@@ -111,8 +111,8 @@ inline bool is_exchange_final(OrderState s) noexcept {
 // the durable proof that it never crossed (NeverSent). A NEW predicate on purpose: is_exchange_final()'s comment above says
 // what it means ("the exchange can no longer be holding this order") and NeverSent is not an exchange state at all, so
 // widening it would make every caller that asks the exchange question answer a different one. The recovery scan (skip an
-// order that needs neither a checkpoint nor an orphan count) is the first and, in this slice, only caller; the slot release
-// and the retention filters join it when the writers do (S4, S6). Reconciliation targets are NOT derived from it: no
+// order that needs neither a checkpoint nor an orphan count) is the first and, so far, only caller; the slot release and the
+// retention filters join it when the closure's callers do (S5, S6). Reconciliation targets are NOT derived from it: no
 // reconcile or query result can name NeverSent (order_tracker.hpp lists its legal targets explicitly).
 inline bool is_resolved(OrderState s) noexcept {
     return is_exchange_final(s) || s == OrderState::NeverSent;

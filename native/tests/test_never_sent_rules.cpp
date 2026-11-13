@@ -2,8 +2,9 @@
 // (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 and 4.6)
 //
 // Pure logic, no logs: the order is a ClosureTarget (what the recovery scan knows of it) and the frame an AuditRecord. The
-// same rule is applied to real logs by the recovery reader (test_never_sent_reader.cpp), and will be applied by the writers
-// of slices S4 and S6 before they write -- so a frame a writer lets through is a frame the next start accepts.
+// same rule is applied to real logs by the recovery reader (test_never_sent_reader.cpp) and by the writer
+// DurableAuditSink::append_never_sent() before it writes (test_never_sent_writer.cpp) -- so a frame the writer lets through is
+// a frame the next start accepts.
 //
 // The verdicts come in a fixed order (the order first, then the frame: pairing, existence, identity): the order is part of the
 // contract, because a caller that wants to say WHY an order cannot be closed asks the order's question first.

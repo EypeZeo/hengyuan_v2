@@ -3,11 +3,11 @@
 //
 // Governance: L1 (pure logic: no I/O, no allocation, no clock). docs/NOTSENT_CLOSURE_DESIGN.md 4.3 says what an
 // OrderNeverSent frame contains and 4.6 what the recovery reader does with one; this header is the "does it close THIS order"
-// half of that, in one place. Today only the recovery reader (DurableAuditSink's scan) calls it. The writers -- slice S4 (the
-// final gate's refusal, class B) and S6 (a refusal before the Prepared frame, class A) -- will call the very same function
-// before they write, for the reason operator_resolution_rules.hpp gives for its own: a frame the writer lets through but the
-// reader refuses would not just be refused later, it would make the whole store Corrupt at the next start. One rule, several
-// callers, on purpose.
+// half of that, in one place. Two callers, both in DurableAuditSink: the recovery scan, and the writer, append_never_sent() (slice
+// S4), which calls the very same function before it writes -- for the reason operator_resolution_rules.hpp gives for its own: a
+// frame the writer lets through but the reader refuses would not just be refused later, it would make the whole store Corrupt at
+// the next start. One rule, two callers, on purpose. (The writer's own callers are the later slices: S5, the final gate's
+// refusal, class B, and S6, a refusal before the Prepared frame, class A.)
 //
 // WHAT AN OrderNeverSent FRAME CLAIMS, AND WHAT THE READER CAN AND CANNOT CHECK. The frame says "this order never crossed": no
 // byte of its request ever left the process. The reader cannot verify that -- only the writer knew whether it had claimed the

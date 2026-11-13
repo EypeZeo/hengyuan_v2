@@ -2,21 +2,25 @@
 // test_never_sent_guard.cpp -- Q23 slices S2/S3 guard (docs/NOTSENT_CLOSURE_DESIGN.md 4.6 and 8).
 //
 // S2/S3 teach the recovery reader to accept ONE new kind of frame, OrderNeverSent (event 23, resulting state NeverSent = 12),
-// which the writers of slices S4 (the final gate's refusal) and S6 (a refusal before the Prepared frame) will write. What keeps
-// that acceptance safe NOW is the absence of anything that could produce such a frame, or act on one: behaviour cannot see an
-// absence, so this test reads the sources, exactly as test_operator_resolution_guard.cpp does for the operator's frame:
+// which the writer of slice S4 (DurableAuditSink::append_never_sent()) writes for its callers, S5 (the final gate's refusal)
+// and S6 (a refusal before the Prepared frame). What keeps that acceptance safe NOW is the absence of anything that could
+// produce such a frame, or act on one: behaviour cannot see an absence, so this test reads the sources, exactly as
+// test_operator_resolution_guard.cpp does for the operator's frame:
 //
 //   1. AuditEventType::OrderNeverSent is NAMED only where it is defined, where the codec decides which version may carry it,
 //      where the closure rule (never_sent_rules.hpp) reads it, and where the recovery scan recognises the frame. Each pin
 //      carries the exact number of mentions. A further file naming it is a producer (or a new reader) somebody has to look at.
 //   2. OrderState::NeverSent likewise: the state machine, the codec's version bound, the rule and the reader. In particular
 //      nothing live -- the orchestrator, the tracker, the publishers, the reconcile path -- moves an order into it.
-//   3. The closure rule, check_closure(), is applied by the recovery scan and nothing else: the writers join it in S4 and S6,
-//      and that is the slice that adds them here with the reason.
+//   3. The closure rule, check_closure(), is applied by the recovery scan and by the one writer, append_never_sent() (Q23 S4),
+//      and nothing else: what the writer lets through, the reader accepts. The callers of the writer join in S5 and S6.
 //   4. is_resolved() is called by the recovery scan and nothing else (the slot release and the retention filters join in the
 //      writer slices). is_exchange_final() keeps meaning what it says: its callers are not pinned here (they predate this slice),
 //      but test_order_lifecycle.cpp pins that NeverSent is not exchange-final.
 //   5. The closure counter, recovered_never_sent(), is read by nothing in production.
+//   6. (Q23 S4) The writer, DurableAuditSink::append_never_sent(), has NO caller in production, and the switch that lets a sink
+//      write the frame at all, NeverSentWrites, is named by the sink header alone -- so no process can turn it on. The callers
+//      (S5's final gate, S6's refusals before the Prepared frame) add themselves here, with the reason, in the PR that wires them.
 //
 // The scan strips comments and the contents of string/char literals first, so prose that mentions a name does not count and a
 // string that contains one cannot hide a real use. (test_helpers/cxx_source_view.hpp is the one shared scanner.)
@@ -208,7 +212,7 @@ TEST(NeverSentGuard, TheNeverSentStateIsNamedOnlyByTheStateMachineTheCodecTheRul
 }
 
 TEST(NeverSentGuard, NothingLiveNamesTheEventOrTheState) {
-    // The point of the two pins above, said once by name: the live process is the one that would WRITE the frame (S4, S6),
+    // The point of the two pins above, said once by name: the live process is the one that would CALL the writer (S5, S6),
     // and none of it may mention the event or the state yet.
     for (const char* rel :
          {"include/hengyuan/live_submit_orchestrator.hpp", "include/hengyuan/order_tracker.hpp",
@@ -229,13 +233,37 @@ TEST(NeverSentGuard, NothingLiveNamesTheEventOrTheState) {
     }
 }
 
-TEST(NeverSentGuard, TheClosureRuleIsAppliedByTheRecoveryScanAlone) {
-    // The writers (S4, S6) will apply the very same function before they write; until they exist, only the reader does.
-    expect_named_only_in("check_closure", {{kRules, 1, "the definition"}, {kSink, 1, "the recovery scan"}});
+TEST(NeverSentGuard, TheClosureRuleIsAppliedByTheRecoveryScanAndTheNeverSentWriterAlone) {
+    // The writer applies the very same function the reader does, before it writes: a frame the writer accepts is a frame the
+    // next start accepts. Nothing else may decide whether a closure is legitimate.
+    expect_named_only_in("check_closure", {{kRules, 1, "the definition"},
+                                           {kSink, 2, "the recovery scan, and append_never_sent() before it writes"}});
     const SourceFile* sink = find_source(kSink);
     ASSERT_NE(sink, nullptr);
     EXPECT_EQ(count_identifier(function_body(sink->code, "run_recovery_scan_impl"), "check_closure"), 1u)
-        << "the call is inside the recovery scan, not in an append path";
+        << "one call is inside the recovery scan";
+    EXPECT_EQ(count_identifier(function_body(sink->code, "append_never_sent"), "check_closure"), 1u)
+        << "the other is inside the writer, before it appends";
+    EXPECT_EQ(count_identifier(function_body(sink->code, "append_durable"), "check_closure"), 0u)
+        << "append_durable() judges no frame's legality (it never has)";
+}
+
+TEST(NeverSentGuard, TheClosureWriterHasNoCallerAndTheSwitchIsNamedByTheSinkAlone) {
+    // Q23 S4: the writer exists and nothing in the tree calls it or turns it on. Every caller is a producer of the frame, so the
+    // callers (S5, S6) are added here one by one, each with the reason, by the PR that wires them.
+    expect_named_only_in("append_never_sent", {{kSink, 1, "the definition"}});
+    // The switch is a constructor argument: the only way to pass Enabled is to name the enum, so a process that turns the writer
+    // on shows up here. In the sink: the enum, the constructor parameter and its default, the accessor, the member and its
+    // initialiser, and the one check inside append_never_sent().
+    expect_named_only_in("NeverSentWrites", {{kSink, 7, "the enum, the constructor, the accessor, the member, the check"}});
+    // The default really is Disabled, and the only check of it refuses everything but Enabled.
+    const SourceFile* sink = find_source(kSink);
+    ASSERT_NE(sink, nullptr);
+    EXPECT_NE(sink->code.find("NeverSentWrites never_sent_writes = NeverSentWrites::Disabled"), std::string::npos)
+        << "the constructor's default must stay Disabled";
+    EXPECT_NE(function_body(sink->code, "append_never_sent").find("never_sent_writes_ != NeverSentWrites::Enabled"),
+              std::string::npos)
+        << "the writer's first check refuses everything but Enabled";
 }
 
 TEST(NeverSentGuard, TheResolvedPredicateIsAppliedByTheRecoveryScanAlone) {
