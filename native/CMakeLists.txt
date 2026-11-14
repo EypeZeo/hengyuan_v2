@@ -726,7 +726,7 @@ if(HY_BUILD_TESTS)
     gtest_discover_tests(test_never_sent_guard)
 
     # Q23 slice S4 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 to 4.5, 5.4 and 8): the closure WRITER, DurableAuditSink::append_never_sent(),
-    # behind the NeverSentWrites constructor switch (default off, and nothing in the tree turns it on or calls it yet -- the
+    # behind the NeverSentWrites constructor switch (default off; the two submit harnesses enable it -- the
     # guard above pins that). Real sinks on real files: the refusals, the successful closure and the version it moves the store
     # to, the fault injections of design 4.5 (an append that fails, a frame that lands late, a frame that never lands, a torn
     # tail), and the check that what the writer accepts is exactly what the next start accepts.
@@ -734,6 +734,27 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_never_sent_writer PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_never_sent_writer)
     gtest_discover_tests(test_never_sent_writer)
+
+    # Q23 slice S6 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 and 8, class A): the first CALLER of that writer. An order a local gate refuses
+    # after its Intent frame is closed as never sent instead of being left as an Intent orphan. test_never_sent_class_a: the six
+    # refusals of orchestrate_submit() against a fake durable port (what is written, in which order, what the result says, the
+    # recently-closed tripwire of Gate 9b). test_never_sent_orphans: the same against a REAL sink on real files (N refusals leave no
+    # orphan, the store moves to v6, and duplicate attempts stay refused after restart). test_never_sent_budget covers failed
+    # appends and late landing, plus the Q19 durable-append cost (benchmark enabled with --gtest_also_run_disabled_tests).
+    add_executable(test_never_sent_class_a tests/test_never_sent_class_a.cpp)
+    target_link_libraries(test_never_sent_class_a PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_never_sent_class_a)
+    gtest_discover_tests(test_never_sent_class_a)
+
+    add_executable(test_never_sent_orphans tests/test_never_sent_orphans.cpp)
+    target_link_libraries(test_never_sent_orphans PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_never_sent_orphans)
+    gtest_discover_tests(test_never_sent_orphans)
+
+    add_executable(test_never_sent_budget tests/test_never_sent_budget.cpp)
+    target_link_libraries(test_never_sent_budget PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_never_sent_budget)
+    gtest_discover_tests(test_never_sent_budget)
 
     # D5 slice R2 (docs/OPERATOR_RESOLUTION_DESIGN.md 5, 6 and 10): the decisions behind an OrderOperatorResolved
     # frame's evidence (operator_resolution_evidence.hpp) -- the fence arithmetic, the allOrders windows, the client order
@@ -818,6 +839,21 @@ if(HY_BUILD_TESTS)
     target_link_libraries(test_live_submit_orchestrator PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_live_submit_orchestrator)
     gtest_discover_tests(test_live_submit_orchestrator)
+
+    add_executable(test_submit_final_gate tests/test_submit_final_gate.cpp)
+    target_link_libraries(test_submit_final_gate PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_submit_final_gate)
+    gtest_discover_tests(test_submit_final_gate)
+
+    add_executable(test_submit_reservation tests/test_submit_reservation.cpp)
+    target_link_libraries(test_submit_reservation PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_submit_reservation)
+    gtest_discover_tests(test_submit_reservation)
+
+    add_executable(test_submit_authority_concurrency tests/test_submit_authority_concurrency.cpp)
+    target_link_libraries(test_submit_authority_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_submit_authority_concurrency)
+    gtest_discover_tests(test_submit_authority_concurrency PROPERTIES LABELS concurrency)
 
     # 批次 6 6b-0d: startup recovery -- state machine + apply_recovery() against a REAL
     # DurableAuditSink temp file and the real reconcile path (only the exchange is faked).
@@ -1461,6 +1497,10 @@ if(HY_BUILD_TESTS)
         add_executable(tsan_control_relaxed_mailbox tests/tsan_control_relaxed_mailbox.cpp)
         target_link_libraries(tsan_control_relaxed_mailbox PRIVATE hengyuan_core Threads::Threads)
         hengyuan_set_warnings(tsan_control_relaxed_mailbox)
+
+        add_executable(tsan_control_relaxed_submit_authority tests/tsan_control_relaxed_submit_authority.cpp)
+        target_link_libraries(tsan_control_relaxed_submit_authority PRIVATE hengyuan_core Threads::Threads)
+        hengyuan_set_warnings(tsan_control_relaxed_submit_authority)
     endif()
 
     # P2-EXEC-LIVE-01: HMAC signer (requires OpenSSL)

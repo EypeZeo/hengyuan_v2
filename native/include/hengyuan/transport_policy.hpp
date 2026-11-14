@@ -344,6 +344,12 @@ public:
         return effective_used_now(now);
     }
 
+    TimePoint window_deadline() const noexcept {
+        const auto duration = std::chrono::duration_cast<Clock::duration>(std::chrono::seconds(window_seconds_));
+        if (window_start_ > TimePoint::max() - duration) return TimePoint::max();
+        return window_start_ + duration;
+    }
+
     std::uint32_t remaining(TimePoint now = Clock::now()) const noexcept {
         auto avail = available_budget();
         auto used = effective_used_now(now);

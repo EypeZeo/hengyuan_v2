@@ -46,6 +46,7 @@ namespace {
 
 namespace samples = hy::test_samples;
 using hy::BinanceWsApiUserDataSession;
+using hy::SubmitAuthority;
 using hy::UserDataEventKind;
 using hy::UserDataWsEvent;
 using hy::WsApiSessionEnd;
@@ -806,11 +807,17 @@ TEST_F(WsApiSessionTest, AnUnknownEventTypeIsCountedAndNotDelivered) {
 }
 
 TEST_F(WsApiSessionTest, AnEventStreamTerminatedIsDeliveredAndEndsTheGeneration) {
-    auto session = make_session(4);
+    auto authority = std::make_shared<SubmitAuthority>();
+    const std::uint64_t old_epoch = authority->epoch();
+    Opts options;
+    options.cfg.submit_authority = authority;
+    auto session = make_session(4, options);
     session->start();
     ASSERT_TRUE(wait_until([&] { return session->is_connected(); }));
     server_->send_text(std::string(samples::kEventEventStreamTerminated));
     ASSERT_TRUE(wait_stopped(*session));
+    ASSERT_TRUE(wait_until([&] { return authority->epoch() != old_epoch; }));
+    EXPECT_FALSE(authority->claim(old_epoch));
     EXPECT_EQ(session->end_cause(), WsApiSessionEnd::StreamTerminated);
     EXPECT_EQ(session->stats_snapshot().errors, 0U);
     const std::vector<UserDataWsEvent> events = drain_ring();
@@ -820,11 +827,17 @@ TEST_F(WsApiSessionTest, AnEventStreamTerminatedIsDeliveredAndEndsTheGeneration)
 }
 
 TEST_F(WsApiSessionTest, AServerShutdownAfterTheSubscriptionIsDeliveredAndEndsTheGeneration) {
-    auto session = make_session(5);
+    auto authority = std::make_shared<SubmitAuthority>();
+    const std::uint64_t old_epoch = authority->epoch();
+    Opts options;
+    options.cfg.submit_authority = authority;
+    auto session = make_session(5, options);
     session->start();
     ASSERT_TRUE(wait_until([&] { return session->is_connected(); }));
     server_->send_text(kServerShutdown);
     ASSERT_TRUE(wait_stopped(*session));
+    ASSERT_TRUE(wait_until([&] { return authority->epoch() != old_epoch; }));
+    EXPECT_FALSE(authority->claim(old_epoch));
     EXPECT_EQ(session->end_cause(), WsApiSessionEnd::ServerShutdown);
     const std::vector<UserDataWsEvent> events = drain_ring();
     ASSERT_EQ(events.size(), 1U);
@@ -835,6 +848,22 @@ TEST_F(WsApiSessionTest, AServerShutdownAfterTheSubscriptionIsDeliveredAndEndsTh
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_EQ(session->end_cause(), WsApiSessionEnd::ServerShutdown);
     EXPECT_TRUE(wait_until([&] { return server_->open_connections() == 0U; })) << "the generation is over: its connection is closed";
+}
+
+TEST_F(WsApiSessionTest, StopImmediatelyDisconnectsAndInvalidatesTheOldSubmitEpoch) {
+    auto authority = std::make_shared<SubmitAuthority>();
+    const std::uint64_t old_epoch = authority->epoch();
+    Opts options;
+    options.cfg.submit_authority = authority;
+    auto session = make_session(6, options);
+    session->start();
+    ASSERT_TRUE(wait_until([&] { return session->is_connected(); }));
+
+    session->stop();
+    EXPECT_FALSE(session->is_connected()) << "the stop request is observable before strand cancellation runs";
+    EXPECT_FALSE(authority->claim(old_epoch));
+    ASSERT_TRUE(wait_stopped(*session));
+    EXPECT_EQ(session->end_cause(), WsApiSessionEnd::Requested);
 }
 
 TEST_F(WsApiSessionTest, AFullRingDropsAndCountsInsteadOfBlocking) {

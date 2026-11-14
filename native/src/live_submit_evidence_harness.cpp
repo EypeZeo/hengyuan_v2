@@ -108,6 +108,7 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::SubmitPartialFill: return "SubmitPartialFill";
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
         case OrchestratorGate::NotReady: return "NotReady";
+        case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
     }
     return "?";
 }
@@ -165,7 +166,9 @@ struct Fixture {
         key_ring = std::make_unique<KeyRing>(kek);
         WrappedKeyRecord rec{};
         key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}}, rec);
-        durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
+        // Q23 S6: one of the two harnesses that turn the closure writer on (see live_submit_preflight_harness.cpp).
+        durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1, kMaxIntentOrphans,
+                                                                AuditSinkOpenMode::Trading, NeverSentWrites::Enabled);
         ctx.durable_audit = make_durable_order_audit_port(*durable_audit_sink);
 
         std::strncpy(rules.symbol, "BTCUSDT", sizeof(rules.symbol) - 1);

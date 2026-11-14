@@ -865,8 +865,82 @@ TEST(SubmitReadyToken, ATokenCanBeMovedIntoAnOptional) {
     EXPECT_EQ(held->issued_at_ms(), 9);
 }
 
+TEST(SubmitReadyToken, ClaimConsumesTheIssuedEpochExactlyOnce) {
+    KillSwitch kill_switch;
+    SyntheticReadiness synthetic(kill_switch, 3);
+    ReadinessResult issued = synthetic.readiness().authorize(9);
+    ASSERT_TRUE(issued.ready());
+    ASSERT_TRUE(issued.token.has_value());
+
+    EXPECT_EQ(synthetic.readiness().claim(*issued.token, 10), NotReadyReason::None);
+    EXPECT_EQ(synthetic.readiness().claim(*issued.token, 11), NotReadyReason::EpochChanged);
+}
+
+TEST(SubmitReadyToken, ClaimRejectsATokenFromAnotherIssuer) {
+    KillSwitch kill_switch;
+    SyntheticReadiness first(kill_switch, 3);
+    SyntheticReadiness second(kill_switch, 3);
+    ReadinessResult issued = first.readiness().authorize(9);
+    ASSERT_TRUE(issued.ready());
+    ASSERT_TRUE(issued.token.has_value());
+
+    EXPECT_EQ(second.readiness().claim(*issued.token, 10), NotReadyReason::EpochChanged);
+    EXPECT_EQ(first.readiness().claim(*issued.token, 11), NotReadyReason::None);
+}
+
+TEST(SubmitReadyToken, ClaimRejectsAChangedKillSwitchRevisionEvenAfterReset) {
+    KillSwitch kill_switch;
+    SyntheticReadiness synthetic(kill_switch, 3);
+    ReadinessResult issued = synthetic.readiness().authorize(9);
+    ASSERT_TRUE(issued.ready());
+    ASSERT_TRUE(issued.token.has_value());
+
+    kill_switch.trigger();
+    kill_switch.operator_reset();
+
+    EXPECT_EQ(kill_switch.state(), KillState::Normal);
+    EXPECT_EQ(synthetic.readiness().claim(*issued.token, 10), NotReadyReason::EpochChanged);
+}
+
+TEST(SubmitReadyToken, AFailedFinalCheckDoesNotConsumeTheAuthorizationEpoch) {
+    KillSwitch kill_switch;
+    SyntheticReadiness synthetic(kill_switch, 3);
+    ReadinessResult issued = synthetic.readiness().authorize(9);
+    ASSERT_TRUE(issued.ready());
+    ASSERT_TRUE(issued.token.has_value());
+    const std::uint64_t epoch = synthetic.readiness().authority().epoch();
+    bool final_check_ran = false;
+
+    EXPECT_EQ(synthetic.readiness().claim(*issued.token, 10, [&]() noexcept {
+                  final_check_ran = true;
+                  return false;
+              }),
+              NotReadyReason::FinalCheckFailed);
+    EXPECT_TRUE(final_check_ran);
+    EXPECT_EQ(synthetic.readiness().authority().epoch(), epoch);
+    EXPECT_EQ(synthetic.readiness().claim(*issued.token, 11), NotReadyReason::None);
+}
+
+TEST(SubmitReadyToken, RevocationDuringFinalCheckWinsTheClaimCompareExchange) {
+    KillSwitch kill_switch;
+    SyntheticReadiness synthetic(kill_switch, 3);
+    ReadinessResult issued = synthetic.readiness().authorize(9);
+    ASSERT_TRUE(issued.ready());
+    ASSERT_TRUE(issued.token.has_value());
+    const std::uint64_t epoch = synthetic.readiness().authority().epoch();
+    const std::uint64_t claimed_before = synthetic.readiness().stats().claimed;
+
+    EXPECT_EQ(synthetic.readiness().claim(*issued.token, 10, [&]() noexcept {
+                  synthetic.readiness().authority().revoke();
+                  return true;
+              }),
+              NotReadyReason::EpochChanged);
+    EXPECT_EQ(synthetic.readiness().authority().epoch(), epoch + 1U);
+    EXPECT_EQ(synthetic.readiness().stats().claimed, claimed_before);
+}
+
 TEST(NotReadyReasonNames, EveryReasonHasADistinctNameAndTheCountMatches) {
-    static_assert(kNotReadyReasonCount == static_cast<std::size_t>(NotReadyReason::ClockNotReady) + 1U,
+    static_assert(kNotReadyReasonCount == static_cast<std::size_t>(NotReadyReason::FinalCheckFailed) + 1U,
                   "kNotReadyReasonCount must follow the last enumerator");
     std::vector<std::string_view> seen;
     for (std::size_t i = 0; i < kNotReadyReasonCount; ++i) {

@@ -67,6 +67,7 @@
 #include <hengyuan/binance_ws_api_signing.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
 #include <hengyuan/transport_policy.hpp>
+#include <hengyuan/submit_authority.hpp>
 #include <hengyuan/ws_api_subscribe_mailbox.hpp>
 
 #include <boost/asio.hpp>
@@ -127,6 +128,7 @@ struct WsApiUserDataSessionConfig {
     std::chrono::milliseconds max_signed_age{4'000};
     // Beast's idle timeout. The server pings every 20 s and expects a pong within a minute (P-30); 90 s is also what the other sessions use.
     std::chrono::seconds idle_timeout{90};
+    std::shared_ptr<SubmitAuthority> submit_authority{};
 };
 
 // How a session ended. First cause wins; None while it is still running.
@@ -234,6 +236,7 @@ public:
     // Posts cancellation onto the session's strand and returns immediately (see the header comment for the shutdown contract).
     void stop() {
         stop_requested_.store(true, std::memory_order_release);
+        if (config_.submit_authority) config_.submit_authority->revoke();
         net::post(strand_, [self = this->shared_from_this()] { self->do_stop(); });
     }
 
@@ -241,7 +244,7 @@ public:
     [[nodiscard]] bool stopped() const noexcept { return stop_.load(std::memory_order_acquire); }
     // The subscription is confirmed by both answers (see the header comment). Events may already have been delivered by then: the ones that
     // arrived between the two answers.
-    [[nodiscard]] bool is_connected() const noexcept { return subscribed_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool is_connected() const noexcept { return subscribed_.load(std::memory_order_acquire) && !stop_requested_.load(std::memory_order_acquire) && !stopped(); }
     // TCP, TLS and the WebSocket upgrade are done (the subscribe frame may not have been sent yet).
     [[nodiscard]] bool handshake_done() const noexcept { return handshake_done_.load(std::memory_order_relaxed); }
     // -1 until the subscribe answer was accepted (is_connected() additionally waits for the session.subscriptions listing).
@@ -657,6 +660,7 @@ private:
             stats_.last_error_stage = what;
         }
         stop_.store(true, std::memory_order_release);
+        if (config_.submit_authority) config_.submit_authority->revoke();
         net::post(strand_, [self = this->shared_from_this()] { self->close_transport(); });
     }
 
@@ -664,6 +668,7 @@ private:
     void end_with(WsApiSessionEnd cause) {
         if (!claim_end(cause)) return;
         stop_.store(true, std::memory_order_release);
+        if (config_.submit_authority) config_.submit_authority->revoke();
         close_transport();
     }
 
@@ -671,6 +676,7 @@ private:
     void do_stop() {
         (void)claim_end(WsApiSessionEnd::Requested);
         stop_.store(true, std::memory_order_release);
+        if (config_.submit_authority) config_.submit_authority->revoke();
         close_transport();
     }
 

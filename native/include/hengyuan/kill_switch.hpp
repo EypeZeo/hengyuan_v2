@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 namespace hy {
 
@@ -22,10 +23,12 @@ class KillSwitch {
 public:
     KillState state() const noexcept { return state_; }
     bool can_open() const noexcept { return state_ == KillState::Normal; }
+    std::uint64_t revision() const noexcept { return revision_; }
 
     // Escalate to at least ARMED (e.g. drawdown / stale feed / API errors).
     // Never de-escalates automatically.
     void arm() noexcept {
+        advance_revision();
         if (state_ == KillState::Normal) {
             state_ = KillState::Armed;
             ++arm_count_;
@@ -34,6 +37,7 @@ public:
 
     // Escalate to TRIGGERED (flatten everything). Monotonic.
     void trigger() noexcept {
+        advance_revision();
         if (state_ != KillState::Latched) {
             state_ = KillState::Triggered;
             ++trigger_count_;
@@ -42,6 +46,7 @@ public:
 
     // After flatten completes, latch terminally. No path back except reset().
     void latch() noexcept {
+        advance_revision();
         state_ = KillState::Latched;
     }
 
@@ -49,6 +54,8 @@ public:
     // invariant is that NO automatic code path calls this; only an explicit
     // human/operator action does.
     void operator_reset() noexcept {
+        advance_revision();
+        if (revision_ == std::numeric_limits<std::uint64_t>::max()) return;
         state_ = KillState::Normal;
     }
 
@@ -56,6 +63,11 @@ public:
     std::uint64_t trigger_count() const noexcept { return trigger_count_; }
 
 private:
+    void advance_revision() noexcept {
+        if (revision_ != std::numeric_limits<std::uint64_t>::max()) ++revision_;
+        if (revision_ == std::numeric_limits<std::uint64_t>::max()) state_ = KillState::Latched;
+    }
+    std::uint64_t revision_{0};
     KillState state_{KillState::Normal};
     std::uint64_t arm_count_{0};
     std::uint64_t trigger_count_{0};

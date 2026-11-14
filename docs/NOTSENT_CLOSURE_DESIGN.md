@@ -1,37 +1,37 @@
 # NotSent 闭合与发送前最终授权 —— 语义冻结与协议模型（Q23 切片 1）
 
-状态：**设计，语义已冻结；读者侧已实现（切片 S2 与 S3 合为一片，2026-11-12，PR #250，合并提交 `979a94b`：事件 `OrderNeverSent` = 23、状态 `OrderState::NeverSent` = 12、v6 的合法集合、§4.6 的恢复表、闭合规则 `never_sent_rules.hpp`）；写入口 S4 已实现（2026-11-13，PR #252，合并提交 `5bbbf43`：sink 的 `append_never_sent()` 与默认关闭的构造开关 `NeverSentWrites`，没有调用者），调用者（S5、S6）没有**。原先的“无代码、无枚举取值、无日志字节变化”到这一片为止：枚举值已分配，今天所有存储仍写 v5、一字节不变。起草 2026-10-25；Owner 在 2026-10-24 对计划说“开始”，2026-11-12 对 S2/S3 说“开始，命名按你的建议”；2026-11-13 对 S4 的两个待定点答“不保留审计日志，显式的构造配置，继续下一步操作”（§9 D2）。
+状态：S2/S3 的 v6 读取、状态机与恢复，以及 S4 的默认关闭写入接口已实现。S6 已接入类 A 拒绝流程及对应恢复、容量与成本测试。S5 已实现发送前最终授权与类 B 拒绝。实现命名为 `OrderNeverSent` 与 `OrderState::NeverSent`。各项验证结果见 §8 与 `docs/SPEC_INVARIANTS.md`。
 依据：蓝图 v2.9.0 的 `5.9.2`、F.5、F.9、R-18 / R-22（Owner 已选统一 NotSent）、Q23、FI-055、FI-056、任务 SAFE-07 与 1A.6。
 模型：`formal/notsent_closure.tla`（结果见 §7）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值不在本文分配**，随实现 PR 同步分配，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。
 
-## 1. 问题
+## 1. 目标
 
-1. 发送前最后一道复核不存在：`Prepared` 帧 ACK 之后到 `submit_port.call()` 之间没有任何检查（蓝图 L-40）。令牌是 Gate 2b 签发的快照，之后约十个门与两次持久追加，私网流可能掉线、`serverShutdown` 可能到达、熔断可能锁存，订单照发。
-2. 即使加了最后一门，**拒绝之后订单怎么办**：`Prepared` 已落盘，恢复只会把它读成 `Ambiguous`（可能已发出），占用在途槽位与资金预留。而且**对账关不掉它**：`query_order()` 把一切不是“正向匹配”的回答——包括“交易所没有这个订单”的错误——折叠成 `QueryOutcome::Inconclusive`（`binance_private_rest.hpp:query_order`、`parse_order_query_response`；币安的 -2013 也没有“从未发送”的语义），所以一个从未发出的 `Prepared` 订单永远得不到结论：R-10 隔离判据到点后升级给操作员，并在 L-46 的意义上永久计入清扫的未决数，屏障不再完成。这一条同样适用于“`Prepared` ACK 之后、真正发出之前崩溃”的订单。要么接受这个代价，要么有一个**能证明“没有发出”的持久记录**。
-3. 发送前被拒的订单（Gate 11 到 12c）只留一个 `Intent` 孤儿，预算 `kMaxIntentOrphans` 是唯一的界（L-37）。
+1. 在 `Prepared` 持久确认之后、`submit_port.call()` 之前重新检查发送条件；私有数据流断开、收到 `serverShutdown`、熔断或授权过期都能使原授权失效。
+2. 为确定没有发送的订单写入 `OrderNeverSent`，使恢复能够关闭订单并释放资源。仅有 `Prepared` 的订单仍恢复为 `Ambiguous`；对账继续要求交易所响应与原订单正向匹配。
+3. 对 `Intent` 之后、`Prepared` 之前的本地拒绝采用相同的关闭记录，并限制拒绝循环产生的日志规模。
 
-蓝图的选择（R-18 / R-22）：**一个统一的 NotSent 持久闭合**，同时服务以上两类拒绝。本文冻结它的证明条件、决定字、帧、恢复与版本规则，并用 TLA+ 证明协议；不写实现。
+蓝图的选择（R-18 / R-22）：统一的 NotSent 持久关闭同时服务以上两类拒绝。本文描述授权、写入、恢复和版本规则，并给出 TLA+ 模型与实现对应关系。
 
 **不能退回的教训**：规格 round 13 的 `AbortedPreSend` 把“追加失败”读成“没有发生”，在 round 17 被整体删除（`docs/SPEC_INVARIANTS.md` 的 `OrderState::AbortedPreSend` 条目；`formal/durable_log_recovery_abortedpresend.cfg` 是它的必败反例）：一次 `Failed` 的追加可能已经落盘（迟到的 fsync）。NotSent 因此**只能是一个正向事实**：由一个**事先决定了不发送**的所有者写下，绝不能由失败、超时或“恢复后看起来没发”推出来。
 
-## 2. 树内现状（2026-10-25，master `a3ddea8`）
+## 2. 当前实现（2026-11-14）
 
 | 事实 | 位置 |
 | :-- | :-- |
-| Gate 顺序：10b `Intent` 持久 ACK → 11 操作员确认 → 12 端口有效 → 12b 在途守卫 → 12c 限流扣费 → 在途登记 → **12d `Prepared` 持久 ACK（ACK 之后才 `transition_to(Submitting)`）** → `submit_port.call()` → 13 结果路由（每个分支先持久 ACK，再转状态、释放槽位） | `live_submit_orchestrator.hpp:orchestrate_submit` |
+| 执行顺序：`Intent` 持久确认、操作员确认、端口检查、限流预留、在途登记、`Prepared` 持久确认、`Submitting`、最终检查和一次性 claim、`submit_port.call()`、结果持久确认与状态更新 | `live_submit_orchestrator.hpp:orchestrate_submit` |
 | `Prepared` 追加失败：状态留在 `Intent`，在途槽位**不**释放，返回 `AuditWriteNotAcked`（写入可能已落盘） | 同上，Gate 12d |
 | 恢复扫描：每个 COID 的首帧 `resulting_state` 必须是 `Intent`；之后同状态重复或经 `validate_transition`；扫描结束时 `Submitting` 重映射为 `Ambiguous` 检查点，`Intent` 只计孤儿，`is_exchange_final` 的跳过 | `durable_audit_sink.hpp:run_recovery_scan_impl` |
-| 状态机：`Intent → Submitting` 是 `Intent` 的唯一出边；`Submitting → {Accepted, Rejected, Ambiguous, Filled, PartialFill}`；`is_terminal` 之后一律 `AlreadyTerminal` | `order_lifecycle.hpp:validate_transition` |
-| `is_exchange_final` 已有生产调用点（恢复扫描跳过、编排器 Gate 13、`OrderTracker` 槽位释放与 `drain_reconcile_events`）——`docs/SPEC_INVARIANTS.md` 里“已定义，未启用”的措辞已过期 | `order_tracker.hpp`、`live_submit_orchestrator.hpp` |
-| 事件与状态枚举只追加：`AuditEventType` 0–21、`OrderState` 0–11；codec 的合法性上界写死在最后一个值上 | `audit_trail.hpp`、`order_lifecycle.hpp`、`durable_frame_codec.hpp:is_legal_audit_event_type / is_legal_order_state` |
+| `Intent` 和 `Submitting` 均可转为 `NeverSent`；该状态没有后续出边。`Submitting` 的交易所响应与不确定结果仍按原状态机处理 | `order_lifecycle.hpp:validate_transition` |
+| 恢复通过 `is_resolved()` 跳过 `NeverSent`；编排器在关闭写入确认后释放对应代次的在途槽位与成交上下文 | `durable_audit_sink.hpp`、`live_submit_orchestrator.hpp` |
+| v6 增加 `AuditEventType::OrderNeverSent = 23`、`OrderState::NeverSent = 12`；v5 的合法范围保持原值 | `audit_trail.hpp`、`order_lifecycle.hpp`、`durable_frame_codec.hpp` |
 | 机器字段 `detail_code`（int64，含义随事件类型：交易所错误码、事前检查码）；`detail_msg` 是人读短文 | `audit_trail.hpp:AuditRecord` |
-| 帧格式 v5：载荷 165 字节（`kAuditRecordWireSize`），完整帧 256 字节，`format_version` 不符 → `UnknownVersion`；v3 → v4 → v5 每次升版都因“仓库里没有任何已部署数据”而零迁移成本 | `durable_frame_codec.hpp` |
+| v5/v6 的订单载荷均为 165 字节，完整帧为 256 字节；未知版本返回 `UnknownVersion`，版本回退拒绝读取 | `durable_frame_codec.hpp` |
 | 有日志而缺首个 anchor：`IoError`（失败关闭，不自动放行） | `durable_audit_sink.hpp:finalize_scan_with_anchor_check` |
 
 ## 3. 定义
 
 - **跨越（crossing）**：订单请求的第一个字节可能离开进程的那一刻。**只有一个方向的义务**：跨越 ⇒ 之前已有持久 `Prepared` 且决定字为 `SendClaimed`；反过来不成立（claim 之后、真正写出之前崩溃，订单也读作 `Ambiguous`，这是保守方向）。
-- **决定字（decision word）**：每个在途订单一个，值 `None → Undecided → {SendClaimed → Sent | Rejecting}`。`Undecided` 在 `Prepared` ACK 时建立。
+- **决定字（decision word）**：模型中每个在途订单的抽象状态，值 `None → Undecided → {SendClaimed → Sent | Rejecting}`。`Undecided` 在 `Prepared` ACK 时建立。S5 的实现对应见 §4.2。
 - **NotSent**：一个持久帧（新事件 + 新终态），语义是“这个订单**从未**跨越”。终态；不是交易所的 `Rejected`。
 - **类 A（发送前拒绝）**：`Intent` 之后、`Prepared` 之前被本地拒绝（Gate 11 / 12 / 12b / 12c）。前驱帧是 `Intent`。
 - **类 B（最终门拒绝）**：`Prepared` 之后、决定字取到 `Rejecting`。前驱帧是 `Prepared`。
@@ -41,14 +41,23 @@
 
 ### 4.1 最终门的位置
 
-紧接 `Prepared` 持久 ACK 与 `transition_to(Submitting)`，**在 `submit_port.call()` 之前**，取 claim。这是任务 1A.6（`5.9.2`）要落地的门；它复核的七项见蓝图，本文不改。claim 越靠近传输边界越好：v1 取在 `call` 之前（保守——`call` 里构造与签名请求的时间都算“可能已跨越”）；端口以后若提供“写出前一刻”的回调，claim 应移到那里以缩小 `Ambiguous` 窗口（待定，见 §9 D4）。
+`Prepared` 持久确认与 `transition_to(Submitting)` 之后执行最终检查，并在 `submit_port.call()` 之前取得 claim。claim 成功后，端口构造、签名与写出请求的时间均按可能已经发送处理。异步传输或写出回调采用同样的授权规则，并在实际发送者中消费授权。
 
 ### 4.2 决定字与线性化
 
-1. 决定字**只能**由比较并交换（CAS）从 `Undecided` 迁出：所有者 `Undecided → SendClaimed`（当且仅当全部检查通过且没有已锁存的撤销），所有者或撤销者 `Undecided → Rejecting`。`SendClaimed`、`Sent`、`Rejecting` 之后**任何东西都不得覆盖**。
+1. 模型中，每订单决定字通过原子动作从 `Undecided` 进入 `SendClaimed` 或 `Rejecting`。只有全部检查通过且没有生效的撤销时才允许 `SendClaimed`。两种结果互斥，决定后不能重新开放同一次尝试。
 2. **对每一次撤销 R 与每个订单 o：要么 o 的 claim 线性化在 R 之前（o 可能已在途，撤销者必须按“可能已发出”处理，不得承诺撤回字节），要么 o 被拒绝。**“检查撤销”与“claim”必须是同一个线性化点；先查一遍再 claim 不构成证明（`5.9.2` 的“七次独立 load 后普通 call”）。
-3. 今天发送与撤销事件的消费都在热线程上，决定字退化为局部变量，线性化点就是门的那次读取；**一旦发送由另一线程执行（异步传输），或撤销由另一线程发起（熔断、对账），决定字必须是在途槽位里的原子字，绑定槽位代次**（持有旧句柄的迟到撤销者不得影响被复用的槽位），消费点必须再校验并一次性消费授权。选 CAS 单字还是撤销闩锁加扫描的 Dekker 配对，是切片 S5 的并发设计，带自己的 TSan 负控。
-4. 取到 `Rejecting` 之后，同一个 COID **不得**再发送；取到 `SendClaimed` 之后，**不得**写 NotSent。
+3. S5 的同步实现由同一热线程持有订单、槽位与限流器。跨线程撤销与发送 claim 共同修改 `SubmitAuthority` 的一个原子 epoch：`claim(expected)` 通过 CAS 消费签发时的 epoch，`revoke()` 递增同一个值。撤销先发生时，原 claim 失败；claim 先发生时，订单进入可能已经发送的处理范围。计数达到上限后拒绝新授权。模型中的每订单决定状态由该 CAS 结果和编排器的单一分支表示。
+4. 授权同时绑定签发者、订阅代次、屏障 epoch 和熔断 revision；最终检查绑定原在途句柄的槽位代次与订单号。释放操作验证原句柄，迟到的结果不能释放复用后的槽位。当前授权由热线程直接消费；异步发送者须在实际消费线程重新实现相同的一次性判定与句柄校验。
+5. 取到 `Rejecting` 之后，同一个 COID **不得**再发送；取到 `SendClaimed` 之后，**不得**写 NotSent。
+
+### 4.2.1 S5 的最终检查
+
+`SubmitReadiness::claim()` 先读取当前订阅、恢复、屏障、熔断和签名时钟状态，再检查令牌绑定，随后执行编排器的局部检查，最后执行原子 CAS。局部检查包括：默认 5000 ms 的单调时钟授权期限、原操作员确认的有效期、原槽位所有权、限流预留、账户新鲜度与事前检查、审计可写状态、签名与深度状态，以及规则版本。时间检查发生在读取就绪状态之后，覆盖读取期间消耗的时间。成功 CAS 后直接进入内存审计与提交端口，期间没有持久写入。
+
+`SpotRateLimitTracker::OrderReservation` 是不可复制的票据，记录所属限流器、配置代次及三个维度中最早的窗口截止。过期或重新配置后票据失效。确认关闭后仅退回仍属于原窗口的额度；旧窗口票据不会减少新窗口的使用量。
+
+WebSocket 会话在停止请求、连接错误、`serverShutdown` 或 `eventStreamTerminated` 时先公布停止状态，再撤销共享 epoch。会话和 `PrivateStreamPipeline` 由调用者传入同一个 `SubmitAuthority`；预检程序已连接该对象。`KillSwitch` 由热线程管理，其 revision 使触发后立即重置的操作也会使旧令牌失效。
 
 ### 4.3 NotSent 何时写、写什么
 
@@ -142,9 +151,9 @@
 | :-- | :-- | :-- |
 | S2 codec 读者 | **已实现（与 S3 合为一片，2026-11-12）**：`format_version` 6 与两套合法集合（事件 ≤ 23、状态 ≤ 12），只读不写；未知版本、v5 帧里的 v6 值、版本回退各有明确状态（`format_version` 6 本身与事件 22 已由 D5 R1 落地） | MSVC + GCC `none`；codec 表驱动用例 |
 | S3 状态机与恢复 | **已实现（与 S2 合为一片，2026-11-12；命名已定：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12，规则在 `never_sent_rules.hpp`，读者与写者共用）**：`NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料；**命名**：`order_tracker.hpp` 已有 `QueryOutcome::NotSent`（R-10，意思是对账**查询**没有离开进程），订单状态与事件的新名字要与它区分（实现 PR 里定），否则 grep 和读者都会混 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
-| S4 写入 | **已实现（2026-11-13）**：sink 追加 NotSent——`append_never_sent()`（沿用 `append_impl`，闭合规则与读者共用 `check_closure()`），默认关闭的构造开关 `NeverSentWrites`（Owner 选的“显式的构造配置”），故障注入：Failed、迟到、撕裂尾；**没有调用者**（调用者是 S5、S6） | `address`；旧 `AbortedPreSend` 双发场景作为必败 / 必拒用例保留 |
-| S5 最终门（1A.6、FI-055） | 决定字与门；撤销者与所有者的两种次序；`ServerShutdown`、代次变化、熔断、授权截止注入 | `thread` + arm64 重复；**新增一个 TSan 负控**（把决定字的配对降成 relaxed 必须被抓到）；变异检查 |
-| S6 类 A 闭合（SAFE-07、FI-056） | 各拒绝路径写 NotSent；孤儿计数；纯静态预检前移只作减量优化 | 孤儿预算与告警；拒绝循环的日志规模有界；Q19 先量出每次拒绝多一条持久链的成本 |
+| S4 写入 | **已实现（2026-11-13）**：`append_never_sent()` 沿用 `append_impl`，与读者共用 `check_closure()`，构造开关 `NeverSentWrites` 默认关闭；S6 和 S5 通过 `DurableOrderAuditPort` 写入类 A 和类 B 关闭记录 | `address`；追加失败、迟到完成、尾部撕裂及非法重复发送 |
+| S5 最终授权（1A.6、FI-055） | **已实现（2026-11-14）**：`SubmitAuthority` 原子 epoch 与 `SubmitReadiness::claim()`；令牌绑定签发者、订阅、屏障和熔断代次；最终检查后一次性消费；类 B 拒绝确认写入后释放对应资源 | MSVC、GCC 普通构建、ASan/UBSan、TSan 并发测试和 relaxed 负向控制通过；覆盖实际文件恢复与时限边界；ARM64 重复测试已接入 CI，本次未运行 |
+| S6 类 A 闭合（SAFE-07、FI-056） | **已实现（2026-11-14）**：六种本地拒绝写入 NotSent，确认成功后返回 NeverSent；存储维护已尝试关闭的生成订单号的时间与序号最高值，重启恢复该值，拒绝重复或倒退的尝试；两个测试程序显式启用写入 | MSVC、GCC 普通构建与 ASan/UBSan 回归通过；覆盖孤儿预算、日志容量与恢复；Q19 持久化成本测量已完成 |
 | S7 迁移 | 清单、读者先行开关、回退前停机；仅当存在真实日志 | 迁移中崩溃、清单撕裂、旧构建遇 v6 |
 | S8 操作员闭合（D5，L-46） | 设计与模型已有（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`）；实现切片 R1 至 R6 在那份文档里 | 见该文档 §10；R1 与 S2 合并为同一次 v6 |
 
@@ -162,4 +171,4 @@
 
 ## 10. 与蓝图 F.5 的对照
 
-F.5 里“Required future model invariants”五条，本切片后：前三条（`DurableNotSent ⇒ ¬everCrossed`、`everCrossed ⇒ DurableIntent ∧ DurablePrepared`、`Released ⇒ …`）在**协议层**由 `notsent_closure.tla` 检查（`everCrossed ⇒ DurablePrepared` 是 `SendImpliesDurablePrepared`；Intent 帧未建模）；第四条（日志 / anchor / 目录覆盖）与第五条（单发送者）**没有**检查。F.9 要求的负控里，这里覆盖：旧 `AbortedPreSend` 双发、claim / revoke 两种次序、失败仍落盘、迟到落盘；**没有**覆盖：暂停复活与网络在途（6.7）、槽位跨代（PERF-01）、升级中崩溃与回绕前停机（S7）。Q23 仍然开放：语义已冻结且有模型，实现、迁移、负控、恢复验收都还没做。
+F.5 里“Required future model invariants”五条，本切片后：前三条（`DurableNotSent ⇒ ¬everCrossed`、`everCrossed ⇒ DurableIntent ∧ DurablePrepared`、`Released ⇒ …`）在**协议层**由 `notsent_closure.tla` 检查（`everCrossed ⇒ DurablePrepared` 是 `SendImpliesDurablePrepared`；Intent 帧未建模）；第四条（日志 / anchor / 目录覆盖）与第五条（单发送者）**没有**检查。F.9 要求的负控里，这里覆盖：旧 `AbortedPreSend` 双发、claim / revoke 两种次序、失败仍落盘、迟到落盘；**没有**覆盖：暂停复活与网络在途（6.7）、槽位跨代（PERF-01）、升级中崩溃与回绕前停机（S7）。S2 至 S6 的实现覆盖读取、恢复、默认关闭写入、两类本地拒绝和最终授权；实际文件测试覆盖关闭成功及失败恢复，TSan 负向控制覆盖授权发布内存序。S7 迁移只在存在需要保留的真实日志时启用；异步传输和进程暂停复活的验证继续按各自任务实施。

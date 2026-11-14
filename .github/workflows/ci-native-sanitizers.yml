@@ -179,9 +179,9 @@ jobs:
             test_seal_journal_store_lease test_intent_phase_advancer \
             test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
             test_sweep_concurrency test_account_refresh_concurrency \
-            test_private_stream_pipeline_concurrency \
+            test_private_stream_pipeline_concurrency test_submit_authority_concurrency \
             tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
-            tsan_control_relaxed_mailbox
+            tsan_control_relaxed_mailbox tsan_control_relaxed_submit_authority
 
       # history_size=7 (the maximum) is the single biggest lever on whether a
       # race whose two halves are separated in time gets reported at all — it
@@ -264,6 +264,24 @@ jobs:
           fi
           echo "OK: TSan reported the injected mailbox race as expected — the gate is live."
 
+      - name: "Control: TSan MUST flag the deliberately-relaxed submit authority"
+        working-directory: native/build-tsan
+        env:
+          TSAN_OPTIONS: "history_size=7:halt_on_error=1:exitcode=66"
+        run: |
+          set -u
+          if ./tsan_control_relaxed_submit_authority > control_submit_authority.log 2>&1; then
+            echo "::error::The relaxed submit authority did not report a race."
+            tail -50 control_submit_authority.log
+            exit 1
+          fi
+          if ! grep -q "WARNING: ThreadSanitizer: data race" control_submit_authority.log; then
+            echo "::error::The submit authority control failed without a data-race report."
+            tail -50 control_submit_authority.log
+            exit 1
+          fi
+          echo "OK: TSan reported the injected submit authority race."
+
   arm64-weak-memory:
     name: "ARM64 Release: hardware weak-memory verdict"
     runs-on: ubuntu-24.04-arm
@@ -311,7 +329,7 @@ jobs:
             test_single_flight_fetch_gate test_kline_feed_driver test_depth_feed_driver \
             test_user_data_ws_concurrency test_ws_api_mailbox_concurrency \
             test_sweep_concurrency test_account_refresh_concurrency \
-            test_private_stream_pipeline_concurrency
+            test_private_stream_pipeline_concurrency test_submit_authority_concurrency
 
       # Repeated: unlike TSan's model-level verdict, a weak-memory violation is
       # probabilistic per run. Ten Release-speed runs cost seconds and raise the

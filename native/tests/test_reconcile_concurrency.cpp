@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -92,6 +93,8 @@ SubmitResponse mock_submit(
 
 std::uint32_t mock_current_rules_version(void* /*ud*/) { return 1; }
 
+std::int64_t fixed_monotonic_now(void* /*ud*/) noexcept { return 1'000'000; }
+
 // --- Mock QueryPort (reconcile thread only touches this) ---
 // Always resolves Found -> Filled on the very first attempt: this test's
 // point is the cross-thread handoff, not backoff/retry timing (already
@@ -106,6 +109,7 @@ QueryResult mock_query(const OrderExpectation& /*expected*/, void* /*ud*/) {
 struct SubmittedOrder {
     ClientOrderId coid;
     OrchestratorGate gate;
+    std::optional<never_sent::Reason> final_refusal;
 };
 
 }  // namespace
@@ -143,7 +147,13 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
     evidence.record(EvidencePath::SubmitReject, 2, 0xABCD, 1);
     evidence.record(EvidencePath::SubmitAmbiguous, 3, 0xABCD, 1);
     evidence.record(EvidencePath::KillSwitch, 4, 0xABCD, 1);
-    rate_limiter.configure(100000, 500, 100000, 500, 100000, 500);  // headroom well above kIterations
+    const auto budget_window_start = SpotRateLimitTracker::Clock::now();
+    ASSERT_TRUE(rate_limiter.configure(100000, 500, 100000, 500, 100000, 500,
+                                      RateLimitBudgetSplit::default_split(), budget_window_start,
+                                      /*weight window s*/ 3600,
+                                      /*raw window s*/ 3600,
+                                      /*orders window s*/ 3600))
+        << "this test exercises reconcile handoff, not rate-window rotation";
 
     std::strncpy(rules.symbol, "BTCUSDT", sizeof(rules.symbol) - 1);
     rules.is_trading = true;
@@ -219,6 +229,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
         SyntheticReadiness readiness(kill_switch);
         for (int i = 0; i < kIterations; ++i) {
             OrchestratorContext ctx{};
+            ctx.monotonic_now = &fixed_monotonic_now;
             ctx.audit = &audit;
             ctx.kill_switch = &kill_switch;
             ctx.readiness = &readiness.readiness();
@@ -262,7 +273,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
             ctx.submit_port = {mock_submit, nullptr, mock_current_rules_version};
 
             auto r = orchestrate_submit(ctx);
-            results.push_back(SubmittedOrder{r.order.client_order_id, r.gate});
+            results.push_back(SubmittedOrder{r.order.client_order_id, r.gate, r.final_refusal});
 
             // Keeps ceding the core between iterations so a fast hot thread
             // doesn't simply outrun the reconcile thread's scheduling slice
@@ -339,7 +350,8 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
             // setup. Not asserted against: natural backpressure, not a bug.
             ++other_count;
             EXPECT_EQ(r.gate, OrchestratorGate::DuplicateInFlight)
-                << "unexpected gate at i=" << i;
+                << "unexpected gate at i=" << i << " final_refusal="
+                << (r.final_refusal ? static_cast<int>(*r.final_refusal) : -1);
         }
     }
 

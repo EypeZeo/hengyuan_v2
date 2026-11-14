@@ -184,6 +184,8 @@ SEARCH_FILES = [
     # Q23 slices S2/S3 (docs/SPEC_INVARIANTS.md "Q23 切片 S2/S3"): the closure rule (never_sent_rules.hpp: ClosureTarget,
     # ClosureCheck, check_closure, pairing_holds) is a new load-bearing symbol set -- the same gap every entry above closes.
     REPO_ROOT / "native" / "include" / "hengyuan" / "never_sent_rules.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "submit_authority.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "spot_rate_limit_budget.hpp",
 ]
 
 _LEDGER_SECTION_START = "## 不变量清单"
