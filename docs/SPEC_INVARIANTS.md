@@ -985,6 +985,11 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - **仍未覆盖**：调用者（S5：最终门与决定字，任务 `1A.6`、FI-055；S6：类 A 闭合与 SAFE-07 的孤儿，FI-056）；槽位释放与压实保留改用 `is_resolved()`（`order_tracker.hpp`、
       `live_submit_orchestrator.hpp`、`startup_recovery.hpp` 里 `is_exchange_final()` 的消费者，随调用者一起改；`is_terminal()` 在生产里只有 `validate_transition()` 自己用，没有行为变化）；
       迁移清单与读者先行开关（S7，仅当存在要保留的真实日志）。
+  - **Q23 S6：类 A 拒绝的持久关闭。** `orchestrate_submit()` 在 Intent 确认之后、Prepared 之前的六种本地拒绝路径调用 `DurableOrderAuditPort::append_never_sent()`。返回值保留拒绝原因，并通过 `closure` 返回写入结果；仅 `Appended` 将返回订单转换到 `NeverSent`。其他结果保留 `Intent`，提交端口不被调用。
+    - `OrderAttemptWatermark` 对尝试关闭的系统生成订单号按 `(timestamp_ms, sequence)` 维护最高值。`DurableAuditSink` 在追加 Intent 前拒绝相同或更小的值，在尝试写入关闭帧之前更新最高值，并从恢复扫描中的关闭帧重建它。该检查使用固定存储，不受上下文重建或最近 64 个订单号缓存淘汰影响。同一存储的调用者须递增时间与序号组合；旧格式的订单号仍可读取。
+    - `native/src/live_submit_evidence_harness.cpp` 与 `native/src/live_submit_preflight_harness.cpp` 显式启用 `NeverSentWrites`；默认构造仍关闭写入。每次成功关闭的本地拒绝产生 Intent 与 NeverSent 两个订单帧，共 512 字节。写入帧数受 `max_order_frames` 限制，默认对应现有 1 GiB 读取上限，构造配置只能收紧；到达上限返回失败并以 `FenceReason::LogLimit` 停止追加。日志压缩与持久化服务调度属于单独的实现任务。
+    - 回归范围：六种拒绝原因、关闭返回状态、追加失败、恢复结果、重复订单号、无动态分配，以及 Q19 的拒绝写入成本。发送前最终授权与 Prepared 之后的类 B 拒绝由 S5 实现。
+    - 验证（2026-11-14）：MSVC Release 完整构建通过，CTest 登记 3718 项，执行 3715 项、零失败，其中 1 项跳过，另外 3 项禁用；Q19 成本用例显式运行通过。GCC-14 普通构建与 ASan/UBSan 的相关回归通过，规格引用、枚举对应和并发目标检查通过。32 次拒绝的平均耗时：Windows 禁用关闭写入时 4.06 ms，启用时 7.90 ms；WSL2 对应为 6.02 ms 与 11.63 ms。每次日志增长分别为 256 与 512 字节；测量反映该主机的同步文件写入。
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/

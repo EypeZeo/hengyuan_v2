@@ -3,15 +3,15 @@
 //
 // S2/S3 teach the recovery reader to accept ONE new kind of frame, OrderNeverSent (event 23, resulting state NeverSent = 12),
 // which the writer of slice S4 (DurableAuditSink::append_never_sent()) writes for its callers, S5 (the final gate's refusal)
-// and S6 (a refusal before the Prepared frame). What keeps that acceptance safe NOW is the absence of anything that could
-// produce such a frame, or act on one: behaviour cannot see an absence, so this test reads the sources, exactly as
+// and S6 (a refusal before the Prepared frame). The source guard pins the frame producer, the writer and reader, and the one
+// acknowledged-result transition: behaviour tests cannot prove that no extra producer was added, so this test reads the sources, exactly as
 // test_operator_resolution_guard.cpp does for the operator's frame:
 //
 //   1. AuditEventType::OrderNeverSent is NAMED only where it is defined, where the codec decides which version may carry it,
 //      where the closure rule (never_sent_rules.hpp) reads it, and where the recovery scan recognises the frame. Each pin
 //      carries the exact number of mentions. A further file naming it is a producer (or a new reader) somebody has to look at.
-//   2. OrderState::NeverSent likewise: the state machine, the codec's version bound, the rule and the reader. In particular
-//      nothing live -- the orchestrator, the tracker, the publishers, the reconcile path -- moves an order into it.
+//   2. OrderState::NeverSent likewise: the state machine, the codec's version bound, the rule and the reader. The orchestrator
+//      advances its returned OrderRecord only after the closure append is acknowledged.
 //   3. The closure rule, check_closure(), is applied by the recovery scan and by the one writer, append_never_sent() (Q23 S4),
 //      and nothing else: what the writer lets through, the reader accepts. The callers of the writer join in S5 and S6.
 //   4. is_resolved() is called by the recovery scan and nothing else (the slot release and the retention filters join in the
@@ -118,6 +118,10 @@ constexpr const char* kLifecycle = "include/hengyuan/order_lifecycle.hpp";
 constexpr const char* kCodec = "include/hengyuan/durable_frame_codec.hpp";
 constexpr const char* kRules = "include/hengyuan/never_sent_rules.hpp";
 constexpr const char* kSink = "include/hengyuan/durable_audit_sink.hpp";
+constexpr const char* kPort = "include/hengyuan/durable_order_audit_port.hpp";
+constexpr const char* kOrchestrator = "include/hengyuan/live_submit_orchestrator.hpp";
+constexpr const char* kPreflightHarness = "src/live_submit_preflight_harness.cpp";
+constexpr const char* kEvidenceHarness = "src/live_submit_evidence_harness.cpp";
 
 const SourceFile* find_source(std::string_view rel) {
     for (const SourceFile& f : production_sources()) {
@@ -197,23 +201,25 @@ TEST(NeverSentGuard, TheNeverSentEventIsNamedOnlyByItsDefinitionTheCodecTheRuleA
                          {{kTrail, 2, "the enumerator and its name in audit_event_name()"},
                           {kCodec, 2, "is_legal_audit_event_type_for_version(): the v6 bound and the assertion that the two "
                                       "v6-only events are consecutive"},
-                          {kRules, 2, "pairing_holds() and check_closing_frame(): the rule reads the event, it never builds one"},
-                          {kSink, 1, "the recovery scan recognising the frame -- it compares, it constructs nothing"}});
+                          {kRules, 3, "pairing_holds() and check_closing_frame() read the event; class_a_closure_of() is the one place a "
+                                      "closing frame is built (Q23 S6), from the Intent it closes"},
+                          {kSink, 2, "the recovery scan observes the closure id for the watermark and routes the closure frame"}});
 }
 
-TEST(NeverSentGuard, TheNeverSentStateIsNamedOnlyByTheStateMachineTheCodecTheRuleAndTheReader) {
+TEST(NeverSentGuard, TheNeverSentStateIsNamedByItsModelTheCodecTheRuleTheReaderAndTheClassAResultTransition) {
     expect_named_only_in("NeverSent",
                          {{kLifecycle, 6, "the enumerator, order_state_name(), is_terminal(), is_resolved() and the two edges "
                                           "of validate_transition()"},
                           {kCodec, 1, "is_legal_order_state_for_version(): the v6 bound"},
-                          {kRules, 3, "check_order_closable() asks the state machine about the edge; pairing_holds() and "
-                                      "check_closing_frame() read the frame's state"},
+                          {kRules, 4, "check_order_closable() asks the state machine about the edge; pairing_holds() and "
+                                      "check_closing_frame() read the frame's state; class_a_closure_of() sets it"},
+                          {kOrchestrator, 1, "an acknowledged class A closure advances the returned OrderRecord"},
                           {kSink, 1, "the recovery scan, after the rule accepted the frame"}});
 }
 
-TEST(NeverSentGuard, NothingLiveNamesTheEventOrTheState) {
-    // The point of the two pins above, said once by name: the live process is the one that would CALL the writer (S5, S6),
-    // and none of it may mention the event or the state yet.
+TEST(NeverSentGuard, LiveCodeDoesNotConstructTheEventAndOnlyTheOrchestratorRecordsItsAcknowledgedClosure) {
+    // The orchestrator may expose the state transition after the writer acknowledges a class A closure. The event remains owned by
+    // the shared closure builder and writer; no live path may construct it directly.
     for (const char* rel :
          {"include/hengyuan/live_submit_orchestrator.hpp", "include/hengyuan/order_tracker.hpp",
           "include/hengyuan/order_durable_path.hpp", "include/hengyuan/durable_order_audit_port.hpp",
@@ -223,7 +229,8 @@ TEST(NeverSentGuard, NothingLiveNamesTheEventOrTheState) {
         const SourceFile* f = find_source(rel);
         ASSERT_NE(f, nullptr) << rel << " moved or was renamed: update this list";
         EXPECT_EQ(count_identifier(f->code, "OrderNeverSent"), 0u) << rel;
-        EXPECT_EQ(count_identifier(f->code, "NeverSent"), 0u) << rel;
+        EXPECT_EQ(count_identifier(f->code, "NeverSent"),
+                  std::string_view(rel) == kOrchestrator ? 1u : 0u) << rel;
     }
     for (const SourceFile& f : production_sources()) {
         if (f.rel.rfind("src/", 0) == 0) {
@@ -248,14 +255,25 @@ TEST(NeverSentGuard, TheClosureRuleIsAppliedByTheRecoveryScanAndTheNeverSentWrit
         << "append_durable() judges no frame's legality (it never has)";
 }
 
-TEST(NeverSentGuard, TheClosureWriterHasNoCallerAndTheSwitchIsNamedByTheSinkAlone) {
-    // Q23 S4: the writer exists and nothing in the tree calls it or turns it on. Every caller is a producer of the frame, so the
-    // callers (S5, S6) are added here one by one, each with the reason, by the PR that wires them.
-    expect_named_only_in("append_never_sent", {{kSink, 1, "the definition"}});
+TEST(NeverSentGuard, TheClosureWriterIsReachedOnlyThroughThePortAndTheSwitchIsTurnedOnByTwoHarnessesAlone) {
+    // Q23 S4 built the writer; S6 (class A) is its first caller. Every caller is a producer of the frame, so each is added here with
+    // the reason, by the PR that wires it. The route: DurableAuditSink::append_never_sent() <- the sink adapter of the port (in the
+    // orchestrator header) <- DurableOrderAuditPort::append_never_sent() <- detail::close_never_sent() <- the six local refusals.
+    expect_named_only_in("append_never_sent",
+                         {{kSink, 1, "the definition"},
+                          {kPort, 1, "the port's method: a null function pointer answers NotWired"},
+                          {kOrchestrator, 2, "the sink adapter of the port, and detail::close_never_sent() (the one caller)"}});
+    expect_named_only_in("close_never_sent", {{kOrchestrator, 7, "the definition and the six class A refusals (Gate 11 twice, Gate 12, Gate 12b twice, Gate 12c)"}});
+    // The frame is built and judged in one place: the rules header's class_a_* functions, used by the orchestrator's helper alone.
+    expect_named_only_in("class_a_closure_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});
+    expect_named_only_in("class_a_target_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});
     // The switch is a constructor argument: the only way to pass Enabled is to name the enum, so a process that turns the writer
     // on shows up here. In the sink: the enum, the constructor parameter and its default, the accessor, the member and its
-    // initialiser, and the one check inside append_never_sent().
-    expect_named_only_in("NeverSentWrites", {{kSink, 7, "the enum, the constructor, the accessor, the member, the check"}});
+    // initialiser, and the one check inside append_never_sent(). Elsewhere: the two Testnet-only harnesses (one mention each,
+    // `NeverSentWrites::Enabled` in the construction of their audit sink). A production trading process is not one of them yet.
+    expect_named_only_in("NeverSentWrites", {{kSink, 7, "the enum, the constructor, the accessor, the member, the check"},
+                                             {kPreflightHarness, 1, "the Testnet-only cold-start harness turns the writer on"},
+                                             {kEvidenceHarness, 1, "the dry-run evidence harness turns the writer on"}});
     // The default really is Disabled, and the only check of it refuses everything but Enabled.
     const SourceFile* sink = find_source(kSink);
     ASSERT_NE(sink, nullptr);

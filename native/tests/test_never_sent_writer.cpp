@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 #include <hengyuan/durable_audit_sink.hpp>
+#include <hengyuan/live_submit_orchestrator.hpp>
 
 #include <array>
 #include <cstddef>
@@ -785,4 +786,80 @@ TEST_F(NeverSentWriterTest, TheOldAbortedPreSendDoubleSendLeavesAStoreTheNextSta
     const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled);
     EXPECT_EQ(sink->recovery_status(), RecoveryScanStatus::Corrupt);
     EXPECT_TRUE(sink->fenced()) << "a store that holds a re-sent order is never opened for trading";
+}
+
+// --- the port's view of the writer (Q23 S6) ----------------------------------------------------------------------------------
+
+TEST_F(NeverSentWriterTest, ThePortAnswersWhatTheOrchestratorActsOnForEveryOutcomeOfTheSink) {
+    // durable_audit_sink_closure_adapter() (live_submit_orchestrator.hpp) turns the sink's NeverSentAppendStatus into the port's
+    // ClosureAppendStatus. The orchestrator acts on the port's: closed (Appended), nothing was tried (NotEnabled, NotWired), nothing
+    // was written (Refused), or the append failed and the frame may be on the disk (Failed).
+    const std::vector<AuditRecord> history{intent(kA)};
+    const never_sent::ClosureTarget target = target_of(history);
+
+    // a port with no closure function at all
+    const DurableOrderAuditPort bare{};
+    EXPECT_EQ(bare.append_never_sent(target, closure(kA), 9000).status, ClosureAppendStatus::NotWired);
+    EXPECT_FALSE(bare.append_never_sent(target, closure(kA), 9000).append.acked());
+
+    // closed
+    write_history(history);
+    {
+        const auto sink = open();
+        const ClosureAppendResult r = make_durable_order_audit_port(*sink).append_never_sent(target, closure(kA), 9000);
+        EXPECT_EQ(r.status, ClosureAppendStatus::Appended);
+        EXPECT_TRUE(r.append.acked());
+    }
+    expect_closed_at_next_start(1u, "a closure through the port");
+
+    // not enabled: a sink built without the switch, and an operator-open sink
+    write_history(history);
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled);
+        const ClosureAppendResult r = make_durable_order_audit_port(*sink).append_never_sent(target, closure(kA), 9000);
+        EXPECT_EQ(r.status, ClosureAppendStatus::NotEnabled);
+        EXPECT_FALSE(r.append.acked());
+    }
+    {
+        const auto sink = open(AuditSinkOpenMode::OperatorOpen, NeverSentWrites::Enabled);
+        EXPECT_EQ(make_durable_order_audit_port(*sink).append_never_sent(target, closure(kA), 9000).status,
+                  ClosureAppendStatus::NotEnabled);
+    }
+
+    // refused, nothing written: the rule says no, an empty id, a fenced sink
+    {
+        const auto sink = open();
+        const DurableOrderAuditPort port = make_durable_order_audit_port(*sink);
+        const never_sent::ClosureTarget ambiguous_order = target_of({intent(kA), prepared(kA), ambiguous(kA)});
+        EXPECT_EQ(port.append_never_sent(ambiguous_order, closure(kA), 9000).status, ClosureAppendStatus::Refused);
+        AuditRecord empty_id = closure(kA);
+        empty_id.set_client_order_id("");
+        EXPECT_EQ(port.append_never_sent(target, empty_id, 9000).status, ClosureAppendStatus::Refused);
+        EXPECT_FALSE(sink->fenced()) << "a refusal fences nothing";
+    }
+    write_history(history);
+    std::vector<std::byte> damaged = log_bytes();
+    ASSERT_GT(damaged.size(), 100u);
+    damaged[100] = static_cast<std::byte>(~static_cast<unsigned>(damaged[100]));
+    {
+        std::ofstream out(base_path_, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(damaged.data()), static_cast<std::streamsize>(damaged.size()));
+    }
+    {
+        const auto sink = open();
+        ASSERT_TRUE(sink->fenced());
+        EXPECT_EQ(make_durable_order_audit_port(*sink).append_never_sent(target, closure(kA), 9000).status, ClosureAppendStatus::Refused);
+    }
+
+    // failed: the frame is appended, its tip anchor cannot be written
+    write_history(history);
+    std::error_code ec;
+    ASSERT_TRUE(fs::create_directory(base_path_ + ".tip.tmp", ec)) << ec.message();
+    {
+        const auto sink = open();
+        const ClosureAppendResult r = make_durable_order_audit_port(*sink).append_never_sent(target, closure(kA), 9000);
+        EXPECT_EQ(r.status, ClosureAppendStatus::Failed);
+        EXPECT_FALSE(r.append.acked());
+        EXPECT_TRUE(sink->fenced());
+    }
 }

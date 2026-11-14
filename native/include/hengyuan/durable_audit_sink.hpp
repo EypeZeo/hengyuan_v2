@@ -55,6 +55,7 @@
 #include <hengyuan/durable_log_store.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/never_sent_rules.hpp>
+#include <hengyuan/order_attempt_watermark.hpp>
 #include <hengyuan/operator_resolution_frame.hpp>
 #include <hengyuan/operator_resolution_rules.hpp>
 #include <hengyuan/order_lifecycle.hpp>
@@ -69,6 +70,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -317,6 +319,7 @@ enum class FenceReason : std::uint8_t {
     None = 0,       // not fenced
     IoError = 1,    // encode failure, non-disk-full I/O failure, or a non-clean recovery scan
     DiskFull = 2,   // ENOSPC/EDQUOT (POSIX) or ERROR_DISK_FULL/ERROR_HANDLE_DISK_FULL (Windows)
+    LogLimit = 3,   // the configured order-frame budget has been exhausted
 };
 
 // D5 / R1 (docs/OPERATOR_RESOLUTION_DESIGN.md 7.2 and 10): how the recovery scan treats the capacity bounds.
@@ -417,10 +420,12 @@ public:
     // no caller can lift the bound. Production passes nothing.
     // open_mode (D5 / R1): see AuditSinkOpenMode. Production passes nothing (Trading).
     // never_sent_writes (Q23 S4): see NeverSentWrites. Production passes nothing (Disabled): append_never_sent() refuses.
+    // max_order_frames bounds growth between operator maintenance runs; it cannot exceed the recovery byte limit.
     DurableAuditSink(const std::string& path, KeyRing& key_ring, std::uint32_t active_key_id,
                      std::size_t max_intent_orphans = kMaxIntentOrphans,
                      AuditSinkOpenMode open_mode = AuditSinkOpenMode::Trading,
-                     NeverSentWrites never_sent_writes = NeverSentWrites::Disabled) noexcept
+                     NeverSentWrites never_sent_writes = NeverSentWrites::Disabled,
+                     std::uint64_t max_order_frames = kMaxDurableLogBytes / kOrderEventFrameSize) noexcept
         : log_store_(path, path + ".lock", path + ".tip"),
           rotation_log_store_(path + ".keyrotations", path + ".keyrotations.lock", path + ".keyrotations.tip"),
           store_identity_store_(path + ".storeid", path + ".storeid.lock", path + ".storeid.tip"),
@@ -428,7 +433,8 @@ public:
           active_key_id_(active_key_id),
           max_intent_orphans_(max_intent_orphans < kMaxIntentOrphans ? max_intent_orphans : kMaxIntentOrphans),
           open_mode_(open_mode),
-          never_sent_writes_(never_sent_writes) {
+          never_sent_writes_(never_sent_writes),
+          max_order_frames_(std::min(max_order_frames, kMaxDurableLogBytes / kOrderEventFrameSize)) {
         if (!acquire_lock()) {
             recovery_status_ = RecoveryScanStatus::IoError;
             return;
@@ -578,6 +584,9 @@ public:
     // auto-retries. now_ms is caller-supplied (this codebase's established
     // clock-injection style, not read from a global clock here).
     AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) noexcept {
+        if (rec.event_type == AuditEventType::OrderIntentCreated) {
+            if (!attempt_watermark_.permits(rec.client_order_id)) return {};
+        }
         return append_impl(rec, now_ms, write_version_);
     }
 
@@ -674,9 +683,8 @@ public:
     //     (it never crossed, so that is still true), a frame that did not leaves it Prepared, which is Ambiguous (4.5);
     //   * on success the frame is durable and acknowledged and write_format_version() becomes 6 (the store's tip IS v6 now,
     //     and the monotone version rule means everything that follows must be v6 too).
-    // The sink does NOT track which ids it has closed, and it cannot know that the id has an Intent frame in the log or that
-    // nothing follows the closure. The closure must be the LAST frame of its order, and keeping that is the caller's job: the
-    // order's in-flight slot is released after the acknowledgement (design 4.4), so nothing writes for the order again.
+    // The generated-id watermark prevents a new Intent at or below a closed attempt. The caller owns the remaining
+    // lifecycle checks: the Intent must exist, the closure must be the last frame, and resource release follows its ACK.
     NeverSentAppend append_never_sent(const never_sent::ClosureTarget& target, const AuditRecord& rec,
                                       std::int64_t now_ms) noexcept {
         NeverSentAppend out{};
@@ -701,6 +709,8 @@ public:
             out.status = NeverSentAppendStatus::Refused;
             return out;
         }
+        // A failed closure may reach disk; prevent restarting its generated identity.
+        attempt_watermark_.observe(rec.client_order_id);
         out.append = append_impl(rec, now_ms, kFrameFormatVersionV6);
         if (!out.append.acked()) {
             out.status = NeverSentAppendStatus::AppendFailed;
@@ -733,6 +743,12 @@ private:
         AuditAppendResult result{};
         if (fenced_ || !log_open_) {
             result.status = AuditAppendResult::Status::Failed;
+            return result;
+        }
+
+        if (next_sequence_ >= max_order_frames_) {
+            fenced_ = true;
+            fence_reason_ = FenceReason::LogLimit;
             return result;
         }
 
@@ -1145,6 +1161,7 @@ private:
             max_version_seen = frame.format_version;
 
             std::string coid(frame.record.client_order_id);
+            if (frame.record.event_type == AuditEventType::OrderNeverSent) attempt_watermark_.observe(coid);
             auto [it, inserted] = per_coid.try_emplace(coid);
             if (inserted) coid_scan_order.push_back(coid);
             auto& rs = it->second;
@@ -1724,6 +1741,7 @@ private:
     RecoveryScanStatus recovery_status_{RecoveryScanStatus::IoError};
 
     std::uint64_t next_sequence_{0};
+    OrderAttemptWatermark attempt_watermark_{};
     std::array<std::byte, kMacLen> tip_mac_{};
 
     std::array<OrderRecoveryCheckpoint, kMaxInFlight> checkpoints_{};
@@ -1742,6 +1760,7 @@ private:
     AuditSinkOpenMode open_mode_{AuditSinkOpenMode::Trading};
     std::uint8_t write_version_{kFrameFormatVersion};
     NeverSentWrites never_sent_writes_{NeverSentWrites::Disabled};
+    std::uint64_t max_order_frames_;
     std::array<OperatorResolvedOrder, kMaxOperatorResolved> operator_resolved_{};
     std::size_t operator_resolved_count_{0};
     RecoveryOverflow recovery_overflow_{};

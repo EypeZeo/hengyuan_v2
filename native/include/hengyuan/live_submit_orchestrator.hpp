@@ -162,8 +162,25 @@ inline AuditAppendResult durable_audit_sink_append_adapter(void* user_data, cons
 inline bool durable_audit_sink_fenced_adapter(void* user_data) noexcept {
     return static_cast<DurableAuditSink*>(user_data)->fenced();
 }
+// Q23 S6: the closure writer of the port, over DurableAuditSink::append_never_sent(). The sink decides whether it may write one at all
+// (NeverSentWrites, default Disabled), so a port made over a default sink answers NotEnabled and nothing changes for it.
+inline ClosureAppendResult durable_audit_sink_closure_adapter(void* user_data, const never_sent::ClosureTarget& target,
+                                                              const AuditRecord& rec, std::int64_t now_ms) noexcept {
+    const NeverSentAppend r = static_cast<DurableAuditSink*>(user_data)->append_never_sent(target, rec, now_ms);
+    ClosureAppendResult out{};
+    out.append = r.append;
+    switch (r.status) {
+        case NeverSentAppendStatus::Appended: out.status = ClosureAppendStatus::Appended; break;
+        case NeverSentAppendStatus::AppendFailed: out.status = ClosureAppendStatus::Failed; break;
+        case NeverSentAppendStatus::NotEnabled:
+        case NeverSentAppendStatus::NotTradingOpen: out.status = ClosureAppendStatus::NotEnabled; break;
+        default: out.status = ClosureAppendStatus::Refused; break;  // fenced, an empty id, the rule said no: nothing was written
+    }
+    return out;
+}
 inline DurableOrderAuditPort make_durable_order_audit_port(DurableAuditSink& sink) noexcept {
-    return DurableOrderAuditPort{&durable_audit_sink_append_adapter, &durable_audit_sink_fenced_adapter, &sink};
+    return DurableOrderAuditPort{&durable_audit_sink_append_adapter, &durable_audit_sink_fenced_adapter, &sink,
+                                 &durable_audit_sink_closure_adapter};
 }
 
 // --- Operator confirmation bound to an immutable order summary (ADR-019 D3 M3) ---
@@ -267,6 +284,11 @@ struct OrchestratorResult {
     NotReadyReason not_ready_reason{NotReadyReason::None};
     // Appended (M3a). The stream generation the SubmitReadyToken rested on; 0 when no token was obtained (a call that stopped before Gate 2b).
     std::uint64_t ready_generation{0};
+    // Appended (Q23 S6). What happened to the order's Intent frame when a LOCAL gate refused the order after it was written (Gates 11, 12, 12b,
+    // 12c): Appended = closed as never sent, so the next start finds no Intent orphan; NotEnabled / NotWired = nothing was tried, the order is
+    // the Intent orphan it always was; Refused / Failed = tried and not closed (Failed: the frame may be on the disk). NotAttempted for every
+    // other result, in particular for every call that wrote no Intent frame. `gate` is the refusal either way: this field never changes it.
+    ClosureAppendStatus closure{ClosureAppendStatus::NotAttempted};
 };
 
 // --- Orchestrator context (all dependencies injected) ---
@@ -285,6 +307,10 @@ struct OrchestratorContext {
     // style as submit_port; unwired defaults to is_valid()==false, which fails
     // Gate 5 closed rather than silently skipping the durable-before-send check.
     DurableOrderAuditPort durable_audit{};
+    // Q23 S6: the client order ids this context closed as never sent (the last few). Gate 9b refuses an id on this list BEFORE it writes an
+    // Intent frame: a frame after a closure is Corrupt at the next start, and a refused order has no in-flight slot to keep that from
+    // happening. Owned by the thread that owns the context; empty (so it changes nothing) until a closure has been tried.
+    never_sent::RecentlyClosedIds recently_closed{};
 
     // Reconcile/poll loop wiring (order_tracker.hpp). Both nullable and default
     // to nullptr for backward compatibility with existing callers/tests that
@@ -405,6 +431,25 @@ namespace detail {
         ctx.fill_context->durable_acked(std::string_view(ar.client_order_id), ar.resulting_state, ar.filled_qty_ticks);
     }
     return true;
+}
+
+// Q23 S6 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3, class A): an order a LOCAL gate refused after its Intent frame was acknowledged and before any
+// Prepared frame is closed as never sent -- the durable proof that no byte of its request left the process -- instead of being left as an Intent
+// orphan. `intent` is the Intent frame THIS call wrote, so the target and the closing frame are the order the log already holds. What happens is
+// whatever the port's closure writer does: nothing for a port without one or a sink not built to write closures (the default: the order stays the
+// Intent orphan it always was), a closure, or a refusal / a failed append. A failed append is not "nothing happened" (the frame may be on the
+// disk), so the id is remembered whenever a frame was, or may have been, written; Gate 9b then refuses the same id before it writes another Intent
+// frame (a frame after a closure is Corrupt at the next start). No ring record and no shadow move: the order was never registered or tracked, and
+// the shadow of an untracked order is a no-op (see append_order_frame()).
+[[nodiscard]] inline ClosureAppendStatus close_never_sent(OrchestratorContext& ctx, const AuditRecord& intent,
+                                                           never_sent::Reason reason, OrderRecord& order) noexcept {
+    const ClosureAppendResult r = ctx.durable_audit.append_never_sent(
+        never_sent::class_a_target_of(intent), never_sent::class_a_closure_of(intent, reason, ctx.now_ms), ctx.now_ms);
+    if (r.status == ClosureAppendStatus::Appended || r.status == ClosureAppendStatus::Failed) {
+        ctx.recently_closed.remember(std::string_view(intent.client_order_id));
+    }
+    if (r.status == ClosureAppendStatus::Appended) order.transition_to(OrderState::NeverSent);
+    return r.status;
 }
 
 }  // namespace detail
@@ -617,7 +662,9 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // the whole log Corrupt on the next start while the duplicate was refused only at Gate 12b -- after the frame
     // was written. The registration at Gate 12b stays (it is also the capacity check, and the only thing that
     // claims the slot).
-    if (ctx.in_flight && ctx.in_flight->is_in_flight(coid.view())) {
+    // Q23 S6: the same refusal for an id this context already CLOSED as never sent (ctx.recently_closed): a client order id is one attempt, and an
+    // Intent frame after the closure would make the next start Corrupt. Nothing is written for it, so there is nothing to close.
+    if ((ctx.in_flight && ctx.in_flight->is_in_flight(coid.view())) || ctx.recently_closed.contains(coid.view())) {
         result.gate = OrchestratorGate::DuplicateInFlight;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
@@ -633,8 +680,9 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     }
 
     // Gate 10: Audit intent
+    AuditRecord intent_frame{};  // Q23 S6: kept for the class A closure -- what the log holds of this order, if a local gate refuses it below
     {
-        AuditRecord ar{};
+        AuditRecord& ar = intent_frame;
         ar.timestamp_ms = ctx.now_ms;
         ar.event_type = AuditEventType::OrderIntentCreated;
         ar.mode = ctx.mode;
@@ -666,6 +714,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     (void)checked_notional(ctx.price_ticks, ctx.qty_ticks, confirm_notional);
     if (!ctx.confirmation.confirmed) {
         result.gate = OrchestratorGate::OperatorNotConfirmed;
+        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMissing, result.order);
         return result;
     }
     if (!ctx.confirmation.authorizes(ctx.symbol_id, ctx.side, ctx.order_type,
@@ -682,6 +731,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.side = ctx.side;
         ar.set_detail("confirmation does not authorize this order");
         ctx.audit->append(ar);
+        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMismatch, result.order);
         return result;
     }
 
@@ -697,6 +747,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.side = ctx.side;
         ar.set_detail("submit port invalid");
         ctx.audit->append(ar);
+        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::SubmitPortInvalid, result.order);
         return result;
     }
 
@@ -704,6 +755,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // A missing registry fails closed — live submit must never run un-guarded.
     if (!ctx.in_flight) {
         result.gate = OrchestratorGate::InFlightRegistryUnavailable;
+        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::InFlightRegistryUnavailable, result.order);
         return result;
     }
 
@@ -723,6 +775,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.resulting_state = result.order.state;
         ar.side = ctx.side;
         ctx.audit->append(ar);
+        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::RateLimitExhausted, result.order);
         return result;
     }
 
@@ -742,6 +795,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.side = ctx.side;
         ar.set_detail("duplicate in-flight - reconcile, do NOT resubmit");
         ctx.audit->append(ar);
+        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::DuplicateInFlight, result.order);
         return result;
     }
 

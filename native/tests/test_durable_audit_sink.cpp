@@ -1668,6 +1668,7 @@ const char* fence_reason_name(FenceReason r) {
         case FenceReason::None: return "None";
         case FenceReason::IoError: return "IoError";
         case FenceReason::DiskFull: return "DiskFull";
+        case FenceReason::LogLimit: return "LogLimit";
     }
     return "?";
 }

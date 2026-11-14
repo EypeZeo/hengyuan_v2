@@ -29,7 +29,11 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <string_view>
 
 #include <hengyuan/audit_trail.hpp>
 #include <hengyuan/order_lifecycle.hpp>
@@ -101,5 +105,85 @@ inline ClosureCheck check_closure(const ClosureTarget& target, const AuditRecord
     const ClosureCheck order = check_order_closable(target);
     return order != ClosureCheck::Ok ? order : check_closing_frame(target, rec);
 }
+
+// --- Class A: an order refused after its Intent frame and before its Prepared frame (Q23 S6, docs/NOTSENT_CLOSURE_DESIGN.md 4.3) ---
+
+// The reason a class A closure carries in detail_code (design 4.3: "the reason goes in detail_code, not in detail_msg"). Informational
+// for the reader -- a value it does not know is not corruption -- and stable for whoever reads the log. One value per local refusal
+// the orchestrator can make between the Intent frame and the Prepared frame; the class B reasons (the final gate, slice S5) will be
+// added from 32 up.
+enum class Reason : std::int64_t {
+    ConfirmationMissing = 1,         // the operator's CONFIRM is not there
+    ConfirmationMismatch = 2,        // ...or does not authorise this order
+    SubmitPortInvalid = 3,           // the injected submit port is not usable
+    InFlightRegistryUnavailable = 4, // no in-flight registry: a live submit never runs unguarded
+    RateLimitExhausted = 5,          // the actual rate-limit charge was refused
+    DuplicateInFlight = 6,           // the in-flight registry already holds the client order id
+};
+
+// What the owner of a class A order knows of it: its Intent frame was acknowledged and NOTHING else happened -- no Prepared frame, no
+// claim, no byte of a request. Built from that Intent frame, so the target and the closing frame cannot disagree about the order.
+inline ClosureTarget class_a_target_of(const AuditRecord& intent) noexcept {
+    ClosureTarget t{};
+    t.state = OrderState::Intent;
+    t.exchange_order_id = 0;
+    t.filled_qty_ticks = 0;
+    t.symbol_id = intent.symbol_id;
+    t.side = intent.side;
+    t.mode = intent.mode;
+    t.price_ticks = intent.price_ticks;
+    t.qty_ticks = intent.qty_ticks;
+    return t;
+}
+
+// The closing frame of such an order: the NeverSent pair, the Intent's order unchanged, nothing filled, no exchange id, the reason in
+// detail_code and nothing in detail_msg. check_closure(class_a_target_of(intent), class_a_closure_of(intent, r, t)) is Ok for every
+// reason (test_never_sent_rules.cpp pins it).
+inline AuditRecord class_a_closure_of(const AuditRecord& intent, Reason reason, std::int64_t now_ms) noexcept {
+    AuditRecord r = intent;
+    r.timestamp_ms = now_ms;
+    r.event_type = AuditEventType::OrderNeverSent;
+    r.resulting_state = OrderState::NeverSent;
+    r.exchange_order_id = 0;
+    r.filled_qty_ticks = 0;
+    r.avg_fill_price_ticks = 0;
+    r.detail_code = static_cast<std::int64_t>(reason);
+    r.detail_msg[0] = '\0';
+    return r;
+}
+
+// The client order ids a context closed as never sent -- the most recent kCapacity of them. A client order id is ONE attempt: a frame
+// after the closure makes the next start Corrupt (design 4.2, the model's SingleAttemptCoid), and a class A order has no in-flight slot
+// to keep that true, so whoever is about to write an Intent frame asks here first. Fixed storage, no allocation. An id is remembered
+// when its closure was acknowledged AND when the append failed (the frame may be on the disk anyway: design 4.5). Older ids are
+// forgotten in order. DurableAuditSink independently enforces the generated attempt watermark across contexts and restarts.
+class RecentlyClosedIds {
+public:
+    static constexpr std::size_t kCapacity = 64;
+
+    void remember(std::string_view coid) noexcept {
+        if (coid.empty() || coid.size() > kClientOrderIdLen) return;
+        ClientOrderId& slot = ids_[next_];
+        std::memcpy(slot.id, coid.data(), coid.size());
+        slot.id[coid.size()] = '\0';
+        next_ = (next_ + 1) % kCapacity;
+        if (count_ < kCapacity) ++count_;
+    }
+
+    bool contains(std::string_view coid) const noexcept {
+        if (coid.empty()) return false;
+        for (std::size_t i = 0; i < count_; ++i) {
+            if (ids_[i].view() == coid) return true;
+        }
+        return false;
+    }
+
+    std::size_t size() const noexcept { return count_; }
+
+private:
+    std::array<ClientOrderId, kCapacity> ids_{};
+    std::size_t next_{0};
+    std::size_t count_{0};
+};
 
 }  // namespace hy::never_sent

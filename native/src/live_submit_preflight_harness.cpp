@@ -796,7 +796,11 @@ int main(int argc, char* argv[]) {
     WrappedKeyRecord key_rec{};
     key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}},
                        key_rec);
-    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
+    // Q23 S6: this Testnet-only harness is one of the two processes that turn the closure writer on (the other is live_submit_evidence_harness):
+    // an order a local gate refuses after its Intent frame is closed as never sent instead of being left as an Intent orphan.
+    // test_never_sent_guard.cpp pins that no other production source names NeverSentWrites.
+    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1, kMaxIntentOrphans,
+                                                                 AuditSinkOpenMode::Trading, NeverSentWrites::Enabled);
 
     // --- The private-stream pipeline (M5b-1, private_stream_pipeline.hpp) ----------------------------------------
     // Everything below is the process's and outlives it. The pipeline creates no thread and opens no connection by

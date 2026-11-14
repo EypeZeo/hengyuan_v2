@@ -1,6 +1,6 @@
 # NotSent 闭合与发送前最终授权 —— 语义冻结与协议模型（Q23 切片 1）
 
-状态：**设计，语义已冻结；读者侧已实现（切片 S2 与 S3 合为一片，2026-11-12，PR #250，合并提交 `979a94b`：事件 `OrderNeverSent` = 23、状态 `OrderState::NeverSent` = 12、v6 的合法集合、§4.6 的恢复表、闭合规则 `never_sent_rules.hpp`）；写入口 S4 已实现（2026-11-13，PR #252，合并提交 `5bbbf43`：sink 的 `append_never_sent()` 与默认关闭的构造开关 `NeverSentWrites`，没有调用者），调用者（S5、S6）没有**。原先的“无代码、无枚举取值、无日志字节变化”到这一片为止：枚举值已分配，今天所有存储仍写 v5、一字节不变。起草 2026-10-25；Owner 在 2026-10-24 对计划说“开始”，2026-11-12 对 S2/S3 说“开始，命名按你的建议”；2026-11-13 对 S4 的两个待定点答“不保留审计日志，显式的构造配置，继续下一步操作”（§9 D2）。
+状态：S2/S3 的 v6 读取、状态机与恢复，以及 S4 的默认关闭写入接口已实现。S6 已接入类 A 拒绝流程及对应恢复、容量与成本测试；S5 的发送前最终授权待实现。实现命名为 `OrderNeverSent` 与 `OrderState::NeverSent`。
 依据：蓝图 v2.9.0 的 `5.9.2`、F.5、F.9、R-18 / R-22（Owner 已选统一 NotSent）、Q23、FI-055、FI-056、任务 SAFE-07 与 1A.6。
 模型：`formal/notsent_closure.tla`（结果见 §7）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值不在本文分配**，随实现 PR 同步分配，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。
 
@@ -142,9 +142,9 @@
 | :-- | :-- | :-- |
 | S2 codec 读者 | **已实现（与 S3 合为一片，2026-11-12）**：`format_version` 6 与两套合法集合（事件 ≤ 23、状态 ≤ 12），只读不写；未知版本、v5 帧里的 v6 值、版本回退各有明确状态（`format_version` 6 本身与事件 22 已由 D5 R1 落地） | MSVC + GCC `none`；codec 表驱动用例 |
 | S3 状态机与恢复 | **已实现（与 S2 合为一片，2026-11-12；命名已定：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12，规则在 `never_sent_rules.hpp`，读者与写者共用）**：`NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料；**命名**：`order_tracker.hpp` 已有 `QueryOutcome::NotSent`（R-10，意思是对账**查询**没有离开进程），订单状态与事件的新名字要与它区分（实现 PR 里定），否则 grep 和读者都会混 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
-| S4 写入 | **已实现（2026-11-13）**：sink 追加 NotSent——`append_never_sent()`（沿用 `append_impl`，闭合规则与读者共用 `check_closure()`），默认关闭的构造开关 `NeverSentWrites`（Owner 选的“显式的构造配置”），故障注入：Failed、迟到、撕裂尾；**没有调用者**（调用者是 S5、S6） | `address`；旧 `AbortedPreSend` 双发场景作为必败 / 必拒用例保留 |
+| S4 写入 | **已实现（2026-11-13）**：sink 追加 NotSent——`append_never_sent()`（沿用 `append_impl`，闭合规则与读者共用 `check_closure()`），默认关闭的构造开关 `NeverSentWrites`（Owner 选的“显式的构造配置”），故障注入：Failed、迟到、撕裂尾；S6 已通过 `DurableOrderAuditPort` 接入类 A 调用者；S5 待实现 | `address`；旧 `AbortedPreSend` 双发场景作为必败 / 必拒用例保留 |
 | S5 最终门（1A.6、FI-055） | 决定字与门；撤销者与所有者的两种次序；`ServerShutdown`、代次变化、熔断、授权截止注入 | `thread` + arm64 重复；**新增一个 TSan 负控**（把决定字的配对降成 relaxed 必须被抓到）；变异检查 |
-| S6 类 A 闭合（SAFE-07、FI-056） | 各拒绝路径写 NotSent；孤儿计数；纯静态预检前移只作减量优化 | 孤儿预算与告警；拒绝循环的日志规模有界；Q19 先量出每次拒绝多一条持久链的成本 |
+| S6 类 A 闭合（SAFE-07、FI-056） | 六种本地拒绝写入 NotSent，确认成功后返回 NeverSent；存储维护已尝试关闭的生成订单号的时间与序号最高值，重启恢复该值，拒绝重复或倒退的尝试；两个测试程序显式启用写入 | 孤儿预算与告警；拒绝循环的日志规模有界；Q19 先量出每次拒绝多一条持久链的成本 |
 | S7 迁移 | 清单、读者先行开关、回退前停机；仅当存在真实日志 | 迁移中崩溃、清单撕裂、旧构建遇 v6 |
 | S8 操作员闭合（D5，L-46） | 设计与模型已有（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`）；实现切片 R1 至 R6 在那份文档里 | 见该文档 §10；R1 与 S2 合并为同一次 v6 |
 
