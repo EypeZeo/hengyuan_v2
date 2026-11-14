@@ -108,10 +108,8 @@ inline ClosureCheck check_closure(const ClosureTarget& target, const AuditRecord
 
 // --- Class A: an order refused after its Intent frame and before its Prepared frame (Q23 S6, docs/NOTSENT_CLOSURE_DESIGN.md 4.3) ---
 
-// The reason a class A closure carries in detail_code (design 4.3: "the reason goes in detail_code, not in detail_msg"). Informational
-// for the reader -- a value it does not know is not corruption -- and stable for whoever reads the log. One value per local refusal
-// the orchestrator can make between the Intent frame and the Prepared frame; the class B reasons (the final gate, slice S5) will be
-// added from 32 up.
+// Stable closure reasons carried in detail_code. Readers accept unknown values.
+// Class A local refusals use 1..6; class B final authorization refusals start at 32.
 enum class Reason : std::int64_t {
     ConfirmationMissing = 1,         // the operator's CONFIRM is not there
     ConfirmationMismatch = 2,        // ...or does not authorise this order
@@ -119,6 +117,13 @@ enum class Reason : std::int64_t {
     InFlightRegistryUnavailable = 4, // no in-flight registry: a live submit never runs unguarded
     RateLimitExhausted = 5,          // the actual rate-limit charge was refused
     DuplicateInFlight = 6,           // the in-flight registry already holds the client order id
+    ReadinessRevoked = 32,
+    AuthorizationExpired = 33,
+    ConfirmationExpired = 34,
+    SlotOwnershipLost = 35,
+    ReservationLost = 36,
+    AccountChanged = 37,
+    PreconditionsChanged = 38,
 };
 
 // What the owner of a class A order knows of it: its Intent frame was acknowledged and NOTHING else happened -- no Prepared frame, no

@@ -108,6 +108,7 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::SubmitPartialFill: return "SubmitPartialFill";
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
         case OrchestratorGate::NotReady: return "NotReady";
+        case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
     }
     return "?";
 }

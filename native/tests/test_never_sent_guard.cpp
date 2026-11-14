@@ -13,14 +13,13 @@
 //   2. OrderState::NeverSent likewise: the state machine, the codec's version bound, the rule and the reader. The orchestrator
 //      advances its returned OrderRecord only after the closure append is acknowledged.
 //   3. The closure rule, check_closure(), is applied by the recovery scan and by the one writer, append_never_sent() (Q23 S4),
-//      and nothing else: what the writer lets through, the reader accepts. The callers of the writer join in S5 and S6.
+//      and nothing else: what the writer lets through, the reader accepts. The class B and class A callers join in S5 and S6.
 //   4. is_resolved() is called by the recovery scan and nothing else (the slot release and the retention filters join in the
 //      writer slices). is_exchange_final() keeps meaning what it says: its callers are not pinned here (they predate this slice),
 //      but test_order_lifecycle.cpp pins that NeverSent is not exchange-final.
 //   5. The closure counter, recovered_never_sent(), is read by nothing in production.
-//   6. (Q23 S4) The writer, DurableAuditSink::append_never_sent(), has NO caller in production, and the switch that lets a sink
-//      write the frame at all, NeverSentWrites, is named by the sink header alone -- so no process can turn it on. The callers
-//      (S5's final gate, S6's refusals before the Prepared frame) add themselves here, with the reason, in the PR that wires them.
+//   6. The switch that lets a sink write the frame at all, NeverSentWrites, is named by the sink header alone, so no production
+//      process can turn it on. The testnet harnesses remain the only callers that construct an enabled sink.
 //
 // The scan strips comments and the contents of string/char literals first, so prose that mentions a name does not count and a
 // string that contains one cannot hide a real use. (test_helpers/cxx_source_view.hpp is the one shared scanner.)
@@ -263,7 +262,7 @@ TEST(NeverSentGuard, TheClosureWriterIsReachedOnlyThroughThePortAndTheSwitchIsTu
                          {{kSink, 1, "the definition"},
                           {kPort, 1, "the port's method: a null function pointer answers NotWired"},
                           {kOrchestrator, 2, "the sink adapter of the port, and detail::close_never_sent() (the one caller)"}});
-    expect_named_only_in("close_never_sent", {{kOrchestrator, 7, "the definition and the six class A refusals (Gate 11 twice, Gate 12, Gate 12b twice, Gate 12c)"}});
+    expect_named_only_in("close_never_sent", {{kOrchestrator, 8, "the definition, six class A refusals, and the S5 final authorization refusal"}});
     // The frame is built and judged in one place: the rules header's class_a_* functions, used by the orchestrator's helper alone.
     expect_named_only_in("class_a_closure_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});
     expect_named_only_in("class_a_target_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});

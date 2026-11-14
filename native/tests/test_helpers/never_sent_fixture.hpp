@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: proprietary
-// Shared Q23 S6 test support for never-sent class A orchestrator and sink tests.
+// Shared Q23 S5/S6 test support for never-sent class A/B orchestrator and sink tests.
 #pragma once
 
 #include <gtest/gtest.h>
@@ -35,6 +35,7 @@ struct TraceEntry {
 // Fixed-capacity fake so an orchestrator call through this fake stays allocation-free.
 struct FakeAudit {
     using IntentAckHook = void (*)(void* user_data, const AuditRecord& intent) noexcept;
+    using PreparedAckHook = void (*)(void* user_data, const AuditRecord& prepared) noexcept;
 
     static constexpr std::size_t kMaxTraceEntries = 32;
 
@@ -49,6 +50,7 @@ struct FakeAudit {
     std::size_t closure_calls{0};
     ClosureAppendStatus closure_status{ClosureAppendStatus::Appended};
     IntentAckHook after_intent_ack{nullptr};
+    PreparedAckHook after_prepared_ack{nullptr};
     void* hook_user_data{nullptr};
 
     static AuditAppendResult append(void* user_data, const AuditRecord& rec, std::int64_t now_ms) noexcept {
@@ -76,6 +78,8 @@ struct FakeAudit {
             self.is_fenced = true;
         } else if (is_intent && self.after_intent_ack != nullptr) {
             self.after_intent_ack(self.hook_user_data, rec);
+        } else if (is_prepared && self.after_prepared_ack != nullptr) {
+            self.after_prepared_ack(self.hook_user_data, rec);
         }
         return result;
     }
@@ -128,6 +132,11 @@ protected:
     FakeAudit fake_audit_{};
     SubmitResponse submit_response_{SubmitOutcome::Accepted, 12345, 0};
     std::size_t submit_calls_{0};
+    std::uint32_t last_submit_symbol_{0};
+    OrderSide last_submit_side_{OrderSide::Buy};
+    OrderType last_submit_type_{OrderType::Limit};
+    std::int64_t last_submit_price_ticks_{0};
+    std::int64_t last_submit_qty_ticks_{0};
 
     void SetUp() override {
         audit_.set_available(true);
@@ -204,10 +213,16 @@ private:
         evidence_.record(EvidencePath::KillSwitch, 4, 0xABCD, 1);
     }
 
-    static SubmitResponse submit(const char*, std::uint32_t, OrderSide, OrderType, std::int64_t, std::int64_t,
+    static SubmitResponse submit(const char*, std::uint32_t symbol, OrderSide side, OrderType type,
+                                 std::int64_t price_ticks, std::int64_t qty_ticks,
                                  const SymbolRules&, void* user_data) {
         auto& self = *static_cast<NeverSentOrchestratorFixture*>(user_data);
         ++self.submit_calls_;
+        self.last_submit_symbol_ = symbol;
+        self.last_submit_side_ = side;
+        self.last_submit_type_ = type;
+        self.last_submit_price_ticks_ = price_ticks;
+        self.last_submit_qty_ticks_ = qty_ticks;
         return self.submit_response_;
     }
 

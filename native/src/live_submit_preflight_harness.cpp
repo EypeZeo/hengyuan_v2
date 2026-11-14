@@ -183,6 +183,7 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::SubmitPartialFill: return "SubmitPartialFill";
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
         case OrchestratorGate::NotReady: return "NotReady";
+        case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
     }
     return "?";
 }
@@ -758,9 +759,12 @@ int main(int argc, char* argv[]) {
                      static_cast<int>(ws_err));
         return 1;
     }
+    auto submit_authority = std::make_shared<SubmitAuthority>();
+    WsApiUserDataSessionConfig private_session_config{};
+    private_session_config.submit_authority = submit_authority;
     WsApiSessionFactory ws_factory(
         WsApiSessionFactory::Deps{ioc, ssl_ctx, user_data_events, *ws_codec, *ws_creds, client.clock_publisher(), rate_limiter},
-        ws_api_endpoint_of(binding));
+        ws_api_endpoint_of(binding), private_session_config);
     RestAccountFetcher account_fetcher(client);
 
     InFlightRegistry in_flight;
@@ -813,6 +817,7 @@ int main(int argc, char* argv[]) {
     parts.rules = PipelineRulesLookup{&registry_rules_for, &registry};
 
     PipelineConfig pipeline_cfg;
+    pipeline_cfg.submit_authority = submit_authority;
     // The supervision the public feeds get: reconnect with backoff, a planned rollover well inside the 24 h limit of
     // a Binance connection, and an end to the run -- exit code 2, not a silent blind loop -- once ten attempts in a
     // row have failed.

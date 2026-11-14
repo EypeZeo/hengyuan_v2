@@ -426,14 +426,27 @@ TEST(SubmitReadinessGuard, SyntheticReadinessIsUsedOnlyByTheListedDrillsAndHarne
 TEST(SubmitReadinessGuard, TheTokenHasOneMintSiteAndOneFriend) {
     const SourceFile* header = find_source("include/hengyuan/submit_readiness.hpp");
     ASSERT_NE(header, nullptr);
-    EXPECT_EQ(count_substring(header->code, "SubmitReadyToken(feed.generation, now_ms)"), 1u)
-        << "exactly one expression builds a token, inside SubmitReadiness::authorize()";
-    // ... and no other two-argument construction (the private constructor takes the generation and the issue time) and no brace construction.
+    const std::size_t evaluator = header->code.find("ReadinessResult evaluate(std::int64_t now_ms) noexcept");
+    const std::size_t mint = header->code.find(
+        "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), kill_switch_.revision(), this)");
+    const std::size_t claim_api = header->code.find("public:", evaluator);
+    ASSERT_NE(evaluator, std::string::npos);
+    ASSERT_NE(mint, std::string::npos);
+    ASSERT_NE(claim_api, std::string::npos);
+    EXPECT_LT(evaluator, mint) << "the evaluator is the one token issuer";
+    EXPECT_LT(mint, claim_api) << "authorize() and claim() share this evaluator rather than minting separately";
+    EXPECT_EQ(count_substring(header->code,
+                              "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), kill_switch_.revision(), this)"),
+              1u);
+    // The private token constructor now binds stream generation, issue time, authority epoch, barrier epoch, kill revision and issuer.
     std::size_t two_argument_constructions = 0;
+    std::size_t six_argument_constructions = 0;
     for (const std::vector<std::string>& args : call_args(header->code, "SubmitReadyToken")) {
         if (args.size() == 2) ++two_argument_constructions;
+        if (args.size() == 6) ++six_argument_constructions;
     }
-    EXPECT_EQ(two_argument_constructions, 1u);
+    EXPECT_EQ(two_argument_constructions, 0u);
+    EXPECT_EQ(six_argument_constructions, 1u);
     EXPECT_EQ(count_substring(header->code, "SubmitReadyToken{"), 0u);
     EXPECT_EQ(count_substring(header->code, "friend"), 1u);
     EXPECT_EQ(count_substring(header->code, "friend class SubmitReadiness;"), 1u) << "the one friend is the issuer";
@@ -643,7 +656,8 @@ struct OrderGatePin {
 };
 
 const OrderGatePin kOrderGates[] = {
-    {"include/hengyuan/live_submit_orchestrator.hpp", 2, 3, "orchestrate_submit(): reads the confirmation (Gate 11) and the port (the rules-version fence, Gate 12, the call)"},
+    {"include/hengyuan/live_submit_orchestrator.hpp", 1, 5,
+     "orchestrate_submit(): captures confirmation once for both checks; validates the port before Intent and again after Prepared, checks its rules version, and calls it"},
     {"include/hengyuan/preflight_probe.hpp", 1, 1,
      "fill_preflight_order(): resets the confirmation to the default (not confirmed) and installs the mock port it is handed"},
     {"include/hengyuan/verified_dry_run_evidence.hpp", 8, 1,
@@ -708,4 +722,54 @@ TEST(SubmitReadinessGuard, ThePreflightHarnessCanOnlyHandItsOrderFillTheMockPort
     EXPECT_EQ(member_assignments(stripped("env.submit_port = {mock, nullptr, version};"), "submit_port"), (Rhs{"{mock, nullptr, version}"}));
     EXPECT_EQ(member_assignments(stripped("ctx.submit_port = real_port;"), "submit_port"), (Rhs{"real_port"})) << "a real port assigned anywhere is visible";
     EXPECT_EQ(count_substring(stripped("// ctx.confirmation.confirmed = true;\n"), "ctx.confirmation"), 0u) << "prose";
+}
+
+TEST(SubmitReadinessGuard, PreflightAndPrivatePipelineShareOneSubmitAuthority) {
+    const SourceFile* harness = find_source("src/live_submit_preflight_harness.cpp");
+    const SourceFile* pipeline = find_source("include/hengyuan/private_stream_pipeline.hpp");
+    ASSERT_NE(harness, nullptr);
+    ASSERT_NE(pipeline, nullptr);
+
+    using Assignments = std::vector<std::string>;
+    EXPECT_EQ(member_assignments(harness->code, "submit_authority"),
+              (Assignments{"submit_authority", "submit_authority"}))
+        << "the session config and pipeline config must receive the same shared authority object";
+    EXPECT_EQ(count_substring(harness->code, "std::make_shared<SubmitAuthority>()"), 1u);
+    EXPECT_EQ(count_substring(squeeze(pipeline->code),
+                              "ReadinessProbe{&read_feed, &read_recovery, &read_clock, &owner}, config.barrier, config.submit_authority"),
+              1u)
+        << "SubmitReadiness inside the pipeline must consume the authority carried by PipelineConfig";
+}
+
+TEST(SubmitReadinessGuard, PreparedAckAndFinalClaimPrecedeTheOnlySubmitCall) {
+    const SourceFile* orchestrator = find_source("include/hengyuan/live_submit_orchestrator.hpp");
+    ASSERT_NE(orchestrator, nullptr);
+    const std::string& code = orchestrator->code;
+    const std::size_t prepared = code.find("ar.event_type = AuditEventType::OrderSubmitPrepared;");
+    const std::size_t prepared_ack = code.find("if (!detail::append_order_frame(ctx, ar))", prepared);
+    const std::size_t transition = code.find("result.order.transition_to(OrderState::Submitting);", prepared_ack);
+    const std::size_t claim = code.find("ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check)", transition);
+    const std::size_t refusal = code.find("if (final_refusal)", claim);
+    const std::size_t submitted_audit = code.find("ar.event_type = AuditEventType::OrderSubmitted;", refusal);
+    const std::size_t submit = code.find("ctx.submit_port.call(", submitted_audit);
+
+    ASSERT_NE(prepared, std::string::npos);
+    ASSERT_NE(prepared_ack, std::string::npos);
+    ASSERT_NE(transition, std::string::npos);
+    ASSERT_NE(claim, std::string::npos);
+    ASSERT_NE(refusal, std::string::npos);
+    ASSERT_NE(submitted_audit, std::string::npos);
+    ASSERT_NE(submit, std::string::npos);
+    EXPECT_LT(prepared, prepared_ack);
+    EXPECT_LT(prepared_ack, transition);
+    EXPECT_LT(transition, claim);
+    EXPECT_LT(claim, refusal);
+    EXPECT_LT(refusal, submitted_audit);
+    EXPECT_LT(submitted_audit, submit);
+
+    const std::string post_claim_submit_window = code.substr(submitted_audit, submit - submitted_audit);
+    EXPECT_EQ(post_claim_submit_window.find("OrchestratorGate::"), std::string::npos)
+        << "after the refusal branch, no local gate may intervene before the submit call";
+    EXPECT_EQ(post_claim_submit_window.find("return result;"), std::string::npos)
+        << "the acknowledged claim must flow directly into the submit port";
 }

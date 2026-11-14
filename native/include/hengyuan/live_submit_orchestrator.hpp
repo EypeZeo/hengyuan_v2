@@ -22,6 +22,8 @@
 //  12. Submit port valid
 //  12b. In-flight / idempotency guard (D8 M6, no blind retry)
 //  12c. Rate limit actual charge, right before the network call (D5)
+//  12d. Durable Prepared acknowledgement and transition to Submitting
+//  12e. Final readiness, order and resource checks, followed by one atomic send claim
 //  13. Audit: OrderSubmitted → SubmitPort::submit() → handle result
 //  14. Result routing: Accepted/Rejected/Ambiguous→reconcile/escalate (D8 M6)
 //
@@ -45,6 +47,8 @@
 #include <hengyuan/sweep_pump.hpp>
 #include <hengyuan/transport_policy.hpp>
 
+#include <chrono>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 
@@ -274,26 +278,36 @@ enum class OrchestratorGate : std::uint8_t {
     // wired, or the stream / startup recovery / clock / kill switch does not allow an order right now. OrchestratorResult::not_ready_reason says
     // which. Nothing was written to the durable log and nothing was sent.
     NotReady = 23,
+    FinalAuthorizationRefused = 24,
 };
 
 struct OrchestratorResult {
     OrchestratorGate gate{OrchestratorGate::Passed};
     OrderRecord order{};
     PreTradeCheck pre_trade_detail{PreTradeCheck::Ok};
-    // Appended (M3a). Set when gate == NotReady; None otherwise.
+    // Readiness refusal at initial authorization or final claim; None otherwise.
     NotReadyReason not_ready_reason{NotReadyReason::None};
     // Appended (M3a). The stream generation the SubmitReadyToken rested on; 0 when no token was obtained (a call that stopped before Gate 2b).
     std::uint64_t ready_generation{0};
-    // Appended (Q23 S6). What happened to the order's Intent frame when a LOCAL gate refused the order after it was written (Gates 11, 12, 12b,
-    // 12c): Appended = closed as never sent, so the next start finds no Intent orphan; NotEnabled / NotWired = nothing was tried, the order is
-    // the Intent orphan it always was; Refused / Failed = tried and not closed (Failed: the frame may be on the disk). NotAttempted for every
-    // other result, in particular for every call that wrote no Intent frame. `gate` is the refusal either way: this field never changes it.
+    // Appended acknowledges a durable NeverSent closure. Other statuses preserve
+    // Intent (class A) or Submitting (class B). Failed may have reached disk.
+    // NotAttempted means no closure was requested; gate retains the refusal cause.
     ClosureAppendStatus closure{ClosureAppendStatus::NotAttempted};
+    std::optional<never_sent::Reason> final_refusal{};
 };
 
 // --- Orchestrator context (all dependencies injected) ---
 
+inline std::int64_t submit_steady_now_ms(void*) noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 struct OrchestratorContext {
+    using MonotonicNow = std::int64_t (*)(void*) noexcept;
+    MonotonicNow monotonic_now{&submit_steady_now_ms};
+    void* monotonic_clock{nullptr};
+    std::int64_t authorization_ttl_ms{5000};
     // Gate inputs
     AuditRingSink* audit{nullptr};
     const KillSwitch* kill_switch{nullptr};
@@ -433,18 +447,15 @@ namespace detail {
     return true;
 }
 
-// Q23 S6 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3, class A): an order a LOCAL gate refused after its Intent frame was acknowledged and before any
-// Prepared frame is closed as never sent -- the durable proof that no byte of its request left the process -- instead of being left as an Intent
-// orphan. `intent` is the Intent frame THIS call wrote, so the target and the closing frame are the order the log already holds. What happens is
-// whatever the port's closure writer does: nothing for a port without one or a sink not built to write closures (the default: the order stays the
-// Intent orphan it always was), a closure, or a refusal / a failed append. A failed append is not "nothing happened" (the frame may be on the
-// disk), so the id is remembered whenever a frame was, or may have been, written; Gate 9b then refuses the same id before it writes another Intent
-// frame (a frame after a closure is Corrupt at the next start). No ring record and no shadow move: the order was never registered or tracked, and
-// the shadow of an untracked order is a no-op (see append_order_frame()).
+// The owner closes an Intent or Prepared attempt only before claiming send authority.
+// Acknowledgement permits the state transition; failure may have reached disk and
+// preserves resources. Generated identities remain protected in the durable sink.
 [[nodiscard]] inline ClosureAppendStatus close_never_sent(OrchestratorContext& ctx, const AuditRecord& intent,
                                                            never_sent::Reason reason, OrderRecord& order) noexcept {
+    auto target = never_sent::class_a_target_of(intent);
+    target.state = order.state;
     const ClosureAppendResult r = ctx.durable_audit.append_never_sent(
-        never_sent::class_a_target_of(intent), never_sent::class_a_closure_of(intent, reason, ctx.now_ms), ctx.now_ms);
+        target, never_sent::class_a_closure_of(intent, reason, ctx.now_ms), ctx.now_ms);
     if (r.status == ClosureAppendStatus::Appended || r.status == ClosureAppendStatus::Failed) {
         ctx.recently_closed.remember(std::string_view(intent.client_order_id));
     }
@@ -524,9 +535,13 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // Gate 2b (private-stream migration M3a, design 5.4): a SubmitReadyToken, or no order. After the two gates above on purpose: the audit sink must
     // be able to record the refusal, and a tripped kill switch keeps reporting itself as KillSwitchNotNormal. The token is the proof that this ran;
     // its generation travels back in the result. Unwired is a refusal, not a pass-through (the reverse of the nullable fields above).
+    const auto authorization_started = ctx.monotonic_now ? ctx.monotonic_now(ctx.monotonic_clock) : -1;
+    const auto authorization_wall_ms = ctx.now_ms;
+    const auto kill_revision = ctx.kill_switch->revision();
+    const KillSwitch* const authorized_kill_switch = ctx.kill_switch;
+    std::optional<SubmitReadyToken> ready_token;
     {
         NotReadyReason why = NotReadyReason::Unwired;
-        std::optional<SubmitReadyToken> ready_token;
         if (ctx.readiness != nullptr) {
             ReadinessResult readiness_result = ctx.readiness->authorize(ctx.now_ms);
             ready_token = std::move(readiness_result.token);
@@ -597,6 +612,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // the version comparison right below only narrows it (see SubmitPort::
     // current_rules_version()'s doc comment for the fail-closed default).
     ctx.pre_trade_rules_snapshot = *ctx.symbol_rules;
+    const auto order_base_asset = ctx.base_asset;
+    const auto order_quote_asset = ctx.quote_asset;
 
     // Gate "1" (spec §2.1/§2.2/§3) -- named SubmitStaleRulesVersion, not
     // renumbered into this function's own gate sequence; see that enumerator's
@@ -710,16 +727,17 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // Gate 11: Operator CONFIRM, bound to the immutable order summary (D3 M3).
     // notional is recomputed here for the max-notional binding; pre-trade already
     // proved it does not overflow.
+    const OrderConfirmation confirmed_order = ctx.confirmation;
     std::int64_t confirm_notional = 0;
-    (void)checked_notional(ctx.price_ticks, ctx.qty_ticks, confirm_notional);
-    if (!ctx.confirmation.confirmed) {
+    (void)checked_notional(intent_frame.price_ticks, intent_frame.qty_ticks, confirm_notional);
+    if (!confirmed_order.confirmed) {
         result.gate = OrchestratorGate::OperatorNotConfirmed;
         result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMissing, result.order);
         return result;
     }
-    if (!ctx.confirmation.authorizes(ctx.symbol_id, ctx.side, ctx.order_type,
-                                     ctx.price_ticks, ctx.qty_ticks,
-                                     confirm_notional, ctx.now_ms)) {
+    if (!confirmed_order.authorizes(intent_frame.symbol_id, intent_frame.side, result.order.order_type,
+                                     intent_frame.price_ticks, intent_frame.qty_ticks,
+                                     confirm_notional, authorization_wall_ms)) {
         result.gate = OrchestratorGate::ConfirmationMismatch;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
@@ -765,7 +783,9 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // try_reserve_order() atomically reserves REQUEST_WEIGHT, RAW_REQUESTS, and
     // ORDERS together (weight -> raw -> orders, rolling back on partial failure) —
     // Gate 8's can_send_order() already null-checked ctx.rate_limiter above.
-    if (!ctx.rate_limiter->try_reserve_order(RateLimitLane::Strategy, ctx.order_weight)) {
+    SpotRateLimitTracker* const reservation_owner = ctx.rate_limiter;
+    auto reservation = reservation_owner->reserve_order(RateLimitLane::Strategy, ctx.order_weight);
+    if (!reservation) {
         result.gate = OrchestratorGate::RateLimitExhausted;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
@@ -783,7 +803,9 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // reconcile-bound handle is on hand below if this submit ends up Ambiguous
     // -- see order_lifecycle.hpp's InFlightHandle doc comment for why the
     // reconcile path needs {slot_index, generation} rather than just the coid.
-    InFlightHandle in_flight_handle = ctx.in_flight->register_submit_handle(coid.view());
+    InFlightRegistry* const slot_owner = ctx.in_flight;
+    OrderFillContext* const fill_owner = ctx.fill_context;
+    InFlightHandle in_flight_handle = slot_owner->register_submit_handle(coid.view());
     if (!in_flight_handle.valid()) {
         result.gate = OrchestratorGate::DuplicateInFlight;
         AuditRecord ar{};
@@ -796,6 +818,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.set_detail("duplicate in-flight - reconcile, do NOT resubmit");
         ctx.audit->append(ar);
         result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::DuplicateInFlight, result.order);
+        if (result.closure == ClosureAppendStatus::Appended) ctx.rate_limiter->release_order(*reservation);
         return result;
     }
 
@@ -823,16 +846,9 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // "transition right after in-flight registration" timing is the P0 that
     // OrderState::AbortedPreSend used to paper over before it was removed).
     {
-        AuditRecord ar{};
-        ar.timestamp_ms = ctx.now_ms;
+        AuditRecord ar = intent_frame;
         ar.event_type = AuditEventType::OrderSubmitPrepared;
-        ar.mode = ctx.mode;
-        ar.symbol_id = ctx.symbol_id;
-        ar.price_ticks = ctx.price_ticks;
-        ar.qty_ticks = ctx.qty_ticks;
-        ar.set_client_order_id(coid.view());
         ar.resulting_state = OrderState::Submitting;  // target state this record authorizes; not applied yet
-        ar.side = ctx.side;
 
         if (!detail::append_order_frame(ctx, ar)) {
             // Never release the in-flight slot here -- a Failed result may still
@@ -846,25 +862,72 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // Transition to Submitting -- the one and only transition site, and only
     // after the Prepared Ack above actually succeeded.
     result.order.transition_to(OrderState::Submitting);
+    // S5: no blocking operation follows the successful claim before the submit port.
+    // Intent and Prepared are acknowledged here; the original slot and reservation
+    // remain held until a durable closing frame permits their release.
+    std::optional<never_sent::Reason> final_refusal;
+    auto final_check = [&]() noexcept {
+        const auto final_steady = ctx.monotonic_now ? ctx.monotonic_now(ctx.monotonic_clock) : -1;
+        std::int64_t final_wall = authorization_wall_ms;
+        if (authorization_started < 0 || final_steady < authorization_started || ctx.authorization_ttl_ms <= 0 ||
+            final_steady - authorization_started >= ctx.authorization_ttl_ms ||
+            authorization_wall_ms > std::numeric_limits<std::int64_t>::max() - (final_steady - authorization_started)) {
+            final_refusal = never_sent::Reason::AuthorizationExpired;
+        } else {
+            final_wall += final_steady - authorization_started;
+            if (!confirmed_order.authorizes(intent_frame.symbol_id, intent_frame.side, result.order.order_type,
+                                             intent_frame.price_ticks, intent_frame.qty_ticks, confirm_notional, final_wall)) {
+                final_refusal = never_sent::Reason::ConfirmationExpired;
+            } else if (ctx.in_flight != slot_owner || !slot_owner->owns(in_flight_handle, coid.view())) {
+                final_refusal = never_sent::Reason::SlotOwnershipLost;
+            } else if (!ctx.rate_limiter || !ctx.rate_limiter->reservation_valid(*reservation)) {
+                final_refusal = never_sent::Reason::ReservationLost;
+            } else if (ctx.kill_switch != authorized_kill_switch || ctx.kill_switch->state() != KillState::Normal ||
+                       ctx.kill_switch->revision() != kill_revision) {
+                final_refusal = never_sent::Reason::ReadinessRevoked;
+            } else if (!ctx.account || validate_pre_trade(result.order.rules_snapshot_at_submit, intent_frame.side,
+                                          intent_frame.price_ticks, intent_frame.qty_ticks, *ctx.account,
+                                          order_base_asset, order_quote_asset, final_wall, ctx.exposure_limits) != PreTradeCheck::Ok) {
+                final_refusal = never_sent::Reason::AccountChanged;
+            } else if (!ctx.audit || !can_submit_order(*ctx.audit) || !ctx.signer_ready || !ctx.depth_synced ||
+                       !ctx.durable_audit.is_valid() || ctx.durable_audit.fenced() || !ctx.submit_port.is_valid() ||
+                       ctx.submit_port.current_rules_version() != result.order.rules_snapshot_at_submit.rules_version) {
+                final_refusal = never_sent::Reason::PreconditionsChanged;
+            }
+        }
+        return !final_refusal.has_value();
+    };
+    result.not_ready_reason = ctx.readiness
+                                  ? ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check)
+                                  : NotReadyReason::Unwired;
+    if (result.not_ready_reason != NotReadyReason::None && !final_refusal) {
+        final_refusal = never_sent::Reason::ReadinessRevoked;
+    }
+    if (final_refusal) {
+        result.gate = OrchestratorGate::FinalAuthorizationRefused;
+        result.final_refusal = *final_refusal;
+        result.closure = detail::close_never_sent(ctx, intent_frame, *final_refusal, result.order);
+        if (result.closure == ClosureAppendStatus::Appended) {
+            const bool released = slot_owner->mark_resolved_handle(in_flight_handle, coid.view());
+            if (fill_owner && (released || !slot_owner->is_in_flight(coid.view()))) {
+                fill_owner->remove(coid.view());
+            }
+            reservation_owner->release_order(*reservation);
+        }
+        return result;
+    }
     {
-        AuditRecord ar{};
-        ar.timestamp_ms = ctx.now_ms;
+        AuditRecord ar = intent_frame;
         ar.event_type = AuditEventType::OrderSubmitted;
-        ar.mode = ctx.mode;
-        ar.symbol_id = ctx.symbol_id;
-        ar.price_ticks = ctx.price_ticks;
-        ar.qty_ticks = ctx.qty_ticks;
-        ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
-        ar.side = ctx.side;
         ctx.audit->append(ar);
     }
 
     // Execute submit. Passes the captured snapshot, not *ctx.symbol_rules --
     // see the capture site above for why (TOCTOU).
     auto resp = ctx.submit_port.call(
-        coid.id, ctx.symbol_id, ctx.side, ctx.order_type,
-        ctx.price_ticks, ctx.qty_ticks, ctx.pre_trade_rules_snapshot);
+        coid.id, intent_frame.symbol_id, intent_frame.side, result.order.order_type,
+        intent_frame.price_ticks, intent_frame.qty_ticks, result.order.rules_snapshot_at_submit);
 
     // Gate 13: Result routing. Every branch durably Acks BEFORE transitioning
     // state, releasing the in-flight slot, or pushing to reconcile (spec
@@ -928,14 +991,14 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                              : (target_state == OrderState::PartialFill)
                                  ? AuditEventType::OrderPartialFill
                                  : AuditEventType::OrderAccepted;
-            ar.mode = ctx.mode;
-            ar.symbol_id = ctx.symbol_id;
+            ar.mode = intent_frame.mode;
+            ar.symbol_id = result.order.symbol_id;
             ar.exchange_order_id = resp.exchange_order_id;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = target_state;
             ar.filled_qty_ticks = resp.filled_qty_ticks;
             ar.avg_fill_price_ticks = resp.avg_fill_price_ticks;
-            ar.side = ctx.side;
+            ar.side = result.order.side;
 
             if (!detail::append_order_frame(ctx, ar)) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
@@ -972,7 +1035,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                     ? ctx.fill_context->consume_delta(coid.view(), resp.filled_qty_ticks)
                     : resp.filled_qty_ticks;
             if (ctx.position_truth) {
-                ctx.position_truth->apply_fill(ctx.symbol_id, ctx.side, safe_fill_delta_ticks);
+                ctx.position_truth->apply_fill(result.order.symbol_id, result.order.side, safe_fill_delta_ticks);
             }
 
             if (is_exchange_final(target_state)) {
@@ -1008,12 +1071,12 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             AuditRecord ar{};
             ar.timestamp_ms = ctx.now_ms;
             ar.event_type = AuditEventType::OrderRejected;
-            ar.mode = ctx.mode;
-            ar.symbol_id = ctx.symbol_id;
+            ar.mode = intent_frame.mode;
+            ar.symbol_id = result.order.symbol_id;
             ar.detail_code = resp.error_code;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Rejected;
-            ar.side = ctx.side;
+            ar.side = result.order.side;
             ar.set_detail("exchange rejected");
 
             if (!detail::append_order_frame(ctx, ar)) {
@@ -1042,11 +1105,11 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             AuditRecord ar{};
             ar.timestamp_ms = ctx.now_ms;
             ar.event_type = AuditEventType::OrderAmbiguous;
-            ar.mode = ctx.mode;
-            ar.symbol_id = ctx.symbol_id;
+            ar.mode = intent_frame.mode;
+            ar.symbol_id = result.order.symbol_id;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Ambiguous;
-            ar.side = ctx.side;
+            ar.side = result.order.side;
             ar.set_detail("POST timeout - ambiguous, do NOT retry");
 
             if (!detail::append_order_frame(ctx, ar)) {
@@ -1074,11 +1137,11 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             AuditRecord ar{};
             ar.timestamp_ms = ctx.now_ms;
             ar.event_type = AuditEventType::OrderAmbiguous;
-            ar.mode = ctx.mode;
-            ar.symbol_id = ctx.symbol_id;
+            ar.mode = intent_frame.mode;
+            ar.symbol_id = result.order.symbol_id;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Ambiguous;
-            ar.side = ctx.side;
+            ar.side = result.order.side;
             ar.set_detail(reply_unusable ? "POST reply named a state no new order can be in - ambiguous"
                                          : "network error - ambiguous");
 
@@ -1111,11 +1174,11 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             AuditRecord ar{};
             ar.timestamp_ms = ctx.now_ms;
             ar.event_type = AuditEventType::OrderAmbiguous;
-            ar.mode = ctx.mode;
-            ar.symbol_id = ctx.symbol_id;
+            ar.mode = intent_frame.mode;
+            ar.symbol_id = result.order.symbol_id;
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Ambiguous;
-            ar.side = ctx.side;
+            ar.side = result.order.side;
             ar.set_detail("StaleRulesVersion returned by SubmitFn post-send (should be unreachable) - ambiguous");
 
             if (!detail::append_order_frame(ctx, ar)) {

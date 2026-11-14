@@ -18,7 +18,7 @@
 // date from a fresh FeedObservation -- whether or not the loop observed it a moment ago -- and only then decides.
 //
 // The token is move-only and has exactly one issuer (SubmitReadiness::authorize): the type is the proof that Gate 2b ran. It is not a lease --
-// nothing re-checks it after it was issued -- so it is used inside the call that obtained it and let go.
+// claim() rechecks it after Prepared and consumes its epoch exactly once.
 //
 // SYNTHETIC SOURCES. Drills, harnesses and tests that have no private stream use synthetic_readiness.hpp, which drives the REAL components
 // (barrier, StartupRecovery) through their public transitions with scripted observations. It is not a bypass, and a guard test
@@ -30,6 +30,7 @@
 
 #include <hengyuan/binance_clock_sync.hpp>
 #include <hengyuan/kill_switch.hpp>
+#include <hengyuan/submit_authority.hpp>
 #include <hengyuan/reconnect_barrier.hpp>
 #include <hengyuan/startup_recovery.hpp>
 
@@ -37,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
 
 namespace hy {
 
@@ -51,8 +53,10 @@ enum class NotReadyReason : std::uint8_t {
     GenerationMismatch = 7,   // the barrier's Reconciled generation is not the live feed's (structurally excluded after observe(); kept as an
                               // independent check so a future change of the barrier cannot silently weaken the token)
     ClockNotReady = 8,        // no fresh signing timestamp can be issued
+    EpochChanged = 9,
+    FinalCheckFailed = 10,
 };
-inline constexpr std::size_t kNotReadyReasonCount = 9;
+inline constexpr std::size_t kNotReadyReasonCount = 11;
 
 [[nodiscard]] constexpr const char* not_ready_reason_name(NotReadyReason r) noexcept {
     switch (r) {
@@ -64,6 +68,8 @@ inline constexpr std::size_t kNotReadyReasonCount = 9;
         case NotReadyReason::FeedDown: return "FeedDown";
         case NotReadyReason::BarrierSweeping: return "BarrierSweeping";
         case NotReadyReason::GenerationMismatch: return "GenerationMismatch";
+        case NotReadyReason::EpochChanged: return "EpochChanged";
+        case NotReadyReason::FinalCheckFailed: return "FinalCheckFailed";
         case NotReadyReason::ClockNotReady: return "ClockNotReady";
     }
     return "?";
@@ -103,11 +109,17 @@ public:
 
 private:
     friend class SubmitReadiness;
-    constexpr SubmitReadyToken(std::uint64_t generation, std::int64_t issued_at_ms) noexcept
-        : generation_(generation), issued_at_ms_(issued_at_ms) {}
+    constexpr SubmitReadyToken(std::uint64_t generation, std::int64_t issued_at_ms, std::uint64_t epoch,
+                               std::uint64_t barrier_epoch, std::uint64_t kill_revision, const void* issuer) noexcept
+        : generation_(generation), issued_at_ms_(issued_at_ms), epoch_(epoch), barrier_epoch_(barrier_epoch),
+          kill_revision_(kill_revision), issuer_(issuer) {}
 
     std::uint64_t generation_;
     std::int64_t issued_at_ms_;
+    std::uint64_t epoch_;
+    std::uint64_t barrier_epoch_;
+    std::uint64_t kill_revision_;
+    const void* issuer_;
 };
 
 struct ReadinessResult {
@@ -120,12 +132,13 @@ struct ReadinessResult {
 struct ReadinessStats {
     std::uint64_t authorized{0};
     std::array<std::uint64_t, kNotReadyReasonCount> refused{};  // indexed by NotReadyReason
+    std::uint64_t claimed{0};
 };
 
 class SubmitReadiness {
 public:
-    SubmitReadiness(const StartupRecovery& recovery, const KillSwitch& kill_switch, ReadinessProbe probe, BarrierPolicy policy = {}) noexcept
-        : recovery_(recovery), kill_switch_(kill_switch), probe_(probe), barrier_(policy) {}
+    SubmitReadiness(const StartupRecovery& recovery, const KillSwitch& kill_switch, ReadinessProbe probe, BarrierPolicy policy = {}, std::shared_ptr<SubmitAuthority> authority = {}) noexcept
+        : recovery_(recovery), kill_switch_(kill_switch), probe_(probe), barrier_(policy), shared_authority_(std::move(authority)) {}
 
     SubmitReadiness(const SubmitReadiness&) = delete;
     SubmitReadiness& operator=(const SubmitReadiness&) = delete;
@@ -142,7 +155,16 @@ public:
     }
 
     [[nodiscard]] ReadinessResult authorize(std::int64_t now_ms) noexcept {
+        auto result = evaluate(now_ms);
+        if (result.ready()) ++stats_.authorized;
+        return result;
+    }
+
+private:
+    [[nodiscard]] ReadinessResult evaluate(std::int64_t now_ms) noexcept {
         if (!probe_.is_valid()) return refuse(NotReadyReason::NoProbe);
+
+        const auto epoch = authority().epoch();
 
         // The barrier is brought up to date FIRST and unconditionally, so that what it says below is what the feed says now.
         const FeedObservation feed = probe_.feed(probe_.user_data);
@@ -160,13 +182,35 @@ public:
         }
         if (!probe_.clock_ready(probe_.user_data)) return refuse(NotReadyReason::ClockNotReady);
 
-        ++stats_.authorized;
+        if (epoch == SubmitAuthority::exhausted() || authority().epoch() != epoch) return refuse(NotReadyReason::EpochChanged);
         ReadinessResult result{};
         result.reason = NotReadyReason::None;
-        result.token = std::optional<SubmitReadyToken>(SubmitReadyToken(feed.generation, now_ms));
+        result.token = std::optional<SubmitReadyToken>(SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), kill_switch_.revision(), this));
         return result;
     }
 
+public:
+    // All thread-owned prerequisites are re-read before competing with external revocations.
+    [[nodiscard]] NotReadyReason claim(const SubmitReadyToken& token, std::int64_t now_ms) noexcept {
+        return claim(token, now_ms, []() noexcept { return true; });
+    }
+
+    template <typename FinalCheck>
+    [[nodiscard]] NotReadyReason claim(const SubmitReadyToken& token, std::int64_t now_ms, FinalCheck&& final_check) noexcept {
+        const auto current = evaluate(now_ms);
+        if (!current.ready()) return current.reason;
+        if (token.issuer_ != this || token.generation_ != current.token->generation_ ||
+            token.barrier_epoch_ != current.token->barrier_epoch_ ||
+            token.kill_revision_ != current.token->kill_revision_ || token.epoch_ != current.token->epoch_) {
+            return refuse(NotReadyReason::EpochChanged).reason;
+        }
+        if (!final_check()) return refuse(NotReadyReason::FinalCheckFailed).reason;
+        if (!authority().claim(token.epoch_)) return refuse(NotReadyReason::EpochChanged).reason;
+        ++stats_.claimed;
+        return NotReadyReason::None;
+    }
+
+    SubmitAuthority& authority() noexcept { return shared_authority_ ? *shared_authority_ : local_authority_; }
     [[nodiscard]] ReconnectBarrier& barrier() noexcept { return barrier_; }
     [[nodiscard]] const ReconnectBarrier& barrier() const noexcept { return barrier_; }
     [[nodiscard]] const ReadinessStats& stats() const noexcept { return stats_; }
@@ -184,6 +228,8 @@ private:
     ReadinessProbe probe_;
     ReconnectBarrier barrier_;
     ReadinessStats stats_{};
+    SubmitAuthority local_authority_{};
+    std::shared_ptr<SubmitAuthority> shared_authority_{};
 };
 
 }  // namespace hy

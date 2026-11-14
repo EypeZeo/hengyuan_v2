@@ -840,6 +840,21 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_live_submit_orchestrator)
     gtest_discover_tests(test_live_submit_orchestrator)
 
+    add_executable(test_submit_final_gate tests/test_submit_final_gate.cpp)
+    target_link_libraries(test_submit_final_gate PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_submit_final_gate)
+    gtest_discover_tests(test_submit_final_gate)
+
+    add_executable(test_submit_reservation tests/test_submit_reservation.cpp)
+    target_link_libraries(test_submit_reservation PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_submit_reservation)
+    gtest_discover_tests(test_submit_reservation)
+
+    add_executable(test_submit_authority_concurrency tests/test_submit_authority_concurrency.cpp)
+    target_link_libraries(test_submit_authority_concurrency PRIVATE hengyuan_core GTest::gtest_main Threads::Threads)
+    hengyuan_set_warnings(test_submit_authority_concurrency)
+    gtest_discover_tests(test_submit_authority_concurrency PROPERTIES LABELS concurrency)
+
     # 批次 6 6b-0d: startup recovery -- state machine + apply_recovery() against a REAL
     # DurableAuditSink temp file and the real reconcile path (only the exchange is faked).
     add_executable(test_startup_recovery tests/test_startup_recovery.cpp)
@@ -1482,6 +1497,10 @@ if(HY_BUILD_TESTS)
         add_executable(tsan_control_relaxed_mailbox tests/tsan_control_relaxed_mailbox.cpp)
         target_link_libraries(tsan_control_relaxed_mailbox PRIVATE hengyuan_core Threads::Threads)
         hengyuan_set_warnings(tsan_control_relaxed_mailbox)
+
+        add_executable(tsan_control_relaxed_submit_authority tests/tsan_control_relaxed_submit_authority.cpp)
+        target_link_libraries(tsan_control_relaxed_submit_authority PRIVATE hengyuan_core Threads::Threads)
+        hengyuan_set_warnings(tsan_control_relaxed_submit_authority)
     endif()
 
     # P2-EXEC-LIVE-01: HMAC signer (requires OpenSSL)

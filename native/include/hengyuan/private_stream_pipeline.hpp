@@ -93,6 +93,7 @@ struct PipelineConfig {
     AccountRefreshPolicy refresh{};
     ExposureLimits exposure_limits{};          // the account freshness window of StartupRecovery is the one validate_pre_trade() applies
     std::int64_t reconcile_deadline_ms{60'000};  // how long recovered orders may stay unconfirmed before the state machine degrades
+    std::shared_ptr<SubmitAuthority> submit_authority{};
 };
 
 // What the process owns, by reference: every referent outlives the pipeline. The function-pointer ports are values.
@@ -223,7 +224,7 @@ private:
             : supervisor(std::move(factory), config.feed),
               holder(account_updates),
               recovery(config.reconcile_deadline_ms),
-              readiness(recovery, parts.kill_switch, ReadinessProbe{&read_feed, &read_recovery, &read_clock, &owner}, config.barrier),
+              readiness(recovery, parts.kill_switch, ReadinessProbe{&read_feed, &read_recovery, &read_clock, &owner}, config.barrier, config.submit_authority),
               pump(readiness, sweep_requests, holder.sweep_probe()),
               reconcile_publisher(parts.durable_port),
               user_data_publisher(parts.durable_port),
