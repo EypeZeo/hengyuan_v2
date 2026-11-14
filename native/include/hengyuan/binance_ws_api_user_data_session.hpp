@@ -494,6 +494,7 @@ private:
                 break;
             case WsApiParseResult::ExecutionReportIncomplete:
                 lost_events_.fetch_add(1, std::memory_order_relaxed);
+                if (config_.submit_authority) config_.submit_authority->revoke();
                 {
                     std::lock_guard<std::mutex> lock(stats_mutex_);
                     ++stats_.lost_events;
@@ -615,7 +616,10 @@ private:
 
         ev.generation = generation_;
         const bool pushed = ring_.try_push(ev);
-        if (!pushed) ring_drops_.fetch_add(1, std::memory_order_relaxed);
+        if (!pushed) {
+            ring_drops_.fetch_add(1, std::memory_order_relaxed);
+            if (config_.submit_authority) config_.submit_authority->revoke();
+        }
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             if (pushed) {

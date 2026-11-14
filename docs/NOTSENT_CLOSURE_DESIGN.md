@@ -57,7 +57,7 @@
 
 `SpotRateLimitTracker::OrderReservation` 是不可复制的票据，记录所属限流器、配置代次及三个维度中最早的窗口截止。过期或重新配置后票据失效。确认关闭后仅退回仍属于原窗口的额度；旧窗口票据不会减少新窗口的使用量。
 
-WebSocket 会话在停止请求、连接错误、`serverShutdown` 或 `eventStreamTerminated` 时先公布停止状态，再撤销共享 epoch。会话和 `PrivateStreamPipeline` 由调用者传入同一个 `SubmitAuthority`；预检程序已连接该对象。`KillSwitch` 由热线程管理，其 revision 使触发后立即重置的操作也会使旧令牌失效。
+WebSocket 会话在停止请求、连接错误、`serverShutdown` 或 `eventStreamTerminated` 时先公布停止状态，再撤销共享 epoch。不完整的执行报告和队列溢出也在更新计数后撤销授权，后续授权须等私有流重新完成清扫。调用者为会话和 `PrivateStreamPipeline` 传入同一个 `SubmitAuthority`，预检程序已使用该配置。`KillSwitch` 由热线程管理，其 revision 使触发后立即重置的操作也会使旧令牌失效。
 
 ### 4.3 NotSent 何时写、写什么
 

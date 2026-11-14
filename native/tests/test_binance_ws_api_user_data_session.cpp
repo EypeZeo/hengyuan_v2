@@ -756,18 +756,27 @@ TEST_F(WsApiSessionTest, EventsOfAnotherSubscriptionAreDroppedAndCounted) {
 }
 
 TEST_F(WsApiSessionTest, AnExecutionReportTheCodecCannotReadWholeIsCountedAsLostNotDelivered) {
-    auto session = make_session(1);
+    auto authority = std::make_shared<SubmitAuthority>();
+    Opts options;
+    options.cfg.submit_authority = authority;
+    auto session = make_session(1, options);
     session->start();
     ASSERT_TRUE(wait_until([&] { return session->is_connected(); }));
+    const std::uint64_t old_epoch = authority->epoch();
     std::string no_order_id(samples::kEventExecutionReport);
     const std::string c = R"("c":"mUvoqJxFIILMdfAW5iGSOW",)";
     const auto p = no_order_id.find(c);
     ASSERT_NE(p, std::string::npos);
     no_order_id.erase(p, c.size());
     server_->send_text(no_order_id);
-    ASSERT_TRUE(wait_until([&] { return session->lost_events() == 1U; })) << diagnostics(*session);
+    ASSERT_TRUE(wait_until([&] {
+        const auto stats = session->stats_snapshot();
+        return stats.lost_events == 1U && authority->epoch() != old_epoch;
+    })) << diagnostics(*session);
+    EXPECT_FALSE(authority->claim(old_epoch));
     EXPECT_TRUE(drain_ring().empty()) << "a fill we could not read is never delivered half-filled";
     EXPECT_EQ(session->stats_snapshot().lost_events, 1U);
+    EXPECT_TRUE(session->is_connected());
     EXPECT_FALSE(session->stopped()) << "one unreadable report does not end the stream";
     // ... and the stream goes on
     server_->send_text(std::string(samples::kEventExecutionReport));
@@ -867,18 +876,25 @@ TEST_F(WsApiSessionTest, StopImmediatelyDisconnectsAndInvalidatesTheOldSubmitEpo
 }
 
 TEST_F(WsApiSessionTest, AFullRingDropsAndCountsInsteadOfBlocking) {
-    auto session = make_session(1);
+    auto authority = std::make_shared<SubmitAuthority>();
+    Opts options;
+    options.cfg.submit_authority = authority;
+    auto session = make_session(1, options);
     session->start();
     ASSERT_TRUE(wait_until([&] { return session->is_connected(); }));
+    const std::uint64_t old_epoch = authority->epoch();
     constexpr std::size_t kSent = 100;  // the ring holds 64 and nobody drains it
     for (std::size_t i = 0; i < kSent; ++i) server_->send_text(std::string(samples::kEventBalanceUpdate));
     ASSERT_TRUE(wait_until([&] {
         const auto st = session->stats_snapshot();
-        return st.events_delivered + st.push_dropped == kSent;
+        return st.events_delivered + st.push_dropped == kSent && st.push_dropped > 0U &&
+               authority->epoch() != old_epoch;
     })) << diagnostics(*session);
     const auto st = session->stats_snapshot();
     EXPECT_GT(st.push_dropped, 0U);
     EXPECT_EQ(session->ring_drops(), st.push_dropped) << "the barrier reads this counter; it must agree with the stats";
+    EXPECT_FALSE(authority->claim(old_epoch));
+    EXPECT_TRUE(session->is_connected());
     EXPECT_FALSE(session->stopped());
     finish(*session);
 }
