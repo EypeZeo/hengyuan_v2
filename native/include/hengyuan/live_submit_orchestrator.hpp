@@ -171,16 +171,17 @@ inline bool durable_audit_sink_fenced_adapter(void* user_data) noexcept {
 inline ClosureAppendResult durable_audit_sink_closure_adapter(void* user_data, const never_sent::ClosureTarget& target,
                                                               const AuditRecord& rec, std::int64_t now_ms) noexcept {
     const NeverSentAppend r = static_cast<DurableAuditSink*>(user_data)->append_never_sent(target, rec, now_ms);
-    ClosureAppendResult out{};
-    out.append = r.append;
     switch (r.status) {
-        case NeverSentAppendStatus::Appended: out.status = ClosureAppendStatus::Appended; break;
-        case NeverSentAppendStatus::AppendFailed: out.status = ClosureAppendStatus::Failed; break;
+        case NeverSentAppendStatus::Appended: return {ClosureAppendStatus::Appended, r.append};
+        case NeverSentAppendStatus::AppendFailed: return {ClosureAppendStatus::Failed, r.append};
         case NeverSentAppendStatus::NotEnabled:
-        case NeverSentAppendStatus::NotTradingOpen: out.status = ClosureAppendStatus::NotEnabled; break;
-        default: out.status = ClosureAppendStatus::Refused; break;  // fenced, an empty id, the rule said no: nothing was written
+        case NeverSentAppendStatus::NotTradingOpen: return {ClosureAppendStatus::NotEnabled, r.append};
+        case NeverSentAppendStatus::NotAttempted:
+        case NeverSentAppendStatus::SinkFenced:
+        case NeverSentAppendStatus::EmptyClientOrderId:
+        case NeverSentAppendStatus::Refused: break;
     }
-    return out;
+    return {ClosureAppendStatus::Refused, r.append};
 }
 inline DurableOrderAuditPort make_durable_order_audit_port(DurableAuditSink& sink) noexcept {
     return DurableOrderAuditPort{&durable_audit_sink_append_adapter, &durable_audit_sink_fenced_adapter, &sink,
