@@ -174,6 +174,12 @@ enum class PrivateRestError : std::uint8_t {
     RateLimitExhausted = 14, // the local rate-limit budget refused this request: nothing was sent (L4 §7.4)
 };
 
+struct ServerTimeReadDiagnostics {
+    std::uint16_t http_status{0};  // populated when a response has a non-200 status
+    bool malformed_http{false};
+    std::optional<std::int64_t> rejected_round_trip_ms;
+};
+
 // §4.2's parse_balance_decimal_to_ticks() moved to binance_decimal.hpp (L4 §5 / PR 5b): the
 // exchangeInfo parser below (fetch_exchange_info()) needs the same function for the
 // MIN_NOTIONAL/NOTIONAL filter, but symbol_registry.hpp — which also needs it — must not pull in
@@ -900,7 +906,7 @@ struct ServerTimeFetchResult {
 
 inline net::awaitable<std::variant<ServerTimeFetchResult, PrivateRestError>>
 fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRestConfig cfg,
-                       RestTestSeam seam) {
+                       RestTestSeam seam, ServerTimeReadDiagnostics* diagnostics = nullptr) {
     static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
@@ -970,7 +976,23 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
         http::response_parser<http::string_body> parser;
         parser.header_limit(permit.max_header_bytes());
         parser.body_limit(permit.max_body_bytes());
-        co_await http::async_read(stream, buffer, parser, net::use_awaitable);
+        boost::system::error_code read_error;
+        co_await http::async_read_header(stream, buffer, parser, net::redirect_error(net::use_awaitable, read_error));
+        // A non-200 status is sufficient to reject the sample, even if its body never arrives.
+        if ((!read_error || read_error == http::error::body_limit) && parser.get().result() != http::status::ok) {
+            if (diagnostics) diagnostics->http_status = static_cast<std::uint16_t>(parser.get().result_int());
+            co_return PrivateRestError::HttpStatus;
+        }
+        if (!read_error) {
+            co_await http::async_read(stream, buffer, parser, net::redirect_error(net::use_awaitable, read_error));
+        }
+        if (read_error) {
+            if (diagnostics) {
+                diagnostics->malformed_http = read_error.category() == make_error_code(http::error::bad_status).category() &&
+                    read_error != http::error::end_of_stream && read_error != http::error::partial_message;
+            }
+            co_return PrivateRestError::Read;
+        }
         auto res = parser.release();
 
         // Sampled immediately after the read completes -- "local_recv_ms", and also the
@@ -979,10 +1001,6 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
         ClockPairSample t1 = fetch_clock_pair();
 
         beast::get_lowest_layer(stream).close();
-
-        if (res.result() != http::status::ok) {
-            co_return PrivateRestError::HttpStatus;
-        }
 
         current_stage = PrivateRestError::JsonParse;
         std::int64_t server_time_ms = 0;
@@ -1363,10 +1381,11 @@ public:
     // D5 R3b-1: the same round trip as sync_clock() (the offset is published exactly as there, the same refusals apply), and the exchange's
     // serverTime of that round trip is handed out as well -- the operator tool's fence is counted on it. `server_time_ms` is left untouched on
     // every failure. Never throws.
-    PrivateRestError read_server_time(std::int64_t& server_time_ms) noexcept {
+    PrivateRestError read_server_time(std::int64_t& server_time_ms, ServerTimeReadDiagnostics* diagnostics = nullptr) noexcept {
+        if (diagnostics) *diagnostics = {};
         try {
             std::int64_t value = 0;
-            const PrivateRestError e = sync_clock_impl(default_cfg_, &value);
+            const PrivateRestError e = sync_clock_impl(default_cfg_, &value, diagnostics);
             if (e == PrivateRestError::None) server_time_ms = value;
             return e;
         } catch (...) {
@@ -1375,7 +1394,8 @@ public:
     }
 
 private:
-    PrivateRestError sync_clock_impl(const PrivateRestConfig& cfg, std::int64_t* server_time_ms_out) {
+    PrivateRestError sync_clock_impl(const PrivateRestConfig& cfg, std::int64_t* server_time_ms_out,
+                                    ServerTimeReadDiagnostics* diagnostics = nullptr) {
         const auto permit = endpoint_permit(ResponseKind::ServerTime);
         if (!permit) return PrivateRestError::InvalidConfig;
         // Budget before the network (L4 §7.4): GET /api/v3/time, weight 1, Reconciliation lane. Refused
@@ -1386,7 +1406,7 @@ private:
         std::variant<detail::ServerTimeFetchResult, PrivateRestError> outcome =
             PrivateRestError::None;
         net::co_spawn(
-            ioc, detail::fetch_server_time_coro(*permit, *budget, cfg, test_seam_),
+            ioc, detail::fetch_server_time_coro(*permit, *budget, cfg, test_seam_, diagnostics),
             [&outcome](std::exception_ptr eptr,
                        std::variant<detail::ServerTimeFetchResult, PrivateRestError> r) {
                 if (eptr) {
@@ -1406,7 +1426,11 @@ private:
         ClockOffsetSnapshot snap{};
         if (!compute_clock_offset(r.local_send_ms, r.local_recv_ms, r.server_time_ms,
                                    r.fetch_sample, snap)) {
-            // RTT over kMaxUsableRttMs, or checked-arithmetic overflow on pathological inputs.
+            std::int64_t round_trip_ms = 0;
+            if (diagnostics && checked_sub_i64(r.local_recv_ms, r.local_send_ms, round_trip_ms) &&
+                (round_trip_ms < 0 || round_trip_ms > kMaxUsableRttMs)) {
+                diagnostics->rejected_round_trip_ms = round_trip_ms;
+            }
             return PrivateRestError::JsonParse;
         }
         // The offset's magnitude, judged by the transport policy's own check: the gap between the

@@ -473,7 +473,6 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     for (;;) {
         const std::optional<ExchangeMs> now = exchange.server_time();
         if (!now) return stop(ResolveStatus::ServerTimeUnavailable);
-        // (an implausible reading is refused by the verdict below, FenceVerdict::ImplausibleTime, and reported as such)
         const FenceVerdict verdict = check_evidence_read(session.lock_ref, *now, session.fence);
         out.fence = verdict;
         if (verdict == FenceVerdict::Satisfied) {
@@ -481,7 +480,12 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
             readings.push_back({"read", now->count()});
             break;
         }
-        if (verdict != FenceVerdict::TooEarly) return stop(ResolveStatus::ServerTimeUnavailable);  // the clock went backwards, ...
+        if (verdict != FenceVerdict::TooEarly) {
+            console.write_line(verdict == FenceVerdict::ReadBeforeLock
+                                   ? "exchange time precedes the session start"
+                                   : "exchange time is invalid for the resolution wait");
+            return stop(ResolveStatus::ServerTimeUnavailable);
+        }
         readings.push_back({"wait", now->count()});
         const std::int64_t remaining_ms = earliest->count() - now->count();  // > 0: the reading is too early
         const std::int64_t step_ms = std::min(remaining_ms + kFenceWaitPadMs, kFenceWaitStepMs);
@@ -638,7 +642,11 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     out.conclusion = fin.status;
     if (fin.status != AbsentConclusionStatus::Absent) return stop(ResolveStatus::EvidenceNotAbsent);
     const std::optional<ExchangeMs> append_ref = exchange.server_time();
-    if (!append_ref || !is_plausible(*append_ref)) return stop(ResolveStatus::ServerTimeUnavailable);
+    if (!append_ref) return stop(ResolveStatus::ServerTimeUnavailable);
+    if (!is_plausible(*append_ref)) {
+        console.write_line("exchange time is invalid for the resolution record");
+        return stop(ResolveStatus::ServerTimeUnavailable);
+    }
 
     AuditRecord rec{};
     rec.timestamp_ms = append_ref->count();

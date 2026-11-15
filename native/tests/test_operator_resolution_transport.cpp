@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -41,6 +42,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -380,6 +382,7 @@ protected:
 // A handler that answers by the path of the request; anything it does not know is a 404.
 struct Routes {
     std::optional<Reply> time;  // unset: every /api/v3/time request is answered with the exchange time of that moment
+    std::function<Reply(const Request&)> time_handler;
     Reply order = Reply::answer(400, R"({"code":-2013,"msg":"Order does not exist."})");
     Reply all_orders = Reply::answer(200, "[]");
     Reply open_orders = Reply::answer(200, "[]");
@@ -389,7 +392,10 @@ struct Routes {
         const Routes r = *this;
         return [r](const Request& req) {
             const std::string path = path_of(req);
-            if (path == "/api/v3/time") return r.time ? *r.time : time_reply();
+            if (path == "/api/v3/time") {
+                if (r.time_handler) return r.time_handler(req);
+                return r.time ? *r.time : time_reply();
+            }
             if (path == "/api/v3/order") return r.order;
             if (path == "/api/v3/allOrders") return r.all_orders;
             if (path == "/api/v3/openOrders") return r.open_orders;
@@ -404,11 +410,13 @@ protected:
     FakeWorld world_;
     FakeSleeper sleeper_{world_};
     std::unique_ptr<BinanceExchangeReadPort> port_;
+    FakeConsole diagnostics_;
 
     void start(const Routes& routes, bool fresh_clock = true, std::chrono::milliseconds spacing = kDefaultRequestSpacing,
-               bool with_credentials = true, std::uint32_t reconciliation_lane = 0) {
+               bool with_credentials = true, std::uint32_t reconciliation_lane = 0, ConsolePort* diagnostics = nullptr) {
         wire(routes.handler(), fresh_clock, with_credentials, reconciliation_lane);
-        port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper_, spacing);
+        diagnostics_.lines.clear();
+        port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper_, spacing, diagnostics);
         sleeper_.sleeps.clear();
     }
 
@@ -422,6 +430,15 @@ protected:
         EXPECT_FALSE(r.transport_ok);
         EXPECT_EQ(r.http_status, 0);
         EXPECT_TRUE(r.body.empty());
+    }
+
+    std::string diagnostic_text() const {
+        std::string out;
+        for (const std::string& line : diagnostics_.lines) {
+            out += line;
+            out.push_back('\n');
+        }
+        return out;
     }
 
     void TearDown() override {
@@ -708,10 +725,91 @@ TEST_F(PortTest, IfTheNewReadingFailsTheReadFailsAndTheRequestIsNeverSent) {
 TEST_F(PortTest, AClockReadingThatIsFarFromTheLocalClockIsNotUsedAndTheReadFails) {
     Routes routes;
     routes.time = Reply::answer(200, hy::test_helpers::server_time_body_offset_by(600'000));
-    start(routes, false);
+    start(routes, false, kDefaultRequestSpacing, true, 0, &diagnostics_);
     EXPECT_FALSE(port_->server_time().has_value());
-    expect_not_completed(port_->open_orders());
+    EXPECT_FALSE(port_->halted());
+    EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/time"}));
+    EXPECT_EQ(diagnostic_text().find("retrying"), std::string::npos);
+}
+
+TEST_F(PortTest, AClockReadRetriesOneDroppedResponseAndSpacesTheRetry) {
+    auto time_requests = std::make_shared<std::atomic<unsigned>>(0);
+    wire(
+        [time_requests](const Request& req) {
+            if (path_of(req) != "/api/v3/time") return Reply::answer(404, "{}");
+            if (time_requests->fetch_add(1) == 0) return Reply::drop();
+            return time_reply();
+        },
+        false);
+    port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper_, kDefaultRequestSpacing, &diagnostics_);
+
+    ASSERT_TRUE(port_->server_time().has_value());
     EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/time", "/api/v3/time"}));
+    EXPECT_EQ(sleeper_.sleeps, (std::vector<std::int64_t>{500}));
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("GET /api/v3/time"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 1/3"), std::string::npos);
+    EXPECT_NE(diagnostics.find("Read failed"), std::string::npos);
+    EXPECT_NE(diagnostics.find("retrying"), std::string::npos);
+}
+
+TEST_F(PortTest, ClockReadStopsAfterThreeDroppedResponses) {
+    wire([](const Request& req) { return path_of(req) == "/api/v3/time" ? Reply::drop() : Reply::answer(404, "{}"); }, false);
+    port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper_, kDefaultRequestSpacing, &diagnostics_);
+
+    EXPECT_FALSE(port_->server_time().has_value());
+    EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/time", "/api/v3/time", "/api/v3/time"}));
+    EXPECT_EQ(sleeper_.sleeps, (std::vector<std::int64_t>{500, 500}));
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("attempt 1/3"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 2/3"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 3/3"), std::string::npos);
+}
+
+TEST_F(PortTest, ATimeRateLimitLatchesThePortAndDoesNotPrintTheResponseBody) {
+    constexpr std::string_view kBody = R"({"private":"synthetic rate-limit detail"})";
+    Routes routes;
+    routes.time = Reply::answer(429, std::string(kBody));
+    start(routes, false, kDefaultRequestSpacing, true, 0, &diagnostics_);
+
+    EXPECT_FALSE(port_->server_time().has_value());
+    EXPECT_TRUE(port_->halted());
+    expect_not_completed(port_->query_order("BTCUSDT", kCoid));
+    EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/time"}));
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("HTTP 429"), std::string::npos);
+    EXPECT_EQ(diagnostics.find(kBody), std::string::npos);
+}
+
+TEST_F(PortTest, AMalformedClockAnswerIsNotRetried) {
+    Routes routes;
+    routes.time = Reply::answer(200, "not json");
+    start(routes, false, kDefaultRequestSpacing, true, 0, &diagnostics_);
+
+    EXPECT_FALSE(port_->server_time().has_value());
+    EXPECT_FALSE(port_->halted());
+    EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/time"}));
+    EXPECT_EQ(diagnostic_text().find("retrying"), std::string::npos);
+}
+
+TEST_F(PortTest, AClockSampleWithAnExcessiveRoundTripIsRetriedAndReportsTheDuration) {
+    auto time_requests = std::make_shared<std::atomic<unsigned>>(0);
+    wire(
+        [time_requests](const Request& req) {
+            if (path_of(req) != "/api/v3/time") return Reply::answer(404, "{}");
+            if (time_requests->fetch_add(1) == 0) std::this_thread::sleep_for(std::chrono::milliseconds{2250});
+            return time_reply();
+        },
+        false);
+    port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper_, kDefaultRequestSpacing, &diagnostics_);
+
+    ASSERT_TRUE(port_->server_time().has_value());
+    EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/time", "/api/v3/time"}));
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("round trip "), std::string::npos);
+    EXPECT_NE(diagnostics.find(" ms"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 1/3"), std::string::npos);
+    EXPECT_NE(diagnostics.find("retrying"), std::string::npos);
 }
 
 // ============================================================ 3. the whole procedure over TLS ======================================================
@@ -944,13 +1042,22 @@ Routes routes_for_uid(std::optional<std::uint64_t> uid) {
 }  // namespace
 
 TEST_F(WholeProcedureTest, AnAbsentOrderIsResolvedWithTheRealPortOverRealTls) {
-    prepare(routes_for_uid(kUid));
+    auto time_requests = std::make_shared<std::atomic<unsigned>>(0);
+    Routes routes = routes_for_uid(kUid);
+    routes.time_handler = [time_requests](const Request&) {
+        if (time_requests->fetch_add(1) == 1) return Reply::drop();  // one transient read failure during the same fenced session
+        return time_reply();
+    };
+    prepare(routes);
     OperatorSession session = begin_operator_session(*audit_, *names_, *ports_, FenceParams{});
     ASSERT_EQ(session.status, SessionStatus::Ready);
     EXPECT_EQ(session.lock_ref.count(), t0_);
+    const ExchangeMs original_lock_ref = session.lock_ref;
     const OperatorResolutionOutcome o = resolve_order(session, request());
     ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status) << " / " << conclusion_name(o.conclusion);
     EXPECT_EQ(o.conclusion, AbsentConclusionStatus::Absent);
+    EXPECT_EQ(session.lock_ref.count(), original_lock_ref.count()) << "a retried time read does not replace the session's original lock reference";
+    EXPECT_GE(time_requests->load(), 3u) << "the injected dropped response was followed by its successful retry";
     EXPECT_EQ(o.append.status, OperatorAppendStatus::Appended);
     ASSERT_TRUE(o.exchange_account_uid.has_value());
     EXPECT_EQ(*o.exchange_account_uid, kUid);
@@ -977,7 +1084,7 @@ TEST_F(WholeProcedureTest, AnAbsentOrderIsResolvedWithTheRealPortOverRealTls) {
     for (const WorldClockPort::Call& c : port_->calls) {
         const bool evidence = c.kind == "order" || c.kind == "allOrders" || c.kind == "openOrders";
         if (!evidence) continue;
-        EXPECT_GE(c.world_ms, t0_ + kDefaultEvidenceWaitMs) << c.kind << " came before the fence was over";
+        EXPECT_GE(c.world_ms, original_lock_ref.count() + kDefaultEvidenceWaitMs) << c.kind << " came before the original lock reference's fence was over";
         if (previous != nullptr) {
             EXPECT_EQ(c.sleeps_before, previous->sleeps_before + 1) << c.kind << ": the gap after the request before it, and nothing else";
             EXPECT_EQ(sleeper_.sleeps[previous->sleeps_before], 500) << c.kind;

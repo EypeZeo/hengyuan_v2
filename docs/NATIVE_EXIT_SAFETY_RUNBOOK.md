@@ -64,7 +64,7 @@ The owner runs this drill on Binance Spot Testnet. `hy_r6_prepare_drill` creates
 
 1. Build both tools with `HY_BUILD_DEMO=ON`. Use a private parent directory on a local disk. With the system clock synchronized, create a fresh output directory with the command below and the UID from your dedicated Testnet account. Keep the directory and its sidecar files together. Use a dedicated read-only Testnet API key for resolution and keep it in a separate private file. Leave other senders for this account stopped during the drill.
 2. Open the rehearsal store with `--list` and record the target client order ID. Keep the backup separate and use the same working store for listing, resolution and the final check. Check the printed environment, account UID, symbol and whether the order can be resolved. The command acquires the store locks and may perform recovery. It needs the local keys and makes no exchange requests.
-3. Run the resolution against the same Testnet account. The program waits at least 270 seconds of exchange time after acquiring the locks and then queries the order and both order lists. Review the result against the exchange's order and trade history for that account and time range. Enter the exact confirmation phrase shown by the tool only when the displayed account, symbol and order ID match and the exchange records show neither the order nor a fill.
+3. Run the resolution against the same Testnet account. The program waits at least 270 seconds of exchange time after acquiring the locks and then queries the order and both order lists. The program reports time-read failures by stage. A DNS, connection, write or read interruption, or a round trip longer than 2 seconds, allows up to three attempts per reading. The wait continues from the original exchange time after the locks were acquired. A TLS handshake failure, a rejected HTTP response or an invalid exchange time stops the run. Review the result against the exchange's order and trade history for that account and time range. Enter the exact confirmation phrase shown by the tool only when the displayed account, symbol and order ID match and the exchange records show neither the order nor a fill.
 4. Expect `result: Resolved (exit code 0)`. Run `--list` again with the same store and verify the target ID is gone from the unresolved list. If the tool returns 59 or 70, inspect `--list` before considering a retry because an append may already have reached storage. Record the result and the before-and-after list status in the drill notes. Keep the response attachment in the tool's local output directory.
 
 From the project root in PowerShell 7, use a new directory and replace the account UID. The two key IDs for a generated store are both `1`. If preparation exits with an error, keep the partial directory for inspection and use a new directory for another attempt.
@@ -89,6 +89,8 @@ $storeArgs = @(
 ```
 
 The first list should show one `Ambiguous` BTCUSDT order with the `coid` recorded in `r6-drill.txt`. After checking it, replace the client order ID below with that value.
+
+If OpenSSL on Windows reports an empty trust store, set `SSL_CERT_FILE` in the current PowerShell session to the path of an installed CA bundle, such as the bundle supplied by Git for Windows at `C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt`. Run the resolution from that session.
 
 ```powershell
 & $tool --env testnet --coid '<client order ID>' --uid $uid `

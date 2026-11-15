@@ -124,7 +124,7 @@ public:
                            "CA bundle (a Linux host or WSL)");
             return nullptr;
         }
-        port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper);
+        port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper, kDefaultRequestSpacing, &err);
         return port_.get();
     }
 

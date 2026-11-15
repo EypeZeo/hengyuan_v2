@@ -25,6 +25,8 @@
 //     operator sat on a prompt for long; when the client says ClockNotFresh the port takes one new reading (GET /api/v3/time, which is
 //     what publishes the snapshot) and repeats the request ONCE. Nothing was signed or sent before that, so nothing is repeated on the
 //     exchange.
+//   * A clock read makes at most three paced attempts. Transport interruptions and slow round trips are retryable.
+//     A rejected response or a failed TLS handshake ends the read. Each failure reports its stage without response content.
 //
 // summarize_account() turns the account answer into the two things the flow uses -- the uid it cross-checks against the one the operator
 // stated, and ONE line of printable ASCII for the operator's eyes -- without ever passing a piece of the response through.
@@ -231,8 +233,9 @@ inline AccountView summarize_account(std::string_view body) {
 class BinanceExchangeReadPort final : public ExchangeReadPort {
 public:
     BinanceExchangeReadPort(BinancePrivateRestClient& client, SleepPort& sleeper,
-                            std::chrono::milliseconds spacing = kDefaultRequestSpacing) noexcept
-        : client_(client), sleeper_(sleeper), spacing_(spacing) {}
+                            std::chrono::milliseconds spacing = kDefaultRequestSpacing,
+                            ConsolePort* diagnostics = nullptr) noexcept
+        : client_(client), sleeper_(sleeper), spacing_(spacing), diagnostics_(diagnostics) {}
 
     BinanceExchangeReadPort(const BinanceExchangeReadPort&) = delete;
     BinanceExchangeReadPort& operator=(const BinanceExchangeReadPort&) = delete;
@@ -280,11 +283,54 @@ private:
                e != PrivateRestError::RateLimitExhausted;
     }
 
+    static bool retryable_time_error(PrivateRestError error, const ServerTimeReadDiagnostics& details) noexcept {
+        if (details.malformed_http) return false;
+        if (details.rejected_round_trip_ms) return *details.rejected_round_trip_ms > kMaxUsableRttMs;
+        return error == PrivateRestError::Resolve || error == PrivateRestError::Connect ||
+               error == PrivateRestError::Write || error == PrivateRestError::Read;
+    }
+
+    static std::string describe_time_error(PrivateRestError error, const ServerTimeReadDiagnostics& details) {
+        if (details.http_status != 0) return "HTTP " + std::to_string(details.http_status);
+        if (details.malformed_http) return "malformed or oversized HTTP response";
+        if (details.rejected_round_trip_ms) {
+            return "clock sample rejected: round trip " + std::to_string(*details.rejected_round_trip_ms) +
+                   " ms (allowed 0 to " + std::to_string(kMaxUsableRttMs) + " ms)";
+        }
+        switch (error) {
+            case PrivateRestError::Resolve: return "DNS lookup failed";
+            case PrivateRestError::Connect: return "Connect failed";
+            case PrivateRestError::TlsHandshake: return "TLS handshake failed";
+            case PrivateRestError::Write: return "Write failed";
+            case PrivateRestError::Read: return "Read failed";
+            case PrivateRestError::HttpStatus: return "unexpected HTTP status";
+            case PrivateRestError::JsonParse: return "JsonParse: invalid server time response or clock sample";
+            case PrivateRestError::ClockSkewTooLarge: return "ClockSkewTooLarge: exchange and local clocks differ too much";
+            case PrivateRestError::RateLimitExhausted: return "local rate limit reached";
+            case PrivateRestError::InvalidConfig: return "invalid REST configuration";
+            default: return "REST error " + std::to_string(static_cast<int>(error));
+        }
+    }
+
     bool read_time(std::int64_t& ms) {
-        wait_gap();
-        const PrivateRestError e = client_.read_server_time(ms);
-        if (went_out(e)) gap_pending_ = true;
-        return e == PrivateRestError::None;
+        constexpr int kMaxAttempts = 3;
+        for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+            wait_gap();
+            ServerTimeReadDiagnostics details;
+            const PrivateRestError error = client_.read_server_time(ms, &details);
+            if (went_out(error)) gap_pending_ = true;
+            if (error == PrivateRestError::None) return true;
+            if (is_back_off_status(details.http_status)) halted_ = true;
+
+            const bool retry = !halted_ && attempt < kMaxAttempts && retryable_time_error(error, details);
+            if (diagnostics_) {
+                diagnostics_->write_line("GET /api/v3/time: " + describe_time_error(error, details) +
+                                         " (attempt " + std::to_string(attempt) + "/" + std::to_string(kMaxAttempts) +
+                                         ")" + (retry ? ", retrying" : ", stopping"));
+            }
+            if (!retry) return false;
+        }
+        return false;
     }
 
     template <class Call>
@@ -314,6 +360,7 @@ private:
     BinancePrivateRestClient& client_;
     SleepPort& sleeper_;
     std::chrono::milliseconds spacing_;
+    ConsolePort* diagnostics_;
     bool gap_pending_{false};
     bool halted_{false};
 };
