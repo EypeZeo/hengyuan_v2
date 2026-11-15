@@ -253,6 +253,10 @@ if(HY_BUILD_DEMO)
     hengyuan_set_warnings(hy_operator_resolve)
     hengyuan_allow_third_party_tsan_fences(hy_operator_resolve)
 
+    add_executable(hy_r6_prepare_drill src/hy_r6_prepare_drill.cpp)
+    target_link_libraries(hy_r6_prepare_drill PRIVATE hengyuan_core)
+    hengyuan_set_warnings(hy_r6_prepare_drill)
+
     add_executable(binance_dry_run_demo src/binance_dry_run_demo.cpp)
     target_link_libraries(binance_dry_run_demo PRIVATE
         hengyuan_dataplane
@@ -1505,6 +1509,13 @@ if(HY_BUILD_TESTS)
 
     # P2-EXEC-LIVE-01: HMAC signer (requires OpenSSL)
     if(HY_BUILD_DEMO)
+        add_test(NAME R6PreparedDrill
+            COMMAND ${CMAKE_COMMAND}
+                "-DDRILL=$<TARGET_FILE:hy_r6_prepare_drill>"
+                "-DRESOLVER=$<TARGET_FILE:hy_operator_resolve>"
+                "-DSCRATCH_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_r6_prepared_drill.cmake")
+
         add_executable(test_binance_signer tests/test_binance_signer.cpp)
         target_link_libraries(test_binance_signer PRIVATE
             hengyuan_core OpenSSL::SSL OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST}

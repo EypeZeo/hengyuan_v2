@@ -71,6 +71,9 @@
 #include <boost/beast.hpp>
 #include <boost/beast/ssl.hpp>
 
+#include <openssl/err.h>
+#include <openssl/sslerr.h>
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4100)
@@ -172,6 +175,26 @@ enum class PrivateRestError : std::uint8_t {
     ClockSkewTooLarge = 13,  // §2.2: the fetched offset exceeds the transport policy's recv window --
                               // not published (a broken local clock or a wrong serverTime)
     RateLimitExhausted = 14, // the local rate-limit budget refused this request: nothing was sent (L4 §7.4)
+};
+
+enum class TlsHandshakeFailure : std::uint8_t {
+    None,
+    Timeout,
+    Interrupted,
+    CertificateRejected,
+    Other,
+};
+
+struct RestReadDiagnostics {
+    std::uint16_t http_status{0};  // populated when a response has a non-200 status
+    TlsHandshakeFailure tls_failure{TlsHandshakeFailure::None};
+    boost::system::error_code tls_error;
+    long tls_verify_result{X509_V_OK};
+};
+
+struct ServerTimeReadDiagnostics : RestReadDiagnostics {
+    bool malformed_http{false};
+    std::optional<std::int64_t> rejected_round_trip_ms;
 };
 
 // §4.2's parse_balance_decimal_to_ticks() moved to binance_decimal.hpp (L4 §5 / PR 5b): the
@@ -898,9 +921,43 @@ struct ServerTimeFetchResult {
     ClockPairSample fetch_sample{fetch_clock_pair()};  // placeholder; always overwritten
 };
 
+// A verification error or a TLS protocol error must not enter the operator's
+// retry loop. Only a timeout or a known network interruption is transient.
+inline void record_tls_handshake_failure(SSL* ssl_handle, boost::system::error_code error,
+                                         RestReadDiagnostics& diagnostics) noexcept {
+    diagnostics.tls_error = error;
+    diagnostics.tls_verify_result = SSL_get_verify_result(ssl_handle);
+    if (diagnostics.tls_verify_result != X509_V_OK) {
+        diagnostics.tls_failure = TlsHandshakeFailure::CertificateRejected;
+        return;
+    }
+    if (error == beast::error::timeout || error == net::error::timed_out) {
+        diagnostics.tls_failure = TlsHandshakeFailure::Timeout;
+        return;
+    }
+    bool interrupted = error == net::error::eof || error == net::error::connection_reset ||
+                       error == net::error::connection_aborted || error == net::error::broken_pipe ||
+                       error == ssl::error::stream_truncated;
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+    if (!interrupted && error.category() == net::error::get_ssl_category()) {
+        const auto packed_error = static_cast<unsigned long>(error.value());
+        interrupted = ERR_GET_LIB(packed_error) == ERR_LIB_SSL &&
+                      ERR_GET_REASON(packed_error) == SSL_R_UNEXPECTED_EOF_WHILE_READING;
+    }
+#endif
+    diagnostics.tls_failure = interrupted ? TlsHandshakeFailure::Interrupted : TlsHandshakeFailure::Other;
+}
+
+inline std::optional<std::uint16_t> non_success_header_status(const http::response_parser<http::string_body>& parser,
+                                                             boost::system::error_code error) noexcept {
+    // Beast can detect an oversized body from Content-Length while parsing the header.
+    if ((error && error != http::error::body_limit) || parser.get().result() == http::status::ok) return std::nullopt;
+    return static_cast<std::uint16_t>(parser.get().result_int());
+}
+
 inline net::awaitable<std::variant<ServerTimeFetchResult, PrivateRestError>>
 fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRestConfig cfg,
-                       RestTestSeam seam) {
+                       RestTestSeam seam, ServerTimeReadDiagnostics* diagnostics = nullptr) {
     static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
@@ -911,6 +968,7 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
         const std::string host(permit.host());
         auto executor = co_await net::this_coro::executor;
 
+        if (diagnostics) current_stage = PrivateRestError::TlsHandshake;
         ssl::context ssl_ctx(ssl::context::tlsv12_client);
         hy::configure_binance_ssl_context(ssl_ctx);
         if (!seam.extra_trusted_ca_pem_path().empty()) {
@@ -932,6 +990,7 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
 #endif
         hy::configure_binance_hostname_verification(stream, host);
 
+        current_stage = PrivateRestError::Resolve;
         const std::string& connect_host =
             seam.connect_host_override().empty() ? host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
@@ -950,7 +1009,12 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
 
         current_stage = PrivateRestError::TlsHandshake;
         beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_handshake_timeout_ms()));
-        co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
+        boost::system::error_code handshake_error;
+        co_await stream.async_handshake(ssl::stream_base::client, net::redirect_error(net::use_awaitable, handshake_error));
+        if (handshake_error) {
+            if (diagnostics) record_tls_handshake_failure(stream.native_handle(), handshake_error, *diagnostics);
+            co_return PrivateRestError::TlsHandshake;
+        }
 
         http::request<http::empty_body> req{http::verb::get, "/api/v3/time", 11};
         req.set(http::field::host, host);
@@ -970,7 +1034,23 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
         http::response_parser<http::string_body> parser;
         parser.header_limit(permit.max_header_bytes());
         parser.body_limit(permit.max_body_bytes());
-        co_await http::async_read(stream, buffer, parser, net::use_awaitable);
+        boost::system::error_code read_error;
+        co_await http::async_read_header(stream, buffer, parser, net::redirect_error(net::use_awaitable, read_error));
+        // A non-200 status is sufficient to reject the sample, even if its body never arrives.
+        if (const auto http_status = non_success_header_status(parser, read_error)) {
+            if (diagnostics) diagnostics->http_status = *http_status;
+            co_return PrivateRestError::HttpStatus;
+        }
+        if (!read_error) {
+            co_await http::async_read(stream, buffer, parser, net::redirect_error(net::use_awaitable, read_error));
+        }
+        if (read_error) {
+            if (diagnostics) {
+                diagnostics->malformed_http = read_error.category() == make_error_code(http::error::bad_status).category() &&
+                    read_error != http::error::end_of_stream && read_error != http::error::partial_message;
+            }
+            co_return PrivateRestError::Read;
+        }
         auto res = parser.release();
 
         // Sampled immediately after the read completes -- "local_recv_ms", and also the
@@ -979,10 +1059,6 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
         ClockPairSample t1 = fetch_clock_pair();
 
         beast::get_lowest_layer(stream).close();
-
-        if (res.result() != http::status::ok) {
-            co_return PrivateRestError::HttpStatus;
-        }
 
         current_stage = PrivateRestError::JsonParse;
         std::int64_t server_time_ms = 0;
@@ -1104,11 +1180,11 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
 // order orchestrator and the reconciler run changes.
 inline net::awaitable<std::variant<RawHttpAnswer, PrivateRestError>> fetch_signed_raw_coro(
     EndpointPermit permit, RateLimitPermit budget, std::string target, std::string api_key,
-    PrivateRestConfig cfg, RestTestSeam seam) {
+    PrivateRestConfig cfg, RestTestSeam seam, RestReadDiagnostics* diagnostics) {
     static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
-    PrivateRestError current_stage = PrivateRestError::Resolve;
+    PrivateRestError current_stage = PrivateRestError::TlsHandshake;
     try {
         const std::string host(permit.host());
         auto executor = co_await net::this_coro::executor;
@@ -1134,6 +1210,7 @@ inline net::awaitable<std::variant<RawHttpAnswer, PrivateRestError>> fetch_signe
 #endif
         hy::configure_binance_hostname_verification(stream, host);
 
+        current_stage = PrivateRestError::Resolve;
         const std::string& connect_host =
             seam.connect_host_override().empty() ? host : seam.connect_host_override();
         net::steady_timer resolve_timer(executor);
@@ -1152,7 +1229,12 @@ inline net::awaitable<std::variant<RawHttpAnswer, PrivateRestError>> fetch_signe
 
         current_stage = PrivateRestError::TlsHandshake;
         beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_handshake_timeout_ms()));
-        co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
+        boost::system::error_code handshake_error;
+        co_await stream.async_handshake(ssl::stream_base::client, net::redirect_error(net::use_awaitable, handshake_error));
+        if (handshake_error) {
+            if (diagnostics) record_tls_handshake_failure(stream.native_handle(), handshake_error, *diagnostics);
+            co_return PrivateRestError::TlsHandshake;
+        }
 
         http::request<http::empty_body> req{http::verb::get, target, 11};
         req.set(http::field::host, host);
@@ -1169,6 +1251,10 @@ inline net::awaitable<std::variant<RawHttpAnswer, PrivateRestError>> fetch_signe
         http::response_parser<http::string_body> parser;
         parser.header_limit(permit.max_header_bytes());
         parser.body_limit(permit.max_body_bytes());
+        boost::system::error_code header_error;
+        co_await http::async_read_header(stream, buffer, parser, net::redirect_error(net::use_awaitable, header_error));
+        if (diagnostics) diagnostics->http_status = non_success_header_status(parser, header_error).value_or(0);
+        if (header_error) co_return PrivateRestError::Read;
         co_await http::async_read(stream, buffer, parser, net::use_awaitable);
         auto res = parser.release();
 
@@ -1363,10 +1449,11 @@ public:
     // D5 R3b-1: the same round trip as sync_clock() (the offset is published exactly as there, the same refusals apply), and the exchange's
     // serverTime of that round trip is handed out as well -- the operator tool's fence is counted on it. `server_time_ms` is left untouched on
     // every failure. Never throws.
-    PrivateRestError read_server_time(std::int64_t& server_time_ms) noexcept {
+    PrivateRestError read_server_time(std::int64_t& server_time_ms, ServerTimeReadDiagnostics* diagnostics = nullptr) noexcept {
+        if (diagnostics) *diagnostics = {};
         try {
             std::int64_t value = 0;
-            const PrivateRestError e = sync_clock_impl(default_cfg_, &value);
+            const PrivateRestError e = sync_clock_impl(default_cfg_, &value, diagnostics);
             if (e == PrivateRestError::None) server_time_ms = value;
             return e;
         } catch (...) {
@@ -1375,7 +1462,8 @@ public:
     }
 
 private:
-    PrivateRestError sync_clock_impl(const PrivateRestConfig& cfg, std::int64_t* server_time_ms_out) {
+    PrivateRestError sync_clock_impl(const PrivateRestConfig& cfg, std::int64_t* server_time_ms_out,
+                                    ServerTimeReadDiagnostics* diagnostics = nullptr) {
         const auto permit = endpoint_permit(ResponseKind::ServerTime);
         if (!permit) return PrivateRestError::InvalidConfig;
         // Budget before the network (L4 §7.4): GET /api/v3/time, weight 1, Reconciliation lane. Refused
@@ -1386,7 +1474,7 @@ private:
         std::variant<detail::ServerTimeFetchResult, PrivateRestError> outcome =
             PrivateRestError::None;
         net::co_spawn(
-            ioc, detail::fetch_server_time_coro(*permit, *budget, cfg, test_seam_),
+            ioc, detail::fetch_server_time_coro(*permit, *budget, cfg, test_seam_, diagnostics),
             [&outcome](std::exception_ptr eptr,
                        std::variant<detail::ServerTimeFetchResult, PrivateRestError> r) {
                 if (eptr) {
@@ -1406,7 +1494,11 @@ private:
         ClockOffsetSnapshot snap{};
         if (!compute_clock_offset(r.local_send_ms, r.local_recv_ms, r.server_time_ms,
                                    r.fetch_sample, snap)) {
-            // RTT over kMaxUsableRttMs, or checked-arithmetic overflow on pathological inputs.
+            std::int64_t round_trip_ms = 0;
+            if (diagnostics && checked_sub_i64(r.local_recv_ms, r.local_send_ms, round_trip_ms) &&
+                (round_trip_ms < 0 || round_trip_ms > kMaxUsableRttMs)) {
+                diagnostics->rejected_round_trip_ms = round_trip_ms;
+            }
             return PrivateRestError::JsonParse;
         }
         // The offset's magnitude, judged by the transport policy's own check: the gap between the
@@ -1846,7 +1938,9 @@ public:
     // (PrivateRestError::None); any HTTP status is an answer, only the transport can fail.
     //
     // GET /api/v3/order?symbol=&origClientOrderId= (weight 4)
-    PrivateRestError fetch_order_raw(std::string_view symbol, std::string_view client_order_id, RawHttpAnswer& out) noexcept {
+    PrivateRestError fetch_order_raw(std::string_view symbol, std::string_view client_order_id, RawHttpAnswer& out,
+                                     RestReadDiagnostics* diagnostics = nullptr) noexcept {
+        if (diagnostics) *diagnostics = {};
         if (!is_valid_exchange_info_symbol(symbol)) return PrivateRestError::InvalidConfig;
         if (client_order_id.empty() || client_order_id.size() > kClientOrderIdLen) return PrivateRestError::InvalidConfig;
         const std::pair<std::string_view, std::string_view> params[] = {
@@ -1854,12 +1948,13 @@ public:
             {"symbol", symbol},
         };
         return signed_get_raw("/api/v3/order", ResponseKind::SignedJson, params,
-                              RawGetBudget{true, PrivateRestEndpoint::GetOrder, 0}, out);
+                              RawGetBudget{true, PrivateRestEndpoint::GetOrder, 0}, out, diagnostics);
     }
 
     // GET /api/v3/allOrders?symbol=&startTime=&endTime=&limit= (weight 20): one page. `limit` is 1..1000 (Binance's maximum).
     PrivateRestError fetch_all_orders_raw(std::string_view symbol, std::int64_t start_ms, std::int64_t end_ms, std::size_t limit,
-                                          RawHttpAnswer& out) noexcept {
+                                          RawHttpAnswer& out, RestReadDiagnostics* diagnostics = nullptr) noexcept {
+        if (diagnostics) *diagnostics = {};
         if (!is_valid_exchange_info_symbol(symbol)) return PrivateRestError::InvalidConfig;
         if (start_ms <= 0 || end_ms < start_ms || limit == 0 || limit > 1000) return PrivateRestError::InvalidConfig;
         char start_buf[24];
@@ -1879,20 +1974,23 @@ public:
             {"symbol", symbol},
         };
         return signed_get_raw("/api/v3/allOrders", ResponseKind::OrderList, params,
-                              RawGetBudget{false, PrivateRestEndpoint::GetOrder, kAllOrdersCallWeight}, out);
+                              RawGetBudget{false, PrivateRestEndpoint::GetOrder, kAllOrdersCallWeight}, out, diagnostics);
     }
 
     // GET /api/v3/openOrders (weight 80: no symbol, every open order of the account)
-    PrivateRestError fetch_open_orders_raw(RawHttpAnswer& out) noexcept {
+    PrivateRestError fetch_open_orders_raw(RawHttpAnswer& out, RestReadDiagnostics* diagnostics = nullptr) noexcept {
+        if (diagnostics) *diagnostics = {};
         return signed_get_raw("/api/v3/openOrders", ResponseKind::OrderList, {},
-                              RawGetBudget{false, PrivateRestEndpoint::GetOrder, kOpenOrdersAllSymbolsCallWeight}, out);
+                              RawGetBudget{false, PrivateRestEndpoint::GetOrder, kOpenOrdersAllSymbolsCallWeight}, out,
+                              diagnostics);
     }
 
     // GET /api/v3/account?omitZeroBalances=true (weight 20): for the account's uid and permissions and for the summary the operator is shown.
-    PrivateRestError fetch_account_raw(RawHttpAnswer& out) noexcept {
+    PrivateRestError fetch_account_raw(RawHttpAnswer& out, RestReadDiagnostics* diagnostics = nullptr) noexcept {
+        if (diagnostics) *diagnostics = {};
         const std::pair<std::string_view, std::string_view> params[] = {{"omitZeroBalances", "true"}};
         return signed_get_raw("/api/v3/account", ResponseKind::SignedJson, params,
-                              RawGetBudget{true, PrivateRestEndpoint::GetAccount, 0}, out);
+                              RawGetBudget{true, PrivateRestEndpoint::GetAccount, 0}, out, diagnostics);
     }
 
     const ClockOffsetPublisher& clock_publisher() const noexcept { return clock_pub_; }
@@ -1949,7 +2047,7 @@ private:
     // build_signed_query(). Never throws: anything that escapes the network section is a Read failure.
     PrivateRestError signed_get_raw(std::string_view path, ResponseKind kind,
                                     std::span<const std::pair<std::string_view, std::string_view>> business_params,
-                                    RawGetBudget budget_spec, RawHttpAnswer& out) noexcept {
+                                    RawGetBudget budget_spec, RawHttpAnswer& out, RestReadDiagnostics* diagnostics) noexcept {
         if (!creds_) return PrivateRestError::SigningFailed;
         const auto permit = endpoint_permit(kind);
         if (!permit) return PrivateRestError::InvalidConfig;
@@ -1991,7 +2089,7 @@ private:
             net::co_spawn(
                 ioc,
                 detail::fetch_signed_raw_coro(*permit, *budget, std::move(target), std::string(key_buf.data(), key_len),
-                                              default_cfg_, test_seam_),
+                                              default_cfg_, test_seam_, diagnostics),
                 [&outcome](std::exception_ptr eptr, std::variant<RawHttpAnswer, PrivateRestError> r) {
                     if (eptr) std::rethrow_exception(eptr);
                     outcome = std::move(r);

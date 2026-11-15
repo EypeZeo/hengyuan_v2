@@ -9,10 +9,13 @@
 //   * Silent       -- the TLS handshake and the request are accepted, no answer ever comes (the client's read timeout);
 //   * CutShort     -- the headers promise the whole body, half of it arrives and the connection is dropped (a body cut off in transit);
 //   * Drop         -- the connection is closed after the request, without a byte of answer.
+// A separate per-connection callback can continue TLS, disconnect after TCP accept but before TLS completes, or hold the connection so the
+// client reaches its TLS handshake timeout. This lets the transport tests distinguish transient handshake faults from certificate failures.
 // Every request is recorded (method, target, the X-MBX-APIKEY and Host headers, body) so a test can assert on what the client really sent.
 //
-// The handler runs on the fixture's own thread under a mutex, one request at a time (it must not call back into the fixture). Same threading pattern as tls_response_acceptor.hpp
-// (accept loop on a dedicated io_context thread); test-only, so the destructor stops the io_context directly.
+// The HTTP handler runs on the fixture's own thread under a mutex, one request at a time (it must not call back into the fixture). The
+// before-handshake callback runs on that thread after TCP accept. Same threading pattern as tls_response_acceptor.hpp (accept loop on a
+// dedicated io_context thread); test-only, so the destructor stops the io_context directly.
 
 #pragma once
 
@@ -41,6 +44,8 @@ using routing_tcp = routing_net::ip::tcp;
 
 class TlsRoutingAcceptor {
 public:
+    enum class BeforeHandshakeAction : std::uint8_t { Continue, Disconnect, Hold };
+
     struct Request {
         std::string method;
         std::string target;  // path and query exactly as sent
@@ -61,16 +66,20 @@ public:
             return Reply{Kind::Answer, status, std::move(body), padding};
         }
         static Reply silent() { return Reply{Kind::Silent, 0, {}, 0}; }
-        static Reply cut_short(std::string body) { return Reply{Kind::CutShort, 200, std::move(body), 0}; }
+        static Reply cut_short(std::string body) { return cut_short(200, std::move(body)); }
+        static Reply cut_short(int status, std::string body) { return Reply{Kind::CutShort, status, std::move(body), 0}; }
         static Reply drop() { return Reply{Kind::Drop, 0, {}, 0}; }
     };
 
     using Handler = std::function<Reply(const Request&)>;
+    using BeforeHandshakeHandler = std::function<BeforeHandshakeAction(std::size_t)>;
 
-    TlsRoutingAcceptor(const std::string& cert_pem_path, const std::string& key_pem_path, Handler handler)
+    TlsRoutingAcceptor(const std::string& cert_pem_path, const std::string& key_pem_path, Handler handler,
+                       BeforeHandshakeHandler before_handshake = {})
         : acceptor_(ioc_, routing_tcp::endpoint(routing_net::ip::make_address("127.0.0.1"), 0)),
           ssl_ctx_(routing_ssl::context::tlsv12_server),
-          handler_(std::move(handler)) {
+          handler_(std::move(handler)),
+          before_handshake_(std::move(before_handshake)) {
         ssl_ctx_.use_certificate_chain_file(cert_pem_path);
         ssl_ctx_.use_private_key_file(key_pem_path, routing_ssl::context::pem);
         accept_loop();
@@ -98,6 +107,11 @@ public:
         return requests_.size();
     }
 
+    std::size_t connection_count() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return accepted_connections_;
+    }
+
 private:
     using Stream = routing_ssl::stream<routing_tcp::socket>;
 
@@ -106,9 +120,25 @@ private:
         auto& lowest = stream->lowest_layer();
         acceptor_.async_accept(lowest, [this, stream](boost::system::error_code ec) {
             if (!ec) {
-                stream->async_handshake(routing_ssl::stream_base::server, [this, stream](boost::system::error_code handshake_ec) {
-                    if (!handshake_ec) serve_one(stream);
-                });
+                std::size_t connection_number = 0;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    connection_number = ++accepted_connections_;
+                }
+                const BeforeHandshakeAction action = before_handshake_ ? before_handshake_(connection_number)
+                                                                       : BeforeHandshakeAction::Continue;
+                if (action == BeforeHandshakeAction::Disconnect) {
+                    boost::system::error_code ignored;
+                    stream->lowest_layer().shutdown(routing_tcp::socket::shutdown_both, ignored);
+                    stream->lowest_layer().close(ignored);
+                } else if (action == BeforeHandshakeAction::Hold) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    held_.push_back(stream);  // leaves TCP connected without completing TLS until the client times out
+                } else {
+                    stream->async_handshake(routing_ssl::stream_base::server, [this, stream](boost::system::error_code handshake_ec) {
+                        if (!handshake_ec) serve_one(stream);
+                    });
+                }
             }
             if (!ioc_.stopped()) accept_loop();
         });
@@ -151,7 +181,9 @@ private:
             }
             case Reply::Kind::CutShort: {
                 // Content-Length promises the whole body; only the first half is sent, then the connection is dropped.
-                auto wire = std::make_shared<std::string>("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                const std::string status_line = "HTTP/1.1 " + std::to_string(reply.status) +
+                                                (reply.status == 429 ? " Too Many Requests\r\n" : " OK\r\n");
+                auto wire = std::make_shared<std::string>(status_line + "Content-Type: application/json\r\nContent-Length: " +
                                                           std::to_string(reply.body.size()) + "\r\nConnection: close\r\n\r\n" +
                                                           reply.body.substr(0, reply.body.size() / 2));
                 routing_net::async_write(*stream, routing_net::buffer(*wire), [stream, wire](boost::system::error_code, std::size_t) {
@@ -178,10 +210,12 @@ private:
     routing_tcp::acceptor acceptor_;
     routing_ssl::context ssl_ctx_;
     Handler handler_;
+    BeforeHandshakeHandler before_handshake_;
     std::thread thread_;
     mutable std::mutex mu_;
     std::vector<Request> requests_;
     std::vector<std::shared_ptr<Stream>> held_;
+    std::size_t accepted_connections_{0};
 };
 
 }  // namespace hy::test_helpers

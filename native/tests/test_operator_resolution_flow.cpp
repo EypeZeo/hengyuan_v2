@@ -1477,23 +1477,39 @@ TEST_F(FlowTest, AnythingButTheExactPhraseWritesNothing) {
         FakeConsole::Mode mode;
         std::string (*variant)(const std::string&);
         ConfirmationVerdict verdict;
+        const char* expected_message;
     };
     const Case cases[] = {
-        {"lower case", FakeConsole::Mode::TypeVariant, &lower_first, ConfirmationVerdict::WrongPhrase},
-        {"trailing space", FakeConsole::Mode::TypeVariant, &trailing_space, ConfirmationVerdict::WrongPhrase},
-        {"leading space", FakeConsole::Mode::TypeVariant, &leading_space, ConfirmationVerdict::WrongPhrase},
-        {"another digest", FakeConsole::Mode::TypeVariant, &other_digest, ConfirmationVerdict::WrongPhrase},
-        {"another environment", FakeConsole::Mode::TypeVariant, &other_environment, ConfirmationVerdict::WrongPhrase},
-        {"another uid", FakeConsole::Mode::TypeVariant, &other_uid, ConfirmationVerdict::WrongPhrase},
-        {"another symbol", FakeConsole::Mode::TypeVariant, &other_symbol, ConfirmationVerdict::WrongPhrase},
-        {"a truncated phrase", FakeConsole::Mode::TypeVariant, &truncated, ConfirmationVerdict::WrongPhrase},
-        {"another order's phrase", FakeConsole::Mode::TypeVariant, &other_order, ConfirmationVerdict::WrongPhrase},
-        {"just CONFIRM", FakeConsole::Mode::TypeVariant, &just_confirm, ConfirmationVerdict::WrongPhrase},
-        {"nothing", FakeConsole::Mode::TypeNothing, nullptr, ConfirmationVerdict::WrongPhrase},
-        {"a timeout", FakeConsole::Mode::Timeout, nullptr, ConfirmationVerdict::NoLine},
-        {"end of input", FakeConsole::Mode::Eof, nullptr, ConfirmationVerdict::NoLine},
-        {"an I/O error", FakeConsole::Mode::Error, nullptr, ConfirmationVerdict::NoLine},
-        {"a line that was too long", FakeConsole::Mode::TooLong, nullptr, ConfirmationVerdict::NoLine},
+        {"lower case", FakeConsole::Mode::TypeVariant, &lower_first, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"trailing space", FakeConsole::Mode::TypeVariant, &trailing_space, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"leading space", FakeConsole::Mode::TypeVariant, &leading_space, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"another digest", FakeConsole::Mode::TypeVariant, &other_digest, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"another environment", FakeConsole::Mode::TypeVariant, &other_environment, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"another uid", FakeConsole::Mode::TypeVariant, &other_uid, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"another symbol", FakeConsole::Mode::TypeVariant, &other_symbol, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"a truncated phrase", FakeConsole::Mode::TypeVariant, &truncated, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"another order's phrase", FakeConsole::Mode::TypeVariant, &other_order, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"just CONFIRM", FakeConsole::Mode::TypeVariant, &just_confirm, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the line does not match the displayed phrase. No resolution was written."},
+        {"nothing", FakeConsole::Mode::TypeNothing, nullptr, ConfirmationVerdict::WrongPhrase,
+         "not confirmed: the confirmation line was empty. No resolution was written."},
+        {"a timeout", FakeConsole::Mode::Timeout, nullptr, ConfirmationVerdict::NoLine,
+         "not confirmed: confirmation timed out. No resolution was written."},
+        {"end of input", FakeConsole::Mode::Eof, nullptr, ConfirmationVerdict::NoLine,
+         "not confirmed: confirmation input ended. No resolution was written."},
+        {"an I/O error", FakeConsole::Mode::Error, nullptr, ConfirmationVerdict::NoLine,
+         "not confirmed: could not read confirmation input. No resolution was written."},
+        {"a line that was too long", FakeConsole::Mode::TooLong, nullptr, ConfirmationVerdict::NoLine,
+         "not confirmed: confirmation line is too long. No resolution was written."},
     };
     for (const Case& c : cases) {
         SCOPED_TRACE(c.name);
@@ -1510,7 +1526,7 @@ TEST_F(FlowTest, AnythingButTheExactPhraseWritesNothing) {
         EXPECT_EQ(o.conclusion, AbsentConclusionStatus::NotConfirmed) << "the evidence was clean; only his word is missing";
         EXPECT_EQ(o.append.status, OperatorAppendStatus::NotAttempted);
         EXPECT_EQ(rig_->store.stored.size(), 1u) << "the evidence he was shown is on disk";
-        EXPECT_TRUE(rig_->console.printed("not confirmed: nothing was written")) << "and he is told that nothing happened";
+        EXPECT_TRUE(rig_->console.printed(c.expected_message)) << "the operator receives the reason confirmation failed";
         EXPECT_FALSE(rig_->console.printed("resolved: the frame is durable"));
         EXPECT_TRUE(logs_untouched());
     }
@@ -1630,7 +1646,7 @@ TEST_F(FlowTest, AnAccountTheExchangeDoesNotNameIsRefusedBeforeAnyWaitWhateverEl
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
     EXPECT_EQ(o.status, ResolveStatus::AccountUnverified) << resolve_status_name(o.status);
     EXPECT_FALSE(o.exchange_account_uid.has_value());
-    EXPECT_TRUE(rig_->console.printed("the exchange did not report the uid of the account this API key belongs to: nothing was written"));
+    EXPECT_TRUE(rig_->console.printed("could not verify the account UID for this API key: nothing was written"));
     EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
 }
 
