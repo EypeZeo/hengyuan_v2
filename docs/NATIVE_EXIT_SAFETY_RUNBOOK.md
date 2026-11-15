@@ -120,6 +120,14 @@ The operator completed the drill on Windows with a Spot Testnet account and a sy
 
 Use an order accepted by Spot Testnet and a separate read-only operator key for the same account. Record the exchange's order placement time as `t0` in milliseconds. Keep the symbol and order identifiers locally. Record the intended polling interval and observation deadline before collecting samples. Start polling promptly after acceptance and record the actual gap between observations. [Spot Testnet REST documentation](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#all-orders-user_data)
 
+Run the standalone PowerShell entry point with its two companion Python files in the repository's `tools` directory. It requires PowerShell 7 and Python 3.8 or later. Replace the example numeric order ID with the exchange's `orderId` for the accepted order.
+
+```powershell
+& '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT -OrderId 12345
+```
+
+The sampler reads the original placement time from `GET /api/v3/order` and verifies the symbol and order ID. The default sampling window is 20 seconds with a one-second polling interval and a five-second timeout per request. Use `-DurationSeconds`, `-PollIntervalMs` and `-TimeoutSeconds` to reproduce a sampling setup. If you need an explicit CA bundle, pass `-CaBundle`. The JSON report contains relative times, statuses and observation counts for sharing. Exit code 3 means a backoff response stopped the run. Exit code 4 means the initial exchange time or order read failed.
+
 1. For each observation, read `GET /api/v3/time`, call `GET /api/v3/allOrders` for the symbol and a time window covering the order, then read `GET /api/v3/time` again. Record both exchange times and match the returned order by symbol and order identifier. [Spot Testnet server time](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#check-server-time)
 2. Mark the order as missing only for a valid, complete HTTP 200 order list. Mark failed requests, saturated pages, and unusable time brackets as inconclusive. Stop the run on HTTP 403, 418 or 429. If a later valid poll loses an order that was previously visible, report that sequence separately.
 3. Report the interval from the **before-query** time of the last valid miss to the **after-query** time of the first valid hit, relative to `t0`. Use zero as the lower bound if the first valid poll already found the order. If the deadline passes with valid misses and zero hits, report the last lower bound with the upper bound open. Record inconclusive runs separately.

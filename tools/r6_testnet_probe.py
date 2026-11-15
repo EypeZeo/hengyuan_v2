@@ -91,17 +91,19 @@ def parse_json(text):
 
 
 class Probe:
-    def __init__(self, key, secret, timeout):
+    def __init__(self, key, secret, timeout, *, request_get=None, attempts=3):
         self.key = key
         self.secret = secret
         self.timeout = timeout
         self.offset_ms = 0
+        self.request_get = request_get or http_get
+        self.attempts = attempts
 
     def now_ms(self):
         return int(time.time() * 1000) + self.offset_ms
 
     def public(self, path):
-        return self._retrying(lambda: http_get(path, {}, self.timeout))
+        return self._retrying(lambda: self.request_get(path, {}, self.timeout), attempts=self.attempts)
 
     def signed(self, path, params):
         def once():
@@ -111,9 +113,9 @@ class Probe:
             p["recvWindow"] = RECV_WINDOW_MS
             query = urllib.parse.urlencode(p)
             signature = hmac.new(self.secret.encode("ascii"), query.encode("ascii"), hashlib.sha256).hexdigest()
-            return http_get(path + "?" + query + "&signature=" + signature, {"X-MBX-APIKEY": self.key}, self.timeout)
+            return self.request_get(path + "?" + query + "&signature=" + signature, {"X-MBX-APIKEY": self.key}, self.timeout)
 
-        return self._retrying(once)
+        return self._retrying(once, attempts=self.attempts)
 
     @staticmethod
     def _retrying(attempt, attempts=3, pause_s=1.5):
