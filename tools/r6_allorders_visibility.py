@@ -387,7 +387,8 @@ def print_order_list(rows, stream):
 
 def select_order(rows):
     print_order_list(rows, sys.stderr)
-    print("Select an order by row number, or press Enter to cancel: ", end="", file=sys.stderr, flush=True)
+    print("Select an order by row number to check continued visibility, or press Enter to cancel: ",
+          end="", file=sys.stderr, flush=True)
     try:
         choice = input().strip()
     except (EOFError, KeyboardInterrupt):
@@ -491,10 +492,12 @@ def main(argv=None):
         report = collect_visibility(probe, symbol, order_id, args.duration_seconds, args.poll_interval_ms)
     if not args.place_testnet_order and args.order_id is None:
         report["selection"] = "recent_orders"
+        report["interval_ms"] = None
         # Selecting an order establishes that allOrders has already shown it once.
         if report["status"] != "stopped" and report["counts"]["missing"]:
             report["status"] = "nonmonotonic"
-            report["interval_ms"] = None
+        elif report["status"] == "bounded":
+            report["status"] = "already_visible"
     print(json.dumps(report, indent=2))
     return {"stopped": 3, "setup_failed": 4}.get(report["status"], 0)
 

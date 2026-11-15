@@ -128,7 +128,7 @@ To reuse a local credential file without passing `-CredentialsFile` each time, p
 & '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT
 ```
 
-An order selected from the list has already been observed in `allOrders`. To capture its first appearance, pass the numeric `orderId` from the exchange's order acknowledgment as soon as the order is accepted.
+An order selected from the list has already been observed in `allOrders`. Completed follow-up runs with hits and zero misses report `already_visible` and set `interval_ms` to `null`. To sample from acceptance, use `-PlaceTestnetOrder` or pass the numeric `orderId` as soon as the exchange acknowledges the order.
 
 ```powershell
 & '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT -OrderId 12345
@@ -171,3 +171,7 @@ The following offline example uses elapsed milliseconds from `t0` and a syntheti
 Sample A gives an observed transition interval of **210–841 ms**. Share the relative times, sample label, observation category, polling interval and sample counts. Retain the configured 120-second read allowance until the real samples have been reviewed. These intervals describe the observed reads. A finite set of samples cannot establish a service-wide upper bound.
 
 Check `-2026` separately using an order known to have been archived. Record the HTTP status and numeric error code if that case is observed. The archive case remains pending until a suitable Testnet order is available. [Binance archived-order error](https://developers.binance.com/en/docs/products/spot/errors#-2026-order_archived)
+
+### Read-only follow-up on 2026-11-15
+
+The operator selected an existing order from the Spot Testnet `allOrders` list. The 20-second follow-up returned six hits, zero misses, and zero inconclusive observations. The exchange-time readings around the first timed query were **24.241 and 26.278 seconds** after placement. Gaps between the exchange-time readings taken before successive queries ranged from **3.365 to 4.029 seconds** with a configured one-second polling interval. The run verifies continued visibility for the selected order. Sampling from acceptance is pending.
