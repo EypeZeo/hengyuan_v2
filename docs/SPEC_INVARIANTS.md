@@ -939,6 +939,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - 回归测试使用本地 TLS 服务模拟握手超时和断开、证书与主机名拒绝、响应中断、往返超过采样时限、HTTP 拒绝和无效 UID。完整流程确认重试后仍从原计时起点等待，且在 270 秒前不查订单。MSVC Release 完整构建通过，3,774 项测试通过、1 项跳过、3 项禁用。GCC 14.2 定向测试 252 项通过，ASan/UBSan 定向测试 62 项通过。
     - 结清工具在 Windows 交互控制台显示 `Confirm>`，回显输入并支持 Backspace 删除上一字符，包括跨行退格。确认最多等待五分钟，Enter 提交后仍逐字节精确匹配当轮完整确认行。退出码 57 说明失败原因，包括输入超时、内容不符、输入结束、输入过长或读取失败。
     - Windows 控制台离线验证使用隔离控制台的输入事件和屏幕缓冲区，五项测试通过后构建 Windows EXE。MSVC Release 完整测试 3,779 项通过、1 项跳过、3 项禁用。GCC 14.2 定向测试 218 项通过。
+    - 2026-11-15，Owner 在 Windows 上完成 Spot Testnet 结清演练。交易所时钟等待 271 秒，点查无此订单，订单历史与挂单查询均通过，人工确认后持久写入结清记录。复查未结清订单为零。归档响应和订单历史可见性仍待测量。[脱敏演练记录](NATIVE_EXIT_SAFETY_RUNBOOK.md#result-on-2026-11-15)
 
   - **[Q23 切片 S2/S3 已落地：读者先行——`OrderNeverSent` 帧与订单状态 `NeverSent`]**（`docs/NOTSENT_CLOSURE_DESIGN.md` §4.3、§4.6、§8；
     Owner 2026-11-12 看过计划说“开始，命名按你的建议”；Tier B）：“这个订单从未越过发送边界”的持久闭合帧，恢复读者现在能读、能校验，

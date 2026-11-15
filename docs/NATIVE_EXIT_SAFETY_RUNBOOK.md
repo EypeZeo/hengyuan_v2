@@ -104,3 +104,18 @@ The credentials file contains `HENGYUAN_OPERATOR_TESTNET_API_KEY` and `HENGYUAN_
 Measure order-list visibility separately using known Testnet orders. For each order, retain the last `allOrders` observation where it was absent and the first observation where it appeared. Record the exchange times around those queries, along with the order acceptance time and polling interval. Report the observed visibility intervals and sample count. Retain the configured 120-second read allowance until the measurements have been reviewed. One successful resolution does not measure visibility, and a finite sample does not establish a service-wide upper bound.
 
 For local verification, CTest's `R6PreparedDrill` runs both entry points against a fresh local directory and checks the resulting list. `RealToolTest.AnAbsentOrderIsResolvedWithTheOperatorKeyOverRealTls` exercises confirmation, append and recovery over a loopback exchange. The Testnet drill exercises the real read and resolution flow for the synthetic order. Measuring order-list visibility requires a separate run with known Testnet orders.
+
+### Result on 2026-11-15
+
+The operator completed the drill on Windows with a Spot Testnet account and a synthetic `Prepared` BTCUSDT order. The order generator had left one `Ambiguous` record in the rehearsal store.
+
+| Check | Observed result |
+| --- | --- |
+| Environment and account | Testnet, with matching account bindings in the store and exchange response |
+| Exchange-clock wait | 271 seconds from the first reading after acquiring the locks |
+| Order queries | Point lookup returned `NoSuchOrder`, one `allOrders` window was `Clear`, and `openOrders` was `Clear` |
+| Transport recovery | TLS handshake timeouts on the time, point and open-order requests recovered on retry |
+| Operator confirmation | The Windows console echoed the current confirmation line and accepted it |
+| Durable resolution and reopening | `Resolved (exit code 0)`. The subsequent `--list` reported `unresolved orders: 0` |
+
+An order that the exchange received is required to measure `allOrders` visibility. The visibility interval and the archived-order response `-2026` remain unmeasured.
