@@ -122,6 +122,8 @@ Use an order accepted by Spot Testnet and a separate read-only operator key for 
 
 Run the PowerShell entry point with its two companion Python files in the repository's `tools` directory. It requires PowerShell 7 and Python 3.8 or later. The default command lists up to ten recent orders for the symbol and asks which one to sample. Add `-ListOnly` to stop after listing.
 
+To reuse a local credential file without passing `-CredentialsFile` each time, put its absolute path alone in `tools/.env.r6-visibility-path`. Git ignores this path setting. Without the setting, the launcher looks for `.env.operator` in the current directory. An explicit `-CredentialsFile` overrides either default.
+
 ```powershell
 & '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT
 ```

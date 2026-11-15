@@ -8,13 +8,14 @@ Lists recent Binance Spot Testnet orders and samples allOrders visibility.
 Run this script with its Python sampler and the existing R6 probe in the same tools directory.
 Choose a recent order interactively or supply an order ID to sample directly.
 Use -ListOnly to display recent orders. Sampling prints a redacted JSON report.
+The default credentials path comes from .env.r6-visibility-path beside this script
+or from .env.operator in the working directory. -CredentialsFile overrides it.
 .EXAMPLE
 & '.\r6_allorders_visibility.ps1' -CredentialsFile '.env.operator' -Symbol BTCUSDT -OrderId 12345
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
     [string]$CredentialsFile,
 
@@ -42,8 +43,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
+if (-not $PSBoundParameters.ContainsKey('CredentialsFile')) {
+    $localPathSetting = Join-Path $PSScriptRoot '.env.r6-visibility-path'
+    if (Test-Path -LiteralPath $localPathSetting -PathType Leaf) {
+        $CredentialsFile = ([string](Get-Content -LiteralPath $localPathSetting -Raw -Encoding utf8)).Trim()
+        if (-not [IO.Path]::IsPathFullyQualified($CredentialsFile)) {
+            throw 'Set an absolute credentials file path in .env.r6-visibility-path.'
+        }
+    } else {
+        $CredentialsFile = '.env.operator'
+    }
+}
 if (-not (Test-Path -LiteralPath $CredentialsFile -PathType Leaf)) {
-    throw 'The specified Testnet credentials file is unavailable.'
+    throw 'The Testnet credentials file is unavailable. Set its path with -CredentialsFile.'
 }
 $credentialsPath = (Resolve-Path -LiteralPath $CredentialsFile).ProviderPath
 
