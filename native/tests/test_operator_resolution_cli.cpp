@@ -467,6 +467,116 @@ OperatorByteResult scripted_byte(void* user, std::chrono::milliseconds) noexcept
     return {OperatorByteStatus::Error};
 }
 
+#ifdef _WIN32
+struct WinConsoleSession {
+    using AllocConsoleWithOptionsFn = HRESULT(WINAPI*)(const void*, int*);
+
+    struct CompatibleAllocConsoleOptions {
+        int mode;
+        BOOL use_show_window;
+        WORD show_window;
+    };
+
+    WinConsoleSession() noexcept
+        : original_input(GetStdHandle(STD_INPUT_HANDLE)), original_output(GetStdHandle(STD_OUTPUT_HANDLE)),
+          original_error(GetStdHandle(STD_ERROR_HANDLE)), had_console(GetConsoleWindow() != nullptr) {
+        // Tests use their own console input buffer. No input event is ever written to the console inherited from the test runner.
+        FreeConsole();
+
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        const auto allocate_with_options = kernel == nullptr
+                                               ? nullptr
+                                               : reinterpret_cast<AllocConsoleWithOptionsFn>(
+                                                     GetProcAddress(kernel, "AllocConsoleWithOptions"));
+        if (allocate_with_options != nullptr) {
+            const CompatibleAllocConsoleOptions options{2, FALSE, SW_HIDE};  // ALLOC_CONSOLE_MODE_NO_WINDOW
+            int allocation_result = 0;
+            allocated = SUCCEEDED(allocate_with_options(&options, &allocation_result)) && allocation_result == 1;
+        }
+        if (!allocated) {
+            allocated = AllocConsole() != 0;
+            if (allocated) {
+                if (HWND window = GetConsoleWindow(); window != nullptr) ShowWindow(window, SW_HIDE);
+            }
+        }
+        if (!allocated) return;
+
+        input = CreateFileW(L"CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            OPEN_EXISTING, 0, nullptr);
+        output = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             OPEN_EXISTING, 0, nullptr);
+        DWORD input_mode = 0;
+        DWORD output_mode = 0;
+        valid = input != INVALID_HANDLE_VALUE && output != INVALID_HANDLE_VALUE &&
+                GetConsoleMode(input, &input_mode) != 0 && GetConsoleMode(output, &output_mode) != 0 && clear_screen() &&
+                SetStdHandle(STD_INPUT_HANDLE, input) != 0 && SetStdHandle(STD_OUTPUT_HANDLE, output) != 0;
+    }
+
+    ~WinConsoleSession() {
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+        if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+        if (allocated) FreeConsole();
+        if (had_console) AttachConsole(ATTACH_PARENT_PROCESS);
+        SetStdHandle(STD_INPUT_HANDLE, original_input);
+        SetStdHandle(STD_OUTPUT_HANDLE, original_output);
+        SetStdHandle(STD_ERROR_HANDLE, original_error);
+    }
+
+    WinConsoleSession(const WinConsoleSession&) = delete;
+    WinConsoleSession& operator=(const WinConsoleSession&) = delete;
+
+    bool clear_screen() const noexcept {
+        CONSOLE_SCREEN_BUFFER_INFO screen{};
+        if (!GetConsoleScreenBufferInfo(output, &screen)) return false;
+        const DWORD cells = static_cast<DWORD>(screen.dwSize.X) * static_cast<DWORD>(screen.dwSize.Y);
+        DWORD written = 0;
+        if (!FillConsoleOutputCharacterW(output, L' ', cells, COORD{0, 0}, &written) || written != cells) return false;
+        return SetConsoleCursorPosition(output, COORD{0, 0}) != 0;
+    }
+
+    bool write_key(wchar_t character, WORD virtual_key = 0, WORD repeat = 1) const noexcept {
+        INPUT_RECORD record{};
+        record.EventType = KEY_EVENT;
+        record.Event.KeyEvent.bKeyDown = TRUE;
+        record.Event.KeyEvent.wRepeatCount = repeat;
+        record.Event.KeyEvent.wVirtualKeyCode = virtual_key;
+        record.Event.KeyEvent.wVirtualScanCode = 0;
+        record.Event.KeyEvent.uChar.UnicodeChar = character;
+        record.Event.KeyEvent.dwControlKeyState = 0;
+        DWORD written = 0;
+        return WriteConsoleInputW(input, &record, 1, &written) != 0 && written == 1;
+    }
+
+    bool write_text(std::wstring_view text) const noexcept {
+        for (const wchar_t character : text) {
+            if (!write_key(character)) return false;
+        }
+        return true;
+    }
+
+    std::wstring read_row(SHORT row) const {
+        CONSOLE_SCREEN_BUFFER_INFO screen{};
+        if (!GetConsoleScreenBufferInfo(output, &screen) || row < 0 || row >= screen.dwSize.Y) return {};
+        std::wstring result(static_cast<std::size_t>(screen.dwSize.X), L'\0');
+        DWORD read = 0;
+        if (!ReadConsoleOutputCharacterW(output, result.data(), static_cast<DWORD>(result.size()), COORD{0, row}, &read) ||
+            read != result.size()) {
+            return {};
+        }
+        return result;
+    }
+
+    HANDLE original_input{INVALID_HANDLE_VALUE};
+    HANDLE original_output{INVALID_HANDLE_VALUE};
+    HANDLE original_error{INVALID_HANDLE_VALUE};
+    HANDLE input{INVALID_HANDLE_VALUE};
+    HANDLE output{INVALID_HANDLE_VALUE};
+    bool had_console{false};
+    bool allocated{false};
+    bool valid{false};
+};
+#endif
+
 }  // namespace
 
 TEST(StdConsole, WritesOnePrintableAsciiLinePerCallAndReplacesEverythingElse) {
@@ -588,6 +698,123 @@ TEST(StdConsole, ACarriageReturnEndsTheLineAndEveryOtherWayOfNotGettingOneIsRepo
         EXPECT_EQ(console.read_line(std::chrono::minutes{6}).status, OperatorInputStatus::Error) << "the reader caps a human's wait at five minutes";
     }
 }
+
+#ifdef _WIN32
+TEST(StdConsoleWindows, DefaultStdoutRouteEchoesAndEditsWithinAnIsolatedConsole) {
+    WinConsoleSession console;
+    ASSERT_TRUE(console.valid);
+    const std::wstring expected = L"Confirm> CONFIRM";
+    ASSERT_TRUE(console.write_text(L"CONFIRN"));
+    ASSERT_TRUE(console.write_key(L'\b', VK_BACK));
+    ASSERT_TRUE(console.write_key(L'M'));
+    ASSERT_TRUE(console.write_key(L'\r', VK_RETURN));
+
+    DWORD original_mode = 0;
+    ASSERT_TRUE(GetConsoleMode(console.output, &original_mode));
+    original_mode &= ~static_cast<DWORD>(ENABLE_WRAP_AT_EOL_OUTPUT);
+    ASSERT_TRUE(SetConsoleMode(console.output, original_mode));
+    StdConsole reader(stdout);
+    const OperatorLineResult result = reader.read_line(std::chrono::seconds{2});
+
+    ASSERT_EQ(result.status, OperatorInputStatus::Line);
+    EXPECT_EQ(result.line(), "CONFIRM");
+    const std::wstring row = console.read_row(0);
+    ASSERT_GE(row.size(), expected.size() + 1);
+    EXPECT_EQ(row.substr(0, expected.size()), expected) << "typed text is visible and Backspace removed the prior character";
+    EXPECT_EQ(row[expected.size()], L' ') << "the corrected character left no visible residue";
+    DWORD restored_mode = 0;
+    ASSERT_TRUE(GetConsoleMode(console.output, &restored_mode));
+    EXPECT_EQ(restored_mode, original_mode) << "the temporary output mode is restored";
+}
+
+TEST(StdConsoleWindows, DirectReaderReturnsAnUnmatchedLineAndSanitizesNonAsciiInput) {
+    {
+        WinConsoleSession console;
+        ASSERT_TRUE(console.valid);
+        ASSERT_TRUE(console.write_text(L"CONFIRM "));
+        ASSERT_TRUE(console.write_key(L'\r', VK_RETURN));
+        const auto result = cli_detail::read_windows_confirmation_line(console.input, console.output, std::chrono::seconds{2});
+        ASSERT_EQ(result.status, OperatorInputStatus::Line);
+        EXPECT_EQ(result.line(), "CONFIRM ");
+        EXPECT_NE(result.line(), "CONFIRM") << "the trailing space remains part of the operator's answer";
+    }
+    {
+        WinConsoleSession console;
+        ASSERT_TRUE(console.valid);
+        ASSERT_TRUE(console.write_key(L'a', 0, 3));
+        ASSERT_TRUE(console.write_key(L'\u00e9'));
+        ASSERT_TRUE(console.write_key(L'\r', VK_RETURN));
+        const auto result = cli_detail::read_windows_confirmation_line(console.input, console.output, std::chrono::seconds{2});
+        ASSERT_EQ(result.status, OperatorInputStatus::Line);
+        ASSERT_EQ(result.size, 4u);
+        EXPECT_EQ(result.line().substr(0, 3), "aaa") << "a repeated-key event contributes every character";
+        EXPECT_EQ(result.line()[3], '\0') << "non-ASCII input remains a mismatch sentinel";
+        const std::wstring row = console.read_row(0);
+        EXPECT_EQ(row.substr(0, 13), L"Confirm> aaa?") << "non-ASCII text is visibly sanitized";
+    }
+}
+
+TEST(StdConsoleWindows, TimeoutAndInputFailureAreReportedWithoutReadingAnotherConsole) {
+    WinConsoleSession console;
+    ASSERT_TRUE(console.valid);
+    DWORD original_mode = 0;
+    ASSERT_TRUE(GetConsoleMode(console.output, &original_mode));
+    original_mode &= ~static_cast<DWORD>(ENABLE_WRAP_AT_EOL_OUTPUT);
+    ASSERT_TRUE(SetConsoleMode(console.output, original_mode));
+
+    const auto timeout = cli_detail::read_windows_confirmation_line(console.input, console.output, std::chrono::milliseconds{40});
+    EXPECT_EQ(timeout.status, OperatorInputStatus::Timeout);
+    DWORD restored_mode = 0;
+    ASSERT_TRUE(GetConsoleMode(console.output, &restored_mode));
+    EXPECT_EQ(restored_mode, original_mode);
+
+    const auto error = cli_detail::read_windows_confirmation_line(INVALID_HANDLE_VALUE, console.output, std::chrono::milliseconds{100});
+    EXPECT_EQ(error.status, OperatorInputStatus::Error);
+    ASSERT_TRUE(GetConsoleMode(console.output, &restored_mode));
+    EXPECT_EQ(restored_mode, original_mode);
+}
+
+TEST(StdConsoleWindows, ExcessCharactersAreRejectedUnlessBackspaceRemovesThem) {
+    WinConsoleSession console;
+    ASSERT_TRUE(console.valid);
+    constexpr auto excess_length = static_cast<WORD>(kConfirmationLineMaxBytes + 1);
+    ASSERT_TRUE(console.write_key(L'x', 0, excess_length));
+    ASSERT_TRUE(console.write_key(L'\r', VK_RETURN));
+    const auto overlong = cli_detail::read_windows_confirmation_line(console.input, console.output, std::chrono::seconds{2});
+    EXPECT_EQ(overlong.status, OperatorInputStatus::TooLong);
+
+    ASSERT_TRUE(console.write_key(L'x', 0, excess_length));
+    ASSERT_TRUE(console.write_key(L'\b', VK_BACK));
+    ASSERT_TRUE(console.write_key(L'\r', VK_RETURN));
+    const auto corrected = cli_detail::read_windows_confirmation_line(console.input, console.output, std::chrono::seconds{2});
+    ASSERT_EQ(corrected.status, OperatorInputStatus::Line);
+    EXPECT_EQ(corrected.line(), std::string(kConfirmationLineMaxBytes, 'x'));
+}
+
+TEST(StdConsoleWindows, BackspaceErasesACharacterAfterTheConsoleWrapsAtTheLastColumn) {
+    WinConsoleSession console;
+    ASSERT_TRUE(console.valid);
+    CONSOLE_SCREEN_BUFFER_INFO screen{};
+    ASSERT_TRUE(GetConsoleScreenBufferInfo(console.output, &screen));
+    constexpr std::size_t prompt_length = std::wstring_view(L"Confirm> ").size();
+    const std::size_t width = static_cast<std::size_t>(screen.dwSize.X);
+    if (width <= prompt_length + 1 || width - prompt_length > kConfirmationLineMaxBytes) {
+        GTEST_SKIP() << "the active console buffer does not provide a useful wrap column";
+    }
+    ASSERT_TRUE(console.write_text(std::wstring(width - prompt_length, L'a')));
+    ASSERT_TRUE(console.write_key(L'\b', VK_BACK));
+    ASSERT_TRUE(console.write_key(L'\r', VK_RETURN));
+
+    const auto result = cli_detail::read_windows_confirmation_line(console.input, console.output, std::chrono::seconds{2});
+    ASSERT_EQ(result.status, OperatorInputStatus::Line);
+    ASSERT_EQ(result.size, width - prompt_length - 1);
+    EXPECT_EQ(result.line(), std::string(result.size, 'a'));
+    const std::wstring first_row = console.read_row(0);
+    ASSERT_GE(first_row.size(), width);
+    EXPECT_EQ(first_row.substr(0, width), L"Confirm> " + std::wstring(result.size, L'a') + L" ")
+        << "Backspace erased the last column after input advanced to the next row";
+}
+#endif
 
 // ============================================================ 3. the evidence directory ==============================================================
 

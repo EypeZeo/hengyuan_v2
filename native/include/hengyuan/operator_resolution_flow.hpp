@@ -345,6 +345,25 @@ inline std::string binding_line(const StoreBindingRead& b) {
     return "store binding: none -- a legacy store, so this tool cannot check that it was written for this environment and account";
 }
 
+constexpr std::string_view confirmation_failure_message(const OperatorLineResult& line) noexcept {
+    switch (line.status) {
+        case OperatorInputStatus::Line:
+            return line.line().empty()
+                       ? "not confirmed: the confirmation line was empty. No resolution was written."
+                       : "not confirmed: the line does not match the displayed phrase. No resolution was written.";
+        case OperatorInputStatus::Timeout:
+            return "not confirmed: confirmation timed out. No resolution was written.";
+        case OperatorInputStatus::EndOfInput:
+            return "not confirmed: confirmation input ended. No resolution was written.";
+        case OperatorInputStatus::TooLong:
+            return "not confirmed: confirmation line is too long. No resolution was written.";
+        case OperatorInputStatus::AlreadyRead:
+        case OperatorInputStatus::Error:
+            return "not confirmed: could not read confirmation input. No resolution was written.";
+    }
+    return "not confirmed: could not read confirmation input. No resolution was written.";
+}
+
 }  // namespace detail
 
 // The tool's environment names against the store's. An out-of-range value (the request check refuses it first) maps to no environment.
@@ -625,6 +644,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     const ConfirmationPhrase phrase = make_confirmation_phrase(challenge);
     if (!phrase.valid) {
         out.confirmation.verdict = ConfirmationVerdict::InvalidPhrase;
+        console.write_line("not confirmed: could not create the confirmation phrase. No resolution was written.");
         return stop(ResolveStatus::NotConfirmed);
     }
     console.write_line("To resolve this order as ABSENT type exactly this line and press Enter:");
@@ -632,7 +652,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     const OperatorLineResult line = console.read_line(req.confirm_timeout);
     out.confirmation = judge_confirmation(phrase, line);
     if (out.confirmation.verdict != ConfirmationVerdict::Confirmed) {
-        console.write_line("not confirmed: nothing was written");
+        console.write_line(detail::confirmation_failure_message(line));
         return stop(ResolveStatus::NotConfirmed);
     }
 

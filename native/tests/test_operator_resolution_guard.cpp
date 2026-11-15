@@ -850,12 +850,15 @@ TEST(OperatorResolutionGuard, TheBoostFreeHeadersOfTheToolHaveAnExactIncludeList
                                         "#include <span>", "#include <string>", "#include <string_view>",
                                         "#include <hengyuan/operator_resolution_confirmation.hpp>"}))
         << "an include added here must be argued for: this header parses a command line and does nothing else";
+    // The bounded Windows console editor uses a fixed echo buffer, standard algorithms, and Win32 input and screen buffers.
     EXPECT_EQ(include_lines(terminal->code),
-              (std::vector<std::string>{"#include <chrono>", "#include <cstddef>", "#include <cstdio>", "#include <filesystem>", "#include <string>",
+              (std::vector<std::string>{"#include <algorithm>", "#include <array>", "#include <chrono>", "#include <cstddef>", "#include <cstdint>",
+                                        "#include <cstdio>", "#include <filesystem>", "#include <string>",
                                         "#include <string_view>", "#include <system_error>", "#include <utility>",
                                         "#include <hengyuan/durable_audit_export.hpp>", "#include <hengyuan/operator_input_reader.hpp>",
                                         "#include <hengyuan/operator_resolution_confirmation.hpp>",
-                                        "#include <hengyuan/operator_resolution_ports.hpp>", "#include <fcntl.h>", "#include <unistd.h>"}))
+                                        "#include <hengyuan/operator_resolution_ports.hpp>", "#include <windows.h>", "#include <fcntl.h>",
+                                        "#include <unistd.h>"}))
         << "an include added here must be argued for: this header moves bytes to a terminal and a directory";
     EXPECT_EQ(include_lines(tool->code),
               (std::vector<std::string>{"#include <array>", "#include <chrono>", "#include <cstddef>", "#include <cstdint>",
