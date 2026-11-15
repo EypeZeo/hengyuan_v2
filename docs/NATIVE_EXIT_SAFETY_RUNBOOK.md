@@ -120,6 +120,43 @@ The operator completed the drill on Windows with a Spot Testnet account and a sy
 
 Use an order accepted by Spot Testnet and a separate read-only operator key for the same account. Record the exchange's order placement time as `t0` in milliseconds. Keep the symbol and order identifiers locally. Record the intended polling interval and observation deadline before collecting samples. Start polling promptly after acceptance and record the actual gap between observations. [Spot Testnet REST documentation](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#all-orders-user_data)
 
+Run the PowerShell entry point with its two companion Python files in the repository's `tools` directory. It requires PowerShell 7 and Python 3.8 or later. The default command lists up to ten recent orders for the symbol and asks which one to sample. Add `-ListOnly` to stop after listing.
+
+To reuse a local credential file without passing `-CredentialsFile` each time, put its absolute path alone in `tools/.env.r6-visibility-path`. Git ignores this path setting. Without the setting, the launcher looks for `.env.operator` in the current directory. An explicit `-CredentialsFile` overrides either default.
+
+```powershell
+& '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT
+```
+
+An order selected from the list has already been observed in `allOrders`. Completed follow-up runs with hits and zero misses report `already_visible` and set `interval_ms` to `null`. To sample from acceptance, use `-PlaceTestnetOrder` or pass the numeric `orderId` as soon as the exchange acknowledges the order.
+
+```powershell
+& '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT -OrderId 12345
+```
+
+When sampling an existing order, the script reads the original placement time from `GET /api/v3/order` and verifies the symbol and order ID.
+
+To submit and sample in one run, generate a separate HMAC key for the same Spot Testnet account. It needs `TRADE` to submit and `USER_DATA` to verify the account. Store it in a separate local UTF-8 file with the following entries. The existing operator key continues to handle the sampling reads. [Binance Spot Test Network](https://testnet.binance.vision/) [Testnet request security](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#request-security)
+
+```dotenv
+HENGYUAN_R6_TESTNET_TRADE_API_KEY=<Testnet TRADE API key>
+HENGYUAN_R6_TESTNET_TRADE_API_SECRET=<Testnet TRADE API secret>
+```
+
+```powershell
+$order = @{
+    Symbol = 'BTCUSDT'
+    Side = Read-Host 'Side (BUY or SELL)'
+    Price = Read-Host 'Limit price'
+    Quantity = Read-Host 'Order quantity in BTC'
+}
+& '.\tools\r6_allorders_visibility.ps1' -PlaceTestnetOrder -TradeCredentialsFile 'D:\TestNet\.env.r6-trade' @order
+```
+
+The script compares the UIDs reported for the two keys before submitting a single `LIMIT_MAKER` order to Spot Testnet. An acknowledgment supplies `orderId` and the placement time `transactTime`. If the outcome is unknown, the script makes up to three read-only queries using the original client order ID. If it still cannot verify the outcome, check that ID in Testnet before running another placement. The script leaves management of the Testnet order to the operator. Keep terminal messages with order identifiers local.
+
+The default sampling window is 20 seconds with a one-second polling interval and a five-second timeout per request. Use `-DurationSeconds`, `-PollIntervalMs` and `-TimeoutSeconds` to reproduce a sampling setup. If you need an explicit CA bundle, pass `-CaBundle`. The JSON report contains relative times, statuses and observation counts for sharing. Exit code 3 means a backoff response stopped the run. Exit code 4 means preparation failed. Exit code 5 means order submission was rejected or its outcome could not be verified.
+
 1. For each observation, read `GET /api/v3/time`, call `GET /api/v3/allOrders` for the symbol and a time window covering the order, then read `GET /api/v3/time` again. Record both exchange times and match the returned order by symbol and order identifier. [Spot Testnet server time](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#check-server-time)
 2. Mark the order as missing only for a valid, complete HTTP 200 order list. Mark failed requests, saturated pages, and unusable time brackets as inconclusive. Stop the run on HTTP 403, 418 or 429. If a later valid poll loses an order that was previously visible, report that sequence separately.
 3. Report the interval from the **before-query** time of the last valid miss to the **after-query** time of the first valid hit, relative to `t0`. Use zero as the lower bound if the first valid poll already found the order. If the deadline passes with valid misses and zero hits, report the last lower bound with the upper bound open. Record inconclusive runs separately.
@@ -133,4 +170,35 @@ The following offline example uses elapsed milliseconds from `t0` and a syntheti
 
 Sample A gives an observed transition interval of **210–841 ms**. Share the relative times, sample label, observation category, polling interval and sample counts. Retain the configured 120-second read allowance until the real samples have been reviewed. These intervals describe the observed reads. A finite set of samples cannot establish a service-wide upper bound.
 
-Check `-2026` separately using an order known to have been archived. Record the HTTP status and numeric error code if that case is observed. The archive case remains pending until a suitable Testnet order is available. [Binance archived-order error](https://developers.binance.com/en/docs/products/spot/errors#-2026-order_archived)
+### Read-only follow-up on 2026-11-15
+
+The operator selected an existing order from the Spot Testnet `allOrders` list. The 20-second follow-up returned six hits, zero misses, and zero inconclusive observations. The exchange-time readings around the first timed query were **24.241 and 26.278 seconds** after placement. Gaps between the exchange-time readings taken before successive queries ranged from **3.365 to 4.029 seconds** with a configured one-second polling interval. The run verifies continued visibility for the selected order.
+
+### Sampling from order acceptance on 2026-11-15
+
+The operator submitted a Spot Testnet `LIMIT_MAKER` order and started `allOrders` sampling from the exchange-reported acceptance time. The saved report has `selection: new_order` and `status: bounded`.
+
+| Measurement | Result |
+| --- | --- |
+| Sampling duration and configured polling interval | 20 seconds and 1,000 ms |
+| First valid query | Found, bracketed by exchange times 1,566 and 4,088 ms after acceptance |
+| Visibility interval for this order | 0–4,088 ms. The first valid query found the order, so there is no observed lower bound above zero. |
+| Observation counts | 5 found, 0 missing, 1 inconclusive |
+| Gaps between pre-query exchange-time readings | 3,165–3,935 ms |
+| Final observation | The sampling deadline expired before the post-query exchange-time read at stage `after_time`. |
+
+The read allowance is 120 seconds.
+
+### Checking the archived-order response
+
+Binance documents `-2026 ORDER_ARCHIVED` for unfilled orders canceled or expired more than 90 days ago that have been archived. Spot Testnet resets its order data approximately monthly, so a newly canceled Testnet order is unlikely to remain available long enough for this check. [Spot Testnet error codes](https://developers.binance.com/en/docs/products/spot/testnet/errors#-2026-order_archived) [Spot Test Network reset FAQ](https://testnet.binance.vision/)
+
+If a suitable order from the operator's Testnet account is available, run the read-only sampler from the repository root with that order's symbol and numeric `orderId`.
+
+```powershell
+$symbol = Read-Host 'Spot Testnet symbol'
+$orderId = [long](Read-Host 'Numeric orderId for the archived order')
+& '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol $symbol -OrderId $orderId
+```
+
+Record the report's `problem.http_status` and `problem.exchange_code` from stage `order`. The sampler exits with code 4 on these point-query errors. Record `-2013` separately as a no-such-order response. The resolver classifies `-2026` as an archived order and refuses an `ABSENT` resolution. Simulated responses cover both codes. Direct Testnet observation of `-2026` is pending.
