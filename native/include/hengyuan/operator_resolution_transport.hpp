@@ -25,8 +25,8 @@
 //     operator sat on a prompt for long; when the client says ClockNotFresh the port takes one new reading (GET /api/v3/time, which is
 //     what publishes the snapshot) and repeats the request ONCE. Nothing was signed or sent before that, so nothing is repeated on the
 //     exchange.
-//   * A clock read makes at most three paced attempts. Transport interruptions and slow round trips are retryable.
-//     A rejected response or a failed TLS handshake ends the read. Each failure reports its stage without response content.
+//   * A clock read makes at most three paced attempts for transient transport errors or slow round trips. A signed read
+//     retries only transient failures before its TLS handshake completes. Each failure reports its stage without response content.
 //
 // summarize_account() turns the account answer into the two things the flow uses -- the uid it cross-checks against the one the operator
 // stated, and ONE line of printable ASCII for the operator's eyes -- without ever passing a piece of the response through.
@@ -242,34 +242,63 @@ public:
 
     // GET /api/v3/time. This also publishes the client's clock-offset snapshot, which every signed read below needs.
     std::optional<ExchangeMs> server_time() override {
-        if (halted_) return std::nullopt;
+        if (report_if_halted("/api/v3/time")) return std::nullopt;
         std::int64_t ms = 0;
         if (!read_time(ms)) return std::nullopt;
         return ExchangeMs{ms};
     }
 
     HttpRead query_order(std::string_view symbol, std::string_view client_order_id) override {
-        return signed_read([&](RawHttpAnswer& out) { return client_.fetch_order_raw(symbol, client_order_id, out); });
+        return signed_read("/api/v3/order", [&](RawHttpAnswer& out, RestReadDiagnostics& details) {
+            return client_.fetch_order_raw(symbol, client_order_id, out, &details);
+        });
     }
 
     HttpRead all_orders(std::string_view symbol, ExchangeMs start, ExchangeMs end, std::size_t limit) override {
-        return signed_read([&](RawHttpAnswer& out) { return client_.fetch_all_orders_raw(symbol, start.count(), end.count(), limit, out); });
+        return signed_read("/api/v3/allOrders", [&](RawHttpAnswer& out, RestReadDiagnostics& details) {
+            return client_.fetch_all_orders_raw(symbol, start.count(), end.count(), limit, out, &details);
+        });
     }
 
     HttpRead open_orders() override {
-        return signed_read([&](RawHttpAnswer& out) { return client_.fetch_open_orders_raw(out); });
+        return signed_read("/api/v3/openOrders", [&](RawHttpAnswer& out, RestReadDiagnostics& details) {
+            return client_.fetch_open_orders_raw(out, &details);
+        });
     }
 
     AccountView account() override {
-        const HttpRead r = signed_read([&](RawHttpAnswer& out) { return client_.fetch_account_raw(out); });
+        constexpr std::string_view path = "/api/v3/account";
+        const HttpRead r = signed_read(path, [&](RawHttpAnswer& out, RestReadDiagnostics& details) {
+            return client_.fetch_account_raw(out, &details);
+        });
         if (!r.transport_ok || r.http_status != 200) return AccountView{};
-        return summarize_account(r.body);
+        AccountView account = summarize_account(r.body);
+        if (!account.uid) report(path, "HTTP 200 without a valid UID");
+        return account;
     }
 
     // Has the exchange told this port to stop (429, 418, 403)? From then on every request fails as not completed, without being sent.
-    bool halted() const noexcept { return halted_; }
+    bool halted() const noexcept { return halt_status_ != 0; }
 
 private:
+    static constexpr int kMaxAttempts = 3;
+
+    void report(std::string_view path, std::string_view message) {
+        if (diagnostics_) diagnostics_->write_line("GET " + std::string(path) + ": " + std::string(message));
+    }
+
+    bool report_if_halted(std::string_view path) {
+        if (!halted()) return false;
+        report(path, "requests stopped after HTTP " + std::to_string(halt_status_));
+        return true;
+    }
+
+    void halt_on_http_status(std::string_view path, std::uint16_t status) {
+        if (!is_back_off_status(status)) return;
+        halt_status_ = status;
+        report(path, "HTTP " + std::to_string(status) + "; no further requests will be sent in this run");
+    }
+
     // The gap between two requests: slept before a request when one went out since the last gap, never before the first.
     void wait_gap() {
         if (!gap_pending_) return;
@@ -287,7 +316,26 @@ private:
         if (details.malformed_http) return false;
         if (details.rejected_round_trip_ms) return *details.rejected_round_trip_ms > kMaxUsableRttMs;
         return error == PrivateRestError::Resolve || error == PrivateRestError::Connect ||
-               error == PrivateRestError::Write || error == PrivateRestError::Read;
+               error == PrivateRestError::Write || error == PrivateRestError::Read ||
+               retryable_tls_error(error, details);
+    }
+
+    static bool retryable_tls_error(PrivateRestError error, const RestReadDiagnostics& details) noexcept {
+        return error == PrivateRestError::TlsHandshake &&
+               (details.tls_failure == TlsHandshakeFailure::Timeout || details.tls_failure == TlsHandshakeFailure::Interrupted);
+    }
+
+    static std::string describe_tls_error(const RestReadDiagnostics& details) {
+        switch (details.tls_failure) {
+            case TlsHandshakeFailure::Timeout: return "TLS handshake timed out";
+            case TlsHandshakeFailure::Interrupted: return "TLS handshake connection interrupted (" + details.tls_error.message() + ")";
+            case TlsHandshakeFailure::CertificateRejected:
+                return "TLS certificate verification failed (" +
+                      std::string(X509_verify_cert_error_string(details.tls_verify_result)) + ")";
+            case TlsHandshakeFailure::Other: return "TLS handshake failed (" + details.tls_error.message() + ")";
+            case TlsHandshakeFailure::None: return "TLS handshake setup failed";
+        }
+        return "TLS handshake failed";
     }
 
     static std::string describe_time_error(PrivateRestError error, const ServerTimeReadDiagnostics& details) {
@@ -297,10 +345,14 @@ private:
             return "clock sample rejected: round trip " + std::to_string(*details.rejected_round_trip_ms) +
                    " ms (allowed 0 to " + std::to_string(kMaxUsableRttMs) + " ms)";
         }
+        return describe_rest_error(error, details);
+    }
+
+    static std::string describe_rest_error(PrivateRestError error, const RestReadDiagnostics& details) {
         switch (error) {
             case PrivateRestError::Resolve: return "DNS lookup failed";
             case PrivateRestError::Connect: return "Connect failed";
-            case PrivateRestError::TlsHandshake: return "TLS handshake failed";
+            case PrivateRestError::TlsHandshake: return describe_tls_error(details);
             case PrivateRestError::Write: return "Write failed";
             case PrivateRestError::Read: return "Read failed";
             case PrivateRestError::HttpStatus: return "unexpected HTTP status";
@@ -308,53 +360,69 @@ private:
             case PrivateRestError::ClockSkewTooLarge: return "ClockSkewTooLarge: exchange and local clocks differ too much";
             case PrivateRestError::RateLimitExhausted: return "local rate limit reached";
             case PrivateRestError::InvalidConfig: return "invalid REST configuration";
+            case PrivateRestError::ClockNotFresh: return "signing clock is not fresh";
+            case PrivateRestError::SigningFailed: return "request signing failed";
             default: return "REST error " + std::to_string(static_cast<int>(error));
         }
     }
 
     bool read_time(std::int64_t& ms) {
-        constexpr int kMaxAttempts = 3;
+        constexpr std::string_view path = "/api/v3/time";
         for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
             wait_gap();
             ServerTimeReadDiagnostics details;
             const PrivateRestError error = client_.read_server_time(ms, &details);
             if (went_out(error)) gap_pending_ = true;
             if (error == PrivateRestError::None) return true;
-            if (is_back_off_status(details.http_status)) halted_ = true;
+            halt_on_http_status(path, details.http_status);
+            if (halted()) return false;
 
-            const bool retry = !halted_ && attempt < kMaxAttempts && retryable_time_error(error, details);
-            if (diagnostics_) {
-                diagnostics_->write_line("GET /api/v3/time: " + describe_time_error(error, details) +
-                                         " (attempt " + std::to_string(attempt) + "/" + std::to_string(kMaxAttempts) +
-                                         ")" + (retry ? ", retrying" : ", stopping"));
-            }
+            const bool retry = attempt < kMaxAttempts && retryable_time_error(error, details);
+            report_attempt(path, describe_time_error(error, details), attempt, retry);
             if (!retry) return false;
         }
         return false;
     }
 
+    void report_attempt(std::string_view path, std::string_view error, int attempt, bool retry) {
+        report(path, std::string(error) + " (attempt " + std::to_string(attempt) + "/" +
+                     std::to_string(kMaxAttempts) + ")" + (retry ? ", retrying" : ", stopping"));
+    }
+
     template <class Call>
-    HttpRead signed_read(Call&& call) {
-        if (halted_) return HttpRead{};
-        for (int attempt = 0; attempt < 2; ++attempt) {
+    HttpRead signed_read(std::string_view path, Call&& call) {
+        if (report_if_halted(path)) return HttpRead{};
+        bool clock_refreshed = false;
+        int attempt = 1;
+        for (;;) {
             wait_gap();
             RawHttpAnswer answer;
-            const PrivateRestError e = call(answer);
+            RestReadDiagnostics details;
+            const PrivateRestError e = call(answer, details);
             if (went_out(e)) gap_pending_ = true;
+            halt_on_http_status(path, details.http_status);
             if (e == PrivateRestError::None) {
-                if (is_back_off_status(answer.http_status)) halted_ = true;
-                HttpRead r;
-                r.transport_ok = true;
-                r.http_status = answer.http_status;
-                r.body = std::move(answer.body);
-                return r;
+                if (diagnostics_ && !halted() && answer.http_status != 200) {
+                    const bool missing_order = path == "/api/v3/order" && answer.http_status == 400 &&
+                        classify_point_query(answer.http_status, answer.body) == PointQueryVerdict::NoSuchOrder;
+                    if (!missing_order) report(path, "HTTP " + std::to_string(answer.http_status));
+                }
+                return HttpRead{true, answer.http_status, std::move(answer.body)};
             }
-            if (e != PrivateRestError::ClockNotFresh || attempt != 0) return HttpRead{};
-            // The snapshot aged out between two requests and nothing was signed or sent: take a new one, then repeat the request once.
-            std::int64_t ignored = 0;
-            if (!read_time(ignored)) return HttpRead{};
+            if (e == PrivateRestError::ClockNotFresh && !clock_refreshed) {
+                clock_refreshed = true;
+                report(path, "signing clock is not fresh; refreshing once");
+                std::int64_t ignored = 0;
+                if (!read_time(ignored)) return HttpRead{};
+                continue;
+            }
+            const bool retry = !halted() && attempt < kMaxAttempts && retryable_tls_error(e, details);
+            std::string error = describe_rest_error(e, details);
+            if (details.http_status != 0) error += " (HTTP " + std::to_string(details.http_status) + ")";
+            report_attempt(path, error, attempt, retry);
+            if (!retry) return HttpRead{};
+            ++attempt;
         }
-        return HttpRead{};
     }
 
     BinancePrivateRestClient& client_;
@@ -362,7 +430,7 @@ private:
     std::chrono::milliseconds spacing_;
     ConsolePort* diagnostics_;
     bool gap_pending_{false};
-    bool halted_{false};
+    std::uint16_t halt_status_{0};
 };
 
 }  // namespace hy::operator_resolution

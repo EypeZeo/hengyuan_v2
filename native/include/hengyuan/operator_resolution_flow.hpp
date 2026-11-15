@@ -428,7 +428,7 @@ inline OperatorResolutionOutcome resolve_order(OperatorSession& session, const O
     const AccountView account = exchange.account();
     out.exchange_account_uid = account.uid;
     if (!account.uid) {
-        console.write_line("the exchange did not report the uid of the account this API key belongs to: nothing was written");
+        console.write_line("could not verify the account UID for this API key: nothing was written");
         return stop(ResolveStatus::AccountUnverified);
     }
     if (*account.uid != req.account_uid) {

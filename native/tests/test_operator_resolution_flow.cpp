@@ -1630,7 +1630,7 @@ TEST_F(FlowTest, AnAccountTheExchangeDoesNotNameIsRefusedBeforeAnyWaitWhateverEl
     const OperatorResolutionOutcome o = resolve_order(session, request(kA));
     EXPECT_EQ(o.status, ResolveStatus::AccountUnverified) << resolve_status_name(o.status);
     EXPECT_FALSE(o.exchange_account_uid.has_value());
-    EXPECT_TRUE(rig_->console.printed("the exchange did not report the uid of the account this API key belongs to: nothing was written"));
+    EXPECT_TRUE(rig_->console.printed("could not verify the account UID for this API key: nothing was written"));
     EXPECT_REFUSED_AT_THE_ACCOUNT_CHECK();
 }
 

@@ -76,8 +76,9 @@ enum class TrustStoreCheck : std::uint8_t {
 class RealExchangeProvider final : public ExchangeProvider {
 public:
     // `client_config`: the client's network timeouts and port (PrivateRestConfig). The HOST is not part of it -- it is the environment's, from
-    // the binding -- and main() passes the default; a test passes the port of its local exchange.
-    explicit RealExchangeProvider(PrivateRestConfig client_config = {}, TrustStoreCheck trust_store = TrustStoreCheck::Required)
+    // the binding -- and a test can pass the port of its local exchange.
+    explicit RealExchangeProvider(PrivateRestConfig client_config = operator_rest_config(),
+                                  TrustStoreCheck trust_store = TrustStoreCheck::Required)
         : client_config_(std::move(client_config)), trust_store_(trust_store) {}
     RealExchangeProvider(const RealExchangeProvider&) = delete;
     RealExchangeProvider& operator=(const RealExchangeProvider&) = delete;
@@ -132,6 +133,12 @@ public:
     BinancePrivateRestClient* client() noexcept { return client_.get(); }
 
 private:
+    static PrivateRestConfig operator_rest_config() {
+        PrivateRestConfig config;
+        config.read_timeout_ms = 20'000;
+        return config;
+    }
+
     // Declared in the order they must outlive each other: the loader first, the tracker before the client that points at it.
     PrivateRestConfig client_config_;
     TrustStoreCheck trust_store_;

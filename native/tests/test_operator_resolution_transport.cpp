@@ -83,6 +83,13 @@ std::string path_of(const Request& r) { return r.target.substr(0, r.target.find(
 
 Reply time_reply() { return Reply::answer(200, hy::test_helpers::current_server_time_body()); }
 
+struct TlsFixtureOptions {
+    std::string server_certificate{"test_leaf_cert_testnet_host.pem"};
+    std::string server_key{"test_leaf_key_testnet_host.pem"};
+    std::string trusted_certificate{"test_leaf_cert_testnet_host.pem"};
+    TlsRoutingAcceptor::BeforeHandshakeHandler before_handshake;
+};
+
 // Binance's documented sample answer of GET /api/v3/account.
 constexpr std::string_view kAccountBody =
     R"({"makerCommission":15,"takerCommission":15,"buyerCommission":0,"sellerCommission":0,)"
@@ -362,10 +369,12 @@ protected:
     }
 
     // `reconciliation_lane`: if non-zero, a tracker is wired in whose Reconciliation lane holds exactly that much weight.
-    void wire(TlsRoutingAcceptor::Handler handler, bool fresh_clock = true, bool with_credentials = true, std::uint32_t reconciliation_lane = 0) {
+    void wire(TlsRoutingAcceptor::Handler handler, bool fresh_clock = true, bool with_credentials = true,
+              std::uint32_t reconciliation_lane = 0, TlsFixtureOptions tls = {}) {
         client_.reset();
-        server_ = std::make_unique<TlsRoutingAcceptor>(fixture_path("test_leaf_cert_testnet_host.pem"),
-                                                       fixture_path("test_leaf_key_testnet_host.pem"), std::move(handler));
+        server_ = std::make_unique<TlsRoutingAcceptor>(fixture_path(tls.server_certificate.c_str()),
+                                                       fixture_path(tls.server_key.c_str()), std::move(handler),
+                                                       std::move(tls.before_handshake));
         cfg_.port = std::to_string(server_->port());
         hy::SpotRateLimitTracker* tracker = nullptr;
         if (reconciliation_lane != 0) {
@@ -374,7 +383,11 @@ protected:
         }
         client_ = std::make_unique<BinancePrivateRestClient>(EnvironmentBinding::testnet(), with_credentials ? make_creds() : nullptr, tracker,
                                                              hy::EndpointWeightTable{}, cfg_);
-        BinancePrivateRestClientTestHooks::use_loopback(*client_, fixture_path("test_leaf_cert_testnet_host.pem"));
+        if (tls.trusted_certificate.empty()) {
+            BinancePrivateRestClientTestHooks::use_loopback(*client_);
+        } else {
+            BinancePrivateRestClientTestHooks::use_loopback(*client_, fixture_path(tls.trusted_certificate.c_str()));
+        }
         if (fresh_clock) BinancePrivateRestClientTestHooks::publish_fresh_clock(*client_);
     }
 };
@@ -413,8 +426,9 @@ protected:
     FakeConsole diagnostics_;
 
     void start(const Routes& routes, bool fresh_clock = true, std::chrono::milliseconds spacing = kDefaultRequestSpacing,
-               bool with_credentials = true, std::uint32_t reconciliation_lane = 0, ConsolePort* diagnostics = nullptr) {
-        wire(routes.handler(), fresh_clock, with_credentials, reconciliation_lane);
+               bool with_credentials = true, std::uint32_t reconciliation_lane = 0, ConsolePort* diagnostics = nullptr,
+               TlsFixtureOptions tls = {}) {
+        wire(routes.handler(), fresh_clock, with_credentials, reconciliation_lane, std::move(tls));
         diagnostics_.lines.clear();
         port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper_, spacing, diagnostics);
         sleeper_.sleeps.clear();
@@ -592,6 +606,137 @@ TEST_F(PortTest, AnAccountAnswerThatIsNotA200IsNotAnAccountWhateverItSays) {
     EXPECT_FALSE(b.summary.empty()) << "and its summary is still composed from what is there";
 }
 
+TEST_F(PortTest, AccountReadAndHttpOutcomesHaveSanitizedDiagnostics) {
+    Routes dropped;
+    dropped.account = Reply::drop();
+    start(dropped, true, kDefaultRequestSpacing, true, 0, &diagnostics_);
+    EXPECT_FALSE(port_->account().uid.has_value());
+    EXPECT_EQ(server_->request_count(), 1u);
+    EXPECT_NE(diagnostic_text().find("GET /api/v3/account: Read failed"), std::string::npos);
+
+    Routes unauthorized;
+    unauthorized.account = Reply::answer(401, R"({"synthetic":"private error body"})");
+    start(unauthorized, true, kDefaultRequestSpacing, true, 0, &diagnostics_);
+    EXPECT_FALSE(port_->account().uid.has_value());
+    std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("GET /api/v3/account: HTTP 401"), std::string::npos);
+    EXPECT_EQ(diagnostics.find("private error body"), std::string::npos);
+
+    Routes missing_uid;
+    missing_uid.account = Reply::answer(200, R"({"accountType":"SPOT","permissions":["SPOT"],"balances":[]})");
+    start(missing_uid, true, kDefaultRequestSpacing, true, 0, &diagnostics_);
+    EXPECT_FALSE(port_->account().uid.has_value());
+    diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("GET /api/v3/account: HTTP 200 without a valid UID"), std::string::npos);
+
+    Routes invalid_uid;
+    invalid_uid.account = Reply::answer(200, R"({"uid":"354937868","accountType":"SPOT","permissions":[],"balances":[]})");
+    start(invalid_uid, true, kDefaultRequestSpacing, true, 0, &diagnostics_);
+    EXPECT_FALSE(port_->account().uid.has_value());
+    EXPECT_NE(diagnostic_text().find("GET /api/v3/account: HTTP 200 without a valid UID"), std::string::npos);
+}
+
+TEST_F(PortTest, TimeReadRetriesTcpDisconnectsBeforeTlsAndStopsAtThreeAttempts) {
+    TlsFixtureOptions tls;
+    tls.before_handshake = [](std::size_t connection) {
+        return connection <= 2 ? TlsRoutingAcceptor::BeforeHandshakeAction::Disconnect
+                               : TlsRoutingAcceptor::BeforeHandshakeAction::Continue;
+    };
+    start(Routes{}, false, kDefaultRequestSpacing, true, 0, &diagnostics_, std::move(tls));
+
+    ASSERT_TRUE(port_->server_time().has_value());
+    EXPECT_EQ(server_->connection_count(), 3u);
+    EXPECT_EQ(server_->request_count(), 1u);
+    EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/time"}));
+    EXPECT_EQ(sleeper_.sleeps, (std::vector<std::int64_t>{500, 500}));
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("GET /api/v3/time"), std::string::npos);
+    EXPECT_NE(diagnostics.find("TLS handshake connection interrupted"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 1/3"), std::string::npos);
+    EXPECT_NE(diagnostics.find("retrying"), std::string::npos);
+}
+
+TEST_F(PortTest, TimeReadStopsAfterThreeTlsHandshakeInterruptions) {
+    TlsFixtureOptions tls;
+    tls.before_handshake = [](std::size_t) { return TlsRoutingAcceptor::BeforeHandshakeAction::Disconnect; };
+    start(Routes{}, false, kDefaultRequestSpacing, true, 0, &diagnostics_, std::move(tls));
+
+    EXPECT_FALSE(port_->server_time().has_value());
+    EXPECT_EQ(server_->connection_count(), 3u);
+    EXPECT_EQ(server_->request_count(), 0u);
+    EXPECT_EQ(sleeper_.sleeps, (std::vector<std::int64_t>{500, 500}));
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("GET /api/v3/time"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 3/3"), std::string::npos);
+    EXPECT_NE(diagnostics.find("stopping"), std::string::npos);
+}
+
+TEST_F(PortTest, AccountReadRetriesTlsTimeoutAndInterruptionBeforeOneHttpRequest) {
+    cfg_.handshake_timeout_ms = 150;
+    TlsFixtureOptions tls;
+    tls.before_handshake = [](std::size_t connection) {
+        if (connection == 1) return TlsRoutingAcceptor::BeforeHandshakeAction::Hold;
+        if (connection == 2) return TlsRoutingAcceptor::BeforeHandshakeAction::Disconnect;
+        return TlsRoutingAcceptor::BeforeHandshakeAction::Continue;
+    };
+    start(Routes{}, true, kDefaultRequestSpacing, true, 0, &diagnostics_, std::move(tls));
+
+    const AccountView account = port_->account();
+    ASSERT_TRUE(account.uid.has_value());
+    EXPECT_EQ(*account.uid, 354937868u);
+    EXPECT_EQ(server_->connection_count(), 3u);
+    EXPECT_EQ(server_->request_count(), 1u);
+    EXPECT_EQ(paths(), (std::vector<std::string>{"/api/v3/account"}));
+    EXPECT_EQ(sleeper_.sleeps, (std::vector<std::int64_t>{500, 500}));
+    const auto requests = server_->requests();
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests[0].api_key_header, BoundTestCredentials::kApiKey);
+    EXPECT_NE(requests[0].target.find("signature="), std::string::npos);
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("GET /api/v3/account"), std::string::npos);
+    EXPECT_NE(diagnostics.find("TLS handshake timed out"), std::string::npos);
+    EXPECT_NE(diagnostics.find("TLS handshake connection interrupted"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 2/3"), std::string::npos);
+}
+
+TEST_F(PortTest, AccountReadStopsAfterThreeTlsHandshakeFailuresWithoutSendingHttp) {
+    cfg_.handshake_timeout_ms = 150;
+    TlsFixtureOptions tls;
+    tls.before_handshake = [](std::size_t) { return TlsRoutingAcceptor::BeforeHandshakeAction::Disconnect; };
+    start(Routes{}, true, kDefaultRequestSpacing, true, 0, &diagnostics_, std::move(tls));
+
+    EXPECT_FALSE(port_->account().uid.has_value());
+    EXPECT_EQ(server_->connection_count(), 3u);
+    EXPECT_EQ(server_->request_count(), 0u);
+    EXPECT_EQ(sleeper_.sleeps, (std::vector<std::int64_t>{500, 500}));
+    const std::string diagnostics = diagnostic_text();
+    EXPECT_NE(diagnostics.find("GET /api/v3/account"), std::string::npos);
+    EXPECT_NE(diagnostics.find("attempt 3/3"), std::string::npos);
+    EXPECT_NE(diagnostics.find("stopping"), std::string::npos);
+}
+
+TEST_F(PortTest, CertificateRejectionAndHostnameMismatchStopWithoutRetry) {
+    TlsFixtureOptions untrusted;
+    untrusted.trusted_certificate.clear();
+    start(Routes{}, false, kDefaultRequestSpacing, true, 0, &diagnostics_, std::move(untrusted));
+    EXPECT_FALSE(port_->server_time().has_value());
+    EXPECT_EQ(server_->connection_count(), 1u);
+    EXPECT_EQ(server_->request_count(), 0u);
+    EXPECT_NE(diagnostic_text().find("TLS certificate verification failed"), std::string::npos);
+    EXPECT_EQ(diagnostic_text().find("retrying"), std::string::npos);
+
+    TlsFixtureOptions wrong_name;
+    wrong_name.server_certificate = "test_leaf_cert.pem";
+    wrong_name.server_key = "test_leaf_key.pem";
+    wrong_name.trusted_certificate = "test_ca_cert.pem";
+    start(Routes{}, true, kDefaultRequestSpacing, true, 0, &diagnostics_, std::move(wrong_name));
+    EXPECT_FALSE(port_->account().uid.has_value());
+    EXPECT_EQ(server_->connection_count(), 1u);
+    EXPECT_EQ(server_->request_count(), 0u);
+    EXPECT_NE(diagnostic_text().find("TLS certificate verification failed"), std::string::npos);
+    EXPECT_EQ(diagnostic_text().find("retrying"), std::string::npos);
+}
+
 // --- the gap between two requests -----------------------------------------------------------------------------------------------------------------
 
 TEST_F(PortTest, NoGapBeforeTheFirstRequestAndOneBeforeEveryOtherAnsweredOne) {
@@ -646,7 +791,7 @@ TEST_F(PortTest, AnAnswerThatSaysStopIsHandedBackAndThenTheAnswererIsLeftAlone) 
                          Case{403, "Forbidden by WAF"}}) {
         Routes routes;
         routes.all_orders = Reply::answer(c.status, c.body);
-        start(routes);
+        start(routes, true, kDefaultRequestSpacing, true, 0, &diagnostics_);
         ASSERT_TRUE(port_->server_time().has_value());
         const HttpRead stop = port_->all_orders("BTCUSDT", ExchangeMs{kStart}, ExchangeMs{kEnd}, 1000);
         EXPECT_TRUE(stop.transport_ok) << c.status;
@@ -663,6 +808,11 @@ TEST_F(PortTest, AnAnswerThatSaysStopIsHandedBackAndThenTheAnswererIsLeftAlone) 
         EXPECT_FALSE(port_->server_time().has_value());
         EXPECT_EQ(server_->request_count(), sent) << c.status << ": nothing more was sent";
         EXPECT_EQ(sleeper_.sleeps.size(), slept) << c.status << ": and nothing was waited for";
+        const std::string diagnostics = diagnostic_text();
+        EXPECT_NE(diagnostics.find("GET /api/v3/allOrders"), std::string::npos) << c.status;
+        EXPECT_NE(diagnostics.find("HTTP " + std::to_string(c.status) + "; no further requests will be sent in this run"),
+                  std::string::npos) << c.status;
+        EXPECT_NE(diagnostics.find("requests stopped after HTTP " + std::to_string(c.status)), std::string::npos) << c.status;
     }
 }
 
@@ -694,6 +844,34 @@ TEST_F(PortTest, EveryReadCanTripTheLatchAndEveryOtherStatusLeavesItAlone) {
         (void)port_->account();
         EXPECT_FALSE(port_->halted()) << status;
         EXPECT_EQ(server_->request_count(), 4u) << status;
+    }
+}
+
+TEST_F(PortTest, ARejectedAccountWithAnOversizedOrInterruptedBodyStillLatchesTheRun) {
+    struct RejectedBody {
+        const char* name;
+        Reply reply;
+    };
+    const std::vector<RejectedBody> cases = {
+        {"over the response limit", Reply::cut_short(429, std::string(response_cap_bytes(ResponseKind::SignedJson) + 1, 'x'))},
+        {"interrupted in transit", Reply::cut_short(429, R"({"synthetic":"rejected body interrupted"})")},
+    };
+    for (const RejectedBody& test_case : cases) {
+        Routes routes;
+        routes.account = test_case.reply;
+        start(routes, true, kDefaultRequestSpacing, true, 0, &diagnostics_);
+
+        EXPECT_FALSE(port_->account().uid.has_value()) << test_case.name;
+        EXPECT_TRUE(port_->halted()) << test_case.name;
+        const std::size_t sent = server_->request_count();
+        EXPECT_EQ(sent, 1u) << test_case.name;
+        expect_not_completed(port_->open_orders());
+        EXPECT_EQ(server_->request_count(), sent) << test_case.name << ": a rejected response with a broken body still stops later traffic";
+        const std::string diagnostics = diagnostic_text();
+        EXPECT_NE(diagnostics.find("GET /api/v3/account"), std::string::npos) << test_case.name;
+        EXPECT_NE(diagnostics.find("HTTP 429; no further requests will be sent in this run"), std::string::npos) << test_case.name;
+        EXPECT_NE(diagnostics.find("requests stopped after HTTP 429"), std::string::npos) << test_case.name;
+        EXPECT_EQ(diagnostics.find("rejected body interrupted"), std::string::npos) << test_case.name;
     }
 }
 
@@ -966,7 +1144,7 @@ protected:
 
     // One ambiguous order in the audit log, one symbol in the control-plane log, both opened the way the tool opens them, and a client whose
     // exchange answers by `routes` (set BEFORE the server starts: the handler is not touched afterwards).
-    void prepare(const Routes& routes) {
+    void prepare(const Routes& routes, TlsFixtureOptions tls = {}) {
         {
             DurableAuditSink sink(audit_path_, *ring_, kKeyId);
             ASSERT_TRUE(sink.is_open());
@@ -996,7 +1174,7 @@ protected:
         ASSERT_FALSE(audit_->fenced());
         ASSERT_TRUE(names_->is_open());
 
-        wire(routes.handler(), /*fresh_clock=*/false);
+        wire(routes.handler(), /*fresh_clock=*/false, /*with_credentials=*/true, /*reconciliation_lane=*/0, std::move(tls));
         real_port_ = std::make_unique<BinanceExchangeReadPort>(*client_, sleeper_);
         port_ = std::make_unique<WorldClockPort>(*real_port_, world_, sleeper_);
         ports_ = std::make_unique<OperatorPorts>(OperatorPorts{*port_, sleeper_, console_, store_});
@@ -1042,13 +1220,13 @@ Routes routes_for_uid(std::optional<std::uint64_t> uid) {
 }  // namespace
 
 TEST_F(WholeProcedureTest, AnAbsentOrderIsResolvedWithTheRealPortOverRealTls) {
-    auto time_requests = std::make_shared<std::atomic<unsigned>>(0);
     Routes routes = routes_for_uid(kUid);
-    routes.time_handler = [time_requests](const Request&) {
-        if (time_requests->fetch_add(1) == 1) return Reply::drop();  // one transient read failure during the same fenced session
-        return time_reply();
+    TlsFixtureOptions tls;
+    tls.before_handshake = [](std::size_t connection) {
+        return connection == 3 ? TlsRoutingAcceptor::BeforeHandshakeAction::Disconnect
+                               : TlsRoutingAcceptor::BeforeHandshakeAction::Continue;
     };
-    prepare(routes);
+    prepare(routes, std::move(tls));
     OperatorSession session = begin_operator_session(*audit_, *names_, *ports_, FenceParams{});
     ASSERT_EQ(session.status, SessionStatus::Ready);
     EXPECT_EQ(session.lock_ref.count(), t0_);
@@ -1057,7 +1235,8 @@ TEST_F(WholeProcedureTest, AnAbsentOrderIsResolvedWithTheRealPortOverRealTls) {
     ASSERT_EQ(o.status, ResolveStatus::Resolved) << resolve_status_name(o.status) << " / " << conclusion_name(o.conclusion);
     EXPECT_EQ(o.conclusion, AbsentConclusionStatus::Absent);
     EXPECT_EQ(session.lock_ref.count(), original_lock_ref.count()) << "a retried time read does not replace the session's original lock reference";
-    EXPECT_GE(time_requests->load(), 3u) << "the injected dropped response was followed by its successful retry";
+    EXPECT_EQ(server_->connection_count(), server_->request_count() + 1u)
+        << "the injected TLS interruption was followed by a successful retry in the same session";
     EXPECT_EQ(o.append.status, OperatorAppendStatus::Appended);
     ASSERT_TRUE(o.exchange_account_uid.has_value());
     EXPECT_EQ(*o.exchange_account_uid, kUid);
