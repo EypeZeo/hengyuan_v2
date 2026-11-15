@@ -174,4 +174,19 @@ Check `-2026` separately using an order known to have been archived. Record the 
 
 ### Read-only follow-up on 2026-11-15
 
-The operator selected an existing order from the Spot Testnet `allOrders` list. The 20-second follow-up returned six hits, zero misses, and zero inconclusive observations. The exchange-time readings around the first timed query were **24.241 and 26.278 seconds** after placement. Gaps between the exchange-time readings taken before successive queries ranged from **3.365 to 4.029 seconds** with a configured one-second polling interval. The run verifies continued visibility for the selected order. Sampling from acceptance is pending.
+The operator selected an existing order from the Spot Testnet `allOrders` list. The 20-second follow-up returned six hits, zero misses, and zero inconclusive observations. The exchange-time readings around the first timed query were **24.241 and 26.278 seconds** after placement. Gaps between the exchange-time readings taken before successive queries ranged from **3.365 to 4.029 seconds** with a configured one-second polling interval. The run verifies continued visibility for the selected order.
+
+### Sampling from order acceptance on 2026-11-15
+
+The operator submitted a Spot Testnet `LIMIT_MAKER` order and started `allOrders` sampling from the exchange-reported acceptance time. The saved report has `selection: new_order` and `status: bounded`.
+
+| Measurement | Result |
+| --- | --- |
+| Sampling duration and configured polling interval | 20 seconds and 1,000 ms |
+| First valid query | Found, bracketed by exchange times 1,566 and 4,088 ms after acceptance |
+| Visibility interval for this order | 0–4,088 ms. The first valid query found the order, so there is no observed lower bound above zero. |
+| Observation counts | 5 found, 0 missing, 1 inconclusive |
+| Gaps between pre-query exchange-time readings | 3,165–3,935 ms |
+| Final observation | The sampling deadline expired before the post-query exchange-time read at stage `after_time`. |
+
+The operator retained the 120-second read allowance. The archived-order response `-2026` remains pending.
