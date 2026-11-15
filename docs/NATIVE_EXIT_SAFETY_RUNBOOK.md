@@ -101,9 +101,7 @@ If OpenSSL on Windows reports an empty trust store, set `SSL_CERT_FILE` in the c
 
 The credentials file contains `HENGYUAN_OPERATOR_TESTNET_API_KEY` and `HENGYUAN_OPERATOR_TESTNET_API_SECRET`. Record the HTTP status and exchange error code separately. A point lookup of HTTP 400 with `-2013` passes that one check. `-2026` means the exchange has an archived record and the workflow refuses absence. Leave the drill order unresolved whenever the queries or the account checks disagree. Share only the exit code and a summary with the account UID and balance details omitted.
 
-Measure order-list visibility separately using known Testnet orders. For each order, retain the last `allOrders` observation where it was absent and the first observation where it appeared. Record the exchange times around those queries, along with the order acceptance time and polling interval. Report the observed visibility intervals and sample count. Retain the configured 120-second read allowance until the measurements have been reviewed. One successful resolution does not measure visibility, and a finite sample does not establish a service-wide upper bound.
-
-For local verification, CTest's `R6PreparedDrill` runs both entry points against a fresh local directory and checks the resulting list. `RealToolTest.AnAbsentOrderIsResolvedWithTheOperatorKeyOverRealTls` exercises confirmation, append and recovery over a loopback exchange. The Testnet drill exercises the real read and resolution flow for the synthetic order. Measuring order-list visibility requires a separate run with known Testnet orders.
+For local verification, CTest's `R6PreparedDrill` runs both entry points against a fresh local directory and checks the resulting list. `RealToolTest.AnAbsentOrderIsResolvedWithTheOperatorKeyOverRealTls` exercises confirmation, append and recovery over a loopback exchange.
 
 ### Result on 2026-11-15
 
@@ -118,4 +116,21 @@ The operator completed the drill on Windows with a Spot Testnet account and a sy
 | Operator confirmation | The Windows console echoed the current confirmation line and accepted it |
 | Durable resolution and reopening | `Resolved (exit code 0)`. The subsequent `--list` reported `unresolved orders: 0` |
 
-An order that the exchange received is required to measure `allOrders` visibility. The visibility interval and the archived-order response `-2026` remain unmeasured.
+### Measuring order-list visibility
+
+Use an order accepted by Spot Testnet and a separate read-only operator key for the same account. Record the exchange's order placement time as `t0` in milliseconds. Keep the symbol and order identifiers locally. Record the intended polling interval and observation deadline before collecting samples. Start polling promptly after acceptance and record the actual gap between observations. [Spot Testnet REST documentation](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#all-orders-user_data)
+
+1. For each observation, read `GET /api/v3/time`, call `GET /api/v3/allOrders` for the symbol and a time window covering the order, then read `GET /api/v3/time` again. Record both exchange times and match the returned order by symbol and order identifier. [Spot Testnet server time](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#check-server-time)
+2. Mark the order as missing only for a valid, complete HTTP 200 order list. Mark failed requests, saturated pages, and unusable time brackets as inconclusive. Stop the run on HTTP 403, 418 or 429. If a later valid poll loses an order that was previously visible, report that sequence separately.
+3. Report the interval from the **before-query** time of the last valid miss to the **after-query** time of the first valid hit, relative to `t0`. Use zero as the lower bound if the first valid poll already found the order. If the deadline passes with valid misses and zero hits, report the last lower bound with the upper bound open. Record inconclusive runs separately.
+
+The following offline example uses elapsed milliseconds from `t0` and a synthetic sample label.
+
+| Sample | Poll | Before query (ms) | After query (ms) | Observation |
+| --- | ---: | ---: | ---: | --- |
+| A | 1 | 210 | 324 | Missing |
+| A | 2 | 730 | 841 | Found |
+
+Sample A gives an observed transition interval of **210–841 ms**. Share the relative times, sample label, observation category, polling interval and sample counts. Retain the configured 120-second read allowance until the real samples have been reviewed. These intervals describe the observed reads. A finite set of samples cannot establish a service-wide upper bound.
+
+Check `-2026` separately using an order known to have been archived. Record the HTTP status and numeric error code if that case is observed. The archive case remains pending until a suitable Testnet order is available. [Binance archived-order error](https://developers.binance.com/en/docs/products/spot/errors#-2026-order_archived)
