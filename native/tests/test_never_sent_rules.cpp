@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
 
 using namespace hy;
 using namespace hy::never_sent;
@@ -250,4 +251,141 @@ TEST(NeverSentRules, TheCallerEstablishesTheThreeFactsTheRuleDoesNotLookAt) {
         EXPECT_EQ(check_closure(target(), frame()), ClosureCheck::Ok);
         EXPECT_EQ(check_closure(target(OrderState::Ambiguous), frame()), ClosureCheck::NotInAClosableState);
     }
+}
+
+// --- class A (Q23 S6): the pure builders ------------------------------------------------------------------------------------
+
+namespace {
+
+// The Intent frame of the order every class A test below refuses.
+AuditRecord intent_frame_of_the_order() {
+    AuditRecord r{};
+    r.timestamp_ms = 1000;
+    r.event_type = AuditEventType::OrderIntentCreated;
+    r.mode = ExecutionMode::Live;
+    r.symbol_id = kSymbol;
+    r.set_client_order_id("HY-NS-INTENT");
+    r.price_ticks = kPrice;
+    r.qty_ticks = kQty;
+    r.resulting_state = OrderState::Intent;
+    r.side = OrderSide::Sell;
+    return r;
+}
+
+constexpr Reason kAllReasons[] = {Reason::ConfirmationMissing,        Reason::ConfirmationMismatch, Reason::SubmitPortInvalid,
+                                  Reason::InFlightRegistryUnavailable, Reason::RateLimitExhausted,   Reason::DuplicateInFlight};
+
+}  // namespace
+
+TEST(NeverSentRules, EveryClassAReasonYieldsAFrameTheRuleAcceptsForTheOrderItWasBuiltFrom) {
+    const AuditRecord intent = intent_frame_of_the_order();
+    const ClosureTarget t = class_a_target_of(intent);
+    for (const Reason reason : kAllReasons) {
+        const AuditRecord closing = class_a_closure_of(intent, reason, 9000);
+        EXPECT_EQ(check_closure(t, closing), ClosureCheck::Ok) << static_cast<long long>(reason);
+        EXPECT_EQ(closing.detail_code, static_cast<std::int64_t>(reason)) << "the reason is the frame's detail_code";
+        EXPECT_EQ(closing.detail_msg[0], '\0') << "and nothing is in detail_msg (design 4.3)";
+        EXPECT_EQ(closing.timestamp_ms, 9000);
+        EXPECT_EQ(closing.event_type, AuditEventType::OrderNeverSent);
+        EXPECT_EQ(closing.resulting_state, OrderState::NeverSent);
+        EXPECT_STREQ(closing.client_order_id, "HY-NS-INTENT");
+    }
+}
+
+TEST(NeverSentRules, TheReasonCodesAreTheDocumentedNumbers) {
+    // Stable for whoever reads the log (docs/NOTSENT_CLOSURE_DESIGN.md 4.3): changing one is changing the log's meaning.
+    EXPECT_EQ(static_cast<int>(Reason::ConfirmationMissing), 1);
+    EXPECT_EQ(static_cast<int>(Reason::ConfirmationMismatch), 2);
+    EXPECT_EQ(static_cast<int>(Reason::SubmitPortInvalid), 3);
+    EXPECT_EQ(static_cast<int>(Reason::InFlightRegistryUnavailable), 4);
+    EXPECT_EQ(static_cast<int>(Reason::RateLimitExhausted), 5);
+    EXPECT_EQ(static_cast<int>(Reason::DuplicateInFlight), 6);
+}
+
+TEST(NeverSentRules, ATargetBuiltFromAnIntentIsAnIntentWithNothingSeen) {
+    const ClosureTarget t = class_a_target_of(intent_frame_of_the_order());
+    EXPECT_EQ(t.state, OrderState::Intent);
+    EXPECT_EQ(t.exchange_order_id, 0);
+    EXPECT_EQ(t.filled_qty_ticks, 0);
+    EXPECT_EQ(t.symbol_id, kSymbol);
+    EXPECT_EQ(t.side, OrderSide::Sell);
+    EXPECT_EQ(t.mode, ExecutionMode::Live);
+    EXPECT_EQ(t.price_ticks, kPrice);
+    EXPECT_EQ(t.qty_ticks, kQty);
+}
+
+TEST(NeverSentRules, TheClosingFrameClaimsNoExistenceEvenWhenTheRecordItWasBuiltFromDid) {
+    // The builder is only ever given an Intent frame, which claims nothing. Given a dirty record it must still not pass an
+    // existence claim on: such a frame would be refused by the rule (FrameClaimsExistence), and a closure must never say it.
+    AuditRecord dirty = intent_frame_of_the_order();
+    dirty.exchange_order_id = 9;
+    dirty.filled_qty_ticks = 4;
+    dirty.avg_fill_price_ticks = 500'000;
+    dirty.detail_code = 77;
+    dirty.set_detail("a message that must not survive");
+    const AuditRecord closing = class_a_closure_of(dirty, Reason::RateLimitExhausted, 9000);
+    EXPECT_EQ(closing.exchange_order_id, 0);
+    EXPECT_EQ(closing.filled_qty_ticks, 0);
+    EXPECT_EQ(closing.avg_fill_price_ticks, 0);
+    EXPECT_EQ(closing.detail_code, static_cast<std::int64_t>(Reason::RateLimitExhausted)) << "the reason replaces whatever was there";
+    EXPECT_EQ(closing.detail_msg[0], '\0');
+    EXPECT_EQ(check_closure(class_a_target_of(intent_frame_of_the_order()), closing), ClosureCheck::Ok);
+}
+
+// --- the recently closed ids ------------------------------------------------------------------------------------------------
+
+TEST(NeverSentRulesRecentlyClosed, RemembersWhatItWasToldAndNothingElse) {
+    RecentlyClosedIds ids;
+    EXPECT_EQ(ids.size(), 0u);
+    EXPECT_FALSE(ids.contains("HY-1-1-0007"));
+    ids.remember("HY-1-1-0007");
+    EXPECT_EQ(ids.size(), 1u);
+    EXPECT_TRUE(ids.contains("HY-1-1-0007"));
+    EXPECT_FALSE(ids.contains("HY-1-2-0007"));
+    EXPECT_FALSE(ids.contains("HY-1-1-0008"));
+}
+
+TEST(NeverSentRulesRecentlyClosed, AnIdThatIsOnlyAPrefixOfARememberedOneIsNotThatOne) {
+    // The comparison is of whole ids: HY-12 must not be refused because HY-123 was closed.
+    RecentlyClosedIds ids;
+    ids.remember("HY-1700000000000-12-0007");
+    EXPECT_FALSE(ids.contains("HY-1700000000000-1-0007"));
+    EXPECT_FALSE(ids.contains("HY-1700000000000-12"));
+    EXPECT_FALSE(ids.contains("HY-1700000000000-12-00070"));
+    EXPECT_TRUE(ids.contains("HY-1700000000000-12-0007"));
+}
+
+TEST(NeverSentRulesRecentlyClosed, EmptyAndTooLongIdsAreIgnoredAndTheLongestLegalOneIsKept) {
+    RecentlyClosedIds ids;
+    ids.remember("");
+    EXPECT_EQ(ids.size(), 0u) << "an empty id names nothing";
+    EXPECT_FALSE(ids.contains("")) << "and nothing is ever 'the empty id'";
+    const std::string longest(kClientOrderIdLen, 'x');
+    const std::string too_long(kClientOrderIdLen + 1, 'y');
+    ids.remember(too_long);
+    EXPECT_EQ(ids.size(), 0u) << "an id that does not fit a ClientOrderId cannot be one";
+    EXPECT_FALSE(ids.contains(too_long));
+    ids.remember(longest);
+    EXPECT_EQ(ids.size(), 1u);
+    EXPECT_TRUE(ids.contains(longest)) << "an id exactly as long as a ClientOrderId can hold is legal";
+}
+
+TEST(NeverSentRulesRecentlyClosed, TheOldestIdIsForgottenFirstWhenTheRingIsFull) {
+    RecentlyClosedIds ids;
+    auto name = [](std::size_t i) { return "HY-ring-" + std::to_string(i); };
+    for (std::size_t i = 0; i < RecentlyClosedIds::kCapacity; ++i) ids.remember(name(i));
+    EXPECT_EQ(ids.size(), RecentlyClosedIds::kCapacity);
+    for (std::size_t i = 0; i < RecentlyClosedIds::kCapacity; ++i) EXPECT_TRUE(ids.contains(name(i))) << i;
+    ids.remember(name(RecentlyClosedIds::kCapacity));  // the 65th id evicts the 1st, and only the 1st
+    EXPECT_EQ(ids.size(), RecentlyClosedIds::kCapacity) << "a full ring does not grow";
+    EXPECT_FALSE(ids.contains(name(0)));
+    for (std::size_t i = 1; i <= RecentlyClosedIds::kCapacity; ++i) EXPECT_TRUE(ids.contains(name(i))) << i;
+    ids.remember(name(RecentlyClosedIds::kCapacity + 1));  // ...then the 2nd
+    EXPECT_FALSE(ids.contains(name(1)));
+    EXPECT_TRUE(ids.contains(name(2)));
+    // a long run keeps exactly the last kCapacity ids
+    for (std::size_t i = RecentlyClosedIds::kCapacity + 2; i < 5 * RecentlyClosedIds::kCapacity + 3; ++i) ids.remember(name(i));
+    const std::size_t last = 5 * RecentlyClosedIds::kCapacity + 2;
+    for (std::size_t i = last + 1 - RecentlyClosedIds::kCapacity; i <= last; ++i) EXPECT_TRUE(ids.contains(name(i))) << i;
+    EXPECT_FALSE(ids.contains(name(last - RecentlyClosedIds::kCapacity)));
 }

@@ -13,10 +13,30 @@
 
 #include <hengyuan/audit_trail.hpp>
 #include <hengyuan/durable_control_plane.hpp>
+#include <hengyuan/never_sent_rules.hpp>
 
 #include <cstdint>
 
 namespace hy {
+
+// Q23 S6 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3): what a closure append through the port did. The caller needs to tell four things apart:
+// the order is closed (Appended), nothing was tried because there is nothing to try with (NotWired: a port without a closure function;
+// NotEnabled: a sink that was not built to write closures -- the default, and then the order is exactly what it was before this
+// existed: an Intent orphan), nothing was written because the writer refused (Refused), and the append failed (Failed: the frame MAY be
+// on the disk, the sink is fenced if the failure was an I/O one). NotAttempted is the value of a result nobody filled in.
+enum class ClosureAppendStatus : std::uint8_t {
+    NotAttempted = 0,
+    Appended = 1,
+    NotEnabled = 2,
+    NotWired = 3,
+    Refused = 4,
+    Failed = 5,
+};
+
+struct ClosureAppendResult {
+    ClosureAppendStatus status{ClosureAppendStatus::NotAttempted};
+    AuditAppendResult append{};  // set when status is Appended or Failed
+};
 
 // --- Durable order-audit port (dependency injection, mirrors SubmitPort) ---
 //
@@ -29,10 +49,15 @@ namespace hy {
 struct DurableOrderAuditPort {
     using AppendFn = AuditAppendResult(*)(void* user_data, const AuditRecord& rec, std::int64_t now_ms);
     using FencedFn = bool(*)(void* user_data);
+    // Q23 S6: the closure writer. Optional and LAST, so that every existing aggregate initialisation {append, fenced, user_data} keeps
+    // meaning what it meant; a port without it answers NotWired.
+    using ClosureFn = ClosureAppendResult(*)(void* user_data, const never_sent::ClosureTarget& target, const AuditRecord& rec,
+                                             std::int64_t now_ms);
 
     AppendFn append_fn{nullptr};
     FencedFn fenced_fn{nullptr};
     void* user_data{nullptr};
+    ClosureFn closure_fn{nullptr};
 
     AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) const noexcept {
         if (!append_fn) {
@@ -41,6 +66,18 @@ struct DurableOrderAuditPort {
             return r;
         }
         return append_fn(user_data, rec, now_ms);
+    }
+
+    // Q23 S6: append the closing frame of an order that never crossed. `target` is the CALLER's account of the order (see
+    // DurableAuditSink::append_never_sent(): the sink holds no live order and checks the frame against it, not the account itself).
+    ClosureAppendResult append_never_sent(const never_sent::ClosureTarget& target, const AuditRecord& rec,
+                                          std::int64_t now_ms) const noexcept {
+        if (!closure_fn) {
+            ClosureAppendResult r{};
+            r.status = ClosureAppendStatus::NotWired;
+            return r;
+        }
+        return closure_fn(user_data, target, rec, now_ms);
     }
 
     // Unwired reads as "already fenced" -- a caller that checks this before ever

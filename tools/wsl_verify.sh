@@ -148,9 +148,9 @@ run_thread() {
         test_seal_journal_store_lease test_intent_phase_advancer \
         test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
         test_sweep_concurrency test_account_refresh_concurrency \
-        test_private_stream_pipeline_concurrency \
+        test_private_stream_pipeline_concurrency test_submit_authority_concurrency \
         tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
-        tsan_control_relaxed_mailbox
+        tsan_control_relaxed_mailbox tsan_control_relaxed_submit_authority
 
     echo "--- concurrency tests (must pass) ---"
     (
@@ -230,6 +230,28 @@ run_thread() {
         fi
         echo "OK: TSan reported the injected race as expected."
         grep -A5 "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_mailbox.log | head -20
+    )
+
+    echo "--- control: tsan_control_relaxed_submit_authority (must FAIL with a data race report) ---"
+    (
+        cd build-linux-tsan
+        export TSAN_OPTIONS="history_size=7:halt_on_error=1:exitcode=66"
+        set +e
+        setarch "$(uname -m)" -R ./tsan_control_relaxed_submit_authority > /tmp/tsan_control_submit_authority.log 2>&1
+        rc=$?
+        set -e
+        if [[ $rc -eq 0 ]]; then
+            echo "ERROR: the relaxed submit authority did not report a race."
+            tail -50 /tmp/tsan_control_submit_authority.log
+            exit 1
+        fi
+        if ! grep -q "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_submit_authority.log; then
+            echo "ERROR: the submit authority control failed without a data-race report."
+            tail -50 /tmp/tsan_control_submit_authority.log
+            exit 1
+        fi
+        echo "OK: TSan reported the injected submit authority race."
+        grep -A5 "WARNING: ThreadSanitizer: data race" /tmp/tsan_control_submit_authority.log | head -20
     )
 }
 

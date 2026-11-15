@@ -562,6 +562,12 @@ public:
         return find_index(coid) != kNotFound;
     }
 
+    bool owns(InFlightHandle handle, std::string_view coid) const noexcept {
+        if (!handle.valid()) return false;
+        const auto& slot = slots_[handle.slot_index];
+        return slot.active && slot.generation == handle.generation && std::string_view(slot.id) == coid;
+    }
+
     // Release a resolved (terminal) order so its slot can be reused.
     void mark_resolved(std::string_view coid) noexcept {
         auto idx = find_index(coid);

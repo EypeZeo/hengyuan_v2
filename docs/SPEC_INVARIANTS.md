@@ -985,6 +985,20 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - **仍未覆盖**：调用者（S5：最终门与决定字，任务 `1A.6`、FI-055；S6：类 A 闭合与 SAFE-07 的孤儿，FI-056）；槽位释放与压实保留改用 `is_resolved()`（`order_tracker.hpp`、
       `live_submit_orchestrator.hpp`、`startup_recovery.hpp` 里 `is_exchange_final()` 的消费者，随调用者一起改；`is_terminal()` 在生产里只有 `validate_transition()` 自己用，没有行为变化）；
       迁移清单与读者先行开关（S7，仅当存在要保留的真实日志）。
+  - **Q23 S6：类 A 拒绝的持久关闭。** `orchestrate_submit()` 在 Intent 确认之后、Prepared 之前的六种本地拒绝路径调用 `DurableOrderAuditPort::append_never_sent()`。返回值保留拒绝原因，并通过 `closure` 返回写入结果；仅 `Appended` 将返回订单转换到 `NeverSent`。其他结果保留 `Intent`，提交端口不被调用。
+    - `OrderAttemptWatermark` 对尝试关闭的系统生成订单号按 `(timestamp_ms, sequence)` 维护最高值。`DurableAuditSink` 在追加 Intent 前拒绝相同或更小的值，在尝试写入关闭帧之前更新最高值，并从恢复扫描中的关闭帧重建它。该检查使用固定存储，不受上下文重建或最近 64 个订单号缓存淘汰影响。同一存储的调用者须递增时间与序号组合；旧格式的订单号仍可读取。
+    - `native/src/live_submit_evidence_harness.cpp` 与 `native/src/live_submit_preflight_harness.cpp` 显式启用 `NeverSentWrites`；默认构造仍关闭写入。每次成功关闭的本地拒绝产生 Intent 与 NeverSent 两个订单帧，共 512 字节。写入帧数受 `max_order_frames` 限制，默认对应现有 1 GiB 读取上限，构造配置只能收紧；到达上限返回失败并以 `FenceReason::LogLimit` 停止追加。日志压缩与持久化服务调度属于单独的实现任务。
+    - 回归范围：六种拒绝原因、关闭返回状态、追加失败、恢复结果、重复订单号、无动态分配，以及 Q19 的拒绝写入成本。发送前最终授权与 Prepared 之后的类 B 拒绝由 S5 实现。
+    - 验证（2026-11-14）：MSVC Release 完整构建通过，CTest 登记 3718 项，执行 3715 项、零失败，其中 1 项跳过，另外 3 项禁用；Q19 成本用例显式运行通过。GCC-14 普通构建与 ASan/UBSan 的相关回归通过，规格引用、枚举对应和并发目标检查通过。32 次拒绝的平均耗时：Windows 禁用关闭写入时 4.06 ms，启用时 7.90 ms；WSL2 对应为 6.02 ms 与 11.63 ms。每次日志增长分别为 256 与 512 字节；测量反映该主机的同步文件写入。
+
+  - **Q23 S5：发送前最终授权与类 B 拒绝。** `orchestrate_submit()` 在 `Prepared` 持久确认之后调用 `SubmitReadiness::claim()`。就绪状态与原令牌的签发者、订阅代次、屏障 epoch、熔断 revision 必须相符；最终检查包含授权期限、原确认的有效期、原在途句柄、限流预留、账户和规则，以及审计、签名与深度状态。期限采用单调时钟，默认 5000 ms，在就绪状态读取完成后检查。提交、Prepared 和内存审计使用同一份原订单参数。
+    - `SubmitAuthority` 的 epoch 使用 acquire/release 原子操作，claim 和 revoke 在同一原子值上排序。撤销使此前签发的令牌失效；一次成功的 claim 消费该 epoch。WebSocket 会话在停止请求、错误与结束事件时公布停止状态并撤销；预检程序为会话与 `PrivateStreamPipeline` 传入同一个 authority。`KillSwitch` 保持热线程所有权，通过递增 revision 记录触发及重置。
+    - `FinalAuthorizationRefused` 返回具体 `final_refusal`。仅 `ClosureAppendStatus::Appended` 将订单变为 `NeverSent`，按原槽位代次释放在途登记，并移除对应成交上下文、退回仍有效的原限流窗口额度。其他关闭结果保留 `Submitting` 和资源。成功 claim 之后不写关闭帧；恢复时，仅有 Prepared 的订单继续进入不确定结果处理。
+    - `OrderReservation` 不可复制、不可直接构造，绑定所属限流器、配置代次与窗口截止。过期、重新配置或消费后的票据不能授权发送；旧票据不能退回新窗口的额度。全部新增发送检查保持无动态内存分配。
+    - 回归包括撤销与 claim 的两种次序、同 epoch 单次消费、发布可见性、断流与代次变化、熔断触发后重置、授权与确认期限、槽位复用、限流配置变更、追加失败及实际文件恢复。`test_submit_authority_concurrency.cpp` 同时加入本地 TSan 和 ARM64 CI 的重复测试；`tsan_control_relaxed_submit_authority.cpp` 将发布所需的内存序降为 relaxed，验证 TSan 能报告数据竞争。
+    - 验证（2026-11-14）：MSVC Release 完整构建通过，CTest 登记 3765 项，3761 项通过、1 项跳过、3 项禁用，零失败；最后的增量构建与 44 项相关测试通过。GCC-14 普通构建和 ASan/UBSan 均编译了两个提交测试程序与 22 个测试目标，每个配置的相关 CTest 都有 631 项通过、2 项禁用。TSan 并发测试 219 项全部通过，4 个负向控制均报告数据竞争并返回 66。ARM64 重复测试已接入 CI，本次未运行硬件验证。
+    - Linux 验证在 tokyo-vps 的独立临时目录运行。ASan/UBSan 串行构建使用 -O2 -g1 -DNDEBUG -fno-var-tracking-assignments，并启用 -fsanitize=address,undefined、-fno-sanitize-recover=all 与 -fno-omit-frame-pointer；运行时启用内存泄漏、返回后的栈访问和严格字符串检查，检测到错误时立即终止。
+
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/

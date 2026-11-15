@@ -57,3 +57,40 @@ Before considering the incident closed:
 
 - **No operator alerting exists yet.** This runbook assumes you somehow find out the kill switch triggered. There is no push notification, SMS, or equivalent wired up anywhere in this codebase. That's a real, separate gap — an exit-safety runbook is not useful if nothing tells you to read it.
 - **No drill has ever been run.** ADR-018's actual D3-LIVE checklist (distinct from `preflight_gate.hpp`'s CODE-PREFLIGHT, see that file's updated header comment) lists "periodic manual out-of-band channel drills" as a precondition. Reading this document is not the same as having practiced it once on your actual phone, with your actual app, under a timer, to find out how long it *really* takes you.
+
+## 7. R6 Testnet drill for an unresolved order
+
+The owner runs this drill on Binance Spot Testnet. Use a dedicated rehearsal store containing a recoverable `Prepared` order from the dedicated Testnet sender, together with that sender's control-plane log, wrapped keys and KEK. The control-plane log must identify the order's symbol from a snapshot written before the order's earliest send time. The Testnet preflight harness stops before confirmation and uses temporary storage. Use an existing rehearsal store that meets these conditions or wait for a sender that can preserve the required state.
+
+1. Stop the sender and verify that no other process or host can submit using its trading credentials. Preserve the complete rehearsal store and its sidecar files before opening it with the recovery tool. Use a separate read-only Testnet API key for the tool. Keep both sets of credentials and the KEK in local files with owner-only access.
+2. Open the rehearsal store with `--list` and record the target client order ID. Keep the backup separate and use the same working store for listing, resolution and the final check. Check the printed environment, account UID, symbol and whether the order can be resolved. The command acquires the store locks and may perform recovery. It needs the local keys and makes no exchange requests.
+3. Run the resolution against the same Testnet account. The program waits at least 270 seconds of exchange time after acquiring the locks and then queries the order and both order lists. Review the result against the exchange's order and trade history for that account and time range. Enter the exact confirmation phrase shown by the tool only when the displayed account, symbol and order ID match and the exchange records show neither the order nor a fill.
+4. Expect `result: Resolved (exit code 0)`. Run `--list` again with the same store and verify the target ID is gone from the unresolved list. If the tool returns 59 or 70, inspect `--list` before considering a retry because an append may already have reached storage. Record the result and the before-and-after list status in the drill notes. Keep the response attachment in the tool's local output directory.
+
+Example in PowerShell 7 from the project root. Replace the store paths, log key IDs, account UID and client order ID with values from the rehearsal store. `-DHY_BUILD_DEMO=ON` enables the tool in the CMake build.
+
+```powershell
+$tool = '.\native\build-msvc\Release\hy_operator_resolve.exe'
+$storeArgs = @(
+    '--audit-log', '.\rehearsal\audit.log',
+    '--control-log', '.\rehearsal\control.log',
+    '--kek-file', '.\rehearsal\operator.kek',
+    '--key-file', '.\rehearsal\audit.keys',
+    '--audit-key-id', '<audit key ID>',
+    '--control-key-id', '<control-plane key ID>'
+)
+& $tool --list @storeArgs
+```
+
+After verifying the target in that listing, run the resolve command.
+
+```powershell
+& $tool --env testnet --coid '<client order ID>' --uid '<account UID>' `
+    --operator 'r6-drill' --credentials-file '.\rehearsal\.env.operator' @storeArgs
+```
+
+The credentials file contains `HENGYUAN_OPERATOR_TESTNET_API_KEY` and `HENGYUAN_OPERATOR_TESTNET_API_SECRET`. Record the HTTP status and exchange error code separately. A point lookup of HTTP 400 with `-2013` passes that one check. `-2026` means the exchange has an archived record and the workflow refuses absence. Leave the drill order unresolved whenever the queries or the account checks disagree.
+
+Measure order-list visibility separately using known Testnet orders. For each order, retain the last `allOrders` observation where it was absent and the first observation where it appeared. Record the exchange times around those queries, along with the order acceptance time and polling interval. Report the observed visibility intervals and sample count. Retain the configured 120-second read allowance until the measurements have been reviewed. One successful resolution does not measure visibility, and a finite sample does not establish a service-wide upper bound.
+
+For local rehearsal, `hy_operator_resolve --help` describes both command forms. The existing `RealToolTest.AnAbsentOrderIsResolvedWithTheOperatorKeyOverRealTls` test uses temporary logs and a loopback exchange to exercise confirmation, append and recovery. It does not use a Testnet account.

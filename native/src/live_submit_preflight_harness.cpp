@@ -183,6 +183,7 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::SubmitPartialFill: return "SubmitPartialFill";
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
         case OrchestratorGate::NotReady: return "NotReady";
+        case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
     }
     return "?";
 }
@@ -758,9 +759,12 @@ int main(int argc, char* argv[]) {
                      static_cast<int>(ws_err));
         return 1;
     }
+    auto submit_authority = std::make_shared<SubmitAuthority>();
+    WsApiUserDataSessionConfig private_session_config{};
+    private_session_config.submit_authority = submit_authority;
     WsApiSessionFactory ws_factory(
         WsApiSessionFactory::Deps{ioc, ssl_ctx, user_data_events, *ws_codec, *ws_creds, client.clock_publisher(), rate_limiter},
-        ws_api_endpoint_of(binding));
+        ws_api_endpoint_of(binding), private_session_config);
     RestAccountFetcher account_fetcher(client);
 
     InFlightRegistry in_flight;
@@ -796,7 +800,11 @@ int main(int argc, char* argv[]) {
     WrappedKeyRecord key_rec{};
     key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}},
                        key_rec);
-    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1);
+    // Q23 S6: this Testnet-only harness is one of the two processes that turn the closure writer on (the other is live_submit_evidence_harness):
+    // an order a local gate refuses after its Intent frame is closed as never sent instead of being left as an Intent orphan.
+    // test_never_sent_guard.cpp pins that no other production source names NeverSentWrites.
+    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1, kMaxIntentOrphans,
+                                                                 AuditSinkOpenMode::Trading, NeverSentWrites::Enabled);
 
     // --- The private-stream pipeline (M5b-1, private_stream_pipeline.hpp) ----------------------------------------
     // Everything below is the process's and outlives it. The pipeline creates no thread and opens no connection by
@@ -809,6 +817,7 @@ int main(int argc, char* argv[]) {
     parts.rules = PipelineRulesLookup{&registry_rules_for, &registry};
 
     PipelineConfig pipeline_cfg;
+    pipeline_cfg.submit_authority = submit_authority;
     // The supervision the public feeds get: reconnect with backoff, a planned rollover well inside the 24 h limit of
     // a Binance connection, and an end to the run -- exit code 2, not a silent blind loop -- once ten attempts in a
     // row have failed.

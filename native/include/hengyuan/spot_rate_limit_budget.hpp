@@ -243,6 +243,8 @@ public:
         return lane_tracker(lane).remaining(now);
     }
 
+    TimePoint window_deadline(RateLimitLane lane) const noexcept { return lane_tracker(lane).window_deadline(); }
+
 private:
     // Bounds-guards the enum-to-index conversion (defense in depth against a caller
     // constructing an out-of-range RateLimitLane via static_cast -- matches this
@@ -270,6 +272,29 @@ public:
     using Clock = RequestWeightTracker::Clock;
     using TimePoint = Clock::time_point;
 
+    struct OrderReservation {
+    private:
+        friend class SpotRateLimitTracker;
+        const SpotRateLimitTracker* owner{nullptr};
+        std::uint64_t configuration{0};
+        TimePoint reserved_at{};
+        TimePoint deadline{};
+        RateLimitLane lane{RateLimitLane::Strategy};
+        std::uint32_t weight{0};
+        bool held{false};
+        OrderReservation(const SpotRateLimitTracker* source, std::uint64_t version, TimePoint at, TimePoint until,
+                         RateLimitLane budget_lane, std::uint32_t amount, bool active) noexcept
+            : owner(source), configuration(version), reserved_at(at), deadline(until), lane(budget_lane),
+              weight(amount), held(active) {}
+    public:
+        OrderReservation(const OrderReservation&) = delete;
+        OrderReservation& operator=(const OrderReservation&) = delete;
+        OrderReservation(OrderReservation&& other) noexcept
+            : owner(other.owner), configuration(other.configuration), reserved_at(other.reserved_at),
+              deadline(other.deadline), lane(other.lane), weight(other.weight), held(other.held) { other.held = false; }
+        OrderReservation& operator=(OrderReservation&&) = delete;
+    };
+
     // Window defaults follow Binance's typical documented intervals for each
     // dimension: REQUEST_WEIGHT ~60s, RAW_REQUESTS ~300s, ORDERS ~10s (the SHORTER of
     // Binance's two real ORDERS windows -- the 1-day window is not modeled, see this
@@ -283,6 +308,8 @@ public:
                    RateLimitBudgetSplit split = RateLimitBudgetSplit::default_split(),
                    TimePoint now = Clock::now(), std::uint32_t weight_window_s = 60,
                    std::uint32_t raw_window_s = 300, std::uint32_t orders_window_s = 10) noexcept {
+        if (configuration_ == std::numeric_limits<std::uint64_t>::max()) return false;
+        ++configuration_;
         const bool ok_w = weight_.reset(weight_limit, weight_safety_margin, split, now, weight_window_s);
         const bool ok_r = raw_.reset(raw_limit, raw_safety_margin, split, now, raw_window_s);
         const bool ok_o = orders_.reset(orders_limit, orders_safety_margin, split, now, orders_window_s);
@@ -313,6 +340,33 @@ public:
             return false;
         }
         return true;
+    }
+
+    std::optional<OrderReservation> reserve_order(RateLimitLane lane, std::uint32_t weight,
+                                                   TimePoint now = Clock::now()) noexcept {
+        if (configuration_ == std::numeric_limits<std::uint64_t>::max()) return std::nullopt;
+        if (!try_reserve_order(lane, weight, now)) return std::nullopt;
+        auto deadline = weight_.window_deadline(lane);
+        if (raw_.window_deadline(lane) < deadline) deadline = raw_.window_deadline(lane);
+        if (orders_.window_deadline(lane) < deadline) deadline = orders_.window_deadline(lane);
+        return OrderReservation{this, configuration_, now, deadline, lane, weight, true};
+    }
+
+    bool reservation_valid(const OrderReservation& ticket, TimePoint now = Clock::now()) const noexcept {
+        return configuration_ != std::numeric_limits<std::uint64_t>::max() &&
+               ticket.owner == this && ticket.held && ticket.configuration == configuration_ &&
+               now >= ticket.reserved_at && now < ticket.deadline;
+    }
+
+    // Refund only the original, still-current windows, after a durable no-send result.
+    // Expired windows retain their conservative accounting until normal decay.
+    void release_order(OrderReservation& ticket, TimePoint now = Clock::now()) noexcept {
+        if (reservation_valid(ticket, now)) {
+            weight_.rollback(ticket.lane, ticket.weight, now);
+            raw_.rollback(ticket.lane, 1, now);
+            orders_.rollback(ticket.lane, 1, now);
+        }
+        ticket.held = false;
     }
 
     // Non-order-placing calls (GetOrder/GetAccount/GetExchangeInfo/GetServerTime):
@@ -379,6 +433,7 @@ private:
     PartitionedRateBudget weight_{};
     PartitionedRateBudget raw_{};
     PartitionedRateBudget orders_{};
+    std::uint64_t configuration_{0};
 };
 static_assert(std::is_trivially_copyable_v<SpotRateLimitTracker>);
 static_assert(std::is_standard_layout_v<SpotRateLimitTracker>);
