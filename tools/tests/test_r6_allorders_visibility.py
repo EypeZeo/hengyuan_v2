@@ -370,11 +370,7 @@ class TestnetTransportTests(unittest.TestCase):
 class VisibilityCliTests(unittest.TestCase):
     def _credentials_file(self, directory: str) -> Path:
         path = Path(directory) / "fake credentials with spaces.env"
-        path.write_text(
-            "HENGYUAN_OPERATOR_TESTNET_API_KEY=TEST_KEY_ONLY\n"
-            "HENGYUAN_OPERATOR_TESTNET_API_SECRET=TEST_SECRET_ONLY\n",
-            encoding="utf-8",
-        )
+        path.touch()
         return path
 
     def _call_main_with_fake_probe(self, probe: FakeProbe) -> tuple[int, dict[str, object], mock.Mock]:
@@ -386,12 +382,18 @@ class VisibilityCliTests(unittest.TestCase):
                 factory_calls.append((args, kwargs))
                 return probe
 
+            fake_environment = {
+                visibility.r6.KEY_VAR: "TEST_KEY_ONLY",
+                visibility.r6.SECRET_VAR: "TEST_SECRET_ONLY",
+            }
             stdout = io.StringIO()
-            with mock.patch.object(visibility.r6, "Probe", side_effect=fake_factory) as probe_factory:
-                with contextlib.redirect_stdout(stdout):
-                    exit_code = visibility.main(
-                        ["--env-file", str(credentials_path), "--order-id", str(ORDER_ID), "--duration-seconds", "1"]
-                    )
+            with mock.patch.object(visibility.r6, "read_env_file", return_value=fake_environment) as read_env_file:
+                with mock.patch.object(visibility.r6, "Probe", side_effect=fake_factory) as probe_factory:
+                    with contextlib.redirect_stdout(stdout):
+                        exit_code = visibility.main(
+                            ["--env-file", str(credentials_path), "--order-id", str(ORDER_ID), "--duration-seconds", "1"]
+                        )
+            read_env_file.assert_called_once_with(str(credentials_path))
             self.assertEqual(len(factory_calls), 1)
             args, kwargs = factory_calls[0]
             self.assertEqual(args, ("TEST_KEY_ONLY", "TEST_SECRET_ONLY", 5))
@@ -411,11 +413,17 @@ class VisibilityCliTests(unittest.TestCase):
             credentials_path = self._credentials_file(directory)
             stdout = io.StringIO()
             stderr = io.StringIO()
-            with mock.patch.object(visibility.r6, "Probe", return_value=probe) as probe_factory:
-                with mock.patch.object(visibility, "collect_visibility", return_value=collection_report) as collect:
-                    with mock.patch("builtins.input", return_value=input_value) as user_input:
-                        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                            exit_code = visibility.main(["--env-file", str(credentials_path), *arguments])
+            fake_environment = {
+                visibility.r6.KEY_VAR: "TEST_KEY_ONLY",
+                visibility.r6.SECRET_VAR: "TEST_SECRET_ONLY",
+            }
+            with mock.patch.object(visibility.r6, "read_env_file", return_value=fake_environment) as read_env_file:
+                with mock.patch.object(visibility.r6, "Probe", return_value=probe) as probe_factory:
+                    with mock.patch.object(visibility, "collect_visibility", return_value=collection_report) as collect:
+                        with mock.patch("builtins.input", return_value=input_value) as user_input:
+                            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                                exit_code = visibility.main(["--env-file", str(credentials_path), *arguments])
+            read_env_file.assert_called_once_with(str(credentials_path))
             return exit_code, stdout.getvalue(), stderr.getvalue(), collect, user_input, probe_factory
 
     def test_fake_probe_stopped_status_is_reported_as_exit_3_json(self) -> None:

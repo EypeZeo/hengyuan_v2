@@ -30,6 +30,15 @@ PRICE = "64000.25"
 QUANTITY = "0.0025"
 
 
+class EnvFileParsingTests(unittest.TestCase):
+    def test_utf8_bom_is_removed_from_a_noncredential_configuration_key(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r6-env-file-") as directory:
+            config_path = Path(directory) / "generic-config.env"
+            config_path.write_text("APP_MODE=offline\n", encoding="utf-8-sig")
+
+            self.assertEqual(visibility.r6.read_env_file(config_path), {"APP_MODE": "offline"})
+
+
 def _text(body: object) -> str | None:
     return body if isinstance(body, str) else json.dumps(body)
 
@@ -313,13 +322,17 @@ class SubmitTestnetOrderCliTests(unittest.TestCase):
     def test_place_flags_use_distinct_fake_probes_and_pass_ack_time_to_visibility(self) -> None:
         read_probe, trade_probe = _ready_probes()
         created: list[FakeProbe] = []
+        expected_probes = {
+            ("READ_KEY_ONLY", "READ_SECRET_ONLY"): read_probe,
+            ("TRADE_KEY_ONLY", "TRADE_SECRET_ONLY"): trade_probe,
+        }
 
         def fake_probe_factory(key: str, secret: str, timeout: int, **kwargs: object) -> FakeProbe:
             self.assertEqual(timeout, 5)
             self.assertIs(kwargs["request_get"], visibility.testnet_get)
             self.assertEqual(kwargs["attempts"], 1)
-            probe = read_probe if key == "READ_KEY_ONLY" else trade_probe
-            self.assertIn(secret, {"READ_SECRET_ONLY", "TRADE_SECRET_ONLY"})
+            self.assertIn((key, secret), expected_probes)
+            probe = expected_probes[(key, secret)]
             created.append(probe)
             return probe
 
@@ -334,14 +347,22 @@ class SubmitTestnetOrderCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="r6-order-cli-") as directory:
             read_credentials = Path(directory) / "read fake credentials.env"
             trade_credentials = Path(directory) / "trade fake credentials.env"
-            read_credentials.write_text(
-                f"{visibility.r6.KEY_VAR}=READ_KEY_ONLY\n{visibility.r6.SECRET_VAR}=READ_SECRET_ONLY\n",
-                encoding="utf-8",
-            )
-            trade_credentials.write_text(
-                f"{visibility.TRADE_KEY_VAR}=TRADE_KEY_ONLY\n{visibility.TRADE_SECRET_VAR}=TRADE_SECRET_ONLY\n",
-                encoding="utf-8-sig",
-            )
+            read_credentials.touch()
+            trade_credentials.touch()
+
+            def fake_env_file(path: str) -> dict[str, str]:
+                if path == str(read_credentials):
+                    return {
+                        visibility.r6.KEY_VAR: "READ_KEY_ONLY",
+                        visibility.r6.SECRET_VAR: "READ_SECRET_ONLY",
+                    }
+                if path == str(trade_credentials):
+                    return {
+                        visibility.TRADE_KEY_VAR: "TRADE_KEY_ONLY",
+                        visibility.TRADE_SECRET_VAR: "TRADE_SECRET_ONLY",
+                    }
+                raise AssertionError(f"unexpected environment file path: {path}")
+
             arguments = [
                 "--env-file",
                 str(read_credentials),
@@ -361,16 +382,21 @@ class SubmitTestnetOrderCliTests(unittest.TestCase):
                 "--poll-interval-ms",
                 "500",
             ]
-            with mock.patch.object(visibility.r6, "Probe", side_effect=fake_probe_factory):
-                with mock.patch.object(visibility, "collect_visibility", return_value=visibility_report) as collect:
-                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                        exit_code = visibility.main(arguments)
+            with mock.patch.object(visibility.r6, "read_env_file", side_effect=fake_env_file) as read_env_file:
+                with mock.patch.object(visibility.r6, "Probe", side_effect=fake_probe_factory):
+                    with mock.patch.object(visibility, "collect_visibility", return_value=visibility_report) as collect:
+                        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            exit_code = visibility.main(arguments)
 
         self.assertEqual(exit_code, 0)
         report = json.loads(stdout.getvalue())
         self.assertEqual(report["selection"], "new_order")
         self.assertIn(f"Spot Testnet accepted {SYMBOL} orderId {ORDER_ID}", stderr.getvalue())
         self.assertEqual(created, [read_probe, trade_probe])
+        self.assertEqual(
+            read_env_file.call_args_list,
+            [mock.call(str(read_credentials)), mock.call(str(trade_credentials))],
+        )
         collect.assert_called_once_with(
             read_probe, SYMBOL, ORDER_ID, 2, 500, accepted_ms=ACK_MS
         )
