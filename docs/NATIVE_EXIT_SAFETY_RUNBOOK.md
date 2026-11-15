@@ -134,7 +134,28 @@ An order selected from the list has already been observed in `allOrders`. To cap
 & '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT -OrderId 12345
 ```
 
-The sampler reads the original placement time from `GET /api/v3/order` and verifies the symbol and order ID. The default sampling window is 20 seconds with a one-second polling interval and a five-second timeout per request. Use `-DurationSeconds`, `-PollIntervalMs` and `-TimeoutSeconds` to reproduce a sampling setup. If you need an explicit CA bundle, pass `-CaBundle`. The JSON report contains relative times, statuses and observation counts for sharing. Exit code 3 means a backoff response stopped the run. Exit code 4 means the initial exchange time or order read failed.
+When sampling an existing order, the script reads the original placement time from `GET /api/v3/order` and verifies the symbol and order ID.
+
+To submit and sample in one run, generate a separate HMAC key for the same Spot Testnet account. It needs `TRADE` to submit and `USER_DATA` to verify the account. Store it in a separate local UTF-8 file with the following entries. The existing operator key continues to handle the sampling reads. [Binance Spot Test Network](https://testnet.binance.vision/) [Testnet request security](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#request-security)
+
+```dotenv
+HENGYUAN_R6_TESTNET_TRADE_API_KEY=<Testnet TRADE API key>
+HENGYUAN_R6_TESTNET_TRADE_API_SECRET=<Testnet TRADE API secret>
+```
+
+```powershell
+$order = @{
+    Symbol = 'BTCUSDT'
+    Side = Read-Host 'Side (BUY or SELL)'
+    Price = Read-Host 'Limit price'
+    Quantity = Read-Host 'Order quantity in BTC'
+}
+& '.\tools\r6_allorders_visibility.ps1' -PlaceTestnetOrder -TradeCredentialsFile 'D:\TestNet\.env.r6-trade' @order
+```
+
+The script compares the UIDs reported for the two keys before submitting a single `LIMIT_MAKER` order to Spot Testnet. An acknowledgment supplies `orderId` and the placement time `transactTime`. If the outcome is unknown, the script makes up to three read-only queries using the original client order ID. If it still cannot verify the outcome, check that ID in Testnet before running another placement. The script leaves management of the Testnet order to the operator. Keep terminal messages with order identifiers local.
+
+The default sampling window is 20 seconds with a one-second polling interval and a five-second timeout per request. Use `-DurationSeconds`, `-PollIntervalMs` and `-TimeoutSeconds` to reproduce a sampling setup. If you need an explicit CA bundle, pass `-CaBundle`. The JSON report contains relative times, statuses and observation counts for sharing. Exit code 3 means a backoff response stopped the run. Exit code 4 means preparation failed. Exit code 5 means order submission was rejected or its outcome could not be verified.
 
 1. For each observation, read `GET /api/v3/time`, call `GET /api/v3/allOrders` for the symbol and a time window covering the order, then read `GET /api/v3/time` again. Record both exchange times and match the returned order by symbol and order identifier. [Spot Testnet server time](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#check-server-time)
 2. Mark the order as missing only for a valid, complete HTTP 200 order list. Mark failed requests, saturated pages, and unusable time brackets as inconclusive. Stop the run on HTTP 403, 418 or 429. If a later valid poll loses an order that was previously visible, report that sequence separately.

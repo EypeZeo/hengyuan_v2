@@ -44,7 +44,7 @@ def read_env_file(path):
     """KEY=VALUE lines (an optional `export `, optional quotes, # comments); a missing file is an empty mapping."""
     values = {}
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             for raw in fh:
                 line = raw.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -106,16 +106,16 @@ class Probe:
         return self._retrying(lambda: self.request_get(path, {}, self.timeout), attempts=self.attempts)
 
     def signed(self, path, params):
-        def once():
-            # signed afresh on every attempt: a retry seconds later must not carry a stale timestamp
-            p = dict(params)
-            p["timestamp"] = self.now_ms()
-            p["recvWindow"] = RECV_WINDOW_MS
-            query = urllib.parse.urlencode(p)
-            signature = hmac.new(self.secret.encode("ascii"), query.encode("ascii"), hashlib.sha256).hexdigest()
-            return self.request_get(path + "?" + query + "&signature=" + signature, {"X-MBX-APIKEY": self.key}, self.timeout)
+        return self._retrying(lambda: self.signed_once(path, params), attempts=self.attempts)
 
-        return self._retrying(once, attempts=self.attempts)
+    def signed_once(self, path, params, *, transport=None):
+        p = dict(params)
+        p["timestamp"] = self.now_ms()
+        p["recvWindow"] = RECV_WINDOW_MS
+        query = urllib.parse.urlencode(p)
+        signature = hmac.new(self.secret.encode("ascii"), query.encode("ascii"), hashlib.sha256).hexdigest()
+        request = self.request_get if transport is None else transport
+        return request(path + "?" + query + "&signature=" + signature, {"X-MBX-APIKEY": self.key}, self.timeout)
 
     @staticmethod
     def _retrying(attempt, attempts=3, pause_s=1.5):

@@ -163,6 +163,31 @@ class CollectVisibilityTests(unittest.TestCase):
         first = report["observations"][0]
         self.assertEqual(report["interval_ms"], {"lower": 0, "upper": first["after_ms"]})
 
+    def test_supplied_acceptance_time_skips_initial_order_lookup_and_keeps_relative_times(self) -> None:
+        probe = FakeProbe([ACCEPTED_MS, ACCEPTED_MS + 200], [_found_page()])
+        clock = FakeClock()
+
+        report = visibility.collect_visibility(
+            probe,
+            SYMBOL,
+            ORDER_ID,
+            duration_seconds=0.5,
+            poll_interval_ms=1000,
+            accepted_ms=ACCEPTED_MS,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+        self.assertEqual(
+            [call["path"] for call in probe.calls],
+            [visibility.TIME_PATH, visibility.ALL_ORDERS_PATH, visibility.TIME_PATH],
+        )
+        self.assertEqual(report["status"], "bounded")
+        self.assertEqual(report["observations"][0]["result"], "found")
+        self.assertEqual(report["observations"][0]["before_ms"], 0)
+        self.assertEqual(report["observations"][0]["after_ms"], 200)
+        self.assertEqual(report["interval_ms"], {"lower": 0, "upper": 200})
+
     def test_misses_through_deadline_are_right_censored(self) -> None:
         probe = _probe_for([_missing_page()] * 5)
 

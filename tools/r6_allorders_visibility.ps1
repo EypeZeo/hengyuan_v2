@@ -8,6 +8,8 @@ Lists recent Binance Spot Testnet orders and samples allOrders visibility.
 Run this script with its Python sampler and the existing R6 probe in the same tools directory.
 Choose a recent order interactively or supply an order ID to sample directly.
 Use -ListOnly to display recent orders. Sampling prints a redacted JSON report.
+Use -PlaceTestnetOrder with -TradeCredentialsFile, -Symbol, -Side, -Price and
+-Quantity to submit one LIMIT_MAKER order and start sampling from its acceptance.
 The default credentials path comes from .env.r6-visibility-path beside this script
 or from .env.operator in the working directory. -CredentialsFile overrides it.
 .EXAMPLE
@@ -27,6 +29,16 @@ param(
     [ValidatePattern('^[A-Z0-9]{1,19}$')]
     [string]$Symbol = 'BTCUSDT',
 
+    [switch]$PlaceTestnetOrder,
+    [ValidateNotNullOrEmpty()]
+    [string]$TradeCredentialsFile,
+    [ValidateSet('BUY', 'SELL')]
+    [string]$Side,
+    [ValidateNotNullOrEmpty()]
+    [string]$Price,
+    [ValidateNotNullOrEmpty()]
+    [string]$Quantity,
+
     [ValidateRange(1, 300)]
     [int]$DurationSeconds = 20,
 
@@ -42,6 +54,35 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+
+$hasOrderId = $PSBoundParameters.ContainsKey('OrderId')
+$placementParameters = @('TradeCredentialsFile', 'Side', 'Price', 'Quantity')
+if ($PlaceTestnetOrder) {
+    if ($ListOnly -or $hasOrderId) {
+        throw 'Use -PlaceTestnetOrder without -ListOnly or -OrderId.'
+    }
+    if (-not $PSBoundParameters.ContainsKey('Symbol')) {
+        throw 'Specify -Symbol explicitly with -PlaceTestnetOrder.'
+    }
+    foreach ($parameter in $placementParameters) {
+        if (-not $PSBoundParameters.ContainsKey($parameter)) {
+            throw "Specify -${parameter} with -PlaceTestnetOrder."
+        }
+    }
+    if (-not (Test-Path -LiteralPath $TradeCredentialsFile -PathType Leaf)) {
+        throw 'The Testnet TRADE credentials file is unavailable.'
+    }
+    $tradeCredentialsPath = (Resolve-Path -LiteralPath $TradeCredentialsFile).ProviderPath
+} else {
+    if ($ListOnly -and $hasOrderId) {
+        throw 'Choose either -ListOnly or -OrderId.'
+    }
+    foreach ($parameter in $placementParameters) {
+        if ($PSBoundParameters.ContainsKey($parameter)) {
+            throw "Use -${parameter} with -PlaceTestnetOrder."
+        }
+    }
+}
 
 if (-not $PSBoundParameters.ContainsKey('CredentialsFile')) {
     $localPathSetting = Join-Path $PSScriptRoot '.env.r6-visibility-path'
@@ -69,12 +110,16 @@ if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
 }
 $python = Get-Command -Name python -CommandType Application | Select-Object -First 1
 $integerFormat = [Globalization.CultureInfo]::InvariantCulture
-$hasOrderId = $PSBoundParameters.ContainsKey('OrderId')
-if ($ListOnly -and $hasOrderId) {
-    throw 'Choose either -ListOnly or -OrderId.'
-}
 $nativeArguments = @($samplerPath, '--env-file', $credentialsPath)
-if ($hasOrderId) {
+if ($PlaceTestnetOrder) {
+    $nativeArguments += @(
+        '--place-testnet-order'
+        '--trade-env-file', $tradeCredentialsPath
+        '--side', $Side.ToUpperInvariant()
+        '--price', $Price
+        '--quantity', $Quantity
+    )
+} elseif ($hasOrderId) {
     $nativeArguments += @('--order-id', $OrderId.ToString($integerFormat))
 } elseif ($ListOnly) {
     $nativeArguments += '--list-only'

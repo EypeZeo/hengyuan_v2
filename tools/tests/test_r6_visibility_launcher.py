@@ -299,6 +299,63 @@ class WindowsLauncherTests(unittest.TestCase):
             self.assertNotIn('"argv"', completed.stdout)
             self.assertNotRegex(completed.stderr, r"(?i)supply values for the following parameters|credentialsfile:")
 
+    def test_place_order_flags_forward_both_fake_credential_paths_and_order_fields(self) -> None:
+        pwsh = self._powershell()
+        with tempfile.TemporaryDirectory(prefix="r6 visibility place ") as directory:
+            root = Path(directory)
+            launcher, working_directory = self._prepare_launcher(root)
+            read_credentials = root / "offline fake read credentials.env"
+            trade_credentials = root / "offline fake trade credentials.env"
+            read_credentials.write_text("placeholder only\n", encoding="utf-8")
+            trade_credentials.write_text("placeholder only\n", encoding="utf-8")
+
+            completed = self._invoke(
+                pwsh,
+                launcher,
+                working_directory,
+                [
+                    "-CredentialsFile",
+                    str(read_credentials.resolve()),
+                    "-PlaceTestnetOrder",
+                    "-TradeCredentialsFile",
+                    str(trade_credentials.resolve()),
+                    "-Symbol",
+                    "BTCUSDT",
+                    "-Side",
+                    "BUY",
+                    "-Price",
+                    "64000.25",
+                    "-Quantity",
+                    "0.0025",
+                ],
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            arguments = json.loads(completed.stdout.strip())["argv"]
+            self._assert_env_file_argument(arguments, read_credentials)
+            self.assertEqual(arguments[2], "--place-testnet-order")
+            self.assertEqual(arguments[3], "--trade-env-file")
+            self.assertTrue(Path(arguments[4]).samefile(trade_credentials))
+            self.assertEqual(
+                arguments[5:],
+                [
+                    "--side",
+                    "BUY",
+                    "--price",
+                    "64000.25",
+                    "--quantity",
+                    "0.0025",
+                    "--symbol",
+                    "BTCUSDT",
+                    "--duration-seconds",
+                    "20",
+                    "--poll-interval-ms",
+                    "1000",
+                    "--timeout-seconds",
+                    "5",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
