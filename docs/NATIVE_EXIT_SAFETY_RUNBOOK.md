@@ -120,7 +120,13 @@ The operator completed the drill on Windows with a Spot Testnet account and a sy
 
 Use an order accepted by Spot Testnet and a separate read-only operator key for the same account. Record the exchange's order placement time as `t0` in milliseconds. Keep the symbol and order identifiers locally. Record the intended polling interval and observation deadline before collecting samples. Start polling promptly after acceptance and record the actual gap between observations. [Spot Testnet REST documentation](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#all-orders-user_data)
 
-Run the standalone PowerShell entry point with its two companion Python files in the repository's `tools` directory. It requires PowerShell 7 and Python 3.8 or later. Replace the example numeric order ID with the exchange's `orderId` for the accepted order.
+Run the PowerShell entry point with its two companion Python files in the repository's `tools` directory. It requires PowerShell 7 and Python 3.8 or later. The default command lists up to ten recent orders for the symbol and asks which one to sample. Add `-ListOnly` to stop after listing.
+
+```powershell
+& '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT
+```
+
+An order selected from the list has already been observed in `allOrders`. To capture its first appearance, pass the numeric `orderId` from the exchange's order acknowledgment as soon as the order is accepted.
 
 ```powershell
 & '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol BTCUSDT -OrderId 12345

@@ -94,6 +94,80 @@ class WindowsLauncherTests(unittest.TestCase):
             )
             self.assertEqual(result["ssl_cert_file"], str(ca_bundle.resolve()))
 
+    def test_launcher_omits_unspecified_order_id_and_forwards_list_only(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("the launcher contract is Windows PowerShell specific")
+        pwsh = shutil.which("pwsh")
+        if pwsh is None or shutil.which("python") is None:
+            self.skipTest("pwsh and python must both be available on PATH")
+
+        source_script = TOOLS_DIR / "r6_allorders_visibility.ps1"
+        with tempfile.TemporaryDirectory(prefix="r6 visibility launcher ") as directory:
+            root = Path(directory)
+            working_directory = root / "separate working directory"
+            working_directory.mkdir()
+            launcher = root / source_script.name
+            shutil.copyfile(source_script, launcher)
+            credentials = root / "offline fake credentials.env"
+            credentials.write_text("placeholder only\n", encoding="utf-8")
+            (root / "r6_testnet_probe.py").write_text("# offline launcher placeholder\n", encoding="utf-8")
+            (root / "r6_allorders_visibility.py").write_text(
+                "import json, sys\n"
+                "print(json.dumps({'argv': sys.argv[1:]}))\n",
+                encoding="utf-8",
+            )
+
+            def invoke(extra_arguments: list[str]) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+                completed = subprocess.run(
+                    [pwsh, "-NoProfile", "-File", str(launcher), "-CredentialsFile", str(credentials.resolve()), *extra_arguments],
+                    cwd=working_directory,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                return completed, json.loads(completed.stdout.strip())
+
+            no_order, no_order_result = invoke([])
+            self.assertEqual(no_order.returncode, 0, no_order.stderr)
+            self.assertNotIn("--order-id", no_order_result["argv"])
+            self.assertEqual(
+                no_order_result["argv"],
+                [
+                    "--env-file",
+                    str(credentials.resolve()),
+                    "--symbol",
+                    "BTCUSDT",
+                    "--duration-seconds",
+                    "20",
+                    "--poll-interval-ms",
+                    "1000",
+                    "--timeout-seconds",
+                    "5",
+                ],
+            )
+
+            list_only, list_only_result = invoke(["-ListOnly"])
+            self.assertEqual(list_only.returncode, 0, list_only.stderr)
+            self.assertIn("--list-only", list_only_result["argv"])
+            self.assertNotIn("--order-id", list_only_result["argv"])
+            self.assertEqual(
+                list_only_result["argv"],
+                [
+                    "--env-file",
+                    str(credentials.resolve()),
+                    "--list-only",
+                    "--symbol",
+                    "BTCUSDT",
+                    "--duration-seconds",
+                    "20",
+                    "--poll-interval-ms",
+                    "1000",
+                    "--timeout-seconds",
+                    "5",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

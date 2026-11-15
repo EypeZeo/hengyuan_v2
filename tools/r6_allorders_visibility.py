@@ -8,6 +8,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import r6_testnet_probe as r6
 
@@ -16,6 +17,7 @@ ORDER_PATH = "/api/v3/order"
 ALL_ORDERS_PATH = "/api/v3/allOrders"
 BACKOFF_STATUSES = {403, 418, 429}
 PAGE_LIMIT = 1000
+RECENT_ORDER_LIMIT = 10
 RESPONSE_CAP = 1 << 20
 WINDOW_LIMIT_MS = 86_400_000
 MAX_ORDER_ID = (1 << 63) - 1
@@ -101,7 +103,7 @@ def read_order_time(probe, symbol, order_id):
     return accepted_ms
 
 
-def classify_page(rows, symbol, order_id):
+def page_order_ids(rows, symbol):
     if not isinstance(rows, list):
         raise ReadFailure("all_orders", "invalid_page", 200)
     if len(rows) >= PAGE_LIMIT:
@@ -115,7 +117,11 @@ def classify_page(rows, symbol, order_id):
         if type(value) is not int or not 0 <= value <= MAX_ORDER_ID or value in ids:
             raise ReadFailure("all_orders", "invalid_page", 200)
         ids.add(value)
-    return "found" if order_id in ids else "missing"
+    return ids
+
+
+def classify_page(rows, symbol, order_id):
+    return "found" if order_id in page_order_ids(rows, symbol) else "missing"
 
 
 def summarize(report):
@@ -236,11 +242,51 @@ def symbol_name(value):
     return value
 
 
+def recent_orders(probe, symbol):
+    read_exchange_time(probe, "initial_time")
+    rows = read_json(probe, "all_orders", ALL_ORDERS_PATH, {"symbol": symbol, "limit": RECENT_ORDER_LIMIT})
+    page_order_ids(rows, symbol)
+    if any(type(row.get("time")) is not int or row["time"] < 0 for row in rows):
+        raise ReadFailure("all_orders", "invalid_order_time", 200)
+    return sorted(rows, key=lambda row: row["time"], reverse=True)[:RECENT_ORDER_LIMIT]
+
+
+def print_order_list(rows, stream):
+    print(f"{'#':>2}  {'orderId':>19}  {'Symbol':<19}  {'Status':<18}  Placed at (SGT)", file=stream)
+    sgt = timezone(timedelta(hours=8))
+    for index, row in enumerate(rows, start=1):
+        status = row.get("status")
+        if not isinstance(status, str) or not re.fullmatch(r"[A-Z_]{1,18}", status):
+            status = "-"
+        try:
+            placed = datetime.fromtimestamp(row["time"] / 1000, sgt).strftime("%Y-%m-%d %H:%M:%S")
+        except (OverflowError, OSError, ValueError):
+            placed = "-"
+        print(f"{index:>2}  {row['orderId']:>19}  {row['symbol']:<19}  {status:<18}  {placed}", file=stream)
+
+
+def select_order(rows):
+    print_order_list(rows, sys.stderr)
+    print("Select an order by row number, or press Enter to cancel: ", end="", file=sys.stderr, flush=True)
+    try:
+        choice = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not choice:
+        return None
+    if not re.fullmatch(r"[0-9]{1,2}", choice) or not 1 <= int(choice) <= len(rows):
+        print("Choose a row number from the displayed list.", file=sys.stderr)
+        return None
+    return rows[int(choice) - 1]["orderId"]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", required=True)
     parser.add_argument("--symbol", type=symbol_name, default="BTCUSDT")
-    parser.add_argument("--order-id", required=True, type=bounded_integer(0, MAX_ORDER_ID))
+    order_source = parser.add_mutually_exclusive_group()
+    order_source.add_argument("--order-id", type=bounded_integer(0, MAX_ORDER_ID))
+    order_source.add_argument("--list-only", action="store_true")
     parser.add_argument("--duration-seconds", type=bounded_integer(1, 300), default=20)
     parser.add_argument("--poll-interval-ms", type=bounded_integer(500, 60_000), default=1000)
     parser.add_argument("--timeout-seconds", type=bounded_integer(1, 30), default=5)
@@ -257,7 +303,31 @@ def main(argv=None):
         return 2
 
     probe = r6.Probe(key, secret, args.timeout_seconds, request_get=testnet_get, attempts=1)
-    report = collect_visibility(probe, args.symbol, args.order_id, args.duration_seconds, args.poll_interval_ms)
+    order_id = args.order_id
+    if order_id is None:
+        try:
+            rows = recent_orders(probe, args.symbol)
+        except ReadFailure as problem:
+            status = "stopped" if problem.stopped else "setup_failed"
+            print(json.dumps({"environment": "SPOT_TESTNET", "status": status, "problem": problem.details}, indent=2))
+            return 3 if problem.stopped else 4
+        if not rows:
+            print(f"No visible Testnet orders for {args.symbol}.", file=sys.stderr)
+            return 0 if args.list_only else 2
+        if args.list_only:
+            print_order_list(rows, sys.stdout)
+            return 0
+        order_id = select_order(rows)
+        if order_id is None:
+            return 2
+
+    report = collect_visibility(probe, args.symbol, order_id, args.duration_seconds, args.poll_interval_ms)
+    if args.order_id is None:
+        report["selection"] = "recent_orders"
+        # Selecting an order establishes that allOrders has already shown it once.
+        if report["status"] != "stopped" and report["counts"]["missing"]:
+            report["status"] = "nonmonotonic"
+            report["interval_ms"] = None
     print(json.dumps(report, indent=2))
     return {"stopped": 3, "setup_failed": 4}.get(report["status"], 0)
 

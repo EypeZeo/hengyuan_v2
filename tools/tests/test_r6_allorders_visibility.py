@@ -374,6 +374,25 @@ class VisibilityCliTests(unittest.TestCase):
             self.assertEqual(kwargs["attempts"], 1)
             return exit_code, json.loads(stdout.getvalue()), probe_factory
 
+    def _run_cli_with_fakes(
+        self,
+        probe: FakeProbe,
+        arguments: list[str],
+        *,
+        input_value: str = "",
+        collection_report: dict[str, object] | None = None,
+    ) -> tuple[int, str, str, mock.Mock, mock.Mock, mock.Mock]:
+        with tempfile.TemporaryDirectory(prefix="r6-visibility-cli-") as directory:
+            credentials_path = self._credentials_file(directory)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(visibility.r6, "Probe", return_value=probe) as probe_factory:
+                with mock.patch.object(visibility, "collect_visibility", return_value=collection_report) as collect:
+                    with mock.patch("builtins.input", return_value=input_value) as user_input:
+                        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            exit_code = visibility.main(["--env-file", str(credentials_path), *arguments])
+            return exit_code, stdout.getvalue(), stderr.getvalue(), collect, user_input, probe_factory
+
     def test_fake_probe_stopped_status_is_reported_as_exit_3_json(self) -> None:
         probe = _probe_for([(429, {"code": -1003, "msg": "hidden body"})])
 
@@ -394,6 +413,117 @@ class VisibilityCliTests(unittest.TestCase):
         self.assertEqual(report["status"], "setup_failed")
         self.assertEqual(report["problem"]["stage"], "order")
         self.assertNotIn("/api/v3/", json.dumps(report))
+
+    def test_interactive_selection_lists_newest_first_and_samples_the_selected_order_id(self) -> None:
+        rows = [
+            {"symbol": SYMBOL, "orderId": 501, "time": ACCEPTED_MS + 1_000, "status": "FILLED"},
+            {"symbol": SYMBOL, "orderId": 503, "time": ACCEPTED_MS + 3_000, "status": "NEW"},
+            {"symbol": SYMBOL, "orderId": 502, "time": ACCEPTED_MS + 2_000, "status": "PARTIALLY_FILLED"},
+        ]
+        probe = _probe_for([(200, rows)])
+        collection_report = {"status": "bounded", "interval_ms": {"lower": 0, "upper": 100},
+                             "counts": {"missing": 0}, "observations": []}
+
+        exit_code, stdout, stderr, collect, user_input, _ = self._run_cli_with_fakes(
+            probe,
+            ["--duration-seconds", "3", "--poll-interval-ms", "500"],
+            input_value="2",
+            collection_report=collection_report,
+        )
+
+        self.assertEqual(exit_code, 0)
+        report = json.loads(stdout)
+        self.assertEqual(report["selection"], "recent_orders")
+        self.assertEqual(report["status"], "bounded")
+        self.assertNotIn("501", stdout)
+        self.assertNotIn("502", stdout)
+        self.assertNotIn("503", stdout)
+        self.assertIn("Select an order by row number", stderr)
+        positions = [stderr.index(str(order_id)) for order_id in (503, 502, 501)]
+        self.assertEqual(positions, sorted(positions))
+        user_input.assert_called_once_with()
+        collect.assert_called_once_with(probe, SYMBOL, 502, 3, 500)
+        self.assertEqual([call["path"] for call in probe.calls], [visibility.TIME_PATH, visibility.ALL_ORDERS_PATH])
+        list_call = probe.calls[-1]
+        self.assertEqual(list_call["params"], {"symbol": SYMBOL, "limit": 10})
+
+    def test_list_only_prints_recent_orders_without_sampling_or_prompting(self) -> None:
+        rows = [
+            {"symbol": SYMBOL, "orderId": 601, "time": ACCEPTED_MS + 1_000, "status": "FILLED"},
+            {"symbol": SYMBOL, "orderId": 603, "time": ACCEPTED_MS + 3_000, "status": "NEW"},
+            {"symbol": SYMBOL, "orderId": 602, "time": ACCEPTED_MS + 2_000, "status": "PARTIALLY_FILLED"},
+        ]
+        probe = _probe_for([(200, rows)])
+
+        exit_code, stdout, stderr, collect, user_input, _ = self._run_cli_with_fakes(
+            probe, ["--list-only"], collection_report={"status": "bounded", "counts": {"missing": 0}}
+        )
+
+        self.assertEqual(exit_code, 0)
+        positions = [stdout.index(str(order_id)) for order_id in (603, 602, 601)]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("Select an order", stderr)
+        collect.assert_not_called()
+        user_input.assert_not_called()
+        self.assertEqual([call["path"] for call in probe.calls], [visibility.TIME_PATH, visibility.ALL_ORDERS_PATH])
+        self.assertEqual(probe.calls[-1]["params"], {"symbol": SYMBOL, "limit": 10})
+
+    def test_empty_recent_order_list_does_not_prompt_or_start_sampling(self) -> None:
+        for arguments, expected_exit in (([], 2), (["--list-only"], 0)):
+            with self.subTest(arguments=arguments):
+                probe = _probe_for([(200, [])])
+
+                exit_code, stdout, stderr, collect, user_input, _ = self._run_cli_with_fakes(
+                    probe, arguments, collection_report={"status": "bounded", "counts": {"missing": 0}}
+                )
+
+                self.assertEqual(exit_code, expected_exit)
+                self.assertIn("No visible Testnet orders", stderr)
+                self.assertEqual(stdout, "")
+                collect.assert_not_called()
+                user_input.assert_not_called()
+                self.assertEqual([call["path"] for call in probe.calls], [visibility.TIME_PATH, visibility.ALL_ORDERS_PATH])
+
+    def test_a_missing_sample_after_interactive_selection_is_nonmonotonic(self) -> None:
+        rows = [{"symbol": SYMBOL, "orderId": 702, "time": ACCEPTED_MS + 2_000, "status": "NEW"}]
+        probe = _probe_for([(200, rows)])
+        collection_report = {
+            "status": "right_censored",
+            "interval_ms": {"lower": 1_000, "upper": None},
+            "counts": {"missing": 1},
+            "observations": [{"result": "missing", "before_ms": 1_000, "after_ms": 1_100, "gap_ms": None}],
+        }
+
+        exit_code, stdout, _stderr, collect, _user_input, _ = self._run_cli_with_fakes(
+            probe, [], input_value="1", collection_report=collection_report
+        )
+
+        report = json.loads(stdout)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["selection"], "recent_orders")
+        self.assertEqual(report["status"], "nonmonotonic")
+        self.assertIsNone(report["interval_ms"])
+        collect.assert_called_once_with(probe, SYMBOL, 702, 20, 1000)
+
+    def test_explicit_order_id_skips_listing_and_preserves_direct_sampling(self) -> None:
+        probe = _probe_for([])
+        collection_report = {"status": "bounded", "interval_ms": {"lower": 0, "upper": 100},
+                             "counts": {"missing": 0}, "observations": []}
+
+        exit_code, stdout, stderr, collect, user_input, _ = self._run_cli_with_fakes(
+            probe,
+            ["--order-id", str(ORDER_ID), "--duration-seconds", "4", "--poll-interval-ms", "750"],
+            collection_report=collection_report,
+        )
+
+        self.assertEqual(exit_code, 0)
+        report = json.loads(stdout)
+        self.assertNotIn("selection", report)
+        self.assertEqual(report["status"], "bounded")
+        self.assertEqual(stderr, "")
+        user_input.assert_not_called()
+        collect.assert_called_once_with(probe, SYMBOL, ORDER_ID, 4, 750)
+        self.assertEqual(probe.calls, [])
 
 
 if __name__ == "__main__":

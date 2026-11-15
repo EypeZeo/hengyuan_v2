@@ -3,10 +3,11 @@
 
 <#
 .SYNOPSIS
-Samples allOrders visibility for one accepted Binance Spot Testnet order.
+Lists recent Binance Spot Testnet orders and samples allOrders visibility.
 .DESCRIPTION
 Run this script with its Python sampler and the existing R6 probe in the same tools directory.
-It reads the specified credential file and prints a JSON report with relative times and statuses.
+Choose a recent order interactively or supply an order ID to sample directly.
+Use -ListOnly to display recent orders. Sampling prints a redacted JSON report.
 .EXAMPLE
 & '.\r6_allorders_visibility.ps1' -CredentialsFile '.env.operator' -Symbol BTCUSDT -OrderId 12345
 #>
@@ -17,9 +18,10 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$CredentialsFile,
 
-    [Parameter(Mandatory)]
     [ValidateRange(0, 9223372036854775807)]
     [long]$OrderId,
+
+    [switch]$ListOnly,
 
     [ValidatePattern('^[A-Z0-9]{1,19}$')]
     [string]$Symbol = 'BTCUSDT',
@@ -55,10 +57,17 @@ if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
 }
 $python = Get-Command -Name python -CommandType Application | Select-Object -First 1
 $integerFormat = [Globalization.CultureInfo]::InvariantCulture
-$nativeArguments = @(
-    $samplerPath
-    '--env-file', $credentialsPath
-    '--order-id', $OrderId.ToString($integerFormat)
+$hasOrderId = $PSBoundParameters.ContainsKey('OrderId')
+if ($ListOnly -and $hasOrderId) {
+    throw 'Choose either -ListOnly or -OrderId.'
+}
+$nativeArguments = @($samplerPath, '--env-file', $credentialsPath)
+if ($hasOrderId) {
+    $nativeArguments += @('--order-id', $OrderId.ToString($integerFormat))
+} elseif ($ListOnly) {
+    $nativeArguments += '--list-only'
+}
+$nativeArguments += @(
     '--symbol', $Symbol.ToUpperInvariant()
     '--duration-seconds', $DurationSeconds.ToString($integerFormat)
     '--poll-interval-ms', $PollIntervalMs.ToString($integerFormat)
