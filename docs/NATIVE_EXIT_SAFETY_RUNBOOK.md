@@ -170,8 +170,6 @@ The following offline example uses elapsed milliseconds from `t0` and a syntheti
 
 Sample A gives an observed transition interval of **210–841 ms**. Share the relative times, sample label, observation category, polling interval and sample counts. Retain the configured 120-second read allowance until the real samples have been reviewed. These intervals describe the observed reads. A finite set of samples cannot establish a service-wide upper bound.
 
-Check `-2026` separately using an order known to have been archived. Record the HTTP status and numeric error code if that case is observed. The archive case remains pending until a suitable Testnet order is available. [Binance archived-order error](https://developers.binance.com/en/docs/products/spot/errors#-2026-order_archived)
-
 ### Read-only follow-up on 2026-11-15
 
 The operator selected an existing order from the Spot Testnet `allOrders` list. The 20-second follow-up returned six hits, zero misses, and zero inconclusive observations. The exchange-time readings around the first timed query were **24.241 and 26.278 seconds** after placement. Gaps between the exchange-time readings taken before successive queries ranged from **3.365 to 4.029 seconds** with a configured one-second polling interval. The run verifies continued visibility for the selected order.
@@ -189,4 +187,18 @@ The operator submitted a Spot Testnet `LIMIT_MAKER` order and started `allOrders
 | Gaps between pre-query exchange-time readings | 3,165–3,935 ms |
 | Final observation | The sampling deadline expired before the post-query exchange-time read at stage `after_time`. |
 
-The operator retained the 120-second read allowance. The archived-order response `-2026` remains pending.
+The read allowance is 120 seconds.
+
+### Checking the archived-order response
+
+Binance documents `-2026 ORDER_ARCHIVED` for unfilled orders canceled or expired more than 90 days ago that have been archived. Spot Testnet resets its order data approximately monthly, so a newly canceled Testnet order is unlikely to remain available long enough for this check. [Spot Testnet error codes](https://developers.binance.com/en/docs/products/spot/testnet/errors#-2026-order_archived) [Spot Test Network reset FAQ](https://testnet.binance.vision/)
+
+If a suitable order from the operator's Testnet account is available, run the read-only sampler from the repository root with that order's symbol and numeric `orderId`.
+
+```powershell
+$symbol = Read-Host 'Spot Testnet symbol'
+$orderId = [long](Read-Host 'Numeric orderId for the archived order')
+& '.\tools\r6_allorders_visibility.ps1' -CredentialsFile '.\.env.operator' -Symbol $symbol -OrderId $orderId
+```
+
+Record the report's `problem.http_status` and `problem.exchange_code` from stage `order`. The sampler exits with code 4 on these point-query errors. Record `-2013` separately as a no-such-order response. The resolver classifies `-2026` as an archived order and refuses an `ABSENT` resolution. Simulated responses cover both codes. Direct Testnet observation of `-2026` is pending.

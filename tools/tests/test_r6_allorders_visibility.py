@@ -439,6 +439,31 @@ class VisibilityCliTests(unittest.TestCase):
         self.assertEqual(report["problem"]["stage"], "order")
         self.assertNotIn("/api/v3/", json.dumps(report))
 
+    def test_archive_and_missing_order_errors_keep_code_without_leaking_response_details(self) -> None:
+        private_message = "private order response message marker"
+        for exchange_code in (-2026, -2013):
+            with self.subTest(exchange_code=exchange_code):
+                probe = _probe_for(
+                    [],
+                    order_status=400,
+                    order_body={"code": exchange_code, "msg": private_message, "orderId": ORDER_ID},
+                )
+
+                exit_code, report, _ = self._call_main_with_fake_probe(probe)
+
+                serialized = json.dumps(report)
+                self.assertEqual(exit_code, 4)
+                self.assertEqual(report["status"], "setup_failed")
+                self.assertEqual(report["problem"]["stage"], "order")
+                self.assertEqual(report["problem"]["http_status"], 400)
+                self.assertEqual(report["problem"]["exchange_code"], exchange_code)
+                self.assertNotIn(str(ORDER_ID), serialized)
+                self.assertNotIn(private_message, serialized)
+                self.assertEqual(
+                    [call["path"] for call in probe.calls],
+                    [visibility.TIME_PATH, visibility.ORDER_PATH],
+                )
+
     def test_interactive_selection_lists_newest_first_and_samples_the_selected_order_id(self) -> None:
         rows = [
             {"symbol": SYMBOL, "orderId": 501, "time": ACCEPTED_MS + 1_000, "status": "FILLED"},
