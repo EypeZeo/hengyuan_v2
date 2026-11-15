@@ -933,6 +933,9 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - **关闭了的开放问题**：上面 R3b-1、R3b-2、R3b-3 与 R4 条目的 “仍未覆盖” 把 “Testnet 的 `/api/v3/account` 是否带 `uid`（若不带，流程会以 `AccountUnverified` 挡住演练）” 与 “`-2013` 的真实状态码” 记为未量，设计 §9 把 “`-2013` 的状态是声明的一部分、真实表现由 R6 测量” 当作假设；这两件现已量过：Testnet 带 `uid`，工具不会挡住演练；不存在的订单就是 HTTP 400 / -2013。那几个条目保持写作当时的原文，答案在这里。
     - **验证**：py_compile、ruff check（E、F、W）通过；离线自检（假传输）覆盖恰好 5 个 GET、请求头带密钥且查询带 `timestamp` / `recvWindow` / `signature`、输出里没有密钥 / 密钥串 / `uid` 的值、`uid` 存在与缺失两条路径、没有凭据时退出码 2 且不发任何请求、`.env` 解析。没有触碰 `native/`，所以原生 CI 没有运行。
 
+  - **D5 R6：生成可恢复的 Testnet 演练存储。** `native/src/hy_r6_prepare_drill.cpp` 只接受新输出目录和非零 Testnet 账户 UID。入口生成该目录专用的随机 KEK 与封装日志密钥，只写入 Testnet 环境绑定，不载入交易所凭据。它先确认品种快照与账户绑定，再确认同一订单的 Intent 与 Prepared 写入，然后关闭日志。恢复时该订单出现在未结清列表中，状态为 `Ambiguous`，品种为 BTCUSDT。写入中断后的目录保留供检查，重试须指定新目录。
+    - 验证（2026-11-15）：MSVC Release 完整构建通过，3,739 项测试通过，1 项跳过、3 项禁用。GCC 14.2 定向测试 108 项通过，ASan/UBSan 定向测试 61 项通过。命令行测试确认两个订单帧、账户绑定、恢复列单和重复目录拒绝。结清流程使用本地 TLS 服务验证。
+
   - **[Q23 切片 S2/S3 已落地：读者先行——`OrderNeverSent` 帧与订单状态 `NeverSent`]**（`docs/NOTSENT_CLOSURE_DESIGN.md` §4.3、§4.6、§8；
     Owner 2026-11-12 看过计划说“开始，命名按你的建议”；Tier B）：“这个订单从未越过发送边界”的持久闭合帧，恢复读者现在能读、能校验，
     但**没有任何生产代码能写它**：写入口是 S4（sink 的 `append_never_sent()`，见下面的 “Q23 切片 S4” 条目），它的调用者是 S5（最终门的拒绝，类 B）与 S6（`Prepared` 之前的拒绝，类 A）；本片只让读者先行（设计 §5 第 4 条）。

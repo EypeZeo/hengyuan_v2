@@ -208,7 +208,7 @@
 | R5 环境与账户绑定（已合入：PR #220，`3363115`，2026-11-01；见 `docs/SPEC_INVARIANTS.md`“D5 切片 R5”） | R-env：存储记环境与账户（`store_binding.hpp` 读与判定、`store_binding_writer.hpp` 写）、工具在账户检查之后核对并拒绝不一致（Production 无绑定即拒绝）、交易进程一侧的 `ensure_store_binding()`（尚无调用方，M5 接线）、证据文件记绑定 | 单元 + 流程 + 工具 + 守卫；变异检查；生产启用的前置 |
 | R6 运行手册与 Testnet 演练（第一步已合入：PR #221，`0ef2b4e`，2026-11-01；见 `docs/SPEC_INVARIANTS.md`“D5 切片 R6”） | `NATIVE_EXIT_SAFETY_RUNBOOK.md` 新增一节；**Owner** 在 Testnet 上制造一个崩溃窗口订单并用工具结清；测量 `-2013` / `-2026` 的实际表现和读延迟 L。**第一步（已合入）**：只读探针 `tools/r6_testnet_probe.py` 由 Owner 在 Testnet 上运行，量出 `GET /api/v3/account` 带 19 位十进制的 `uid`、不存在的订单为 HTTP 400 / `-2013`、`order` / `allOrders` / `openOrders` 三个读端点对只读密钥都有应答；**仍待**：崩溃窗口订单的演练、`-2026` 的表现、读取可见性测量 | 演练记录；参数 L 的基线 |
 
-R6 的操作步骤见 [原生退出安全手册第 7 节](NATIVE_EXIT_SAFETY_RUNBOOK.md#7-r6-testnet-drill-for-an-unresolved-order)。Testnet 演练需要保留发送进程的审计日志、控制面日志及可恢复的 `Prepared` 订单。现有预检程序使用临时存储并停在操作员确认之前。实际演练和读取可见性测量待完成。
+R6 的操作步骤见 [原生退出安全手册第 7 节](NATIVE_EXIT_SAFETY_RUNBOOK.md#7-r6-testnet-drill-for-an-unresolved-order)。`hy_r6_prepare_drill` 在新目录生成独立的 Testnet 演练存储，保存两份日志、加密封装的日志密钥、KEK 和指定账户的绑定记录。它先写入品种快照，再写入 `Intent` 和 `Prepared`。这两个订单帧复现发送前进程终止时可恢复的状态，不产生交易所请求。演练者使用 `hy_operator_resolve` 在 Testnet 读取并结清该记录。真实查询结果与读取可见性测量仍待记录。
 
 K2、K3（存在的订单、带成交的解决）排在账务 / `PositionTruth` 恢复路径能吸收操作员解决的成交之后，另行设计。
 

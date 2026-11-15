@@ -201,15 +201,41 @@ TEST(OrderDurablePathGuard, TheScansOwnHelpersBehave) {
 
 TEST(OrderDurablePathGuard, EveryProductionAppendOfAnOrderFrameIsOneOfTheKnownWriters) {
     // The calls of the durable port's append_durable(). The orchestrator's two are the sink adapter of the port and the ONE function every frame of an
-    // order's life goes through (append_order_frame); the other two are the publishers' own append(). A fifth writer is a review item: it must plan
-    // against the shadow and move it after the ACK, and then be added here.
+    // order's life goes through (append_order_frame); the other two are the publishers' own append(). The offline R6 generator is allowed two setup
+    // writes for its synthetic Intent and Prepared records; it never sends an order. Any other writer must be reviewed and added here.
     const std::map<std::string, std::size_t> expected = {
         {"include/hengyuan/binance_user_data_event.hpp", 1},     // UserDataDurablePublisher::append
         {"include/hengyuan/live_submit_orchestrator.hpp", 2},    // durable_audit_sink_append_adapter() and detail::append_order_frame()
         {"include/hengyuan/order_tracker.hpp", 1},               // ReconcileDurablePublisher::append
+        {"src/hy_r6_prepare_drill.cpp", 2},                       // offline synthetic Intent and Prepared only; the generator never sends
     };
     const std::map<std::string, std::size_t> actual = calls_by_file("append_durable");
     EXPECT_EQ(actual, expected) << "expected:" << describe(expected) << "\n  actual:" << describe(actual);
+
+    const SourceFile* drill = find_source("src/hy_r6_prepare_drill.cpp");
+    ASSERT_NE(drill, nullptr);
+    const auto drill_appends = call_args(drill->code, "append_durable");
+    ASSERT_EQ(drill_appends.size(), 2u);
+    EXPECT_EQ(drill_appends[0], (std::vector<std::string>{"order", "now_ms"}));
+    EXPECT_EQ(drill_appends[1], (std::vector<std::string>{"order", "now_ms"}));
+
+    const std::size_t intent_event = drill->code.find("order.event_type = hy::AuditEventType::OrderIntentCreated;");
+    const std::size_t intent_state = drill->code.find("order.resulting_state = hy::OrderState::Intent;");
+    const std::size_t first_append = drill->code.find("audit->append_durable(order, now_ms).acked()");
+    const std::size_t prepared_event = drill->code.find("order.event_type = hy::AuditEventType::OrderSubmitPrepared;");
+    const std::size_t prepared_state = drill->code.find("order.resulting_state = hy::OrderState::Submitting;");
+    const std::size_t second_append = find_after(drill->code, "audit->append_durable(order, now_ms).acked()", first_append + 1);
+    ASSERT_NE(intent_event, std::string::npos);
+    ASSERT_NE(intent_state, std::string::npos);
+    ASSERT_NE(first_append, std::string::npos);
+    ASSERT_NE(prepared_event, std::string::npos);
+    ASSERT_NE(prepared_state, std::string::npos);
+    ASSERT_NE(second_append, std::string::npos);
+    EXPECT_LT(intent_event, intent_state);
+    EXPECT_LT(intent_state, first_append);
+    EXPECT_LT(first_append, prepared_event);
+    EXPECT_LT(prepared_event, prepared_state);
+    EXPECT_LT(prepared_state, second_append);
 }
 
 TEST(OrderDurablePathGuard, TheOrchestratorAppendsEveryFrameOfAnOrdersLifeThroughOneFunction) {

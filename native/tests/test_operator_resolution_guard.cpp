@@ -1039,6 +1039,7 @@ constexpr const char* kBinding = "include/hengyuan/store_binding.hpp";
 constexpr const char* kBindingWriter = "include/hengyuan/store_binding_writer.hpp";
 constexpr const char* kPipelineFile = "include/hengyuan/private_stream_pipeline.hpp";
 constexpr const char* kPreflightHarness = "src/live_submit_preflight_harness.cpp";
+constexpr const char* kPreparedDrill = "src/hy_r6_prepare_drill.cpp";
 
 const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kConfirmation, kPorts,        kBundle,
                                       kFlow,  kTransport, kCli,  kTerminal,     kTool,         kRealExchange, kMain};
@@ -1046,12 +1047,15 @@ const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kCon
 }  // namespace
 
 TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
-    expect_named_only_in("store_binding_writer", {{kPipelineFile, 1, "the trading process's wiring includes the write side (M5a-2b): the first and only production includer"}});
+    // The prepared-drill generator binds only its newly created synthetic Testnet store, using the explicit fixture uid. The production pipeline checks below remain unchanged.
+    expect_named_only_in("store_binding_writer", {{kPipelineFile, 1, "the trading process's wiring includes the write side (M5a-2b): the first production includer"},
+                                                   {kPreparedDrill, 1, "the offline prepared-drill generator binds its new synthetic Testnet store"}});
     expect_named_only_in("bind_store", {{kBindingWriter, 2, "the definition and its one call inside ensure_store_binding()"},
                                         {kPipelineFile, 1, "the pipeline's own method of that name, which calls ensure_store_binding()"},
                                         {kPreflightHarness, 1, "the preflight harness's one call (M5b-1): the first process that creates the pipeline"}});
     expect_named_only_in("ensure_store_binding", {{kBindingWriter, 3, "the two overloads, and the sink overload's call of the value overload"},
-                                                  {kPipelineFile, 1, "the pipeline's one call, with the uid the exchange reported"}});
+                                                  {kPipelineFile, 1, "the pipeline's one call, with the uid the exchange reported"},
+                                                  {kPreparedDrill, 1, "the generator's one call for its synthetic Testnet store"}});
     expect_named_only_in("encode_store_binding", {{kBindingWriter, 2, "the definition and its one call inside bind_store()"}});
     for (const char* f : kOperatorFiles) {
         const SourceFile* src = find_source(f);
@@ -1082,6 +1086,11 @@ TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
     EXPECT_EQ(harness_uid_reads[0], (std::vector<std::string>{"client", "exchange_uid"}));
     EXPECT_EQ(count_identifier(harness->code, "exchange_uid"), 4u)
         << "declared, read from the exchange, counted for the log (the value itself is never printed), handed to bind_store(): nothing else may set it";
+    const SourceFile* prepared_drill = find_source(kPreparedDrill);
+    ASSERT_NE(prepared_drill, nullptr);
+    const auto prepared_drill_binds = call_args(prepared_drill->code, "ensure_store_binding");
+    ASSERT_EQ(prepared_drill_binds.size(), 1u);
+    EXPECT_EQ(prepared_drill_binds[0], (std::vector<std::string>{"*audit", "audit_path", "*ring", "hy::StoreEnvironment::Testnet", "uid", "now_ms"}));
     // and the read side has no way to write one either
     const SourceFile* reader = find_source(kBinding);
     ASSERT_NE(reader, nullptr);
