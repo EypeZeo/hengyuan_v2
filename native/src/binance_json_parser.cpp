@@ -183,74 +183,48 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
         return ParseResult::UnknownSymbol;
     }
 
-    uint64_t event_time = 0;
-    [[maybe_unused]] auto e1 = doc["E"].get_uint64().get(event_time);
+    const bool is_trade = event_type == "trade";
+    if (is_trade || event_type == "aggTrade") {
+        std::uint64_t event_time = 0;
+        std::uint64_t trade_id = 0;
+        std::string_view price_str, qty_str;
+        bool buyer_is_maker = false;
+        if (doc["E"].get_uint64().get(event_time)
+            || doc[is_trade ? "t" : "a"].get_uint64().get(trade_id)
+            || doc["p"].get_string().get(price_str)
+            || doc["q"].get_string().get(qty_str)
+            || doc["m"].get_bool().get(buyer_is_maker)) {
+            ++counters_.malformed;
+            return ParseResult::MalformedJson;
+        }
 
-    if (event_type == "trade") {
+        const auto price = parse_decimal_to_fixed(price_str, sym_cfg->price_multiplier);
+        if (!price) {
+            ++counters_.price_overflow;
+            return ParseResult::PriceOverflow;
+        }
+
+        const auto qty = parse_decimal_to_fixed(qty_str, sym_cfg->qty_multiplier);
+        if (!qty) {
+            ++counters_.qty_overflow;
+            return ParseResult::QtyOverflow;
+        }
+
         auto& out = out_events[0];
         std::memset(&out, 0, sizeof(out));
-        out.symbol_id = sym_cfg->symbol_id;
-        out.ts_recv_ns = recv_ns;
-        out.ts_event_ms = event_time;
-        out.type = EventType::Trade;
-
-        uint64_t trade_id = 0;
-        [[maybe_unused]] auto e2 = doc["t"].get_uint64().get(trade_id);
         out.event_id = trade_id;
-
-        std::string_view price_str, qty_str;
-        if (doc["p"].get_string().get(price_str) || doc["q"].get_string().get(qty_str)) {
-            ++counters_.malformed;
-            return ParseResult::MalformedJson;
-        }
-
-        auto price = parse_decimal_to_fixed(price_str, sym_cfg->price_multiplier);
-        if (!price) { ++counters_.price_overflow; return ParseResult::PriceOverflow; }
         out.price_ticks = *price;
-
-        auto qty = parse_decimal_to_fixed(qty_str, sym_cfg->qty_multiplier);
-        if (!qty) { ++counters_.qty_overflow; return ParseResult::QtyOverflow; }
         out.qty_lots = *qty;
-
-        bool buyer_is_maker = false;
-        [[maybe_unused]] auto e3 = doc["m"].get_bool().get(buyer_is_maker);
-        out.side = buyer_is_maker ? Side::Sell : Side::Buy;
-
-        out_count = 1;
-
-    } else if (event_type == "aggTrade") {
-        auto& out = out_events[0];
-        std::memset(&out, 0, sizeof(out));
-        out.symbol_id = sym_cfg->symbol_id;
-        out.ts_recv_ns = recv_ns;
         out.ts_event_ms = event_time;
-        out.type = EventType::AggTrade;
-
-        uint64_t agg_id = 0;
-        [[maybe_unused]] auto e4 = doc["a"].get_uint64().get(agg_id);
-        out.event_id = agg_id;
-
-        std::string_view price_str, qty_str;
-        if (doc["p"].get_string().get(price_str) || doc["q"].get_string().get(qty_str)) {
-            ++counters_.malformed;
-            return ParseResult::MalformedJson;
-        }
-
-        auto price = parse_decimal_to_fixed(price_str, sym_cfg->price_multiplier);
-        if (!price) { ++counters_.price_overflow; return ParseResult::PriceOverflow; }
-        out.price_ticks = *price;
-
-        auto qty = parse_decimal_to_fixed(qty_str, sym_cfg->qty_multiplier);
-        if (!qty) { ++counters_.qty_overflow; return ParseResult::QtyOverflow; }
-        out.qty_lots = *qty;
-
-        bool buyer_is_maker = false;
-        [[maybe_unused]] auto e5 = doc["m"].get_bool().get(buyer_is_maker);
+        out.ts_recv_ns = recv_ns;
+        out.symbol_id = sym_cfg->symbol_id;
+        out.type = is_trade ? EventType::Trade : EventType::AggTrade;
         out.side = buyer_is_maker ? Side::Sell : Side::Buy;
-
         out_count = 1;
 
     } else if (event_type == "depthUpdate") {
+        uint64_t event_time = 0;
+        [[maybe_unused]] auto e1 = doc["E"].get_uint64().get(event_time);
         uint64_t first_update_id = 0;
         [[maybe_unused]] auto e6a = doc["U"].get_uint64().get(first_update_id);
         uint64_t final_update_id = 0;

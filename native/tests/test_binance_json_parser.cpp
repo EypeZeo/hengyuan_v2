@@ -67,6 +67,70 @@ TEST_F(BinanceJsonParserTest, ParseAggTrade) {
     EXPECT_EQ(evs_[0].symbol_id, 1u);
 }
 
+TEST_F(BinanceJsonParserTest, TradeAndAggTradeRejectMissingOrMalformedRequiredFields) {
+    struct EventShape {
+        const char* event_type;
+        const char* id_field;
+    };
+    const EventShape event_shapes[] = {{"trade", "t"}, {"aggTrade", "a"}};
+
+    const auto make_json = [](const char* event_type, const char* id_field, const char* omitted_field,
+                              const char* malformed_field, const char* malformed_value) {
+        std::string json = "{\"e\":\"";
+        json += event_type;
+        json += "\",";
+        const auto append = [&](const char* key, const char* valid_value) {
+            const std::string field(key);
+            if (omitted_field != nullptr && field == omitted_field) return;
+            json += "\"";
+            json += key;
+            json += "\":";
+            json += malformed_field != nullptr && field == malformed_field ? malformed_value : valid_value;
+            json += ",";
+        };
+        append("E", "1700000000000");
+        append("s", "\"BTCUSDT\"");
+        append(id_field, "123456");
+        append("p", "\"100.00000000\"");
+        append("q", "\"1.00000000\"");
+        append("m", "false");
+        json.pop_back();
+        json += "}";
+        return json;
+    };
+
+    const auto expect_malformed = [&](const EventShape& shape, const char* field, const char* omitted_field,
+                                      const char* malformed_field, const char* malformed_value,
+                                      const char* scenario) {
+        SCOPED_TRACE(std::string(shape.event_type) + " " + field + " " + scenario);
+        parser_.reset_counters();
+        const std::string json = make_json(shape.event_type, shape.id_field, omitted_field,
+                                           malformed_field, malformed_value);
+        const ParseResult result = parse_one(json.c_str());
+        EXPECT_EQ(result, ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    };
+
+    for (const EventShape& shape : event_shapes) {
+        struct RequiredField {
+            const char* key;
+            const char* wrong_type_value;
+        };
+        const RequiredField fields[] = {
+            {"E", "\"not-a-time\""},
+            {shape.id_field, "\"not-an-id\""},
+            {"m", "1"},
+        };
+        for (const RequiredField& field : fields) {
+            expect_malformed(shape, field.key, field.key, nullptr, nullptr, "missing");
+            expect_malformed(shape, field.key, nullptr, field.key, field.wrong_type_value, "wrong type");
+        }
+        expect_malformed(shape, shape.id_field, nullptr, shape.id_field, "-1", "negative unsigned id");
+    }
+}
+
 TEST_F(BinanceJsonParserTest, ParseDepthUpdate) {
     const char* json = R"({
         "e": "depthUpdate", "E": 1700000002000, "s": "BTCUSDT",
