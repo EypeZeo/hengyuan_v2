@@ -218,7 +218,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-052** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-053** | PRE_D3 | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-054** | PRE_D3 | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
-| **FI-055** | PRE_D3 | L3 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-055** | PRE_D3 | L3 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-056** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-057** | PRE_D3 | L2 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-058** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 1e104d7 |
@@ -1620,12 +1620,12 @@ gate_tag: PRE_D3
 scope: 按产品
 stage: 1A
 level: L3
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: open:native/include/hengyuan/submit_readiness.hpp#"It is not a lease"
-note: 令牌是 Gate 2b 签发即用的一次性快照，注释写明不是租约（蓝图 L-40）；发送之前的最后一门不存在。
+open: open:native/include/hengyuan/live_submit_orchestrator.hpp#orchestrate_submit
+note: PARTIAL：S5 已实现 Prepared 持久确认后的最终检查与 claim/revoke，类 B NeverSent 调用已接入；源码和既有验证说明见 SPEC_INVARIANTS.md。生产装配、目标主机时效及适用恢复验证仍未完成，本次未运行测试。
 ```
 
 ```ledger
@@ -1641,7 +1641,7 @@ gate_result: BLOCKED
 baseline: 58b60d0
 open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet"
 refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan
-note: PARTIAL：越过 Intent 的订单永不归为孤儿、孤儿预算是精确上界、越界时启动以恢复扫描失败降级，均有真实日志上的单测；运行期计数、分级告警与可验证归档都不存在，路线待 R-18。
+note: PARTIAL：孤儿预算与恢复单测已有；S5/S6 已接入类 B/类 A NeverSent，写入失败保留资源。运行期计数、告警、归档与 S7 迁移恢复仍待完成；本次未运行测试。
 ```
 
 ```ledger

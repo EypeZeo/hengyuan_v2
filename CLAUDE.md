@@ -236,25 +236,23 @@ green gate or a green merge guard alone doesn't mean it did.
 target.** The two specs are accepted implementation blueprints:
 
 - `docs/BINANCE_PRIVATE_REST_L4_SPEC.md` (rev 72) — signed read-only client + durable
-  control-plane store. **Next implementation milestone.**
-- `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (rev 73) — the L5 POST adapter. Follows and
-  depends on L4.
+  control-plane store. Implementation present; production integration and validation remain.
+- `docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md` (rev 73) — the L5 POST adapter. Depends on L4; production integration and validation remain.
 
 Implementation-level acceptance for each is defined by its own fault-injection matrix passing
 against real code, plus this repo's MSVC/WSL2/sanitizer discipline — not a v1-style review
 ceremony. Much of L4 §10's ABI surface is already ported into
 `native/include/hengyuan/durable_control_plane.hpp` (tracked in `docs/SPEC_INVARIANTS.md`).
 
-**Current honest state:** the authenticated REST client (`binance_private_rest.hpp`) and the real
-`POST /api/v3/order` adapter composed into a `SubmitPort` (`binance_submit_adapter.hpp`) are
-implemented and unit-tested, but nothing calls that `SubmitPort` against the exchange: every
-harness that reaches `orchestrate_submit()` injects a mock, and the one testnet-only cold-start
-harness (`live_submit_preflight_harness.cpp`;
-owner-supplied `.env`) assembles the real one without ever calling it. That harness has run
-once against the real Testnet, on the owner's own Testnet key (2026-11-07: account and
-exchangeInfo reads, the signed private user-data stream, a reconcile sweep; mock submit port, no
-order). No order has ever been submitted to any Binance environment, and no production
-credential has ever been used against this code.
+Current operating state (2026-11-15, through PR #256): native orchestrator harnesses still
+use a mock submit port. The preflight harness assembles the real adapter without invoking it.
+The 2026-11-07 Testnet run covered reads, the signed private stream and reconciliation.
+On 2026-11-15 the operator completed the R6 synthetic-Prepared resolution drill. A separate
+visibility sampler submitted one Testnet LIMIT_MAKER order; this does not validate the
+native SubmitPort order path. No production credentials or production funds were used.
+S5/S6 final authorization and NeverSent callers are implemented. Scope approval, persistent
+kill state, cancellation, minimum accounting and production integration remain unfinished.
+See docs/NATIVE_EXIT_SAFETY_RUNBOOK.md for the recorded scope and remaining checks.
 
 **What remains true regardless of any file in this repo:** nobody but the account owner can
 create a real Binance API key, decide to risk real money, or do the physical/legal things

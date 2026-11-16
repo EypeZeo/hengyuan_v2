@@ -7,8 +7,8 @@
 
 ```powershell
 python tools/doc_site/build_site.py           # 生成 docs/HengYuan_v2_...TODOLIST.html
-python tools/doc_site/verify_site.py          # 43 项结构与一致性校验，失败退出码 1
-python tools/doc_site/verify_gates.py         # 19 项闸门负向对照：确认每项校验都真的会失败
+python tools/doc_site/verify_site.py          # 结构与一致性校验，失败退出码 1
+python tools/doc_site/verify_gates.py         # 结构检查的负向测试：确认每项校验都真的会失败
 node   tools/doc_site/verify_interaction.mjs  # 66 项交互行为回归（真实浏览器 + 真实鼠标）
 node   tools/doc_site/verify_nojs.mjs         # 10 项无 JavaScript 降级核对
 node   tools/doc_site/snapshot_states.mjs     # 截取关键界面状态，供人工核对视觉
@@ -17,6 +17,10 @@ python tools/doc_site/snapshot_panels.py      # 抽出代表性面板为独立�
 
 生成与校验只依赖 Python 3 标准库；交互回归与截图依赖 Node（内置 `WebSocket`）与本机
 Chrome/Edge，均不引入 npm 依赖。产物不产生任何外部请求。
+
+## 原文与日期检查
+
+HTML 的数据区保存原文的 Base64 编码副本；校验器解码后直接比较源文件字节。核对日期从 Markdown 元数据读取，并与页面日期比较。生成和检查过程不计算文件摘要。
 
 ## 为什么校验分四层
 

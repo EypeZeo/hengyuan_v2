@@ -39,7 +39,7 @@ try {
     `站点=${r.stations} 线路=${r.lanes} 光流=${r.flows} 支线=${r.spurs} 联络弧=${r.arcs} 列车=${r.trains}`);
   check("无 JS 时五张 Mermaid 图与公式已转换", r.diagrams === 4 && r.math > 0,
     `图解=${r.diagrams} 公式=${r.math}`);
-  check("无 JS 时卡片与任务全部可见", r.cards === 27 && r.tasks === 71 && r.hiddenCards === 0,
+  check("无 JS 时卡片与任务全部可见", r.cards === 27 && r.tasks === 74 && r.hiddenCards === 0,
     `${r.cards}/${r.tasks}/隐藏${r.hiddenCards}`);
   check("无 JS 时故障表完整", r.fiRows === 58, String(r.fiRows));
   check("无 JS 时无 JS 才创建的残留空态", r.unused === 0, String(r.unused));
