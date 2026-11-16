@@ -225,11 +225,11 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 38 | 4 | 22 | 12 | BLOCKED |
+| PRE_D3 | 38 | 4 | 23 | 11 | BLOCKED |
 | PRE_OWNER_LIVE | 14 | 0 | 3 | 11 | BLOCKED |
 | CANARY | 6 | 0 | 0 | 6 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 29，PARTIAL 25，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 28，PARTIAL 26，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -1625,6 +1625,7 @@ result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
 open: open:native/include/hengyuan/live_submit_orchestrator.hpp#orchestrate_submit
+refs: code:native/include/hengyuan/submit_authority.hpp#SubmitAuthority test:native/tests/test_submit_final_gate.cpp#RevokedAuthorityRefusesThePreparedOrder test:native/tests/test_submit_authority_concurrency.cpp#RevokeThenClaimRejectsTheOldEpoch
 note: PARTIAL：S5 已实现 Prepared 持久确认后的最终检查与 claim/revoke，类 B NeverSent 调用已接入；源码和既有验证说明见 SPEC_INVARIANTS.md。生产装配、目标主机时效及适用恢复验证仍未完成，本次未运行测试。
 ```
 
