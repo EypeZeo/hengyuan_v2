@@ -41,6 +41,33 @@ TEST(DepthManager, BuffersEventsBeforeSnapshot) {
     EXPECT_EQ(dm.state(), DepthState::Buffering);
 }
 
+TEST(DepthManager, BufferingDoesNotCacheReversedUpdateRange) {
+    DepthManager dm;
+
+    const auto reversed = make_depth(100, 10, Side::Buy, 9);
+    EXPECT_FALSE(dm.on_depth_event(reversed, 10, 9));
+    EXPECT_EQ(dm.state(), DepthState::Buffering);
+    EXPECT_EQ(dm.stats().events_buffered, 0u);
+
+    const auto valid = make_depth(100, 20, Side::Buy, 10);
+    EXPECT_FALSE(dm.on_depth_event(valid, 10, 10));
+    EXPECT_EQ(dm.stats().events_buffered, 1u);
+
+    DepthSnapshot snap;
+    snap.last_update_id = 9;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+
+    EXPECT_TRUE(dm.apply_snapshot(snap));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().events_applied, 1u);
+    ASSERT_EQ(dm.book().bid_count(), 2u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 100);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 20);
+}
+
 TEST(DepthManager, SnapshotTransitionsToTracking) {
     DepthManager dm;
 
@@ -129,6 +156,39 @@ TEST(DepthManager, TrackingAppliesEventsDirectly) {
     EXPECT_TRUE(applied);
     EXPECT_EQ(dm.stats().events_applied, 1u);
     EXPECT_EQ(dm.book().bid_count(), 2u);
+}
+
+TEST(DepthManager, TrackingRejectsReversedRangeWithoutResyncOrBookChange) {
+    DepthManager dm;
+
+    DepthSnapshot snap;
+    snap.last_update_id = 100;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+    ASSERT_TRUE(dm.apply_snapshot(snap));
+    ASSERT_EQ(dm.state(), DepthState::Tracking);
+
+    const auto reversed = make_depth(99, 0, Side::Buy, 99);
+    EXPECT_FALSE(dm.on_depth_event(reversed, 101, 99));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    EXPECT_EQ(dm.stats().gap_events, 0u);
+    EXPECT_EQ(dm.stats().events_applied, 0u);
+    ASSERT_EQ(dm.book().bid_count(), 1u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 99);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 50);
+
+    const auto next_contiguous = make_depth(100, 25, Side::Buy, 101);
+    EXPECT_TRUE(dm.on_depth_event(next_contiguous, 101, 101));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    ASSERT_EQ(dm.book().bid_count(), 2u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 100);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 25);
+    EXPECT_EQ(dm.book().bids()[1].price_ticks, 99);
+    EXPECT_EQ(dm.book().bids()[1].qty_lots, 50);
 }
 
 TEST(DepthManager, TrackingDetectsGap) {

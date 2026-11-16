@@ -92,6 +92,7 @@ public:
     //   Buffering: store in ring buffer
     //   Syncing:   should not be called (caller drains buffer first)
     //   Tracking:  apply to book, check for gaps
+    // A reversed update range is ignored before any buffering or sequencing.
     // Returns true iff the event was consumed in Tracking state without a detected
     // gap. That is NOT the same as "changed the book": a level outside the
     // maintained top-N window (OrderBook::ApplyResult::OutsideWindow) is consumed
@@ -101,6 +102,10 @@ public:
     bool on_depth_event(const BinanceMarketEvent& ev,
                         std::uint64_t first_update_id,
                         std::uint64_t final_update_id) noexcept {
+        if (final_update_id < first_update_id) [[unlikely]] {
+            return false;
+        }
+
         if (state_ == DepthState::Buffering) {
             if (buf_count_ < kMaxBuffered) {
                 buf_events_[buf_count_] = ev;

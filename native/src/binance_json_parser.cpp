@@ -225,10 +225,14 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
     } else if (event_type == "depthUpdate") {
         uint64_t event_time = 0;
         [[maybe_unused]] auto e1 = doc["E"].get_uint64().get(event_time);
-        uint64_t first_update_id = 0;
-        [[maybe_unused]] auto e6a = doc["U"].get_uint64().get(first_update_id);
-        uint64_t final_update_id = 0;
-        [[maybe_unused]] auto e6b = doc["u"].get_uint64().get(final_update_id);
+        std::uint64_t first_update_id = 0;
+        std::uint64_t final_update_id = 0;
+        if (doc["U"].get_uint64().get(first_update_id)
+            || doc["u"].get_uint64().get(final_update_id)
+            || final_update_id < first_update_id) [[unlikely]] {
+            ++counters_.malformed;
+            return ParseResult::MalformedJson;
+        }
 
         std::size_t n = 0;
         bool truncated = false;

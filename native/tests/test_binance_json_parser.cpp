@@ -159,6 +159,49 @@ TEST_F(BinanceJsonParserTest, ParseDepthUpdate) {
     EXPECT_EQ(evs_[1].side, Side::Sell);
 }
 
+TEST_F(BinanceJsonParserTest, DepthUpdateRejectsMalformedSequenceRanges) {
+    struct Case {
+        const char* name;
+        const char* range_fields;
+    };
+    const Case cases[] = {
+        {"missing U", R"("u":2)"},
+        {"missing u", R"("U":1)"},
+        {"U is a string", R"("U":"1","u":2)"},
+        {"u is a string", R"("U":1,"u":"2")"},
+        {"U is negative", R"("U":-1,"u":2)"},
+        {"u is negative", R"("U":1,"u":-2)"},
+        {"U is fractional", R"("U":1.5,"u":2)"},
+        {"u is fractional", R"("U":1,"u":2.5)"},
+        {"range is reversed", R"("U":2,"u":1)"},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        parser_.reset_counters();
+        std::string json = R"({"e":"depthUpdate","E":1700000002000,"s":"BTCUSDT",)";
+        json += test_case.range_fields;
+        json += R"(,"b":[["100.00000000","1.00000000"]],"a":[]})";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    }
+}
+
+TEST_F(BinanceJsonParserTest, DepthUpdateAllowsEqualSequenceRange) {
+    const char* json = R"({
+        "e":"depthUpdate","E":1700000002000,"s":"BTCUSDT",
+        "U":101,"u":101,
+        "b":[["100.00000000","1.00000000"]],"a":[]
+    })";
+    EXPECT_EQ(parse_one(json), ParseResult::Ok);
+    EXPECT_EQ(count_, 1u);
+    EXPECT_EQ(evs_[0].type, EventType::DepthDelta);
+    EXPECT_EQ(evs_[0].event_id, 101u);
+}
+
 TEST_F(BinanceJsonParserTest, ParseDepthMultipleLevels) {
     const char* json = R"({
         "e": "depthUpdate", "E": 1700000003000, "s": "BTCUSDT",
