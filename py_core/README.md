@@ -22,6 +22,14 @@ What the report says: `validation_report.json` carries `causal_check` (`prefix_d
 
 **Coverage boundary — what this does not prove.** The differential only has force at the sampled bars. It does not prove that a hand-written strategy has no hidden data dependency and says nothing about unsampled bars; a signal file (`--signals`) can only get index and timestamp checks and is reported as `index_only`, never as a causal pass. The remaining risk goes to the experiment audit (D1). `lag.n < 1` in a StrategySpec is rejected at parse time (`LookaheadBiasError`, also a `StrategySpecError`).
 
+## v2.11 research work
+
+The [research plan](../docs/RESEARCH_EXECUTION_PLAN.md) schedules data availability, experiment
+registration, three accounting views, HAC and paired-block validation, and initial spot strategies.
+These are planned additions. Current fixed fee/slippage backtests and sampled causal checks
+do not implement the new accounting or statistical workflow. Existing risk_fraction semantics
+remain unchanged. Scope approval and actual orders belong to native execution.
+
 ## Setup (independent of v1)
 
 ```powershell

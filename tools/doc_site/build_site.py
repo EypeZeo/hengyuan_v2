@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import collections
 import datetime
-import hashlib
+import base64
 import html as _html
 import io
 import json
@@ -28,7 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 SRC = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md")
 OUT = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.html")
 
-BASELINE_DATE = datetime.date(2026, 9, 29)      # 与 0.1 节同步时间一致
+BASELINE_DATE = None  # Set from the roadmap metadata before rendering.
 EXTERNAL_REF = re.compile(r'(?:src|href)\s*=\s*"(?:https?:)?//', re.I)
 
 
@@ -1018,7 +1018,7 @@ def parse_effort_days(text: str) -> float:
 def timeline_panel(stations: list) -> str:
     rows = [s for s in stations if re.match(r"^\d{4}-\d{2}-\d{2}$", s["due"])]
     if not rows:
-        return ""
+        return '<p class="timeline-empty" role="status">尚未安排完成日期</p>'
     span_end = max(datetime.date.fromisoformat(s["due"]) for s in rows) + datetime.timedelta(days=8)
     span_start = BASELINE_DATE - datetime.timedelta(days=6)
     total = (span_end - span_start).days
@@ -1039,7 +1039,7 @@ def timeline_panel(stations: list) -> str:
         cur = datetime.date(cur.year + (1 if nxt > 12 else 0), 1 if nxt > 12 else nxt, 1)
     tx = left + (BASELINE_DATE - span_start).days * scale
     p.append('<line class="today" x1="%.1f" y1="28" x2="%.1f" y2="%d"/>' % (tx, tx, int(h) - 12))
-    p.append('<text class="today-label" x="%.1f" y="%d">基线日 %s</text>'
+    p.append('<text class="today-label" x="%.1f" y="%d">核对日 %s</text>'
              % (tx + 5, int(h) - 16, BASELINE_DATE.isoformat()))
     for k, s in enumerate(rows):
         y = 44 + k * row_h
@@ -2018,12 +2018,13 @@ applyAll();
 
 
 def build() -> str:
-    global LANE_ORDER
-    # 源哈希必须针对磁盘原始字节计算，使外部工具（Get-FileHash / sha256sum）可独立复核；
-    # 解析则统一在归一化换行后的文本上进行，避免 CRLF 污染单元格与标记。
+    global LANE_ORDER, BASELINE_DATE
     raw = io.open(SRC, "rb").read()
-    sha = hashlib.sha256(raw).hexdigest()
     text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    date_match = re.search(r"\| 同步时间（本地快照） \| (\d{4}-\d{2}-\d{2}) \|", text)
+    if not date_match:
+        raise ValueError("Roadmap synchronization date is missing")
+    BASELINE_DATE = datetime.date.fromisoformat(date_match.group(1))
     lines = text.split("\n")
     heads = parse_heading_index(lines)
     mblocks = parse_mermaid_blocks(lines)
@@ -2174,7 +2175,6 @@ def build() -> str:
         '<meta name="color-scheme" content="dark light">\n'
         '<title>HengYuan v2 全自动加密货币量化实盘系统实施指南与完整 TODO LIST（v' + ver + '）</title>\n'
         '<meta name="generator" content="tools/doc_site/build_site.py">\n'
-        '<meta name="source-sha256" content="' + sha + '">\n'
         # 主题必须在首帧前落定，否则浅色偏好用户会先看到一帧深色。该脚本是主题的唯一解析点。
         '<script>' + THEME_BOOT + '</script>\n'
         '<style>' + CSS + '</style>\n</head>\n<body>\n'
@@ -2184,11 +2184,10 @@ def build() -> str:
         '<header class="topbar"><div class="row">\n'
         '<span class="brand">HengYuan v2 实施指南与 TODO LIST</span>\n'
         '<span class="chip">v<b>' + ver + '</b></span>\n'
-        '<span class="chip">基线 <b>' + BASELINE_DATE.isoformat() + '</b></span>\n'
+        '<span class="chip">核对日期 <b>' + BASELINE_DATE.isoformat() + '</b></span>\n'
         '<span class="chip">站点 <b>' + str(len(stations)) + '</b></span>\n'
         '<span class="chip">故障用例 <b>' + str(len(fi)) + '</b></span>\n'
         '<span class="chip">任务 <b>' + str(len(tasks)) + '</b></span>\n'
-        '<span class="chip">源哈希 <b>' + sha[:12] + '</b></span>\n'
         '<span class="spacer"></span>\n'
         '<label class="search"><span class="sicon" aria-hidden="true">检索</span>'
         '<input id="q" type="search" autocomplete="off" aria-keyshortcuts="/" '
@@ -2202,9 +2201,10 @@ def build() -> str:
         '<kbd>T</kbd> 切换主题、<kbd>?</kbd> 显示或隐藏本行</span></div></header>\n<div class="shell">\n')
 
     data = json.dumps({
-        "meta": {"version": ver, "sha256": sha, "baseline": BASELINE_DATE.isoformat(),
+        "meta": {"version": ver, "baseline": BASELINE_DATE.isoformat(),
                  "stations": len(stations), "fi": len(fi), "tasks": len(tasks),
                  "annotations": len(annotations), "review": len(review), "limits": len(limits)},
+        "source": {"encoding": "base64", "content": base64.b64encode(raw).decode("ascii")},
         "labels": dict(STATUS_LABEL),
         "stations": [{"id": s["id"], "status": s["status"], "lane": s["lane"],
                       "laneTitle": LANE_TITLE.get(s["lane"], ""),
@@ -2218,7 +2218,7 @@ def build() -> str:
 
     foot = (
         '\n<div class="foot">本页由 <code>tools/doc_site/build_site.py</code> 从权威 Markdown 生成，'
-        '源文件 SHA-256 前 12 位 <code>' + sha[:12] + '</code>；全部数据由脚本解析得出，未经手工录入，'
+        '版本 <code>' + ver + '</code>；'
         '与 <code>docs/HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md</code> 同源。'
         '产物不含生成时间戳，同一输入可逐字节复现。'
         '交互状态仅将主题、动画开关与单击站点行为写入本机 localStorage，不联网、不外发。</div>\n</main>\n</div>\n'

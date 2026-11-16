@@ -5,6 +5,14 @@ C++ 侧求值器是批次 5。
 
 ---
 
+## v2.11 implementation scope
+
+The current StrategySpec schema remains unchanged. [Research planning](RESEARCH_EXECUTION_PLAN.md)
+defines the next additions: point-in-time input, experiment registration, fee-asset and CNY accounting,
+and explicit sizing modes. Strategy lifecycle, exit/rearm and availability semantics require
+implementation and cross-runtime tests before use. Current validation metadata does not establish
+complete point-in-time verification, HAC calibration or independent holdout evaluation.
+
 ## 1. 这个东西为什么存在
 
 研究在 Python（pandas、向量化、分钟级），执行在 C++（实时 book、微秒级）。两边都需要「同一个

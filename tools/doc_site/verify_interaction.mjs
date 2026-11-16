@@ -301,13 +301,26 @@ try {
   check("存在筛选时出现清除按钮", facets.clearVisible === true);
 
   const mapSync = await b.eval(`
+    const data=JSON.parse(document.getElementById('site-data').textContent);
+    const isoDate=/^\\d{4}-\\d{2}-\\d{2}$/;
     return {dim:document.querySelectorAll('.st.dim').length,
             lit:document.querySelectorAll('.st:not(.dim)').length,
             marks:document.querySelectorAll('mark').length,
-            bars:document.querySelectorAll('.gantt .bar.dim').length};`);
+            bars:document.querySelectorAll('.gantt .bar.dim').length,
+            totalBars:document.querySelectorAll('.gantt .bar').length,
+            dueCount:data.stations.filter(s=>isoDate.test(s.due||'')).length,
+            emptyVisible:[...document.querySelectorAll('.timeline-empty')]
+              .some(e=>!e.hidden&&e.getClientRects().length>0)};`);
   check("检索同时收敛线路图（此前图完全不受检索影响）",
     mapSync.dim > 0 && mapSync.lit > 0, `淡化=${mapSync.dim} 命中=${mapSync.lit}`);
-  check("检索同时收敛时间轴", mapSync.bars > 0, String(mapSync.bars));
+  if (mapSync.dueCount === 0) {
+    check("无预期完成日期时不生成时间轴条形并显示空状态",
+      mapSync.totalBars === 0 && mapSync.emptyVisible,
+      `日期=${mapSync.dueCount} 条形=${mapSync.totalBars} 空状态=${mapSync.emptyVisible}`);
+  } else {
+    check("检索同时收敛时间轴", mapSync.totalBars === mapSync.dueCount && mapSync.bars > 0,
+      `日期=${mapSync.dueCount} 条形=${mapSync.totalBars} 淡化=${mapSync.bars}`);
+  }
 
   const nomatch = await b.eval(`
     const q=document.getElementById('q');
@@ -439,12 +452,25 @@ try {
       cardRole:document.querySelector('.card').getAttribute('role'),
       stAria:(document.querySelector('.st').getAttribute('aria-label')||'').length>8,
       liveRegions:document.querySelectorAll('[aria-live]').length,
-      barFocusable:!!document.querySelector('.gantt .bar[tabindex="0"]'),
+      barCount:document.querySelectorAll('.gantt .bar').length,
+      barsFocusable:[...document.querySelectorAll('.gantt .bar')].every(b=>
+        b.getAttribute('tabindex')==='0'&&b.getAttribute('role')==='button'&&
+        !!b.getAttribute('data-station')),
+      timelineEmptyVisible:[...document.querySelectorAll('.timeline-empty')]
+        .some(e=>!e.hidden&&e.getClientRects().length>0),
       progress:!!document.getElementById('prog'),
       totop:!!document.getElementById('totop')};`);
   check("卡片可聚焦且声明角色", a11y.cardFocusable && a11y.cardRole === "button");
   check("站点具备完整 aria 标签", a11y.stAria === true);
-  check("时间轴条形可键盘聚焦", a11y.barFocusable === true);
+  if (mapSync.dueCount === 0) {
+    check("无预期完成日期时没有时间轴键盘目标",
+      a11y.barCount === 0 && a11y.barsFocusable && a11y.timelineEmptyVisible,
+      `条形=${a11y.barCount} 空状态=${a11y.timelineEmptyVisible}`);
+  } else {
+    check("时间轴条形可键盘聚焦",
+      a11y.barCount === mapSync.dueCount && a11y.barsFocusable,
+      `条形=${a11y.barCount} 日期=${mapSync.dueCount}`);
+  }
   check("存在 aria-live 播报区", a11y.liveRegions >= 3, String(a11y.liveRegions));
   check("具备阅读进度与回到顶部", a11y.progress && a11y.totop);
 
