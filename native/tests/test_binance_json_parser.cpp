@@ -159,6 +159,31 @@ TEST_F(BinanceJsonParserTest, ParseDepthUpdate) {
     EXPECT_EQ(evs_[1].side, Side::Sell);
 }
 
+TEST_F(BinanceJsonParserTest, DepthUpdateRejectsMissingOrMalformedEventTime) {
+    struct Case {
+        const char* name;
+        const char* event_time_field;
+    };
+    const Case cases[] = {
+        {"missing E", ""},
+        {"E is a string", R"(,"E":"1700000002000")"},
+        {"E is negative", R"(,"E":-1)"},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        parser_.reset_counters();
+        std::string json = R"({"e":"depthUpdate")";
+        json += test_case.event_time_field;
+        json += R"(,"s":"BTCUSDT","U":1,"u":2,"b":[["100.00000000","1.00000000"]],"a":[]})";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    }
+}
+
 TEST_F(BinanceJsonParserTest, DepthUpdateRejectsMalformedSequenceRanges) {
     struct Case {
         const char* name;
