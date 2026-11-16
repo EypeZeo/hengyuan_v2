@@ -52,7 +52,7 @@ struct DepthSnapshot {
 struct DepthManagerStats {
     std::uint64_t events_applied{0};
     std::uint64_t events_buffered{0};
-    std::uint64_t events_dropped{0};  // dropped during sync (u <= lastUpdateId)
+    std::uint64_t events_dropped{0};  // stale levels dropped during snapshot replay
     std::uint64_t snapshots{0};
     std::uint64_t resyncs{0};         // gap detected → back to Buffering
     std::uint64_t gap_events{0};      // events that arrived with U gap
@@ -127,8 +127,12 @@ public:
         }
 
         if (state_ == DepthState::Tracking) {
-            // Gap detection: next event's U should be <= last_applied_u_ + 1
-            if (last_applied_u_ > 0 && first_update_id > last_applied_u_ + 1) {
+            if (final_update_id < last_applied_u_) {
+                return false;
+            }
+            // Compare the distance after checking order to avoid wrapping at UINT64_MAX.
+            if (last_applied_u_ > 0 && first_update_id > last_applied_u_
+                && first_update_id - last_applied_u_ > 1) {
                 ++stats_.gap_events;
                 ++stats_.resyncs;
                 start_buffering();
@@ -171,14 +175,15 @@ public:
         last_applied_u_ = snap.last_update_id;
 
         // Replay buffered events:
-        //  - Drop events where final_update_id <= lastUpdateId
+        //  - Drop events covered by the snapshot and events older than the last applied update
+        //  - Keep equal update IDs while replaying levels from the same update
         //  - First valid event must have U <= lastUpdateId+1 <= u
         bool found_first = false;
         for (std::size_t i = 0; i < buf_count_; ++i) {
             const std::uint64_t U = buf_first_u_[i];
             const std::uint64_t u = buf_final_u_[i];
 
-            if (u <= snap.last_update_id) {
+            if (u <= snap.last_update_id || u < last_applied_u_) {
                 ++stats_.events_dropped;
                 continue;
             }
