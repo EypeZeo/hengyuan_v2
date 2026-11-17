@@ -174,17 +174,17 @@ inline KlinesParseError parse_klines_response(std::string_view body, std::int64_
             return KlinesParseError::BadBarShape;
         }
 
-        if (close_time >= now_ms) {
-            // Still forming. Only legal as the very last element; it is never returned.
-            unclosed_seen = true;
-            out.dropped_unclosed_tail = true;
-            continue;
-        }
-
         if (out.count > 0) {
             const KlineWsEvent& prev = out.bars[out.count - 1];
             if (open_time <= prev.open_time_ms) return KlinesParseError::NonMonotonic;
             if (open_time != prev.close_time_ms + 1) return KlinesParseError::GapInside;
+        }
+
+        if (close_time >= now_ms) {
+            // A forming candle is allowed only at the end of the response.
+            unclosed_seen = true;
+            out.dropped_unclosed_tail = true;
+            continue;
         }
 
         KlineWsEvent& bar = out.bars[out.count];
