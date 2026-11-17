@@ -106,6 +106,7 @@ public:
     const ParseCounters& counters() const noexcept { return counters_; }
     void reset_counters() noexcept { counters_ = {}; }
 
+    // Apply the positive multiplier and truncate toward zero.
     static std::optional<std::int64_t> parse_decimal_to_fixed(
         std::string_view s, std::int64_t multiplier) noexcept;
 
