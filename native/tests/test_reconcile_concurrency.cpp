@@ -344,12 +344,12 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
                 << "Ambiguous order must have been resolved and released by the reconcile "
                    "thread + drain by now, i=" << i;
         } else {
-            // OrchestratorGate::DuplicateInFlight (registry momentarily at
+            // OrchestratorGate::InFlightCapacityExceeded (registry momentarily at
             // capacity) is the only other reachable outcome here -- every
             // earlier gate is satisfied unconditionally by this fixture's
             // setup. Not asserted against: natural backpressure, not a bug.
             ++other_count;
-            EXPECT_EQ(r.gate, OrchestratorGate::DuplicateInFlight)
+            EXPECT_EQ(r.gate, OrchestratorGate::InFlightCapacityExceeded)
                 << "unexpected gate at i=" << i << " final_refusal="
                 << (r.final_refusal ? static_cast<int>(*r.final_refusal) : -1);
         }

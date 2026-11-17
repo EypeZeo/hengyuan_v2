@@ -522,6 +522,11 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       与其他扫描失败同等对待）；只有孤儿的日志是 `Clean`。构造函数的可选第四参数 `max_intent_orphans` 只能
       收紧、不能放宽（大于 `kMaxIntentOrphans` 的值被夹回），测试因此不必写 4096 帧就能到达边界。孤儿留在日志里
       供审计；规格还设想的压实归档（`kIntentOrphanRetainMs`）本片不做，所以压实存在之前，预算是唯一的界。
+    - **SAFE-07a 运行期限额**：`PrivateStreamPipeline` 将恢复扫描计数和接收器的限额传给唯一的 `IntentOrphanBudget`，
+      同一提交线程的所有上下文副本访问该对象。恢复条目的拒绝原因记为 `RecoveredUnknown`。运行期仅计入已持久确认 `Intent` 且
+      类 A 关闭未获持久确认的尝试，并分别记录原始拒绝原因。在途表登记重复订单与容量耗尽使用不同的拒绝原因。
+      计数达到限额的 25%、50%、75% 和 90% 时按向上取整的阈值设置内存告警位。累计达到 90% 后，
+      编排器在追加下一条 `Intent` 前返回 `IntentOrphanBudgetExceeded`。可验证归档和 S7 迁移仍待实现。
     - **重复单**：编排器在 Gate 10 之前加了只读的在途预检（Gate 9b）：同一订单号已在途时，在写任何持久帧之前就
       以 `DuplicateInFlight` 拒绝。此前第二个 `Intent` 帧先落盘、到 Gate 12b 才被登记表拒绝，而 `Submitting` /
       `Accepted` 之后的 `Intent` 是非法转移，下次启动整本日志 `Corrupt`。Gate 12b 的登记保留（它同时是容量检查，
@@ -990,7 +995,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - **源码检查**：`test_operator_resolution_guard.cpp` 检查 `write_version_` 的三处赋值和 `append_impl()` 的三个调用者。
       `test_never_sent_guard.cpp` 检查共享规则的调用位置、`DurableOrderAuditPort` 的写入适配器，以及编排器的六类本地拒绝和最终授权拒绝。
     - 生产进程启用、压实保留策略与有条件的 S7 迁移仍待完成。
-  - **Q23 S6：类 A 拒绝的持久关闭。** `orchestrate_submit()` 在 Intent 确认之后、Prepared 之前的六种本地拒绝路径调用 `DurableOrderAuditPort::append_never_sent()`。返回值保留拒绝原因，并通过 `closure` 返回写入结果；仅 `Appended` 将返回订单转换到 `NeverSent`。其他结果保留 `Intent`，提交端口不被调用。
+  - **Q23 S6：类 A 拒绝的持久关闭。** `orchestrate_submit()` 在 Intent 确认之后、Prepared 之前处理类 A 本地拒绝，并调用 `DurableOrderAuditPort::append_never_sent()`。返回值保留拒绝原因，并通过 `closure` 返回写入结果；仅 `Appended` 将返回订单转换到 `NeverSent`。其他结果保留 `Intent`，提交端口不被调用。
     - `OrderAttemptWatermark` 对尝试关闭的系统生成订单号按 `(timestamp_ms, sequence)` 维护最高值。`DurableAuditSink` 在追加 Intent 前拒绝相同或更小的值，在尝试写入关闭帧之前更新最高值，并从恢复扫描中的关闭帧重建它。该检查使用固定存储，不受上下文重建或最近 64 个订单号缓存淘汰影响。同一存储的调用者须递增时间与序号组合；旧格式的订单号仍可读取。
     - `native/src/live_submit_evidence_harness.cpp` 与 `native/src/live_submit_preflight_harness.cpp` 显式启用 `NeverSentWrites`；默认构造仍关闭写入。每次成功关闭的本地拒绝产生 Intent 与 NeverSent 两个订单帧，共 512 字节。写入帧数受 `max_order_frames` 限制，默认对应现有 1 GiB 读取上限，构造配置只能收紧；到达上限返回失败并以 `FenceReason::LogLimit` 停止追加。日志压缩与持久化服务调度属于单独的实现任务。
     - 回归范围：六种拒绝原因、关闭返回状态、追加失败、恢复结果、重复订单号、无动态分配，以及 Q19 的拒绝写入成本。发送前最终授权与 Prepared 之后的类 B 拒绝由 S5 实现。

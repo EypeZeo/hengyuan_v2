@@ -184,6 +184,8 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
         case OrchestratorGate::NotReady: return "NotReady";
         case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
+        case OrchestratorGate::InFlightCapacityExceeded: return "InFlightCapacityExceeded";
+        case OrchestratorGate::IntentOrphanBudgetExceeded: return "IntentOrphanBudgetExceeded";
     }
     return "?";
 }
@@ -929,6 +931,21 @@ int main(int argc, char* argv[]) {
 
     PrivateStreamWatch watch;
     ProbeCounters probes;
+    std::uint8_t reported_orphan_alerts = 0;
+    const auto report_orphan_alerts = [&] {
+        const auto& orphan_budget = private_pipeline->intent_orphan_budget();
+        const auto alert_mask = orphan_budget.alert_mask();
+        const auto new_orphan_alerts = static_cast<std::uint8_t>(alert_mask & static_cast<std::uint8_t>(~reported_orphan_alerts));
+        for (std::size_t i = 0; i < never_sent::kIntentOrphanAlertBits.size(); ++i) {
+            if ((new_orphan_alerts & never_sent::kIntentOrphanAlertBits[i]) == 0) continue;
+            std::fprintf(stderr,
+                         "  WARN: Intent orphan budget %u%% reached: count=%zu maximum=%zu recovered=%zu live=%zu\n",
+                         static_cast<unsigned>(never_sent::kIntentOrphanAlertPercents[i]), orphan_budget.total(),
+                         orphan_budget.maximum(), orphan_budget.recovered(), orphan_budget.live());
+        }
+        reported_orphan_alerts = alert_mask;
+    };
+    report_orphan_alerts();
     // The startup probe (see the header comment): at most three attempts, five seconds apart, until one reaches the confirmation gate.
     constexpr int kStartupProbeMaxAttempts = 3;
     int startup_probe_attempts = 0;
@@ -974,6 +991,7 @@ int main(int argc, char* argv[]) {
 
         const auto result = orchestrate_submit(ctx);
         ++probes.total;
+        report_orphan_alerts();
         std::printf("  [preflight probe #%" PRIu64 "] (%s) %s %s price=%" PRId64 " qty=%" PRId64 " -> gate=%s\n",
                     preflight_probes, origin, action == SuggestedAction::Open ? "OPEN" : "CLOSE",
                     plan->side == OrderSide::Buy ? "BUY" : "SELL", plan->price_ticks, plan->qty_ticks,

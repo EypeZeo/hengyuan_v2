@@ -40,6 +40,7 @@
 #include <hengyuan/exit_safety.hpp>
 #include <hengyuan/kill_switch.hpp>
 #include <hengyuan/late_fill_alarm.hpp>
+#include <hengyuan/never_sent_runtime_budget.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
@@ -280,6 +281,8 @@ enum class OrchestratorGate : std::uint8_t {
     // which. Nothing was written to the durable log and nothing was sent.
     NotReady = 23,
     FinalAuthorizationRefused = 24,
+    InFlightCapacityExceeded = 25,
+    IntentOrphanBudgetExceeded = 26,
 };
 
 struct OrchestratorResult {
@@ -295,6 +298,8 @@ struct OrchestratorResult {
     // NotAttempted means no closure was requested; gate retains the refusal cause.
     ClosureAppendStatus closure{ClosureAppendStatus::NotAttempted};
     std::optional<never_sent::Reason> final_refusal{};
+    // SAFE-07a: the current cumulative in-memory alert mask, not a durable event. Zero when no budget is wired.
+    std::uint8_t orphan_alert_mask{0};
 };
 
 // --- Orchestrator context (all dependencies injected) ---
@@ -326,6 +331,9 @@ struct OrchestratorContext {
     // Intent frame: a frame after a closure is Corrupt at the next start, and a refused order has no in-flight slot to keep that from
     // happening. Owned by the thread that owns the context; empty (so it changes nothing) until a closure has been tried.
     never_sent::RecentlyClosedIds recently_closed{};
+    // SAFE-07a: optional for legacy/synthetic callers; a live PrivateStreamPipeline always wires its hot-side object.
+    // The pointee belongs to the submit hot thread and outlives every context copy. It is never copied into the context.
+    never_sent::IntentOrphanBudget* intent_orphan_budget{nullptr};
 
     // Reconcile/poll loop wiring (order_tracker.hpp). Both nullable and default
     // to nullptr for backward compatibility with existing callers/tests that
@@ -464,6 +472,19 @@ namespace detail {
     return r.status;
 }
 
+// Class A alone can leave an Intent orphan. Keeping the counter in this separate wrapper makes it impossible for the class-B
+// final-authorization path to increment the Intent budget by calling the generic closure helper above.
+[[nodiscard]] inline ClosureAppendStatus close_class_a_never_sent(OrchestratorContext& ctx, const AuditRecord& intent,
+                                                                  never_sent::Reason reason,
+                                                                  OrchestratorResult& result) noexcept {
+    const ClosureAppendStatus status = close_never_sent(ctx, intent, reason, result.order);
+    if (ctx.intent_orphan_budget != nullptr) {
+        ctx.intent_orphan_budget->observe_class_a(reason, status);
+        result.orphan_alert_mask = ctx.intent_orphan_budget->alert_mask();
+    }
+    return status;
+}
+
 }  // namespace detail
 
 // --- Core orchestration function ---
@@ -511,6 +532,7 @@ inline void drain_hot_inputs(OrchestratorContext& ctx) noexcept {
 
 inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept {
     OrchestratorResult result{};
+    if (ctx.intent_orphan_budget != nullptr) result.orphan_alert_mask = ctx.intent_orphan_budget->alert_mask();
 
     // Everything the hot thread has to drain before it looks at a gate -- unconditional on the gates, see drain_hot_inputs() above for what and why.
     drain_hot_inputs(ctx);
@@ -697,6 +719,24 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         return result;
     }
 
+    // SAFE-07a: at 90% of the Intent-orphan budget, stop before another Intent can be written. This is an in-memory
+    // admission refusal only: no closure is applicable before an Intent ACK, and no alert is appended to the durable log.
+    if (ctx.intent_orphan_budget != nullptr && !ctx.intent_orphan_budget->allows_new_intent()) {
+        result.gate = OrchestratorGate::IntentOrphanBudgetExceeded;
+        AuditRecord ar{};
+        ar.timestamp_ms = ctx.now_ms;
+        ar.event_type = AuditEventType::PreflightFailed;
+        ar.mode = ctx.mode;
+        ar.symbol_id = ctx.symbol_id;
+        ar.set_client_order_id(coid.view());
+        ar.resulting_state = result.order.state;
+        ar.side = ctx.side;
+        ar.detail_code = 90;
+        ar.set_detail("Intent orphan budget reached 90 percent");
+        ctx.audit->append(ar);
+        return result;
+    }
+
     // Gate 10: Audit intent
     AuditRecord intent_frame{};  // Q23 S6: kept for the class A closure -- what the log holds of this order, if a local gate refuses it below
     {
@@ -733,7 +773,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     (void)checked_notional(intent_frame.price_ticks, intent_frame.qty_ticks, confirm_notional);
     if (!confirmed_order.confirmed) {
         result.gate = OrchestratorGate::OperatorNotConfirmed;
-        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMissing, result.order);
+        result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMissing, result);
         return result;
     }
     if (!confirmed_order.authorizes(intent_frame.symbol_id, intent_frame.side, result.order.order_type,
@@ -750,7 +790,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.side = ctx.side;
         ar.set_detail("confirmation does not authorize this order");
         ctx.audit->append(ar);
-        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMismatch, result.order);
+        result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMismatch, result);
         return result;
     }
 
@@ -766,7 +806,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.side = ctx.side;
         ar.set_detail("submit port invalid");
         ctx.audit->append(ar);
-        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::SubmitPortInvalid, result.order);
+        result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::SubmitPortInvalid, result);
         return result;
     }
 
@@ -774,7 +814,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // A missing registry fails closed — live submit must never run un-guarded.
     if (!ctx.in_flight) {
         result.gate = OrchestratorGate::InFlightRegistryUnavailable;
-        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::InFlightRegistryUnavailable, result.order);
+        result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::InFlightRegistryUnavailable, result);
         return result;
     }
 
@@ -796,19 +836,19 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.resulting_state = result.order.state;
         ar.side = ctx.side;
         ctx.audit->append(ar);
-        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::RateLimitExhausted, result.order);
+        result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::RateLimitExhausted, result);
         return result;
     }
 
-    // Handle-returning form (not the bool-only register_submit()) so a
-    // reconcile-bound handle is on hand below if this submit ends up Ambiguous
-    // -- see order_lifecycle.hpp's InFlightHandle doc comment for why the
-    // reconcile path needs {slot_index, generation} rather than just the coid.
+    // The typed registration keeps the reconcile-bound {slot_index, generation} handle and distinguishes a duplicate COID
+    // from a different COID that found no free slot. The legacy bool/invalid-handle APIs delegate to this same operation.
     InFlightRegistry* const slot_owner = ctx.in_flight;
     OrderFillContext* const fill_owner = ctx.fill_context;
-    InFlightHandle in_flight_handle = slot_owner->register_submit_handle(coid.view());
-    if (!in_flight_handle.valid()) {
-        result.gate = OrchestratorGate::DuplicateInFlight;
+    const InFlightRegistration registration = slot_owner->register_submit_detailed(coid.view());
+    const InFlightHandle in_flight_handle = registration.handle;
+    if (!registration.registered()) {
+        const bool capacity = registration.status == InFlightRegistrationStatus::CapacityExhausted;
+        result.gate = capacity ? OrchestratorGate::InFlightCapacityExceeded : OrchestratorGate::DuplicateInFlight;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
         ar.event_type = AuditEventType::PreflightFailed;
@@ -816,9 +856,10 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         ar.set_client_order_id(coid.view());
         ar.resulting_state = result.order.state;
         ar.side = ctx.side;
-        ar.set_detail("duplicate in-flight - reconcile, do NOT resubmit");
+        ar.set_detail(capacity ? "in-flight capacity exhausted" : "duplicate in-flight - reconcile, do NOT resubmit");
         ctx.audit->append(ar);
-        result.closure = detail::close_never_sent(ctx, intent_frame, never_sent::Reason::DuplicateInFlight, result.order);
+        const auto reason = capacity ? never_sent::Reason::InFlightCapacityExceeded : never_sent::Reason::DuplicateInFlight;
+        result.closure = detail::close_class_a_never_sent(ctx, intent_frame, reason, result);
         if (result.closure == ClosureAppendStatus::Appended) ctx.rate_limiter->release_order(*reservation);
         return result;
     }

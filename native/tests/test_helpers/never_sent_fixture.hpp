@@ -128,6 +128,7 @@ protected:
     InFlightRegistry in_flight_{};
     SymbolRules rules_{};
     AccountSnapshot account_{};
+    ::hy::never_sent::IntentOrphanBudget intent_orphan_budget_{0, 100};
     OrchestratorContext ctx_{};
     FakeAudit fake_audit_{};
     SubmitResponse submit_response_{SubmitOutcome::Accepted, 12345, 0};
@@ -167,6 +168,7 @@ protected:
         ctx_.depth_synced = true;
         ctx_.rate_limiter = &rate_limiter_;
         ctx_.in_flight = &in_flight_;
+        ctx_.intent_orphan_budget = &intent_orphan_budget_;
         ctx_.symbol_rules = &rules_;
         ctx_.account = &account_;
         ctx_.side = OrderSide::Buy;
