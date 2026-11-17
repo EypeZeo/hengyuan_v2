@@ -188,6 +188,53 @@ class CollectVisibilityTests(unittest.TestCase):
         self.assertEqual(report["observations"][0]["after_ms"], 200)
         self.assertEqual(report["interval_ms"], {"lower": 0, "upper": 200})
 
+    def test_deadline_during_after_time_read_keeps_hit_and_miss_inconclusive(self) -> None:
+        class DeadlineProbe(FakeProbe):
+            def __init__(self, clock: FakeClock, finish_at: float, page: tuple[int, object]) -> None:
+                super().__init__([ACCEPTED_MS, ACCEPTED_MS + 200], [page])
+                self.clock = clock
+                self.finish_at = finish_at
+                self.time_reads = 0
+
+            def public(self, path: str) -> tuple[int, str]:
+                result = super().public(path)
+                if path == visibility.TIME_PATH:
+                    self.time_reads += 1
+                    if self.time_reads == 2:
+                        self.clock.value = self.finish_at
+                return result
+
+        for page_name, page in (("found", _found_page()), ("empty", _missing_page())):
+            for finish_at in (0.5, 0.6):
+                with self.subTest(page=page_name, finish_at=finish_at):
+                    clock = FakeClock()
+                    probe = DeadlineProbe(clock, finish_at, page)
+
+                    report = visibility.collect_visibility(
+                        probe,
+                        SYMBOL,
+                        ORDER_ID,
+                        duration_seconds=0.5,
+                        poll_interval_ms=500,
+                        accepted_ms=ACCEPTED_MS,
+                        monotonic=clock.monotonic,
+                        sleep=clock.sleep,
+                    )
+
+                    self.assertEqual(report["status"], "inconclusive")
+                    self.assertIsNone(report["interval_ms"])
+                    self.assertEqual(report["counts"], {"found": 0, "missing": 0, "inconclusive": 1})
+                    self.assertEqual(len(report["observations"]), 1)
+                    observation = report["observations"][0]
+                    self.assertEqual(observation["result"], "inconclusive")
+                    self.assertEqual(observation["problem"]["stage"], "after_time")
+                    self.assertEqual(observation["problem"]["reason"], "observation_deadline")
+                    self.assertIsNone(observation["after_ms"])
+                    self.assertEqual(
+                        [call["path"] for call in probe.calls],
+                        [visibility.TIME_PATH, visibility.ALL_ORDERS_PATH, visibility.TIME_PATH],
+                    )
+
     def test_misses_through_deadline_are_right_censored(self) -> None:
         probe = _probe_for([_missing_page()] * 5)
 

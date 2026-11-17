@@ -319,6 +319,8 @@ def collect_visibility(
             if monotonic() >= deadline:
                 raise ReadFailure("after_time", "observation_deadline")
             after = read_exchange_time(probe, "after_time")
+            if monotonic() >= deadline:
+                raise ReadFailure("after_time", "observation_deadline")
             if after < before:
                 raise ReadFailure("after_time", "invalid_time_bracket")
             observation["after_ms"] = after - accepted_ms
