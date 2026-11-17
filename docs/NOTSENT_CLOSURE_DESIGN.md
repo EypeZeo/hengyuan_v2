@@ -1,6 +1,6 @@
 # NotSent 闭合与发送前最终授权 —— 语义冻结与协议模型（Q23 切片 1）
 
-状态：S2/S3 的 v6 读取、状态机与恢复，以及 S4 的默认关闭写入接口已实现。S6 已接入类 A 拒绝流程及对应恢复、容量与成本测试。S5 已实现发送前最终授权与类 B 拒绝。实现命名为 `OrderNeverSent` 与 `OrderState::NeverSent`。各项验证结果见 §8 与 `docs/SPEC_INVARIANTS.md`。
+状态：S2/S3 的 v6 读取、状态机与恢复，以及 S4 的默认关闭写入接口已合入。S5 的发送前最终授权与类 B 拒绝、S6 的类 A 拒绝及其恢复与容量测试已随 [PR #254](https://github.com/EypeZeo/hengyuan_v2/pull/254) 合入。实现命名为 `OrderNeverSent` 与 `OrderState::NeverSent`。各项验证结果见 §8 与 `docs/SPEC_INVARIANTS.md`。
 依据：蓝图 v2.9.0 的 `5.9.2`、F.5、F.9、R-18 / R-22（Owner 已选统一 NotSent）、Q23、FI-055、FI-056、任务 SAFE-07 与 1A.6。
 模型：`formal/notsent_closure.tla`（结果见 §7）。本文的“必须 / 不得”是对后续实现 PR 的要求；**数值取值不在本文分配**，随实现 PR 同步分配，并过 `tools/spec_enum_diff.py`、codec 与恢复扫描。
 
@@ -152,9 +152,9 @@ WebSocket 会话在停止请求、连接错误、`serverShutdown` 或 `eventStre
 | S2 codec 读者 | **已实现（与 S3 合为一片，2026-11-12）**：`format_version` 6 与两套合法集合（事件 ≤ 23、状态 ≤ 12），只读不写；未知版本、v5 帧里的 v6 值、版本回退各有明确状态（`format_version` 6 本身与事件 22 已由 D5 R1 落地） | MSVC + GCC `none`；codec 表驱动用例 |
 | S3 状态机与恢复 | **已实现（与 S2 合为一片，2026-11-12；命名已定：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12，规则在 `never_sent_rules.hpp`，读者与写者共用）**：`NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料；**命名**：`order_tracker.hpp` 已有 `QueryOutcome::NotSent`（R-10，意思是对账**查询**没有离开进程），订单状态与事件的新名字要与它区分（实现 PR 里定），否则 grep 和读者都会混 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
 | S4 写入 | **已实现（2026-11-13）**：`append_never_sent()` 沿用 `append_impl`，与读者共用 `check_closure()`，构造开关 `NeverSentWrites` 默认关闭；S6 和 S5 通过 `DurableOrderAuditPort` 写入类 A 和类 B 关闭记录 | `address`；追加失败、迟到完成、尾部撕裂及非法重复发送 |
-| S5 最终授权（1A.6、FI-055） | **已实现（2026-11-14）**：`SubmitAuthority` 原子 epoch 与 `SubmitReadiness::claim()`；令牌绑定签发者、订阅、屏障和熔断代次；最终检查后一次性消费；类 B 拒绝确认写入后释放对应资源 | MSVC、GCC 普通构建、ASan/UBSan、TSan 并发测试和 relaxed 负向控制通过；覆盖实际文件恢复与时限边界；ARM64 重复测试已接入 CI，本次未运行 |
-| S6 类 A 闭合（SAFE-07、FI-056） | **已实现（2026-11-14）**：六种本地拒绝写入 NotSent，确认成功后返回 NeverSent；存储维护已尝试关闭的生成订单号的时间与序号最高值，重启恢复该值，拒绝重复或倒退的尝试；两个测试程序显式启用写入 | MSVC、GCC 普通构建与 ASan/UBSan 回归通过；覆盖孤儿预算、日志容量与恢复；Q19 持久化成本测量已完成 |
-| S7 迁移 | 清单、读者先行开关、回退前停机；仅当存在真实日志 | 迁移中崩溃、清单撕裂、旧构建遇 v6 |
+| S5 最终授权（1A.6、FI-055） | **已合入（2026-11-15，PR #254）**。`SubmitAuthority` 原子 epoch 与 `SubmitReadiness::claim()` 将令牌绑定到签发者、订阅、屏障和熔断代次。最终检查后一次性消费授权。类 B 拒绝持久确认后释放对应资源。 | MSVC、GCC 普通构建和文件恢复及时限边界测试通过。ASan/UBSan、TSan 并发测试及 relaxed 负向对照和 ARM64 测试已通过。[CI 运行记录](https://github.com/EypeZeo/hengyuan_v2/actions/runs/43611195442)。真实进程的完整持久化延迟注入待执行。 |
+| S6 类 A 闭合（SAFE-07、FI-056） | **已合入（2026-11-15，PR #254）**。六种本地拒绝写入 `OrderNeverSent`，持久确认后返回 `NeverSent`。存储记录已尝试关闭的订单号的最高时间与序号，重启时恢复该值并拒绝重复或倒退的尝试。两个测试程序显式启用写入。 | MSVC、GCC 普通构建和 ASan/UBSan 回归通过，测试覆盖孤儿预算、日志容量与恢复。Q19 持久化成本测量已完成。运行期孤儿计数、分级告警与可验证归档待实现，归档中断后的恢复待验证。 |
+| S7 迁移 | 待实现。需要保留的日志涉及格式变更时，按 §5 实施迁移清单、读者先行和回退前停机。 | 迁移中崩溃、清单撕裂和旧构建读取 v6。 |
 | S8 操作员闭合（D5，L-46） | 设计与模型已有（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`）；实现切片 R1 至 R6 在那份文档里 | 见该文档 §10；R1 与 S2 合并为同一次 v6 |
 
 ## 9. 请 Owner 确认的点

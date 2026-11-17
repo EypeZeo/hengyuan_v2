@@ -22,11 +22,12 @@ python tools/closure_ledger_check.py --self-test
 
 - FI-050：归因改为证据与可能原因集，允许共同原因/未定因；正常期验收使用预注册误报预算及区间，不承诺真实市场零误报。实现仍未开工。
 - FI-051：时间屏障依据可交易净优势衰减和独立硬上限，不以信号自相关半衰期直接替代；退出未知保护不变。
-- FI-055/056：最终门验证本次 handle/代次的唯一所有权；R-18/R-22 已确定统一 NotSent 持久闭合设计，仍需规格/版本迁移/模型/实现验收；延迟注入须覆盖完整日志、anchor 与目录同步链，不仅两次逻辑追加。
+- FI-055/056：S5/S6 已实现发送前最终授权和 `NeverSent` 持久关闭。FI-055 的真实进程延迟注入须覆盖完整的日志、anchor 与目录同步。FI-056 仍需运行期孤儿计数、分级告警、可验证归档和 S7 迁移恢复。
 - FI-046/047/048/049/054 及相关回归的细分故障与预算条件见蓝图 F.9。自动围栏和有限自动恢复、R2/180 天保留均未实现；不提高 ImplPathStatus，也不豁免首笔实盘之前的恢复、监控和 Owner 授权。
 - 2026-10-25（Q23 切片 1）：FI-055/056 里 NotSent 的语义已冻结于 `docs/NOTSENT_CLOSURE_DESIGN.md`，协议有模型 `formal/notsent_closure.tla`（模型层：设计配置无反例，8 个开关各有必败配置）。两条用例的状态、门禁结论与证据不变：模型不证明实现，实现、迁移与负控仍未做。
 - 2026-11-12（Q23 切片 S2/S3，PR #250，`979a94b`）：NotSent 的**读者侧**已落地（事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12、codec 的 v6 合法集合、`never_sent_rules.hpp`、恢复表 §4.6）。FI-055/056 的状态、门禁结论与证据不变：读者不是写者，发送路径上还没有任何代码写这个帧；写者（S4 至 S6）、迁移（S7）与负控的实现侧用例仍未做。
 - 2026-11-13（Q23 切片 S4，PR #252，`5bbbf43`）：NotSent 的**写入口**已落地（`append_never_sent()`、默认关闭的构造开关 `NeverSentWrites`）。FI-055/056 的状态、门禁结论与证据不变：写入口没有调用者，发送路径上还没有任何代码写这个帧；调用者（S5、S6）、迁移（S7）与负控的实现侧用例仍未做。
+- 2026-11-15（Q23 S5/S6，PR #254）合入发送前最终授权与两类 `NeverSent` 本地拒绝。FI-055 的测试覆盖授权撤销、熔断后持久关闭和时限边界。FI-056 的测试覆盖本地拒绝、活动日志容量和重启后的孤儿预算。两项的实现覆盖均为 `PARTIAL`，完整故障场景均为 `NOT_RUN`，`PRE_D3` 仍为 `BLOCKED`。[ASan/UBSan、TSan 与 ARM64 运行记录](https://github.com/EypeZeo/hengyuan_v2/actions/runs/43611195442)
 - 2026-10-25（D5）：被困订单的出口（L-46）有了设计与模型（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`），与 FI-002、FI-003、FI-009、FI-011、FI-043 的状态与证据无关，一律不变；实现 R1（恢复读者）已于 2026-10-25 合入（PR #203，`a4372ba`），R2（证据原语）已于 2026-10-26 合入（PR #205，`99d8cb4`），R3-0（工具的持久层数据源）已于 2026-10-27 合入（PR #207，`f7b964c`），R3a（工具的流程：端口、确认短语与读行器、证据文件、`resolve_order()`，对着回环假交易所）已于 2026-10-29 合入（PR #210，`7b66a62`），R3b-1（离线工具的真实交易所读：客户端的原样回传 GET、`BinanceExchangeReadPort` 与配速 / 限流闩、账户 UID 与密钥所属账户的核对）已于 2026-10-30 合入（PR #212，`f06a3a2`），R3b-2（离线工具的命令行 `hy_operator_resolve`：严格的参数文法、`--list`、KEK 文件与密钥文件、只读专用凭据、终端适配器与证据目录、退出码）已于 2026-10-31 合入（PR #214，`bdaece6`），R3b-3（L-50 的附加防线：一个品种名只对不早于日志首次给出它的时刻发送的订单有效）已于 2026-10-31 合入（PR #216，`8b8ad5f`），R4（迟到成交告警：对已被操作员结清的订单，交易所一开口（该 COID 的任何执行报告）就熔断并写审计）已于 2026-10-31 合入（PR #218，`df9b363`），R5（存储的环境与账户绑定：日志记下它属于哪个交易所环境、哪个账户，离线工具据此核对）已于 2026-11-01 合入（PR #220，`3363115`），R6 的第一步（只读 Testnet 探针 `tools/r6_testnet_probe.py`：账户 `uid` 是否存在、不存在订单的真实应答、三个读端点是否可读；Owner 在 Testnet 上运行并贴回结果）已于 2026-11-01 合入（PR #221，`0ef2b4e`），都不改变上述任何一项的状态与证据，R6 的其余部分（运行手册、崩溃窗口演练、读延迟 L 的测量）未开始。
 - 2026-11-02（私网流迁移 M4）：用户数据流排空（审计 P1-002 的路径 ③）先落持久帧、再折进 `PositionTruth`（PR #224，`9675b6c`）。P1-002 的 `code` 段由 MISSING 改为 PRESENT（判断：持久出口已在代码里，未接发布者时的内存优先由守卫钉住并随 M5 删除；若认为这仍算缺口，改回 MISSING 即可），状态仍为 PARTIAL——`runtime` 与 `budget` 两段仍缺（没有进程运行这条排空，同步 fsync 的时延没有测量）；FI-031 的备注随之更新，状态与结果不变。其余条目的状态与证据不变。
 - 2026-11-05（私网流迁移 M5a）：账户刷新通道、真实取账户端口与私网流流水线接线完成（PR #228，`2777c27`；PR #229，`bdbd96b`）。没有任何进程创建流水线，所以 P1-002 与各 FI 条目的状态、结果与证据均不变——P1-002 的 `runtime` 与 `budget` 两段仍缺；新的缺口 L-53（独立对账线程的凭据与限流）登记在蓝图附录 D。
@@ -1624,9 +1625,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: open:native/include/hengyuan/live_submit_orchestrator.hpp#orchestrate_submit
-refs: code:native/include/hengyuan/submit_authority.hpp#SubmitAuthority test:native/tests/test_submit_final_gate.cpp#RevokedAuthorityRefusesThePreparedOrder test:native/tests/test_submit_authority_concurrency.cpp#RevokeThenClaimRejectsTheOldEpoch
-note: PARTIAL：S5 已实现 Prepared 持久确认后的最终检查与 claim/revoke，类 B NeverSent 调用已接入；源码和既有验证说明见 SPEC_INVARIANTS.md。生产装配、目标主机时效及适用恢复验证仍未完成，本次未运行测试。
+open: open:native/tests/test_never_sent_guard.cpp#"A production trading process is not one of them yet" open:docs/NOTSENT_CLOSURE_DESIGN.md#"真实进程的完整持久化延迟注入待执行"
+refs: code:native/include/hengyuan/submit_authority.hpp#SubmitAuthority test:native/tests/test_submit_readiness.cpp#RevocationDuringFinalCheckWinsTheClaimCompareExchange test:native/tests/test_submit_final_gate.cpp#RevokedAuthorityRefusesThePreparedOrder test:native/tests/test_submit_final_gate.cpp#KillTriggerAfterPreparedWritesClassBClosureAndReleasesResources test:native/tests/test_submit_final_gate.cpp#AuthorizationTtlExpiresAtTheInclusiveBoundary test:native/tests/test_submit_authority_concurrency.cpp#RevokeThenClaimRejectsTheOldEpoch
+note: S5 在 Prepared 持久确认后复核发送条件并一次性消费授权。测试覆盖撤销竞争、熔断后的持久拒绝及资源释放、授权到期边界。待对真实进程注入完整的日志、anchor 与目录同步延迟，验证目标主机时效并记录从签发到发送决定的时间线。
 ```
 
 ```ledger
@@ -1640,9 +1641,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet"
-refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan
-note: PARTIAL：孤儿预算与恢复单测已有；S5/S6 已接入类 B/类 A NeverSent，写入失败保留资源。运行期计数、告警、归档与 S7 迁移恢复仍待完成；本次未运行测试。
+open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet" open:docs/NOTSENT_CLOSURE_DESIGN.md#"运行期孤儿计数、分级告警与可验证归档待实现"
+refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan test:native/tests/test_never_sent_orphans.cpp#RepeatedClosuresStayBelowSmallBudgetAndWatermarkSurvivesEvictionAndRestart test:native/tests/test_never_sent_class_a.cpp#FiveFrameLimitKeepsThirdIntentWhenItsClosureHitsTheLimit test:native/tests/test_never_sent_budget.cpp#FailedClosureWithoutAFrameRestoresTheIntentOrphanOnRestart
+note: S6 的测试覆盖类 A 拒绝的 NeverSent 持久记录、重启后的孤儿预算、活动日志帧数上限和写入失败后的孤儿恢复。运行期计数、原因分类、分级告警与可验证归档待实现。归档中断、清单撕裂和 S7 迁移恢复待验证。
 ```
 
 ```ledger
