@@ -227,6 +227,43 @@ TEST_F(BinanceJsonParserTest, DepthUpdateAllowsEqualSequenceRange) {
     EXPECT_EQ(evs_[0].event_id, 101u);
 }
 
+TEST_F(BinanceJsonParserTest, DepthUpdateRejectsMalformedLevelsWithoutPartialAcceptance) {
+    struct Case {
+        const char* name;
+        const char* level_fields;
+    };
+    const Case cases[] = {
+        {"missing bids", R"("a":[["101.00000000","1.00000000"]])"},
+        {"missing asks", R"("b":[["100.00000000","1.00000000"]])"},
+        {"bids not an array", R"("b":"bad","a":[["101.00000000","1.00000000"]])"},
+        {"asks not an array", R"("b":[["100.00000000","1.00000000"]],"a":null)"},
+        {"bad level mixed with valid level", R"("b":[["100.00000000","1.00000000"],["bad","1.00000000"]],"a":[])"},
+        {"short level", R"("b":[["100.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"long level", R"("b":[["100.00000000","1.00000000","extra"]],"a":[["101.00000000","1.00000000"]])"},
+        {"price is not a string", R"("b":[[100,"1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"quantity is not a string", R"("b":[["100.00000000",1]],"a":[["101.00000000","1.00000000"]])"},
+        {"price is not a fixed decimal", R"("b":[["not-a-price","1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"quantity is not a fixed decimal", R"("b":[["100.00000000","not-a-quantity"]],"a":[["101.00000000","1.00000000"]])"},
+        {"zero price", R"("b":[["0.00000000","1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"negative price", R"("b":[["-1.00000000","1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"negative quantity", R"("b":[["100.00000000","-0.00000001"]],"a":[["101.00000000","1.00000000"]])"},
+        {"positive quantity below one lot", R"("b":[["100.00000000","0.000000001"]],"a":[["101.00000000","1.00000000"]])"},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        parser_.reset_counters();
+        std::string json = R"({"e":"depthUpdate","E":1700000002000,"s":"BTCUSDT","U":10,"u":10,)";
+        json += test_case.level_fields;
+        json += "}";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    }
+}
+
 TEST_F(BinanceJsonParserTest, ParseDepthMultipleLevels) {
     const char* json = R"({
         "e": "depthUpdate", "E": 1700000003000, "s": "BTCUSDT",
@@ -349,6 +386,14 @@ TEST(DecimalToFixed, NegativeValue) {
     auto r = BinanceJsonParser::parse_decimal_to_fixed("-1.50000000", 100'000'000);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(*r, -150000000LL);
+}
+
+TEST(DecimalToFixed, SignOrDecimalPointWithoutDigitsRejected) {
+    const char* inputs[] = {"-", ".", "-."};
+    for (const char* input : inputs) {
+        SCOPED_TRACE(input);
+        EXPECT_FALSE(BinanceJsonParser::parse_decimal_to_fixed(input, 100'000'000).has_value());
+    }
 }
 
 TEST(DecimalToFixed, EmptyString) {

@@ -61,6 +61,7 @@ std::optional<std::int64_t> BinanceJsonParser::parse_decimal_to_fixed(
         negative = true;
         pos = 1;
     }
+    if (pos == s.size() || s.substr(pos) == ".") return std::nullopt;
 
     std::int64_t integer_part = 0;
     while (pos < s.size() && s[pos] != '.') {
@@ -237,28 +238,35 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
         std::size_t n = 0;
         bool truncated = false;
 
-        // Parse bids ("b" array): each element is ["price", "qty"]
-        simdjson::ondemand::array bids_arr;
-        if (doc["b"].get_array().get(bids_arr) == simdjson::SUCCESS) {
-            for (auto level_result : bids_arr) {
+        const auto parse_levels = [&](const char* key, Side side) {
+            simdjson::ondemand::array levels;
+            if (doc[key].get_array().get(levels) != simdjson::SUCCESS) return false;
+
+            for (auto level_result : levels) {
                 if (n >= max_events) {
                     truncated = true;
                     break;
                 }
                 simdjson::ondemand::array pair;
-                if (level_result.get_array().get(pair) != simdjson::SUCCESS) continue;
+                if (level_result.get_array().get(pair) != simdjson::SUCCESS) return false;
                 auto it = pair.begin();
-                if (it == pair.end()) continue;
+                if (it == pair.end()) return false;
                 std::string_view price_str;
-                if ((*it).get_string().get(price_str) != simdjson::SUCCESS) continue;
+                if ((*it).get_string().get(price_str) != simdjson::SUCCESS) return false;
                 ++it;
-                if (it == pair.end()) continue;
+                if (it == pair.end()) return false;
                 std::string_view qty_str;
-                if ((*it).get_string().get(qty_str) != simdjson::SUCCESS) continue;
+                if ((*it).get_string().get(qty_str) != simdjson::SUCCESS) return false;
+                ++it;
+                if (it != pair.end()) return false;
 
-                auto price = parse_decimal_to_fixed(price_str, sym_cfg->price_multiplier);
-                auto qty = parse_decimal_to_fixed(qty_str, sym_cfg->qty_multiplier);
-                if (!price || !qty) continue;
+                const auto price = parse_decimal_to_fixed(price_str, sym_cfg->price_multiplier);
+                const auto qty = parse_decimal_to_fixed(qty_str, sym_cfg->qty_multiplier);
+                if (!price || !qty || *price <= 0 || *qty < 0) return false;
+                // Only an actual zero may remove a level.
+                if (*qty == 0 && qty_str.find_first_not_of("-0.") != std::string_view::npos) {
+                    return false;
+                }
 
                 auto& ev = out_events[n];
                 std::memset(&ev, 0, sizeof(ev));
@@ -270,47 +278,15 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
                 ev.ts_recv_ns = recv_ns;
                 ev.symbol_id = sym_cfg->symbol_id;
                 ev.type = EventType::DepthDelta;
-                ev.side = Side::Buy;  // bid side
+                ev.side = side;
                 ++n;
             }
-        }
+            return true;
+        };
 
-        // Parse asks ("a" array)
-        simdjson::ondemand::array asks_arr;
-        if (doc["a"].get_array().get(asks_arr) == simdjson::SUCCESS) {
-            for (auto level_result : asks_arr) {
-                if (n >= max_events) {
-                    truncated = true;
-                    break;
-                }
-                simdjson::ondemand::array pair;
-                if (level_result.get_array().get(pair) != simdjson::SUCCESS) continue;
-                auto it = pair.begin();
-                if (it == pair.end()) continue;
-                std::string_view price_str;
-                if ((*it).get_string().get(price_str) != simdjson::SUCCESS) continue;
-                ++it;
-                if (it == pair.end()) continue;
-                std::string_view qty_str;
-                if ((*it).get_string().get(qty_str) != simdjson::SUCCESS) continue;
-
-                auto price = parse_decimal_to_fixed(price_str, sym_cfg->price_multiplier);
-                auto qty = parse_decimal_to_fixed(qty_str, sym_cfg->qty_multiplier);
-                if (!price || !qty) continue;
-
-                auto& ev = out_events[n];
-                std::memset(&ev, 0, sizeof(ev));
-                ev.event_id = final_update_id;
-                ev.aux_id = first_update_id;
-                ev.price_ticks = *price;
-                ev.qty_lots = *qty;
-                ev.ts_event_ms = event_time;
-                ev.ts_recv_ns = recv_ns;
-                ev.symbol_id = sym_cfg->symbol_id;
-                ev.type = EventType::DepthDelta;
-                ev.side = Side::Sell;  // ask side
-                ++n;
-            }
+        if (!parse_levels("b", Side::Buy) || (!truncated && !parse_levels("a", Side::Sell))) {
+            ++counters_.malformed;
+            return ParseResult::MalformedJson;
         }
 
         // AUDIT MD-TRUNC-015: a depth delta is explicitly NOT conflatable
