@@ -153,7 +153,8 @@ WebSocket 会话在停止请求、连接错误、`serverShutdown` 或 `eventStre
 | S3 状态机与恢复 | **已实现（与 S2 合为一片，2026-11-12；命名已定：事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12，规则在 `never_sent_rules.hpp`，读者与写者共用）**：`NotSent` 状态与边、`is_resolved`、恢复表（§4.6）、重放语料；**命名**：`order_tracker.hpp` 已有 `QueryOutcome::NotSent`（R-10，意思是对账**查询**没有离开进程），订单状态与事件的新名字要与它区分（实现 PR 里定），否则 grep 和读者都会混 | `none` + `address`；表中每一行与每个 `Corrupt` 一个用例；枚举 / 规格对照 |
 | S4 写入 | **已实现（2026-11-13）**：`append_never_sent()` 沿用 `append_impl`，与读者共用 `check_closure()`，构造开关 `NeverSentWrites` 默认关闭；S6 和 S5 通过 `DurableOrderAuditPort` 写入类 A 和类 B 关闭记录 | `address`；追加失败、迟到完成、尾部撕裂及非法重复发送 |
 | S5 最终授权（1A.6、FI-055） | **已合入（2026-11-15，PR #254）**。`SubmitAuthority` 原子 epoch 与 `SubmitReadiness::claim()` 将令牌绑定到签发者、订阅、屏障和熔断代次。最终检查后一次性消费授权。类 B 拒绝持久确认后释放对应资源。 | MSVC、GCC 普通构建和文件恢复及时限边界测试通过。ASan/UBSan、TSan 并发测试及 relaxed 负向对照和 ARM64 测试已通过。[CI 运行记录](https://github.com/EypeZeo/hengyuan_v2/actions/runs/43611195442)。真实进程的完整持久化延迟注入待执行。 |
-| S6 类 A 闭合（SAFE-07、FI-056） | **已合入（2026-11-15，PR #254）**。六种本地拒绝写入 `OrderNeverSent`，持久确认后返回 `NeverSent`。存储记录已尝试关闭的订单号的最高时间与序号，重启时恢复该值并拒绝重复或倒退的尝试。两个测试程序显式启用写入。 | MSVC、GCC 普通构建和 ASan/UBSan 回归通过，测试覆盖孤儿预算、日志容量与恢复。Q19 持久化成本测量已完成。运行期孤儿计数、分级告警与可验证归档待实现，归档中断后的恢复待验证。 |
+| S6 类 A 闭合（SAFE-07、FI-056） | **已合入（2026-11-15，PR #254）**。六种本地拒绝写入 `OrderNeverSent`，持久确认后返回 `NeverSent`。存储记录已尝试关闭的订单号的最高时间与序号，重启时恢复该值并拒绝重复或倒退的尝试。两个测试程序显式启用写入。 | MSVC、GCC 普通构建和 ASan/UBSan 回归通过，测试覆盖孤儿预算、日志容量与恢复。Q19 持久化成本测量已完成。 |
+| SAFE-07a 运行期孤儿预算（FI-056） | `IntentOrphanBudget` 由提交线程持有，使用恢复计数初始化。类 A 拒绝的关闭未获持久确认时，按拒绝原因计数。25%、50%、75% 和 90% 阈值按预算向上取整并分别报告。达到 90% 后，编排器在写入 `Intent` 前停止接收新提交。 | 测试覆盖原因分类、阈值、真实接收器恢复、多个上下文共享同一计数和类 B 的边界。可验证归档、归档中断恢复与 S7 迁移仍待完成。 |
 | S7 迁移 | 待实现。需要保留的日志涉及格式变更时，按 §5 实施迁移清单、读者先行和回退前停机。 | 迁移中崩溃、清单撕裂和旧构建读取 v6。 |
 | S8 操作员闭合（D5，L-46） | 设计与模型已有（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`）；实现切片 R1 至 R6 在那份文档里 | 见该文档 §10；R1 与 S2 合并为同一次 v6 |
 

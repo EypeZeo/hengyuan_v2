@@ -526,6 +526,20 @@ struct InFlightHandle {
     bool valid() const noexcept { return slot_index < kMaxInFlight; }
 };
 
+enum class InFlightRegistrationStatus : std::uint8_t {
+    Success = 0,
+    EmptyClientOrderId = 1,
+    Duplicate = 2,
+    CapacityExhausted = 3,
+};
+
+struct InFlightRegistration {
+    InFlightHandle handle{};
+    InFlightRegistrationStatus status{InFlightRegistrationStatus::EmptyClientOrderId};
+
+    [[nodiscard]] bool registered() const noexcept { return status == InFlightRegistrationStatus::Success; }
+};
+
 class InFlightRegistry {
 public:
     // Attempt to record a submit for `coid`. Returns false if this id is already
@@ -542,8 +556,14 @@ public:
     // Gate 12b's existing synchronous call site has no cross-thread staleness
     // hazard and can keep using the bool-returning form unchanged.
     InFlightHandle register_submit_handle(std::string_view coid) noexcept {
-        if (coid.empty()) return {};
-        if (find_index(coid) != kNotFound) return {};  // already in-flight
+        return register_submit_detailed(coid).handle;
+    }
+
+    // The typed form preserves the old invalid-handle API while distinguishing a duplicate id from capacity exhaustion.
+    // Slot selection, generation changes and the count of active orders are exactly the same in both forms.
+    InFlightRegistration register_submit_detailed(std::string_view coid) noexcept {
+        if (coid.empty()) return {{}, InFlightRegistrationStatus::EmptyClientOrderId};
+        if (find_index(coid) != kNotFound) return {{}, InFlightRegistrationStatus::Duplicate};
         for (std::size_t i = 0; i < kMaxInFlight; ++i) {
             if (!slots_[i].active) {
                 auto len = coid.size() < kClientOrderIdLen ? coid.size() : kClientOrderIdLen;
@@ -552,10 +572,10 @@ public:
                 slots_[i].active = true;
                 ++slots_[i].generation;  // bump on every inactive -> active transition
                 ++count_;
-                return InFlightHandle{i, slots_[i].generation};
+                return {InFlightHandle{i, slots_[i].generation}, InFlightRegistrationStatus::Success};
             }
         }
-        return {};  // capacity exhausted → fail-closed
+        return {{}, InFlightRegistrationStatus::CapacityExhausted};
     }
 
     bool is_in_flight(std::string_view coid) const noexcept {

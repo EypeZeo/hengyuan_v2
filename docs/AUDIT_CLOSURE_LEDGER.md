@@ -22,7 +22,7 @@ python tools/closure_ledger_check.py --self-test
 
 - FI-050：归因改为证据与可能原因集，允许共同原因/未定因；正常期验收使用预注册误报预算及区间，不承诺真实市场零误报。实现仍未开工。
 - FI-051：时间屏障依据可交易净优势衰减和独立硬上限，不以信号自相关半衰期直接替代；退出未知保护不变。
-- FI-055/056：S5/S6 已实现发送前最终授权和 `NeverSent` 持久关闭。FI-055 的真实进程延迟注入须覆盖完整的日志、anchor 与目录同步。FI-056 仍需运行期孤儿计数、分级告警、可验证归档和 S7 迁移恢复。
+- FI-055/056：S5/S6 已实现发送前最终授权和 `NeverSent` 持久关闭。FI-055 的真实进程延迟注入须覆盖完整的日志、anchor 与目录同步。FI-056 已覆盖运行期孤儿计数、原因分类与分级告警，仍需可验证归档和 S7 迁移恢复。
 - FI-046/047/048/049/054 及相关回归的细分故障与预算条件见蓝图 F.9。自动围栏和有限自动恢复、R2/180 天保留均未实现；不提高 ImplPathStatus，也不豁免首笔实盘之前的恢复、监控和 Owner 授权。
 - 2026-10-25（Q23 切片 1）：FI-055/056 里 NotSent 的语义已冻结于 `docs/NOTSENT_CLOSURE_DESIGN.md`，协议有模型 `formal/notsent_closure.tla`（模型层：设计配置无反例，8 个开关各有必败配置）。两条用例的状态、门禁结论与证据不变：模型不证明实现，实现、迁移与负控仍未做。
 - 2026-11-12（Q23 切片 S2/S3，PR #250，`979a94b`）：NotSent 的**读者侧**已落地（事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12、codec 的 v6 合法集合、`never_sent_rules.hpp`、恢复表 §4.6）。FI-055/056 的状态、门禁结论与证据不变：读者不是写者，发送路径上还没有任何代码写这个帧；写者（S4 至 S6）、迁移（S7）与负控的实现侧用例仍未做。
@@ -1643,9 +1643,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet" open:docs/NOTSENT_CLOSURE_DESIGN.md#"运行期孤儿计数、分级告警与可验证归档待实现"
-refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan test:native/tests/test_never_sent_orphans.cpp#RepeatedClosuresStayBelowSmallBudgetAndWatermarkSurvivesEvictionAndRestart test:native/tests/test_never_sent_class_a.cpp#FiveFrameLimitKeepsThirdIntentWhenItsClosureHitsTheLimit test:native/tests/test_never_sent_budget.cpp#FailedClosureWithoutAFrameRestoresTheIntentOrphanOnRestart
-note: S6 的测试覆盖类 A 拒绝的 NeverSent 持久记录、重启后的孤儿预算、活动日志帧数上限和写入失败后的孤儿恢复。运行期计数、原因分类、分级告警与可验证归档待实现。归档中断、清单撕裂和 S7 迁移恢复待验证。
+open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet" open:docs/NOTSENT_CLOSURE_DESIGN.md#"可验证归档、归档中断恢复与 S7 迁移仍待完成"
+refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan test:native/tests/test_never_sent_orphans.cpp#RepeatedClosuresStayBelowSmallBudgetAndWatermarkSurvivesEvictionAndRestart test:native/tests/test_never_sent_class_a.cpp#FiveFrameLimitKeepsThirdIntentWhenItsClosureHitsTheLimit test:native/tests/test_never_sent_budget.cpp#FailedClosureWithoutAFrameRestoresTheIntentOrphanOnRestart test:native/tests/test_never_sent_runtime_budget.cpp#EveryClassARefusalHasAnAccurateReasonBucketForEveryUnclosedStatus test:native/tests/test_never_sent_class_a.cpp#NinetyPercentStopsTheNextRequestBeforeAnyNewIntent test:native/tests/test_private_stream_pipeline.cpp#RuntimeOrphanBudgetSeedsRecoveryOnceAndSharesItAcrossContexts
+note: S6 覆盖类 A 拒绝的 NeverSent 持久记录、活动日志帧数上限和写入失败后的孤儿恢复。SAFE-07a 覆盖恢复计数初始化、运行期拒绝分类、分级告警和达到 90% 阈值后停止写入新 Intent。可验证归档仍待实现，归档中断、清单撕裂和 S7 迁移恢复仍待验证。
 ```
 
 ```ledger

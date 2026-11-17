@@ -109,6 +109,8 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
         case OrchestratorGate::NotReady: return "NotReady";
         case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
+        case OrchestratorGate::InFlightCapacityExceeded: return "InFlightCapacityExceeded";
+        case OrchestratorGate::IntentOrphanBudgetExceeded: return "IntentOrphanBudgetExceeded";
     }
     return "?";
 }

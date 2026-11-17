@@ -273,7 +273,8 @@ AuditRecord intent_frame_of_the_order() {
 }
 
 constexpr Reason kAllReasons[] = {Reason::ConfirmationMissing,        Reason::ConfirmationMismatch, Reason::SubmitPortInvalid,
-                                  Reason::InFlightRegistryUnavailable, Reason::RateLimitExhausted,   Reason::DuplicateInFlight};
+                                  Reason::InFlightRegistryUnavailable, Reason::RateLimitExhausted,   Reason::DuplicateInFlight,
+                                  Reason::InFlightCapacityExceeded};
 
 }  // namespace
 
@@ -300,6 +301,7 @@ TEST(NeverSentRules, TheReasonCodesAreTheDocumentedNumbers) {
     EXPECT_EQ(static_cast<int>(Reason::InFlightRegistryUnavailable), 4);
     EXPECT_EQ(static_cast<int>(Reason::RateLimitExhausted), 5);
     EXPECT_EQ(static_cast<int>(Reason::DuplicateInFlight), 6);
+    EXPECT_EQ(static_cast<int>(Reason::InFlightCapacityExceeded), 7);
 }
 
 TEST(NeverSentRules, ATargetBuiltFromAnIntentIsAnIntentWithNothingSeen) {

@@ -329,11 +329,11 @@ TEST_F(NeverSentOrchestratorFixture, RegistryFilledDuringIntentAckRejectsBeforeS
     EXPECT_TRUE(mutation.filled);
     EXPECT_EQ(in_flight_.count(), hy::kMaxInFlight);
     EXPECT_FALSE(in_flight_.is_in_flight(expected_coid().view()));
-    EXPECT_EQ(result.gate, OrchestratorGate::DuplicateInFlight);
+    EXPECT_EQ(result.gate, OrchestratorGate::InFlightCapacityExceeded);
     EXPECT_EQ(result.closure, ClosureAppendStatus::Appended);
     EXPECT_EQ(submit_calls_, 0u);
     EXPECT_EQ(allocations.calls, 0u);
-    expect_class_a_trace(fake_audit_, ctx_, result.order, Reason::DuplicateInFlight, ClosureAppendStatus::Appended);
+    expect_class_a_trace(fake_audit_, ctx_, result.order, Reason::InFlightCapacityExceeded, ClosureAppendStatus::Appended);
 }
 
 TEST_F(NeverSentOrchestratorFixture, NonAppendedClosureStatusesPreserveTheOriginalRefusalAndIntentState) {
@@ -453,6 +453,76 @@ TEST_F(NeverSentOrchestratorFixture, FailedClosureAlsoProtectsItsCoidFromAnother
     EXPECT_EQ(fake_audit_.closure_calls, 1u);
     EXPECT_EQ(fake_audit_.trace_count, 2u);
     EXPECT_EQ(submit_calls_, 0u);
+}
+
+TEST_F(NeverSentOrchestratorFixture, NinetyPercentStopsTheNextRequestBeforeAnyNewIntent) {
+    ::hy::never_sent::IntentOrphanBudget budget{3, 4};
+    ctx_.intent_orphan_budget = &budget;
+    ctx_.confirmation.confirmed = false;
+    fake_audit_.closure_status = ClosureAppendStatus::NotEnabled;
+
+    const OrchestratorResult crossing = hy::orchestrate_submit(ctx_);
+    ASSERT_EQ(crossing.gate, OrchestratorGate::OperatorNotConfirmed);
+    ASSERT_EQ(crossing.closure, ClosureAppendStatus::NotEnabled);
+    EXPECT_EQ(crossing.order.state, OrderState::Intent);
+    EXPECT_EQ(crossing.orphan_alert_mask, ::hy::never_sent::kIntentOrphanAlertAll);
+    EXPECT_EQ(budget.total(), 4u);
+    EXPECT_TRUE(budget.stopped());
+    EXPECT_EQ(fake_audit_.durable_append_calls, 1u);
+    EXPECT_EQ(fake_audit_.closure_calls, 1u);
+
+    ++ctx_.sequence;
+    const OrchestratorResult stopped = hy::orchestrate_submit(ctx_);
+    EXPECT_EQ(stopped.gate, OrchestratorGate::IntentOrphanBudgetExceeded);
+    EXPECT_EQ(stopped.closure, ClosureAppendStatus::NotAttempted);
+    EXPECT_EQ(stopped.orphan_alert_mask, ::hy::never_sent::kIntentOrphanAlertAll);
+    EXPECT_EQ(fake_audit_.durable_append_calls, 1u) << "no second Intent was written";
+    EXPECT_EQ(fake_audit_.closure_calls, 1u) << "there is nothing new to close";
+    EXPECT_EQ(fake_audit_.trace_count, 2u);
+    EXPECT_EQ(submit_calls_, 0u);
+}
+
+TEST_F(NeverSentOrchestratorFixture, RecoveredNinetyPercentBaselineStopsBeforeTheFirstIntent) {
+    ::hy::never_sent::IntentOrphanBudget budget{90, 100};
+    ctx_.intent_orphan_budget = &budget;
+
+    const OrchestratorResult stopped = hy::orchestrate_submit(ctx_);
+
+    EXPECT_EQ(stopped.gate, OrchestratorGate::IntentOrphanBudgetExceeded);
+    EXPECT_EQ(stopped.orphan_alert_mask, ::hy::never_sent::kIntentOrphanAlertAll);
+    EXPECT_EQ(stopped.closure, ClosureAppendStatus::NotAttempted);
+    EXPECT_EQ(budget.recovered(), 90u);
+    EXPECT_EQ(budget.count(::hy::never_sent::IntentOrphanReason::RecoveredUnknown), 90u);
+    EXPECT_EQ(fake_audit_.durable_append_calls, 0u);
+    EXPECT_EQ(fake_audit_.closure_calls, 0u);
+    EXPECT_EQ(submit_calls_, 0u);
+}
+
+TEST_F(NeverSentOrchestratorFixture, OnlyUnclosedClassARefusalsAdvanceTheRuntimeOrphanCount) {
+    ctx_.confirmation.confirmed = false;
+    const OrchestratorResult closed = hy::orchestrate_submit(ctx_);
+    ASSERT_EQ(closed.closure, ClosureAppendStatus::Appended);
+    EXPECT_EQ(intent_orphan_budget_.total(), 0u);
+
+    fake_audit_ = FakeAudit{};
+    fake_audit_.wire(ctx_.durable_audit);
+    fake_audit_.closure_status = ClosureAppendStatus::Failed;
+    ++ctx_.sequence;
+    const OrchestratorResult unclosed = hy::orchestrate_submit(ctx_);
+    ASSERT_EQ(unclosed.closure, ClosureAppendStatus::Failed);
+    EXPECT_EQ(intent_orphan_budget_.total(), 1u);
+    EXPECT_EQ(intent_orphan_budget_.count(::hy::never_sent::IntentOrphanReason::ConfirmationMissing), 1u);
+
+    fake_audit_ = FakeAudit{};
+    fake_audit_.wire(ctx_.durable_audit);
+    fake_audit_.closure_status = ClosureAppendStatus::NotAttempted;
+    ++ctx_.sequence;
+    const OrchestratorResult unattempted = hy::orchestrate_submit(ctx_);
+    ASSERT_EQ(unattempted.gate, OrchestratorGate::OperatorNotConfirmed);
+    ASSERT_EQ(unattempted.closure, ClosureAppendStatus::NotAttempted);
+    EXPECT_EQ(unattempted.order.state, OrderState::Intent);
+    EXPECT_EQ(intent_orphan_budget_.total(), 2u);
+    EXPECT_EQ(intent_orphan_budget_.count(::hy::never_sent::IntentOrphanReason::ConfirmationMissing), 2u);
 }
 
 TEST(OrderPathAllocation, TheProbeDetectsTheAllocationFormsUsedByTheHarness) {

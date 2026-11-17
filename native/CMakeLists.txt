@@ -760,6 +760,12 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_never_sent_budget)
     gtest_discover_tests(test_never_sent_budget)
 
+    # SAFE-07a: hot-thread runtime orphan accounting, alert thresholds and typed duplicate-vs-capacity registration.
+    add_executable(test_never_sent_runtime_budget tests/test_never_sent_runtime_budget.cpp)
+    target_link_libraries(test_never_sent_runtime_budget PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_never_sent_runtime_budget)
+    gtest_discover_tests(test_never_sent_runtime_budget)
+
     # D5 slice R2 (docs/OPERATOR_RESOLUTION_DESIGN.md 5, 6 and 10): the decisions behind an OrderOperatorResolved
     # frame's evidence (operator_resolution_evidence.hpp) -- the fence arithmetic, the allOrders windows, the client order
     # id's timestamp and the rules that turn the exchange's verdicts into a conclusion. Pure logic: it links no JSON

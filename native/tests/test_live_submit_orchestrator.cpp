@@ -1155,7 +1155,7 @@ TEST_F(LiveSubmitTest, ARefusalAfterTheIntentFrameSendsNothing) {
         ASSERT_TRUE(in_flight_.register_submit(id));
     }
     ctx_.sequence = 4;
-    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::DuplicateInFlight);  // no free slot
+    ASSERT_EQ(orchestrate_submit(ctx_).gate, OrchestratorGate::InFlightCapacityExceeded);  // new id, no free slot
 
     EXPECT_EQ(g_mock_submit_calls, 0) << "none of the four refusals may have reached the exchange";
 }
@@ -1870,7 +1870,7 @@ TEST_F(LiveSubmitDurableIntegrationTest, ARefusalBecauseTheRegistryIsFullLeavesA
 
     ctx_.sequence = 5;
     const OrchestratorResult r = orchestrate_submit(ctx_);
-    ASSERT_EQ(r.gate, OrchestratorGate::DuplicateInFlight) << "capacity is reported through the same gate";
+    ASSERT_EQ(r.gate, OrchestratorGate::InFlightCapacityExceeded) << "capacity is distinct from a duplicate COID";
     EXPECT_FALSE(in_flight_.is_in_flight(r.order.client_order_id.view()));
     EXPECT_EQ(g_mock_submit_calls, 0);
 

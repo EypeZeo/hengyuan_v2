@@ -285,6 +285,7 @@ protected:
         EXPECT_EQ(result.gate, OrchestratorGate::FinalAuthorizationRefused);
         EXPECT_EQ(result.final_refusal, reason);
         EXPECT_EQ(result.closure, status);
+        EXPECT_EQ(intent_orphan_budget_.total(), 0u) << "a Prepared class-B refusal is never an Intent orphan";
         EXPECT_TRUE(mutation_.invoked);
         EXPECT_EQ(submit_calls_, 0u);
         EXPECT_EQ(fake_audit_.trace[0].record.event_type, AuditEventType::OrderIntentCreated);
