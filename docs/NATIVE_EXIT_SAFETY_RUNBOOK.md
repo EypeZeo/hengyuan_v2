@@ -158,7 +158,7 @@ The script compares the UIDs reported for the two keys before submitting a singl
 The default sampling window is 20 seconds with a one-second polling interval and a five-second timeout per request. Use `-DurationSeconds`, `-PollIntervalMs` and `-TimeoutSeconds` to reproduce a sampling setup. If you need an explicit CA bundle, pass `-CaBundle`. The JSON report contains relative times, statuses and observation counts for sharing. Exit code 3 means a backoff response stopped the run. Exit code 4 means preparation failed. Exit code 5 means order submission was rejected or its outcome could not be verified.
 
 1. For each observation, read `GET /api/v3/time`, call `GET /api/v3/allOrders` for the symbol and a time window covering the order, then read `GET /api/v3/time` again. Record both exchange times and match the returned order by symbol and order identifier. [Spot Testnet server time](https://developers.binance.com/en/docs/products/spot/testnet/rest-api#check-server-time)
-2. Mark the order as missing only for a valid, complete HTTP 200 order list. Mark failed requests, saturated pages, and unusable time brackets as inconclusive. Stop the run on HTTP 403, 418 or 429. If a later valid poll loses an order that was previously visible, report that sequence separately.
+2. Mark the order as missing only for a valid, complete HTTP 200 order list. Mark failed requests, saturated pages, invalid JSON, rows outside the requested time window, and unusable time brackets as inconclusive. JSON objects must have unique field names. The post-query time read must finish before the sampling deadline for an observation to count. Stop the run on HTTP 403, 418 or 429. If a later valid poll loses an order that was previously visible, report that sequence separately.
 3. Report the interval from the **before-query** time of the last valid miss to the **after-query** time of the first valid hit, relative to `t0`. Use zero as the lower bound if the first valid poll already found the order. If the deadline passes with valid misses and zero hits, report the last lower bound with the upper bound open. Record inconclusive runs separately.
 
 The following offline example uses elapsed milliseconds from `t0` and a synthetic sample label.
@@ -188,6 +188,22 @@ The operator submitted a Spot Testnet `LIMIT_MAKER` order and started `allOrders
 | Final observation | The sampling deadline expired before the post-query exchange-time read at stage `after_time`. |
 
 The read allowance is 120 seconds.
+
+### Sampling from order acceptance on 2026-11-17
+
+An automated run verified that the operator and `TRADE` keys belonged to the same Spot Testnet account, submitted one `BTCUSDT BUY LIMIT_MAKER` order, and sampled from the exchange-reported acceptance time. The saved report has `selection: new_order` and `status: bounded`.
+
+| Measurement | Result |
+| --- | --- |
+| Sampling duration and configured polling interval | 20 seconds and 1,000 ms |
+| First valid query | Found, bracketed by exchange times 1,760 and 3,477 ms after acceptance |
+| Visibility interval for this order | 0–3,477 ms |
+| Observation counts | 6 found, 0 missing, 1 inconclusive |
+| Gaps between pre-query exchange-time readings | 2,551–5,995 ms, including the final inconclusive observation |
+| Final observation | The sampling deadline expired before dispatching `allOrders` at stage `all_orders`. |
+| Follow-up order status | `NEW` at the post-sampling point lookup |
+
+The read allowance is 120 seconds. The measured interval applies to this order.
 
 ### Checking the archived-order response
 

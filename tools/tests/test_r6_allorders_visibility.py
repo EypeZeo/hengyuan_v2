@@ -188,6 +188,53 @@ class CollectVisibilityTests(unittest.TestCase):
         self.assertEqual(report["observations"][0]["after_ms"], 200)
         self.assertEqual(report["interval_ms"], {"lower": 0, "upper": 200})
 
+    def test_deadline_during_after_time_read_keeps_hit_and_miss_inconclusive(self) -> None:
+        class DeadlineProbe(FakeProbe):
+            def __init__(self, clock: FakeClock, finish_at: float, page: tuple[int, object]) -> None:
+                super().__init__([ACCEPTED_MS, ACCEPTED_MS + 200], [page])
+                self.clock = clock
+                self.finish_at = finish_at
+                self.time_reads = 0
+
+            def public(self, path: str) -> tuple[int, str]:
+                result = super().public(path)
+                if path == visibility.TIME_PATH:
+                    self.time_reads += 1
+                    if self.time_reads == 2:
+                        self.clock.value = self.finish_at
+                return result
+
+        for page_name, page in (("found", _found_page()), ("empty", _missing_page())):
+            for finish_at in (0.5, 0.6):
+                with self.subTest(page=page_name, finish_at=finish_at):
+                    clock = FakeClock()
+                    probe = DeadlineProbe(clock, finish_at, page)
+
+                    report = visibility.collect_visibility(
+                        probe,
+                        SYMBOL,
+                        ORDER_ID,
+                        duration_seconds=0.5,
+                        poll_interval_ms=500,
+                        accepted_ms=ACCEPTED_MS,
+                        monotonic=clock.monotonic,
+                        sleep=clock.sleep,
+                    )
+
+                    self.assertEqual(report["status"], "inconclusive")
+                    self.assertIsNone(report["interval_ms"])
+                    self.assertEqual(report["counts"], {"found": 0, "missing": 0, "inconclusive": 1})
+                    self.assertEqual(len(report["observations"]), 1)
+                    observation = report["observations"][0]
+                    self.assertEqual(observation["result"], "inconclusive")
+                    self.assertEqual(observation["problem"]["stage"], "after_time")
+                    self.assertEqual(observation["problem"]["reason"], "observation_deadline")
+                    self.assertIsNone(observation["after_ms"])
+                    self.assertEqual(
+                        [call["path"] for call in probe.calls],
+                        [visibility.TIME_PATH, visibility.ALL_ORDERS_PATH, visibility.TIME_PATH],
+                    )
+
     def test_misses_through_deadline_are_right_censored(self) -> None:
         probe = _probe_for([_missing_page()] * 5)
 
@@ -195,6 +242,54 @@ class CollectVisibilityTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "right_censored")
         self.assertEqual(report["interval_ms"], {"lower": report["observations"][-1]["before_ms"], "upper": None})
+
+    def test_all_orders_rows_outside_requested_time_window_are_inconclusive(self) -> None:
+        requested_start = ACCEPTED_MS - 1_000
+        requested_end = ACCEPTED_MS + 3_000
+        cases = (
+            ("target before start", ORDER_ID, requested_start - 1),
+            ("other order before start", ORDER_ID + 1, requested_start - 1),
+            ("target after end", ORDER_ID, requested_end + 1),
+            ("other order after end", ORDER_ID + 1, requested_end + 1),
+        )
+
+        for name, order_id, order_time in cases:
+            with self.subTest(name=name):
+                page = (200, [{"symbol": SYMBOL, "orderId": order_id, "time": order_time}])
+                probe = _probe_for([page], brackets=[(3_000, 4_000)])
+
+                report = _run_collection(probe, duration_seconds=0.5)
+
+                self.assertEqual(report["status"], "inconclusive")
+                self.assertIsNone(report["interval_ms"])
+                self.assertEqual(report["counts"], {"found": 0, "missing": 0, "inconclusive": 1})
+                self.assertEqual(
+                    report["observations"][0]["problem"],
+                    {
+                        "stage": "all_orders",
+                        "reason": "order_time_outside_window",
+                        "http_status": 200,
+                    },
+                )
+                all_orders_call = next(
+                    call for call in probe.calls if call.get("path") == visibility.ALL_ORDERS_PATH
+                )
+                self.assertEqual(all_orders_call["params"]["startTime"], requested_start)
+                self.assertEqual(all_orders_call["params"]["endTime"], requested_end)
+
+    def test_all_orders_rows_at_inclusive_window_bounds_are_accepted(self) -> None:
+        requested_start = ACCEPTED_MS - 1_000
+        requested_end = ACCEPTED_MS + 3_000
+
+        for name, order_time in (("start", requested_start), ("end", requested_end)):
+            with self.subTest(bound=name):
+                page = (200, [{"symbol": SYMBOL, "orderId": ORDER_ID, "time": order_time}])
+                probe = _probe_for([page], brackets=[(3_000, 4_000)])
+
+                report = _run_collection(probe, duration_seconds=0.5)
+
+                self.assertEqual(report["observations"][0]["result"], "found")
+                self.assertEqual(report["counts"], {"found": 1, "missing": 0, "inconclusive": 0})
 
     def test_a_later_miss_after_visibility_is_nonmonotonic(self) -> None:
         probe = _probe_for([_found_page(), _missing_page(), _missing_page(), _found_page()])
@@ -237,6 +332,14 @@ class CollectVisibilityTests(unittest.TestCase):
                 (200, [{"symbol": SYMBOL, "orderId": 42, "time": visibility.MAX_ORDER_ID + 1}]),
                 "invalid_order_time",
             ),
+            "duplicate orderId field": (
+                (200, f'[{{"symbol":"{SYMBOL}","orderId":42,"orderId":{ORDER_ID},"time":{ACCEPTED_MS}}}]'),
+                "invalid_page",
+            ),
+            "non-finite optional field": (
+                (200, f'[{{"symbol":"{SYMBOL}","orderId":42,"time":{ACCEPTED_MS},"executedQty":NaN}}]'),
+                "invalid_page",
+            ),
         }
         for name, (page, expected_reason) in cases.items():
             with self.subTest(name=name):
@@ -247,8 +350,10 @@ class CollectVisibilityTests(unittest.TestCase):
                 self.assertEqual(report["status"], "inconclusive")
                 self.assertIsNone(report["interval_ms"])
                 self.assertGreater(report["counts"]["inconclusive"], 0)
+                self.assertEqual(report["counts"]["found"], 0)
                 self.assertEqual(report["counts"]["missing"], 0)
                 self.assertEqual(report["observations"][0]["problem"]["reason"], expected_reason)
+                self.assertTrue(all(item["result"] == "inconclusive" for item in report["observations"]))
 
     def test_time_that_moves_backward_is_not_a_valid_absence(self) -> None:
         probe = _probe_for(
@@ -305,6 +410,24 @@ class CollectVisibilityTests(unittest.TestCase):
         forbidden_keys = {"orderid", "clientorderid", "request", "params", "url", "signature", "body"}
         self.assertTrue(forbidden_keys.isdisjoint({key.casefold() for key in _all_dict_keys(report)}))
         self.assertNotIn("/api/v3/", serialized)
+
+
+class StrictJsonDecodeTests(unittest.TestCase):
+    def test_parse_json_rejects_nested_duplicate_keys(self) -> None:
+        self.assertIsNone(visibility.r6.parse_json('{"outer":{"value":1,"value":2}}'))
+
+    def test_parse_json_rejects_nonfinite_constants(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                self.assertIsNone(visibility.r6.parse_json(f'{{"value":{value}}}'))
+
+    def test_parse_json_catches_recursion_error(self) -> None:
+        with mock.patch.object(visibility.r6.json, "loads", side_effect=RecursionError):
+            self.assertIsNone(visibility.r6.parse_json("{}"))
+
+    def test_parse_json_accepts_same_key_in_different_objects(self) -> None:
+        document = visibility.r6.parse_json('{"left":{"id":1},"right":{"id":2}}')
+        self.assertEqual(document, {"left": {"id": 1}, "right": {"id": 2}})
 
 
 def _all_dict_keys(value: object):
