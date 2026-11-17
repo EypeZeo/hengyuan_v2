@@ -128,6 +128,47 @@ TEST_F(BinanceJsonParserTest, TradeAndAggTradeRejectMissingOrMalformedRequiredFi
             expect_malformed(shape, field.key, nullptr, field.key, field.wrong_type_value, "wrong type");
         }
         expect_malformed(shape, shape.id_field, nullptr, shape.id_field, "-1", "negative unsigned id");
+
+        struct InvalidDecimal {
+            const char* key;
+            const char* value;
+            const char* scenario;
+        };
+        const InvalidDecimal invalid_decimals[] = {
+            {"p", "\"0.00000000\"", "zero price"},
+            {"p", "\"-1.00000000\"", "negative price"},
+            {"p", "\"0.000000001\"", "positive price below one tick"},
+            {"q", "\"0.00000000\"", "zero quantity"},
+            {"q", "\"-1.00000000\"", "negative quantity"},
+            {"q", "\"0.000000001\"", "positive quantity below one lot"},
+        };
+        for (const InvalidDecimal& value : invalid_decimals) {
+            expect_malformed(shape, value.key, nullptr, value.key, value.value, value.scenario);
+        }
+    }
+}
+
+TEST_F(BinanceJsonParserTest, TradeAndAggTradeAcceptMinimumRepresentableQuantity) {
+    struct EventShape {
+        const char* event_type;
+        const char* id_field;
+    };
+    const EventShape event_shapes[] = {{"trade", "t"}, {"aggTrade", "a"}};
+
+    for (const EventShape& shape : event_shapes) {
+        SCOPED_TRACE(shape.event_type);
+        parser_.reset_counters();
+        const std::string json = std::string(R"({"e":")") + shape.event_type +
+            R"(","E":1700000000000,"s":"BTCUSDT",")" + shape.id_field +
+            R"(":123456,"p":"100.00000000","q":"0.00000001","m":false})";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::Ok);
+        EXPECT_EQ(count_, 1u);
+        EXPECT_EQ(evs_[0].type, std::string_view(shape.event_type) == "trade" ? EventType::Trade : EventType::AggTrade);
+        EXPECT_EQ(evs_[0].price_ticks, 10'000'000'000LL);
+        EXPECT_EQ(evs_[0].qty_lots, 1LL);
+        EXPECT_EQ(parser_.counters().malformed, 0u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 1u);
     }
 }
 

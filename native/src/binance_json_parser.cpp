@@ -210,6 +210,10 @@ ParseResult BinanceJsonParser::parse(std::string_view json_bytes,
             ++counters_.qty_overflow;
             return ParseResult::QtyOverflow;
         }
+        if (*price <= 0 || *qty <= 0) [[unlikely]] {
+            ++counters_.malformed;
+            return ParseResult::MalformedJson;
+        }
 
         auto& out = out_events[0];
         std::memset(&out, 0, sizeof(out));
