@@ -43,7 +43,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <string_view>
 #include <system_error>
 
@@ -82,12 +81,6 @@ inline constexpr const char* klines_parse_error_name(KlinesParseError e) noexcep
 }
 
 namespace detail {
-
-// The largest bar time (ms since the epoch) the parser accepts. Bar times come straight from the peer's JSON and
-// are then added to, subtracted from and compared (`close - open + 1`, `previous close + 1`); a quarter of
-// INT64_MAX leaves room for those operations, and is still some 29 million years past any real timestamp.
-// Audit F-B-006: without a bound, a row with open = INT64_MIN + 1 and close = INT64_MAX was signed-overflow UB.
-inline constexpr std::int64_t kMaxKlineTimeMs = std::numeric_limits<std::int64_t>::max() / 4;
 
 // std::from_chars is allocation-free and locale-independent (same choice as KlineJsonParser).
 // Prices must be > 0 and volume >= 0, both finite.

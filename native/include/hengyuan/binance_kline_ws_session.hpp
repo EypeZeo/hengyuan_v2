@@ -109,24 +109,19 @@ namespace websocket = beast::websocket;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
 
-// KlineWsEvent, KlineWsEventRing, KlineBarGapGuard, KlineIngestResult and ingest_closed_bar()
-// live in kline_bar.hpp (Boost-free, 批次 6 6b-0f) -- moved there verbatim so the REST backfill
-// codec and the feed supervisor can use them without this header's Boost/Beast/OpenSSL weight.
-
 enum class KlineParseResult : std::uint8_t {
     Ok = 0,             // closed candle ("k"."x" == true), event fully populated -- push it
     Unclosed = 1,        // "k"."x" == false -- deliberately not an error; on_read() must not push
     MalformedJson = 2,
-    MissingFields = 3,   // wrong/absent "e", absent "k", or a required field inside "k" missing
+    MissingFields = 3,   // absent or invalid required data
 };
 
 // Zero allocation in parse(), matching binance_json_parser.hpp's own AUDIT
 // PERF-ALLOC-012 / Appendix D L-38 discipline exactly: everything is sized once, in the
 // constructor, for the largest frame a session can deliver (kWsReadMessageMaxBytes) -- simdjson's
 // arrays and string buffer via allocate(), and one fixed padded copy buffer -- never a fresh
-// simdjson::padded_string per message and no buffer that grows on a longer frame. `out` is left
-// at its default (is_closed == false) on any non-Ok path -- never partially filled in a way a
-// caller could mistake for a real closed bar.
+// simdjson::padded_string per message and no buffer that grows on a longer frame. Errors leave
+// `out` at its default. The Unclosed result exposes the parsed fields with is_closed == false.
 class KlineJsonParser {
 public:
     // Allocates ALL of the parser's memory, once (about 28 MB of address space, 4 MiB of it
@@ -192,17 +187,22 @@ public:
             return KlineParseResult::MissingFields;
         }
 
-        out.open_time_ms = open_time_ms;
-        out.close_time_ms = close_time_ms;
-        out.open = open_v;
-        out.high = high_v;
-        out.low = low_v;
-        out.close = close_v;
-        out.volume = volume_v;
-
-        if (!is_closed) return KlineParseResult::Unclosed;
-        out.is_closed = true;
-        return KlineParseResult::Ok;
+        const KlineWsEvent event{
+            .open_time_ms = open_time_ms,
+            .close_time_ms = close_time_ms,
+            .open = open_v,
+            .high = high_v,
+            .low = low_v,
+            .close = close_v,
+            .volume = volume_v,
+            .is_closed = is_closed,
+        };
+        if (event.is_closed && (event.open_time_ms < 0 || event.close_time_ms > detail::kMaxKlineTimeMs ||
+                                !is_sane_closed_kline(event))) {
+            return KlineParseResult::MissingFields;
+        }
+        out = event;
+        return event.is_closed ? KlineParseResult::Ok : KlineParseResult::Unclosed;
     }
 
 private:

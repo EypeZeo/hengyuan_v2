@@ -4,27 +4,27 @@
 // feed supervisor, so logic that only needs a bar, the ring or the continuity guard can be built
 // and unit-tested without dragging in Boost.Asio/Beast/OpenSSL.
 //
-// What is moved and what is new: KlineWsEvent, KlineWsEventRing, KlineBarGapGuard,
-// KlineIngestResult and ingest_closed_bar() are moved out of binance_kline_ws_session.hpp with their
-// code unchanged (only the comments were re-pointed at that header, which still owns the two design
-// requirements -- in-place unclosed-bar filtering and bar-gap detection -- and external review
-// P0-04). The interval helpers below are NEW: kline_interval_span_ms() is the span table the
-// backfill codec needs, and is_valid_kline_interval() is the same 16-value allow-list the session
-// used to keep as a private loop -- that session-side detail::is_valid_kline_interval() now
-// delegates here, so there is one list, not two.
-
 #pragma once
 
 #include <hengyuan/spsc_ring.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <type_traits>
 
 namespace hy {
+
+namespace detail {
+
+// Bound exchange timestamps before calculating bar durations and next-bar boundaries.
+inline constexpr std::int64_t kMaxKlineTimeMs = std::numeric_limits<std::int64_t>::max() / 4;
+
+}  // namespace detail
 
 // Binance's documented kline interval set. "1M" (calendar month, capital M) is deliberately
 // listed distinctly from "1m" (minute) -- this is Binance's own convention, not a typo.
@@ -80,6 +80,16 @@ struct KlineWsEvent {
 static_assert(std::is_trivially_copyable_v<KlineWsEvent>,
               "KlineWsEvent crosses the SpscRing producer/consumer boundary");
 
+inline bool is_sane_closed_kline(const KlineWsEvent& b) noexcept {
+    if (!b.is_closed || b.close_time_ms <= b.open_time_ms) return false;
+    const double prices[] = {b.open, b.high, b.low, b.close};
+    for (const double p : prices) {
+        if (!std::isfinite(p) || p <= 0.0) return false;
+    }
+    if (!std::isfinite(b.volume) || b.volume < 0.0) return false;
+    return b.high >= b.low && b.open >= b.low && b.open <= b.high && b.close >= b.low && b.close <= b.high;
+}
+
 // Small, closed-candles-only ring -- see binance_kline_ws_session.hpp's header comment,
 // requirement 1, for why a large ring would just paper over a filtering bug instead of catching it.
 using KlineWsEventRing = SpscRing<KlineWsEvent, 16>;
@@ -121,7 +131,8 @@ public:
     // detected a gap (is_suspended() flips true), or because the guard was already suspended.
     bool accept(const KlineWsEvent& event) noexcept {
         if (suspended_) return false;
-        if (have_prev_close_ && event.open_time_ms != prev_close_time_ms_ + 1) {
+        if (have_prev_close_ && (prev_close_time_ms_ == std::numeric_limits<std::int64_t>::max() ||
+                                event.open_time_ms != prev_close_time_ms_ + 1)) {
             suspended_ = true;
             return false;
         }

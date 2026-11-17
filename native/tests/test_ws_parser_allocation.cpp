@@ -65,10 +65,11 @@ std::string describe(const std::vector<std::size_t>& sizes, const std::vector<st
 
 // --- kline frames ---
 
-std::string kline_body(bool closed, const std::string& before_k = "") {
+std::string kline_body(bool closed, const std::string& before_k = "", const char* low_price = "0.0005") {
     return std::string(R"({"e":"kline","E":123456789,"s":"BNBBTC",)") + before_k +
            R"("k":{"t":123400000,"T":123459999,"s":"BNBBTC","i":"1m","f":100,"L":200,)"
-           R"("o":"0.0010","c":"0.0020","h":"0.0025","l":"0.0015","v":"1000","n":100,"x":)" +
+           R"("o":"0.0010","c":"0.0020","h":"0.0025","l":")" + low_price +
+           R"(","v":"1000","n":100,"x":)" +
            (closed ? "true" : "false") + R"(,"q":"1.0000","V":"500","Q":"0.500","B":"123456"}})";
 }
 
@@ -169,6 +170,7 @@ TEST(KlineJsonParserAllocation, EveryOutcomeAllocatesNothingAtAnySize) {
     add_both("unclosed kline", kline_body(false), KlineParseResult::Unclosed);
     add_both("wrong event type", R"({"e":"trade","E":1})", KlineParseResult::MissingFields);
     add_both("no k object", R"({"e":"kline","E":1})", KlineParseResult::MissingFields);
+    add_both("inconsistent OHLC", kline_body(true, "", "0.0015"), KlineParseResult::MissingFields);
     cases.push_back({"dense numbers", dense_numbers, KlineParseResult::Ok, false});
     cases.push_back({"huge open price", huge_open, KlineParseResult::MissingFields, false});
     cases.push_back({"empty", "", KlineParseResult::MalformedJson, false});

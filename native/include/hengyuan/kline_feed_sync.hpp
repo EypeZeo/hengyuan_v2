@@ -48,7 +48,6 @@
 #include <hengyuan/strategy_spec_operators.hpp>
 #include <hengyuan/strategy_spec_types.hpp>
 
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -137,19 +136,6 @@ struct KlineSyncStats {
     std::uint64_t manual_invalidations{0};
     std::uint64_t overdue_invalidations{0};
 };
-
-// A bar the evaluator may be fed: closed, forward in time, finite positive prices that are
-// mutually consistent, finite non-negative volume. The same shape rules binance_klines_codec.hpp
-// enforces per bar, applied here to the live path as well.
-inline bool is_sane_closed_kline(const KlineWsEvent& b) noexcept {
-    if (!b.is_closed || b.close_time_ms <= b.open_time_ms) return false;
-    const double prices[] = {b.open, b.high, b.low, b.close};
-    for (const double p : prices) {
-        if (!std::isfinite(p) || p <= 0.0) return false;
-    }
-    if (!std::isfinite(b.volume) || b.volume < 0.0) return false;
-    return b.high >= b.low && b.open >= b.low && b.open <= b.high && b.close >= b.low && b.close <= b.high;
-}
 
 class KlineFeedSync {
 public:
