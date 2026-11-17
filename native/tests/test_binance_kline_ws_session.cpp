@@ -23,6 +23,8 @@
 #include "test_helpers/blackhole_acceptor.hpp"
 
 #include <chrono>
+#include <limits>
+#include <string_view>
 #include <thread>
 
 using hy::BinanceKlineWsSession;
@@ -55,7 +57,7 @@ std::string kline_body(bool closed, std::int64_t open_time_ms = 123400000,
     return R"({"e":"kline","E":123456789,"s":"BNBBTC","k":{)"
            R"("t":)" + std::to_string(open_time_ms) + R"(,"T":)" + std::to_string(close_time_ms) +
            R"(,"s":"BNBBTC","i":"1m","f":100,"L":200,)"
-           R"("o":"0.0010","c":"0.0020","h":"0.0025","l":"0.0015","v":"1000","n":100,)"
+           R"("o":"0.0010","c":"0.0020","h":"0.0025","l":"0.0005","v":"1000","n":100,)"
            R"("x":)" + std::string(closed ? "true" : "false") + R"(,)"
            R"("q":"1.0000","V":"500","Q":"0.500","B":"123456"}})";
 }
@@ -94,7 +96,7 @@ TEST(KlineJsonParser, ClosedCandleExtractsFullFieldSet) {
     EXPECT_EQ(ev.close_time_ms, 123459999);
     EXPECT_DOUBLE_EQ(ev.open, 0.0010);
     EXPECT_DOUBLE_EQ(ev.high, 0.0025);
-    EXPECT_DOUBLE_EQ(ev.low, 0.0015);
+    EXPECT_DOUBLE_EQ(ev.low, 0.0005);
     EXPECT_DOUBLE_EQ(ev.close, 0.0020);
     EXPECT_DOUBLE_EQ(ev.volume, 1000.0);
     EXPECT_EQ(ev.symbol_id, 0u);  // never parsed from JSON -- stamped by the session, not here
@@ -108,9 +110,14 @@ TEST(KlineJsonParser, UnclosedCandleNeverReturnsOk) {
     KlineWsEvent ev{};
     const auto body = kline_body(/*closed=*/false);
     ASSERT_EQ(parser.parse(body, ev), KlineParseResult::Unclosed);
-    EXPECT_FALSE(ev.is_closed);  // OHLCV may still be populated (forward-scan parse), but
-                                  // is_closed itself -- the only field on_read() branches on --
-                                  // stays false, and the result is never Ok either way.
+    EXPECT_FALSE(ev.is_closed);
+    EXPECT_EQ(ev.open_time_ms, 123400000);
+    EXPECT_EQ(ev.close_time_ms, 123459999);
+    EXPECT_DOUBLE_EQ(ev.open, 0.0010);
+    EXPECT_DOUBLE_EQ(ev.high, 0.0025);
+    EXPECT_DOUBLE_EQ(ev.low, 0.0005);
+    EXPECT_DOUBLE_EQ(ev.close, 0.0020);
+    EXPECT_DOUBLE_EQ(ev.volume, 1000.0);
 }
 
 TEST(KlineJsonParser, MissingRequiredNumericFieldRejected) {
@@ -134,9 +141,14 @@ TEST(KlineJsonParser, NonNumericDecimalStringRejected) {
 // these must now be refused, on EACH numeric field (a per-field bug would otherwise hide).
 namespace {
 std::string kline_body_with_fields(std::string_view o, std::string_view h, std::string_view l,
-                                    std::string_view c, std::string_view v) {
-    std::string body = R"({"e":"kline","E":1,"s":"BNBBTC","k":{"t":100,"T":159,"s":"BNBBTC","i":"1m",)"
-                       R"("f":1,"L":2,"o":")";
+                                    std::string_view c, std::string_view v,
+                                    std::string_view open_time = "100",
+                                    std::string_view close_time = "159") {
+    std::string body = R"({"e":"kline","E":1,"s":"BNBBTC","k":{"t":)";
+    body += open_time;
+    body += R"(,"T":)";
+    body += close_time;
+    body += R"(,"s":"BNBBTC","i":"1m","f":1,"L":2,"o":")";
     body += o;
     body += R"(","c":")";
     body += c;
@@ -150,6 +162,58 @@ std::string kline_body_with_fields(std::string_view o, std::string_view h, std::
     return body;
 }
 }  // namespace
+
+TEST(KlineJsonParser, ClosedCandleRejectsInvalidOhlcVolumeAndTimestampsAndClearsOutput) {
+    struct Case {
+        const char* name;
+        std::string_view open;
+        std::string_view high;
+        std::string_view low;
+        std::string_view close;
+        std::string_view volume;
+        std::string_view open_time;
+        std::string_view close_time;
+    };
+    const std::string close_time_too_large =
+        std::to_string(std::numeric_limits<std::int64_t>::max() / 4 + 1);
+    const Case cases[] = {
+        {"low exceeds high", "1", "2", "3", "1.5", "1", "100", "159"},
+        {"open below low", "0.5", "2", "1", "1.5", "1", "100", "159"},
+        {"open above high", "3", "2", "1", "1.5", "1", "100", "159"},
+        {"close below low", "2", "3", "1.5", "1", "1", "100", "159"},
+        {"close above high", "1.5", "2", "1", "3", "1", "100", "159"},
+        {"zero OHLC prices", "0", "0", "0", "0", "1", "100", "159"},
+        {"negative OHLC prices", "-1", "-1", "-1", "-1", "1", "100", "159"},
+        {"negative volume", "1", "2", "1", "2", "-1", "100", "159"},
+        {"negative open time", "1", "2", "1", "2", "1", "-1", "159"},
+        {"close time equals open time", "1", "2", "1", "2", "1", "100", "100"},
+        {"close time before open time", "1", "2", "1", "2", "1", "100", "99"},
+        {"close time above INT64_MAX/4", "1", "2", "1", "2", "1", "100", close_time_too_large},
+    };
+
+    KlineJsonParser parser;
+    const std::string valid_body = kline_body_with_fields("1", "2", "1", "2", "1");
+    KlineWsEvent ev{};
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        ASSERT_EQ(parser.parse(valid_body, ev), KlineParseResult::Ok);
+        EXPECT_TRUE(ev.is_closed);
+
+        const std::string invalid_body = kline_body_with_fields(
+            test_case.open, test_case.high, test_case.low, test_case.close, test_case.volume,
+            test_case.open_time, test_case.close_time);
+        EXPECT_EQ(parser.parse(invalid_body, ev), KlineParseResult::MissingFields);
+        EXPECT_FALSE(ev.is_closed);
+        EXPECT_EQ(ev.open_time_ms, 0);
+        EXPECT_EQ(ev.close_time_ms, 0);
+        EXPECT_DOUBLE_EQ(ev.open, 0.0);
+        EXPECT_DOUBLE_EQ(ev.high, 0.0);
+        EXPECT_DOUBLE_EQ(ev.low, 0.0);
+        EXPECT_DOUBLE_EQ(ev.close, 0.0);
+        EXPECT_DOUBLE_EQ(ev.volume, 0.0);
+        EXPECT_EQ(ev.symbol_id, 0u);
+    }
+}
 
 TEST(KlineJsonParser, OnlyAWholeFiniteDecimalStringIsAccepted) {
     const char* const bad[] = {"nan",  "NaN",   "-nan", "inf",  "-inf",  "Infinity", "1.5abc", "1.5 ", " 1.5",
@@ -172,20 +236,25 @@ TEST(KlineJsonParser, OrdinaryBinanceDecimalsStillParseExactly) {
         const char* text;
         double expected;
     };
-    const Case good[] = {{"0", 0.0},
-                         {"0.00000000", 0.0},
-                         {"148976.11427815", 148976.11427815},
+    const Case good[] = {{"148976.11427815", 148976.11427815},
                          {"0.01634790", 0.0163479},
+                         {"0.00000001", 1e-8},
                          {"1E3", 1000.0},
                          {"1e-8", 1e-8},
                          {"12345678.9", 12345678.9}};
     for (const Case& c : good) {
         KlineJsonParser parser;
         KlineWsEvent ev{};
-        const auto body = kline_body_with_fields("1.0", "1.0", "1.0", c.text, "1.0");
+        const auto body = kline_body_with_fields(c.text, c.text, c.text, c.text, "1.0");
         ASSERT_EQ(parser.parse(body, ev), KlineParseResult::Ok) << c.text;
         EXPECT_DOUBLE_EQ(ev.close, c.expected) << c.text;
     }
+
+    KlineJsonParser parser;
+    KlineWsEvent ev{};
+    const auto zero_volume_body = kline_body_with_fields("1.0", "2.0", "1.0", "2.0", "0");
+    ASSERT_EQ(parser.parse(zero_volume_body, ev), KlineParseResult::Ok);
+    EXPECT_DOUBLE_EQ(ev.volume, 0.0);
 }
 
 // The real session must plug into both the reconnect supervisor and the per-tick driver: a concept
@@ -274,6 +343,21 @@ TEST(KlineBarGapGuard, ContiguousSecondBarAccepted) {
     second.close_time_ms = 2999;
     EXPECT_TRUE(guard.accept(second));
     EXPECT_FALSE(guard.is_suspended());
+}
+
+TEST(KlineBarGapGuard, MaximumCloseTimeDoesNotWrapIntoAContiguousMinimumOpenTime) {
+    KlineBarGapGuard guard;
+    const std::int64_t max_time = std::numeric_limits<std::int64_t>::max();
+    KlineWsEvent first{};
+    first.open_time_ms = max_time - 1;
+    first.close_time_ms = max_time;
+    ASSERT_TRUE(guard.accept(first));
+
+    KlineWsEvent wrapped{};
+    wrapped.open_time_ms = std::numeric_limits<std::int64_t>::min();
+    wrapped.close_time_ms = wrapped.open_time_ms + 1;
+    EXPECT_FALSE(guard.accept(wrapped));
+    EXPECT_TRUE(guard.is_suspended());
 }
 
 TEST(KlineBarGapGuard, GapRejectsTheTriggeringBarAndSuspends) {
