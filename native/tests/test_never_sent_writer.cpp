@@ -21,6 +21,7 @@
 // file of the same name a moment later races a real-time antivirus scanner on a Windows host.
 
 #include <gtest/gtest.h>
+#include <hengyuan/durable_audit_archive.hpp>
 #include <hengyuan/durable_audit_sink.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
 
@@ -57,6 +58,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::uint32_t kKeyId = 1;
+constexpr std::int64_t kMigrationCreatedUtcMs = 1'800'000'000'000;
 
 std::vector<std::byte> plaintext_key() {
     static const char kKey[] = "never-sent-writer-test-key";
@@ -197,7 +199,7 @@ protected:
     void remove_all() {
         if (base_path_.empty()) return;
         std::error_code ec;
-        for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".keyrotations", ".keyrotations.lock",
+        for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".s7.archive", ".keyrotations", ".keyrotations.lock",
                                    ".keyrotations.tip", ".keyrotations.tip.tmp", ".storeid", ".storeid.lock",
                                    ".storeid.tip", ".storeid.tip.tmp"}) {
             fs::remove(base_path_ + suffix, ec);  // a file or an (empty) directory: the fault injection makes one
@@ -211,8 +213,10 @@ protected:
     }
 
     std::unique_ptr<DurableAuditSink> open(AuditSinkOpenMode mode = AuditSinkOpenMode::Trading,
-                                           NeverSentWrites writes = NeverSentWrites::Enabled) {
-        return std::make_unique<DurableAuditSink>(base_path_, *ring_, kKeyId, kMaxIntentOrphans, mode, writes);
+                                           NeverSentWrites writes = NeverSentWrites::Enabled,
+                                           AuditMigrationPolicy migration = AuditMigrationPolicy::Discover) {
+        return std::make_unique<DurableAuditSink>(base_path_, *ring_, kKeyId, kMaxIntentOrphans, mode, writes,
+                                                  kMaxDurableLogBytes / kOrderEventFrameSize, migration);
     }
 
     // Lays an order history down on a fresh path with the real writer (a plain trading sink: v5), then closes it.
@@ -252,6 +256,22 @@ protected:
         std::vector<std::byte> out(raw.size());
         if (!raw.empty()) std::memcpy(out.data(), raw.data(), raw.size());
         return out;
+    }
+
+    static void write_file_bytes(const std::string& path, const std::vector<std::byte>& bytes) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open()) << path;
+        if (!bytes.empty()) out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        ASSERT_TRUE(out.good()) << path;
+    }
+
+    void rewrite_log_and_anchor(const std::vector<std::byte>& log, const std::vector<std::byte>& anchor) {
+        write_file_bytes(base_path_, log);
+        write_file_bytes(base_path_ + ".tip", anchor);
+    }
+
+    ExportFileResult prepare_migration_archive() {
+        return prepare_audit_migration(base_path_, *ring_, kMigrationCreatedUtcMs);
     }
 
     std::vector<std::byte> log_bytes() const { return file_bytes(base_path_); }
@@ -589,6 +609,238 @@ TEST_F(NeverSentWriterTest, TheSwitchBelongsToTheSinkNotToTheStore) {
     // a store with a closure in it, reopened by a sink that was not told to write one: it reads, it refuses to write
     const Attempt a = attempt(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, target_of({intent(kB)}), closure(kB));
     expect_refused_untouched(a, NeverSentAppendStatus::NotEnabled, "the store is v6, the switch is still the sink's", kFrameFormatVersionV6);
+}
+
+TEST_F(NeverSentWriterTest, RequireArchiveWithoutAMigrationArchiveFencesAndPreservesAV5Store) {
+    write_history({intent(kA), prepared(kA)});
+    ASSERT_FALSE(fs::exists(base_path_ + ".s7.archive"));
+    const std::vector<std::byte> original_log = log_bytes();
+    const std::vector<std::byte> original_anchor = anchor_bytes();
+
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_TRUE(sink->fenced());
+        EXPECT_FALSE(sink->append_durable(intent(kB), 2000).acked());
+    }
+    EXPECT_EQ(log_bytes(), original_log);
+    EXPECT_EQ(anchor_bytes(), original_anchor);
+}
+
+TEST_F(NeverSentWriterTest, ARequiredArchiveWithMissingStoreIdentityFencesWithoutRecreatingTheIdentity) {
+    write_history({intent(kA), prepared(kA)});
+    ASSERT_EQ(prepare_migration_archive().status, ExportStatus::Ok);
+    const std::vector<std::byte> original_log = log_bytes();
+    const std::vector<std::byte> original_anchor = anchor_bytes();
+    const std::string identity_path = base_path_ + ".storeid.tip";
+    ASSERT_TRUE(fs::exists(identity_path));
+    ASSERT_TRUE(fs::remove(identity_path));
+    ASSERT_FALSE(fs::exists(identity_path));
+
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_TRUE(sink->fenced());
+        EXPECT_FALSE(sink->append_durable(intent(kB), 2000).acked());
+    }
+    EXPECT_EQ(log_bytes(), original_log);
+    EXPECT_EQ(anchor_bytes(), original_anchor);
+    EXPECT_FALSE(fs::exists(identity_path)) << "a fenced migration source must not receive a replacement identity";
+}
+
+TEST_F(NeverSentWriterTest, AVerifiedV5ArchiveMakesOrdinaryAppendsStartAtV6AcrossRestarts) {
+    write_history({intent(kA), prepared(kA)});
+    const std::vector<std::byte> v5_log = log_bytes();
+    const std::vector<std::byte> v5_anchor = anchor_bytes();
+
+    const ExportFileResult archive = prepare_migration_archive();
+    ASSERT_EQ(archive.status, ExportStatus::Ok);
+    ASSERT_TRUE(fs::exists(base_path_ + ".s7.archive"));
+    EXPECT_EQ(log_bytes(), v5_log) << "preparing the archive leaves the source log intact";
+    EXPECT_EQ(anchor_bytes(), v5_anchor) << "preparing the archive leaves the source anchor intact";
+
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_FALSE(sink->fenced());
+        EXPECT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+    }
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_FALSE(sink->fenced());
+        EXPECT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+        ASSERT_TRUE(sink->append_durable(intent(kB), 2000).acked());
+    }
+
+    EXPECT_EQ(log_bytes().size(), v5_log.size() + kOrderEventFrameSize);
+    EXPECT_EQ(version_of_frame(0), kFrameFormatVersion);
+    EXPECT_EQ(version_of_frame(1), kFrameFormatVersion);
+    EXPECT_EQ(version_of_frame(2), kFrameFormatVersionV6) << "the first ordinary append after migration is v6";
+    const std::vector<std::byte> migrated_log = log_bytes();
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_FALSE(sink->fenced());
+        EXPECT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+    }
+    EXPECT_EQ(log_bytes(), migrated_log) << "reopening the migrated store does not append a duplicate frame";
+}
+
+TEST_F(NeverSentWriterTest, APartialFirstV6FrameIsCutBackToTheArchivedV5Boundary) {
+    write_history({intent(kA), prepared(kA)});
+    const std::vector<std::byte> v5_log = log_bytes();
+    const std::vector<std::byte> v5_anchor = anchor_bytes();
+    ASSERT_EQ(prepare_migration_archive().status, ExportStatus::Ok);
+
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        ASSERT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+        ASSERT_TRUE(sink->append_durable(intent(kB), 2000).acked());
+    }
+    const std::vector<std::byte> complete_v6_log = log_bytes();
+    ASSERT_EQ(complete_v6_log.size(), v5_log.size() + kOrderEventFrameSize);
+    ASSERT_EQ(static_cast<std::uint8_t>(complete_v6_log[v5_log.size()]), kFrameFormatVersionV6);
+
+    constexpr std::size_t kTornBytes = 17;
+    std::vector<std::byte> torn_log(complete_v6_log.begin(),
+                                    complete_v6_log.begin() + static_cast<std::ptrdiff_t>(v5_log.size() + kTornBytes));
+    rewrite_log_and_anchor(torn_log, v5_anchor);
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_FALSE(sink->fenced());
+        EXPECT_EQ(sink->recovery_status(), RecoveryScanStatus::Recovered);
+        EXPECT_EQ(sink->recovered_torn_tail_bytes(), kTornBytes);
+        EXPECT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+    }
+    EXPECT_EQ(log_bytes(), v5_log) << "only the partial first v6 frame is removed";
+    EXPECT_EQ(anchor_bytes(), v5_anchor) << "the v5 anchor remains valid after removing the incomplete frame";
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        EXPECT_TRUE(sink->is_open());
+        EXPECT_FALSE(sink->fenced());
+        EXPECT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+    }
+}
+
+TEST_F(NeverSentWriterTest, ACompleteFirstV6FrameRepairsTheRestoredV5AnchorWithoutDuplicatingIt) {
+    write_history({intent(kA), prepared(kA)});
+    const std::vector<std::byte> v5_log = log_bytes();
+    const std::vector<std::byte> v5_anchor = anchor_bytes();
+    ASSERT_EQ(prepare_migration_archive().status, ExportStatus::Ok);
+
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        ASSERT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+        ASSERT_TRUE(sink->append_durable(intent(kB), 2000).acked());
+    }
+    const std::vector<std::byte> complete_v6_log = log_bytes();
+    const std::vector<std::byte> complete_v6_anchor = anchor_bytes();
+    ASSERT_EQ(complete_v6_log.size(), v5_log.size() + kOrderEventFrameSize);
+    ASSERT_EQ(static_cast<std::uint8_t>(complete_v6_log[v5_log.size()]), kFrameFormatVersionV6);
+    ASSERT_NE(complete_v6_anchor, v5_anchor);
+
+    rewrite_log_and_anchor(complete_v6_log, v5_anchor);
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_FALSE(sink->fenced());
+        EXPECT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+    }
+    EXPECT_EQ(log_bytes(), complete_v6_log) << "the already-landed first v6 frame is not written again";
+    EXPECT_EQ(anchor_bytes(), complete_v6_anchor) << "the v5 anchor is advanced to the complete v6 tip";
+
+    const std::vector<std::byte> repaired_anchor = anchor_bytes();
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        ASSERT_TRUE(sink->is_open());
+        EXPECT_FALSE(sink->fenced());
+        EXPECT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+    }
+    EXPECT_EQ(log_bytes(), complete_v6_log) << "a second restart does not duplicate the first v6 frame";
+    EXPECT_EQ(anchor_bytes(), repaired_anchor);
+}
+
+TEST_F(NeverSentWriterTest, ACorruptOrTruncatedMigrationArchiveFailsClosedWithoutCuttingTheSource) {
+    for (const bool truncate_archive : {false, true}) {
+        SCOPED_TRACE(truncate_archive ? "truncated archive" : "corrupt archive");
+        write_history({intent(kA), prepared(kA)});
+        const std::vector<std::byte> v5_log = log_bytes();
+        const std::vector<std::byte> v5_anchor = anchor_bytes();
+        ASSERT_EQ(prepare_migration_archive().status, ExportStatus::Ok);
+
+        {
+            const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+            ASSERT_TRUE(sink->is_open());
+            ASSERT_EQ(sink->write_format_version(), kFrameFormatVersionV6);
+            ASSERT_TRUE(sink->append_durable(intent(kB), 2000).acked());
+        }
+        const std::vector<std::byte> complete_v6_log = log_bytes();
+        ASSERT_EQ(complete_v6_log.size(), v5_log.size() + kOrderEventFrameSize);
+        constexpr std::size_t kTornBytes = 19;
+        const std::vector<std::byte> torn_log(complete_v6_log.begin(),
+                                              complete_v6_log.begin() + static_cast<std::ptrdiff_t>(v5_log.size() + kTornBytes));
+        rewrite_log_and_anchor(torn_log, v5_anchor);
+
+        const std::string archive_path = base_path_ + ".s7.archive";
+        if (truncate_archive) {
+            std::error_code ec;
+            fs::resize_file(archive_path, 7, ec);
+            ASSERT_FALSE(ec) << ec.message();
+        } else {
+            std::vector<std::byte> bytes = file_bytes(archive_path);
+            ASSERT_FALSE(bytes.empty());
+            bytes.front() ^= std::byte{0xff};
+            write_file_bytes(archive_path, bytes);
+        }
+
+        const std::vector<std::byte> source_before = log_bytes();
+        const std::vector<std::byte> anchor_before = anchor_bytes();
+        {
+            const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+            EXPECT_TRUE(sink->fenced()) << "an unusable archive cannot authorize a v6 migration";
+            EXPECT_FALSE(sink->append_durable(intent(kB), 2001).acked());
+        }
+        EXPECT_EQ(log_bytes(), source_before) << "archive validation failure must leave a torn source untouched";
+        EXPECT_EQ(anchor_bytes(), anchor_before) << "archive validation failure must not replace the source anchor";
+        EXPECT_EQ(source_before.size(), v5_log.size() + kTornBytes)
+            << "the torn v6 suffix remains present when the archive cannot be verified";
+    }
+}
+
+TEST_F(NeverSentWriterTest, AVersionFiveAppendAfterTheArchiveIsRejectedOnRequiredRestart) {
+    write_history({intent(kA), prepared(kA)});
+    ASSERT_EQ(prepare_migration_archive().status, ExportStatus::Ok);
+    const std::string archive_path = base_path_ + ".s7.archive";
+    const std::vector<std::byte> archive_bytes = file_bytes(archive_path);
+    ASSERT_FALSE(archive_bytes.empty());
+    {
+        std::error_code ec;
+        ASSERT_TRUE(fs::remove(archive_path, ec));
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    // A process that opened before migration discovery remains a v5 writer; its later v5 frame must invalidate this archive.
+    {
+        const auto sink = open();
+        ASSERT_TRUE(sink->is_open());
+        ASSERT_EQ(sink->write_format_version(), kFrameFormatVersion);
+        ASSERT_TRUE(sink->append_durable(intent(kB), 2000).acked());
+    }
+    ASSERT_EQ(version_of_frame(2), kFrameFormatVersion);
+    write_file_bytes(archive_path, archive_bytes);
+    const std::vector<std::byte> source_before = log_bytes();
+    const std::vector<std::byte> anchor_before = anchor_bytes();
+    {
+        const auto sink = open(AuditSinkOpenMode::Trading, NeverSentWrites::Disabled, AuditMigrationPolicy::RequireArchive);
+        EXPECT_TRUE(sink->fenced()) << "a post-archive v5 frame lies beyond the verified migration boundary";
+        EXPECT_FALSE(sink->append_durable(intent(kA), 2001).acked());
+    }
+    EXPECT_EQ(log_bytes(), source_before);
+    EXPECT_EQ(anchor_bytes(), anchor_before);
 }
 
 // --- the faults of design 4.5 ------------------------------------------------------------------------------------------------
