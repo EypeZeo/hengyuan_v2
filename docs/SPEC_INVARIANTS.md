@@ -601,9 +601,10 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       枚举的越界值不会变成宽松。交易进程**不得**用这个模式。
     - **守卫**（`test_operator_resolution_guard.cpp`，读源码）：事件 22 只被定义处、编解码和读者提及（逐文件钉次数）；除 sink
       头文件外没有任何源文件出现 `OperatorOpen`；`validate_operator_resolution()` 只有读者调用；`write_version_` 全库只赋值一次，
-      `encode_order_event_frame()` 全库只有一个生产调用且以 `write_version_` 为版本；`kFrameFormatVersionV6` 只出现在编解码与
-      sink，控制面仍是 `kFrameFormatVersion`。`validate_transition()` 对 `EscalatedToOperator` 出发的每条边仍是 `AlreadyTerminal`
-      （`test_order_lifecycle.cpp`）。导出器（`durable_audit_export.hpp`）同读 v5/v6、同样拒绝版本回退，清单报告日志里最高的版本。
+      `encode_order_event_frame()` 全库只有一个生产调用且以 `write_version_` 为版本。控制面仍是 `kFrameFormatVersion`。
+      `validate_transition()` 对 `EscalatedToOperator` 出发的每条边仍是 `AlreadyTerminal`（`test_order_lifecycle.cpp`）。
+      导出器（`durable_audit_export.hpp`）同读 v5/v6、同样拒绝版本回退，清单报告最高版本和首个 v6 帧序号。
+      `kFrameFormatVersionV6` 只用于编解码、sink 和导出器的只读核验。
     - **仍未覆盖**：写事件 22 的一方（切片 R3 的离线工具）；证据原语（R2，已落地，见下一条）；迟到成交告警（R4）；环境与账户绑定
       （R5，生产启用的前置）；NotSent 的状态与事件（`docs/NOTSENT_CLOSURE_DESIGN.md` S2/S3，**已落地**，见下面的 “Q23 切片 S2/S3” 条目：在同一个 v6 里追加了事件 23 与状态 12）；迁移（没有真实
       日志之前不需要）。

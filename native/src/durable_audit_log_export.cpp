@@ -15,7 +15,7 @@
 //
 // Usage:
 //   durable_audit_log_export --log <sink base path> --out <ndjson path> --kek-hex <64hex> --key-file <path>
-//                             [--allow-missing-anchor]
+//                             [--allow-missing-anchor | --require-complete-source]
 //   durable_audit_log_export --usage
 //
 // Exit codes: 0 = exported, 2 = usage error, 3 = key file did not load, 4 = verification/export failed (see the
@@ -65,7 +65,8 @@ void print_usage() {
     std::printf(
         "usage:\n"
         "  durable_audit_log_export --log <sink base path> --out <ndjson path>\n"
-        "                            --kek-hex <64hex> --key-file <path> [--allow-missing-anchor]\n"
+        "                            --kek-hex <64hex> --key-file <path>\n"
+        "                            [--allow-missing-anchor | --require-complete-source]\n"
         "  durable_audit_log_export --usage\n"
         "--log       the DurableAuditSink base path (no suffix) -- e.g. state/audit.log.\n"
         "            Its .lock/.tip/.storeid.tip siblings are derived from this path, same as the writer's own.\n"
@@ -76,7 +77,9 @@ void print_usage() {
         "--key-file  a HYKEYS01 wrapped-key file (durable_audit_export.hpp's own format): the key(s) the log was\n"
         "            signed with, wrapped under --kek-hex. This tool's own input contract, not a key ceremony.\n"
         "--allow-missing-anchor  export even without a .tip file (the export then cannot show the tail was not\n"
-        "            cut off; the manifest's tip_anchor field says \"absent-allowed\" so the consumer can see it).\n",
+        "            cut off; the manifest's tip_anchor field says \"absent-allowed\" so the consumer can see it).\n"
+        "--require-complete-source  require a non-empty log, an intact tail, an anchor at the last frame,\n"
+        "            and a verified store identity. Use this for an S7 migration source check.\n",
         kKekSize * 2);
 }
 
@@ -109,6 +112,8 @@ int main(int argc, char** argv) {
             }
         } else if (arg == "--allow-missing-anchor") {
             opts.allow_missing_anchor = true;
+        } else if (arg == "--require-complete-source") {
+            opts.require_complete_source = true;
         } else if (arg == "--usage" || arg == "-h" || arg == "--help") {
             print_usage();
             return 0;
@@ -121,6 +126,11 @@ int main(int argc, char** argv) {
 
     if (log_arg.empty() || out_arg.empty() || key_file_arg.empty() || !have_kek) {
         print_usage();
+        return 2;
+    }
+
+    if (opts.require_complete_source && opts.allow_missing_anchor) {
+        std::fprintf(stderr, "error: choose one of --require-complete-source and --allow-missing-anchor\n");
         return 2;
     }
 
@@ -157,6 +167,10 @@ int main(int argc, char** argv) {
                : v.anchor == AnchorState::AbsentAllowed ? "absent-allowed"
                : v.anchor == AnchorState::EmptyLog      ? "empty-log"
                                                         : "not-checked");
+    if (result.status == ExportStatus::OutputSyncUncertain) {
+        std::fprintf(stderr, "error: the complete output was published, but its directory could not be flushed\n");
+        return 4;
+    }
     if (result.status != ExportStatus::Ok) {
         std::fprintf(stderr, "error: at log offset %zu (expected sequence %llu)\n", v.error_offset,
                      static_cast<unsigned long long>(v.error_sequence));
