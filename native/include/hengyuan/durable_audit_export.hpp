@@ -37,11 +37,13 @@
 
 #pragma once
 
+#include <hengyuan/audit_archive_format.hpp>
 #include <hengyuan/durable_audit_sink.hpp>  // tip anchor / store identity decoders, DurableAuditSink's file naming
 #include <hengyuan/durable_frame_codec.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/secure_wipe.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -102,6 +104,7 @@ enum class ExportStatus : std::uint8_t {
     OutputSyncUncertain = 21,      // the complete file is visible, but the directory flush failed
     MalformedArchive = 22,        // archive envelope or length is invalid
     MigrationSourceVersion = 23,  // preparation requires a v5 source
+    ReservedMigrationPath = 24,   // ordinary exports reserve migration filenames for S7 preparation
 };
 
 inline constexpr const char* export_status_name(ExportStatus s) noexcept {
@@ -130,6 +133,7 @@ inline constexpr const char* export_status_name(ExportStatus s) noexcept {
         case ExportStatus::OutputSyncUncertain: return "OutputSyncUncertain";
         case ExportStatus::MalformedArchive: return "MalformedArchive";
         case ExportStatus::MigrationSourceVersion: return "MigrationSourceVersion";
+        case ExportStatus::ReservedMigrationPath: return "ReservedMigrationPath";
     }
     return "?";
 }
@@ -813,6 +817,21 @@ private:
 
 namespace detail {
 
+inline bool is_reserved_migration_output(const std::string& path) {
+    auto filename = std::filesystem::path(path).filename().string();
+#if defined(_WIN32)
+    // Win32 aliases can use a stream suffix, case changes, trailing dots or trailing spaces.
+    const auto stream = filename.find(':');
+    if (stream != std::string::npos) filename.resize(stream);
+    const auto last = filename.find_last_not_of(" .");
+    filename.resize(last == std::string::npos ? 0 : last + 1);
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](char ch) {
+        return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + ('a' - 'A')) : ch;
+    });
+#endif
+    return std::string_view(filename).ends_with(audit_archive::kMigrationSuffix);
+}
+
 inline ExclusiveOutputFile::OpenStatus open_archive_staging(ExclusiveOutputFile& file, const std::string& destination) {
     const auto parent = std::filesystem::path(destination).parent_path();
 #if defined(_WIN32)
@@ -881,6 +900,10 @@ inline ExportFileResult export_audit_log_file(const std::string& log_path, const
                                               const KeyRing& ring, const ExportOptions& opts = ExportOptions{}) {
     ExportFileResult result;
     try {
+        if (detail::is_reserved_migration_output(out_path)) {
+            result.status = ExportStatus::ReservedMigrationPath;
+            return result;
+        }
         switch (probe_writer_lock(log_path + ".lock")) {
             case WriterProbe::NotHeld: break;
             case WriterProbe::Held: result.status = ExportStatus::WriterLive; return result;

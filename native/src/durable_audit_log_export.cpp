@@ -79,6 +79,7 @@ void print_usage() {
         "            Its .lock/.tip/.storeid.tip siblings are derived from this path, same as the writer's own.\n"
         "            Refuses if the writer's .lock is currently held (this is an OFFLINE tool).\n"
         "--out       destination path for an NDJSON export or a raw archive.\n"
+        "            The .s7.archive suffix is reserved for --prepare-s7.\n"
         "--prepare-s7  publish the v5 source segment and migration manifest as <log>.s7.archive.\n"
         "--kek-hex   the operator-provisioned KEK, %zu hex characters. Never a file path -- this is a diagnostic\n"
         "            tool's own argument convention, not KekLoader's file-based one.\n"
@@ -201,6 +202,10 @@ int main(int argc, char** argv) {
                : v.anchor == AnchorState::AbsentAllowed ? "absent-allowed"
                : v.anchor == AnchorState::EmptyLog      ? "empty-log"
                                                         : "not-checked");
+    if (result.status == ExportStatus::ReservedMigrationPath) {
+        std::fprintf(stderr, "error: choose a different output path. .s7.archive is reserved for --prepare-s7\n");
+        return 4;
+    }
     if (result.status == ExportStatus::OutputSyncUncertain) {
         std::fprintf(stderr, "error: the complete output was published, but its directory could not be flushed\n");
         return 4;

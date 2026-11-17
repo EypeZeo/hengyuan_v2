@@ -74,6 +74,10 @@ inline ExportFileResult publish_audit_archive(const std::string& log_path, const
                                                audit_archive::Kind kind) {
     ExportFileResult result;
     try {
+        if (kind == audit_archive::Kind::Segment && is_reserved_migration_output(out_path)) {
+            result.status = ExportStatus::ReservedMigrationPath;
+            return result;
+        }
         if (created_utc_ms <= 0) {
             result.status = ExportStatus::MalformedArchive;
             return result;
