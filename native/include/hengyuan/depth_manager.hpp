@@ -6,7 +6,7 @@
 //   2. Fetch REST snapshot (GET /api/v3/depth?limit=1000)
 //   3. Drop buffered events where u <= lastUpdateId
 //   4. Verify first applied event has U <= lastUpdateId+1 <= u
-//   5. Track incrementally; on gap → re-buffer + re-snapshot
+//   5. Check each buffered and live update for continuity; on gap → re-buffer + re-snapshot
 //
 // Governance: L2 (state machine + buffer logic, no network).
 // The actual REST fetch is performed by the caller and injected via
@@ -130,9 +130,7 @@ public:
             if (final_update_id < last_applied_u_) {
                 return false;
             }
-            // Compare the distance after checking order to avoid wrapping at UINT64_MAX.
-            if (last_applied_u_ > 0 && first_update_id > last_applied_u_
-                && first_update_id - last_applied_u_ > 1) {
+            if (last_applied_u_ > 0 && has_update_gap(first_update_id, last_applied_u_)) {
                 ++stats_.gap_events;
                 ++stats_.resyncs;
                 start_buffering();
@@ -152,7 +150,7 @@ public:
 
     // Apply a REST snapshot. Call this after fetching the snapshot while in
     // Buffering state. Transitions through Syncing → Tracking.
-    // Returns true if sync succeeded (found valid continuation in buffer).
+    // Returns true if the snapshot and buffered replay can be applied.
     bool apply_snapshot(const DepthSnapshot& snap) noexcept {
         if (state_ != DepthState::Buffering) return false;
 
@@ -167,6 +165,22 @@ public:
         }
 
         ++stats_.snapshots;
+        // Check sequence continuity before installing any snapshot or buffered level.
+        std::uint64_t replay_last_u = snap.last_update_id;
+        for (std::size_t i = 0; i < buf_count_; ++i) {
+            const std::uint64_t final_update_id = buf_final_u_[i];
+            if (final_update_id <= snap.last_update_id || final_update_id < replay_last_u) {
+                ++stats_.events_dropped;
+                continue;
+            }
+            if (has_update_gap(buf_first_u_[i], replay_last_u)) {
+                ++stats_.resyncs;
+                start_buffering();
+                return false;
+            }
+            replay_last_u = final_update_id;
+        }
+
         state_ = DepthState::Syncing;
 
         // Initialize book from snapshot
@@ -174,35 +188,17 @@ public:
                              snap.bids, snap.bid_count);
         last_applied_u_ = snap.last_update_id;
 
-        // Replay buffered events:
-        //  - Drop events covered by the snapshot and events older than the last applied update
-        //  - Keep equal update IDs while replaying levels from the same update
-        //  - First valid event must have U <= lastUpdateId+1 <= u
-        bool found_first = false;
+        // Replay the validated sequence, keeping all levels that share an update ID.
         for (std::size_t i = 0; i < buf_count_; ++i) {
-            const std::uint64_t U = buf_first_u_[i];
-            const std::uint64_t u = buf_final_u_[i];
-
-            if (u <= snap.last_update_id || u < last_applied_u_) {
-                ++stats_.events_dropped;
+            const std::uint64_t final_update_id = buf_final_u_[i];
+            if (final_update_id <= snap.last_update_id || final_update_id < last_applied_u_) {
                 continue;
-            }
-
-            if (!found_first) {
-                // First event after snapshot: verify U <= lastUpdateId+1 <= u
-                if (U > snap.last_update_id + 1) {
-                    // Gap between snapshot and first buffered event → resync
-                    ++stats_.resyncs;
-                    start_buffering();
-                    return false;
-                }
-                found_first = true;
             }
 
             record_apply_result(book_.apply_delta(buf_events_[i].price_ticks,
                                                    buf_events_[i].qty_lots,
                                                    buf_events_[i].side));
-            last_applied_u_ = u;
+            last_applied_u_ = final_update_id;
             ++stats_.events_applied;
         }
 
@@ -217,6 +213,11 @@ public:
     }
 
 private:
+    static constexpr bool has_update_gap(std::uint64_t first_update_id, std::uint64_t last_update_id) noexcept {
+        // Compare the distance after checking order to avoid wrapping at UINT64_MAX.
+        return first_update_id > last_update_id && first_update_id - last_update_id > 1;
+    }
+
     // Folds OrderBook::apply_delta()'s outcome into stats_ instead of discarding it.
     // Deliberately does NOT change any control flow: OutsideWindow is the normal
     // outcome for a deep level and must never trigger a resync, and InvalidInput must

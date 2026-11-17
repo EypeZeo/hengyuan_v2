@@ -406,6 +406,40 @@ TEST(DepthFeedDriver, ABufferOverflowDuringBufferingRejectsTheSnapshotAndTellsTh
         << "a rejected apply must reach the gate's own cooldown, not an immediate retry";
 }
 
+TEST(DepthFeedDriver, ABufferedUpdateGapAfterTheFirstSnapshotContinuationRejectsAndCoolsDown) {
+    Rig rig;
+    (void)rig.tick(0);  // generation 1, Buffering, snapshot fetch starts
+    ASSERT_TRUE(WaitForCallCount(rig.fetcher, 1, std::chrono::seconds(2)));
+
+    // The snapshot at 100 can continue with update 101. Update 103 then leaves 102 missing.
+    rig.push(depth_event(101, 101));
+    rig.push(depth_event(103, 103));
+    const auto drained = rig.tick(1);
+    ASSERT_EQ(drained.events_drained, 2U);
+
+    const auto rejected_before = rig.driver.stats().snapshots_rejected;
+    rig.fetcher.unblock(snapshot(100));
+    const auto report = rig.tick_until_snapshot_collected(2);
+
+    EXPECT_TRUE(report.snapshot_applied);
+    EXPECT_FALSE(report.snapshot_apply_ok);
+    EXPECT_EQ(rig.driver.stats().snapshots_rejected, rejected_before + 1);
+    EXPECT_EQ(rig.depth_mgr->state(), DepthState::Buffering);
+    EXPECT_TRUE(rig.depth_mgr->needs_snapshot());
+    EXPECT_EQ(rig.depth_mgr->book().bid_count(), 0U);
+    EXPECT_EQ(rig.depth_mgr->book().ask_count(), 0U);
+    EXPECT_FALSE(rig.depth_mgr->book().top_of_book().has_value());
+
+    // A rejected replay must put the gate into its existing cooldown. Keep ticking long enough
+    // for an accidental immediate retry to reach the gated fetcher.
+    for (int i = 0; i < 50; ++i) {
+        (void)rig.tick(3 + i);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_EQ(rig.fetcher.call_count(), 1)
+        << "a rejected replay must reach the gate's cooldown, not an immediate retry";
+}
+
 // --- staleness (6b-0f-9) -----------------------------------------------------------------------------
 //
 // A connected feed whose depth events stop being accepted is a frozen book that still looks healthy (the WS
