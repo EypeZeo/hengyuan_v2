@@ -227,6 +227,9 @@ def page_order_ids(rows, symbol):
         value = row.get("orderId")
         if type(value) is not int or not 0 <= value <= MAX_ORDER_ID or value in ids:
             raise ReadFailure("all_orders", "invalid_page", 200)
+        placed_ms = row.get("time")
+        if type(placed_ms) is not int or not 0 <= placed_ms <= MAX_ORDER_ID:
+            raise ReadFailure("all_orders", "invalid_order_time", 200)
         ids.add(value)
     return ids
 
@@ -366,8 +369,6 @@ def recent_orders(probe, symbol):
     read_exchange_time(probe, "initial_time")
     rows = read_json(probe, "all_orders", ALL_ORDERS_PATH, {"symbol": symbol, "limit": RECENT_ORDER_LIMIT})
     page_order_ids(rows, symbol)
-    if any(type(row.get("time")) is not int or row["time"] < 0 for row in rows):
-        raise ReadFailure("all_orders", "invalid_order_time", 200)
     return sorted(rows, key=lambda row: row["time"], reverse=True)[:RECENT_ORDER_LIMIT]
 
 
