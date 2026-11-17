@@ -104,6 +104,32 @@ TEST(DepthSnapshotCodec, LevelPriceNotStringRejected) {
     EXPECT_TRUE(is_error(result, DepthSnapshotParseError::MalformedLevel));
 }
 
+TEST(DepthSnapshotCodec, InvalidRestPriceLevelsAreRejected) {
+    struct Case {
+        const char* name;
+        const char* bids;
+        const char* asks;
+    };
+    const Case cases[] = {
+        {"bid_level_has_extra_field", R"(["100","1","extra"])", R"(["101","1"])"},
+        {"ask_level_has_extra_field", R"(["100","1"])", R"(["101","1","extra"])"},
+        {"zero_bid_price", R"(["0","1"])", R"(["101","1"])"},
+        {"negative_bid_price", R"(["-1","1"])", R"(["101","1"])"},
+        {"zero_ask_price", R"(["100","1"])", R"(["0","1"])"},
+        {"negative_ask_price", R"(["100","1"])", R"(["-1","1"])"},
+        {"valid_and_invalid_bid_levels", R"(["100","1"],["0","1"])", R"(["101","1"])"},
+        {"valid_and_invalid_ask_levels", R"(["100","1"])", R"(["0","1"],["101","1"])"},
+    };
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        const std::string body = std::string(R"({"lastUpdateId":1,"bids":[)") + test_case.bids +
+                                 R"(],"asks":[)" + test_case.asks + R"(]})";
+        const auto result = parse_depth_response(body, kPriceMult, kQtyMult);
+        EXPECT_TRUE(is_error(result, DepthSnapshotParseError::MalformedLevel));
+    }
+}
+
 TEST(DepthSnapshotCodec, UnparseableDecimalRejected) {
     const char* body = R"({
         "lastUpdateId": 1,
