@@ -209,12 +209,36 @@ class CollectVisibilityTests(unittest.TestCase):
     def test_full_or_malformed_pages_are_inconclusive_not_missing(self) -> None:
         saturated = (200, [{"symbol": SYMBOL, "orderId": index} for index in range(visibility.PAGE_LIMIT)])
         cases = {
-            "full page": saturated,
-            "object instead of array": (200, {"orders": []}),
-            "invalid JSON": (200, "not-json"),
-            "invalid row": (200, [{"symbol": SYMBOL}]),
+            "full page": (saturated, "saturated_page"),
+            "object instead of array": ((200, {"orders": []}), "invalid_page"),
+            "invalid JSON": ((200, "not-json"), "invalid_page"),
+            "invalid row": ((200, [{"symbol": SYMBOL}]), "invalid_page"),
+            "missing order time": (
+                (200, [{"symbol": SYMBOL, "orderId": 42}]),
+                "invalid_order_time",
+            ),
+            "null order time": (
+                (200, [{"symbol": SYMBOL, "orderId": 42, "time": None}]),
+                "invalid_order_time",
+            ),
+            "string order time": (
+                (200, [{"symbol": SYMBOL, "orderId": 42, "time": str(ACCEPTED_MS)}]),
+                "invalid_order_time",
+            ),
+            "boolean order time": (
+                (200, [{"symbol": SYMBOL, "orderId": 42, "time": True}]),
+                "invalid_order_time",
+            ),
+            "negative order time": (
+                (200, [{"symbol": SYMBOL, "orderId": 42, "time": -1}]),
+                "invalid_order_time",
+            ),
+            "order time above signed maximum": (
+                (200, [{"symbol": SYMBOL, "orderId": 42, "time": visibility.MAX_ORDER_ID + 1}]),
+                "invalid_order_time",
+            ),
         }
-        for name, page in cases.items():
+        for name, (page, expected_reason) in cases.items():
             with self.subTest(name=name):
                 probe = _probe_for([page] * 5)
 
@@ -224,6 +248,7 @@ class CollectVisibilityTests(unittest.TestCase):
                 self.assertIsNone(report["interval_ms"])
                 self.assertGreater(report["counts"]["inconclusive"], 0)
                 self.assertEqual(report["counts"]["missing"], 0)
+                self.assertEqual(report["observations"][0]["problem"]["reason"], expected_reason)
 
     def test_time_that_moves_backward_is_not_a_valid_absence(self) -> None:
         probe = _probe_for(

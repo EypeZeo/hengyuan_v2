@@ -23,13 +23,34 @@ import json
 import os
 import re
 import sys
+from html.parser import HTMLParser
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md")
 OUT = os.path.join(ROOT, "docs", "HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.html")
 
 BASELINE_DATE = None  # Set from the roadmap metadata before rendering.
-EXTERNAL_REF = re.compile(r'(?:src|href)\s*=\s*"(?:https?:)?//', re.I)
+
+
+class _ExternalReferenceParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.references: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for name, value in attrs:
+            if name in {"src", "href", "xlink:href"} and value and value.strip().lower().startswith(
+                ("http:", "https:", "//")
+            ):
+                line, column = self.getpos()
+                self.references.append(f"{line}:{column + 1} <{tag}> {name}")
+
+
+def external_references(page: str) -> list[str]:
+    parser = _ExternalReferenceParser()
+    parser.feed(page)
+    parser.close()
+    return parser.references
 
 
 # --------------------------------------------------------------------------- #
@@ -2236,7 +2257,7 @@ def build() -> str:
 
 def main() -> int:
     html_out = build()
-    bad = EXTERNAL_REF.findall(html_out)
+    bad = external_references(html_out)
     if bad:
         print("外部引用检查失败：%s" % bad[:5])
         return 2
