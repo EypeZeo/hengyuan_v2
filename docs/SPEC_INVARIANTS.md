@@ -940,7 +940,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - 结清工具在 Windows 交互控制台显示 `Confirm>`，回显输入并支持 Backspace 删除上一字符，包括跨行退格。确认最多等待五分钟，Enter 提交后仍逐字节精确匹配当轮完整确认行。退出码 57 说明失败原因，包括输入超时、内容不符、输入结束、输入过长或读取失败。
     - Windows 控制台离线验证使用隔离控制台的输入事件和屏幕缓冲区，五项测试通过后构建 Windows EXE。MSVC Release 完整测试 3,779 项通过、1 项跳过、3 项禁用。GCC 14.2 定向测试 218 项通过。
     - 2026-11-15，Owner 在 Windows 上完成 Spot Testnet 结清演练。交易所时钟等待 271 秒，点查无此订单，订单历史与挂单查询均通过，人工确认后持久写入结清记录。复查未结清订单为零。[脱敏演练记录](NATIVE_EXIT_SAFETY_RUNBOOK.md#result-on-2026-11-15)
-    - 同日的独立 Spot Testnet 采样中，受理后的首次有效 `allOrders` 查询命中，可见时间上界为 4.088 秒。等待参数 L 为 120 秒。归档响应 `-2026` 已离线验证，真实 Testnet 样本待取得。[新订单采样记录](NATIVE_EXIT_SAFETY_RUNBOOK.md#sampling-from-order-acceptance-on-2026-11-15)
+    - 2026-11-15 和 2026-11-17 的两次独立 Spot Testnet 采样中，受理后的首次有效 `allOrders` 查询均命中，两笔订单各自的可见时间上界为 4.088 秒和 3.477 秒。等待参数 L 为 120 秒。归档响应 `-2026` 已离线验证，真实 Testnet 样本待取得。[11 月 15 日采样记录](NATIVE_EXIT_SAFETY_RUNBOOK.md#sampling-from-order-acceptance-on-2026-11-15)、[11 月 17 日采样记录](NATIVE_EXIT_SAFETY_RUNBOOK.md#sampling-from-order-acceptance-on-2026-11-17)
 
   - **[Q23 切片 S2/S3 已落地：读者先行——`OrderNeverSent` 帧与订单状态 `NeverSent`]**（`docs/NOTSENT_CLOSURE_DESIGN.md` §4.3、§4.6、§8；
     Owner 2026-11-12 看过计划说“开始，命名按你的建议”。Tier B）：PR #250 合入持久闭合帧的读取和校验（设计 §5 第 4 条）。

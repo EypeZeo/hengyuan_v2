@@ -243,6 +243,54 @@ class CollectVisibilityTests(unittest.TestCase):
         self.assertEqual(report["status"], "right_censored")
         self.assertEqual(report["interval_ms"], {"lower": report["observations"][-1]["before_ms"], "upper": None})
 
+    def test_all_orders_rows_outside_requested_time_window_are_inconclusive(self) -> None:
+        requested_start = ACCEPTED_MS - 1_000
+        requested_end = ACCEPTED_MS + 3_000
+        cases = (
+            ("target before start", ORDER_ID, requested_start - 1),
+            ("other order before start", ORDER_ID + 1, requested_start - 1),
+            ("target after end", ORDER_ID, requested_end + 1),
+            ("other order after end", ORDER_ID + 1, requested_end + 1),
+        )
+
+        for name, order_id, order_time in cases:
+            with self.subTest(name=name):
+                page = (200, [{"symbol": SYMBOL, "orderId": order_id, "time": order_time}])
+                probe = _probe_for([page], brackets=[(3_000, 4_000)])
+
+                report = _run_collection(probe, duration_seconds=0.5)
+
+                self.assertEqual(report["status"], "inconclusive")
+                self.assertIsNone(report["interval_ms"])
+                self.assertEqual(report["counts"], {"found": 0, "missing": 0, "inconclusive": 1})
+                self.assertEqual(
+                    report["observations"][0]["problem"],
+                    {
+                        "stage": "all_orders",
+                        "reason": "order_time_outside_window",
+                        "http_status": 200,
+                    },
+                )
+                all_orders_call = next(
+                    call for call in probe.calls if call.get("path") == visibility.ALL_ORDERS_PATH
+                )
+                self.assertEqual(all_orders_call["params"]["startTime"], requested_start)
+                self.assertEqual(all_orders_call["params"]["endTime"], requested_end)
+
+    def test_all_orders_rows_at_inclusive_window_bounds_are_accepted(self) -> None:
+        requested_start = ACCEPTED_MS - 1_000
+        requested_end = ACCEPTED_MS + 3_000
+
+        for name, order_time in (("start", requested_start), ("end", requested_end)):
+            with self.subTest(bound=name):
+                page = (200, [{"symbol": SYMBOL, "orderId": ORDER_ID, "time": order_time}])
+                probe = _probe_for([page], brackets=[(3_000, 4_000)])
+
+                report = _run_collection(probe, duration_seconds=0.5)
+
+                self.assertEqual(report["observations"][0]["result"], "found")
+                self.assertEqual(report["counts"], {"found": 1, "missing": 0, "inconclusive": 0})
+
     def test_a_later_miss_after_visibility_is_nonmonotonic(self) -> None:
         probe = _probe_for([_found_page(), _missing_page(), _missing_page(), _found_page()])
 
