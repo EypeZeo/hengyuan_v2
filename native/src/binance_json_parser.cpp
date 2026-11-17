@@ -7,6 +7,29 @@
 
 namespace hy {
 
+namespace {
+
+std::int64_t scale_decimal_fraction(std::int64_t fraction_digits, std::int64_t divisor,
+                                    std::int64_t multiplier) noexcept {
+    if (multiplier % divisor == 0) return fraction_digits * (multiplier / divisor);
+    if (divisor % multiplier == 0) return fraction_digits / (divisor / multiplier);
+
+    // Work from the least significant decimal digit. Splitting the multiplier
+    // by ten keeps the intermediate sum in range and the carry below multiplier.
+    const auto scale = static_cast<std::uint64_t>(multiplier);
+    const auto scale_quotient = scale / 10;
+    const auto scale_remainder = scale % 10;
+    std::uint64_t carry = 0;
+    for (; divisor > 1; divisor /= 10) {
+        const auto digit = static_cast<std::uint64_t>(fraction_digits % 10);
+        carry = scale_quotient * digit + (scale_remainder * digit + carry) / 10;
+        fraction_digits /= 10;
+    }
+    return static_cast<std::int64_t>(carry);
+}
+
+}  // namespace
+
 BinanceJsonParser::BinanceJsonParser()
     : padded_buf_(kWsReadMessageMaxBytes + simdjson::SIMDJSON_PADDING, '\0') {
     // allocate() sizes everything an on-demand parser ever needs for a document of this length (string buffer, structural
@@ -91,30 +114,14 @@ std::optional<std::int64_t> BinanceJsonParser::parse_decimal_to_fixed(
         }
     }
 
-    // result = (integer_part + frac_value/frac_divisor) * multiplier
-    // To avoid double: integer_part * multiplier + frac_value * (multiplier / frac_divisor)
     if (integer_part > std::numeric_limits<std::int64_t>::max() / multiplier)
         return std::nullopt;
-    std::int64_t int_contrib = integer_part * multiplier;
+    const std::int64_t int_contrib = integer_part * multiplier;
 
-    std::int64_t frac_contrib = 0;
-    if (frac_divisor > 0 && frac_value > 0) {
-        if (multiplier >= frac_divisor) {
-            frac_contrib = frac_value * (multiplier / frac_divisor);
-        } else {
-            frac_contrib = frac_value / (frac_divisor / multiplier);
-        }
-    }
+    const std::int64_t frac_contrib =
+        frac_value > 0 ? scale_decimal_fraction(frac_value, frac_divisor, multiplier) : 0;
 
-    // The two guards above only prove each CONTRIBUTION fits on its own; their SUM
-    // still can't. `max / multiplier` truncates, so integer_part is allowed right up
-    // to floor(max/multiplier) -- leaving max % multiplier of headroom, while
-    // frac_contrib ranges up to multiplier-1. For multiplier=1e8 (this parser's
-    // default price/qty multiplier) that headroom is 54,775,807 against a
-    // frac_contrib ceiling of 99,999,999, so "92233720368.99999999" overflows.
-    // Both operands are non-negative here (integer_part and multiplier are both
-    // positive, and frac_contrib is only assigned inside a frac_value > 0 branch),
-    // so a single subtraction-form check is sufficient and cannot itself overflow.
+    // Check the scaled fraction against the range left by the scaled integer.
     if (frac_contrib > std::numeric_limits<std::int64_t>::max() - int_contrib) {
         return std::nullopt;
     }

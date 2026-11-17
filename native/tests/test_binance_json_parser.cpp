@@ -50,6 +50,22 @@ TEST_F(BinanceJsonParserTest, ParseTrade) {
     EXPECT_EQ(evs_[0].ts_recv_ns, 99999ULL);
 }
 
+TEST_F(BinanceJsonParserTest, TradeUsesRegisteredNonPowerOfTenScales) {
+    BinanceJsonParser parser;
+    ASSERT_TRUE(parser.register_symbol("BTCUSDT", 0, 17, 3));
+
+    const char* json =
+        R"({"e":"trade","E":1700000000000,"s":"BTCUSDT","t":1,"p":"0.9","q":"0.9","m":false})";
+    BinanceMarketEvent event{};
+    std::size_t count = 0;
+
+    EXPECT_EQ(parser.parse(json, 99999, &event, 1, count), ParseResult::Ok);
+    EXPECT_EQ(count, 1u);
+    EXPECT_EQ(event.type, EventType::Trade);
+    EXPECT_EQ(event.price_ticks, 15);
+    EXPECT_EQ(event.qty_lots, 2);
+}
+
 TEST_F(BinanceJsonParserTest, ParseAggTrade) {
     const char* json = R"({
         "e": "aggTrade", "E": 1700000001000, "s": "ETHUSDT", "a": 789,
@@ -427,6 +443,38 @@ TEST(DecimalToFixed, NegativeValue) {
     auto r = BinanceJsonParser::parse_decimal_to_fixed("-1.50000000", 100'000'000);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(*r, -150000000LL);
+}
+
+TEST(DecimalToFixed, ArbitraryPositiveMultipliersTruncateTowardZero) {
+    struct Case {
+        const char* value;
+        std::int64_t multiplier;
+        std::int64_t expected;
+    };
+    const Case cases[] = {
+        {"0.9", 3, 2},
+        {"-0.9", 3, -2},
+        {"0.9", 17, 15},
+        {"0.09", 11, 0},
+        {"0.999999999999999999", std::numeric_limits<std::int64_t>::max(),
+         9'223'372'036'854'775'797LL},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.value);
+        const auto result =
+            BinanceJsonParser::parse_decimal_to_fixed(test_case.value, test_case.multiplier);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(*result, test_case.expected);
+    }
+}
+
+TEST(DecimalToFixed, NonPowerOfTenScaleInt64Boundary) {
+    const auto maximum = BinanceJsonParser::parse_decimal_to_fixed("542551296285575047.5", 17);
+    ASSERT_TRUE(maximum.has_value());
+    EXPECT_EQ(*maximum, std::numeric_limits<std::int64_t>::max());
+
+    EXPECT_FALSE(BinanceJsonParser::parse_decimal_to_fixed("542551296285575047.6", 17).has_value());
 }
 
 TEST(DecimalToFixed, SignOrDecimalPointWithoutDigitsRejected) {

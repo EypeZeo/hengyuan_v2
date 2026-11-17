@@ -45,6 +45,24 @@ TEST(DepthSnapshotCodec, ParsesValidResponse) {
     EXPECT_EQ(snap.asks[1].price_ticks, 10150000000LL);
 }
 
+TEST(DepthSnapshotCodec, ParsesCustomPositiveMultipliersWithoutIntermediateTruncation) {
+    const char* body = R"({
+        "lastUpdateId": 1,
+        "bids": [["0.8", "0.9"]],
+        "asks": [["0.9", "0.9"]]
+    })";
+    const auto result = parse_depth_response(body, /*price_multiplier=*/17, /*qty_multiplier=*/3);
+    ASSERT_TRUE(std::holds_alternative<DepthSnapshot>(result));
+
+    const auto& snap = std::get<DepthSnapshot>(result);
+    ASSERT_EQ(snap.bid_count, 1u);
+    ASSERT_EQ(snap.ask_count, 1u);
+    EXPECT_EQ(snap.bids[0].price_ticks, 13);
+    EXPECT_EQ(snap.asks[0].price_ticks, 15);
+    EXPECT_EQ(snap.bids[0].qty_lots, 2);
+    EXPECT_EQ(snap.asks[0].qty_lots, 2);
+}
+
 TEST(DepthSnapshotCodec, MissingLastUpdateIdRejected) {
     const char* body = R"({
         "bids": [["100.00000000", "1.00000000"]],
