@@ -65,6 +65,32 @@ def check_source_copy_controls() -> None:
             clean_ok)
 
 
+def check_external_reference_controls() -> None:
+    """HTML 属性中各种合法写法都要识别外部引用，正文和 data 属性不算。"""
+    clean_cases = (
+        ("站内锚点", '<a href="#section">标题</a>'),
+        ("本地资源", '<script src="/assets/app.js"></script>'),
+        ("正文中的 URL 文字", '<p>https://cdn.example.test/app.js</p>'),
+        ("data 属性中的 URL", '<div data-src="https://cdn.example.test/app.js" '
+                              'data-href="//cdn.example.test/file"></div>'),
+    )
+    clean_ok = all(not B.external_references(page) for _, page in clean_cases)
+    for label, page in clean_cases:
+        expect(f"外链检查忽略{label}", not B.external_references(page))
+
+    remote_cases = (
+        ("单引号 src", "<script src='https://cdn.example.test/app.js'></script>"),
+        ("无引号 href", "<a href=https://cdn.example.test/page>外部</a>"),
+        ("协议相对 src", "<img src=//cdn.example.test/image.png>"),
+        ("大写属性名与协议", '<A HREF="HTTPS://cdn.example.test/page">外部</A>'),
+        ("HTML 实体编码的 URL", '<a href="https&#58;&#47;&#47;cdn.example.test/page">外部</a>'),
+        ("显式 HTTPS 协议", '<a href="https:cdn.example.test/page">外部</a>'),
+        ("SVG 外部引用", '<svg><use xlink:href="https://cdn.example.test/icons.svg#mark"/></svg>'),
+    )
+    for label, page in remote_cases:
+        control(f"外链检查捕获{label}", bool(B.external_references(page)), clean_ok)
+
+
 def timeline_has_focusable_station_bar(markup: str, station_id: str) -> bool:
     bars = re.findall(r'<rect\b[^>]*class="bar(?:\s[^"]*)?"[^>]*>', markup)
     station_attr = 'data-station="%s"' % station_id
@@ -110,6 +136,9 @@ MOUNTS = ['id="q"', 'id="metro-svg"', 'id="status-note"', 'id="prog"', 'id="toto
 def main() -> int:
     print("== 原文副本检查（内存样本） ==")
     check_source_copy_controls()
+
+    print("\n== HTML 外部引用的属性写法 ==")
+    check_external_reference_controls()
 
     print("\n== 合成站点的时间轴渲染 ==")
     check_timeline_rendering()

@@ -200,15 +200,19 @@ def parse_tokens(text: str) -> list[Token]:
 
 
 KEY_RE = re.compile(r"^([a-z][a-z0-9_.]*):\s?(.*)$")
+REPEATABLE_FIELDS = frozenset({"bkl", "legacy", "open", "refs"})
 
 
 def parse_ledger(text: str) -> tuple[dict[str, str], list[Item]]:
     """Return (front matter, items). Items are the ```ledger fenced blocks, in file order."""
     front: dict[str, str] = {}
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), start=1):
         m = re.match(r"^<!--\s*ledger-meta\s+([a-z_]+)=(.*?)\s*-->\s*$", line)
         if m:
-            front[m.group(1)] = m.group(2)
+            key, value = m.groups()
+            if key in front:
+                raise LedgerFormatError(f"line {lineno}: duplicate ledger metadata {key!r}")
+            front[key] = value
     items: list[Item] = []
     lines = text.splitlines()
     i = 0
@@ -247,6 +251,8 @@ def _parse_block(block: list[str], first_line: int) -> Item:
                 raise LedgerFormatError(f"line {first_line + offset}: duplicate segment {name!r}")
             segments[name] = _parse_segment(value, first_line + offset)
             continue
+        if key in fields and key not in REPEATABLE_FIELDS:
+            raise LedgerFormatError(f"line {first_line + offset}: duplicate field {key!r}")
         fields.setdefault(key, []).append(value)
         if key in ("open", "refs"):
             tokens.extend(parse_tokens(value))
@@ -1513,6 +1519,16 @@ def self_test(ledger_path: Path) -> int:
     for name, mutate, fragment in (
         ("语法: 未知的判定词", lambda s: s.replace("seg.code: PRESENT", "seg.code: MAYBE", 1), "bad verdict"),
         (
+            "语法: 重复的 status 字段",
+            lambda s: "```ledger\nid: FI-001\nstatus: PARTIAL\nstatus: IMPLEMENTED\n```\n" + s,
+            "duplicate field",
+        ),
+        (
+            "语法: adjudicated 元数据重复且冲突",
+            lambda s: "<!-- ledger-meta adjudicated=2099-01-01 -->\n" + s,
+            "duplicate ledger metadata",
+        ),
+        (
             "语法: 重复的段",
             lambda s: s.replace("seg.budget: NA", "seg.code: NA\nseg.budget: NA", 1),
             "duplicate segment",
@@ -1530,6 +1546,16 @@ def self_test(ledger_path: Path) -> int:
             verdict(name, False, "没有报错")
         except LedgerFormatError as exc:
             verdict(name, fragment in str(exc), str(exc)[:60])
+
+    first_ref = "doc:README.md#HengYuan"
+    second_ref = "code:tools/closure_ledger_check.py#parse_ledger"
+    _, split_items = parse_ledger(f"```ledger\nid: FI-001\nrefs: {first_ref}\nrefs: {second_ref}\n```")
+    expected_refs = [first_ref, second_ref]
+    verdict(
+        "语法: 多行 refs 列表保留字段与引用",
+        split_items[0].fields["refs"] == expected_refs
+        and [token.raw for token in split_items[0].tokens] == expected_refs,
+    )
 
     print()
     print(f"{total - len(failures)}/{total} 个对照有效。")

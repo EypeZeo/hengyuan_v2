@@ -192,7 +192,7 @@ def main() -> int:
           == page[page.find("<style>"):page.find("</style>")].count("}"))
 
     # ---- B 离线 ----
-    ext = re.findall(r'(?:src|href)\s*=\s*"(?:https?:)?//', page, re.I)
+    ext = B.external_references(page)
     check("B1 无外部引用", not ext, str(ext[:3]))
     check("B2 无 import/外链样式", "@import" not in page and "<link" not in page)
 
