@@ -703,7 +703,14 @@ TEST_F(NeverSentReaderTest, TheVerifierReadsAClosureLogAndReportsVersion6) {
     ASSERT_TRUE(v.ok()) << export_status_name(v.status);
     EXPECT_EQ(v.frames, frames.size());
     EXPECT_EQ(v.max_frame_version, 6u);
-    EXPECT_NE(audit_export_manifest_line(v).find("\"frame_format_version\":6,"), std::string::npos);
+    ASSERT_TRUE(v.first_v6_sequence.has_value());
+    EXPECT_EQ(v.first_v6_sequence.value(), 2u);
+    ASSERT_TRUE(v.tip_anchor_sequence.has_value());
+    EXPECT_EQ(v.tip_anchor_sequence.value(), 4u);
+    const std::string manifest = audit_export_manifest_line(v);
+    EXPECT_NE(manifest.find("\"frame_format_version\":6,"), std::string::npos);
+    EXPECT_NE(manifest.find("\"first_v6_seq\":2"), std::string::npos);
+    EXPECT_NE(manifest.find("\"tip_anchor_seq\":4"), std::string::npos);
 }
 
 TEST_F(NeverSentReaderTest, TheVerifierRefusesTheClosureInAV5Frame) {

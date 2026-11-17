@@ -678,6 +678,135 @@ TEST(DurableAuditExport, AMissingAnchorRefusesByDefaultAndExportsWhenExplicitlyA
     EXPECT_TRUE(contains(manifest, "\"tip_anchor\":\"absent-allowed\""));
 }
 
+// --- archive source completeness ---------------------------------------------------------------------------------------
+
+TEST(DurableAuditExport, CompleteArchiveSourceExportsWithBoundaryManifestFields) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+
+    KeyRing reader_ring(std::span<const std::byte, kKekSize>(fx.kek.data(), fx.kek.size()));
+    WrappedKeyRecord rec{};
+    const std::array<std::byte, 32> plaintext = SinkFixture::make_key_bytes(1);
+    ASSERT_EQ(reader_ring.add_key(1, std::span<const std::byte>(plaintext.data(), plaintext.size()), rec),
+              KeyRingAddStatus::Ok);
+
+    ExportOptions opts;
+    opts.require_complete_source = true;
+    const ExportFileResult r = export_audit_log_file(fx.path, fx.out_path(), reader_ring, opts);
+    ASSERT_EQ(r.status, ExportStatus::Ok) << export_status_name(r.status);
+    EXPECT_EQ(r.verification.frames, 1U);
+    EXPECT_FALSE(r.verification.first_v6_sequence.has_value());
+    ASSERT_TRUE(r.verification.tip_anchor_sequence.has_value());
+    EXPECT_EQ(r.verification.tip_anchor_sequence.value(), 0U);
+
+    const std::string manifest = split_lines(read_whole(fx.out_path()))[0];
+    EXPECT_TRUE(contains(manifest, "\"first_v6_seq\":null"));
+    EXPECT_TRUE(contains(manifest, "\"tip_anchor_seq\":0"));
+}
+
+TEST(DurableAuditExport, StrictArchiveSourceRefusesAnEmptyLogAndDefaultExportStillAllowsIt) {
+    SinkFixture fx;
+    fx.close_writer();
+
+    KeyRing reader_ring(std::span<const std::byte, kKekSize>(fx.kek.data(), fx.kek.size()));
+    WrappedKeyRecord rec{};
+    const std::array<std::byte, 32> plaintext = SinkFixture::make_key_bytes(1);
+    ASSERT_EQ(reader_ring.add_key(1, std::span<const std::byte>(plaintext.data(), plaintext.size()), rec),
+              KeyRingAddStatus::Ok);
+
+    ExportOptions strict;
+    strict.require_complete_source = true;
+    const ExportFileResult refused = export_audit_log_file(fx.path, fx.out_path(), reader_ring, strict);
+    EXPECT_EQ(refused.status, ExportStatus::ArchiveSourceIncomplete);
+    EXPECT_FALSE(std::filesystem::exists(fx.out_path()));
+
+    const ExportFileResult compatible = export_audit_log_file(fx.path, fx.out_path(), reader_ring);
+    EXPECT_EQ(compatible.status, ExportStatus::Ok) << export_status_name(compatible.status);
+    EXPECT_EQ(compatible.verification.anchor, AnchorState::EmptyLog);
+}
+
+TEST(DurableAuditExport, StrictArchiveSourceRefusesATornTailAndDefaultExportStillAllowsIt) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    std::vector<std::byte> log = read_whole(fx.path);
+    ASSERT_FALSE(log.empty());
+    log.insert(log.end(), {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}});
+    write_whole(fx.path, log);
+
+    KeyRing reader_ring(std::span<const std::byte, kKekSize>(fx.kek.data(), fx.kek.size()));
+    WrappedKeyRecord rec{};
+    const std::array<std::byte, 32> plaintext = SinkFixture::make_key_bytes(1);
+    ASSERT_EQ(reader_ring.add_key(1, std::span<const std::byte>(plaintext.data(), plaintext.size()), rec),
+              KeyRingAddStatus::Ok);
+
+    ExportOptions strict;
+    strict.require_complete_source = true;
+    const ExportFileResult refused = export_audit_log_file(fx.path, fx.out_path(), reader_ring, strict);
+    EXPECT_EQ(refused.status, ExportStatus::ArchiveSourceIncomplete);
+    EXPECT_FALSE(std::filesystem::exists(fx.out_path()));
+
+    const ExportFileResult compatible = export_audit_log_file(fx.path, fx.out_path(), reader_ring);
+    ASSERT_EQ(compatible.status, ExportStatus::Ok) << export_status_name(compatible.status);
+    EXPECT_EQ(compatible.verification.torn_tail_bytes, 4U);
+}
+
+TEST(DurableAuditExport, StrictArchiveSourceRefusesAStaleAnchorAndDefaultExportStillAllowsIt) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    const std::vector<std::byte> stale_anchor = read_whole(fx.path + ".tip");
+    ASSERT_FALSE(stale_anchor.empty());
+
+    fx.sink = std::make_unique<DurableAuditSink>(fx.path, *fx.ring, 1);
+    ASSERT_TRUE(fx.sink->is_open());
+    fx.append_intent(1001, "COID-0000000000000002");
+    fx.close_writer();
+    write_whole(fx.path + ".tip", stale_anchor);
+
+    KeyRing reader_ring(std::span<const std::byte, kKekSize>(fx.kek.data(), fx.kek.size()));
+    WrappedKeyRecord rec{};
+    const std::array<std::byte, 32> plaintext = SinkFixture::make_key_bytes(1);
+    ASSERT_EQ(reader_ring.add_key(1, std::span<const std::byte>(plaintext.data(), plaintext.size()), rec),
+              KeyRingAddStatus::Ok);
+
+    ExportOptions strict;
+    strict.require_complete_source = true;
+    const ExportFileResult refused = export_audit_log_file(fx.path, fx.out_path(), reader_ring, strict);
+    EXPECT_EQ(refused.status, ExportStatus::ArchiveSourceIncomplete);
+    EXPECT_FALSE(std::filesystem::exists(fx.out_path()));
+
+    const ExportFileResult compatible = export_audit_log_file(fx.path, fx.out_path(), reader_ring);
+    ASSERT_EQ(compatible.status, ExportStatus::Ok) << export_status_name(compatible.status);
+    ASSERT_TRUE(compatible.verification.tip_anchor_sequence.has_value());
+    EXPECT_EQ(compatible.verification.tip_anchor_sequence.value(), 0U);
+    EXPECT_EQ(compatible.verification.frames, 2U);
+}
+
+TEST(DurableAuditExport, StrictArchiveSourceRequiresTheStoreIdentitySidecar) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    ASSERT_TRUE(std::filesystem::remove(fx.path + ".storeid.tip"));
+
+    KeyRing reader_ring(std::span<const std::byte, kKekSize>(fx.kek.data(), fx.kek.size()));
+    WrappedKeyRecord rec{};
+    const std::array<std::byte, 32> plaintext = SinkFixture::make_key_bytes(1);
+    ASSERT_EQ(reader_ring.add_key(1, std::span<const std::byte>(plaintext.data(), plaintext.size()), rec),
+              KeyRingAddStatus::Ok);
+
+    ExportOptions strict;
+    strict.require_complete_source = true;
+    const ExportFileResult refused = export_audit_log_file(fx.path, fx.out_path(), reader_ring, strict);
+    EXPECT_EQ(refused.status, ExportStatus::ArchiveIdentityMissing);
+    EXPECT_FALSE(std::filesystem::exists(fx.out_path()));
+
+    const ExportFileResult compatible = export_audit_log_file(fx.path, fx.out_path(), reader_ring);
+    EXPECT_EQ(compatible.status, ExportStatus::Ok) << export_status_name(compatible.status);
+    EXPECT_EQ(compatible.verification.identity, IdentityState::Absent);
+}
+
 TEST(DurableAuditExport, AnAnchorAheadOfTheLogIsRollbackAndRefused) {
     SinkFixture fx;
     fx.append_intent(1000, "COID-0000000000000001");
@@ -893,6 +1022,62 @@ TEST(DurableAuditExport, ExclusiveOutputFileRefusesWriteAndCommitBeforeACreateOr
     const std::vector<std::byte> bytes = read_whole(path);
     EXPECT_EQ(bytes.size(), 0U) << "the refused write() must not have reached the file";
     std::remove(path.c_str());
+}
+
+TEST(DurableAuditExport, ArchiveStagingPublishesTheCompleteFileOnlyAtTheFinalPath) {
+    const std::string final_path = scratch_prefix() + ".archive";
+    std::remove(final_path.c_str());
+    {
+        ExclusiveOutputFile staging;
+        ASSERT_EQ(detail::open_archive_staging(staging, final_path), ExclusiveOutputFile::OpenStatus::Ok);
+        ASSERT_TRUE(staging.write("complete archive\n"));
+        EXPECT_FALSE(std::filesystem::exists(final_path));
+        ASSERT_EQ(staging.publish_as(final_path), ExportStatus::Ok);
+    }
+    ASSERT_TRUE(std::filesystem::exists(final_path));
+    const std::vector<std::byte> published = read_whole(final_path);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(published.data()), published.size()), "complete archive\n");
+    std::remove(final_path.c_str());
+}
+
+TEST(DurableAuditExport, ArchiveStagingPreservesACompetingFinalFile) {
+    const std::string final_path = scratch_prefix() + ".archive";
+    std::remove(final_path.c_str());
+    {
+        ExclusiveOutputFile staging;
+        ASSERT_EQ(detail::open_archive_staging(staging, final_path), ExclusiveOutputFile::OpenStatus::Ok);
+        ASSERT_TRUE(staging.write("staged archive\n"));
+        {
+            std::ofstream competing(final_path, std::ios::binary | std::ios::trunc);
+            ASSERT_TRUE(competing.is_open());
+            competing << "competing writer\n";
+        }
+        EXPECT_EQ(staging.publish_as(final_path), ExportStatus::OutputExists);
+    }
+    const std::vector<std::byte> preserved = read_whole(final_path);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(preserved.data()), preserved.size()), "competing writer\n");
+    std::remove(final_path.c_str());
+}
+
+TEST(DurableAuditExport, AbandonedArchiveStagingLeavesNoFinalAndAllowsRetry) {
+    const std::string final_path = scratch_prefix() + ".archive";
+    std::remove(final_path.c_str());
+    {
+        ExclusiveOutputFile staging;
+        ASSERT_EQ(detail::open_archive_staging(staging, final_path), ExclusiveOutputFile::OpenStatus::Ok);
+        ASSERT_TRUE(staging.write("partial archive\n"));
+    }
+    EXPECT_FALSE(std::filesystem::exists(final_path));
+    {
+        ExclusiveOutputFile retry;
+        ASSERT_EQ(detail::open_archive_staging(retry, final_path), ExclusiveOutputFile::OpenStatus::Ok);
+        ASSERT_TRUE(retry.write("retry archive\n"));
+        ASSERT_EQ(retry.publish_as(final_path), ExportStatus::Ok);
+    }
+    EXPECT_TRUE(std::filesystem::exists(final_path));
+    const std::vector<std::byte> published = read_whole(final_path);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(published.data()), published.size()), "retry archive\n");
+    std::remove(final_path.c_str());
 }
 
 // --- JSON string encoding ------------------------------------------------------------------------------------------

@@ -17,8 +17,8 @@
 //      refuses every edge out of EscalatedToOperator is a behaviour, pinned in test_order_lifecycle.cpp.)
 //   4. The sink's write version is assigned exactly once, by its recovery scan, and the only production call of
 //      encode_order_event_frame() passes it as the version. So no code path writes the first v6 frame of a store.
-//   5. Format version 6 is named only by the codec and the sink; every control-plane record is still written and
-//      read at kFrameFormatVersion (5).
+//   5. Format version 6 is named only by the codec, the sink and the read-only audit export verifier; every control-plane
+//      record is still written and read at kFrameFormatVersion (5).
 //
 // The scan strips comments and the contents of string/char literals first, so prose that mentions a name does not
 // count and a string that contains one cannot hide a real use. (The helpers are copies of the ones in
@@ -172,6 +172,7 @@ const std::vector<SourceFile>& production_sources() {
 
 constexpr const char* kCodec = "include/hengyuan/durable_frame_codec.hpp";
 constexpr const char* kSink = "include/hengyuan/durable_audit_sink.hpp";
+constexpr const char* kExport = "include/hengyuan/durable_audit_export.hpp";
 constexpr const char* kTrail = "include/hengyuan/audit_trail.hpp";
 constexpr const char* kLifecycle = "include/hengyuan/order_lifecycle.hpp";
 constexpr const char* kFrame = "include/hengyuan/operator_resolution_frame.hpp";
@@ -470,15 +471,24 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAnd
     EXPECT_EQ(count_identifier(function_body(sink->code, "append_durable"), "write_version_"), 1u);
 }
 
-TEST(OperatorResolutionGuard, FormatVersionSixIsNamedOnlyByTheCodecAndTheSink) {
+TEST(OperatorResolutionGuard, FormatVersionSixIsNamedOnlyByCodecSinkAndReadOnlyExport) {
+    const SourceFile* export_header = find_source(kExport);
+    ASSERT_NE(export_header, nullptr) << "the read-only audit export header must be present";
+    const std::string verify_body = function_body(export_header->code, "verify_audit_log");
+    ASSERT_FALSE(verify_body.empty()) << "the permitted export use must be inside verify_audit_log()";
+    EXPECT_EQ(count_identifier(verify_body, "kFrameFormatVersionV6"), 1u)
+        << "verify_audit_log() may name v6 once to report the first v6 sequence";
+    EXPECT_EQ(count_identifier(export_header->code, "kFrameFormatVersionV6"), 1u)
+        << "the export header may not name v6 outside verify_audit_log()";
+
     std::vector<std::string> problems;
     for (const SourceFile& f : production_sources()) {
         if (count_identifier(f.code, "kFrameFormatVersionV6") == 0) continue;
-        if (f.rel != kCodec && f.rel != kSink) problems.push_back(f.rel);
+        if (f.rel != kCodec && f.rel != kSink && f.rel != kExport) problems.push_back(f.rel);
     }
     for (const std::string& f : problems) {
-        ADD_FAILURE() << f << " names kFrameFormatVersionV6 -- only the codec (which reads it) and the sink (which "
-                              "adopts it from the store's tip) may in R1; the tool of slice R3 is added with its file";
+        ADD_FAILURE() << f << " names kFrameFormatVersionV6 -- only the codec, the sink, and the read-only audit export "
+                              "verifier may name it";
     }
     // ...and the control-plane records stay at 5: they are written and read strictly against kFrameFormatVersion.
     bool saw_control_plane = false;
