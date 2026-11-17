@@ -64,9 +64,9 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 ### 1.3 Fault 段的分级（待 Owner 确认的解释）
 
-`4.1.2` 写“Fault 段指该缺陷对应的故障注入用例编号及其执行结果”，而注册表 45 条里没有一条已通过，较早关闭的缺陷（SUPP 类）也不对应任何 FI 编号。本文件的做法：
+`4.1.2` 要求 Fault 段记录故障注入用例及其执行结果。较早关闭的 SUPP 缺陷没有对应的 FI 编号，因此这里使用以下两种分级。
 
-- `PRESENT:FI`——引用 FI 编号且该用例已通过。目前没有任何项能达到这一级。
+- `PRESENT:FI` 要求所引用的每条 FI 用例均为 `IMPLEMENTED`，且 `result` 和 `gate_result` 均为 `PASS`。每条用例须包含格式有效的 `run:` 引用。CI 运行的实际结果由 `--online` 检查。
 - `PRESENT:UT`——没有 FI 编号可引时，引用一个**命名的 L0 负向测试**，它把缺陷条件注入进去并断言被拒；本仓库自己的 FI 用例也把 L0 单元测试当证据产物（FI-032、FI-037）。
 - 这是对 `4.1.2` 的一个解释，不是修改；它由 Owner 在合并本 PR 时确认。若要求只认 FI 编号，用 `--strict-fault` 运行核对工具，会列出全部依赖 `UT` 级证据的项，这些项随之降为 `PARTIAL`。
 
@@ -80,7 +80,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 字段 | 取值与规则 |
 | :--- | :--- |
-| `status` | 沿用蓝图第 7 卷的词：`NOT_TESTABLE_YET`（还没有可执行的注入手段或被测实现）、`PARTIAL`（至少有一个单测直接断言了该用例的一部分不变量）。再加 `IMPLEMENTED`：实装路径存在、级别满足并取得成功运行证据；目前没有任何一条 |
+| `status` | `NOT_TESTABLE_YET` 表示缺少可执行的注入手段或被测实现。`PARTIAL` 表示至少有一项单测直接验证了用例的一部分不变量。`IMPLEMENTED` 表示被测路径已实现，验证级别满足要求并有成功运行记录。 |
 | `result` | `NOT_RUN`、`PASS`、`FAIL`；`PASS` 只允许配 `IMPLEMENTED` |
 | `gate_result` | `PASS` 当且仅当 `status` 为 `IMPLEMENTED`、`result` 为 `PASS` 且引用了真实成功的 `run:`；其余一律 `BLOCKED`（`7.1`：`PARTIAL`、缺失或未执行直接阻塞） |
 | `open` | 未 `IMPLEMENTED` 的用例必须带至少一个可失败的“尚未”断言（`open:`、`absent:`、`nofile:`、`countN:`），实现落地的那天它会失败，迫使状态前移 |
@@ -93,6 +93,8 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 引用以 `种类:路径#内容` 书写，由工具逐条解析。符号引用按整词匹配，`A::B` 要求 B 出现在 A 之后；带引号的内容按字面匹配。
 
+`open` 字段记录尚未完成的条件。`absent:`、`nofile:` 和 `countN:` 用于核对已实现的行为时，写在 `refs` 或对应的 `seg.*` 中。
+
 | 引用 | 含义 | 核对 |
 | :--- | :--- | :--- |
 | `code:` `test:` | 现行代码符号、测试用例 | 文件存在，符号存在 |
@@ -103,7 +105,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | `doc:` `bp:` `frozen:` | 规格文字、蓝图文字、冻结原文（v2.5.6）里的旧标识 | 文字存在 |
 | `ignored:` | `.gitignore` 必须忽略的路径 | `git check-ignore` |
 | `pr:N@SHA` | 已合并 PR 及其合并提交前缀 | 合并提交在 `HEAD` 历史中；`--online` 再查 GitHub 的合并状态与提交前缀 |
-| `run:ID@SHA/文件[作业]` | CI run、被测提交、workflow 文件与可选作业名 | `--online`：必须 `completed` 且 `success`，提交与 workflow 相符；被取消、失败、未结束的 run 一律不是证据 |
+| `run:ID@SHA/文件[作业]` | CI run、被测提交、workflow 文件与可选作业名 | 离线检查引用格式。`--online` 还检查运行是否完成并成功，以及提交、workflow 和所指定的作业是否相符。 |
 | `fi:FI-nnn=状态` | 故障用例及其在蓝图注册表中的状态 | 必须与蓝图第 7 卷一致 |
 | `log:` | 真实运行日志文件 | 文件存在 |
 
