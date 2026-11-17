@@ -94,10 +94,7 @@ def response_json(stage, http_status, body):
         raise ReadFailure(stage, "transport_error")
     if http_status in BACKOFF_STATUSES:
         raise ReadFailure(stage, "backoff", http_status)
-    try:
-        document = r6.parse_json(body) if isinstance(body, str) else None
-    except RecursionError:
-        document = None
+    document = r6.parse_json(body) if isinstance(body, str) else None
     if http_status != 200:
         code = document.get("code") if isinstance(document, dict) else None
         if type(code) is not int or not -99_999 <= code < 0:

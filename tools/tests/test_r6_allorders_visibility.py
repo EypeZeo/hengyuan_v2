@@ -284,6 +284,14 @@ class CollectVisibilityTests(unittest.TestCase):
                 (200, [{"symbol": SYMBOL, "orderId": 42, "time": visibility.MAX_ORDER_ID + 1}]),
                 "invalid_order_time",
             ),
+            "duplicate orderId field": (
+                (200, f'[{{"symbol":"{SYMBOL}","orderId":42,"orderId":{ORDER_ID},"time":{ACCEPTED_MS}}}]'),
+                "invalid_page",
+            ),
+            "non-finite optional field": (
+                (200, f'[{{"symbol":"{SYMBOL}","orderId":42,"time":{ACCEPTED_MS},"executedQty":NaN}}]'),
+                "invalid_page",
+            ),
         }
         for name, (page, expected_reason) in cases.items():
             with self.subTest(name=name):
@@ -294,8 +302,10 @@ class CollectVisibilityTests(unittest.TestCase):
                 self.assertEqual(report["status"], "inconclusive")
                 self.assertIsNone(report["interval_ms"])
                 self.assertGreater(report["counts"]["inconclusive"], 0)
+                self.assertEqual(report["counts"]["found"], 0)
                 self.assertEqual(report["counts"]["missing"], 0)
                 self.assertEqual(report["observations"][0]["problem"]["reason"], expected_reason)
+                self.assertTrue(all(item["result"] == "inconclusive" for item in report["observations"]))
 
     def test_time_that_moves_backward_is_not_a_valid_absence(self) -> None:
         probe = _probe_for(
@@ -352,6 +362,24 @@ class CollectVisibilityTests(unittest.TestCase):
         forbidden_keys = {"orderid", "clientorderid", "request", "params", "url", "signature", "body"}
         self.assertTrue(forbidden_keys.isdisjoint({key.casefold() for key in _all_dict_keys(report)}))
         self.assertNotIn("/api/v3/", serialized)
+
+
+class StrictJsonDecodeTests(unittest.TestCase):
+    def test_parse_json_rejects_nested_duplicate_keys(self) -> None:
+        self.assertIsNone(visibility.r6.parse_json('{"outer":{"value":1,"value":2}}'))
+
+    def test_parse_json_rejects_nonfinite_constants(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                self.assertIsNone(visibility.r6.parse_json(f'{{"value":{value}}}'))
+
+    def test_parse_json_catches_recursion_error(self) -> None:
+        with mock.patch.object(visibility.r6.json, "loads", side_effect=RecursionError):
+            self.assertIsNone(visibility.r6.parse_json("{}"))
+
+    def test_parse_json_accepts_same_key_in_different_objects(self) -> None:
+        document = visibility.r6.parse_json('{"left":{"id":1},"right":{"id":2}}')
+        self.assertEqual(document, {"left": {"id": 1}, "right": {"id": 2}})
 
 
 def _all_dict_keys(value: object):

@@ -83,10 +83,25 @@ def http_get(path_and_query, headers, timeout):
         return None, detail
 
 
+def _unique_json_object(pairs):
+    document = {}
+    for name, value in pairs:
+        if name in document:
+            raise ValueError("Duplicate JSON object member")
+        document[name] = value
+    return document
+
+
+def _reject_json_constant(_value):
+    raise ValueError("Non-standard JSON constant")
+
+
 def parse_json(text):
     try:
-        return json.loads(text)
-    except ValueError:
+        return json.loads(
+            text, object_pairs_hook=_unique_json_object, parse_constant=_reject_json_constant,
+        )
+    except (ValueError, RecursionError):
         return None
 
 

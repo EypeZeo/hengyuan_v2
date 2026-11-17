@@ -259,6 +259,28 @@ class SubmitTestnetOrderTests(unittest.TestCase):
         )
         self.assertEqual(sleeps, [])
 
+    def test_duplicate_code_fields_in_http_400_trigger_read_only_recovery(self) -> None:
+        duplicate_code_body = '{"code":-1007,"code":-1013,"msg":"execution status unknown"}'
+        read_probe, trade_probe = _ready_probes(
+            submit_response=(400, duplicate_code_body),
+            order_responses=[_lookup_response(200, _recovered_order)],
+        )
+
+        order_id, accepted_ms = _submit(read_probe, trade_probe)
+
+        self.assertEqual((order_id, accepted_ms), (LOOKUP_ORDER_ID, LOOKUP_MS))
+        self.assertEqual(len(trade_probe.signed_once_calls), 1)
+        submit_params = trade_probe.signed_once_calls[0]["params"]
+        self.assertIsInstance(submit_params, dict)
+        client_order_id = submit_params["newClientOrderId"]
+        lookup_calls = [call for call in read_probe.calls if call.get("path") == visibility.ORDER_PATH]
+        self.assertEqual(len(lookup_calls), 1)
+        self.assertEqual(
+            lookup_calls[0]["params"],
+            {"symbol": SYMBOL, "origClientOrderId": client_order_id},
+        )
+        self.assertEqual(trade_probe.signed_once_calls[0]["path"], visibility.ORDER_PATH)
+
     def test_transport_timeout_and_unclear_ack_also_use_bounded_lookup(self) -> None:
         ambiguous_acks = (
             (None, None),
