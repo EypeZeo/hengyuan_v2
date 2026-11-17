@@ -36,8 +36,7 @@ namespace hy {
 
 enum class DepthSnapshotParseError {
     InvalidLastUpdateId,  // missing, wrong type, or == 0
-    MalformedLevel,       // a level isn't a valid [price_string, qty_string] pair, or either
-                           // string fails to parse as a decimal
+    MalformedLevel,       // invalid [price_string, qty_string] pair or non-positive price
     NonPositiveQty,        // qty <= 0
     TooManyLevels,         // more levels than DepthSnapshot's fixed 1024-per-side capacity
     OrderingViolation,     // bids not strictly descending, asks not strictly ascending, or
@@ -80,10 +79,15 @@ inline bool parse_side(simdjson::ondemand::array& levels, PriceLevel* out, std::
             err = DepthSnapshotParseError::MalformedLevel;
             return false;
         }
+        ++it;
+        if (it != pair.end()) {
+            err = DepthSnapshotParseError::MalformedLevel;
+            return false;
+        }
 
         auto price = BinanceJsonParser::parse_decimal_to_fixed(price_str, price_multiplier);
         auto qty = BinanceJsonParser::parse_decimal_to_fixed(qty_str, qty_multiplier);
-        if (!price || !qty) {
+        if (!price || !qty || *price <= 0) {
             err = DepthSnapshotParseError::MalformedLevel;
             return false;
         }

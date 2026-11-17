@@ -173,8 +173,7 @@ TEST(BinanceJsonParserAllocation, EveryOutcomeAllocatesNothingAtAnySize) {
     const std::string dense_levels =
         repeated_to(R"({"e":"depthUpdate","E":1,"s":"BTCUSDT","U":1,"u":2,"b":[)", R"(["50000.0","1.0"],)", R"(["50000.0","1.0"])",
                     R"(],"a":[["60000.0","1.0"]]})", kLimit);
-    // The longest tape: an array of 2 M numbers -- no level is an array, so nothing is produced (MalformedJson) but every structural
-    // character of the 4 MiB is indexed and visited.
+    // A 4 MiB array of numbers exercises indexing at the frame limit. Its first level is malformed.
     const std::string dense_numbers =
         repeated_to(R"({"e":"depthUpdate","E":1,"s":"BTCUSDT","U":1,"u":2,"b":[)", "1,", "1", R"(],"a":[]})", kLimit);
     // The symbol is a ~4 MiB string, unescaped into simdjson's string buffer in full, and matches nothing.
