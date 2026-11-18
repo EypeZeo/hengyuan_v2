@@ -408,10 +408,18 @@ class ExposureRiskPair:
 
 
 @dataclass(frozen=True, slots=True)
+class ExposureNavPair:
+    candidate: str
+    trend: tuple[DailyNav, ...]
+    reference: tuple[DailyNav, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ExposureEvaluation:
     baseline: TrialOutcome
     pairs: tuple[ExposurePair, ...]
     risk_diagnostics: tuple[ExposureRiskPair, ...] = ()
+    daily_nav: tuple[ExposureNavPair, ...] = ()
 
 
 def _exposure(outcome: TrialOutcome) -> Decimal:
@@ -470,6 +478,7 @@ def evaluate_exposure_allocations(
     contributions: Sequence[CashContribution],
     *,
     include_risk_diagnostics: bool = False,
+    include_daily_nav: bool = False,
 ) -> ExposureEvaluation:
     """Compare frozen allocations on a later account history with shared funding."""
     market, schedule = tuple(bars), tuple(contributions)
@@ -478,34 +487,47 @@ def evaluate_exposure_allocations(
     if market[0].open_time_utc < fit.ends_at_utc:
         raise ValueError("evaluation must start at or after the calibration window closes")
     funding = {item.open_time_utc: item.amount_cny for item in schedule}
-    baseline_points: list[DailyNav] | None = [] if include_risk_diagnostics else None
+    collect_nav = include_risk_diagnostics or include_daily_nav
+    baseline_points: list[DailyNav] | None = [] if collect_nav else None
     baseline = _exposure_reference(
         execution.strategy_allocation, market, funding, execution, daily_nav_points=baseline_points
     )
     windows = dict(_TREND_TRIALS)
     references = {execution.strategy_allocation: baseline}
     reference_risks: dict[Decimal, DailyRisk] = {}
+    reference_nav: dict[Decimal, tuple[DailyNav, ...]] = {}
     if baseline_points is not None:
-        reference_risks[execution.strategy_allocation] = summarize_daily_risk(baseline_points)
+        if include_risk_diagnostics:
+            reference_risks[execution.strategy_allocation] = summarize_daily_risk(baseline_points)
+        if include_daily_nav:
+            reference_nav[execution.strategy_allocation] = tuple(baseline_points)
     pairs = []
     risk_pairs = []
+    nav_pairs = []
     for selection in fit.selections:
-        trend_points: list[DailyNav] | None = [] if include_risk_diagnostics else None
+        trend_points: list[DailyNav] | None = [] if collect_nav else None
         trend = _replay_trial(
             selection.candidate, windows[selection.candidate], market, funding, execution,
             measure_exposure=True, daily_nav_points=trend_points,
         )
         if selection.allocation not in references:
-            reference_points: list[DailyNav] | None = [] if include_risk_diagnostics else None
+            reference_points: list[DailyNav] | None = [] if collect_nav else None
             references[selection.allocation] = _exposure_reference(
                 selection.allocation, market, funding, execution, daily_nav_points=reference_points
             )
             if reference_points is not None:
-                reference_risks[selection.allocation] = summarize_daily_risk(reference_points)
+                if include_risk_diagnostics:
+                    reference_risks[selection.allocation] = summarize_daily_risk(reference_points)
+                if include_daily_nav:
+                    reference_nav[selection.allocation] = tuple(reference_points)
         reference = references[selection.allocation]
-        if trend_points is not None:
+        if include_risk_diagnostics and trend_points is not None:
             risk_pairs.append(ExposureRiskPair(
                 selection.candidate, summarize_daily_risk(trend_points), reference_risks[selection.allocation]
+            ))
+        if include_daily_nav and trend_points is not None:
+            nav_pairs.append(ExposureNavPair(
+                selection.candidate, tuple(trend_points), reference_nav[selection.allocation]
             ))
         exposure_gap = abs(_exposure(trend) - _exposure(reference))
         baseline_gap = abs(_exposure(trend) - _exposure(baseline))
@@ -520,4 +542,4 @@ def evaluate_exposure_allocations(
             pnl_difference_cny=_difference(trend.all_in_pnl_cny, reference.all_in_pnl_cny),
             drawdown_difference=_difference(trend.max_drawdown, reference.max_drawdown),
         ))
-    return ExposureEvaluation(baseline, tuple(pairs), tuple(risk_pairs))
+    return ExposureEvaluation(baseline, tuple(pairs), tuple(risk_pairs), tuple(nav_pairs))

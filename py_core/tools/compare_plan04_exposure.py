@@ -27,6 +27,7 @@ from py_core.tools.compare_plan04 import funding_schedule, serialize_report_valu
 
 _PROTOCOL = "plan04-exposure-match-v1"
 _RISK_PROTOCOL = "plan04-matched-risk-v1"
+DAILY_NAV_PROTOCOL = "plan04-exposure-daily-nav-v1"
 _MONTHLY_CNY = (Decimal(0), Decimal(200), Decimal(500))
 ExposureCase = tuple[Decimal, ExposureFit, ExposureEvaluation]
 
@@ -93,8 +94,11 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--registry", type=Path, default=Path(".var/research/experiments.jsonl"))
     parser.add_argument("--risk-diagnostics", action="store_true", help="add daily drawdown and tail return diagnostics")
+    parser.add_argument("--export-daily-nav", action="store_true", help="include paired UTC daily NAV paths")
     args = parser.parse_args()
     protocol = _RISK_PROTOCOL if args.risk_diagnostics else _PROTOCOL
+    if args.export_daily_nav:
+        protocol = DAILY_NAV_PROTOCOL
     try:
         calibration = load_historical_market(args.calibration_manifest)
         fits = tuple(
@@ -117,6 +121,7 @@ def main() -> None:
                     evaluation.bars,
                     funding_schedule(evaluation.bars, monthly),
                     include_risk_diagnostics=args.risk_diagnostics,
+                    include_daily_nav=args.export_daily_nav,
                 ),
             )
             for monthly, fit in zip(_MONTHLY_CNY, fits, strict=True)
@@ -137,6 +142,8 @@ def main() -> None:
         outcome = asdict(evaluated)
         if not args.risk_diagnostics:
             del outcome["risk_diagnostics"]
+        if not args.export_daily_nav:
+            del outcome["daily_nav"]
         scenarios.append({"monthly_cny": monthly, "grid": [asdict(point) for point in fit.grid], **outcome})
     report = {
         "protocol": protocol,
