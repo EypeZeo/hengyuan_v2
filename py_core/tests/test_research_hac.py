@@ -162,6 +162,17 @@ def test_an_integer_outside_float64_range_is_rejected() -> None:
     assert estimate_sharpe_hac([10**400, 1]).primary.status is HacStatus.INVALID_INPUT
 
 
+def test_a_masked_return_is_rejected_without_using_its_hidden_value() -> None:
+    values = np.ma.array([1.0, -50.0, 2.0], mask=[False, True, False])
+    assert estimate_sharpe_hac(values).primary.status is HacStatus.INVALID_INPUT
+
+
+@pytest.mark.parametrize("dtype", ["datetime64[D]", "timedelta64[D]"])
+def test_temporal_arrays_are_rejected_without_converting_them_to_returns(dtype: str) -> None:
+    values = np.arange(3).astype(dtype)
+    assert estimate_sharpe_hac(values).primary.status is HacStatus.INVALID_INPUT
+
+
 def test_returns_one_float_apart_preserve_the_exact_two_point_influence() -> None:
     estimate = estimate_sharpe_hac([1.0, math.nextafter(1.0, math.inf)], include_adjacent=False).primary
     assert estimate.status is HacStatus.OK
@@ -231,5 +242,12 @@ def test_an_autocovariance_summation_overflow_is_a_numeric_failure(monkeypatch: 
 def test_a_positive_long_run_variance_cannot_produce_a_zero_standard_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("py_core.research.hac._autocovariances", lambda centered, lag: (5e-324,))
     estimate = estimate_sharpe_hac([-1.0, 1.0], lag=0, include_adjacent=False).primary
+    assert estimate.status is HacStatus.NUMERIC_FAILURE
+    assert estimate.standard_error is None
+
+
+def test_bartlett_summation_overflow_is_a_numeric_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("py_core.research.hac._autocovariances", lambda centered, lag: (1.7e308,) * 4)
+    estimate = estimate_sharpe_hac([-1.0, 1.0, -1.0, 1.0], lag=3).primary
     assert estimate.status is HacStatus.NUMERIC_FAILURE
     assert estimate.standard_error is None

@@ -142,7 +142,13 @@ def _estimate_one(x: np.ndarray, lag: int) -> HacEstimate:
             )
 
     weights = tuple(1.0 - k / (lag + 1.0) for k in range(1, lag + 1))
-    omega = autocovariances[0] + 2.0 * math.fsum(weight * gamma for weight, gamma in zip(weights, autocovariances[1:], strict=True))
+    try:
+        weighted_covariances = math.fsum(
+            weight * gamma for weight, gamma in zip(weights, autocovariances[1:], strict=True)
+        )
+    except (OverflowError, ValueError):
+        return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "the Bartlett covariance sum is non-finite")
+    omega = autocovariances[0] + 2.0 * weighted_covariances
     if not math.isfinite(omega):
         return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "the long-run variance is non-finite")
     if omega <= 0.0:
@@ -191,11 +197,16 @@ def estimate_sharpe_hac(
             ``lag < n-1``. Both estimates have independent statuses.
     """
     try:
+        if np.ma.is_masked(returns):
+            raise ValueError("returns must not contain masked observations")
         values = np.asarray(returns)
-        if np.iscomplexobj(values) or (
-            values.dtype.kind == "O" and any(isinstance(value, (complex, np.complexfloating)) for value in values.flat)
+        if values.dtype.kind in "cmM" or (
+            values.dtype.kind == "O"
+            and any(
+                isinstance(value, (complex, np.complexfloating, np.datetime64, np.timedelta64)) for value in values.flat
+            )
         ):
-            raise ValueError("returns must be real")
+            raise ValueError("returns must contain real numbers")
         with np.errstate(over="ignore", invalid="ignore"):
             x = np.asarray(values, dtype=np.float64)
     except (TypeError, ValueError, OverflowError) as exc:
