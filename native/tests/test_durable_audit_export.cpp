@@ -3,6 +3,7 @@
 // not against this test's own assumptions about it. Corruption is then injected byte-for-byte into that real log.
 
 #include <gtest/gtest.h>
+#include <hengyuan/durable_audit_archive.hpp>
 #include <hengyuan/durable_audit_export.hpp>
 
 #include <algorithm>
@@ -12,6 +13,8 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,7 +51,8 @@ std::string scratch_prefix() {
 void remove_sink_files(const std::string& base) {
     for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".keyrotations", ".keyrotations.lock",
                                ".keyrotations.tip", ".keyrotations.tip.tmp", ".storeid", ".storeid.lock",
-                               ".storeid.tip", ".storeid.tip.tmp"}) {
+                               ".storeid.tip", ".storeid.tip.tmp", ".raw.archive", ".raw.archive.torn",
+                               ".raw.archive.trailing", ".raw.archive.existing", ".raw.archive.payload-corrupt", ".s7.archive"}) {
         std::remove((base + suffix).c_str());
     }
 }
@@ -93,6 +97,8 @@ struct SinkFixture {
     }
 
     std::string out_path() const { return path + ".export.ndjson"; }
+
+    std::string raw_archive_path() const { return path + ".raw.archive"; }
 
     void append_one(std::int64_t now_ms, const char* coid, OrderState state = OrderState::Accepted,
                     std::int64_t filled = 0) {
@@ -143,6 +149,52 @@ std::vector<std::byte> read_whole(const std::string& path) {
 void write_whole(const std::string& path, std::span<const std::byte> bytes) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+void write_live_v6_resolution(SinkFixture& fx) {
+    constexpr char kCoid[] = "HY-ARCHIVE-V6-0001";
+    const auto make_record = [&](AuditEventType event, OrderState state, std::int64_t timestamp_ms) {
+        AuditRecord record{};
+        record.timestamp_ms = timestamp_ms;
+        record.event_type = event;
+        record.mode = ExecutionMode::Live;
+        record.symbol_id = 1;
+        record.set_client_order_id(kCoid);
+        record.price_ticks = 6'000'000;
+        record.qty_ticks = 100;
+        record.resulting_state = state;
+        record.side = OrderSide::Buy;
+        record.set_detail("archive v6 source");
+        return record;
+    };
+
+    ASSERT_TRUE(fx.sink->append_durable(
+                              make_record(AuditEventType::OrderIntentCreated, OrderState::Intent, 1000), 1000)
+                    .acked());
+    ASSERT_TRUE(fx.sink->append_durable(
+                              make_record(AuditEventType::OrderSubmitPrepared, OrderState::Submitting, 1001), 1001)
+                    .acked());
+    ASSERT_TRUE(fx.sink->append_durable(
+                              make_record(AuditEventType::OrderAmbiguous, OrderState::Ambiguous, 1002), 1002)
+                    .acked());
+    fx.close_writer();
+
+    fx.sink = std::make_unique<DurableAuditSink>(fx.path, *fx.ring, 1, kMaxIntentOrphans,
+                                                 AuditSinkOpenMode::OperatorOpen);
+    ASSERT_TRUE(fx.sink->is_open());
+    ASSERT_FALSE(fx.sink->fenced());
+
+    AuditRecord resolution = make_record(AuditEventType::OrderOperatorResolved, OrderState::Rejected, 1003);
+    resolution.detail_code = static_cast<std::int64_t>(operator_resolution::kKindAbsent |
+                                                       operator_resolution::kAbsentRequiredBits |
+                                                       (std::uint64_t{270} <<
+                                                        operator_resolution::kWaitedSecondsShift) |
+                                                       (std::uint64_t{1} << operator_resolution::kToolVersionShift));
+    resolution.set_detail("op=test;ev=00000000000000000000000000000000");
+    const OperatorResolutionAppend appended = fx.sink->append_operator_resolution(resolution, 1003);
+    ASSERT_EQ(appended.status, OperatorAppendStatus::Appended);
+    ASSERT_TRUE(appended.append.acked());
+    fx.close_writer();
 }
 
 std::vector<std::string> split_lines(std::span<const std::byte> bytes) {
@@ -805,6 +857,219 @@ TEST(DurableAuditExport, StrictArchiveSourceRequiresTheStoreIdentitySidecar) {
     const ExportFileResult compatible = export_audit_log_file(fx.path, fx.out_path(), reader_ring);
     EXPECT_EQ(compatible.status, ExportStatus::Ok) << export_status_name(compatible.status);
     EXPECT_EQ(compatible.verification.identity, IdentityState::Absent);
+}
+
+TEST(DurableAuditArchive, RawSegmentArchivePreservesTheAnchorIdentityAndLogBytes) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    const std::vector<std::byte> log = read_whole(fx.path);
+    const std::vector<std::byte> anchor = read_whole(fx.path + ".tip");
+    const std::vector<std::byte> identity = read_whole(fx.path + ".storeid.tip");
+    ASSERT_EQ(anchor.size(), kTipAnchorSize);
+    ASSERT_EQ(identity.size(), kStoreIdentitySize);
+    ASSERT_FALSE(log.empty());
+
+    const ExportFileResult archived = archive_audit_log_file(fx.path, fx.raw_archive_path(), *fx.ring, 1'800'000'000'000);
+    ASSERT_EQ(archived.status, ExportStatus::Ok) << export_status_name(archived.status);
+    const ExportFileResult verified = verify_audit_archive_file(fx.raw_archive_path(), *fx.ring);
+    ASSERT_EQ(verified.status, ExportStatus::Ok) << export_status_name(verified.status);
+
+    const std::vector<std::byte> bundle = read_whole(fx.raw_archive_path());
+    const std::optional<audit_archive::Header> header = audit_archive::decode_header(bundle);
+    ASSERT_TRUE(header.has_value());
+    EXPECT_EQ(header->kind, audit_archive::Kind::Segment);
+    EXPECT_EQ(header->created_utc_ms, 1'800'000'000'000);
+    EXPECT_EQ(header->log_bytes, log.size());
+    ASSERT_EQ(bundle.size(), audit_archive::kHeaderSize + anchor.size() + identity.size() + log.size());
+
+    const auto body = std::span<const std::byte>(bundle).subspan(audit_archive::kHeaderSize);
+    EXPECT_TRUE(std::equal(anchor.begin(), anchor.end(), body.begin()));
+    EXPECT_TRUE(std::equal(identity.begin(), identity.end(), body.begin() + static_cast<std::ptrdiff_t>(anchor.size())));
+    EXPECT_TRUE(std::equal(log.begin(), log.end(),
+                           body.begin() + static_cast<std::ptrdiff_t>(anchor.size() + identity.size())));
+}
+
+TEST(DurableAuditArchive, ExistingDestinationIsPreserved) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    const std::vector<std::byte> existing{std::byte{0x41}, std::byte{0x52}, std::byte{0x43}};
+    write_whole(fx.raw_archive_path(), existing);
+
+    const ExportFileResult result = archive_audit_log_file(fx.path, fx.raw_archive_path(), *fx.ring, 1'800'000'000'000);
+    EXPECT_EQ(result.status, ExportStatus::OutputExists) << export_status_name(result.status);
+    EXPECT_EQ(read_whole(fx.raw_archive_path()), existing);
+}
+
+TEST(DurableAuditArchive, VerificationRejectsTornAndTrailingBundles) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    ASSERT_EQ(archive_audit_log_file(fx.path, fx.raw_archive_path(), *fx.ring, 1'800'000'000'000).status,
+              ExportStatus::Ok);
+    const std::vector<std::byte> good = read_whole(fx.raw_archive_path());
+    ASSERT_GT(good.size(), audit_archive::kHeaderSize);
+
+    std::vector<std::byte> torn = good;
+    torn.pop_back();
+    write_whole(fx.path + ".raw.archive.torn", torn);
+    const ExportFileResult torn_result = verify_audit_archive_file(fx.path + ".raw.archive.torn", *fx.ring);
+    EXPECT_EQ(torn_result.status, ExportStatus::MalformedArchive) << export_status_name(torn_result.status);
+
+    std::vector<std::byte> trailing = good;
+    trailing.push_back(std::byte{0xA5});
+    write_whole(fx.path + ".raw.archive.trailing", trailing);
+    const ExportFileResult trailing_result = verify_audit_archive_file(fx.path + ".raw.archive.trailing", *fx.ring);
+    EXPECT_EQ(trailing_result.status, ExportStatus::MalformedArchive) << export_status_name(trailing_result.status);
+}
+
+TEST(DurableAuditArchive, VerificationRejectsAPayloadMutationWithoutChangingBundleLength) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    ASSERT_EQ(archive_audit_log_file(fx.path, fx.raw_archive_path(), *fx.ring, 1'800'000'000'000).status,
+              ExportStatus::Ok);
+
+    const std::vector<std::byte> original = read_whole(fx.raw_archive_path());
+    constexpr std::size_t kFrameHeaderSize = 1 + 1 + 4 + 8 + 1 + 8 + 4;
+    const std::size_t payload_offset = audit_archive::kHeaderSize + kTipAnchorSize + kStoreIdentitySize + kFrameHeaderSize;
+    ASSERT_LT(payload_offset, original.size());
+
+    std::vector<std::byte> corrupted = original;
+    corrupted[payload_offset] ^= std::byte{0x01};
+    const std::string corrupted_path = fx.path + ".raw.archive.payload-corrupt";
+    write_whole(corrupted_path, corrupted);
+    ASSERT_EQ(read_whole(corrupted_path).size(), original.size()) << "the envelope and frame lengths remain intact";
+
+    const ExportFileResult result = verify_audit_archive_file(corrupted_path, *fx.ring);
+    EXPECT_NE(result.status, ExportStatus::Ok) << "a modified payload must fail normal archive verification";
+}
+
+TEST(DurableAuditArchive, MigrationPreparationIsIdempotentAndKeepsTheFirstValidArtifact) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+    const std::string migration_path = fx.path + ".s7.archive";
+
+    const ExportFileResult first = prepare_audit_migration(fx.path, *fx.ring, 1'800'000'000'000);
+    ASSERT_EQ(first.status, ExportStatus::Ok) << export_status_name(first.status);
+    const ExportFileResult verified = verify_audit_archive_file(migration_path, *fx.ring);
+    ASSERT_EQ(verified.status, ExportStatus::Ok) << export_status_name(verified.status);
+    const std::vector<std::byte> original = read_whole(migration_path);
+    const std::optional<audit_archive::Header> header = audit_archive::decode_header(original);
+    ASSERT_TRUE(header.has_value());
+    EXPECT_EQ(header->kind, audit_archive::Kind::S7Migration);
+    EXPECT_EQ(header->created_utc_ms, 1'800'000'000'000);
+
+    const ExportFileResult retry = prepare_audit_migration(fx.path, *fx.ring, 1'800'000'001'000);
+    EXPECT_EQ(retry.status, ExportStatus::Ok) << export_status_name(retry.status);
+    EXPECT_EQ(read_whole(migration_path), original);
+}
+
+TEST(DurableAuditArchive, OrdinaryExportsReserveTheMigrationPathForS7Preparation) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+
+    const std::string migration_path = fx.path + ".s7.archive";
+    const std::vector<std::byte> source_log = read_whole(fx.path);
+    const std::vector<std::byte> source_anchor = read_whole(fx.path + ".tip");
+    const std::vector<std::byte> source_identity = read_whole(fx.path + ".storeid.tip");
+    ASSERT_FALSE(source_log.empty());
+    ASSERT_EQ(source_anchor.size(), kTipAnchorSize);
+    ASSERT_EQ(source_identity.size(), kStoreIdentitySize);
+    ASSERT_FALSE(std::filesystem::exists(migration_path));
+
+    const ExportFileResult ndjson = export_audit_log_file(fx.path, migration_path, *fx.ring);
+    EXPECT_EQ(ndjson.status, ExportStatus::ReservedMigrationPath) << export_status_name(ndjson.status);
+    EXPECT_FALSE(std::filesystem::exists(migration_path));
+    EXPECT_EQ(read_whole(fx.path), source_log);
+    EXPECT_EQ(read_whole(fx.path + ".tip"), source_anchor);
+    EXPECT_EQ(read_whole(fx.path + ".storeid.tip"), source_identity);
+
+    const ExportFileResult segment = archive_audit_log_file(fx.path, migration_path, *fx.ring, 1'800'000'000'000);
+    EXPECT_EQ(segment.status, ExportStatus::ReservedMigrationPath) << export_status_name(segment.status);
+    EXPECT_FALSE(std::filesystem::exists(migration_path));
+    EXPECT_EQ(read_whole(fx.path), source_log);
+    EXPECT_EQ(read_whole(fx.path + ".tip"), source_anchor);
+    EXPECT_EQ(read_whole(fx.path + ".storeid.tip"), source_identity);
+
+    const ExportFileResult migration = prepare_audit_migration(fx.path, *fx.ring, 1'800'000'000'000);
+    ASSERT_EQ(migration.status, ExportStatus::Ok) << export_status_name(migration.status);
+    EXPECT_TRUE(std::filesystem::exists(migration_path));
+    const ExportFileResult verified = verify_audit_archive_file(migration_path, *fx.ring);
+    ASSERT_EQ(verified.status, ExportStatus::Ok) << export_status_name(verified.status);
+    const auto bundle = read_whole(migration_path);
+    const auto header = audit_archive::decode_header(bundle);
+    ASSERT_TRUE(header.has_value());
+    EXPECT_EQ(header->kind, audit_archive::Kind::S7Migration);
+    EXPECT_EQ(read_whole(fx.path), source_log);
+    EXPECT_EQ(read_whole(fx.path + ".tip"), source_anchor);
+    EXPECT_EQ(read_whole(fx.path + ".storeid.tip"), source_identity);
+}
+
+#ifdef _WIN32
+TEST(DurableAuditArchive, OrdinaryExportsReserveWindowsAliasesOfTheMigrationPath) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+    fx.close_writer();
+
+    const std::string migration_path = fx.path + ".s7.archive";
+    const std::string alias_path = fx.path + ".S7.ARCHIVE. ";
+    const std::vector<std::byte> source_log = read_whole(fx.path);
+    const std::vector<std::byte> source_anchor = read_whole(fx.path + ".tip");
+    const std::vector<std::byte> source_identity = read_whole(fx.path + ".storeid.tip");
+    ASSERT_FALSE(source_log.empty());
+    ASSERT_FALSE(std::filesystem::exists(migration_path));
+
+    const ExportFileResult ndjson = export_audit_log_file(fx.path, alias_path, *fx.ring);
+    EXPECT_EQ(ndjson.status, ExportStatus::ReservedMigrationPath) << export_status_name(ndjson.status);
+    EXPECT_FALSE(std::filesystem::exists(alias_path));
+    EXPECT_FALSE(std::filesystem::exists(migration_path));
+    EXPECT_EQ(read_whole(fx.path), source_log);
+    EXPECT_EQ(read_whole(fx.path + ".tip"), source_anchor);
+    EXPECT_EQ(read_whole(fx.path + ".storeid.tip"), source_identity);
+
+    const ExportFileResult segment = archive_audit_log_file(fx.path, alias_path, *fx.ring, 1'800'000'000'000);
+    EXPECT_EQ(segment.status, ExportStatus::ReservedMigrationPath) << export_status_name(segment.status);
+    EXPECT_FALSE(std::filesystem::exists(alias_path));
+    EXPECT_FALSE(std::filesystem::exists(migration_path));
+    EXPECT_EQ(read_whole(fx.path), source_log);
+    EXPECT_EQ(read_whole(fx.path + ".tip"), source_anchor);
+    EXPECT_EQ(read_whole(fx.path + ".storeid.tip"), source_identity);
+
+    const ExportFileResult migration = prepare_audit_migration(fx.path, *fx.ring, 1'800'000'000'000);
+    ASSERT_EQ(migration.status, ExportStatus::Ok) << export_status_name(migration.status);
+    EXPECT_TRUE(std::filesystem::exists(migration_path));
+    const ExportFileResult verified = verify_audit_archive_file(migration_path, *fx.ring);
+    ASSERT_EQ(verified.status, ExportStatus::Ok) << export_status_name(verified.status);
+    const auto header = audit_archive::decode_header(read_whole(migration_path));
+    ASSERT_TRUE(header.has_value());
+    EXPECT_EQ(header->kind, audit_archive::Kind::S7Migration);
+}
+#endif
+
+TEST(DurableAuditArchive, ArchiveAndMigrationRefuseWhileTheSourceWriterIsActive) {
+    SinkFixture fx;
+    fx.append_intent(1000, "COID-0000000000000001");
+
+    const ExportFileResult archived = archive_audit_log_file(fx.path, fx.raw_archive_path(), *fx.ring, 1'800'000'000'000);
+    EXPECT_EQ(archived.status, ExportStatus::WriterLive) << export_status_name(archived.status);
+    EXPECT_FALSE(std::filesystem::exists(fx.raw_archive_path()));
+
+    const ExportFileResult migration = prepare_audit_migration(fx.path, *fx.ring, 1'800'000'000'000);
+    EXPECT_EQ(migration.status, ExportStatus::WriterLive) << export_status_name(migration.status);
+    EXPECT_FALSE(std::filesystem::exists(fx.path + ".s7.archive"));
+}
+
+TEST(DurableAuditArchive, MigrationPreparationRefusesAV6Source) {
+    SinkFixture fx;
+    write_live_v6_resolution(fx);
+
+    const ExportFileResult result = prepare_audit_migration(fx.path, *fx.ring, 1'800'000'000'000);
+    EXPECT_EQ(result.status, ExportStatus::MigrationSourceVersion) << export_status_name(result.status);
+    EXPECT_FALSE(std::filesystem::exists(fx.path + ".s7.archive"));
 }
 
 TEST(DurableAuditExport, AnAnchorAheadOfTheLogIsRollbackAndRefused) {

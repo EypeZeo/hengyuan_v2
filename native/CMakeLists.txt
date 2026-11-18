@@ -739,6 +739,15 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_never_sent_writer)
     gtest_discover_tests(test_never_sent_writer)
 
+    add_executable(s7_process_recovery_probe tests/helpers/s7_process_recovery_probe.cpp)
+    target_link_libraries(s7_process_recovery_probe PRIVATE hengyuan_core)
+    hengyuan_set_warnings(s7_process_recovery_probe)
+    add_test(NAME S7ProcessRecovery
+        COMMAND ${CMAKE_COMMAND}
+            "-DPROBE=$<TARGET_FILE:s7_process_recovery_probe>"
+            "-DSCRATCH_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_s7_process_recovery.cmake")
+
     # Q23 slice S6 (docs/NOTSENT_CLOSURE_DESIGN.md 4.3 and 8, class A): the first CALLER of that writer. An order a local gate refuses
     # after its Intent frame is closed as never sent instead of being left as an Intent orphan. test_never_sent_class_a: the six
     # refusals of orchestrate_submit() against a fake durable port (what is written, in which order, what the result says, the
