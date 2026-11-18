@@ -47,6 +47,8 @@
 
 运行报告保存在本机 `%LOCALAPPDATA%/HengYuan-Research/plan04-tail-rank-calibration-v1/calibration.json`，其中包含两种方法的未舍入数值。
 
+[按区块长度校准](PLAN_04_TAIL_LENGTH_CALIBRATION.md)比较了不同长度使用不同秩的结果。
+
 ## 复现
 
 在仓库根目录运行。JSON 报告保留同次原方法与新方法的各项计数、Wilson 区间、半宽及主情景的配对改善。小规模运行可加 `--smoke`，每个情景 4 次重复，每个长度 39 次抽样。
