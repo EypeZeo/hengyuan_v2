@@ -16,6 +16,10 @@ import pytest
 
 from py_core.backtests.cli import build_parser, cmd_run, cmd_run_risk_aware
 from py_core.research.experiments import (
+    BlindAccessKind,
+    BlindSetAccess,
+    BlindSetAccessLog,
+    BlindSetStatus,
     CausalCheck,
     ExperimentRegistry,
     ExperimentStatus,
@@ -213,3 +217,116 @@ def test_run_risk_aware_registers_the_same_way(tmp_path: Any, monkeypatch: pytes
     assert record.causal_check is CausalCheck.INDEX_ONLY
     raw = [json.loads(line) for line in registry_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(raw) == 1 and raw[0]["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# 盲测库访问纪律（任务 3.2 / V-16 的 CLI 接线）
+# ---------------------------------------------------------------------------
+
+
+def blind_args(*, ohlcv: Path, signals: Path, registry: Path, access_log: Path, manifest: Path,
+               blind_set_id: str, trial_id: str, run_id: str | None = None) -> list[str]:
+    argv = [
+        "run",
+        "--ohlcv",
+        str(ohlcv),
+        "--signals",
+        str(signals),
+        "--experiment-registry",
+        str(registry),
+        "--blind-set-access-log",
+        str(access_log),
+        "--blind-set-id",
+        blind_set_id,
+        "--blind-set-manifest",
+        str(manifest),
+        "--trial-id",
+        trial_id,
+    ]
+    if run_id is not None:
+        argv += ["--run-id", run_id]
+    return argv
+
+
+def test_a_fresh_blind_set_records_one_final_evaluation(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    ohlcv = tmp_path / "ohlcv.csv"
+    signals = tmp_path / "signals.csv"
+    registry_path = tmp_path / "experiments.jsonl"
+    access_log = tmp_path / "blind_access.jsonl"
+    manifest = tmp_path / "holdout_manifest.txt"
+    manifest.write_text("frozen holdout content", encoding="utf-8")
+    write_ohlcv_csv(ohlcv)
+    write_signals_csv(signals)
+    monkeypatch.chdir(tmp_path)
+
+    argv = blind_args(ohlcv=ohlcv, signals=signals, registry=registry_path, access_log=access_log,
+                      manifest=manifest, blind_set_id="holdout-2026", trial_id="t-blind")
+    assert cmd_run(build_parser().parse_args(argv)) == 0
+
+    log = BlindSetAccessLog(access_log)
+    assert log.status_of("holdout-2026") is BlindSetStatus.SPENT_BY_FINAL_EVALUATION
+    access = log.all_accesses()[0]
+    assert access.trial_id == "t-blind" and access.kind.value == "final_evaluation"
+
+    record = ExperimentRegistry(registry_path).all_records()[0]
+    assert record.blind_set_id == "holdout-2026"
+    assert dict(record.parameters)["blind_set_sha256"].startswith("sha256:")
+    assert not is_admission_eligible(record)  # --signals 路径：index_only 不能承载冻结评估结论
+
+    # 复用同一个盲测库的第二次评估在事前被拒绝（一个盲测库只服务一次冻结评估）。
+    rerun = blind_args(ohlcv=ohlcv, signals=signals, registry=registry_path, access_log=access_log,
+                       manifest=manifest, blind_set_id="holdout-2026", trial_id="t-blind-2", run_id="t-blind-2")
+    assert cmd_run(build_parser().parse_args(rerun)) == 1
+    assert len(ExperimentRegistry(registry_path).all_records()) == 1  # 登记未发生
+    assert len(log.all_accesses()) == 1  # 访问日志没有新增违约记录
+
+
+def test_a_tainted_blind_set_is_refused_before_anything_runs(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    ohlcv = tmp_path / "ohlcv.csv"
+    signals = tmp_path / "signals.csv"
+    registry_path = tmp_path / "experiments.jsonl"
+    access_log = tmp_path / "blind_access.jsonl"
+    manifest = tmp_path / "holdout_manifest.txt"
+    manifest.write_text("frozen holdout content", encoding="utf-8")
+    write_ohlcv_csv(ohlcv)
+    write_signals_csv(signals)
+
+    # 研究目的的读取污染该集合（如实登记，V-16）。
+    log = BlindSetAccessLog(access_log)
+    log.record(BlindSetAccess(blind_set_id="holdout-2026", kind=BlindAccessKind.RESEARCH,
+                              accessed_at_utc=datetime.now(UTC), recorded_by="researcher-a", trial_id=None))
+    monkeypatch.chdir(tmp_path)
+
+    argv = blind_args(ohlcv=ohlcv, signals=signals, registry=registry_path, access_log=access_log,
+                      manifest=manifest, blind_set_id="holdout-2026", trial_id="t-tainted")
+    assert cmd_run(build_parser().parse_args(argv)) == 1
+    assert not registry_path.exists()  # 登记未发生
+    assert len(log.all_accesses()) == 1  # 拒绝不产生新的访问记录
+
+
+def test_a_missing_manifest_is_a_parameter_error(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    ohlcv = tmp_path / "ohlcv.csv"
+    signals = tmp_path / "signals.csv"
+    registry_path = tmp_path / "experiments.jsonl"
+    access_log = tmp_path / "blind_access.jsonl"
+    write_ohlcv_csv(ohlcv)
+    write_signals_csv(signals)
+    monkeypatch.chdir(tmp_path)
+
+    argv = [
+        "run",
+        "--ohlcv",
+        str(ohlcv),
+        "--signals",
+        str(signals),
+        "--experiment-registry",
+        str(registry_path),
+        "--blind-set-access-log",
+        str(access_log),
+        "--blind-set-id",
+        "holdout-2026",
+        "--trial-id",
+        "t-nomanifest",
+    ]
+    assert cmd_run(build_parser().parse_args(argv)) == 1
+    assert not registry_path.exists()
