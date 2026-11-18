@@ -49,6 +49,7 @@
 
 #pragma once
 
+#include <hengyuan/audit_archive_format.hpp>
 #include <hengyuan/control_plane_frame_codec.hpp>
 #include <hengyuan/durable_control_plane.hpp>
 #include <hengyuan/durable_frame_codec.hpp>
@@ -66,6 +67,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <span>
 #include <string>
@@ -408,6 +410,8 @@ struct NeverSentAppend {
     AuditAppendResult append{};  // set when status is Appended or AppendFailed
 };
 
+enum class AuditMigrationPolicy : std::uint8_t { Discover = 0, RequireArchive = 1 };
+
 class DurableAuditSink {
 public:
     // path: base path for the log (e.g. "state/audit.log"); the lock sidecar
@@ -425,7 +429,8 @@ public:
                      std::size_t max_intent_orphans = kMaxIntentOrphans,
                      AuditSinkOpenMode open_mode = AuditSinkOpenMode::Trading,
                      NeverSentWrites never_sent_writes = NeverSentWrites::Disabled,
-                     std::uint64_t max_order_frames = kMaxDurableLogBytes / kOrderEventFrameSize) noexcept
+                     std::uint64_t max_order_frames = kMaxDurableLogBytes / kOrderEventFrameSize,
+                     AuditMigrationPolicy migration_policy = AuditMigrationPolicy::Discover) noexcept
         : log_store_(path, path + ".lock", path + ".tip"),
           rotation_log_store_(path + ".keyrotations", path + ".keyrotations.lock", path + ".keyrotations.tip"),
           store_identity_store_(path + ".storeid", path + ".storeid.lock", path + ".storeid.tip"),
@@ -434,7 +439,8 @@ public:
           max_intent_orphans_(max_intent_orphans < kMaxIntentOrphans ? max_intent_orphans : kMaxIntentOrphans),
           open_mode_(open_mode),
           never_sent_writes_(never_sent_writes),
-          max_order_frames_(std::min(max_order_frames, kMaxDurableLogBytes / kOrderEventFrameSize)) {
+          max_order_frames_(std::min(max_order_frames, kMaxDurableLogBytes / kOrderEventFrameSize)),
+          migration_policy_(migration_policy) {
         if (!acquire_lock()) {
             recovery_status_ = RecoveryScanStatus::IoError;
             return;
@@ -472,7 +478,7 @@ public:
             }
         }
 
-        recovery_status_ = run_recovery_scan();
+        recovery_status_ = run_recovery_scan(path);
         if (recovery_status_ != RecoveryScanStatus::Clean &&
             recovery_status_ != RecoveryScanStatus::Recovered) {
             // Fail closed: do not allow appends against a log we couldn't
@@ -562,10 +568,7 @@ public:
     AuditSinkOpenMode open_mode() const noexcept { return open_mode_; }
     NeverSentWrites never_sent_writes() const noexcept { return never_sent_writes_; }
 
-    // The format version append_durable() writes: always the store's own tip version (D5 / R1, see the FORMAT
-    // v5 -> v6 note in durable_frame_codec.hpp). 5 for every store that exists today -- an empty one included -- and 6
-    // for a store whose tip is v6, which includes the moment append_operator_resolution() or append_never_sent() has had
-    // its frame acknowledged.
+    // Format used by append_durable(). Recovery selects v6 once it finds v6 frames or verifies an S7 migration archive.
     std::uint8_t write_format_version() const noexcept { return write_version_; }
 
     // SAFE-03 crash-window slice (blueprint L-36): how many bytes of a torn tail -- the partial frame a crash in the
@@ -1077,17 +1080,76 @@ private:
     // this class is built around -- IoError/Corrupt/CapacityExceeded all exist so a
     // problem leaves a diagnosable process behind, and abort() leaves none.
     // Allocation failure now takes the same fail-closed exit as an I/O failure.
-    RecoveryScanStatus run_recovery_scan() noexcept {
+    RecoveryScanStatus run_recovery_scan(const std::string& path) noexcept {
         try {
-            return run_recovery_scan_impl();
+            return run_recovery_scan_impl(path);
         } catch (...) {
             return RecoveryScanStatus::IoError;
         }
     }
 
-    RecoveryScanStatus run_recovery_scan_impl() {
+    RecoveryScanStatus load_migration_archive(const std::string& path, std::span<const std::byte> content,
+                                               std::optional<detail::DecodedTipAnchor>& archive_tip) {
+        const std::filesystem::path archive_path(path + std::string(audit_archive::kMigrationSuffix));
+        std::error_code error;
+        const auto status = std::filesystem::symlink_status(archive_path, error);
+        if (status.type() == std::filesystem::file_type::not_found &&
+            (!error || error == std::errc::no_such_file_or_directory)) {
+            return migration_policy_ == AuditMigrationPolicy::Discover ? RecoveryScanStatus::Clean
+                                                                        : RecoveryScanStatus::IoError;
+        }
+        if (error) return RecoveryScanStatus::IoError;
+        if (!std::filesystem::is_regular_file(status)) return RecoveryScanStatus::Corrupt;
+        std::ifstream archive(archive_path, std::ios::binary);
+        if (!archive) return RecoveryScanStatus::IoError;
+        std::array<std::byte, audit_archive::kHeaderSize> header_bytes;
+        std::array<std::byte, kTipAnchorSize> archived_anchor;
+        std::array<std::byte, kStoreIdentitySize> archived_identity;
+        if (!audit_archive::read_exact(archive, header_bytes) ||
+            !audit_archive::read_exact(archive, archived_anchor) ||
+            !audit_archive::read_exact(archive, archived_identity)) {
+            return RecoveryScanStatus::Corrupt;
+        }
+        const auto header = audit_archive::decode_header(header_bytes);
+        if (!header || header->kind != audit_archive::Kind::S7Migration || header->log_bytes > content.size()) {
+            return RecoveryScanStatus::Corrupt;
+        }
+        const auto old_bytes = static_cast<std::size_t>(header->log_bytes);
+        if (!audit_archive::matches_bytes(archive, content.first(old_bytes)) || !audit_archive::at_end(archive)) {
+            return RecoveryScanStatus::Corrupt;
+        }
+
+        std::ifstream identity(path + ".storeid.tip", std::ios::binary);
+        if (!audit_archive::matches_bytes(identity, archived_identity) || !audit_archive::at_end(identity)) {
+            return RecoveryScanStatus::Corrupt;
+        }
+        std::array<std::byte, kKeyBlockSize> key_block{};
+        ScopedSecureWipe wipe_key_block(key_block);
+        std::uint32_t key_id = 0;
+        detail::DecodedStoreIdentity decoded_identity{};
+        if (!detail::peek_store_identity_key_id(archived_identity, key_id) ||
+            !key_ring_.active_key(key_id, key_block) ||
+            !detail::decode_store_identity(archived_identity, key_block, decoded_identity)) {
+            return RecoveryScanStatus::Corrupt;
+        }
+        detail::DecodedTipAnchor anchor{};
+        if (!detail::peek_tip_anchor_key_id(archived_anchor, key_id) ||
+            !key_ring_.active_key(key_id, key_block) ||
+            !detail::decode_tip_anchor(archived_anchor, key_block, anchor) ||
+            anchor.sequence_number != old_bytes / kOrderEventFrameSize - 1) {
+            return RecoveryScanStatus::Corrupt;
+        }
+        if (!audit_archive::sync_directory(archive_path)) return RecoveryScanStatus::IoError;
+        archive_tip = anchor;
+        return RecoveryScanStatus::Clean;
+    }
+
+    RecoveryScanStatus run_recovery_scan_impl(const std::string& path) {
         std::vector<std::byte> content;
         if (!read_entire_log(content)) return RecoveryScanStatus::IoError;
+        std::optional<detail::DecodedTipAnchor> archive_tip;
+        const auto archive_status = load_migration_archive(path, content, archive_tip);
+        if (archive_status != RecoveryScanStatus::Clean) return archive_status;
 
         if (content.empty()) {
             return finalize_scan_with_anchor_check(/*log_tip_valid=*/false, 0, {}, {});
@@ -1158,6 +1220,11 @@ private:
             // this reader will vouch for. (The first v6 frame has no such predecessor requirement: a store may
             // start at v6.)
             if (frame.format_version < max_version_seen) return RecoveryScanStatus::Corrupt;
+            if (archive_tip) {
+                const auto expected_version = expected_seq <= archive_tip->sequence_number
+                    ? kFrameFormatVersion : kFrameFormatVersionV6;
+                if (frame.format_version != expected_version) return RecoveryScanStatus::Corrupt;
+            }
             max_version_seen = frame.format_version;
 
             std::string coid(frame.record.client_order_id);
@@ -1267,8 +1334,10 @@ private:
             return first_cut == RecoveryScanStatus::Clean ? first : first_cut;
         }
 
+        if (archive_tip && !anchor_matches_frame(*archive_tip, macs_by_sequence)) return RecoveryScanStatus::Corrupt;
+        bool anchor_behind = false;
         auto status = finalize_scan_with_anchor_check(/*log_tip_valid=*/true, expected_seq - 1,
-                                                        macs_by_sequence.back(), macs_by_sequence);
+                                                        macs_by_sequence.back(), macs_by_sequence, &anchor_behind);
         if (status != RecoveryScanStatus::Clean && status != RecoveryScanStatus::Recovered) return status;
 
         // SAFE-03 crash-window slice (blueprint L-36): the scan stopped at `offset`, the end of the last complete
@@ -1285,21 +1354,22 @@ private:
         // exists today, 6 only once a v6 frame is in the log. That is what keeps the "versions never go back" rule
         // above consistent with this class's own appends: the first v6 frame (the operator tool's) followed by the
         // trading process's v5 appends would be Corrupt at the next start.
-        write_version_ = (max_version_seen >= kFrameFormatVersionV6) ? kFrameFormatVersionV6 : kFrameFormatVersion;
+        write_version_ = (archive_tip || max_version_seen >= kFrameFormatVersionV6)
+            ? kFrameFormatVersionV6 : kFrameFormatVersion;
 
         // AUDIT KEY-ROTATE-008: finish the interrupted rotation's step 2 now that the
         // true tip is known. Doing it here (rather than lazily on the next append)
         // means the on-disk anchor is consistent with active_key_id_ before this
         // constructor returns, so a second crash immediately afterwards recovers
         // cleanly through the ordinary path instead of hitting this branch again.
-        if (interrupted_rotation_) {
+        if (interrupted_rotation_ || (archive_tip && anchor_behind)) {
             std::array<std::byte, kKeyBlockSize> key_block{};
             ScopedSecureWipe wipe_key_block(key_block);
             if (!key_ring_.active_key(active_key_id_, key_block)) return RecoveryScanStatus::Corrupt;
             const bool ok = write_tip_anchor(next_sequence_ - 1, tip_mac_, active_key_id_,
                                               std::span<const std::byte>(key_block.data(), key_block.size()));
             if (!ok) return RecoveryScanStatus::IoError;
-            completed_interrupted_rotation_ = true;
+            completed_interrupted_rotation_ = interrupted_rotation_;
         }
 
         // D5 / R1: the operator-resolved list must be COMPLETE to be of any use (a written-off order that is live
@@ -1379,9 +1449,14 @@ private:
     // whether any checkpoints end up non-empty; this function only ever
     // returns Clean (for the "anchor OK, nothing more to say here" case) or
     // an error status.
+    static bool anchor_matches_frame(const detail::DecodedTipAnchor& anchor,
+                                     std::span<const std::array<std::byte, kMacLen>> macs_by_sequence) noexcept {
+        return anchor.sequence_number < macs_by_sequence.size() && macs_by_sequence[anchor.sequence_number] == anchor.mac;
+    }
+
     RecoveryScanStatus finalize_scan_with_anchor_check(
         bool log_tip_valid, std::uint64_t log_tip_sequence, std::array<std::byte, kMacLen> log_tip_mac,
-        const std::vector<std::array<std::byte, kMacLen>>& macs_by_sequence) noexcept {
+        const std::vector<std::array<std::byte, kMacLen>>& macs_by_sequence, bool* anchor_behind = nullptr) noexcept {
         std::vector<std::byte> anchor_bytes;
         const bool anchor_present = read_tip_anchor(anchor_bytes);
 
@@ -1449,9 +1524,8 @@ private:
         // if the log's own frame at that sequence number -- already proven
         // continuous from index 0 through the true tip by the chain check in
         // the main scan loop -- has a mac matching what the anchor claims.
-        if (anchor.sequence_number >= macs_by_sequence.size()) return RecoveryScanStatus::Corrupt;
-        return macs_by_sequence[anchor.sequence_number] == anchor.mac ? RecoveryScanStatus::Clean
-                                                                       : RecoveryScanStatus::Corrupt;
+        if (anchor_behind != nullptr) *anchor_behind = true;
+        return anchor_matches_frame(anchor, macs_by_sequence) ? RecoveryScanStatus::Clean : RecoveryScanStatus::Corrupt;
     }
 
     // Phase 4: sidecar-scoped recovery, deliberately much simpler than
@@ -1638,11 +1712,8 @@ private:
         // (the throwing overload could raise inside this noexcept method).
         std::error_code ec;
         const bool exists = std::filesystem::exists(tip_path, ec);
-        if (ec || exists) {
-            // Either the probe itself failed, or the file is there but
-            // read_tip_anchor() still failed for a real I/O reason (not
-            // "absent") -- do not attempt first-time generation over what
-            // might be a real, unreadable file.
+        if (ec || exists || fenced_) {
+            // Generate an identity only for a usable log with a confirmed missing identity file.
             store_identity_degraded_ = true;
             return;
         }
@@ -1761,6 +1832,7 @@ private:
     std::uint8_t write_version_{kFrameFormatVersion};
     NeverSentWrites never_sent_writes_{NeverSentWrites::Disabled};
     std::uint64_t max_order_frames_;
+    AuditMigrationPolicy migration_policy_;
     std::array<OperatorResolvedOrder, kMaxOperatorResolved> operator_resolved_{};
     std::size_t operator_resolved_count_{0};
     RecoveryOverflow recovery_overflow_{};

@@ -21,9 +21,10 @@
 // Exit codes: 0 = exported, 2 = usage error, 3 = key file did not load, 4 = verification/export failed (see the
 // printed ExportStatus).
 
-#include <hengyuan/durable_audit_export.hpp>
+#include <hengyuan/durable_audit_archive.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -31,6 +32,8 @@
 
 namespace hy {
 namespace {
+
+enum class Mode { Ndjson, Archive, VerifyArchive, PrepareMigration };
 
 bool parse_kek_hex(std::string_view hex, std::array<std::byte, kKekSize>& out) {
     if (hex.size() != kKekSize * 2) return false;
@@ -67,11 +70,17 @@ void print_usage() {
         "  durable_audit_log_export --log <sink base path> --out <ndjson path>\n"
         "                            --kek-hex <64hex> --key-file <path>\n"
         "                            [--allow-missing-anchor | --require-complete-source]\n"
+        "  durable_audit_log_export --archive --log <sink base path> --out <archive path>\n"
+        "                            --kek-hex <64hex> --key-file <path>\n"
+        "  durable_audit_log_export --verify-archive --log <archive path> --kek-hex <64hex> --key-file <path>\n"
+        "  durable_audit_log_export --prepare-s7 --log <v5 sink base path> --kek-hex <64hex> --key-file <path>\n"
         "  durable_audit_log_export --usage\n"
         "--log       the DurableAuditSink base path (no suffix) -- e.g. state/audit.log.\n"
         "            Its .lock/.tip/.storeid.tip siblings are derived from this path, same as the writer's own.\n"
         "            Refuses if the writer's .lock is currently held (this is an OFFLINE tool).\n"
-        "--out       output NDJSON path; must not already exist (never overwritten).\n"
+        "--out       destination path for an NDJSON export or a raw archive.\n"
+        "            The .s7.archive suffix is reserved for --prepare-s7.\n"
+        "--prepare-s7  publish the v5 source segment and migration manifest as <log>.s7.archive.\n"
         "--kek-hex   the operator-provisioned KEK, %zu hex characters. Never a file path -- this is a diagnostic\n"
         "            tool's own argument convention, not KekLoader's file-based one.\n"
         "--key-file  a HYKEYS01 wrapped-key file (durable_audit_export.hpp's own format): the key(s) the log was\n"
@@ -93,6 +102,7 @@ int main(int argc, char** argv) {
     std::array<std::byte, kKekSize> kek{};
     bool have_kek = false;
     ExportOptions opts;
+    Mode mode = Mode::Ndjson;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -110,6 +120,14 @@ int main(int argc, char** argv) {
                 }
                 have_kek = true;
             }
+        } else if (arg == "--archive" || arg == "--verify-archive" || arg == "--prepare-s7") {
+            if (mode != Mode::Ndjson) {
+                std::fprintf(stderr, "error: choose one archive operation\n");
+                return 2;
+            }
+            if (arg == "--archive") mode = Mode::Archive;
+            else if (arg == "--verify-archive") mode = Mode::VerifyArchive;
+            else mode = Mode::PrepareMigration;
         } else if (arg == "--allow-missing-anchor") {
             opts.allow_missing_anchor = true;
         } else if (arg == "--require-complete-source") {
@@ -124,11 +142,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (log_arg.empty() || out_arg.empty() || key_file_arg.empty() || !have_kek) {
+    const bool output_required = mode == Mode::Ndjson || mode == Mode::Archive;
+    if (log_arg.empty() || key_file_arg.empty() || !have_kek || output_required != !out_arg.empty()) {
         print_usage();
         return 2;
     }
 
+    if (mode != Mode::Ndjson && (opts.require_complete_source || opts.allow_missing_anchor)) {
+        std::fprintf(stderr, "error: NDJSON source options only apply to NDJSON exports\n");
+        return 2;
+    }
     if (opts.require_complete_source && opts.allow_missing_anchor) {
         std::fprintf(stderr, "error: choose one of --require-complete-source and --allow-missing-anchor\n");
         return 2;
@@ -158,7 +181,19 @@ int main(int argc, char** argv) {
         return 3;
     }
 
-    const ExportFileResult result = export_audit_log_file(log_arg, out_arg, ring, opts);
+    const auto recorded_at = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    ExportFileResult result;
+    switch (mode) {
+        case Mode::Ndjson: result = export_audit_log_file(log_arg, out_arg, ring, opts); break;
+        case Mode::Archive:
+            result = archive_audit_log_file(log_arg, out_arg, ring, static_cast<std::int64_t>(recorded_at));
+            break;
+        case Mode::VerifyArchive: result = verify_audit_archive_file(log_arg, ring); break;
+        case Mode::PrepareMigration:
+            result = prepare_audit_migration(log_arg, ring, static_cast<std::int64_t>(recorded_at));
+            break;
+    }
     const AuditLogVerification& v = result.verification;
     std::printf("status=%s frames=%llu verified_bytes=%zu torn_tail_bytes=%zu tip_anchor=%s\n",
                export_status_name(result.status), static_cast<unsigned long long>(v.frames), v.verified_bytes,
@@ -167,6 +202,10 @@ int main(int argc, char** argv) {
                : v.anchor == AnchorState::AbsentAllowed ? "absent-allowed"
                : v.anchor == AnchorState::EmptyLog      ? "empty-log"
                                                         : "not-checked");
+    if (result.status == ExportStatus::ReservedMigrationPath) {
+        std::fprintf(stderr, "error: choose a different output path. .s7.archive is reserved for --prepare-s7\n");
+        return 4;
+    }
     if (result.status == ExportStatus::OutputSyncUncertain) {
         std::fprintf(stderr, "error: the complete output was published, but its directory could not be flushed\n");
         return 4;
@@ -176,6 +215,12 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(v.error_sequence));
         return 4;
     }
-    std::printf("wrote %s\n", out_arg.c_str());
+    if (mode == Mode::PrepareMigration) {
+        std::printf("prepared %s%s\n", log_arg.c_str(), audit_archive::kMigrationSuffix.data());
+    } else if (mode == Mode::VerifyArchive) {
+        std::printf("verified %s\n", log_arg.c_str());
+    } else {
+        std::printf("wrote %s\n", out_arg.c_str());
+    }
     return 0;
 }
