@@ -238,6 +238,20 @@ def test_naive_decision_or_period_end_is_a_caller_error() -> None:
         decision_read_verdict(observed(), T0, period_end_utc=(T0 + ONE_HOUR).replace(tzinfo=None))
 
 
+def test_a_naive_timestamp_inside_a_record_rejects_the_record_instead_of_crashing_the_batch() -> None:
+    decision_time = T0 + ONE_HOUR
+    naive_available = replace(observed(), available_at_utc=(T0 + ONE_HOUR).replace(tzinfo=None))
+    assert decision_read_verdict(naive_available, decision_time) is DecisionReadVerdict.INVALID_TIME_INFO
+    naive_received = replace(observed(), received_at_utc=(T0 + ONE_HOUR).replace(tzinfo=None))
+    assert decision_read_verdict(naive_received, decision_time, require_receipt=True) is DecisionReadVerdict.INVALID_TIME_INFO
+    naive_event = replace(observed(), event_time_utc=T0.replace(tzinfo=None))
+    assert decision_read_verdict(naive_event, decision_time) is DecisionReadVerdict.INVALID_TIME_INFO
+
+    partition = partition_by_decision_readability([observed(T0, available_at=decision_time), naive_available], decision_time)
+    assert partition.readable_indices == (0,)
+    assert [(r.index, r.verdict) for r in partition.rejected] == [(1, DecisionReadVerdict.INVALID_TIME_INFO)]
+
+
 def test_partition_keeps_order_and_reports_rejection_reasons() -> None:
     decision_time = T0 + ONE_HOUR
     infos = [

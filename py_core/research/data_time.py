@@ -191,6 +191,7 @@ class DecisionReadVerdict(StrEnum):
     """决策读数裁决：READABLE 之外的一切都是拒绝原因（fail-closed，可解释）。"""
 
     READABLE = "readable"
+    INVALID_TIME_INFO = "invalid_time_info"
     UNKNOWN_AVAILABLE_TIME = "unknown_available_time"
     AVAILABLE_AFTER_DECISION = "available_after_decision"
     RECEIPT_UNRECORDED = "receipt_unrecorded"
@@ -218,12 +219,19 @@ def decision_read_verdict(
       禁运数据，决策时刻未到之前不可读，不需要单独的"未来数据"问题码。
 
     ``decision_time_utc``/``period_end_utc`` 不是数据：不带时区或非 UTC 属于调用方
-    缺陷，直接抛 ``ValueError``，不折进数据问题码。
+    缺陷，直接抛 ``ValueError``，不折进数据问题码。记录里的 naive/非 UTC 时间戳
+    则相反是数据缺陷：整条记录以 ``INVALID_TIME_INFO`` 拒绝（批处理里一条坏
+    记录不能把整批划分炸成 ``TypeError``）。
     """
     if not _require_utc(decision_time_utc):
         raise ValueError("decision_time_utc must be timezone-aware UTC.")
     if period_end_utc is not None and not _require_utc(period_end_utc):
         raise ValueError("period_end_utc must be timezone-aware UTC.")
+    if any(
+        value is not None and not _require_utc(value)
+        for value in (info.event_time_utc, info.available_at_utc, info.received_at_utc)
+    ):
+        return DecisionReadVerdict.INVALID_TIME_INFO
 
     if info.available_at_utc is None:
         return DecisionReadVerdict.UNKNOWN_AVAILABLE_TIME
