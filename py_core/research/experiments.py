@@ -47,6 +47,8 @@ __all__ = [
     "RegistryUsageViolation",
     "RegistryUsageViolationCode",
     "counts_by_status",
+    "is_admission_eligible",
+    "params_from_mapping",
     "record_from_json_line",
     "record_to_json_line",
     "verify_blind_set_usage",
@@ -100,11 +102,11 @@ class ExperimentIssueCode(StrEnum):
     TRAIN_EVAL_OVERLAP = "TRAIN_EVAL_OVERLAP"
     DATA_DOES_NOT_COVER_WINDOWS = "DATA_DOES_NOT_COVER_WINDOWS"
     NEGATIVE_RANDOM_SEED = "NEGATIVE_RANDOM_SEED"
+    EVALUATION_WINDOW_REQUIRED = "EVALUATION_WINDOW_REQUIRED"
     DATA_WINDOW_NOT_ORDERED = "DATA_WINDOW_NOT_ORDERED"
     OBSERVED_BEFORE_EVALUATION_END = "OBSERVED_BEFORE_EVALUATION_END"
     FAILED_WITHOUT_REASON = "FAILED_WITHOUT_REASON"
     FAILURE_REASON_ON_NON_FAILURE = "FAILURE_REASON_ON_NON_FAILURE"
-    COMPLETED_WITHOUT_PREFIX_DIFFERENTIAL = "COMPLETED_WITHOUT_PREFIX_DIFFERENTIAL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +144,10 @@ class ExperimentRecord:
     ``parameters`` 是"名称 -> 值"的有序对（值以文本登记，候选空间按名称去重）；
     ``observed_at_utc`` 是这条结果被观察并记录的时刻；``recorded_by`` 是参与选择的
     人员或程序；``influenced_selection`` 把影响后续选择的诊断实验纳入选择历史。
+
+    ``train_*`` 与 ``random_seed`` 可以为空：一次**无训练**的评估运行（策略与参数在
+    运行前已冻结的全样本回测）如实留空，而不是伪造一段训练窗口。这类记录登记合法，
+    但过不了 :func:`is_admission_eligible`——准入要求净化滚动验证，登记只是如实记录。
     """
 
     trial_id: str
@@ -154,18 +160,46 @@ class ExperimentRecord:
     data_end_utc: datetime
     code_version: str
     cost_model: str
-    train_start_utc: datetime
-    train_end_utc: datetime
     eval_start_utc: datetime
     eval_end_utc: datetime
-    random_seed: int
     causal_check: CausalCheck
     observed_at_utc: datetime
     recorded_by: str
+    train_start_utc: datetime | None = None
+    train_end_utc: datetime | None = None
+    random_seed: int | None = None
     influenced_selection: bool = False
     parent_trial_id: str | None = None
     blind_set_id: str | None = None
     failure_reason: str | None = None
+
+
+def is_admission_eligible(record: ExperimentRecord) -> bool:
+    """登记侧的准入**必要条件**，不是完整准入判定。
+
+    三个必要条件：状态为 ``COMPLETED``、因果检查为 ``prefix_differential``（SAFE-05
+    / D1 的因果 2 级下限）、并且训练窗口存在（准入要求净化滚动验证；无训练的全样本
+    回测只是诊断）。任务 3.2/3.3 的其余合同（独立保留数据、成本压力、区间下限等）
+    在各自环节另行核验；通过本函数不等于准入。
+    """
+    return (
+        record.status is ExperimentStatus.COMPLETED
+        and record.causal_check is CausalCheck.PREFIX_DIFFERENTIAL
+        and record.train_start_utc is not None
+        and record.train_end_utc is not None
+    )
+
+
+def params_from_mapping(mapping: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    """把参数字典转成登记用的有序"名称 -> 文本值"对。
+
+    键按名称排序（候选空间与书写顺序无关）；字符串原样登记，其余值用
+    ``json.dumps`` 的稳定文本，保证同一字典两次转换结果逐字节一致。
+    """
+    def as_text(value: Any) -> str:
+        return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    return tuple((name, as_text(mapping[name])) for name in sorted(mapping))
 
 
 def validate_experiment_record(record: ExperimentRecord) -> tuple[ExperimentIssue, ...]:
@@ -182,7 +216,7 @@ def validate_experiment_record(record: ExperimentRecord) -> tuple[ExperimentIssu
         "observed_at_utc": record.observed_at_utc,
     }
     for field, value in datetimes.items():
-        if not _is_utc(value):
+        if value is not None and not _is_utc(value):
             issues.append(ExperimentIssue(ExperimentIssueCode.NOT_TIMEZONE_AWARE_UTC, f"{field} must be timezone-aware UTC."))
 
     for field, value in (("trial_id", record.trial_id), ("family_id", record.family_id)):
@@ -209,7 +243,9 @@ def validate_experiment_record(record: ExperimentRecord) -> tuple[ExperimentIssu
     if len(names) != len(set(names)):
         issues.append(ExperimentIssue(ExperimentIssueCode.DUPLICATE_PARAMETER_NAME, "parameter names must be unique."))
 
-    aware = {field: _is_utc(value) for field, value in datetimes.items()}
+    aware = {field: value is not None and _is_utc(value) for field, value in datetimes.items()}
+    if record.eval_start_utc is None or record.eval_end_utc is None:
+        issues.append(ExperimentIssue(ExperimentIssueCode.EVALUATION_WINDOW_REQUIRED, "an evaluation window is required."))
     if aware["train_start_utc"] and aware["train_end_utc"] and not record.train_start_utc < record.train_end_utc:
         issues.append(ExperimentIssue(ExperimentIssueCode.WINDOW_NOT_ORDERED, "train window must satisfy start < end."))
     if aware["eval_start_utc"] and aware["eval_end_utc"] and not record.eval_start_utc < record.eval_end_utc:
@@ -222,26 +258,26 @@ def validate_experiment_record(record: ExperimentRecord) -> tuple[ExperimentIssu
         issues.append(ExperimentIssue(ExperimentIssueCode.TRAIN_EVAL_OVERLAP, "the evaluation window must not overlap the training window."))
     if aware["data_start_utc"] and aware["data_end_utc"] and not record.data_start_utc < record.data_end_utc:
         issues.append(ExperimentIssue(ExperimentIssueCode.DATA_WINDOW_NOT_ORDERED, "the data range must satisfy start < end."))
-    if aware["data_start_utc"] and aware["train_start_utc"] and record.data_start_utc > record.train_start_utc:
-        issues.append(ExperimentIssue(ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS, "data_start_utc must not start after the training window."))
-    if aware["data_end_utc"] and aware["eval_end_utc"] and record.data_end_utc < record.eval_end_utc:
-        issues.append(ExperimentIssue(ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS, "data_end_utc must not end before the evaluation window."))
+    if aware["data_start_utc"] and aware["data_end_utc"]:
+        window_starts = [value for value, is_aware in ((record.train_start_utc, aware["train_start_utc"]), (record.eval_start_utc, aware["eval_start_utc"])) if is_aware]
+        window_ends = [value for value, is_aware in ((record.train_end_utc, aware["train_end_utc"]), (record.eval_end_utc, aware["eval_end_utc"])) if is_aware]
+        if window_starts and record.data_start_utc > min(window_starts):
+            issues.append(ExperimentIssue(ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS, "data_start_utc must not start after the earliest window."))
+        if window_ends and record.data_end_utc < max(window_ends):
+            issues.append(ExperimentIssue(ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS, "data_end_utc must not end before the latest window."))
 
-    if record.random_seed < 0:
-        issues.append(ExperimentIssue(ExperimentIssueCode.NEGATIVE_RANDOM_SEED, "random_seed must not be negative."))
+    if record.random_seed is not None and (isinstance(record.random_seed, bool) or not isinstance(record.random_seed, int) or record.random_seed < 0):
+        issues.append(ExperimentIssue(ExperimentIssueCode.NEGATIVE_RANDOM_SEED, "random_seed must be a non-negative integer or None (deterministic run)."))
 
     if record.status is ExperimentStatus.FAILED and (record.failure_reason is None or not record.failure_reason.strip()):
         issues.append(ExperimentIssue(ExperimentIssueCode.FAILED_WITHOUT_REASON, "a FAILED trial must record its failure reason."))
     if record.status is not ExperimentStatus.FAILED and record.failure_reason is not None:
         issues.append(ExperimentIssue(ExperimentIssueCode.FAILURE_REASON_ON_NON_FAILURE, "failure_reason belongs on FAILED trials only."))
 
-    if record.status is ExperimentStatus.COMPLETED and record.causal_check is not CausalCheck.PREFIX_DIFFERENTIAL:
-        issues.append(
-            ExperimentIssue(
-                ExperimentIssueCode.COMPLETED_WITHOUT_PREFIX_DIFFERENTIAL,
-                "a COMPLETED trial must carry causal_check=prefix_differential (SAFE-05 / D1 admission contract).",
-            )
-        )
+    # 因果检查只是如实登记的字段：COMPLETED + index_only 是合法登记（预计算信号的
+    # 诊断性回测必须能进台账），但它过不了 is_admission_eligible()——准入的因果
+    # 2 级下限在准入侧核验，不在登记侧拒绝。
+
     if (
         record.status is ExperimentStatus.COMPLETED
         and aware["observed_at_utc"]
@@ -319,8 +355,8 @@ def record_to_json_line(record: ExperimentRecord) -> str:
         "data_end_utc": record.data_end_utc.isoformat(),
         "code_version": record.code_version,
         "cost_model": record.cost_model,
-        "train_start_utc": record.train_start_utc.isoformat(),
-        "train_end_utc": record.train_end_utc.isoformat(),
+        "train_start_utc": record.train_start_utc.isoformat() if record.train_start_utc is not None else None,
+        "train_end_utc": record.train_end_utc.isoformat() if record.train_end_utc is not None else None,
         "eval_start_utc": record.eval_start_utc.isoformat(),
         "eval_end_utc": record.eval_end_utc.isoformat(),
         "random_seed": record.random_seed,
@@ -364,6 +400,11 @@ def record_from_json_line(line: str, line_number: int) -> ExperimentRecord:
             raise corrupt(f"field {name!r} must be timezone-aware UTC")
         return value
 
+    def datetime_field_or_none(name: str) -> datetime | None:
+        if field(name) is None:
+            return None
+        return datetime_field(name)
+
     try:
         status = ExperimentStatus(field("status"))
         causal = CausalCheck(field("causal_check"))
@@ -388,8 +429,8 @@ def record_from_json_line(line: str, line_number: int) -> ExperimentRecord:
     if not isinstance(payload["influenced_selection"], bool):
         raise corrupt("field 'influenced_selection' must be a boolean")
     seed = payload["random_seed"]
-    if not isinstance(seed, int) or isinstance(seed, bool):
-        raise corrupt("random_seed must be an integer")
+    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+        raise corrupt("random_seed must be an integer or null (deterministic run)")
 
     record = ExperimentRecord(
         trial_id=field("trial_id"),
@@ -403,8 +444,8 @@ def record_from_json_line(line: str, line_number: int) -> ExperimentRecord:
         data_end_utc=datetime_field("data_end_utc"),
         code_version=field("code_version"),
         cost_model=field("cost_model"),
-        train_start_utc=datetime_field("train_start_utc"),
-        train_end_utc=datetime_field("train_end_utc"),
+        train_start_utc=datetime_field_or_none("train_start_utc"),
+        train_end_utc=datetime_field_or_none("train_end_utc"),
         eval_start_utc=datetime_field("eval_start_utc"),
         eval_end_utc=datetime_field("eval_end_utc"),
         random_seed=field("random_seed"),
