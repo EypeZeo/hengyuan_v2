@@ -114,11 +114,13 @@ def test_default_bootstrap_result_remains_the_baseline_variant(monkeypatch: pyte
     assert baseline == original
 
 
-def _replication_metrics(primary_coverage: bool) -> calibrate_plan04_tail_ranked.ReplicationMetrics:
+def _replication_metrics(
+    primary_coverage: bool, *, long_false_positive: bool = False
+) -> calibrate_plan04_tail_ranked.ReplicationMetrics:
     base = calibrate_plan04_tail_ranked.ReplicationMetrics
     return base(
         coverage=(False, primary_coverage, False),
-        false_positive=(False, False, False),
+        false_positive=(False, False, long_false_positive),
         stable_false_positive=False,
         any_detected=False,
         all_detected=False,
@@ -184,3 +186,108 @@ def test_ranked_smoke_calibration_is_deterministic_and_reports_frozen_protocol()
         assert result["adjusted"]["failures"] == {}
         assert result["paired_primary_coverage"] is not None
     json.dumps(first, allow_nan=False)
+
+
+def test_by_length_smoke_reports_frozen_seed_and_rank_levels() -> None:
+    report = calibrate_plan04_tail_ranked.run_length_calibration(smoke=True, workers=1)
+
+    assert report["protocol"] == "plan04-tail-length-calibration-v1"
+    assert report["status"] == "smoke"
+    assert report["seed"] == 20261130
+    assert report["repetitions_per_scenario"] == 4
+    assert report["resamples_per_length"] == 99
+    assert report["block_lengths"] == [7, 14, 28]
+    assert report["levels_per_thousand_by_method"] == {
+        "baseline": (950, 950, 950),
+        "fixed_rank": (965, 965, 965),
+        "adjusted": (960, 965, 980),
+    }
+    assert report["minimum_long_false_positive_reduction"] == pytest.approx(0.01)
+    for result in report["results"]:
+        for method in ("baseline", "fixed_rank", "adjusted"):
+            assert result[method]["valid_repetitions"] == 4
+            assert result[method]["failures"] == {}
+        assert result["paired_primary_coverage"] is not None
+        if result["scenario"]["name"] in calibrate_plan04_tail_ranked._LONG_SCENARIOS:
+            assert result["paired_long_false_positive"]["valid_repetitions"] == 4
+        else:
+            assert "paired_long_false_positive" not in result
+    json.dumps(report, allow_nan=False)
+
+
+def test_by_length_replication_shares_the_fourteen_day_fixed_rank_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    levels_by_length = ((950, 965, 960), (950, 965, 965), (950, 965, 980))
+    calls: list[tuple[float, tuple[int, ...]]] = []
+    bootstrap = calibrate_plan04_tail_ranked.bootstrap_tail_band_levels
+
+    def record_levels(
+        returns: np.ndarray,
+        *,
+        block_length: float,
+        n_resamples: int,
+        rng: np.random.Generator,
+        levels_per_thousand: tuple[int, ...],
+    ) -> tuple[plan04_paired_tail.TailFamilyBands, ...]:
+        calls.append((block_length, levels_per_thousand))
+        return bootstrap(
+            returns,
+            block_length=block_length,
+            n_resamples=n_resamples,
+            rng=rng,
+            levels_per_thousand=levels_per_thousand,
+        )
+
+    monkeypatch.setattr(calibrate_plan04_tail_ranked, "bootstrap_tail_band_levels", record_levels)
+    scenario = next(
+        item for item in calibrate_plan04_tail_ranked.SCENARIOS if item.name == "ar_positive_null"
+    )
+    outcome = calibrate_plan04_tail_ranked._replication(
+        (scenario, np.random.SeedSequence(20261130), 99, levels_by_length)
+    )
+
+    assert not isinstance(outcome, str)
+    assert calls == list(zip(calibrate_plan04_tail_ranked.BLOCK_LENGTHS, levels_by_length, strict=True))
+    fixed_rank, adjusted = outcome[1], outcome[2]
+    fourteen_day_index = calibrate_plan04_tail_ranked.BLOCK_LENGTHS.index(14)
+    assert fixed_rank.coverage[fourteen_day_index] == adjusted.coverage[fourteen_day_index]
+    assert fixed_rank.false_positive[fourteen_day_index] == adjusted.false_positive[fourteen_day_index]
+    assert fixed_rank.half_widths[fourteen_day_index] == adjusted.half_widths[fourteen_day_index]
+
+
+def test_long_false_positive_comparison_enforces_a_one_percent_paired_reduction() -> None:
+    fixed = [_replication_metrics(False, long_false_positive=True) for _ in range(100)]
+    adjusted_at_threshold = [_replication_metrics(False, long_false_positive=True) for _ in range(99)]
+    adjusted_at_threshold.append(_replication_metrics(False))
+
+    passed = calibrate_plan04_tail_ranked.compare_long_false_positives(fixed, adjusted_at_threshold)
+
+    assert passed["fixed_rank_only"] == 1
+    assert passed["adjusted_only"] == 0
+    assert passed["net_reduction"] == pytest.approx(0.01)
+    assert passed["criterion"] == "within_tolerance"
+
+    fixed_below_threshold = [_replication_metrics(False, long_false_positive=True) for _ in range(101)]
+    adjusted_below_threshold = [_replication_metrics(False, long_false_positive=True) for _ in range(100)]
+    adjusted_below_threshold.append(_replication_metrics(False))
+    failed = calibrate_plan04_tail_ranked.compare_long_false_positives(
+        fixed_below_threshold, adjusted_below_threshold
+    )
+
+    assert failed["net_reduction"] == pytest.approx(1 / 101)
+    assert failed["criterion"] == "not_met"
+
+
+@pytest.mark.parametrize("levels", [(), (0,), (1000,), (True,), (950.5,)])
+def test_rank_level_api_rejects_empty_noninteger_and_out_of_range_levels(
+    levels: tuple[object, ...],
+) -> None:
+    with pytest.raises(ValueError, match="rank levels must be integers between 1 and 999"):
+        plan04_paired_tail.bootstrap_tail_band_levels(
+            np.zeros((20, 2)),
+            block_length=7,
+            n_resamples=39,
+            rng=np.random.default_rng(24),
+            levels_per_thousand=levels,  # type: ignore[arg-type]
+        )

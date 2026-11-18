@@ -102,7 +102,7 @@ def _bands_from_half_width(
     return TailFamilyBands(half_width, count, bands)
 
 
-def _bootstrap_tail_band_levels(
+def bootstrap_tail_band_levels(
     returns: Sequence[Sequence[float]] | np.ndarray,
     *,
     block_length: float,
@@ -110,6 +110,11 @@ def _bootstrap_tail_band_levels(
     rng: np.random.Generator,
     levels_per_thousand: tuple[int, ...],
 ) -> tuple[TailFamilyBands, ...]:
+    """Return one band per rank level, in input order, from shared resampled errors."""
+    if not levels_per_thousand or any(
+        type(level) is not int or not 0 < level < 1000 for level in levels_per_thousand
+    ):
+        raise ValueError("rank levels must be integers between 1 and 999")
     values = _return_matrix(returns)
     count = worst_five_percent_count(values.shape[0])
     indices = stationary_bootstrap_indices(
@@ -144,7 +149,7 @@ def bootstrap_tail_bands(
     rng: np.random.Generator,
 ) -> TailFamilyBands:
     """Estimate paired tail differences using shared date draws and one family half-width."""
-    return _bootstrap_tail_band_levels(
+    return bootstrap_tail_band_levels(
         returns,
         block_length=block_length,
         n_resamples=n_resamples,
@@ -161,7 +166,7 @@ def bootstrap_tail_band_variants(
     rng: np.random.Generator,
 ) -> tuple[TailFamilyBands, TailFamilyBands]:
     """Return the original and prespecified wider bands using the same resampled errors."""
-    baseline, adjusted = _bootstrap_tail_band_levels(
+    baseline, adjusted = bootstrap_tail_band_levels(
         returns,
         block_length=block_length,
         n_resamples=n_resamples,
