@@ -28,6 +28,8 @@ from py_core.research.experiments import (
     RegistryFormatError,
     RegistryUsageViolationCode,
     counts_by_status,
+    is_admission_eligible,
+    params_from_mapping,
     record_from_json_line,
     record_to_json_line,
     validate_experiment_record,
@@ -93,13 +95,19 @@ def test_a_default_record_and_every_status_are_valid() -> None:
         assert validate_issues(make_record(**overrides)) == (), status
 
 
-def test_completed_requires_prefix_differential() -> None:
-    assert validate_issues(make_record(causal_check=CausalCheck.INDEX_ONLY)) == (
-        ExperimentIssueCode.COMPLETED_WITHOUT_PREFIX_DIFFERENTIAL,
-    )
-    assert validate_issues(make_record(causal_check=CausalCheck.NOT_RUN)) == (
-        ExperimentIssueCode.COMPLETED_WITHOUT_PREFIX_DIFFERENTIAL,
-    )
+def test_completed_with_a_weaker_causal_check_is_registrable_but_not_admission_eligible() -> None:
+    # 登记 vs 准入的分工（任务 3.2 / 3.4）：预计算信号的诊断回测必须能进台账
+    # （causal_check 如实登记为 index_only），但它过不了登记侧的准入必要条件。
+    for causal in (CausalCheck.INDEX_ONLY, CausalCheck.NOT_RUN):
+        record = make_record(causal_check=causal)
+        assert validate_issues(record) == ()
+        assert is_admission_eligible(record) is False
+    assert is_admission_eligible(make_record()) is True
+    # 缺少训练窗口的无训练评估运行同样登记合法、准入不合格。
+    no_train = make_record(train_start_utc=None, train_end_utc=None)
+    assert validate_issues(no_train) == ()
+    assert is_admission_eligible(no_train) is False
+    assert is_admission_eligible(make_record(status=ExperimentStatus.FAILED, failure_reason="boom")) is False
 
 
 def test_failed_requires_a_reason_and_others_must_not_carry_one() -> None:
@@ -150,6 +158,38 @@ def test_windows_must_be_ordered_and_disjoint_and_covered_by_the_data() -> None:
         ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS,
     )
     assert validate_issues(make_record(random_seed=-1)) == (ExperimentIssueCode.NEGATIVE_RANDOM_SEED,)
+    assert validate_issues(make_record(random_seed=True)) == (ExperimentIssueCode.NEGATIVE_RANDOM_SEED,)
+
+
+def test_an_evaluation_window_is_required_even_without_training() -> None:
+    no_windows = make_record(eval_start_utc=None, eval_end_utc=None, train_start_utc=None, train_end_utc=None)
+    assert validate_issues(no_windows) == (ExperimentIssueCode.EVALUATION_WINDOW_REQUIRED,)
+    # 一次无训练的评估运行（策略/参数已冻结的全样本回测）登记合法。
+    evaluation_only = make_record(train_start_utc=None, train_end_utc=None, random_seed=None)
+    assert validate_issues(evaluation_only) == ()
+
+
+def test_the_data_range_covers_evaluation_when_there_is_no_training_window() -> None:
+    assert validate_issues(
+        make_record(train_start_utc=None, train_end_utc=None, data_end_utc=datetime(2025, 12, 1, tzinfo=UTC))
+    ) == (ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS,)
+    # 评估窗是唯一的窗口：数据起点早于评估起点即合法，不再要求覆盖一段训练窗。
+    assert validate_issues(
+        make_record(train_start_utc=None, train_end_utc=None, data_start_utc=datetime(2025, 2, 1, tzinfo=UTC))
+    ) == ()
+
+
+def test_params_from_mapping_is_sorted_and_stable() -> None:
+    pairs = params_from_mapping({"zeta": "1", "alpha": {"b": 2}, "mid": 3.5})
+    assert [name for name, _ in pairs] == ["alpha", "mid", "zeta"]
+    assert pairs == (("alpha", '{"b": 2}'), ("mid", "3.5"), ("zeta", "1"))
+    assert params_from_mapping({"alpha": '{"b": 2}'}) == params_from_mapping({"alpha": '{"b": 2}'})
+
+
+def test_the_json_line_round_trip_preserves_null_train_windows_and_null_seed() -> None:
+    record = make_record(train_start_utc=None, train_end_utc=None, random_seed=None)
+    restored = record_from_json_line(record_to_json_line(record), 1)
+    assert restored == record
 
 
 def test_adjacent_windows_share_a_boundary_legally() -> None:
@@ -235,7 +275,7 @@ def test_a_child_before_its_parent_is_a_corrupt_file(tmp_path: Path) -> None:
         lambda: record_to_json_line(make_record()).replace('"random_seed":7', '"random_seed":7.5'),
         lambda: record_to_json_line(make_record()).replace('"purpose":"', '"purpose":42,"x":"'),
         lambda: record_to_json_line(make_record()) + '{"extra":true}',
-        lambda: record_to_json_line(make_record(causal_check=CausalCheck.INDEX_ONLY)),
+        lambda: record_to_json_line(make_record()).replace('"eval_end_utc":"2026-01-01T00:00:00+00:00"', '"eval_end_utc":null'),
         lambda: record_to_json_line(make_record()) + record_to_json_line(make_record()),
     ],
 )

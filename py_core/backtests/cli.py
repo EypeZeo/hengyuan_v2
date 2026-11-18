@@ -61,6 +61,16 @@ from py_core.manual_ohlcv import (
     NormalizedOhlcvRecord,
     OhlcvTimeframe,
 )
+from py_core.research.experiments import (
+    CausalCheck,
+    ExperimentRecord,
+    ExperimentRegistry,
+    ExperimentStatus,
+    RegistryCorruptError,
+    RegistryFormatError,
+    is_admission_eligible,
+    params_from_mapping,
+)
 from py_core.risk.risk_config import RiskConfig
 from py_core.strategies.base import (
     DEFAULT_CAUSAL_POINTS,
@@ -75,6 +85,89 @@ NON_AUTH_NOTICE = (
     "NOT financial advice. NOT trading authorization.\n"
     "NOT dry-run readiness. NOT live readiness.\n"
 )
+
+DEFAULT_EXPERIMENT_REGISTRY = ".var/research/experiments.jsonl"
+
+
+def register_backtest_trial(
+    args: argparse.Namespace,
+    *,
+    records: list[NormalizedOhlcvRecord],
+    causal_evidence: CausalEvidence | None,
+    strategy_params: dict[str, Any],
+    run_id: str,
+) -> ExperimentRecord:
+    """把一次回测运行登记进实验台账（任务 3.2：登记所有候选，含诊断性回测）。
+
+    登记**发生在产物落盘之后**：产物已存在而登记失败是研究纪律事故，调用方必须
+    把它当作失败 loudly 报告，不能静默吞掉（否则台账只剩获胜参数）。无训练的全
+    样本回测如实登记为没有训练窗口的评估运行；``--strategy`` 路径因果检查是
+    ``prefix_differential``，``--signals`` 路径如实登记 ``index_only``——后者登记
+    合法但过不了准入必要条件（:func:`is_admission_eligible`）。
+
+    Raises:
+        RegistryFormatError: 记录不满足登记合同（含 trial_id 重复）。
+        RegistryCorruptError: 台账文件损坏。
+        OSError: 台账文件不可写。
+    """
+    if not records:
+        raise ValueError("no OHLCV records to register")
+    trial_id = getattr(args, "trial_id", None) or run_id
+    family = getattr(args, "experiment_family", None)
+    if not family:
+        family = args.strategy.split(":", 1)[0].rsplit(".", 1)[-1] if args.strategy else "signals_csv"
+
+    causal_check = CausalCheck.PREFIX_DIFFERENTIAL if causal_evidence is not None else CausalCheck.INDEX_ONLY
+
+    fingerprint = ohlcv_fingerprint(Path(args.ohlcv), records)
+    if fingerprint.get("kind") == "file_sha256":
+        data_version = f"ohlcv_sha256:{fingerprint['sha256'][:16]}"
+    else:
+        data_version = "ohlcv_summary:" + json.dumps(fingerprint, sort_keys=True, ensure_ascii=False)
+
+    strategy_fingerprint = strategy_source_fingerprint(args.strategy)
+    if strategy_fingerprint is not None and strategy_fingerprint.get("source_available"):
+        code_version = f"strategy_sha256:{strategy_fingerprint['sha256'][:16]}"
+    elif args.strategy:
+        code_version = f"strategy_spec:{args.strategy}"
+    else:
+        code_version = "signals_csv"
+
+    parameters = dict(strategy_params)
+    parameters.update(
+        {
+            "market": args.market,
+            "symbol": args.symbol,
+            "timeframe": args.timeframe,
+            "initial_capital": args.initial_capital,
+        }
+    )
+
+    data_start = records[0].event_time_utc
+    data_end = records[-1].event_time_utc
+    record = ExperimentRecord(
+        trial_id=trial_id,
+        family_id=family,
+        purpose=f"{args.command}: research backtest run (non-authorizing)",
+        status=ExperimentStatus.COMPLETED,
+        parameters=params_from_mapping(parameters),
+        data_version=data_version,
+        data_start_utc=data_start,
+        data_end_utc=data_end,
+        code_version=code_version,
+        cost_model=f"fee_{args.fee_bps:g}bps_slippage_{args.slippage_bps:g}bps",
+        eval_start_utc=data_start,
+        eval_end_utc=data_end,
+        causal_check=causal_check,
+        observed_at_utc=datetime.now(UTC),
+        recorded_by="backtests.cli",
+    )
+    # 任务 3.2 的登记入口与 save_results 同一约定：自动创建 .var 下的目录。
+    registry_path = Path(args.experiment_registry)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry = ExperimentRegistry(registry_path)
+    registry.register(record)
+    return record
 
 
 def validate_run_id(run_id: str) -> None:
@@ -538,6 +631,24 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
         strategy_fingerprint_info=strategy_source_fingerprint(args.strategy),
     )
     print(f"\n[INFO] Artifacts 已保存至: {run_dir}")
+
+    # 实验登记（任务 3.2）：与 run 子命令同一合同，失败 loudly 报告。
+    if not getattr(args, "no_experiment_registry", False):
+        try:
+            record = register_backtest_trial(
+                args, records=records, causal_evidence=causal_evidence, strategy_params=strategy_params, run_id=run_id
+            )
+        except (RegistryFormatError, RegistryCorruptError, OSError, ValueError) as exc:
+            print(f"[ERROR] 实验登记失败: {exc}", file=sys.stderr)
+            return 1
+        eligible = is_admission_eligible(record)
+        print(
+            f"[INFO] experiment registry: trial_id={record.trial_id} family={record.family_id} "
+            f"causal_check={record.causal_check.value} admission_eligible={eligible}"
+        )
+        if not eligible:
+            print("[WARN] run registered but NOT admission-eligible: it must not carry final-evaluation conclusions")
+
     print(NON_AUTH_NOTICE)
     return 0
 
@@ -655,6 +766,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         strategy_fingerprint_info=strategy_source_fingerprint(args.strategy),
     )
     print(f"\n[INFO] 结果已保存至: {output_dir.resolve()}")
+
+    # 实验登记（任务 3.2）：登记所有候选，发生在产物落盘之后；失败 loudly 报告。
+    if not getattr(args, "no_experiment_registry", False):
+        try:
+            record = register_backtest_trial(
+                args, records=records, causal_evidence=causal_evidence, strategy_params=strategy_params, run_id=run_id
+            )
+        except (RegistryFormatError, RegistryCorruptError, OSError, ValueError) as exc:
+            print(f"[ERROR] 实验登记失败: {exc}", file=sys.stderr)
+            return 1
+        eligible = is_admission_eligible(record)
+        print(
+            f"[INFO] experiment registry: trial_id={record.trial_id} family={record.family_id} "
+            f"causal_check={record.causal_check.value} admission_eligible={eligible}"
+        )
+        if not eligible:
+            print("[WARN] run registered but NOT admission-eligible: it must not carry final-evaluation conclusions")
+
     print(NON_AUTH_NOTICE)
     return 0
 
@@ -712,6 +841,26 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--symbol", default="BTC/USDT", help="交易对符号（默认 BTC/USDT）")
     run_parser.add_argument("--timeframe", default="1d", help="时间周期（默认 1d）")
     run_parser.add_argument("--run-id", default=None, help="自定义 run_id（用于输出目录）")
+    run_parser.add_argument(
+        "--experiment-registry",
+        default=DEFAULT_EXPERIMENT_REGISTRY,
+        help=f"实验登记台账（JSONL）路径（默认 {DEFAULT_EXPERIMENT_REGISTRY}）",
+    )
+    run_parser.add_argument(
+        "--no-experiment-registry",
+        action="store_true",
+        help="跳过实验登记（默认登记每一次运行；任务 3.2：登记所有候选）",
+    )
+    run_parser.add_argument(
+        "--experiment-family",
+        default=None,
+        help="实验族 id（默认取策略模块名；--signals 路径默认 signals_csv）",
+    )
+    run_parser.add_argument(
+        "--trial-id",
+        default=None,
+        help="实验 trial_id（默认跟随 run_id；重跑必须换新的 trial_id）",
+    )
 
     # ── run-risk-aware subcommand ────────────────────────────────────────────
     rra_parser = subparsers.add_parser("run-risk-aware", help="运行风险感知回测（P2-RM-03）")
@@ -786,6 +935,26 @@ def build_parser() -> argparse.ArgumentParser:
     rra_parser.add_argument("--symbol", default="BTC/USDT", help="交易对符号（默认 BTC/USDT）")
     rra_parser.add_argument("--timeframe", default="1d", help="时间周期（默认 1d）")
     rra_parser.add_argument("--run-id", default=None, help="自定义 run_id（用于输出目录）")
+    rra_parser.add_argument(
+        "--experiment-registry",
+        default=DEFAULT_EXPERIMENT_REGISTRY,
+        help=f"实验登记台账（JSONL）路径（默认 {DEFAULT_EXPERIMENT_REGISTRY}）",
+    )
+    rra_parser.add_argument(
+        "--no-experiment-registry",
+        action="store_true",
+        help="跳过实验登记（默认登记每一次运行；任务 3.2：登记所有候选）",
+    )
+    rra_parser.add_argument(
+        "--experiment-family",
+        default=None,
+        help="实验族 id（默认取策略模块名；--signals 路径默认 signals_csv）",
+    )
+    rra_parser.add_argument(
+        "--trial-id",
+        default=None,
+        help="实验 trial_id（默认跟随 run_id；重跑必须换新的 trial_id）",
+    )
 
     return parser
 
