@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, DecimalException
 from itertools import pairwise
@@ -34,6 +34,7 @@ _ONE = Decimal(1)
 _INTERVAL = timedelta(hours=4)
 _CNY, _QUOTE, _BASE = "CNY", "quote", "base"
 ALLOCATION_REFERENCE = "buy_hold_allocated"
+EXPOSURE_MATCH_TOLERANCE = Decimal("0.05")
 _PASSIVE_TRIALS = (("cash_cny", None), ("cash_quote", None), ("buy_hold", None))
 _TREND_TRIALS = (("trend_14d", TREND_BARS_4H_14D), ("trend_28d", TREND_BARS_4H_28D))
 TRIALS = (*_PASSIVE_TRIALS, *_TREND_TRIALS)
@@ -354,3 +355,130 @@ def compare_cash_flows(
                 name, ExperimentStatus.FAILED, total_contributed, CausalCheck.NOT_RUN, failure_reason=str(error)
             ))
     return ComparisonResult(schedule, tuple(outcomes))
+
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureGridPoint:
+    allocation: Decimal
+    mean_base_exposure: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureSelection:
+    candidate: str
+    allocation: Decimal
+    calibration_trend_exposure: Decimal
+    calibration_reference_exposure: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureFit:
+    ends_at_utc: datetime
+    execution: ExecutionAssumptions
+    grid: tuple[ExposureGridPoint, ...]
+    selections: tuple[ExposureSelection, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExposurePair:
+    selection: ExposureSelection
+    trend: TrialOutcome
+    reference: TrialOutcome
+    exposure_gap: Decimal
+    baseline_exposure_gap: Decimal
+    closer: bool
+    within_tolerance: bool
+    pnl_difference_cny: Decimal | None
+    drawdown_difference: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureEvaluation:
+    baseline: TrialOutcome
+    pairs: tuple[ExposurePair, ...]
+
+
+def _exposure(outcome: TrialOutcome) -> Decimal:
+    if outcome.mean_base_exposure is None:
+        raise ValueError(f"{outcome.name} has no measured base-asset exposure")
+    return outcome.mean_base_exposure
+
+
+def _exposure_reference(
+    allocation: Decimal,
+    bars: tuple[ComparisonBar, ...],
+    funding: dict[datetime, Decimal],
+    execution: ExecutionAssumptions,
+) -> TrialOutcome:
+    name = "cash_quote" if allocation == 0 else ALLOCATION_REFERENCE
+    settings = replace(execution, strategy_allocation=allocation)
+    return _replay_trial(name, None, bars, funding, settings, measure_exposure=True)
+
+
+def fit_exposure_allocations(
+    bars: Sequence[ComparisonBar],
+    contributions: Sequence[CashContribution],
+    execution: ExecutionAssumptions,
+) -> ExposureFit:
+    """Select the closest buy-and-hold allocation using only calibration exposure."""
+    market, schedule = tuple(bars), tuple(contributions)
+    _validate(market, schedule, execution)
+    funding = {item.open_time_utc: item.amount_cny for item in schedule}
+    targets = [
+        (name, _exposure(_replay_trial(name, window, market, funding, execution, measure_exposure=True)))
+        for name, window in _TREND_TRIALS
+    ]
+    grid = []
+    for percent in range(51):
+        allocation = Decimal(percent).scaleb(-2)
+        reference = _exposure_reference(allocation, market, funding, execution)
+        grid.append(ExposureGridPoint(allocation, _exposure(reference)))
+    selections = []
+    for candidate, target in targets:
+        nearest = min(grid, key=lambda point: (abs(point.mean_base_exposure - target), point.allocation))
+        selections.append(ExposureSelection(candidate, nearest.allocation, target, nearest.mean_base_exposure))
+    return ExposureFit(market[-1].open_time_utc + _INTERVAL, execution, tuple(grid), tuple(selections))
+
+
+def _difference(left: Decimal | None, right: Decimal | None) -> Decimal | None:
+    return left - right if left is not None and right is not None else None
+
+
+def evaluate_exposure_allocations(
+    fit: ExposureFit,
+    bars: Sequence[ComparisonBar],
+    contributions: Sequence[CashContribution],
+) -> ExposureEvaluation:
+    """Compare frozen allocations on a later account history with shared funding."""
+    market, schedule = tuple(bars), tuple(contributions)
+    execution = fit.execution
+    _validate(market, schedule, execution)
+    if market[0].open_time_utc < fit.ends_at_utc:
+        raise ValueError("evaluation must start at or after the calibration window closes")
+    funding = {item.open_time_utc: item.amount_cny for item in schedule}
+    baseline = _exposure_reference(execution.strategy_allocation, market, funding, execution)
+    windows = dict(_TREND_TRIALS)
+    references = {execution.strategy_allocation: baseline}
+    pairs = []
+    for selection in fit.selections:
+        trend = _replay_trial(
+            selection.candidate, windows[selection.candidate], market, funding, execution, measure_exposure=True
+        )
+        if selection.allocation not in references:
+            references[selection.allocation] = _exposure_reference(selection.allocation, market, funding, execution)
+        reference = references[selection.allocation]
+        exposure_gap = abs(_exposure(trend) - _exposure(reference))
+        baseline_gap = abs(_exposure(trend) - _exposure(baseline))
+        pairs.append(ExposurePair(
+            selection=selection,
+            trend=trend,
+            reference=reference,
+            exposure_gap=exposure_gap,
+            baseline_exposure_gap=baseline_gap,
+            closer=exposure_gap < baseline_gap,
+            within_tolerance=exposure_gap <= EXPOSURE_MATCH_TOLERANCE,
+            pnl_difference_cny=_difference(trend.all_in_pnl_cny, reference.all_in_pnl_cny),
+            drawdown_difference=_difference(trend.max_drawdown, reference.max_drawdown),
+        ))
+    return ExposureEvaluation(baseline, tuple(pairs))

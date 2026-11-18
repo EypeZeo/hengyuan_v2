@@ -164,7 +164,7 @@ def _trial_records(
     return tuple(records)
 
 
-def _serialize(value: object) -> str:
+def serialize_report_value(value: object) -> str:
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, datetime):
@@ -228,7 +228,7 @@ def main() -> int:
             start_utc=bars[0].open_time_utc,
             end_utc=bars[-1].open_time_utc + timedelta(hours=4),
         )
-    print(json.dumps(report, indent=2, default=_serialize, allow_nan=False))
+    print(json.dumps(report, indent=2, default=serialize_report_value, allow_nan=False))
     return int(failed)
 
 
