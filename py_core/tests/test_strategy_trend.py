@@ -6,16 +6,21 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 
+from py_core.backtests.cli import build_parser, cmd_run
+from py_core.research.experiments import CausalCheck, ExperimentRegistry
 from py_core.strategies.base import checked_signals
 from py_core.strategies.trend import (
     MAX_HOLD_BARS_4H_21D,
-    TREND_BARS_4H_4D,
+    TREND_BARS_4H_14D,
     TREND_BARS_4H_28D,
     TrendFollowingStrategy,
 )
@@ -41,26 +46,89 @@ def signals_of(closes: list[float], **kwargs: Any) -> list[float]:
     return list(TrendFollowingStrategy(**kwargs).generate_signals(make_df(closes)))
 
 
+def write_ohlcv_csv(path: Path, closes: list[float]) -> None:
+    lines = ["timestamp_utc,open,high,low,close,volume"]
+    for bar, close in enumerate(closes):
+        timestamp = _BASE_DT + timedelta(hours=4 * bar)
+        timestamp_text = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append(f"{timestamp_text},{close},{close},{close},{close},1000")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # 构造参数
 # ---------------------------------------------------------------------------
 
 
 def test_frozen_first_batch_defaults_match_the_plan() -> None:
-    assert TREND_BARS_4H_4D == 24
+    assert TREND_BARS_4H_14D == 84
     assert TREND_BARS_4H_28D == 168
     assert MAX_HOLD_BARS_4H_21D == 126
+    strategy = TrendFollowingStrategy()
+    assert strategy.trend_bars == TREND_BARS_4H_14D
+    assert strategy.max_hold_bars == MAX_HOLD_BARS_4H_21D
 
 
-@pytest.mark.parametrize("bad", [{"trend_bars": 0}, {"trend_bars": -3}, {"max_hold_bars": 0}])
+@pytest.mark.parametrize(
+    "bad",
+    [{"trend_bars": 0}, {"trend_bars": -3}, {"max_hold_bars": 0}, {"max_hold_bars": -3}],
+)
 def test_non_positive_parameters_are_rejected(bad: dict[str, int]) -> None:
     with pytest.raises(ValueError, match="必须为正整数"):
         TrendFollowingStrategy(**bad)
 
 
-def test_a_hold_cap_shorter_than_the_trend_window_is_rejected_as_a_unit_error() -> None:
-    with pytest.raises(ValueError, match="换算错误"):
-        TrendFollowingStrategy(trend_bars=24, max_hold_bars=10)
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("trend_bars", True),
+        ("trend_bars", 5.0),
+        ("trend_bars", np.float64(5.0)),
+        ("max_hold_bars", True),
+        ("max_hold_bars", 5.0),
+        ("max_hold_bars", np.float64(5.0)),
+    ],
+)
+def test_window_parameters_reject_booleans_and_floats(parameter: str, value: object) -> None:
+    with pytest.raises(ValueError, match="必须为正整数"):
+        TrendFollowingStrategy(**{parameter: value})
+
+
+def test_window_parameters_accept_numpy_integer_types() -> None:
+    strategy = TrendFollowingStrategy(trend_bars=np.int64(84), max_hold_bars=np.int32(126))
+
+    assert strategy.trend_bars == 84
+    assert strategy.max_hold_bars == 126
+
+
+def test_28_day_trend_accepts_21_day_hold_cap_and_resets_after_cap_on_rising_path() -> None:
+    total_bars = TREND_BARS_4H_28D + MAX_HOLD_BARS_4H_21D + 2
+    closes = [100.0 + i for i in range(total_bars)]
+    result = signals_of(
+        closes,
+        trend_bars=TREND_BARS_4H_28D,
+        max_hold_bars=MAX_HOLD_BARS_4H_21D,
+    )
+
+    assert all(pd.isna(value) for value in result[:TREND_BARS_4H_28D])
+    entry_bar = TREND_BARS_4H_28D
+    cap_exit_bar = entry_bar + MAX_HOLD_BARS_4H_21D
+    assert result[entry_bar] == 1.0
+    assert all(value == 1.0 for value in result[entry_bar:cap_exit_bar])
+    assert result[cap_exit_bar] == 0.0
+    assert all(value == 0.0 for value in result[cap_exit_bar:])
+
+
+@pytest.mark.parametrize(("hours_per_bar", "omitted_bar"), [(4, 2), (3, None)])
+def test_the_strategy_rejects_missing_or_non_4h_bars(hours_per_bar: int, omitted_bar: int | None) -> None:
+    bar_numbers = [bar for bar in range(6) if bar != omitted_bar]
+    frame = make_df([100.0 + bar for bar in bar_numbers])
+    frame.index = pd.DatetimeIndex(
+        [_BASE_DT + timedelta(hours=hours_per_bar * bar) for bar in bar_numbers]
+    )
+
+    with pytest.raises(ValueError, match="STR-TREND-01 需要连续的 4 小时 K 线"):
+        TrendFollowingStrategy(trend_bars=2, max_hold_bars=3).generate_signals(frame)
 
 
 # ---------------------------------------------------------------------------
@@ -201,3 +269,83 @@ def test_a_truncated_prefix_reproduces_the_same_signal_prefix() -> None:
         for i in range(cut):
             a, b = full.iloc[i], truncated.iloc[i]
             assert (pd.isna(a) and pd.isna(b)) or a == b, f"prefix mismatch at {i} (cut={cut})"
+
+
+@pytest.mark.parametrize(
+    ("trend_bars", "run_id", "trial_id"),
+    [
+        (TREND_BARS_4H_14D, "trend-14d-cli", "trend-14d-trial"),
+        (TREND_BARS_4H_28D, "trend-28d-cli", "trend-28d-trial"),
+    ],
+)
+def test_frozen_trend_windows_run_through_offline_cli_and_register(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trend_bars: int,
+    run_id: str,
+    trial_id: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    total_bars = trend_bars + MAX_HOLD_BARS_4H_21D + 2
+    closes = [100.0 + bar for bar in range(total_bars)]
+    ohlcv_path = tmp_path / f"{run_id}.csv"
+    registry_path = tmp_path / "experiments.jsonl"
+    write_ohlcv_csv(ohlcv_path, closes)
+    strategy_params = {
+        "trend_bars": trend_bars,
+        "max_hold_bars": MAX_HOLD_BARS_4H_21D,
+    }
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--ohlcv",
+            str(ohlcv_path),
+            "--strategy",
+            "py_core.strategies.trend:TrendFollowingStrategy",
+            "--strategy-params",
+            json.dumps(strategy_params),
+            "--market",
+            "crypto_spot",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "4h",
+            "--run-id",
+            run_id,
+            "--experiment-family",
+            "STR-TREND-01",
+            "--trial-id",
+            trial_id,
+            "--experiment-registry",
+            str(registry_path),
+        ]
+    )
+
+    assert cmd_run(args) == 0
+
+    output_dir = tmp_path / ".var" / "backtests" / run_id
+    report = json.loads((output_dir / "validation_report.json").read_text(encoding="utf-8"))
+    manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    trades = [
+        json.loads(line)
+        for line in (output_dir / "trades.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert report["bar_count"] == total_bars
+    assert report["causal_check"] == "prefix_differential"
+    assert manifest["strategy_params"] == strategy_params
+    assert any(
+        trade["direction"] == "buy" and trade["bar_index"] == trend_bars + 1 for trade in trades
+    )
+    assert any(
+        trade["direction"] == "sell"
+        and trade["bar_index"] == trend_bars + MAX_HOLD_BARS_4H_21D + 1
+        for trade in trades
+    )
+    record = ExperimentRegistry(registry_path).by_trial(trial_id)
+    assert record is not None
+    assert record.family_id == "STR-TREND-01"
+    assert record.causal_check is CausalCheck.PREFIX_DIFFERENTIAL
+    registered_params = dict(record.parameters)
+    assert json.loads(registered_params["trend_bars"]) == trend_bars
+    assert json.loads(registered_params["max_hold_bars"]) == MAX_HOLD_BARS_4H_21D
+    assert registered_params["timeframe"] == "4h"
