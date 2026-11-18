@@ -53,25 +53,37 @@ def _episode(peak: DailyNav, trough: DailyNav, end: DailyNav, *, recovered: bool
     )
 
 
-def summarize_daily_risk(points: Sequence[DailyNav]) -> DailyRisk:
-    """Measure daily return tails and drawdown episodes, including an open final episode."""
+def worst_five_percent_count(observations: int) -> int:
+    """Count the observations in the empirical five-percent tail, rounding up."""
+    return (observations + 19) // 20
+
+
+def daily_simple_returns(points: Sequence[DailyNav]) -> tuple[Decimal, ...]:
+    """Validate the clock and NAV values before deriving contiguous daily returns."""
     for point in points:
         stamp = point.as_of_utc
         if stamp.utcoffset() != timedelta(0) or stamp.time() != time.min:
             raise ValueError("daily NAV must be observed at UTC midnight")
         if not isinstance(point.nav, Decimal) or not point.nav.is_finite() or point.nav <= 0:
             raise ValueError("daily NAV must be a finite positive Decimal")
-    if len(points) < 2:
+    returns = []
+    for previous, current in pairwise(points):
+        if current.as_of_utc - previous.as_of_utc != _DAY:
+            raise ValueError("daily NAV observations must be consecutive")
+        returns.append(current.nav / previous.nav - _ONE)
+    return tuple(returns)
+
+
+def summarize_daily_risk(points: Sequence[DailyNav]) -> DailyRisk:
+    """Measure daily return tails and drawdown episodes, including an open final episode."""
+    returns = daily_simple_returns(points)
+    if not returns:
         return DailyRisk(0, 0, None, None, None, None, None)
 
     peak = points[0]
     trough: DailyNav | None = None
     episodes: list[DrawdownEpisode] = []
-    returns: list[Decimal] = []
-    for previous, current in pairwise(points):
-        if current.as_of_utc - previous.as_of_utc != _DAY:
-            raise ValueError("daily NAV observations must be consecutive")
-        returns.append(current.nav / previous.nav - _ONE)
+    for current in points[1:]:
         if current.nav >= peak.nav:
             if trough is not None:
                 episodes.append(_episode(peak, trough, current, recovered=True))
@@ -86,7 +98,7 @@ def summarize_daily_risk(points: Sequence[DailyNav]) -> DailyRisk:
 
     deepest = max(episodes, key=lambda episode: episode.depth, default=None)
     longest = max(episodes, key=lambda episode: episode.duration_days, default=None)
-    tail_count = (len(returns) + 19) // 20
+    tail_count = worst_five_percent_count(len(returns))
     return DailyRisk(
         observations=len(returns),
         tail_observations=tail_count,
