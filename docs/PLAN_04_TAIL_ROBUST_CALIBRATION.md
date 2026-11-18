@@ -20,7 +20,7 @@
 
 ## Smoke 结果
 
-实现：新文件 `py_core/tools/calibrate_plan04_tail_robust.py` 与 `py_core/tests/test_plan04_tail_robust.py`。单元测试覆盖两个单元的有向选择、其他单元不变、同偏差时的方向、非法输入、独立种子隔离和 smoke 流程。Smoke 使用每颗种子每情景 4 次重复、每种长度 199 次抽样，全部完成且无估计失败；全量 Python 回归 **1,148 项通过、2 项跳过**，Ruff 零发现。
+实现：新文件 `py_core/tools/calibrate_plan04_tail_robust.py` 与 `py_core/tests/test_plan04_tail_robust.py`。单元测试覆盖两个单元的有向选择、其他单元不变、同偏差时的方向、非法输入、独立种子隔离和 smoke 流程。Smoke 使用每颗种子每情景 4 次重复、每种长度 199 次抽样，全部完成且无估计失败；全量 Python 回归 **1,149 项通过、2 项跳过**，Ruff 零发现。
 
 Smoke 打印的临时秩为：独立正态 `(970, 950, 970)`，正自相关零差异 `(970, 975, 970)`，独立厚尾 `(970, 975, 970)`，正自相关混合差异 `(985, 975, 970)`。这些是**小样本流程输出，不是最终选定秩，也不构成校准结论**。
 
