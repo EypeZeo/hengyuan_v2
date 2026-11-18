@@ -30,6 +30,8 @@
 
 此次比较使用已读样本。相同的入金配置比例仍产生不同的实际仓位，结果用于描述不同账户方案的表现。
 
+[按实际平均持仓确定参照](PLAN_04_EXPOSURE_MATCH.md)补充用早期样本选择入金比例的结果。
+
 ## 复现
 
 原报告和台账保存在本地 `%LOCALAPPDATA%/HengYuan-Research/plan04-allocation-v1`。沿用既有历史输入，在仓库根目录运行，重跑时更换编号。 [2024 年数据](PLAN_04_HISTORICAL_DIAGNOSTIC.md) · [2025 年数据](PLAN_04_TEMPORAL_VALIDATION.md)

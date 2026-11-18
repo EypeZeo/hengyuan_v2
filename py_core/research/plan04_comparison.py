@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, DecimalException
 from itertools import pairwise
@@ -22,6 +22,7 @@ from py_core.research.ledgers import (
     PerformanceAccount,
     TradingAssetAccount,
 )
+from py_core.research.plan04_risk import DailyNav, DailyRisk, summarize_daily_risk
 from py_core.strategies.base import check_signal_prefixes
 from py_core.strategies.trend import (
     TREND_BARS_4H_14D,
@@ -34,6 +35,7 @@ _ONE = Decimal(1)
 _INTERVAL = timedelta(hours=4)
 _CNY, _QUOTE, _BASE = "CNY", "quote", "base"
 ALLOCATION_REFERENCE = "buy_hold_allocated"
+EXPOSURE_MATCH_TOLERANCE = Decimal("0.05")
 _PASSIVE_TRIALS = (("cash_cny", None), ("cash_quote", None), ("buy_hold", None))
 _TREND_TRIALS = (("trend_14d", TREND_BARS_4H_14D), ("trend_28d", TREND_BARS_4H_28D))
 TRIALS = (*_PASSIVE_TRIALS, *_TREND_TRIALS)
@@ -206,6 +208,7 @@ def _replay_trial(
     execution: ExecutionAssumptions,
     *,
     measure_exposure: bool,
+    daily_nav_points: list[DailyNav] | None = None,
 ) -> TrialOutcome:
     open_targets, causal = _target_for_each_open(bars, trend_bars)
     assets = TradingAssetAccount()
@@ -221,6 +224,8 @@ def _replay_trial(
     previous_target = exit_pending = False
     daily_returns: list[Decimal] = []
     previous_daily_nav = _ONE if bars[0].open_time_utc.time() == time.min else None
+    if daily_nav_points is not None and previous_daily_nav is not None:
+        daily_nav_points.append(DailyNav(bars[0].open_time_utc, previous_daily_nav))
 
     for index, (bar, target) in enumerate(zip(bars, open_targets, strict=True)):
         month = bar.open_time_utc.year, bar.open_time_utc.month
@@ -294,8 +299,11 @@ def _replay_trial(
             exposure_sum += base_value / terminal_value
         performance.mark(terminal_value)
         max_drawdown = max(max_drawdown, performance.drawdown() or _ZERO)
-        if (bar.open_time_utc + _INTERVAL).time() == time.min:
+        close_time = bar.open_time_utc + _INTERVAL
+        if close_time.time() == time.min:
             nav = performance.nav()
+            if daily_nav_points is not None and nav is not None:
+                daily_nav_points.append(DailyNav(close_time, nav))
             if previous_daily_nav and nav is not None:
                 daily_returns.append(nav / previous_daily_nav - _ONE)
             previous_daily_nav = nav
@@ -354,3 +362,162 @@ def compare_cash_flows(
                 name, ExperimentStatus.FAILED, total_contributed, CausalCheck.NOT_RUN, failure_reason=str(error)
             ))
     return ComparisonResult(schedule, tuple(outcomes))
+
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureGridPoint:
+    allocation: Decimal
+    mean_base_exposure: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureSelection:
+    candidate: str
+    allocation: Decimal
+    calibration_trend_exposure: Decimal
+    calibration_reference_exposure: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureFit:
+    ends_at_utc: datetime
+    execution: ExecutionAssumptions
+    grid: tuple[ExposureGridPoint, ...]
+    selections: tuple[ExposureSelection, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExposurePair:
+    selection: ExposureSelection
+    trend: TrialOutcome
+    reference: TrialOutcome
+    exposure_gap: Decimal
+    baseline_exposure_gap: Decimal
+    closer: bool
+    within_tolerance: bool
+    pnl_difference_cny: Decimal | None
+    drawdown_difference: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureRiskPair:
+    candidate: str
+    trend: DailyRisk
+    reference: DailyRisk
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureEvaluation:
+    baseline: TrialOutcome
+    pairs: tuple[ExposurePair, ...]
+    risk_diagnostics: tuple[ExposureRiskPair, ...] = ()
+
+
+def _exposure(outcome: TrialOutcome) -> Decimal:
+    if outcome.mean_base_exposure is None:
+        raise ValueError(f"{outcome.name} has no measured base-asset exposure")
+    return outcome.mean_base_exposure
+
+
+def _exposure_reference(
+    allocation: Decimal,
+    bars: tuple[ComparisonBar, ...],
+    funding: dict[datetime, Decimal],
+    execution: ExecutionAssumptions,
+    *,
+    daily_nav_points: list[DailyNav] | None = None,
+) -> TrialOutcome:
+    name = "cash_quote" if allocation == 0 else ALLOCATION_REFERENCE
+    settings = replace(execution, strategy_allocation=allocation)
+    return _replay_trial(
+        name, None, bars, funding, settings, measure_exposure=True, daily_nav_points=daily_nav_points
+    )
+
+
+def fit_exposure_allocations(
+    bars: Sequence[ComparisonBar],
+    contributions: Sequence[CashContribution],
+    execution: ExecutionAssumptions,
+) -> ExposureFit:
+    """Select the closest buy-and-hold allocation using only calibration exposure."""
+    market, schedule = tuple(bars), tuple(contributions)
+    _validate(market, schedule, execution)
+    funding = {item.open_time_utc: item.amount_cny for item in schedule}
+    targets = [
+        (name, _exposure(_replay_trial(name, window, market, funding, execution, measure_exposure=True)))
+        for name, window in _TREND_TRIALS
+    ]
+    grid = []
+    for percent in range(51):
+        allocation = Decimal(percent).scaleb(-2)
+        reference = _exposure_reference(allocation, market, funding, execution)
+        grid.append(ExposureGridPoint(allocation, _exposure(reference)))
+    selections = []
+    for candidate, target in targets:
+        nearest = min(grid, key=lambda point: (abs(point.mean_base_exposure - target), point.allocation))
+        selections.append(ExposureSelection(candidate, nearest.allocation, target, nearest.mean_base_exposure))
+    return ExposureFit(market[-1].open_time_utc + _INTERVAL, execution, tuple(grid), tuple(selections))
+
+
+def _difference(left: Decimal | None, right: Decimal | None) -> Decimal | None:
+    return left - right if left is not None and right is not None else None
+
+
+def evaluate_exposure_allocations(
+    fit: ExposureFit,
+    bars: Sequence[ComparisonBar],
+    contributions: Sequence[CashContribution],
+    *,
+    include_risk_diagnostics: bool = False,
+) -> ExposureEvaluation:
+    """Compare frozen allocations on a later account history with shared funding."""
+    market, schedule = tuple(bars), tuple(contributions)
+    execution = fit.execution
+    _validate(market, schedule, execution)
+    if market[0].open_time_utc < fit.ends_at_utc:
+        raise ValueError("evaluation must start at or after the calibration window closes")
+    funding = {item.open_time_utc: item.amount_cny for item in schedule}
+    baseline_points: list[DailyNav] | None = [] if include_risk_diagnostics else None
+    baseline = _exposure_reference(
+        execution.strategy_allocation, market, funding, execution, daily_nav_points=baseline_points
+    )
+    windows = dict(_TREND_TRIALS)
+    references = {execution.strategy_allocation: baseline}
+    reference_risks: dict[Decimal, DailyRisk] = {}
+    if baseline_points is not None:
+        reference_risks[execution.strategy_allocation] = summarize_daily_risk(baseline_points)
+    pairs = []
+    risk_pairs = []
+    for selection in fit.selections:
+        trend_points: list[DailyNav] | None = [] if include_risk_diagnostics else None
+        trend = _replay_trial(
+            selection.candidate, windows[selection.candidate], market, funding, execution,
+            measure_exposure=True, daily_nav_points=trend_points,
+        )
+        if selection.allocation not in references:
+            reference_points: list[DailyNav] | None = [] if include_risk_diagnostics else None
+            references[selection.allocation] = _exposure_reference(
+                selection.allocation, market, funding, execution, daily_nav_points=reference_points
+            )
+            if reference_points is not None:
+                reference_risks[selection.allocation] = summarize_daily_risk(reference_points)
+        reference = references[selection.allocation]
+        if trend_points is not None:
+            risk_pairs.append(ExposureRiskPair(
+                selection.candidate, summarize_daily_risk(trend_points), reference_risks[selection.allocation]
+            ))
+        exposure_gap = abs(_exposure(trend) - _exposure(reference))
+        baseline_gap = abs(_exposure(trend) - _exposure(baseline))
+        pairs.append(ExposurePair(
+            selection=selection,
+            trend=trend,
+            reference=reference,
+            exposure_gap=exposure_gap,
+            baseline_exposure_gap=baseline_gap,
+            closer=exposure_gap < baseline_gap,
+            within_tolerance=exposure_gap <= EXPOSURE_MATCH_TOLERANCE,
+            pnl_difference_cny=_difference(trend.all_in_pnl_cny, reference.all_in_pnl_cny),
+            drawdown_difference=_difference(trend.max_drawdown, reference.max_drawdown),
+        ))
+    return ExposureEvaluation(baseline, tuple(pairs), tuple(risk_pairs))
