@@ -124,8 +124,8 @@ def _rate_json(rate: Rate | None) -> dict | None:
     return asdict(rate) if rate is not None else None
 
 
-def _summarize(
-    scenario: TailScenario, outcomes: Iterable[ReplicationMetrics | str], *, smoke: bool
+def summarize_replications(
+    scenario: TailScenario, outcomes: Iterable[ReplicationMetrics | str], *, progress_total: int | None = None
 ) -> dict:
     failures: Counter[str] = Counter()
     completed = []
@@ -134,8 +134,8 @@ def _summarize(
             failures[outcome] += 1
         else:
             completed.append(outcome)
-        if not smoke and count % 50 == 0:
-            print(f"{scenario.name} {count}/{REPETITIONS}", file=sys.stderr, flush=True)
+        if progress_total is not None and count % 50 == 0:
+            print(f"{scenario.name} {count}/{progress_total}", file=sys.stderr, flush=True)
     valid = len(completed)
     blocks = []
     for index, length in enumerate(BLOCK_LENGTHS):
@@ -164,6 +164,18 @@ def _summarize(
     return result
 
 
+def summary_within_tolerance(summary: dict) -> bool:
+    return (
+        not summary["failures"]
+        and summary["stable_false_positive_criterion"] == "within_tolerance"
+        and all(
+            block["coverage_criterion"] == "within_tolerance"
+            and block["false_positive_criterion"] == "within_tolerance"
+            for block in summary["blocks"]
+        )
+    )
+
+
 def run_calibration(*, smoke: bool = False, workers: int = 1) -> dict:
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
@@ -175,18 +187,11 @@ def run_calibration(*, smoke: bool = False, workers: int = 1) -> dict:
         for scenario, seed in zip(SCENARIOS, scenario_seeds, strict=True):
             jobs = ((scenario, rep_seed, resamples) for rep_seed in seed.spawn(repeats))
             outcomes = pool.map(_replication, jobs) if pool is not None else map(_replication, jobs)
-            results.append(_summarize(scenario, outcomes, smoke=smoke))
+            results.append(summarize_replications(
+                scenario, outcomes, progress_total=None if smoke else REPETITIONS
+            ))
 
-    passed = all(
-        not row["failures"]
-        and row["stable_false_positive_criterion"] == "within_tolerance"
-        and all(
-            block["coverage_criterion"] == "within_tolerance"
-            and block["false_positive_criterion"] == "within_tolerance"
-            for block in row["blocks"]
-        )
-        for row in results
-    )
+    passed = all(summary_within_tolerance(row) for row in results)
     return {
         "protocol": "plan04-tail-coverage-v1",
         "profile": "smoke" if smoke else "formal",
