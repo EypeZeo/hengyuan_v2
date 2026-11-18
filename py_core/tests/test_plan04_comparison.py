@@ -72,9 +72,20 @@ def test_timed_deposits_are_equal_across_references_and_flat_valuation_has_no_pn
     contributions = make_contributions(bars, [(0, _D("100")), (3, _D("200")), (6, _D("300"))])
 
     result = compare_cash_flows(bars, contributions, execution())
+    allocated_result = compare_cash_flows(
+        bars, contributions, execution(), include_allocation_reference=True
+    )
 
     outcomes = outcomes_by_name(result)
     assert tuple(outcomes) == ("cash_cny", "cash_quote", "buy_hold", "trend_14d", "trend_28d")
+    assert tuple(outcomes_by_name(allocated_result)) == (
+        "cash_cny",
+        "cash_quote",
+        "buy_hold",
+        "buy_hold_allocated",
+        "trend_14d",
+        "trend_28d",
+    )
     for outcome in outcomes.values():
         assert outcome.contributed_cny == _D("600")
         assert outcome.terminal_cny == _D("600")
@@ -86,6 +97,105 @@ def test_timed_deposits_are_equal_across_references_and_flat_valuation_has_no_pn
     for name in ("trend_14d", "trend_28d"):
         assert outcomes[name].status == "no_trade"
         assert outcomes[name].fills == ()
+
+
+def test_allocated_reference_keeps_reserve_and_carries_rounding_dust_between_deposits() -> None:
+    bars = make_bars(
+        4,
+        open_prices=[_D("20"), _D("25"), _D("30"), _D("35")],
+        close_prices=[_D("20"), _D("30"), _D("30"), _D("40")],
+        quote_cny_rates=[_D("2")] * 4,
+    )
+    contributions = make_contributions(bars, [(0, _D("100")), (2, _D("100"))])
+
+    result = compare_cash_flows(
+        bars,
+        contributions,
+        execution(),
+        include_allocation_reference=True,
+    )
+
+    allocated = outcomes_by_name(result)["buy_hold_allocated"]
+    assert [fill.side for fill in allocated.fills] == ["buy", "buy"]
+    assert [fill.open_time_utc for fill in allocated.fills] == [
+        bars[0].open_time_utc,
+        bars[2].open_time_utc,
+    ]
+    assert [fill.quantity for fill in allocated.fills] == [_D("1.2"), _D("0.8")]
+    assert allocated.rejected_orders == 0
+    assert allocated.contributed_cny == _D("200")
+    assert allocated.terminal_cny == _D("264")
+    expected_exposure = (
+        _D("24") / _D("50")
+        + _D("36") / _D("62")
+        + _D("60") / _D("112")
+        + _D("80") / _D("132")
+    ) / _D("4")
+    assert float(allocated.mean_base_exposure) == pytest.approx(float(expected_exposure))
+
+
+def test_rejected_allocated_budget_carries_until_a_later_contribution_open() -> None:
+    prices = [_D("20"), _D("10"), _D("20"), _D("20")]
+    bars = make_bars(
+        4,
+        open_prices=prices,
+        close_prices=prices,
+        quote_cny_rates=[_D("2")] * 4,
+    )
+    contributions = make_contributions(bars, [(0, _D("100")), (2, _D("100"))])
+
+    result = compare_cash_flows(
+        bars,
+        contributions,
+        execution(min_notional=_D("25")),
+        include_allocation_reference=True,
+    )
+
+    allocated = outcomes_by_name(result)["buy_hold_allocated"]
+    assert allocated.status == "completed"
+    assert allocated.rejected_orders == 1
+    assert len(allocated.fills) == 1
+    assert allocated.fills[0].open_time_utc == bars[2].open_time_utc
+    assert allocated.fills[0].quantity == _D("2.5")
+    assert allocated.fills[0].price * allocated.fills[0].quantity == _D("50")
+    assert allocated.terminal_cny == _D("200")
+
+
+def test_allocated_reference_applies_conversion_slippage_and_base_fee_in_quote_fx() -> None:
+    bars = make_bars(
+        1,
+        open_prices=[_D("20")],
+        close_prices=[_D("20.2")],
+        quote_cny_rates=[_D("2")],
+    )
+    contributions = make_contributions(bars, [(0, _D("100"))])
+    settings = execution(
+        price_tick=_D("0.1"),
+        quantity_step=_D("0.1"),
+        min_notional=_D("24.24"),
+        trade_fee_rate=_D("0.01"),
+        conversion_fee_rate=_D("0.01"),
+        slippage_rate=_D("0.01"),
+    )
+
+    result = compare_cash_flows(
+        bars,
+        contributions,
+        settings,
+        include_allocation_reference=True,
+    )
+
+    allocated = outcomes_by_name(result)["buy_hold_allocated"]
+    assert len(allocated.fills) == 1
+    fill = allocated.fills[0]
+    assert fill.side == "buy"
+    assert fill.price == _D("20.2")
+    assert fill.quantity == _D("1.2")
+    assert fill.price * fill.quantity == settings.min_notional
+    assert fill.fee == _D("0.012")
+    assert allocated.conversion_fees_cny == _D("1")
+    assert allocated.trade_fees_cny == _D("0.4848")
+    assert allocated.terminal_cny == _D("98.5152")
 
 
 def test_buy_and_sell_fills_obey_steps_minimum_notional_and_fee_assets() -> None:

@@ -14,6 +14,7 @@ import pandas as pd
 from py_core.research.experiments import CausalCheck, ExperimentStatus
 from py_core.research.ledgers import (
     AllInCnyAccount,
+    BalanceState,
     FlowEvent,
     FlowEventKind,
     LedgerEvent,
@@ -32,13 +33,11 @@ _ZERO = Decimal(0)
 _ONE = Decimal(1)
 _INTERVAL = timedelta(hours=4)
 _CNY, _QUOTE, _BASE = "CNY", "quote", "base"
-TRIALS = (
-    ("cash_cny", None),
-    ("cash_quote", None),
-    ("buy_hold", None),
-    ("trend_14d", TREND_BARS_4H_14D),
-    ("trend_28d", TREND_BARS_4H_28D),
-)
+ALLOCATION_REFERENCE = "buy_hold_allocated"
+_PASSIVE_TRIALS = (("cash_cny", None), ("cash_quote", None), ("buy_hold", None))
+_TREND_TRIALS = (("trend_14d", TREND_BARS_4H_14D), ("trend_28d", TREND_BARS_4H_28D))
+TRIALS = (*_PASSIVE_TRIALS, *_TREND_TRIALS)
+_TRIALS_WITH_ALLOCATION = (*_PASSIVE_TRIALS, (ALLOCATION_REFERENCE, None), *_TREND_TRIALS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +95,7 @@ class TrialOutcome:
     fills: tuple[Fill, ...] = ()
     rejected_orders: int = 0
     failure_reason: str | None = None
+    mean_base_exposure: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,8 +194,7 @@ def _order_fill(
     return Fill(bar.open_time_utc, side, price, quantity, fee_basis * execution.trade_fee_rate)
 
 
-def _value_cny(assets: TradingAssetAccount, price: Decimal, rate: Decimal) -> Decimal:
-    balance = assets.state()
+def _value_cny(balance: BalanceState, price: Decimal, rate: Decimal) -> Decimal:
     return balance.available(_CNY) + (balance.available(_QUOTE) + balance.available(_BASE) * price) * rate
 
 
@@ -205,6 +204,8 @@ def _replay_trial(
     bars: tuple[ComparisonBar, ...],
     funding_by_open: dict[datetime, Decimal],
     execution: ExecutionAssumptions,
+    *,
+    measure_exposure: bool,
 ) -> TrialOutcome:
     open_targets, causal = _target_for_each_open(bars, trend_bars)
     assets = TradingAssetAccount()
@@ -212,6 +213,9 @@ def _replay_trial(
     owner = AllInCnyAccount()
     fills: list[Fill] = []
     max_drawdown = trade_fees = conversion_fees = _ZERO
+    # The allocated budget carries unspent buy funds across deposits without using the cash reserve.
+    allocated_quote = exposure_sum = _ZERO
+    is_allocated_hold = name == ALLOCATION_REFERENCE
     rejected_orders = 0
     previous_month = None
     previous_target = exit_pending = False
@@ -224,7 +228,7 @@ def _replay_trial(
             owner.record_external_cost(f"run-{index}", execution.strategy_monthly_cost_cny)
         previous_month = month
 
-        open_value = _value_cny(assets, bar.open_price, bar.quote_cny_rate)
+        open_value = _value_cny(assets.state(), bar.open_price, bar.quote_cny_rate)
         performance.mark(open_value)
         max_drawdown = max(max_drawdown, performance.drawdown() or _ZERO)
         funding = funding_by_open.get(bar.open_time_utc)
@@ -238,6 +242,8 @@ def _replay_trial(
                 conversion_fees += fee_cny
                 asset, units = _QUOTE, (funding - fee_cny) / bar.quote_cny_rate
             assets.apply(LedgerEvent(deposit_id, LedgerEventKind.DEPOSIT, asset, quantity=units))
+            if is_allocated_hold:
+                allocated_quote += units * execution.strategy_allocation
 
         balance = assets.state()
         cash = balance.available(_QUOTE)
@@ -245,6 +251,8 @@ def _replay_trial(
         side, available = None, _ZERO
         if name == "buy_hold" and funding is not None:
             side, available = "buy", cash
+        elif is_allocated_hold and funding is not None:
+            side, available = "buy", min(cash, allocated_quote)
         elif trend_bars is not None:
             sellable = holding >= execution.quantity_step
             exit_pending = sellable and (exit_pending or not target)
@@ -262,21 +270,28 @@ def _replay_trial(
             else:
                 is_buy = side == "buy"
                 fee_asset = _BASE if is_buy else _QUOTE
+                notional = fill.quantity * fill.price
                 assets.apply(LedgerEvent(
                     f"fill-{index}",
                     LedgerEventKind.BUY_FILL if is_buy else LedgerEventKind.SELL_FILL,
                     _BASE,
                     asset_quantity=fill.quantity,
                     counter_asset=_QUOTE,
-                    counter_quantity=fill.quantity * fill.price,
+                    counter_quantity=notional,
                     fee_asset=fee_asset if fill.fee else None,
                     fee_quantity=fill.fee or None,
                 ))
+                if is_allocated_hold:
+                    allocated_quote -= notional
                 fills.append(fill)
                 trade_fees += fill.fee * (fill.price if is_buy else _ONE) * bar.quote_cny_rate
                 exit_pending = False
 
-        terminal_value = _value_cny(assets, bar.close_price, bar.quote_cny_rate)
+        close_balance = assets.state()
+        terminal_value = _value_cny(close_balance, bar.close_price, bar.quote_cny_rate)
+        if measure_exposure and terminal_value > 0:
+            base_value = close_balance.available(_BASE) * bar.close_price * bar.quote_cny_rate
+            exposure_sum += base_value / terminal_value
         performance.mark(terminal_value)
         max_drawdown = max(max_drawdown, performance.drawdown() or _ZERO)
         if (bar.open_time_utc + _INTERVAL).time() == time.min:
@@ -310,6 +325,7 @@ def _replay_trial(
         daily_sharpe=daily_sharpe,
         fills=tuple(fills),
         rejected_orders=rejected_orders,
+        mean_base_exposure=exposure_sum / len(bars) if measure_exposure else None,
     )
 
 
@@ -317,6 +333,8 @@ def compare_cash_flows(
     bars: Sequence[ComparisonBar],
     contributions: Sequence[CashContribution],
     execution: ExecutionAssumptions,
+    *,
+    include_allocation_reference: bool = False,
 ) -> ComparisonResult:
     """Replay independent accounts in fixed trial order and retain failed trials."""
     market = tuple(bars)
@@ -325,9 +343,12 @@ def compare_cash_flows(
     funding = {item.open_time_utc: item.amount_cny for item in schedule}
     total_contributed = sum(funding.values(), _ZERO)
     outcomes: list[TrialOutcome] = []
-    for name, trend_bars in TRIALS:
+    trials = _TRIALS_WITH_ALLOCATION if include_allocation_reference else TRIALS
+    for name, trend_bars in trials:
         try:
-            outcomes.append(_replay_trial(name, trend_bars, market, funding, execution))
+            outcomes.append(_replay_trial(
+                name, trend_bars, market, funding, execution, measure_exposure=include_allocation_reference
+            ))
         except (ValueError, DecimalException) as error:
             outcomes.append(TrialOutcome(
                 name, ExperimentStatus.FAILED, total_contributed, CausalCheck.NOT_RUN, failure_reason=str(error)

@@ -43,6 +43,8 @@
 
 14 日候选的三个 ETHUSDT 情景达到收益改进标准，28 日候选的 BTCUSDT 每月追加 500 CNY 情景达到标准。两组分别通过 3/6 和 1/6，均未达到跨情景一致性标准。两组趋势策略在十二项比较中的最大回撤均较低，其中八项的综合盈亏也较低。上述结果延续了 2024 年诊断中的回撤差异，综合盈亏的相对排序随交易对及入金情景变化。两组趋势方案以 50% 配置比例入场，买入持有使用全部可用报价资产，回撤比较包含不同仓位规模的影响。
 
+[按入金比例买入持有的参照](PLAN_04_ALLOCATION_REFERENCE.md)补充相同配置比例的比较，并报告实际平均持仓比例。
+
 ## 本地复现
 
 原始公开档案、转换后的输入、两份比较报告和实验台账保存在 `%LOCALAPPDATA%/HengYuan-Research/plan04-2025-v1`。准备命令读取 24 个 Binance 月度档案、ECB 的 `D.CNY+USD.EUR.SP00.A` CSV 及 Coinbase 日线 JSON 文件。ECB 数据日期为 2024-12-20 至 2025-12-31，Coinbase UTC 请求区间以 2024-12-20、2025-07-01、2026-01-01 为边界。 [Coinbase K 线接口](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles) · [ECB 发布安排](https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html)
