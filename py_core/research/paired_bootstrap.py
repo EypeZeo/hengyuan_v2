@@ -160,6 +160,28 @@ def _bartlett_mean_se(samples: np.ndarray, lag: int) -> np.ndarray:
     return se
 
 
+def _prewhitened_mean_se(samples: np.ndarray, lag: int) -> np.ndarray:
+    """Fit a centered AR(1), then restore the residual long-run variance to the input scale."""
+    n = samples.shape[-1]
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
+        centered = samples - samples[..., :1]
+        centered -= np.mean(centered, axis=-1, keepdims=True)
+        previous = centered[..., :-1]
+        current = centered[..., 1:]
+        denominator = np.sum(previous**2, axis=-1)
+        phi = np.sum(previous * current, axis=-1) / denominator
+        valid_fit = np.isfinite(denominator) & (denominator > 0) & np.isfinite(phi) & (np.abs(phi) < 1)
+        if not np.all(valid_fit):
+            raise ValueError("prewhitening requires an identifiable stationary AR(1) fit")
+        residuals = current - phi[..., None] * previous
+        residual_se = _bartlett_mean_se(residuals, lag)
+        # The Bartlett helper uses n-1 residuals. The original mean uses n observations.
+        scale = residual_se * math.sqrt((n - 1) / n) / np.abs(1 - phi)
+    if not np.all(np.isfinite(scale) & (scale > 0)):
+        raise ValueError("prewhitened standard errors must be positive and finite")
+    return scale
+
+
 def compare_paired_mean_studentized(
     returns: Sequence[Sequence[float]] | np.ndarray,
     *,
@@ -168,26 +190,31 @@ def compare_paired_mean_studentized(
     n_resamples: int,
     rng: np.random.Generator,
     alpha: float = 0.05,
+    prewhiten: bool = False,
 ) -> PairedMeanInterval:
     """Studentized paired interval with a Bartlett standard error for each draw.
 
     The input is an aligned benchmark/candidate pair. The Bartlett bandwidth is
     fixed in advance and applied to the original series and every resample.
+    With prewhitening it applies to the residuals of a separately fitted AR(1)
+    for each series.
     """
     difference = _single_pair(returns, alpha)[:, 0]
     n = difference.size
+    variance_observations = n - 1 if prewhiten else n
     if (
         isinstance(variance_lag, bool)
         or not isinstance(variance_lag, (int, np.integer))
-        or not 0 <= variance_lag < n
+        or not 0 <= variance_lag < variance_observations
     ):
-        raise ValueError("variance lag must be an integer in [0, n-1]")
+        raise ValueError("variance lag must be a nonnegative integer smaller than its variance sample")
     indices = stationary_bootstrap_indices(n, block_length=block_length, n_resamples=n_resamples, rng=rng)
-    scale = float(_bartlett_mean_se(difference, int(variance_lag)))
+    estimate_se = _prewhitened_mean_se if prewhiten else _bartlett_mean_se
+    scale = float(estimate_se(difference, int(variance_lag)))
     with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
         mean = float(np.mean(difference))
         centered_draws = (difference - mean)[indices]
-        bootstrap_se = _bartlett_mean_se(centered_draws, int(variance_lag))
+        bootstrap_se = estimate_se(centered_draws, int(variance_lag))
         pivots = np.mean(centered_draws, axis=1) / bootstrap_se
     if not math.isfinite(mean) or not np.all(np.isfinite(pivots)):
         raise ValueError("studentized bootstrap pivots are not finite")
