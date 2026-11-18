@@ -19,6 +19,7 @@ from py_core.research.experiments import (
     require_valid_experiment_record,
 )
 from py_core.research.plan04_comparison import (
+    ALLOCATION_REFERENCE,
     TRIALS,
     CashContribution,
     ComparisonBar,
@@ -31,6 +32,7 @@ from py_core.research.plan04_history import HistoricalMarket, load_historical_ma
 from py_core.strategies.trend import MAX_HOLD_BARS_4H_21D
 
 _PROTOCOL = "plan04-matched-funding-v1"
+_ALLOCATION_PROTOCOL = "plan04-allocation-reference-v1"
 _EXECUTION = ExecutionAssumptions(
     price_tick=Decimal("0.01"),
     quantity_step=Decimal("0.0001"),
@@ -76,14 +78,39 @@ def _delta(left: Decimal | None, right: Decimal | None) -> Decimal | None:
     return left - right if left is not None and right is not None else None
 
 
-def _relative_metrics(outcome: TrialOutcome, reference: TrialOutcome) -> dict[str, Decimal | str | None]:
-    return {
+def _relative_metrics(
+    outcome: TrialOutcome, reference: TrialOutcome, *, include_exposure: bool
+) -> dict[str, Decimal | str | None]:
+    metrics = {
         "candidate": outcome.name,
         "reference": reference.name,
         "terminal_cny_difference": _delta(outcome.terminal_cny, reference.terminal_cny),
         "all_in_pnl_cny_difference": _delta(outcome.all_in_pnl_cny, reference.all_in_pnl_cny),
         "daily_mean_return_difference": _delta(outcome.daily_mean_return, reference.daily_mean_return),
         "daily_sharpe_difference": _delta(outcome.daily_sharpe, reference.daily_sharpe),
+    }
+
+    if include_exposure:
+        metrics["max_drawdown_difference"] = _delta(outcome.max_drawdown, reference.max_drawdown)
+        metrics["mean_base_exposure_difference"] = _delta(outcome.mean_base_exposure, reference.mean_base_exposure)
+    return metrics
+
+
+def _scenario_report(monthly: Decimal, result: ComparisonResult, *, include_exposure: bool) -> dict:
+    report = asdict(result)
+    if not include_exposure:
+        for outcome in report["outcomes"]:
+            del outcome["mean_base_exposure"]
+    return {
+        "monthly_cny": monthly,
+        **report,
+        "comparisons": [
+            _relative_metrics(outcome, reference, include_exposure=include_exposure)
+            for outcome in result.outcomes
+            if outcome.name.startswith("trend_")
+            for reference in result.outcomes
+            if not reference.name.startswith("trend_")
+        ],
     }
 
 
@@ -93,10 +120,11 @@ def _trial_records(
     cases: tuple[tuple[Decimal, ComparisonResult], ...],
     execution: ExecutionAssumptions,
     market: HistoricalMarket | None,
+    protocol: str,
 ) -> tuple[ExperimentRecord, ...]:
     observed = datetime.now(UTC)
     start, end = bars[0].open_time_utc, bars[-1].open_time_utc + timedelta(hours=4)
-    windows = dict(TRIALS)
+    windows = dict(TRIALS) | {ALLOCATION_REFERENCE: None}
     records = []
     for monthly, result in cases:
         for outcome in result.outcomes:
@@ -122,7 +150,7 @@ def _trial_records(
                 data_version=market.data_version if market else "synthetic-market-v1",
                 data_start_utc=start,
                 data_end_utc=end,
-                code_version=_PROTOCOL,
+                code_version=protocol,
                 cost_model="spot-fee-slippage-conversion-external",
                 eval_start_utc=start,
                 eval_end_utc=end,
@@ -149,7 +177,11 @@ def main() -> int:
     parser.add_argument("--run-id", required=True, help="unique prefix for the registered trials")
     parser.add_argument("--registry", type=Path, default=Path(".var/research/experiments.jsonl"))
     parser.add_argument("--historical-manifest", type=Path, help="validated local market and exchange-rate files")
+    parser.add_argument(
+        "--allocation-reference", action="store_true", help="add buy and hold at the strategy's funding allocation"
+    )
     args = parser.parse_args()
+    protocol = _ALLOCATION_PROTOCOL if args.allocation_reference else _PROTOCOL
     market = None
     if args.historical_manifest is not None:
         try:
@@ -159,10 +191,16 @@ def main() -> int:
     bars = market.bars if market else synthetic_market()
     execution = market.execution if market else _EXECUTION
     cases = tuple(
-        (monthly, compare_cash_flows(bars, funding_schedule(bars, monthly), execution))
+        (
+            monthly,
+            compare_cash_flows(
+                bars, funding_schedule(bars, monthly), execution,
+                include_allocation_reference=args.allocation_reference,
+            ),
+        )
         for monthly in _MONTHLY_CNY
     )
-    records = _trial_records(args.run_id, bars, cases, execution, market)
+    records = _trial_records(args.run_id, bars, cases, execution, market, protocol)
     args.registry.parent.mkdir(parents=True, exist_ok=True)
     registry = ExperimentRegistry(args.registry)
     if any(record.trial_id in registry.trial_ids() for record in records):
@@ -172,23 +210,13 @@ def main() -> int:
 
     failed = any(record.status is ExperimentStatus.FAILED for record in records)
     report = {
-        "protocol": _PROTOCOL,
+        "protocol": protocol,
         "data": "historical" if market else "synthetic",
         "bars": len(bars),
         "execution": asdict(execution),
         "status": "failed_trials" if failed else "completed",
         "scenarios": [
-            {
-                "monthly_cny": monthly,
-                **asdict(result),
-                "comparisons": [
-                    _relative_metrics(outcome, reference)
-                    for outcome in result.outcomes
-                    if outcome.name.startswith("trend_")
-                    for reference in result.outcomes
-                    if not reference.name.startswith("trend_")
-                ],
-            }
+            _scenario_report(monthly, result, include_exposure=args.allocation_reference)
             for monthly, result in cases
         ],
     }
