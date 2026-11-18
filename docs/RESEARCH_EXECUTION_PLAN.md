@@ -229,6 +229,8 @@ c_{\mathrm{fixed}}=\frac{FX}{V}.
 
 STR-TREND-01 可通过回测命令的 `--strategy py_core.strategies.trend:TrendFollowingStrategy` 加载。使用连续的 4 小时 K 线并指定 `--timeframe 4h`，分别登记 `trend_bars=84` 和 `trend_bars=168` 的实验，两者均使用 `max_hold_bars=126`。
 
+[PLAN-04 相同资金流比较](PLAN_04_MATCHED_CASH_FLOW.md) 记录两组趋势窗口与三种参照在相同入金计划下的离线结果。
+
 每个候选都写明决策时刻、下单时刻、价格来源、部分成交处理、持有计时起点、退出优先级和复位条件。只有当前信号改变且对应交易可以执行时才产生订单，不能每根周期重复买入。
 
 研究中的持有上限表示到时发出受约束的退出意图。行情不可用、交易所停机或订单结果未知时，记录超时暴露并执行恢复规则；不把计划退出时间当作实际成交保证。

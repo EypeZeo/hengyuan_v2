@@ -231,9 +231,10 @@ def _sample_positions(full_signal: pd.Series[Any], points: int) -> tuple[int, ..
     return tuple(sorted({round(float(x)) for x in np.linspace(first, last, num=count)}))
 
 
-def _prefix_differential(
-    strategy: Strategy, df: pd.DataFrame, points: int
+def check_signal_prefixes(
+    strategy: Strategy, df: pd.DataFrame, *, points: int = DEFAULT_CAUSAL_POINTS
 ) -> tuple[pd.Series[Any], tuple[int, ...]]:
+    """Check sampled historical prefixes and return the signal and sampled positions."""
     if points < 1:
         raise ValueError(f"points 必须 >= 1，收到 {points}")
     if df.empty:
@@ -291,7 +292,7 @@ def checked_signals(
         validate_signal_output(signal, df)
         return signal, evidence
 
-    signal, positions = _prefix_differential(strategy, df, points)
+    signal, positions = check_signal_prefixes(strategy, df, points=points)
     row_hashes = pd.util.hash_pandas_object(df, index=True)
     return signal, CausalEvidence(
         method=_METHOD_PREFIX_DIFFERENTIAL,
