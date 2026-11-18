@@ -14,37 +14,51 @@ from py_core.tools.calibrate_plan04_tail_robust import (
 )
 
 HELDOUT = (955, 965, 965)
+REPETITIONS = 200
 
 
-def coverage_grid(*, gaussian14: dict[int, int], mixed7: dict[int, int]) -> dict:
-    target = TARGET_PER_THOUSAND
+def coverage_grid(
+    *,
+    gaussian14: dict[int, int],
+    mixed7: dict[int, int],
+    repetitions: int = REPETITIONS,
+    default_count: int = 0,
+) -> dict:
+    assert 0 <= default_count <= repetitions
+    assert all(0 <= count <= repetitions for count in (*gaussian14.values(), *mixed7.values()))
     result = {}
     for scenario in SCENARIOS:
-        counts = [[target, target, target] for _ in GRID]
+        counts = [[default_count, default_count, default_count] for _ in GRID]
         for index, level in enumerate(GRID):
-            counts[index][1] = gaussian14.get(level, target)
-            counts[index][0] = mixed7.get(level, target)
+            counts[index][1] = gaussian14.get(level, default_count)
+            counts[index][0] = mixed7.get(level, default_count)
         result[scenario.name] = tuple(tuple(row) for row in counts)
     return result
 
 
-def test_only_the_two_registered_cells_change() -> None:
-    coverage = coverage_grid(gaussian14={950: TARGET_PER_THOUSAND, 965: TARGET_PER_THOUSAND + 500},
-                             mixed7={970: TARGET_PER_THOUSAND, 955: TARGET_PER_THOUSAND - 400})
-    selected = select_targeted_levels(coverage, HELDOUT, 1)
+def test_scaled_target_selects_the_nearest_rank_in_both_directions_and_leaves_other_cells_unchanged() -> None:
+    gaussian14 = dict(zip(GRID, (140, 150, 160, 170, 180, 185, 190, 191, 200, 200, 200, 200, 200), strict=True))
+    mixed7 = dict(zip(GRID, (120, 125, 130, 135, 140, 145, 150, 160, 170, 180, 191, 192, 200), strict=True))
+    coverage = coverage_grid(gaussian14=gaussian14, mixed7=mixed7)
+
+    assert 1_000 * 191 == TARGET_PER_THOUSAND * REPETITIONS
+    selected = select_targeted_levels(coverage, HELDOUT, REPETITIONS)
+
     for scenario in SCENARIOS:
         if scenario.name == "gaussian_null":
-            assert selected[scenario.name] == (955, 925, 965)
+            assert selected[scenario.name] == (955, 960, 965)
         elif scenario.name == "ar_mixed_alternative":
-            assert selected[scenario.name] == (985, 965, 965)
+            assert selected[scenario.name] == (975, 965, 965)
         else:
             assert selected[scenario.name] == HELDOUT
 
 
 def test_direction_never_crosses_the_heldout_rank() -> None:
-    coverage = coverage_grid(gaussian14={level: TARGET_PER_THOUSAND + 100 for level in GRID},
-                             mixed7={level: TARGET_PER_THOUSAND - 100 for level in GRID})
-    selected = select_targeted_levels(coverage, HELDOUT, 1)
+    coverage = coverage_grid(
+        gaussian14={level: 120 + 5 * index for index, level in enumerate(GRID)},
+        mixed7={level: 130 + 5 * index for index, level in enumerate(GRID)},
+    )
+    selected = select_targeted_levels(coverage, HELDOUT, REPETITIONS)
     for scenario in SCENARIOS:
         levels = selected[scenario.name]
         if scenario.name == "gaussian_null":
@@ -56,20 +70,48 @@ def test_direction_never_crosses_the_heldout_rank() -> None:
 
 def test_ties_follow_the_required_correction_direction() -> None:
     coverage = coverage_grid(
-        gaussian14={955: TARGET_PER_THOUSAND + 100, 960: TARGET_PER_THOUSAND + 100},
-        mixed7={960: TARGET_PER_THOUSAND - 100, 965: TARGET_PER_THOUSAND - 100},
+        gaussian14=dict(zip(GRID, (150, 155, 160, 165, 170, 175, 190, 192, 200, 200, 200, 200, 200), strict=True)),
+        mixed7=dict(zip(GRID, (150, 155, 160, 165, 170, 175, 180, 185, 188, 189, 190, 192, 200), strict=True)),
     )
-    selected = select_targeted_levels(coverage, HELDOUT, 1)
-    assert selected["gaussian_null"][1] == 925
-    assert selected["ar_mixed_alternative"][0] == 985
+    selected = select_targeted_levels(coverage, HELDOUT, REPETITIONS)
+    assert abs(1_000 * coverage["gaussian_null"][GRID.index(955)][1] - TARGET_PER_THOUSAND * REPETITIONS) == abs(
+        1_000 * coverage["gaussian_null"][GRID.index(960)][1] - TARGET_PER_THOUSAND * REPETITIONS
+    )
+    assert abs(1_000 * coverage["ar_mixed_alternative"][GRID.index(975)][0] - TARGET_PER_THOUSAND * REPETITIONS) == abs(
+        1_000 * coverage["ar_mixed_alternative"][GRID.index(980)][0] - TARGET_PER_THOUSAND * REPETITIONS
+    )
+    assert selected["gaussian_null"][1] == 955
+    assert selected["ar_mixed_alternative"][0] == 980
 
 
 def test_invalid_inputs_are_rejected() -> None:
     coverage = coverage_grid(gaussian14={}, mixed7={})
     with pytest.raises(ValueError, match="one rank per block"):
-        select_targeted_levels(coverage, (950, 950), 1)
+        select_targeted_levels(coverage, (950, 950), REPETITIONS)
     with pytest.raises(ValueError, match="positive"):
         select_targeted_levels(coverage, HELDOUT, 0)
+
+
+def test_coverage_counts_must_be_within_the_repetition_total() -> None:
+    coverage = coverage_grid(gaussian14={}, mixed7={})
+    malformed = dict(coverage)
+    rows = list(malformed[SCENARIOS[0].name])
+    rows[0] = (REPETITIONS + 1, 0, 0)
+    malformed[SCENARIOS[0].name] = tuple(rows)
+
+    with pytest.raises(ValueError, match="integer coverage counts within the repetition total"):
+        select_targeted_levels(malformed, HELDOUT, REPETITIONS)
+
+
+def test_coverage_rows_must_match_the_number_of_block_lengths() -> None:
+    coverage = coverage_grid(gaussian14={}, mixed7={})
+    malformed = dict(coverage)
+    rows = list(malformed[SCENARIOS[0].name])
+    rows[0] = (0, 0)
+    malformed[SCENARIOS[0].name] = tuple(rows)
+
+    with pytest.raises(ValueError, match="integer coverage counts within the repetition total"):
+        select_targeted_levels(malformed, HELDOUT, REPETITIONS)
 
 
 def test_smoke_run_uses_new_validation_seeds_and_keeps_selection_out_of_validation() -> None:

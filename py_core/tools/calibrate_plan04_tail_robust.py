@@ -83,8 +83,8 @@ def select_targeted_levels(
     """
     if len(heldout_levels) != len(BLOCK_LENGTHS):
         raise ValueError("heldout_levels must have one rank per block length")
-    if repetitions <= 0:
-        raise ValueError("repetitions must be positive")
+    if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions <= 0:
+        raise ValueError("repetitions must be a positive integer")
     over_index = BLOCK_LENGTHS.index(_OVER_COVERED_LENGTH)
     under_index = BLOCK_LENGTHS.index(_UNDER_COVERED_LENGTH)
     base_over = GRID.index(heldout_levels[over_index])
@@ -94,21 +94,27 @@ def select_targeted_levels(
     selected: dict[str, tuple[int, ...]] = {}
     for scenario in SCENARIOS:
         counts = coverage[scenario.name]
+        if len(counts) != len(GRID) or any(
+            len(row) != len(BLOCK_LENGTHS)
+            or any(isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= repetitions for count in row)
+            for row in counts
+        ):
+            raise ValueError(f"{scenario.name} must provide integer coverage counts within the repetition total")
         levels = list(heldout_levels)
-        for length_index, length in enumerate(BLOCK_LENGTHS):
+        for length_index in range(len(BLOCK_LENGTHS)):
             if scenario.name == _OVER_COVERED_SCENARIO and length_index == over_index:
                 candidates = range(base_over + 1)
                 # Same deviation -> lower level (stronger narrowing correction).
                 chosen = min(
                     candidates,
-                    key=lambda i: (abs(counts[i][length_index] - target), GRID[i]),
+                    key=lambda i: (abs(1000 * counts[i][length_index] - target), GRID[i]),
                 )
             elif scenario.name == _UNDER_COVERED_SCENARIO and length_index == under_index:
                 candidates = range(base_under, len(GRID))
                 # Same deviation -> higher level (stronger widening correction).
                 chosen = min(
                     candidates,
-                    key=lambda i: (abs(counts[i][length_index] - target), -GRID[i]),
+                    key=lambda i: (abs(1000 * counts[i][length_index] - target), -GRID[i]),
                 )
             else:
                 chosen = GRID.index(heldout_levels[length_index])
