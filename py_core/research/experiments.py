@@ -100,6 +100,8 @@ class ExperimentIssueCode(StrEnum):
     TRAIN_EVAL_OVERLAP = "TRAIN_EVAL_OVERLAP"
     DATA_DOES_NOT_COVER_WINDOWS = "DATA_DOES_NOT_COVER_WINDOWS"
     NEGATIVE_RANDOM_SEED = "NEGATIVE_RANDOM_SEED"
+    DATA_WINDOW_NOT_ORDERED = "DATA_WINDOW_NOT_ORDERED"
+    OBSERVED_BEFORE_EVALUATION_END = "OBSERVED_BEFORE_EVALUATION_END"
     FAILED_WITHOUT_REASON = "FAILED_WITHOUT_REASON"
     FAILURE_REASON_ON_NON_FAILURE = "FAILURE_REASON_ON_NON_FAILURE"
     COMPLETED_WITHOUT_PREFIX_DIFFERENTIAL = "COMPLETED_WITHOUT_PREFIX_DIFFERENTIAL"
@@ -218,6 +220,8 @@ def validate_experiment_record(record: ExperimentRecord) -> tuple[ExperimentIssu
         and record.train_end_utc > record.eval_start_utc
     ):
         issues.append(ExperimentIssue(ExperimentIssueCode.TRAIN_EVAL_OVERLAP, "the evaluation window must not overlap the training window."))
+    if aware["data_start_utc"] and aware["data_end_utc"] and not record.data_start_utc < record.data_end_utc:
+        issues.append(ExperimentIssue(ExperimentIssueCode.DATA_WINDOW_NOT_ORDERED, "the data range must satisfy start < end."))
     if aware["data_start_utc"] and aware["train_start_utc"] and record.data_start_utc > record.train_start_utc:
         issues.append(ExperimentIssue(ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS, "data_start_utc must not start after the training window."))
     if aware["data_end_utc"] and aware["eval_end_utc"] and record.data_end_utc < record.eval_end_utc:
@@ -238,6 +242,18 @@ def validate_experiment_record(record: ExperimentRecord) -> tuple[ExperimentIssu
                 "a COMPLETED trial must carry causal_check=prefix_differential (SAFE-05 / D1 admission contract).",
             )
         )
+    if (
+        record.status is ExperimentStatus.COMPLETED
+        and aware["observed_at_utc"]
+        and aware["eval_end_utc"]
+        and record.observed_at_utc < record.eval_end_utc
+    ):
+        issues.append(
+            ExperimentIssue(
+                ExperimentIssueCode.OBSERVED_BEFORE_EVALUATION_END,
+                "a COMPLETED trial must be observed at or after its evaluation window ends: an earlier observation cannot have judged data it did not have yet.",
+            )
+        )
 
     return tuple(issues)
 
@@ -254,6 +270,35 @@ def require_valid_experiment_record(record: ExperimentRecord) -> None:
 # ---------------------------------------------------------------------------
 
 _DATETIME_FIELDS = ("data_start_utc", "data_end_utc", "train_start_utc", "train_end_utc", "eval_start_utc", "eval_end_utc", "observed_at_utc")
+
+# record_to_json_line 写出的字段集合；加载时拒绝未知字段，schema 演进必须显式改这个模块，
+# 不能让旧代码静默忽略它读不懂的新字段。
+_KNOWN_RECORD_FIELDS = frozenset(
+    {
+        "trial_id",
+        "family_id",
+        "parent_trial_id",
+        "purpose",
+        "status",
+        "parameters",
+        "data_version",
+        "data_start_utc",
+        "data_end_utc",
+        "code_version",
+        "cost_model",
+        "train_start_utc",
+        "train_end_utc",
+        "eval_start_utc",
+        "eval_end_utc",
+        "random_seed",
+        "causal_check",
+        "blind_set_id",
+        "failure_reason",
+        "observed_at_utc",
+        "recorded_by",
+        "influenced_selection",
+    }
+)
 
 
 class RegistryCorruptError(ValueError):
@@ -301,6 +346,9 @@ def record_from_json_line(line: str, line_number: int) -> ExperimentRecord:
         raise corrupt(f"invalid JSON ({exc.msg})") from exc
     if not isinstance(payload, dict):
         raise corrupt("a record must be a JSON object")
+    unknown_fields = set(payload) - _KNOWN_RECORD_FIELDS
+    if unknown_fields:
+        raise corrupt(f"unknown field(s) {sorted(unknown_fields)!r}: the schema must move explicitly, not be silently ignored")
 
     def field(name: str) -> Any:
         if name not in payload:
@@ -547,8 +595,13 @@ def _access_from_json_line(line: str, line_number: int) -> BlindSetAccess:
         payload = json.loads(line)
     except json.JSONDecodeError as exc:
         raise corrupt(f"invalid JSON ({exc.msg})") from exc
-    if not isinstance(payload, dict) or any(name not in payload for name in ("blind_set_id", "kind", "accessed_at_utc", "recorded_by", "trial_id")):
+    if not isinstance(payload, dict):
         raise corrupt("an access record must be a JSON object with the documented fields")
+    unknown_access_fields = set(payload) - {"blind_set_id", "kind", "accessed_at_utc", "recorded_by", "trial_id"}
+    if unknown_access_fields:
+        raise corrupt(f"unknown field(s) {sorted(unknown_access_fields)!r}")
+    if any(name not in payload for name in ("blind_set_id", "kind", "accessed_at_utc", "recorded_by", "trial_id")):
+        raise corrupt("an access record is missing a documented field")
     try:
         kind = BlindAccessKind(payload["kind"])
     except ValueError as exc:

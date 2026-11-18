@@ -156,6 +156,28 @@ def test_adjacent_windows_share_a_boundary_legally() -> None:
     assert validate_issues(make_record()) == ()  # train_end == eval_start 是合法相邻
 
 
+def test_the_data_range_itself_must_be_ordered() -> None:
+    assert validate_issues(make_record(data_start_utc=DATA_END, data_end_utc=T0)) == (
+        ExperimentIssueCode.DATA_WINDOW_NOT_ORDERED,
+        ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS,
+        ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS,
+    )
+    assert validate_issues(make_record(data_start_utc=T0, data_end_utc=T0)) == (
+        ExperimentIssueCode.DATA_WINDOW_NOT_ORDERED,
+        ExperimentIssueCode.DATA_DOES_NOT_COVER_WINDOWS,
+    )
+
+
+def test_a_completed_trial_is_observed_at_or_after_its_evaluation_window_ends() -> None:
+    early_observation = replace(make_record(), observed_at_utc=datetime(2025, 12, 1, tzinfo=UTC))
+    assert validate_issues(early_observation) == (ExperimentIssueCode.OBSERVED_BEFORE_EVALUATION_END,)
+    assert validate_issues(make_record()) == ()  # observed_at 在 eval_end 之后
+    # 非 COMPLETED 状态不受约束：计划中的实验在窗口结束前登记是正常的。
+    planned = replace(make_record(), status=ExperimentStatus.PLANNED, causal_check=CausalCheck.NOT_RUN,
+                      observed_at_utc=datetime(2025, 1, 2, tzinfo=UTC))
+    assert validate_issues(planned) == ()
+
+
 # ---------------------------------------------------------------------------
 # 追加式台账
 # ---------------------------------------------------------------------------
@@ -212,6 +234,7 @@ def test_a_child_before_its_parent_is_a_corrupt_file(tmp_path: Path) -> None:
         lambda: record_to_json_line(make_record()).replace('"random_seed":7', '"random_seed":true'),
         lambda: record_to_json_line(make_record()).replace('"random_seed":7', '"random_seed":7.5'),
         lambda: record_to_json_line(make_record()).replace('"purpose":"', '"purpose":42,"x":"'),
+        lambda: record_to_json_line(make_record()) + '{"extra":true}',
         lambda: record_to_json_line(make_record(causal_check=CausalCheck.INDEX_ONLY)),
         lambda: record_to_json_line(make_record()) + record_to_json_line(make_record()),
     ],
