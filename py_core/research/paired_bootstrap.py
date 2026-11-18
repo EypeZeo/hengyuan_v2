@@ -108,11 +108,28 @@ def _single_pair(returns: Sequence[Sequence[float]] | np.ndarray, alpha: float) 
     return differences
 
 
-def _mean_interval(mean: float, errors: np.ndarray, alpha: float, scale: float = 1.0) -> PairedMeanInterval:
+def _outward_quantiles(errors: np.ndarray, alpha: float) -> tuple[float, float, float]:
+    sample_size = errors.size
+    grid = sample_size + 1
+    lower_rank = math.floor(grid * alpha / 2)
+    if lower_rank < 1:
+        raise ValueError("too few draws for finite outward tail ranks")
+    indices = (lower_rank - 1, grid - lower_rank - 1, grid - math.floor(grid * alpha) - 1)
+    ordered = np.partition(errors, indices)
+    low_error, high_error, one_sided_error = (float(ordered[index]) for index in indices)
+    return low_error, high_error, one_sided_error
+
+
+def _mean_interval(
+    mean: float, errors: np.ndarray, alpha: float, scale: float = 1.0, *, outward_ranks: bool = False
+) -> PairedMeanInterval:
     with np.errstate(over="ignore", invalid="ignore"):
-        low_error, high_error, one_sided_error = np.quantile(
-            errors, (alpha / 2, 1 - alpha / 2, 1 - alpha), method="linear"
-        )
+        if outward_ranks:
+            low_error, high_error, one_sided_error = _outward_quantiles(errors, alpha)
+        else:
+            low_error, high_error, one_sided_error = np.quantile(
+                errors, (alpha / 2, 1 - alpha / 2, 1 - alpha), method="linear"
+            )
     result = PairedMeanInterval(
         mean, mean - scale * float(high_error), mean - scale * float(low_error), mean - scale * float(one_sided_error)
     )
@@ -182,23 +199,16 @@ def _prewhitened_mean_se(samples: np.ndarray, lag: int) -> np.ndarray:
     return scale
 
 
-def compare_paired_mean_studentized(
+def _studentized_paired_pivots(
     returns: Sequence[Sequence[float]] | np.ndarray,
     *,
     block_length: float,
     variance_lag: int,
     n_resamples: int,
     rng: np.random.Generator,
-    alpha: float = 0.05,
-    prewhiten: bool = False,
-) -> PairedMeanInterval:
-    """Studentized paired interval with a Bartlett standard error for each draw.
-
-    The input is an aligned benchmark/candidate pair. The Bartlett bandwidth is
-    fixed in advance and applied to the original series and every resample.
-    With prewhitening it applies to the residuals of a separately fitted AR(1)
-    for each series.
-    """
+    alpha: float,
+    prewhiten: bool,
+) -> tuple[float, float, np.ndarray]:
     difference = _single_pair(returns, alpha)[:, 0]
     n = difference.size
     variance_observations = n - 1 if prewhiten else n
@@ -218,7 +228,48 @@ def compare_paired_mean_studentized(
         pivots = np.mean(centered_draws, axis=1) / bootstrap_se
     if not math.isfinite(mean) or not np.all(np.isfinite(pivots)):
         raise ValueError("studentized bootstrap pivots are not finite")
+    return mean, scale, pivots
+
+
+def compare_paired_mean_studentized(
+    returns: Sequence[Sequence[float]] | np.ndarray,
+    *,
+    block_length: float,
+    variance_lag: int,
+    n_resamples: int,
+    rng: np.random.Generator,
+    alpha: float = 0.05,
+    prewhiten: bool = False,
+) -> PairedMeanInterval:
+    """Studentized paired interval with a Bartlett standard error for each draw.
+
+    The input is an aligned benchmark/candidate pair. The Bartlett bandwidth is
+    fixed in advance and applied to the original series and every resample.
+    With prewhitening it applies to the residuals of a separately fitted AR(1)
+    for each series.
+    """
+    mean, scale, pivots = _studentized_paired_pivots(
+        returns, block_length=block_length, variance_lag=variance_lag, n_resamples=n_resamples,
+        rng=rng, alpha=alpha, prewhiten=prewhiten,
+    )
     return _mean_interval(mean, pivots, alpha, scale)
+
+
+def compare_paired_prewhitened_quantiles(
+    returns: Sequence[Sequence[float]] | np.ndarray,
+    *,
+    block_length: float,
+    variance_lag: int,
+    n_resamples: int,
+    rng: np.random.Generator,
+    alpha: float = 0.05,
+) -> tuple[PairedMeanInterval, PairedMeanInterval]:
+    """Return the linear and outward-rank intervals from common prewhitened pivots."""
+    mean, scale, pivots = _studentized_paired_pivots(
+        returns, block_length=block_length, variance_lag=variance_lag, n_resamples=n_resamples,
+        rng=rng, alpha=alpha, prewhiten=True,
+    )
+    return _mean_interval(mean, pivots, alpha, scale), _mean_interval(mean, pivots, alpha, scale, outward_ranks=True)
 
 
 def evaluate_fixed_family(

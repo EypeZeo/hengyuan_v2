@@ -12,6 +12,7 @@ import numpy as np
 from py_core.research.paired_bootstrap import (
     compare_paired_mean,
     compare_paired_mean_studentized,
+    compare_paired_prewhitened_quantiles,
 )
 from py_core.tools.calibrate_paired_bootstrap import (
     BLOCK_LENGTH,
@@ -33,6 +34,8 @@ SEED = 20261122
 REPETITIONS = 3000
 PREWHITENED_SEED = 20261123
 PREWHITENED_REPETITIONS = 6000
+RANKED_SEED = 20261124
+RANKED_REPETITIONS = 6000
 VARIANCE_LAG = 8
 MIN_COVERAGE_GAIN = 0.02
 TARGET = "paired_ar_positive_null"
@@ -50,7 +53,8 @@ def _summarize(covered: int, rejected: int, width: float, valid: int) -> dict:
 
 
 def calibrate_scenario(
-    scenario: Scenario, repetitions: int, n_resamples: int, seed: np.random.SeedSequence, *, prewhiten: bool = False
+    scenario: Scenario, repetitions: int, n_resamples: int, seed: np.random.SeedSequence,
+    *, prewhiten: bool = False, ranked: bool = False,
 ) -> dict:
     data_seed, draw_seed = seed.spawn(2)
     data_rng = np.random.Generator(np.random.PCG64(data_seed))
@@ -58,6 +62,8 @@ def calibrate_scenario(
     failures: Counter[str] = Counter()
     basic_covered = studentized_covered = basic_rejected = studentized_rejected = 0
     basic_width = studentized_width = 0.0
+    linear_covered = linear_rejected = 0
+    linear_width = 0.0
     studentized_only = basic_only = 0
     for _ in range(repetitions):
         panel = simulated_panel(scenario, data_rng)
@@ -68,10 +74,18 @@ def calibrate_scenario(
                 panel, block_length=BLOCK_LENGTH, n_resamples=n_resamples, alpha=ALPHA,
                 rng=np.random.Generator(np.random.PCG64(draw)),
             )
-            studentized = compare_paired_mean_studentized(
-                panel, block_length=BLOCK_LENGTH, variance_lag=VARIANCE_LAG, n_resamples=n_resamples,
-                alpha=ALPHA, rng=np.random.Generator(np.random.PCG64(draw)), prewhiten=prewhiten,
-            )
+            studentized_rng = np.random.Generator(np.random.PCG64(draw))
+            linear_control = None
+            if ranked:
+                linear_control, studentized = compare_paired_prewhitened_quantiles(
+                    panel, block_length=BLOCK_LENGTH, variance_lag=VARIANCE_LAG, n_resamples=n_resamples,
+                    alpha=ALPHA, rng=studentized_rng,
+                )
+            else:
+                studentized = compare_paired_mean_studentized(
+                    panel, block_length=BLOCK_LENGTH, variance_lag=VARIANCE_LAG, n_resamples=n_resamples,
+                    alpha=ALPHA, rng=studentized_rng, prewhiten=prewhiten,
+                )
         except ValueError as error:
             failures[str(error)] += 1
             continue
@@ -86,6 +100,10 @@ def calibrate_scenario(
         studentized_width += studentized.upper - studentized.lower
         basic_only += int(basic_hit and not studentized_hit)
         studentized_only += int(studentized_hit and not basic_hit)
+        if linear_control is not None:
+            linear_covered += int(linear_control.lower <= scenario.excess_mean <= linear_control.upper)
+            linear_rejected += int(linear_control.one_sided_lower > 0.0)
+            linear_width += linear_control.upper - linear_control.lower
 
     valid = repetitions - sum(failures.values())
     coverage = wilson_rate(studentized_covered, valid)
@@ -101,7 +119,7 @@ def calibrate_scenario(
             if gain is not None and gain >= MIN_COVERAGE_GAIN and discordant is not None and discordant.lower > 0.5
             else "not_confirmed"
         )
-    return {
+    result = {
         "scenario": asdict(scenario),
         "failures": dict(failures),
         "basic": _summarize(basic_covered, basic_rejected, basic_width, valid),
@@ -112,22 +130,29 @@ def calibrate_scenario(
         "studentized_share_of_discordant_coverage": asdict(discordant) if discordant else None,
         "criteria": criteria,
     }
+    if ranked:
+        result["linear_prewhitened"] = _summarize(linear_covered, linear_rejected, linear_width, valid)
+    return result
 
 
-def run_calibration(*, smoke: bool = False, prewhiten: bool = False) -> dict:
-    seed = PREWHITENED_SEED if prewhiten else SEED
-    planned_repetitions = PREWHITENED_REPETITIONS if prewhiten else REPETITIONS
+def run_calibration(*, smoke: bool = False, prewhiten: bool = False, ranked: bool = False) -> dict:
+    if ranked:
+        protocol, seed, planned_repetitions = "plan-05-ranked-paired-v1", RANKED_SEED, RANKED_REPETITIONS
+    elif prewhiten:
+        protocol, seed, planned_repetitions = "plan-05-prewhitened-paired-v1", PREWHITENED_SEED, PREWHITENED_REPETITIONS
+    else:
+        protocol, seed, planned_repetitions = "plan-05-studentized-paired-v1", SEED, REPETITIONS
     repetitions, resamples = (12, 39) if smoke else (planned_repetitions, RESAMPLES)
     seeds = np.random.SeedSequence(seed).spawn(len(PAIR_SCENARIOS))
     rows = [
-        calibrate_scenario(scenario, repetitions, resamples, scenario_seed, prewhiten=prewhiten)
+        calibrate_scenario(scenario, repetitions, resamples, scenario_seed, prewhiten=prewhiten, ranked=ranked)
         for scenario, scenario_seed in zip(PAIR_SCENARIOS, seeds, strict=True)
     ]
     supported = all(
         not row["failures"] and all(value == "within_tolerance" for value in row["criteria"].values()) for row in rows
     )
     return {
-        "protocol": "plan-05-prewhitened-paired-v1" if prewhiten else "plan-05-studentized-paired-v1",
+        "protocol": protocol,
         "profile": "smoke" if smoke else "formal",
         "status": "smoke" if smoke else ("within_tolerance" if supported else "not_calibrated"),
         "seed": seed,
@@ -148,9 +173,14 @@ def run_calibration(*, smoke: bool = False, prewhiten: bool = False) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke", action="store_true", help="exercise the protocol on a smaller sample")
-    parser.add_argument("--prewhiten", action="store_true", help="run the independent AR(1) prewhitening protocol")
+    methods = parser.add_mutually_exclusive_group()
+    methods.add_argument("--prewhiten", action="store_true", help="run the independent AR(1) prewhitening protocol")
+    methods.add_argument("--rank-quantiles", action="store_true", help="run the independent outward-rank protocol")
     args = parser.parse_args()
-    print(json.dumps(run_calibration(smoke=args.smoke, prewhiten=args.prewhiten), indent=2, allow_nan=False))
+    print(json.dumps(
+        run_calibration(smoke=args.smoke, prewhiten=args.prewhiten, ranked=args.rank_quantiles),
+        indent=2, allow_nan=False,
+    ))
 
 
 if __name__ == "__main__":
