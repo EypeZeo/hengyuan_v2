@@ -31,6 +31,8 @@ from py_core.tools.calibrate_plan05 import (
 
 SEED = 20261122
 REPETITIONS = 3000
+PREWHITENED_SEED = 20261123
+PREWHITENED_REPETITIONS = 6000
 VARIANCE_LAG = 8
 MIN_COVERAGE_GAIN = 0.02
 TARGET = "paired_ar_positive_null"
@@ -48,7 +50,7 @@ def _summarize(covered: int, rejected: int, width: float, valid: int) -> dict:
 
 
 def calibrate_scenario(
-    scenario: Scenario, repetitions: int, n_resamples: int, seed: np.random.SeedSequence
+    scenario: Scenario, repetitions: int, n_resamples: int, seed: np.random.SeedSequence, *, prewhiten: bool = False
 ) -> dict:
     data_seed, draw_seed = seed.spawn(2)
     data_rng = np.random.Generator(np.random.PCG64(data_seed))
@@ -68,7 +70,7 @@ def calibrate_scenario(
             )
             studentized = compare_paired_mean_studentized(
                 panel, block_length=BLOCK_LENGTH, variance_lag=VARIANCE_LAG, n_resamples=n_resamples,
-                alpha=ALPHA, rng=np.random.Generator(np.random.PCG64(draw)),
+                alpha=ALPHA, rng=np.random.Generator(np.random.PCG64(draw)), prewhiten=prewhiten,
             )
         except ValueError as error:
             failures[str(error)] += 1
@@ -112,21 +114,23 @@ def calibrate_scenario(
     }
 
 
-def run_calibration(*, smoke: bool = False) -> dict:
-    repetitions, resamples = (12, 39) if smoke else (REPETITIONS, RESAMPLES)
-    seeds = np.random.SeedSequence(SEED).spawn(len(PAIR_SCENARIOS))
+def run_calibration(*, smoke: bool = False, prewhiten: bool = False) -> dict:
+    seed = PREWHITENED_SEED if prewhiten else SEED
+    planned_repetitions = PREWHITENED_REPETITIONS if prewhiten else REPETITIONS
+    repetitions, resamples = (12, 39) if smoke else (planned_repetitions, RESAMPLES)
+    seeds = np.random.SeedSequence(seed).spawn(len(PAIR_SCENARIOS))
     rows = [
-        calibrate_scenario(scenario, repetitions, resamples, seed)
-        for scenario, seed in zip(PAIR_SCENARIOS, seeds, strict=True)
+        calibrate_scenario(scenario, repetitions, resamples, scenario_seed, prewhiten=prewhiten)
+        for scenario, scenario_seed in zip(PAIR_SCENARIOS, seeds, strict=True)
     ]
     supported = all(
         not row["failures"] and all(value == "within_tolerance" for value in row["criteria"].values()) for row in rows
     )
     return {
-        "protocol": "plan-05-studentized-paired-v1",
+        "protocol": "plan-05-prewhitened-paired-v1" if prewhiten else "plan-05-studentized-paired-v1",
         "profile": "smoke" if smoke else "formal",
         "status": "smoke" if smoke else ("within_tolerance" if supported else "not_calibrated"),
-        "seed": SEED,
+        "seed": seed,
         "numpy": np.__version__,
         "observations": OBSERVATIONS,
         "repetitions_per_scenario": repetitions,
@@ -144,8 +148,9 @@ def run_calibration(*, smoke: bool = False) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke", action="store_true", help="exercise the protocol on a smaller sample")
+    parser.add_argument("--prewhiten", action="store_true", help="run the independent AR(1) prewhitening protocol")
     args = parser.parse_args()
-    print(json.dumps(run_calibration(smoke=args.smoke), indent=2, allow_nan=False))
+    print(json.dumps(run_calibration(smoke=args.smoke, prewhiten=args.prewhiten), indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":
