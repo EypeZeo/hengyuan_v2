@@ -88,23 +88,37 @@ def _resampled_tail_means(values: np.ndarray, indices: np.ndarray, tail_count: i
     return means
 
 
-def bootstrap_tail_bands(
+def _bands_from_half_width(
+    tails: np.ndarray, observed: np.ndarray, half_width: float, count: int
+) -> TailFamilyBands:
+    with np.errstate(over="ignore", invalid="ignore"):
+        lower, upper = observed - half_width, observed + half_width
+    if not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)):
+        raise ValueError("bootstrap produced a non-finite tail band")
+    bands = tuple(
+        TailBand(float(ref), float(trend), float(diff), float(lo), float(hi))
+        for ref, trend, diff, lo, hi in zip(tails[::2], tails[1::2], observed, lower, upper, strict=True)
+    )
+    return TailFamilyBands(half_width, count, bands)
+
+
+def _bootstrap_tail_band_levels(
     returns: Sequence[Sequence[float]] | np.ndarray,
     *,
     block_length: float,
     n_resamples: int,
     rng: np.random.Generator,
-) -> TailFamilyBands:
-    """Estimate paired tail differences using shared date draws and one family half-width."""
+    levels_per_thousand: tuple[int, ...],
+) -> tuple[TailFamilyBands, ...]:
     values = _return_matrix(returns)
     count = worst_five_percent_count(values.shape[0])
     indices = stationary_bootstrap_indices(
         values.shape[0], block_length=block_length, n_resamples=n_resamples, rng=rng
     )
     draws = len(indices)
-    rank = (95 * (draws + 1) + 99) // 100
-    if rank > draws:
-        raise ValueError("too few resamples for the simultaneous 95% tail band")
+    ranks = tuple((level * (draws + 1) + 999) // 1000 for level in levels_per_thousand)
+    if max(ranks) > draws:
+        raise ValueError("too few resamples for the requested simultaneous tail band")
     with np.errstate(over="ignore", invalid="ignore"):
         tails = _tail_means(values, count)
         observed = tails[1::2] - tails[::2]
@@ -114,16 +128,47 @@ def bootstrap_tail_bands(
         if not np.all(np.isfinite(max_errors)):
             raise ValueError("bootstrap produced a non-finite tail error")
 
-        half_width = float(np.partition(max_errors, rank - 1)[rank - 1])
-        lower, upper = observed - half_width, observed + half_width
-        if not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)):
-            raise ValueError("bootstrap produced a non-finite tail band")
-
-    bands = tuple(
-        TailBand(float(ref), float(trend), float(diff), float(lo), float(hi))
-        for ref, trend, diff, lo, hi in zip(tails[::2], tails[1::2], observed, lower, upper, strict=True)
+    positions = tuple(rank - 1 for rank in ranks)
+    ordered_at_ranks = np.partition(max_errors, positions)
+    return tuple(
+        _bands_from_half_width(tails, observed, float(ordered_at_ranks[index]), count)
+        for index in positions
     )
-    return TailFamilyBands(half_width, count, bands)
+
+
+def bootstrap_tail_bands(
+    returns: Sequence[Sequence[float]] | np.ndarray,
+    *,
+    block_length: float,
+    n_resamples: int,
+    rng: np.random.Generator,
+) -> TailFamilyBands:
+    """Estimate paired tail differences using shared date draws and one family half-width."""
+    return _bootstrap_tail_band_levels(
+        returns,
+        block_length=block_length,
+        n_resamples=n_resamples,
+        rng=rng,
+        levels_per_thousand=(950,),
+    )[0]
+
+
+def bootstrap_tail_band_variants(
+    returns: Sequence[Sequence[float]] | np.ndarray,
+    *,
+    block_length: float,
+    n_resamples: int,
+    rng: np.random.Generator,
+) -> tuple[TailFamilyBands, TailFamilyBands]:
+    """Return the original and prespecified wider bands using the same resampled errors."""
+    baseline, adjusted = _bootstrap_tail_band_levels(
+        returns,
+        block_length=block_length,
+        n_resamples=n_resamples,
+        rng=rng,
+        levels_per_thousand=(950, 965),
+    )
+    return baseline, adjusted
 
 
 def classify_tail_direction(bands: Sequence[TailBand]) -> str:
