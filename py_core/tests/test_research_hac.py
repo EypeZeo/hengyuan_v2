@@ -134,8 +134,9 @@ def test_non_finite_returns_are_rejected(values: list[float]) -> None:
     assert estimate.standard_error is None
 
 
-def test_constant_returns_have_zero_variance_not_a_fake_standard_error() -> None:
-    estimate = estimate_sharpe_hac([2.0, 2.0, 2.0]).primary
+@pytest.mark.parametrize("value", [2.0, 0.1, 1e308])
+def test_constant_returns_have_zero_variance_not_a_fake_standard_error(value: float) -> None:
+    estimate = estimate_sharpe_hac([value] * 3).primary
     assert estimate.status is HacStatus.ZERO_VARIANCE
     assert estimate.standard_error is None
 
@@ -148,6 +149,24 @@ def test_a_two_dimensional_input_is_rejected() -> None:
 def test_an_unconvertible_input_is_rejected() -> None:
     estimate = estimate_sharpe_hac([object()]).primary  # type: ignore[list-item]
     assert estimate.status is HacStatus.INVALID_INPUT
+
+
+@pytest.mark.parametrize("dtype", [np.complex128, object])
+@pytest.mark.filterwarnings("error::numpy.exceptions.ComplexWarning")
+def test_complex_arrays_are_rejected_without_discarding_the_imaginary_part(dtype: type) -> None:
+    values = np.array([np.complex128(1 + 2j), np.complex128(2 + 3j)], dtype=dtype)
+    assert estimate_sharpe_hac(values).primary.status is HacStatus.INVALID_INPUT
+
+
+def test_an_integer_outside_float64_range_is_rejected() -> None:
+    assert estimate_sharpe_hac([10**400, 1]).primary.status is HacStatus.INVALID_INPUT
+
+
+def test_returns_one_float_apart_preserve_the_exact_two_point_influence() -> None:
+    estimate = estimate_sharpe_hac([1.0, math.nextafter(1.0, math.inf)], include_adjacent=False).primary
+    assert estimate.status is HacStatus.OK
+    assert estimate.influence_function == pytest.approx([-1.0, 1.0])
+    assert estimate.standard_error == pytest.approx(math.sqrt(0.5))
 
 
 def test_a_failed_primary_estimate_has_no_sensitivity_estimates() -> None:
@@ -184,15 +203,24 @@ def test_a_failed_adjacent_bandwidth_keeps_its_own_status(monkeypatch: pytest.Mo
     assert report.sensitivity[0].status is HacStatus.INVALID_LONG_RUN_VARIANCE
 
 
-def test_extreme_but_finite_values_fail_cleanly_without_runtime_warnings() -> None:
-    estimate = estimate_sharpe_hac([1e308, -1e308], lag=0, include_adjacent=False).primary
-    assert estimate.status in {HacStatus.NUMERIC_FAILURE, HacStatus.ZERO_VARIANCE}
-    assert estimate.standard_error is None
+@pytest.mark.parametrize("scale", [1e308, 1e-170, math.ulp(0.0)])
+def test_finite_rescaling_preserves_hac_at_extreme_magnitudes(scale: float) -> None:
+    report = estimate_sharpe_hac([-scale, scale, -scale, scale], lag=1)
+    assert [estimate.lag for estimate in report.sensitivity] == [0, 2]
+    for estimate, variance in zip((*report.sensitivity, report.primary), (1.0, 1.0 / 3.0, 0.25), strict=True):
+        assert estimate.status is HacStatus.OK
+        assert estimate.sharpe_ratio == 0.0
+        assert estimate.long_run_variance == pytest.approx(variance)
+        assert estimate.standard_error == pytest.approx(math.sqrt(variance / 4))
 
 
 def test_an_autocovariance_summation_overflow_is_a_numeric_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    def overflow(_: object) -> float:
-        raise OverflowError("forced fsum overflow")
+    fsum = math.fsum
+
+    def overflow(values) -> float:
+        if not isinstance(values, np.ndarray):
+            raise OverflowError("forced fsum overflow")
+        return fsum(values)
 
     monkeypatch.setattr("py_core.research.hac.math.fsum", overflow)
     estimate = estimate_sharpe_hac([-1.0, 1.0], lag=0, include_adjacent=False).primary

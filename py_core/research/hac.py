@@ -104,29 +104,33 @@ def _autocovariances(centered: np.ndarray, lag: int) -> tuple[float, ...]:
 
 def _estimate_one(x: np.ndarray, lag: int) -> HacEstimate:
     n = int(x.size)
-    # IEEE overflow is converted into a status below, never allowed to escape as a
-    # RuntimeWarning (pytest promotes those to errors) or a silent NaN result.
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        mean = float(np.mean(x))
-        sigma2 = float(np.mean((x - mean) ** 2))
-        if not math.isfinite(sigma2):
-            return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "the population variance overflowed")
-        if sigma2 <= 0.0:
-            return _failure(HacStatus.ZERO_VARIANCE, lag, n, "the return series has zero population variance")
-
+    if np.all(x == x[0]):
+        return _failure(HacStatus.ZERO_VARIANCE, lag, n, "the return series has zero population variance")
+    # Power-of-two scaling preserves the Sharpe ratio and influence function and
+    # keeps squared deviations representable. Center the differences from the
+    # first observation so the mean's precision is relative to the spread.
+    _, exponent = math.frexp(float(np.max(np.abs(x))))
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
+        scaled = np.ldexp(x, -exponent)
+        shifted = scaled - scaled[0]
+        deviations = shifted - np.mean(shifted)
+        squares = deviations**2
+        sigma2 = float(np.mean(squares))
+        if not math.isfinite(sigma2) or sigma2 <= 0.0:
+            return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "the population variance is not positive and finite")
         sigma = math.sqrt(sigma2)
+        mean = math.fsum(scaled) / n
         sharpe = mean / sigma
-        standardized = (x - mean) / sigma
-        influence = standardized - (sharpe / 2.0) * (standardized**2 - 1.0)
+        influence = deviations / sigma - (sharpe / 2.0) * ((squares - sigma2) / sigma2)
     if not math.isfinite(sharpe) or not np.all(np.isfinite(influence)):
         return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "the Sharpe ratio or its influence function is non-finite")
 
-    influence_mean = float(np.mean(influence))
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
+        influence_mean = float(np.mean(influence))
+        if not math.isfinite(influence_mean):
+            return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "the influence-function mean is non-finite")
         centered = influence - influence_mean
         autocovariances = _autocovariances(centered, lag)
-    if not math.isfinite(influence_mean):
-        return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "the influence-function mean is non-finite")
     if not all(math.isfinite(value) for value in autocovariances):
         return _failure(HacStatus.NUMERIC_FAILURE, lag, n, "an autocovariance is non-finite")
     if autocovariances[0] == 0.0 and all(value == 0.0 for value in autocovariances):
@@ -183,12 +187,18 @@ def estimate_sharpe_hac(
         returns: one-dimensional, complete and equally spaced per-period net returns.
         lag: frozen Bartlett bandwidth, an integer in ``[0, n-1]``. It is not selected
             from the resulting standard errors. ``lag=0`` is the no-autocovariance case.
-        include_adjacent: also estimate ``lag-1`` (when positive) and ``lag+1`` (when
-            below ``n-1``); their estimates have independent statuses.
+        include_adjacent: also estimate ``lag-1`` if ``lag > 0`` and ``lag+1`` if
+            ``lag < n-1``. Both estimates have independent statuses.
     """
     try:
-        x = np.asarray(returns, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
+        values = np.asarray(returns)
+        if np.iscomplexobj(values) or (
+            values.dtype.kind == "O" and any(isinstance(value, (complex, np.complexfloating)) for value in values.flat)
+        ):
+            raise ValueError("returns must be real")
+        with np.errstate(over="ignore", invalid="ignore"):
+            x = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
         return HacReport(primary=_failure(HacStatus.INVALID_INPUT, lag if isinstance(lag, int) else -1, 0, str(exc)))
     n = int(x.size) if x.ndim == 1 else 0
     if x.ndim != 1:
