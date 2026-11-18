@@ -26,6 +26,7 @@ from py_core.research.plan04_history import HistoricalMarket, load_historical_ma
 from py_core.tools.compare_plan04 import funding_schedule, serialize_report_value
 
 _PROTOCOL = "plan04-exposure-match-v1"
+_RISK_PROTOCOL = "plan04-matched-risk-v1"
 _MONTHLY_CNY = (Decimal(0), Decimal(200), Decimal(500))
 ExposureCase = tuple[Decimal, ExposureFit, ExposureEvaluation]
 
@@ -35,6 +36,7 @@ def _records(
     calibration: HistoricalMarket,
     evaluation: HistoricalMarket,
     cases: tuple[ExposureCase, ...],
+    protocol: str,
 ) -> tuple[ExperimentRecord, ...]:
     observed = datetime.now(UTC)
     start = evaluation.bars[0].open_time_utc
@@ -70,7 +72,7 @@ def _records(
                 data_version=evaluation.data_version,
                 data_start_utc=start,
                 data_end_utc=end,
-                code_version=_PROTOCOL,
+                code_version=protocol,
                 cost_model="spot-fee-slippage-conversion-external",
                 eval_start_utc=start,
                 eval_end_utc=end,
@@ -90,7 +92,9 @@ def main() -> None:
     parser.add_argument("--evaluation-manifest", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--registry", type=Path, default=Path(".var/research/experiments.jsonl"))
+    parser.add_argument("--risk-diagnostics", action="store_true", help="add daily drawdown and tail return diagnostics")
     args = parser.parse_args()
+    protocol = _RISK_PROTOCOL if args.risk_diagnostics else _PROTOCOL
     try:
         calibration = load_historical_market(args.calibration_manifest)
         fits = tuple(
@@ -105,10 +109,19 @@ def main() -> None:
         if evaluation.data_version == calibration.data_version:
             raise ValueError("calibration and evaluation must have distinct data versions")
         cases = tuple(
-            (monthly, fit, evaluate_exposure_allocations(fit, evaluation.bars, funding_schedule(evaluation.bars, monthly)))
+            (
+                monthly,
+                fit,
+                evaluate_exposure_allocations(
+                    fit,
+                    evaluation.bars,
+                    funding_schedule(evaluation.bars, monthly),
+                    include_risk_diagnostics=args.risk_diagnostics,
+                ),
+            )
             for monthly, fit in zip(_MONTHLY_CNY, fits, strict=True)
         )
-        records = _records(args.run_id, calibration, evaluation, cases)
+        records = _records(args.run_id, calibration, evaluation, cases, protocol)
     except (OSError, ValueError, OverflowError) as error:
         parser.error(str(error))
 
@@ -119,8 +132,14 @@ def main() -> None:
     for record in records:
         registry.register(record)
 
+    scenarios = []
+    for monthly, fit, evaluated in cases:
+        outcome = asdict(evaluated)
+        if not args.risk_diagnostics:
+            del outcome["risk_diagnostics"]
+        scenarios.append({"monthly_cny": monthly, "grid": [asdict(point) for point in fit.grid], **outcome})
     report = {
-        "protocol": _PROTOCOL,
+        "protocol": protocol,
         "symbol": evaluation.symbol,
         "calibration_data_version": calibration.data_version,
         "evaluation_data_version": evaluation.data_version,
@@ -128,10 +147,7 @@ def main() -> None:
         "evaluation_bars": len(evaluation.bars),
         "tolerance": EXPOSURE_MATCH_TOLERANCE,
         "execution": asdict(evaluation.execution),
-        "scenarios": [
-            {"monthly_cny": monthly, "grid": [asdict(point) for point in fit.grid], **asdict(evaluated)}
-            for monthly, fit, evaluated in cases
-        ],
+        "scenarios": scenarios,
     }
     print(json.dumps(report, indent=2, default=serialize_report_value, allow_nan=False))
 
