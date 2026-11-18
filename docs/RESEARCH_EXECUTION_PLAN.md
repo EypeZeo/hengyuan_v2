@@ -333,6 +333,8 @@ SE_{\mathrm{HAC}}(\widehat{s})=\sqrt{\widehat{\Omega}/n}.
 
 方法依据为 [Newey–West 的 HAC 估计](https://www.nber.org/papers/t0055) 与 [Lo 的 Sharpe 统计研究](https://traders.studentorg.berkeley.edu/papers/The-Statistics-of-Sharpe-Ratios.pdf)。以上影响函数接口是本规划对项目估计流程的具体设计，需要数值与模拟校准。
 
+模拟方案、实际覆盖率和固定候选集合误报率见 [PLAN-05 离线模拟校准](PLAN_05_SIMULATION_CALIBRATION.md)。
+
 ### 6.4 多重选择与 DSR
 
 保留 PSR、DSR 和 PBO 的独立输出，但区分：
