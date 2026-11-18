@@ -62,6 +62,10 @@ from py_core.manual_ohlcv import (
     OhlcvTimeframe,
 )
 from py_core.research.experiments import (
+    BlindAccessKind,
+    BlindSetAccess,
+    BlindSetAccessLog,
+    BlindSetStatus,
     CausalCheck,
     ExperimentRecord,
     ExperimentRegistry,
@@ -70,6 +74,7 @@ from py_core.research.experiments import (
     RegistryFormatError,
     is_admission_eligible,
     params_from_mapping,
+    verify_blind_set_usage,
 )
 from py_core.risk.risk_config import RiskConfig
 from py_core.strategies.base import (
@@ -96,6 +101,7 @@ def register_backtest_trial(
     causal_evidence: CausalEvidence | None,
     strategy_params: dict[str, Any],
     run_id: str,
+    blind_set_sha256: str | None = None,
 ) -> ExperimentRecord:
     """把一次回测运行登记进实验台账（任务 3.2：登记所有候选，含诊断性回测）。
 
@@ -142,6 +148,9 @@ def register_backtest_trial(
             "initial_capital": args.initial_capital,
         }
     )
+    blind_set_id = getattr(args, "blind_set_id", None)
+    if blind_set_id and blind_set_sha256:
+        parameters["blind_set_sha256"] = blind_set_sha256
 
     data_start = records[0].event_time_utc
     data_end = records[-1].event_time_utc
@@ -161,6 +170,7 @@ def register_backtest_trial(
         causal_check=causal_check,
         observed_at_utc=datetime.now(UTC),
         recorded_by="backtests.cli",
+        blind_set_id=blind_set_id or None,
     )
     # 任务 3.2 的登记入口与 save_results 同一约定：自动创建 .var 下的目录。
     registry_path = Path(args.experiment_registry)
@@ -168,6 +178,69 @@ def register_backtest_trial(
     registry = ExperimentRegistry(registry_path)
     registry.register(record)
     return record
+
+
+def precheck_blind_set(args: argparse.Namespace) -> str:
+    """独立保留数据（盲测库）访问纪律的**事前**检查（任务 3.2 / V-16）。
+
+    ``--blind-set-id`` 给出时：manifest 文件的 sha256 固定这份冻结数据的身份；访问
+    日志显示该集合已被研究读取污染（TAINTED）或已被别的 trial 的冻结评估用掉
+    （SPENT）时，在回测与登记发生之前直接拒绝——台账里不留违约记录，评估不白跑。
+    返回 manifest 的 ``sha256:<前16位>``（进因果证据与登记参数）。
+
+    Raises:
+        RegistryFormatError: 纪律拒绝（污染/复用/形状问题）。
+        OSError: manifest 不可读或访问日志不可写。
+        ValueError: 参数配对不完整。
+    """
+    blind_set_id = getattr(args, "blind_set_id", None)
+    if not blind_set_id:
+        raise ValueError("precheck_blind_set() requires --blind-set-id")
+    manifest = getattr(args, "blind_set_manifest", None)
+    if not manifest:
+        raise ValueError("--blind-set-manifest is required with --blind-set-id: a blind set is pinned by its frozen content")
+    digest = hashlib.sha256(Path(manifest).read_bytes()).hexdigest()
+    blind_sha = f"sha256:{digest[:16]}"
+
+    log_path = Path(args.blind_set_access_log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    access_log = BlindSetAccessLog(log_path)
+    status = access_log.status_of(blind_set_id)
+    if status is BlindSetStatus.TAINTED_BY_RESEARCH:
+        raise RegistryFormatError(
+            f"blind set {blind_set_id!r} was read for research purposes and is permanently tainted; "
+            "it can no longer serve as independent holdout evidence (V-16)"
+        )
+    if status is BlindSetStatus.SPENT_BY_FINAL_EVALUATION:
+        raise RegistryFormatError(
+            f"blind set {blind_set_id!r} was already spent by a final evaluation; "
+            "one holdout serves exactly one final evaluation"
+        )
+    return blind_sha
+
+
+def record_blind_set_access(args: argparse.Namespace, *, trial_id: str) -> None:
+    """登记一次 FINAL_EVALUATION 访问并跑 usage 双保险（在 trial 登记之后调用）。"""
+    access_log = BlindSetAccessLog(Path(args.blind_set_access_log))
+    access_log.record(
+        BlindSetAccess(
+            blind_set_id=args.blind_set_id,
+            kind=BlindAccessKind.FINAL_EVALUATION,
+            accessed_at_utc=datetime.now(UTC),
+            recorded_by="backtests.cli",
+            trial_id=trial_id,
+        )
+    )
+    registry = ExperimentRegistry(Path(args.experiment_registry))
+    violations = verify_blind_set_usage(registry, access_log)
+    if violations:
+        for violation in violations:
+            print(
+                f"[ERROR] blind-set usage violation: trial={violation.trial_id} "
+                f"set={violation.blind_set_id} code={violation.code.value}",
+                file=sys.stderr,
+            )
+        raise RegistryFormatError("the blind-set access log does not support this trial's claim")
 
 
 def validate_run_id(run_id: str) -> None:
@@ -343,17 +416,20 @@ def load_signals_from_strategy(
     *,
     allow_external: bool,
     causal_points: int = DEFAULT_CAUSAL_POINTS,
+    blind_set_hash: str | None = None,
 ) -> tuple[pd.Series[Any], CausalEvidence]:
     """用策略框架在已经构建好的 df 上生成 signal Series，并先过因果门禁（SAFE-05）。
 
     df 由调用方构建一次并传入（不在这里再调用 records_to_dataframe()）——避免策略生成和
-    回测执行各自独立构建一次同样的 DataFrame。
+    回测执行各自独立构建一次同样的 DataFrame。``blind_set_hash`` 是本次评价所用独立保留
+    数据的固定内容哈希（D1 预留槽位）：给出时原样写进因果证据，作为"这份评价用的是哪一
+    份冻结盲测库"的机械线索；数据本体与访问纪律由调用方的访问日志承担。
 
     Raises:
         LookaheadBiasError: 前缀截断差分发现信号依赖了该 bar 之后才存在的数据。
     """
     strategy = load_strategy(strategy_spec, allow_external=allow_external, **strategy_params)
-    return checked_signals(strategy, df, points=causal_points)
+    return checked_signals(strategy, df, points=causal_points, blind_set_hash=blind_set_hash)
 
 
 def save_results(
@@ -501,6 +577,15 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
         print("[ERROR] 必须且只能提供 --strategy 或 --signals 之一", file=sys.stderr)
         return 1
 
+    # 独立保留数据（盲测库）纪律的事前检查：与 run 子命令同一合同。
+    blind_hash: str | None = None
+    if getattr(args, "blind_set_id", None):
+        try:
+            blind_hash = precheck_blind_set(args)
+        except (RegistryFormatError, OSError, ValueError) as exc:
+            print(f"[ERROR] 盲测库访问纪律拒绝: {exc}", file=sys.stderr)
+            return 1
+
     print(f"[INFO] 加载 OHLCV: {ohlcv_path}")
     records = load_ohlcv_csv(
         ohlcv_path,
@@ -523,6 +608,7 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
                 df,
                 allow_external=args.allow_external_strategy,
                 causal_points=getattr(args, "causal_points", DEFAULT_CAUSAL_POINTS),
+                blind_set_hash=blind_hash,
             )
         except LookaheadBiasError as exc:
             print(f"[ERROR] 因果核验失败: {exc}", file=sys.stderr)
@@ -636,8 +722,16 @@ def cmd_run_risk_aware(args: argparse.Namespace) -> int:
     if not getattr(args, "no_experiment_registry", False):
         try:
             record = register_backtest_trial(
-                args, records=records, causal_evidence=causal_evidence, strategy_params=strategy_params, run_id=run_id
+                args,
+                records=records,
+                causal_evidence=causal_evidence,
+                strategy_params=strategy_params,
+                run_id=run_id,
+                blind_set_sha256=blind_hash,
             )
+            if getattr(args, "blind_set_id", None):
+                record_blind_set_access(args, trial_id=record.trial_id)
+                print(f"[INFO] blind set {args.blind_set_id}: final-evaluation access recorded and verified")
         except (RegistryFormatError, RegistryCorruptError, OSError, ValueError) as exc:
             print(f"[ERROR] 实验登记失败: {exc}", file=sys.stderr)
             return 1
@@ -666,6 +760,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("[ERROR] 必须且只能提供 --strategy 或 --signals 之一", file=sys.stderr)
         return 1
 
+    # 独立保留数据（盲测库）纪律的事前检查：污染或已用掉的集合在回测发生之前拒绝。
+    blind_hash: str | None = None
+    if getattr(args, "blind_set_id", None):
+        try:
+            blind_hash = precheck_blind_set(args)
+        except (RegistryFormatError, OSError, ValueError) as exc:
+            print(f"[ERROR] 盲测库访问纪律拒绝: {exc}", file=sys.stderr)
+            return 1
+
     print(f"[INFO] 加载 OHLCV: {ohlcv_path}")
     records = load_ohlcv_csv(
         ohlcv_path,
@@ -691,6 +794,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 df,
                 allow_external=args.allow_external_strategy,
                 causal_points=getattr(args, "causal_points", DEFAULT_CAUSAL_POINTS),
+                blind_set_hash=blind_hash,
             )
         except LookaheadBiasError as exc:
             print(f"[ERROR] 因果核验失败: {exc}", file=sys.stderr)
@@ -771,8 +875,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not getattr(args, "no_experiment_registry", False):
         try:
             record = register_backtest_trial(
-                args, records=records, causal_evidence=causal_evidence, strategy_params=strategy_params, run_id=run_id
+                args,
+                records=records,
+                causal_evidence=causal_evidence,
+                strategy_params=strategy_params,
+                run_id=run_id,
+                blind_set_sha256=blind_hash,
             )
+            if getattr(args, "blind_set_id", None):
+                record_blind_set_access(args, trial_id=record.trial_id)
+                print(f"[INFO] blind set {args.blind_set_id}: final-evaluation access recorded and verified")
         except (RegistryFormatError, RegistryCorruptError, OSError, ValueError) as exc:
             print(f"[ERROR] 实验登记失败: {exc}", file=sys.stderr)
             return 1
@@ -860,6 +972,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--trial-id",
         default=None,
         help="实验 trial_id（默认跟随 run_id；重跑必须换新的 trial_id）",
+    )
+    run_parser.add_argument(
+        "--blind-set-id",
+        default=None,
+        help="独立保留数据（盲测库）的 id；给出时本次运行作为一次冻结评估记入访问日志",
+    )
+    run_parser.add_argument(
+        "--blind-set-manifest",
+        default=None,
+        help="盲测库清单文件路径（其 sha256 固定数据身份；--blind-set-id 必填配对）",
+    )
+    run_parser.add_argument(
+        "--blind-set-access-log",
+        default=".var/research/blind_access.jsonl",
+        help="盲测库访问日志（JSONL）路径（默认 .var/research/blind_access.jsonl）",
     )
 
     # ── run-risk-aware subcommand ────────────────────────────────────────────
@@ -954,6 +1081,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--trial-id",
         default=None,
         help="实验 trial_id（默认跟随 run_id；重跑必须换新的 trial_id）",
+    )
+    rra_parser.add_argument(
+        "--blind-set-id",
+        default=None,
+        help="独立保留数据（盲测库）的 id；给出时本次运行作为一次冻结评估记入访问日志",
+    )
+    rra_parser.add_argument(
+        "--blind-set-manifest",
+        default=None,
+        help="盲测库清单文件路径（其 sha256 固定数据身份；--blind-set-id 必填配对）",
+    )
+    rra_parser.add_argument(
+        "--blind-set-access-log",
+        default=".var/research/blind_access.jsonl",
+        help="盲测库访问日志（JSONL）路径（默认 .var/research/blind_access.jsonl）",
     )
 
     return parser
