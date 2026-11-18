@@ -142,6 +142,11 @@ def _validate(
             raise ValueError("contributions must be strictly ordered UTC bar opens")
         _positive(contribution.amount_cny, "amount_cny")
         previous = current
+    validate_execution_assumptions(execution)
+
+
+def validate_execution_assumptions(execution: ExecutionAssumptions) -> None:
+    """Reject execution assumptions outside the supported cash and order models."""
     _positive(execution.price_tick, "price_tick")
     _positive(execution.quantity_step, "quantity_step")
     _decimal(execution.min_notional, "min_notional", _ZERO)

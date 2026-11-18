@@ -1,4 +1,4 @@
-"""Run the offline PLAN-04 funding scenarios on a deterministic synthetic market."""
+"""Run the offline PLAN-04 funding scenarios on synthetic data or a local historical snapshot."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from py_core.research.plan04_comparison import (
     TrialOutcome,
     compare_cash_flows,
 )
+from py_core.research.plan04_history import HistoricalMarket, load_historical_market
 from py_core.strategies.trend import MAX_HOLD_BARS_4H_21D
 
 _PROTOCOL = "plan04-matched-funding-v1"
@@ -90,6 +91,8 @@ def _trial_records(
     run_id: str,
     bars: tuple[ComparisonBar, ...],
     cases: tuple[tuple[Decimal, ComparisonResult], ...],
+    execution: ExecutionAssumptions,
+    market: HistoricalMarket | None,
 ) -> tuple[ExperimentRecord, ...]:
     observed = datetime.now(UTC)
     start, end = bars[0].open_time_utc, bars[-1].open_time_utc + timedelta(hours=4)
@@ -99,7 +102,7 @@ def _trial_records(
         for outcome in result.outcomes:
             trend_bars = windows[outcome.name]
             parameters = {
-                **{key: str(value) for key, value in asdict(_EXECUTION).items()},
+                **{key: str(value) for key, value in asdict(execution).items()},
                 "candidate": outcome.name,
                 "initial_cny": str(_INITIAL_CNY),
                 "monthly_cny": str(monthly),
@@ -107,13 +110,16 @@ def _trial_records(
                 "trend_bars": trend_bars,
                 "max_hold_bars": MAX_HOLD_BARS_4H_21D if trend_bars is not None else None,
             }
+            if market is not None:
+                parameters["symbol"] = market.symbol
+                parameters["max_rate_age_hours"] = market.max_rate_age_hours
             record = ExperimentRecord(
                 trial_id=f"{run_id}-{monthly}-{outcome.name}",
                 family_id="STR-TREND-01",
-                purpose="synthetic matched contribution comparison",
+                purpose="historical matched contribution diagnostic" if market else "synthetic matched contribution comparison",
                 status=outcome.status,
                 parameters=params_from_mapping(parameters),
-                data_version="synthetic-market-v1",
+                data_version=market.data_version if market else "synthetic-market-v1",
                 data_start_utc=start,
                 data_end_utc=end,
                 code_version=_PROTOCOL,
@@ -142,13 +148,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True, help="unique prefix for the registered trials")
     parser.add_argument("--registry", type=Path, default=Path(".var/research/experiments.jsonl"))
+    parser.add_argument("--historical-manifest", type=Path, help="validated local market and exchange-rate files")
     args = parser.parse_args()
-    bars = synthetic_market()
+    market = None
+    if args.historical_manifest is not None:
+        try:
+            market = load_historical_market(args.historical_manifest)
+        except (OSError, ValueError, OverflowError) as error:
+            parser.error(str(error))
+    bars = market.bars if market else synthetic_market()
+    execution = market.execution if market else _EXECUTION
     cases = tuple(
-        (monthly, compare_cash_flows(bars, funding_schedule(bars, monthly), _EXECUTION))
+        (monthly, compare_cash_flows(bars, funding_schedule(bars, monthly), execution))
         for monthly in _MONTHLY_CNY
     )
-    records = _trial_records(args.run_id, bars, cases)
+    records = _trial_records(args.run_id, bars, cases, execution, market)
     args.registry.parent.mkdir(parents=True, exist_ok=True)
     registry = ExperimentRegistry(args.registry)
     if any(record.trial_id in registry.trial_ids() for record in records):
@@ -159,9 +173,9 @@ def main() -> int:
     failed = any(record.status is ExperimentStatus.FAILED for record in records)
     report = {
         "protocol": _PROTOCOL,
-        "data": "synthetic",
+        "data": "historical" if market else "synthetic",
         "bars": len(bars),
-        "execution": asdict(_EXECUTION),
+        "execution": asdict(execution),
         "status": "failed_trials" if failed else "completed",
         "scenarios": [
             {
@@ -178,6 +192,14 @@ def main() -> int:
             for monthly, result in cases
         ],
     }
+    if market is not None:
+        report.update(
+            symbol=market.symbol,
+            data_version=market.data_version,
+            max_rate_age_hours=market.max_rate_age_hours,
+            start_utc=bars[0].open_time_utc,
+            end_utc=bars[-1].open_time_utc + timedelta(hours=4),
+        )
     print(json.dumps(report, indent=2, default=_serialize, allow_nan=False))
     return int(failed)
 
