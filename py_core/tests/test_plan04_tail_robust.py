@@ -87,6 +87,13 @@ def test_smoke_run_uses_new_validation_seeds_and_keeps_selection_out_of_validati
         assert all(part["robust_within_point_tolerances"] is not None for part in row["by_seed"])
 
 
+def test_smoke_run_also_works_with_a_process_pool() -> None:
+    report = run_calibration(smoke=True, workers=2)
+    assert report["status"] == "smoke"
+    assert report["validation_seeds"] == VALIDATION_SEEDS
+    assert len(report["results"]) == len(SCENARIOS)
+
+
 def test_workers_must_be_a_positive_integer() -> None:
     with pytest.raises(ValueError, match="positive integer"):
         run_calibration(smoke=True, workers=0)
