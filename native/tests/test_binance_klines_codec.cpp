@@ -100,6 +100,16 @@ TEST(KlinesCodec, TheStillFormingLastBarIsDroppedNeverReturned) {
     EXPECT_EQ(shared_out().bars[1].close_time_ms, 119'999);
 }
 
+TEST(KlinesCodec, AFormingLastBarMustBeContiguousWithClosedBars) {
+    const std::string body = "[" + row(0, 59'999) + "," + row(120'000, 179'999) + "]";
+    EXPECT_EQ(parse(body, /*now=*/150'000), KlinesParseError::GapInside);
+}
+
+TEST(KlinesCodec, AFormingLastBarWithDuplicateOpenTimeIsNonMonotonic) {
+    const std::string body = "[" + row(0, 59'999) + "," + row(0, 120'000) + "]";
+    EXPECT_EQ(parse(body, /*now=*/60'000, /*span=*/0), KlinesParseError::NonMonotonic);
+}
+
 TEST(KlinesCodec, ABarClosesStrictlyBeforeNow) {
     // close_time 59999: closed iff now > 59999. At now == 59999 it is still "forming".
     EXPECT_EQ(parse(contiguous_rows(1), /*now=*/59'999), KlinesParseError::Empty);

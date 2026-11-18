@@ -94,10 +94,7 @@ def response_json(stage, http_status, body):
         raise ReadFailure(stage, "transport_error")
     if http_status in BACKOFF_STATUSES:
         raise ReadFailure(stage, "backoff", http_status)
-    try:
-        document = r6.parse_json(body) if isinstance(body, str) else None
-    except RecursionError:
-        document = None
+    document = r6.parse_json(body) if isinstance(body, str) else None
     if http_status != 200:
         code = document.get("code") if isinstance(document, dict) else None
         if type(code) is not int or not -99_999 <= code < 0:
@@ -214,7 +211,7 @@ def submit_testnet_order(read_probe, trade_probe, symbol, side, price, quantity,
     raise failure
 
 
-def page_order_ids(rows, symbol):
+def page_order_ids(rows, symbol, *, time_window=None):
     if not isinstance(rows, list):
         raise ReadFailure("all_orders", "invalid_page", 200)
     if len(rows) >= PAGE_LIMIT:
@@ -227,12 +224,18 @@ def page_order_ids(rows, symbol):
         value = row.get("orderId")
         if type(value) is not int or not 0 <= value <= MAX_ORDER_ID or value in ids:
             raise ReadFailure("all_orders", "invalid_page", 200)
+        placed_ms = row.get("time")
+        if type(placed_ms) is not int or not 0 <= placed_ms <= MAX_ORDER_ID:
+            raise ReadFailure("all_orders", "invalid_order_time", 200)
+        if time_window is not None and not time_window[0] <= placed_ms <= time_window[1]:
+            raise ReadFailure("all_orders", "order_time_outside_window", 200)
         ids.add(value)
     return ids
 
 
-def classify_page(rows, symbol, order_id):
-    return "found" if order_id in page_order_ids(rows, symbol) else "missing"
+def classify_page(rows, symbol, order_id, *, time_window=None):
+    ids = page_order_ids(rows, symbol, time_window=time_window)
+    return "found" if order_id in ids else "missing"
 
 
 def summarize(report):
@@ -305,10 +308,11 @@ def collect_visibility(
 
             if monotonic() >= deadline:
                 raise ReadFailure("all_orders", "observation_deadline")
+            window_end = min(before, window_start + WINDOW_LIMIT_MS)
             params = {
                 "symbol": symbol,
                 "startTime": window_start,
-                "endTime": min(before, window_start + WINDOW_LIMIT_MS),
+                "endTime": window_end,
                 "limit": PAGE_LIMIT,
             }
             rows = read_json(probe, "all_orders", ALL_ORDERS_PATH, params)
@@ -316,11 +320,13 @@ def collect_visibility(
             if monotonic() >= deadline:
                 raise ReadFailure("after_time", "observation_deadline")
             after = read_exchange_time(probe, "after_time")
+            if monotonic() >= deadline:
+                raise ReadFailure("after_time", "observation_deadline")
             if after < before:
                 raise ReadFailure("after_time", "invalid_time_bracket")
             observation["after_ms"] = after - accepted_ms
             last_exchange_ms = after
-            observation["result"] = classify_page(rows, symbol, order_id)
+            observation["result"] = classify_page(rows, symbol, order_id, time_window=(window_start, window_end))
         except ReadFailure as problem:
             observation["problem"] = problem.details
             if problem.stopped:
@@ -366,8 +372,6 @@ def recent_orders(probe, symbol):
     read_exchange_time(probe, "initial_time")
     rows = read_json(probe, "all_orders", ALL_ORDERS_PATH, {"symbol": symbol, "limit": RECENT_ORDER_LIMIT})
     page_order_ids(rows, symbol)
-    if any(type(row.get("time")) is not int or row["time"] < 0 for row in rows):
-        raise ReadFailure("all_orders", "invalid_order_time", 200)
     return sorted(rows, key=lambda row: row["time"], reverse=True)[:RECENT_ORDER_LIMIT]
 
 

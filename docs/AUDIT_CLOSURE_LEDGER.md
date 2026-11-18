@@ -22,11 +22,12 @@ python tools/closure_ledger_check.py --self-test
 
 - FI-050：归因改为证据与可能原因集，允许共同原因/未定因；正常期验收使用预注册误报预算及区间，不承诺真实市场零误报。实现仍未开工。
 - FI-051：时间屏障依据可交易净优势衰减和独立硬上限，不以信号自相关半衰期直接替代；退出未知保护不变。
-- FI-055/056：最终门验证本次 handle/代次的唯一所有权；R-18/R-22 已确定统一 NotSent 持久闭合设计，仍需规格/版本迁移/模型/实现验收；延迟注入须覆盖完整日志、anchor 与目录同步链，不仅两次逻辑追加。
+- FI-055/056：S5/S6 已实现发送前最终授权和 `NeverSent` 持久关闭。FI-055 的真实进程延迟注入须覆盖完整的日志、anchor 与目录同步。FI-056 已覆盖运行期孤儿计数、分级告警、原始日志段归档和 S7 离线迁移恢复。源段压实、多代归档以及目标主机中断验证仍待完成。
 - FI-046/047/048/049/054 及相关回归的细分故障与预算条件见蓝图 F.9。自动围栏和有限自动恢复、R2/180 天保留均未实现；不提高 ImplPathStatus，也不豁免首笔实盘之前的恢复、监控和 Owner 授权。
 - 2026-10-25（Q23 切片 1）：FI-055/056 里 NotSent 的语义已冻结于 `docs/NOTSENT_CLOSURE_DESIGN.md`，协议有模型 `formal/notsent_closure.tla`（模型层：设计配置无反例，8 个开关各有必败配置）。两条用例的状态、门禁结论与证据不变：模型不证明实现，实现、迁移与负控仍未做。
 - 2026-11-12（Q23 切片 S2/S3，PR #250，`979a94b`）：NotSent 的**读者侧**已落地（事件 `OrderNeverSent` = 23、状态 `NeverSent` = 12、codec 的 v6 合法集合、`never_sent_rules.hpp`、恢复表 §4.6）。FI-055/056 的状态、门禁结论与证据不变：读者不是写者，发送路径上还没有任何代码写这个帧；写者（S4 至 S6）、迁移（S7）与负控的实现侧用例仍未做。
 - 2026-11-13（Q23 切片 S4，PR #252，`5bbbf43`）：NotSent 的**写入口**已落地（`append_never_sent()`、默认关闭的构造开关 `NeverSentWrites`）。FI-055/056 的状态、门禁结论与证据不变：写入口没有调用者，发送路径上还没有任何代码写这个帧；调用者（S5、S6）、迁移（S7）与负控的实现侧用例仍未做。
+- 2026-11-15（Q23 S5/S6，PR #254）合入发送前最终授权与两类 `NeverSent` 本地拒绝。FI-055 的测试覆盖授权撤销、熔断后持久关闭和时限边界。FI-056 的测试覆盖本地拒绝、活动日志容量和重启后的孤儿预算。两项的实现覆盖均为 `PARTIAL`，完整故障场景均为 `NOT_RUN`，`PRE_D3` 仍为 `BLOCKED`。[ASan/UBSan、TSan 与 ARM64 运行记录](https://github.com/EypeZeo/hengyuan_v2/actions/runs/43611195442)
 - 2026-10-25（D5）：被困订单的出口（L-46）有了设计与模型（`docs/OPERATOR_RESOLUTION_DESIGN.md`、`formal/operator_resolution.tla`），与 FI-002、FI-003、FI-009、FI-011、FI-043 的状态与证据无关，一律不变；实现 R1（恢复读者）已于 2026-10-25 合入（PR #203，`a4372ba`），R2（证据原语）已于 2026-10-26 合入（PR #205，`99d8cb4`），R3-0（工具的持久层数据源）已于 2026-10-27 合入（PR #207，`f7b964c`），R3a（工具的流程：端口、确认短语与读行器、证据文件、`resolve_order()`，对着回环假交易所）已于 2026-10-29 合入（PR #210，`7b66a62`），R3b-1（离线工具的真实交易所读：客户端的原样回传 GET、`BinanceExchangeReadPort` 与配速 / 限流闩、账户 UID 与密钥所属账户的核对）已于 2026-10-30 合入（PR #212，`f06a3a2`），R3b-2（离线工具的命令行 `hy_operator_resolve`：严格的参数文法、`--list`、KEK 文件与密钥文件、只读专用凭据、终端适配器与证据目录、退出码）已于 2026-10-31 合入（PR #214，`bdaece6`），R3b-3（L-50 的附加防线：一个品种名只对不早于日志首次给出它的时刻发送的订单有效）已于 2026-10-31 合入（PR #216，`8b8ad5f`），R4（迟到成交告警：对已被操作员结清的订单，交易所一开口（该 COID 的任何执行报告）就熔断并写审计）已于 2026-10-31 合入（PR #218，`df9b363`），R5（存储的环境与账户绑定：日志记下它属于哪个交易所环境、哪个账户，离线工具据此核对）已于 2026-11-01 合入（PR #220，`3363115`），R6 的第一步（只读 Testnet 探针 `tools/r6_testnet_probe.py`：账户 `uid` 是否存在、不存在订单的真实应答、三个读端点是否可读；Owner 在 Testnet 上运行并贴回结果）已于 2026-11-01 合入（PR #221，`0ef2b4e`），都不改变上述任何一项的状态与证据，R6 的其余部分（运行手册、崩溃窗口演练、读延迟 L 的测量）未开始。
 - 2026-11-02（私网流迁移 M4）：用户数据流排空（审计 P1-002 的路径 ③）先落持久帧、再折进 `PositionTruth`（PR #224，`9675b6c`）。P1-002 的 `code` 段由 MISSING 改为 PRESENT（判断：持久出口已在代码里，未接发布者时的内存优先由守卫钉住并随 M5 删除；若认为这仍算缺口，改回 MISSING 即可），状态仍为 PARTIAL——`runtime` 与 `budget` 两段仍缺（没有进程运行这条排空，同步 fsync 的时延没有测量）；FI-031 的备注随之更新，状态与结果不变。其余条目的状态与证据不变。
 - 2026-11-05（私网流迁移 M5a）：账户刷新通道、真实取账户端口与私网流流水线接线完成（PR #228，`2777c27`；PR #229，`bdbd96b`）。没有任何进程创建流水线，所以 P1-002 与各 FI 条目的状态、结果与证据均不变——P1-002 的 `runtime` 与 `budget` 两段仍缺；新的缺口 L-53（独立对账线程的凭据与限流）登记在蓝图附录 D。
@@ -63,9 +64,9 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 ### 1.3 Fault 段的分级（待 Owner 确认的解释）
 
-`4.1.2` 写“Fault 段指该缺陷对应的故障注入用例编号及其执行结果”，而注册表 45 条里没有一条已通过，较早关闭的缺陷（SUPP 类）也不对应任何 FI 编号。本文件的做法：
+`4.1.2` 要求 Fault 段记录故障注入用例及其执行结果。较早关闭的 SUPP 缺陷没有对应的 FI 编号，因此这里使用以下两种分级。
 
-- `PRESENT:FI`——引用 FI 编号且该用例已通过。目前没有任何项能达到这一级。
+- `PRESENT:FI` 要求所引用的每条 FI 用例均为 `IMPLEMENTED`，且 `result` 和 `gate_result` 均为 `PASS`。每条用例须包含格式有效的 `run:` 引用。CI 运行的实际结果由 `--online` 检查。
 - `PRESENT:UT`——没有 FI 编号可引时，引用一个**命名的 L0 负向测试**，它把缺陷条件注入进去并断言被拒；本仓库自己的 FI 用例也把 L0 单元测试当证据产物（FI-032、FI-037）。
 - 这是对 `4.1.2` 的一个解释，不是修改；它由 Owner 在合并本 PR 时确认。若要求只认 FI 编号，用 `--strict-fault` 运行核对工具，会列出全部依赖 `UT` 级证据的项，这些项随之降为 `PARTIAL`。
 
@@ -79,7 +80,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 字段 | 取值与规则 |
 | :--- | :--- |
-| `status` | 沿用蓝图第 7 卷的词：`NOT_TESTABLE_YET`（还没有可执行的注入手段或被测实现）、`PARTIAL`（至少有一个单测直接断言了该用例的一部分不变量）。再加 `IMPLEMENTED`：实装路径存在、级别满足并取得成功运行证据；目前没有任何一条 |
+| `status` | `NOT_TESTABLE_YET` 表示缺少可执行的注入手段或被测实现。`PARTIAL` 表示至少有一项单测直接验证了用例的一部分不变量。`IMPLEMENTED` 表示被测路径已实现，验证级别满足要求并有成功运行记录。 |
 | `result` | `NOT_RUN`、`PASS`、`FAIL`；`PASS` 只允许配 `IMPLEMENTED` |
 | `gate_result` | `PASS` 当且仅当 `status` 为 `IMPLEMENTED`、`result` 为 `PASS` 且引用了真实成功的 `run:`；其余一律 `BLOCKED`（`7.1`：`PARTIAL`、缺失或未执行直接阻塞） |
 | `open` | 未 `IMPLEMENTED` 的用例必须带至少一个可失败的“尚未”断言（`open:`、`absent:`、`nofile:`、`countN:`），实现落地的那天它会失败，迫使状态前移 |
@@ -92,6 +93,8 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 引用以 `种类:路径#内容` 书写，由工具逐条解析。符号引用按整词匹配，`A::B` 要求 B 出现在 A 之后；带引号的内容按字面匹配。
 
+`open` 字段记录尚未完成的条件。`absent:`、`nofile:` 和 `countN:` 用于核对已实现的行为时，写在 `refs` 或对应的 `seg.*` 中。
+
 | 引用 | 含义 | 核对 |
 | :--- | :--- | :--- |
 | `code:` `test:` | 现行代码符号、测试用例 | 文件存在，符号存在 |
@@ -102,7 +105,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | `doc:` `bp:` `frozen:` | 规格文字、蓝图文字、冻结原文（v2.5.6）里的旧标识 | 文字存在 |
 | `ignored:` | `.gitignore` 必须忽略的路径 | `git check-ignore` |
 | `pr:N@SHA` | 已合并 PR 及其合并提交前缀 | 合并提交在 `HEAD` 历史中；`--online` 再查 GitHub 的合并状态与提交前缀 |
-| `run:ID@SHA/文件[作业]` | CI run、被测提交、workflow 文件与可选作业名 | `--online`：必须 `completed` 且 `success`，提交与 workflow 相符；被取消、失败、未结束的 run 一律不是证据 |
+| `run:ID@SHA/文件[作业]` | CI run、被测提交、workflow 文件与可选作业名 | 离线检查引用格式。`--online` 还检查运行是否完成并成功，以及提交、workflow 和所指定的作业是否相符。 |
 | `fi:FI-nnn=状态` | 故障用例及其在蓝图注册表中的状态 | 必须与蓝图第 7 卷一致 |
 | `log:` | 真实运行日志文件 | 文件存在 |
 
@@ -218,18 +221,18 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-052** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-053** | PRE_D3 | L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-054** | PRE_D3 | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
-| **FI-055** | PRE_D3 | L3 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 58b60d0 |
+| **FI-055** | PRE_D3 | L3 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-056** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-057** | PRE_D3 | L2 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-058** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 1e104d7 |
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 38 | 4 | 22 | 12 | BLOCKED |
+| PRE_D3 | 38 | 4 | 23 | 11 | BLOCKED |
 | PRE_OWNER_LIVE | 14 | 0 | 3 | 11 | BLOCKED |
 | CANARY | 6 | 0 | 0 | 6 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 29，PARTIAL 25，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 28，PARTIAL 26，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -1620,12 +1623,13 @@ gate_tag: PRE_D3
 scope: 按产品
 stage: 1A
 level: L3
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: open:native/include/hengyuan/submit_readiness.hpp#"It is not a lease"
-note: 令牌是 Gate 2b 签发即用的一次性快照，注释写明不是租约（蓝图 L-40）；发送之前的最后一门不存在。
+open: open:native/tests/test_never_sent_guard.cpp#"A production trading process is not one of them yet" open:docs/NOTSENT_CLOSURE_DESIGN.md#"真实进程的完整持久化延迟注入待执行"
+refs: code:native/include/hengyuan/submit_authority.hpp#SubmitAuthority test:native/tests/test_submit_readiness.cpp#RevocationDuringFinalCheckWinsTheClaimCompareExchange test:native/tests/test_submit_final_gate.cpp#RevokedAuthorityRefusesThePreparedOrder test:native/tests/test_submit_final_gate.cpp#KillTriggerAfterPreparedWritesClassBClosureAndReleasesResources test:native/tests/test_submit_final_gate.cpp#AuthorizationTtlExpiresAtTheInclusiveBoundary test:native/tests/test_submit_authority_concurrency.cpp#RevokeThenClaimRejectsTheOldEpoch
+note: S5 在 Prepared 持久确认后复核发送条件并一次性消费授权。测试覆盖撤销竞争、熔断后的持久拒绝及资源释放、授权到期边界。待对真实进程注入完整的日志、anchor 与目录同步延迟，验证目标主机时效并记录从签发到发送决定的时间线。
 ```
 
 ```ledger
@@ -1639,9 +1643,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet"
-refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan
-note: PARTIAL：越过 Intent 的订单永不归为孤儿、孤儿预算是精确上界、越界时启动以恢复扫描失败降级，均有真实日志上的单测；运行期计数、分级告警与可验证归档都不存在，路线待 R-18。
+open: open:native/include/hengyuan/durable_control_plane.hpp#"kIntentOrphanRetainMs are not implemented yet" open:docs/NOTSENT_CLOSURE_DESIGN.md#"源段压实与多代归档策略仍待实现"
+refs: test:native/tests/test_durable_audit_sink.cpp#AnOrderThatMovedPastIntentIsNeverAnOrphan test:native/tests/test_durable_audit_sink.cpp#TheIntentOrphanBudgetIsAnExactBound test:native/tests/test_startup_recovery.cpp#AnIntentOrphanBudgetOverrunDegradesStartupAsAFailedRecoveryScan test:native/tests/test_never_sent_orphans.cpp#RepeatedClosuresStayBelowSmallBudgetAndWatermarkSurvivesEvictionAndRestart test:native/tests/test_never_sent_class_a.cpp#FiveFrameLimitKeepsThirdIntentWhenItsClosureHitsTheLimit test:native/tests/test_never_sent_budget.cpp#FailedClosureWithoutAFrameRestoresTheIntentOrphanOnRestart test:native/tests/test_never_sent_runtime_budget.cpp#EveryClassARefusalHasAnAccurateReasonBucketForEveryUnclosedStatus test:native/tests/test_never_sent_class_a.cpp#NinetyPercentStopsTheNextRequestBeforeAnyNewIntent test:native/tests/test_private_stream_pipeline.cpp#RuntimeOrphanBudgetSeedsRecoveryOnceAndSharesItAcrossContexts test:native/tests/test_durable_audit_export.cpp#ArchiveStagingPublishesTheCompleteFileOnlyAtTheFinalPath test:native/tests/test_durable_audit_export.cpp#StrictArchiveSourceRefusesAStaleAnchorAndDefaultExportStillAllowsIt test:native/tests/test_never_sent_reader.cpp#TheVerifierReadsAClosureLogAndReportsVersion6 test:native/tests/test_durable_audit_export.cpp#RawSegmentArchivePreservesTheAnchorIdentityAndLogBytes test:native/tests/test_never_sent_writer.cpp#APartialFirstV6FrameIsCutBackToTheArchivedV5Boundary test:native/tests/test_never_sent_writer.cpp#ACorruptOrTruncatedMigrationArchiveFailsClosedWithoutCuttingTheSource
+note: S6 覆盖类 A 拒绝的 NeverSent 持久记录、活动日志帧数上限和写入失败后的孤儿恢复。SAFE-07a 覆盖恢复计数初始化、运行期拒绝分类、分级告警和达到 90% 阈值后停止写入新 Intent。原始段归档保存原有帧、锚点和存储标识。S7 离线测试覆盖迁移清单截断、首个 v6 帧撕裂和完整 v6 帧落盘后锚点滞后。CTest S7ProcessRecovery 通过独立子进程退出和重启覆盖后两种恢复状态。源段压实、多代归档及目标主机实际中断恢复仍待验证。
 ```
 
 ```ledger

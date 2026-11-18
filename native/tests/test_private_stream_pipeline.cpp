@@ -238,7 +238,9 @@ protected:
         return path_;
     }
 
-    void open_sink() { sink_ = std::make_unique<DurableAuditSink>(path_, *ring_, kKeyId, kMaxIntentOrphans, AuditSinkOpenMode::Trading); }
+    void open_sink(std::size_t max_intent_orphans = kMaxIntentOrphans) {
+        sink_ = std::make_unique<DurableAuditSink>(path_, *ring_, kKeyId, max_intent_orphans, AuditSinkOpenMode::Trading);
+    }
 
     // An order that was submitted and never answered: the log's last frame is Submitting, which a restart recovers as Ambiguous.
     void leave_an_unanswered_order(const char* coid) {
@@ -350,6 +352,31 @@ TEST_F(PipelineTest, TheOrchestratorGetsPastItsReadinessGateWithThePipelinesCont
     const OrchestratorResult result = orchestrate_submit(ctx);
     EXPECT_NE(result.gate, OrchestratorGate::NotReady) << "the readiness gate passed; some later gate (this context carries no order) refuses";
     EXPECT_EQ(result.ready_generation, pipe_->supervisor().generation());
+}
+
+TEST_F(PipelineTest, RuntimeOrphanBudgetSeedsRecoveryOnceAndSharesItAcrossContexts) {
+    {
+        DurableAuditSink first(path_, *ring_, kKeyId);
+        ASSERT_TRUE(first.append_durable(make_intent("orphan-one", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(first.append_durable(make_intent("orphan-two", 100, 10, 1), 1000).acked());
+    }
+    open_sink(2);
+    ASSERT_EQ(sink_->recovered_intent_orphans(), 2u);
+    build();
+
+    const auto& budget = pipe_->intent_orphan_budget();
+    EXPECT_EQ(budget.recovered(), 2u);
+    EXPECT_EQ(budget.live(), 0u);
+    EXPECT_EQ(budget.total(), 2u);
+    EXPECT_EQ(budget.maximum(), 2u);
+    EXPECT_EQ(budget.count(never_sent::IntentOrphanReason::RecoveredUnknown), 2u);
+    EXPECT_EQ(budget.alert_mask(), never_sent::kIntentOrphanAlertAll);
+    EXPECT_TRUE(budget.stopped());
+
+    const OrchestratorContext first = pipe_->make_context();
+    const OrchestratorContext second = pipe_->make_context();
+    EXPECT_EQ(first.intent_orphan_budget, &budget);
+    EXPECT_EQ(second.intent_orphan_budget, &budget) << "context copies share one hot-side owner, never split or reseed the count";
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------

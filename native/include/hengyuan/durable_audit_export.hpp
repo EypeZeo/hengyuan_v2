@@ -31,24 +31,29 @@
 // are illegal is exported as it is and the consumer can see it. And it defines no key ceremony: the ring comes from
 // the caller. load_audit_key_file() below is only this tool's INPUT contract for the wrapped keys.
 //
-// OUTPUT. Line 1 is a manifest object; every further line is one frame. `"type"` tells them apart. The output file
-// is created with CREATE_NEW semantics (an existing file is an error, never overwritten) and 0600 where the platform
-// has that notion.
+// OUTPUT. The first line is a manifest object. Each subsequent line represents one frame. The exporter streams to a
+// staging file in the output directory, flushes it, then publishes the complete file under the final name
+// with no-replace semantics. A staging file uses mode 0600 on POSIX.
 
 #pragma once
 
+#include <hengyuan/audit_archive_format.hpp>
 #include <hengyuan/durable_audit_sink.hpp>  // tip anchor / store identity decoders, DurableAuditSink's file naming
 #include <hengyuan/durable_frame_codec.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/secure_wipe.hpp>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -93,7 +98,13 @@ enum class ExportStatus : std::uint8_t {
     AnchorMismatch = 15,    // the anchor's mac is not that of the log's frame at its sequence number
     StoreIdentityInvalid = 16,  // the identity sidecar exists but does not verify
     OutputExists = 17,      // the output path already exists (CREATE_NEW)
-    OutputError = 18,       // could not create or write the output
+    OutputError = 18,       // could not stage or publish the output
+    ArchiveSourceIncomplete = 19,  // a complete source requires frames and an anchor at the exact tip
+    ArchiveIdentityMissing = 20,   // a complete source requires a store identity
+    OutputSyncUncertain = 21,      // the complete file is visible, but the directory flush failed
+    MalformedArchive = 22,        // archive envelope or length is invalid
+    MigrationSourceVersion = 23,  // preparation requires a v5 source
+    ReservedMigrationPath = 24,   // ordinary exports reserve migration filenames for S7 preparation
 };
 
 inline constexpr const char* export_status_name(ExportStatus s) noexcept {
@@ -117,6 +128,12 @@ inline constexpr const char* export_status_name(ExportStatus s) noexcept {
         case ExportStatus::StoreIdentityInvalid: return "StoreIdentityInvalid";
         case ExportStatus::OutputExists: return "OutputExists";
         case ExportStatus::OutputError: return "OutputError";
+        case ExportStatus::ArchiveSourceIncomplete: return "ArchiveSourceIncomplete";
+        case ExportStatus::ArchiveIdentityMissing: return "ArchiveIdentityMissing";
+        case ExportStatus::OutputSyncUncertain: return "OutputSyncUncertain";
+        case ExportStatus::MalformedArchive: return "MalformedArchive";
+        case ExportStatus::MigrationSourceVersion: return "MigrationSourceVersion";
+        case ExportStatus::ReservedMigrationPath: return "ReservedMigrationPath";
     }
     return "?";
 }
@@ -137,6 +154,7 @@ struct ExportOptions {
     // A log without a tip anchor cannot be shown to have kept its tail. The default refuses; setting this exports
     // it anyway and says so in the manifest (`"tip_anchor":"absent-allowed"`).
     bool allow_missing_anchor{false};
+    bool require_complete_source{false};  // require a non-empty, identified log with an intact and anchored tip
 };
 
 // What verify_audit_log() found. status == Ok means every complete frame verified (and the anchor and identity
@@ -150,6 +168,8 @@ struct AuditLogVerification {
     std::uint64_t error_sequence{0};                // the sequence number that frame was expected to carry
     std::array<std::byte, kMacLen> tail_mac{};      // the last verified frame's mac (valid when frames > 0)
     std::uint8_t max_frame_version{0};              // the highest frame format version seen (0 = no frame); D5 / R1
+    std::optional<std::uint64_t> first_v6_sequence{};   // the first complete v6 frame
+    std::optional<std::uint64_t> tip_anchor_sequence{}; // the verified anchor position
     std::array<std::uint32_t, kMaxLiveKeys> key_ids{};  // distinct key ids seen, in first-appearance order
     std::size_t key_id_count{0};
     std::size_t log_bytes{0};
@@ -324,6 +344,9 @@ inline AuditLogVerification verify_audit_log(std::span<const std::byte> log, con
             v.error_sequence = expected_seq;
             return v;
         }
+        if (frame.format_version == kFrameFormatVersionV6 && !v.first_v6_sequence.has_value()) {
+            v.first_v6_sequence = frame.sequence_number;
+        }
         v.max_frame_version = frame.format_version;
         detail::export_note_key_id(v, frame.key_id);
         if (have_anchor && frame.sequence_number == anchor.sequence_number) {
@@ -365,6 +388,7 @@ inline AuditLogVerification verify_audit_log(std::span<const std::byte> log, con
             return v;
         }
         v.anchor = AnchorState::Verified;
+        v.tip_anchor_sequence = anchor.sequence_number;
     }
 
     if (identity_present) {
@@ -384,6 +408,13 @@ inline AuditLogVerification verify_audit_log(std::span<const std::byte> log, con
         v.store_uuid_lo = identity.store_uuid_lo;
         v.store_uuid_hi = identity.store_uuid_hi;
     }
+    if (opts.require_complete_source) {
+        if (v.frames == 0 || v.torn_tail_bytes != 0 || v.tip_anchor_sequence != v.frames - 1) {
+            v.status = ExportStatus::ArchiveSourceIncomplete;
+        } else if (v.identity != IdentityState::Verified) {
+            v.status = ExportStatus::ArchiveIdentityMissing;
+        }
+    }
     return v;
 }
 
@@ -398,6 +429,8 @@ inline std::string audit_export_manifest_line(const AuditLogVerification& v) {
     // OrderOperatorResolved or an OrderNeverSent frame -- is in it); an empty log reports the version a writer would
     // start it at.
     s += std::to_string(static_cast<unsigned>(v.max_frame_version != 0 ? v.max_frame_version : kFrameFormatVersion));
+    s += ",\"first_v6_seq\":";
+    s += v.first_v6_sequence ? std::to_string(*v.first_v6_sequence) : "null";
     s += ",\"frames\":";
     s += std::to_string(v.frames);
     if (v.frames > 0) {
@@ -427,7 +460,9 @@ inline std::string audit_export_manifest_line(const AuditLogVerification& v) {
         case AnchorState::EmptyLog: s += "empty-log"; break;
         case AnchorState::NotChecked: s += "not-checked"; break;
     }
-    s += "\",\"store_uuid\":";
+    s += "\",\"tip_anchor_seq\":";
+    s += v.tip_anchor_sequence ? std::to_string(*v.tip_anchor_sequence) : "null";
+    s += ",\"store_uuid\":";
     if (v.identity == IdentityState::Verified) {
         s += '"';
         detail::export_hex16_append(s, v.store_uuid_lo);
@@ -648,7 +683,8 @@ public:
     ExclusiveOutputFile& operator=(const ExclusiveOutputFile&) = delete;
     ~ExclusiveOutputFile() { abandon(); }
 
-    OpenStatus create(const std::string& path) noexcept {
+    OpenStatus create(const std::string& path) {
+        if (owns_) return OpenStatus::Error;
         path_ = path;
 #if defined(_WIN32)
         handle_ = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -681,6 +717,7 @@ public:
                 if (errno == EINTR) continue;
                 return false;
             }
+            if (n == 0) return false;
             bytes.remove_prefix(static_cast<std::size_t>(n));
         }
 #endif
@@ -690,18 +727,42 @@ public:
     // Flushes to disk and closes; on success the file is kept, on failure it is removed.
     bool commit() noexcept {
         if (!open_) return false;
-#if defined(_WIN32)
-        const bool ok = FlushFileBuffers(handle_) != 0;
-#else
-        const bool ok = ::fsync(fd_) == 0;
-#endif
-        close_handle();
-        if (!ok) {
+        if (!flush_and_close()) {
             remove_file();
             return false;
         }
         owns_ = false;
         return true;
+    }
+
+    // Publish a flushed staging file within its destination directory. A competing publisher keeps its file.
+    ExportStatus publish_as(const std::string& destination) {
+        if (!open_ || !flush_and_close()) return ExportStatus::OutputError;
+#if defined(_WIN32)
+        if (MoveFileExA(path_.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH) == 0) {
+            const DWORD error = GetLastError();
+            return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS
+                ? ExportStatus::OutputExists : ExportStatus::OutputError;
+        }
+        owns_ = false;
+        return ExportStatus::Ok;
+#else
+        const auto parent = std::filesystem::path(destination).parent_path();
+        const int directory = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory < 0) return ExportStatus::OutputError;
+        if (::link(path_.c_str(), destination.c_str()) != 0) {
+            const int error = errno;
+            ::close(directory);
+            return error == EEXIST ? ExportStatus::OutputExists : ExportStatus::OutputError;
+        }
+        remove_file();
+        int sync_result;
+        do {
+            sync_result = ::fsync(directory);
+        } while (sync_result != 0 && errno == EINTR);
+        ::close(directory);
+        return sync_result == 0 ? ExportStatus::Ok : ExportStatus::OutputSyncUncertain;
+#endif
     }
 
     // Closes and removes the file unless commit() already kept it.
@@ -711,6 +772,20 @@ public:
     }
 
 private:
+    bool flush_and_close() noexcept {
+#if defined(_WIN32)
+        const bool ok = FlushFileBuffers(handle_) != 0;
+#else
+        int sync_result;
+        do {
+            sync_result = ::fsync(fd_);
+        } while (sync_result != 0 && errno == EINTR);
+        const bool ok = sync_result == 0;
+#endif
+        close_handle();
+        return ok;
+    }
+
     void close_handle() noexcept {
 #if defined(_WIN32)
         CloseHandle(handle_);
@@ -722,8 +797,11 @@ private:
         open_ = false;
     }
     void remove_file() noexcept {
-        std::error_code ec;
-        std::filesystem::remove(path_, ec);
+#if defined(_WIN32)
+        DeleteFileA(path_.c_str());
+#else
+        ::unlink(path_.c_str());
+#endif
         owns_ = false;
     }
 
@@ -737,6 +815,79 @@ private:
 #endif
 };
 
+namespace detail {
+
+inline bool is_reserved_migration_output(const std::string& path) {
+    auto filename = std::filesystem::path(path).filename().string();
+#if defined(_WIN32)
+    // Win32 aliases can use a stream suffix, case changes, trailing dots or trailing spaces.
+    const auto stream = filename.find(':');
+    if (stream != std::string::npos) filename.resize(stream);
+    const auto last = filename.find_last_not_of(" .");
+    filename.resize(last == std::string::npos ? 0 : last + 1);
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](char ch) {
+        return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + ('a' - 'A')) : ch;
+    });
+#endif
+    return std::string_view(filename).ends_with(audit_archive::kMigrationSuffix);
+}
+
+inline ExclusiveOutputFile::OpenStatus open_archive_staging(ExclusiveOutputFile& file, const std::string& destination) {
+    const auto parent = std::filesystem::path(destination).parent_path();
+#if defined(_WIN32)
+    const auto process = GetCurrentProcessId();
+#else
+    const auto process = ::getpid();
+#endif
+    static std::atomic<std::uint64_t> serial{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string prefix = ".hy-audit-export-" + std::to_string(process) + "-" + std::to_string(stamp) + "-";
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        const std::string name = prefix + std::to_string(serial.fetch_add(1, std::memory_order_relaxed)) + ".partial";
+        const auto status = file.create((parent / name).string());
+        if (status != ExclusiveOutputFile::OpenStatus::Exists) return status;
+    }
+    return ExclusiveOutputFile::OpenStatus::Error;
+}
+
+}  // namespace detail
+
+namespace detail {
+
+struct AuditExportInput {
+    std::vector<std::byte> log;
+    std::vector<std::byte> anchor;
+    std::vector<std::byte> identity;
+    bool anchor_present{false};
+    bool identity_present{false};
+};
+
+inline ExportStatus read_audit_export_input(const std::string& log_path, AuditExportInput& input) {
+    switch (read_file_bounded(log_path, input.log, kMaxDurableLogBytes)) {
+        case ReadFileStatus::Ok: break;
+        case ReadFileStatus::TooLarge: return ExportStatus::LogTooLarge;
+        case ReadFileStatus::NotFound:
+        case ReadFileStatus::Error: return ExportStatus::IoError;
+    }
+    switch (read_file_bounded(log_path + ".tip", input.anchor, 4096)) {
+        case ReadFileStatus::Ok: input.anchor_present = true; break;
+        case ReadFileStatus::NotFound: break;
+        case ReadFileStatus::TooLarge:
+            return ExportStatus::AnchorInvalid;
+        case ReadFileStatus::Error: return ExportStatus::IoError;
+    }
+    switch (read_file_bounded(log_path + ".storeid.tip", input.identity, 4096)) {
+        case ReadFileStatus::Ok: input.identity_present = true; break;
+        case ReadFileStatus::NotFound: break;
+        case ReadFileStatus::TooLarge:
+            return ExportStatus::StoreIdentityInvalid;
+        case ReadFileStatus::Error: return ExportStatus::IoError;
+    }
+    return ExportStatus::Ok;
+}
+
+}  // namespace detail
+
 struct ExportFileResult {
     ExportStatus status{ExportStatus::Ok};
     AuditLogVerification verification{};
@@ -744,62 +895,44 @@ struct ExportFileResult {
 
 // The whole offline export of `log_path` to `out_path` (which must not exist), under `ring`'s keys. The tip anchor is
 // `<log>.tip`, the store identity `<log>.storeid.tip`, the writer's lock `<log>.lock` (the names DurableAuditSink
-// derives). Verify first, write only if everything holds; a failure after the output was created removes it.
+// derives). Verify the source, then stage and publish the complete export.
 inline ExportFileResult export_audit_log_file(const std::string& log_path, const std::string& out_path,
                                               const KeyRing& ring, const ExportOptions& opts = ExportOptions{}) {
     ExportFileResult result;
     try {
+        if (detail::is_reserved_migration_output(out_path)) {
+            result.status = ExportStatus::ReservedMigrationPath;
+            return result;
+        }
         switch (probe_writer_lock(log_path + ".lock")) {
             case WriterProbe::NotHeld: break;
             case WriterProbe::Held: result.status = ExportStatus::WriterLive; return result;
             case WriterProbe::Unknown: result.status = ExportStatus::WriterUnknown; return result;
         }
 
-        std::vector<std::byte> log;
-        switch (read_file_bounded(log_path, log, kMaxDurableLogBytes)) {
-            case ReadFileStatus::Ok: break;
-            case ReadFileStatus::TooLarge: result.status = ExportStatus::LogTooLarge; return result;
-            case ReadFileStatus::NotFound:
-            case ReadFileStatus::Error: result.status = ExportStatus::IoError; return result;
-        }
-        std::vector<std::byte> anchor;
-        bool anchor_present = false;
-        switch (read_file_bounded(log_path + ".tip", anchor, 4096)) {
-            case ReadFileStatus::Ok: anchor_present = true; break;
-            case ReadFileStatus::NotFound: break;
-            case ReadFileStatus::TooLarge:
-                result.status = ExportStatus::AnchorInvalid;  // a tip anchor is 77 bytes
-                return result;
-            case ReadFileStatus::Error: result.status = ExportStatus::IoError; return result;
-        }
-        std::vector<std::byte> identity;
-        bool identity_present = false;
-        switch (read_file_bounded(log_path + ".storeid.tip", identity, 4096)) {
-            case ReadFileStatus::Ok: identity_present = true; break;
-            case ReadFileStatus::NotFound: break;
-            case ReadFileStatus::TooLarge:
-                result.status = ExportStatus::StoreIdentityInvalid;
-                return result;
-            case ReadFileStatus::Error: result.status = ExportStatus::IoError; return result;
-        }
+        detail::AuditExportInput input;
+        result.status = detail::read_audit_export_input(log_path, input);
+        if (result.status != ExportStatus::Ok) return result;
 
-        result.verification = verify_audit_log(log, ring, anchor_present, anchor, identity_present, identity, opts);
+        result.verification = verify_audit_log(input.log, ring, input.anchor_present, input.anchor,
+                                               input.identity_present, input.identity, opts);
         if (!result.verification.ok()) {
             result.status = result.verification.status;
             return result;
         }
 
+        std::error_code output_path_error;
+        if (std::filesystem::exists(out_path, output_path_error)) {
+            result.status = ExportStatus::OutputExists;
+            return result;
+        }
         ExclusiveOutputFile out;
-        switch (out.create(out_path)) {
-            case ExclusiveOutputFile::OpenStatus::Ok: break;
-            case ExclusiveOutputFile::OpenStatus::Exists: result.status = ExportStatus::OutputExists; return result;
-            case ExclusiveOutputFile::OpenStatus::Error: result.status = ExportStatus::OutputError; return result;
-        }
-        if (!emit_audit_export(log, ring, result.verification, [&out](std::string_view line) { return out.write(line); }) ||
-            !out.commit()) {
-            out.abandon();
+        if (output_path_error || detail::open_archive_staging(out, out_path) != ExclusiveOutputFile::OpenStatus::Ok ||
+            !emit_audit_export(input.log, ring, result.verification, [&out](std::string_view line) { return out.write(line); })) {
             result.status = ExportStatus::OutputError;
+            return result;
         }
+        result.status = out.publish_as(out_path);
         return result;
     } catch (...) {
         result.status = ExportStatus::IoError;

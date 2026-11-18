@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import base64
+import datetime
 import io
 import os
 import re
@@ -39,6 +41,88 @@ def expect(name: str, cond: bool) -> None:
         FAIL.append(name)
 
 
+def check_source_copy_controls() -> None:
+    """用小型内存样本确认原文副本检查接受原文并拒绝损坏输入。"""
+    raw = b"small source copy"
+    content = base64.b64encode(raw).decode("ascii")
+    valid = {"source": {"encoding": "base64", "content": content}}
+    clean_ok = V.source_copy_matches(raw, valid)
+    expect("原文副本：原始字节匹配时通过", clean_ok)
+
+    changed = raw[:-1] + bytes([raw[-1] ^ 1])
+    control("原文副本：原文改动一个字节后拒绝",
+            not V.source_copy_matches(changed, valid), clean_ok)
+    control("原文副本：缺少 source 时拒绝",
+            not V.source_copy_matches(raw, {}), clean_ok)
+    control("原文副本：encoding 错误时拒绝",
+            not V.source_copy_matches(raw, {"source": {"encoding": "utf-8", "content": content}}),
+            clean_ok)
+    control("原文副本：非法 base64 时拒绝",
+            not V.source_copy_matches(raw, {"source": {"encoding": "base64", "content": "%%%"}}),
+            clean_ok)
+    control("原文副本：content 类型错误时拒绝",
+            not V.source_copy_matches(raw, {"source": {"encoding": "base64", "content": 7}}),
+            clean_ok)
+
+
+def check_external_reference_controls() -> None:
+    """HTML 属性中各种合法写法都要识别外部引用，正文和 data 属性不算。"""
+    clean_cases = (
+        ("站内锚点", '<a href="#section">标题</a>'),
+        ("本地资源", '<script src="/assets/app.js"></script>'),
+        ("正文中的 URL 文字", '<p>https://cdn.example.test/app.js</p>'),
+        ("data 属性中的 URL", '<div data-src="https://cdn.example.test/app.js" '
+                              'data-href="//cdn.example.test/file"></div>'),
+    )
+    clean_ok = all(not B.external_references(page) for _, page in clean_cases)
+    for label, page in clean_cases:
+        expect(f"外链检查忽略{label}", not B.external_references(page))
+
+    remote_cases = (
+        ("单引号 src", "<script src='https://cdn.example.test/app.js'></script>"),
+        ("无引号 href", "<a href=https://cdn.example.test/page>外部</a>"),
+        ("协议相对 src", "<img src=//cdn.example.test/image.png>"),
+        ("大写属性名与协议", '<A HREF="HTTPS://cdn.example.test/page">外部</A>'),
+        ("HTML 实体编码的 URL", '<a href="https&#58;&#47;&#47;cdn.example.test/page">外部</a>'),
+        ("显式 HTTPS 协议", '<a href="https:cdn.example.test/page">外部</a>'),
+        ("SVG 外部引用", '<svg><use xlink:href="https://cdn.example.test/icons.svg#mark"/></svg>'),
+    )
+    for label, page in remote_cases:
+        control(f"外链检查捕获{label}", bool(B.external_references(page)), clean_ok)
+
+
+def timeline_has_focusable_station_bar(markup: str, station_id: str) -> bool:
+    bars = re.findall(r'<rect\b[^>]*class="bar(?:\s[^"]*)?"[^>]*>', markup)
+    station_attr = 'data-station="%s"' % station_id
+    return any('tabindex="0"' in bar and station_attr in bar for bar in bars)
+
+
+def check_timeline_rendering() -> None:
+    """用合成日期站点覆盖时间轴条形的生成与键盘属性。"""
+    old_baseline = B.BASELINE_DATE
+    B.BASELINE_DATE = datetime.date(2026, 11, 15)
+    station = {
+        "id": "T0", "status": "TODO", "lane": "A", "due": "2026-11-20",
+        "effort": "2 日", "name": "合成时间轴站点", "anchor": "timeline-test",
+    }
+    try:
+        markup = B.timeline_panel([station])
+        bar = re.search(r'<rect\b[^>]*class="bar(?:\s[^"]*)?"[^>]*>', markup)
+        clean_render = '<svg class="gantt"' in markup and bar is not None
+        has_tabindex = bool(bar and 'tabindex="0"' in bar.group(0))
+        has_station = bool(bar and 'data-station="T0"' in bar.group(0))
+        expect("合成有日期站点生成时间轴条形", clean_render)
+        expect("合成时间轴条形设置 tabindex=0", has_tabindex)
+        expect("合成时间轴条形包含 data-station", has_station)
+
+        without_tabindex = markup.replace(' tabindex="0"', "", 1)
+        control("移除合成时间轴条形 tabindex 后拒绝",
+                not timeline_has_focusable_station_bar(without_tabindex, "T0"),
+                clean_render and has_tabindex and has_station)
+    finally:
+        B.BASELINE_DATE = old_baseline
+
+
 MUST_VARS = {"--bg", "--fg", "--fg2", "--fg3", "--panel", "--panel2", "--line", "--line2",
              "--accent", "--done", "--wip", "--todo", "--blocked", "--dropped",
              "--arc", "--edge", "--hit", "--shadow", "--topbar", "--mark",
@@ -50,6 +134,15 @@ MOUNTS = ['id="q"', 'id="metro-svg"', 'id="status-note"', 'id="prog"', 'id="toto
 
 
 def main() -> int:
+    print("== 原文副本检查（内存样本） ==")
+    check_source_copy_controls()
+
+    print("\n== HTML 外部引用的属性写法 ==")
+    check_external_reference_controls()
+
+    print("\n== 合成站点的时间轴渲染 ==")
+    check_timeline_rendering()
+
     page = io.open(B.OUT, encoding="utf-8").read()
     scripts = V.extract_scripts(page)
     style = V.css_style_block(page)

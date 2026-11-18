@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 using hy::BinanceMarketEvent;
 using hy::DepthManager;
@@ -39,6 +40,33 @@ TEST(DepthManager, BuffersEventsBeforeSnapshot) {
     EXPECT_FALSE(applied);
     EXPECT_EQ(dm.stats().events_buffered, 1u);
     EXPECT_EQ(dm.state(), DepthState::Buffering);
+}
+
+TEST(DepthManager, BufferingDoesNotCacheReversedUpdateRange) {
+    DepthManager dm;
+
+    const auto reversed = make_depth(100, 10, Side::Buy, 9);
+    EXPECT_FALSE(dm.on_depth_event(reversed, 10, 9));
+    EXPECT_EQ(dm.state(), DepthState::Buffering);
+    EXPECT_EQ(dm.stats().events_buffered, 0u);
+
+    const auto valid = make_depth(100, 20, Side::Buy, 10);
+    EXPECT_FALSE(dm.on_depth_event(valid, 10, 10));
+    EXPECT_EQ(dm.stats().events_buffered, 1u);
+
+    DepthSnapshot snap;
+    snap.last_update_id = 9;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+
+    EXPECT_TRUE(dm.apply_snapshot(snap));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().events_applied, 1u);
+    ASSERT_EQ(dm.book().bid_count(), 2u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 100);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 20);
 }
 
 TEST(DepthManager, SnapshotTransitionsToTracking) {
@@ -110,6 +138,51 @@ TEST(DepthManager, ResyncOnGapInBufferedEvents) {
     EXPECT_EQ(dm.stats().resyncs, 1u);
 }
 
+TEST(DepthManager, SnapshotReplayGapRejectsAllBufferedEventsAndRecoversWithFreshSnapshot) {
+    DepthManager dm;
+
+    const auto before_gap = make_depth(100, 10, Side::Buy, 101);
+    const auto after_gap = make_depth(101, 20, Side::Buy, 103);
+    EXPECT_FALSE(dm.on_depth_event(before_gap, 101, 101));
+    EXPECT_FALSE(dm.on_depth_event(after_gap, 103, 103));
+
+    DepthSnapshot stale_snapshot;
+    stale_snapshot.last_update_id = 100;
+    stale_snapshot.bids[0] = {99, 50};
+    stale_snapshot.bid_count = 1;
+    stale_snapshot.asks[0] = {102, 30};
+    stale_snapshot.ask_count = 1;
+
+    EXPECT_FALSE(dm.apply_snapshot(stale_snapshot));
+    EXPECT_EQ(dm.state(), DepthState::Buffering);
+    EXPECT_TRUE(dm.needs_snapshot());
+    EXPECT_EQ(dm.book().bid_count(), 0u);
+    EXPECT_EQ(dm.book().ask_count(), 0u);
+    EXPECT_EQ(dm.stats().resyncs, 1u);
+    EXPECT_EQ(dm.stats().events_applied, 0u);
+
+    const auto recovery_event = make_depth(100, 25, Side::Buy, 104);
+    EXPECT_FALSE(dm.on_depth_event(recovery_event, 104, 104));
+
+    DepthSnapshot fresh_snapshot;
+    fresh_snapshot.last_update_id = 103;
+    fresh_snapshot.bids[0] = {99, 50};
+    fresh_snapshot.bid_count = 1;
+    fresh_snapshot.asks[0] = {102, 30};
+    fresh_snapshot.ask_count = 1;
+
+    EXPECT_TRUE(dm.apply_snapshot(fresh_snapshot));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_FALSE(dm.needs_snapshot());
+    EXPECT_EQ(dm.stats().resyncs, 1u);
+    EXPECT_EQ(dm.stats().events_applied, 1u);
+    ASSERT_EQ(dm.book().bid_count(), 2u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 100);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 25);
+    EXPECT_EQ(dm.book().bids()[1].price_ticks, 99);
+    EXPECT_EQ(dm.book().bids()[1].qty_lots, 50);
+}
+
 TEST(DepthManager, TrackingAppliesEventsDirectly) {
     DepthManager dm;
 
@@ -129,6 +202,110 @@ TEST(DepthManager, TrackingAppliesEventsDirectly) {
     EXPECT_TRUE(applied);
     EXPECT_EQ(dm.stats().events_applied, 1u);
     EXPECT_EQ(dm.book().bid_count(), 2u);
+}
+
+TEST(DepthManager, TrackingDropsOlderRangeWithoutRegressingSequence) {
+    DepthManager dm;
+
+    DepthSnapshot snap;
+    snap.last_update_id = 100;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+    ASSERT_TRUE(dm.apply_snapshot(snap));
+
+    const auto newer = make_depth(100, 25, Side::Buy, 105);
+    ASSERT_TRUE(dm.on_depth_event(newer, 101, 105));
+
+    const auto older = make_depth(99, 0, Side::Buy, 104);
+    EXPECT_FALSE(dm.on_depth_event(older, 102, 104));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    EXPECT_EQ(dm.stats().gap_events, 0u);
+    EXPECT_EQ(dm.stats().events_applied, 1u);
+    ASSERT_EQ(dm.book().bid_count(), 2u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 100);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 25);
+    EXPECT_EQ(dm.book().bids()[1].price_ticks, 99);
+    EXPECT_EQ(dm.book().bids()[1].qty_lots, 50);
+
+    const auto next = make_depth(101, 10, Side::Buy, 106);
+    EXPECT_TRUE(dm.on_depth_event(next, 106, 106));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    ASSERT_EQ(dm.book().bid_count(), 3u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 101);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 10);
+}
+
+TEST(DepthManager, SnapshotReplayDropsOlderRangeAndAllowsSameUpdateIdLevels) {
+    DepthManager dm;
+
+    const auto newer = make_depth(100, 25, Side::Buy, 105);
+    const auto older = make_depth(99, 0, Side::Buy, 104);
+    const auto same_id_bid = make_depth(101, 10, Side::Buy, 105);
+    const auto same_id_ask = make_depth(103, 15, Side::Sell, 105);
+    EXPECT_FALSE(dm.on_depth_event(newer, 101, 105));
+    EXPECT_FALSE(dm.on_depth_event(older, 102, 104));
+    EXPECT_FALSE(dm.on_depth_event(same_id_bid, 105, 105));
+    EXPECT_FALSE(dm.on_depth_event(same_id_ask, 105, 105));
+
+    DepthSnapshot snap;
+    snap.last_update_id = 100;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+
+    EXPECT_TRUE(dm.apply_snapshot(snap));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    EXPECT_EQ(dm.stats().events_applied, 3u);
+    ASSERT_EQ(dm.book().bid_count(), 3u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 101);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 10);
+    EXPECT_EQ(dm.book().bids()[1].price_ticks, 100);
+    EXPECT_EQ(dm.book().bids()[1].qty_lots, 25);
+    EXPECT_EQ(dm.book().bids()[2].price_ticks, 99);
+    EXPECT_EQ(dm.book().bids()[2].qty_lots, 50);
+    ASSERT_EQ(dm.book().ask_count(), 2u);
+    EXPECT_EQ(dm.book().asks()[0].price_ticks, 102);
+    EXPECT_EQ(dm.book().asks()[1].price_ticks, 103);
+    EXPECT_EQ(dm.book().asks()[1].qty_lots, 15);
+}
+
+TEST(DepthManager, TrackingRejectsReversedRangeWithoutResyncOrBookChange) {
+    DepthManager dm;
+
+    DepthSnapshot snap;
+    snap.last_update_id = 100;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+    ASSERT_TRUE(dm.apply_snapshot(snap));
+    ASSERT_EQ(dm.state(), DepthState::Tracking);
+
+    const auto reversed = make_depth(99, 0, Side::Buy, 99);
+    EXPECT_FALSE(dm.on_depth_event(reversed, 101, 99));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    EXPECT_EQ(dm.stats().gap_events, 0u);
+    EXPECT_EQ(dm.stats().events_applied, 0u);
+    ASSERT_EQ(dm.book().bid_count(), 1u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 99);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 50);
+
+    const auto next_contiguous = make_depth(100, 25, Side::Buy, 101);
+    EXPECT_TRUE(dm.on_depth_event(next_contiguous, 101, 101));
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    ASSERT_EQ(dm.book().bid_count(), 2u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 100);
+    EXPECT_EQ(dm.book().bids()[0].qty_lots, 25);
+    EXPECT_EQ(dm.book().bids()[1].price_ticks, 99);
+    EXPECT_EQ(dm.book().bids()[1].qty_lots, 50);
 }
 
 TEST(DepthManager, TrackingDetectsGap) {
@@ -179,6 +356,33 @@ TEST(DepthManager, TrackingAllowsMultiLevelSameUpdateId) {
 
     EXPECT_EQ(dm.book().bid_count(), 2u);
     EXPECT_EQ(dm.book().ask_count(), 2u);
+}
+
+TEST(DepthManager, TrackingAllowsSameUpdateIdAtUint64Maximum) {
+    DepthManager dm;
+    const std::uint64_t max_id = std::numeric_limits<std::uint64_t>::max();
+
+    DepthSnapshot snap;
+    snap.last_update_id = max_id - 1;
+    snap.bids[0] = {99, 50};
+    snap.bid_count = 1;
+    snap.asks[0] = {102, 30};
+    snap.ask_count = 1;
+    ASSERT_TRUE(dm.apply_snapshot(snap));
+
+    const auto bid = make_depth(100, 25, Side::Buy, max_id);
+    const auto ask = make_depth(103, 15, Side::Sell, max_id);
+    EXPECT_TRUE(dm.on_depth_event(bid, max_id, max_id));
+    EXPECT_TRUE(dm.on_depth_event(ask, max_id, max_id));
+
+    EXPECT_EQ(dm.state(), DepthState::Tracking);
+    EXPECT_EQ(dm.stats().resyncs, 0u);
+    EXPECT_EQ(dm.stats().gap_events, 0u);
+    EXPECT_EQ(dm.stats().events_applied, 2u);
+    ASSERT_EQ(dm.book().bid_count(), 2u);
+    EXPECT_EQ(dm.book().bids()[0].price_ticks, 100);
+    ASSERT_EQ(dm.book().ask_count(), 2u);
+    EXPECT_EQ(dm.book().asks()[1].price_ticks, 103);
 }
 
 TEST(DepthManager, RemoveLevelViaZeroQty) {

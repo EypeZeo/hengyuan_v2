@@ -50,6 +50,22 @@ TEST_F(BinanceJsonParserTest, ParseTrade) {
     EXPECT_EQ(evs_[0].ts_recv_ns, 99999ULL);
 }
 
+TEST_F(BinanceJsonParserTest, TradeUsesRegisteredNonPowerOfTenScales) {
+    BinanceJsonParser parser;
+    ASSERT_TRUE(parser.register_symbol("BTCUSDT", 0, 17, 3));
+
+    const char* json =
+        R"({"e":"trade","E":1700000000000,"s":"BTCUSDT","t":1,"p":"0.9","q":"0.9","m":false})";
+    BinanceMarketEvent event{};
+    std::size_t count = 0;
+
+    EXPECT_EQ(parser.parse(json, 99999, &event, 1, count), ParseResult::Ok);
+    EXPECT_EQ(count, 1u);
+    EXPECT_EQ(event.type, EventType::Trade);
+    EXPECT_EQ(event.price_ticks, 15);
+    EXPECT_EQ(event.qty_lots, 2);
+}
+
 TEST_F(BinanceJsonParserTest, ParseAggTrade) {
     const char* json = R"({
         "e": "aggTrade", "E": 1700000001000, "s": "ETHUSDT", "a": 789,
@@ -65,6 +81,111 @@ TEST_F(BinanceJsonParserTest, ParseAggTrade) {
     EXPECT_EQ(evs_[0].qty_lots, 150000000LL);
     EXPECT_EQ(evs_[0].side, Side::Buy);  // m=false -> taker is buyer
     EXPECT_EQ(evs_[0].symbol_id, 1u);
+}
+
+TEST_F(BinanceJsonParserTest, TradeAndAggTradeRejectMissingOrMalformedRequiredFields) {
+    struct EventShape {
+        const char* event_type;
+        const char* id_field;
+    };
+    const EventShape event_shapes[] = {{"trade", "t"}, {"aggTrade", "a"}};
+
+    const auto make_json = [](const char* event_type, const char* id_field, const char* omitted_field,
+                              const char* malformed_field, const char* malformed_value) {
+        std::string json = "{\"e\":\"";
+        json += event_type;
+        json += "\",";
+        const auto append = [&](const char* key, const char* valid_value) {
+            const std::string field(key);
+            if (omitted_field != nullptr && field == omitted_field) return;
+            json += "\"";
+            json += key;
+            json += "\":";
+            json += malformed_field != nullptr && field == malformed_field ? malformed_value : valid_value;
+            json += ",";
+        };
+        append("E", "1700000000000");
+        append("s", "\"BTCUSDT\"");
+        append(id_field, "123456");
+        append("p", "\"100.00000000\"");
+        append("q", "\"1.00000000\"");
+        append("m", "false");
+        json.pop_back();
+        json += "}";
+        return json;
+    };
+
+    const auto expect_malformed = [&](const EventShape& shape, const char* field, const char* omitted_field,
+                                      const char* malformed_field, const char* malformed_value,
+                                      const char* scenario) {
+        SCOPED_TRACE(std::string(shape.event_type) + " " + field + " " + scenario);
+        parser_.reset_counters();
+        const std::string json = make_json(shape.event_type, shape.id_field, omitted_field,
+                                           malformed_field, malformed_value);
+        const ParseResult result = parse_one(json.c_str());
+        EXPECT_EQ(result, ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    };
+
+    for (const EventShape& shape : event_shapes) {
+        struct RequiredField {
+            const char* key;
+            const char* wrong_type_value;
+        };
+        const RequiredField fields[] = {
+            {"E", "\"not-a-time\""},
+            {shape.id_field, "\"not-an-id\""},
+            {"m", "1"},
+        };
+        for (const RequiredField& field : fields) {
+            expect_malformed(shape, field.key, field.key, nullptr, nullptr, "missing");
+            expect_malformed(shape, field.key, nullptr, field.key, field.wrong_type_value, "wrong type");
+        }
+        expect_malformed(shape, shape.id_field, nullptr, shape.id_field, "-1", "negative unsigned id");
+
+        struct InvalidDecimal {
+            const char* key;
+            const char* value;
+            const char* scenario;
+        };
+        const InvalidDecimal invalid_decimals[] = {
+            {"p", "\"0.00000000\"", "zero price"},
+            {"p", "\"-1.00000000\"", "negative price"},
+            {"p", "\"0.000000001\"", "positive price below one tick"},
+            {"q", "\"0.00000000\"", "zero quantity"},
+            {"q", "\"-1.00000000\"", "negative quantity"},
+            {"q", "\"0.000000001\"", "positive quantity below one lot"},
+        };
+        for (const InvalidDecimal& value : invalid_decimals) {
+            expect_malformed(shape, value.key, nullptr, value.key, value.value, value.scenario);
+        }
+    }
+}
+
+TEST_F(BinanceJsonParserTest, TradeAndAggTradeAcceptMinimumRepresentableQuantity) {
+    struct EventShape {
+        const char* event_type;
+        const char* id_field;
+    };
+    const EventShape event_shapes[] = {{"trade", "t"}, {"aggTrade", "a"}};
+
+    for (const EventShape& shape : event_shapes) {
+        SCOPED_TRACE(shape.event_type);
+        parser_.reset_counters();
+        const std::string json = std::string(R"({"e":")") + shape.event_type +
+            R"(","E":1700000000000,"s":"BTCUSDT",")" + shape.id_field +
+            R"(":123456,"p":"100.00000000","q":"0.00000001","m":false})";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::Ok);
+        EXPECT_EQ(count_, 1u);
+        EXPECT_EQ(evs_[0].type, std::string_view(shape.event_type) == "trade" ? EventType::Trade : EventType::AggTrade);
+        EXPECT_EQ(evs_[0].price_ticks, 10'000'000'000LL);
+        EXPECT_EQ(evs_[0].qty_lots, 1LL);
+        EXPECT_EQ(parser_.counters().malformed, 0u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 1u);
+    }
 }
 
 TEST_F(BinanceJsonParserTest, ParseDepthUpdate) {
@@ -93,6 +214,111 @@ TEST_F(BinanceJsonParserTest, ParseDepthUpdate) {
     EXPECT_EQ(evs_[1].price_ticks, 6789100000000LL);
     EXPECT_EQ(evs_[1].qty_lots, 50000000LL);
     EXPECT_EQ(evs_[1].side, Side::Sell);
+}
+
+TEST_F(BinanceJsonParserTest, DepthUpdateRejectsMissingOrMalformedEventTime) {
+    struct Case {
+        const char* name;
+        const char* event_time_field;
+    };
+    const Case cases[] = {
+        {"missing E", ""},
+        {"E is a string", R"(,"E":"1700000002000")"},
+        {"E is negative", R"(,"E":-1)"},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        parser_.reset_counters();
+        std::string json = R"({"e":"depthUpdate")";
+        json += test_case.event_time_field;
+        json += R"(,"s":"BTCUSDT","U":1,"u":2,"b":[["100.00000000","1.00000000"]],"a":[]})";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    }
+}
+
+TEST_F(BinanceJsonParserTest, DepthUpdateRejectsMalformedSequenceRanges) {
+    struct Case {
+        const char* name;
+        const char* range_fields;
+    };
+    const Case cases[] = {
+        {"missing U", R"("u":2)"},
+        {"missing u", R"("U":1)"},
+        {"U is a string", R"("U":"1","u":2)"},
+        {"u is a string", R"("U":1,"u":"2")"},
+        {"U is negative", R"("U":-1,"u":2)"},
+        {"u is negative", R"("U":1,"u":-2)"},
+        {"U is fractional", R"("U":1.5,"u":2)"},
+        {"u is fractional", R"("U":1,"u":2.5)"},
+        {"range is reversed", R"("U":2,"u":1)"},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        parser_.reset_counters();
+        std::string json = R"({"e":"depthUpdate","E":1700000002000,"s":"BTCUSDT",)";
+        json += test_case.range_fields;
+        json += R"(,"b":[["100.00000000","1.00000000"]],"a":[]})";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    }
+}
+
+TEST_F(BinanceJsonParserTest, DepthUpdateAllowsEqualSequenceRange) {
+    const char* json = R"({
+        "e":"depthUpdate","E":1700000002000,"s":"BTCUSDT",
+        "U":101,"u":101,
+        "b":[["100.00000000","1.00000000"]],"a":[]
+    })";
+    EXPECT_EQ(parse_one(json), ParseResult::Ok);
+    EXPECT_EQ(count_, 1u);
+    EXPECT_EQ(evs_[0].type, EventType::DepthDelta);
+    EXPECT_EQ(evs_[0].event_id, 101u);
+}
+
+TEST_F(BinanceJsonParserTest, DepthUpdateRejectsMalformedLevelsWithoutPartialAcceptance) {
+    struct Case {
+        const char* name;
+        const char* level_fields;
+    };
+    const Case cases[] = {
+        {"missing bids", R"("a":[["101.00000000","1.00000000"]])"},
+        {"missing asks", R"("b":[["100.00000000","1.00000000"]])"},
+        {"bids not an array", R"("b":"bad","a":[["101.00000000","1.00000000"]])"},
+        {"asks not an array", R"("b":[["100.00000000","1.00000000"]],"a":null)"},
+        {"bad level mixed with valid level", R"("b":[["100.00000000","1.00000000"],["bad","1.00000000"]],"a":[])"},
+        {"short level", R"("b":[["100.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"long level", R"("b":[["100.00000000","1.00000000","extra"]],"a":[["101.00000000","1.00000000"]])"},
+        {"price is not a string", R"("b":[[100,"1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"quantity is not a string", R"("b":[["100.00000000",1]],"a":[["101.00000000","1.00000000"]])"},
+        {"price is not a fixed decimal", R"("b":[["not-a-price","1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"quantity is not a fixed decimal", R"("b":[["100.00000000","not-a-quantity"]],"a":[["101.00000000","1.00000000"]])"},
+        {"zero price", R"("b":[["0.00000000","1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"negative price", R"("b":[["-1.00000000","1.00000000"]],"a":[["101.00000000","1.00000000"]])"},
+        {"negative quantity", R"("b":[["100.00000000","-0.00000001"]],"a":[["101.00000000","1.00000000"]])"},
+        {"positive quantity below one lot", R"("b":[["100.00000000","0.000000001"]],"a":[["101.00000000","1.00000000"]])"},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        parser_.reset_counters();
+        std::string json = R"({"e":"depthUpdate","E":1700000002000,"s":"BTCUSDT","U":10,"u":10,)";
+        json += test_case.level_fields;
+        json += "}";
+
+        EXPECT_EQ(parse_one(json.c_str()), ParseResult::MalformedJson);
+        EXPECT_EQ(count_, 0u);
+        EXPECT_EQ(parser_.counters().malformed, 1u);
+        EXPECT_EQ(parser_.counters().parsed_ok, 0u);
+    }
 }
 
 TEST_F(BinanceJsonParserTest, ParseDepthMultipleLevels) {
@@ -217,6 +443,46 @@ TEST(DecimalToFixed, NegativeValue) {
     auto r = BinanceJsonParser::parse_decimal_to_fixed("-1.50000000", 100'000'000);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(*r, -150000000LL);
+}
+
+TEST(DecimalToFixed, ArbitraryPositiveMultipliersTruncateTowardZero) {
+    struct Case {
+        const char* value;
+        std::int64_t multiplier;
+        std::int64_t expected;
+    };
+    const Case cases[] = {
+        {"0.9", 3, 2},
+        {"-0.9", 3, -2},
+        {"0.9", 17, 15},
+        {"0.09", 11, 0},
+        {"0.999999999999999999", std::numeric_limits<std::int64_t>::max(),
+         9'223'372'036'854'775'797LL},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.value);
+        const auto result =
+            BinanceJsonParser::parse_decimal_to_fixed(test_case.value, test_case.multiplier);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(*result, test_case.expected);
+    }
+}
+
+TEST(DecimalToFixed, NonPowerOfTenScaleInt64Boundary) {
+    const auto maximum = BinanceJsonParser::parse_decimal_to_fixed("542551296285575047.5", 17);
+    ASSERT_TRUE(maximum.has_value());
+    EXPECT_EQ(*maximum, std::numeric_limits<std::int64_t>::max());
+
+    EXPECT_FALSE(BinanceJsonParser::parse_decimal_to_fixed("542551296285575047.6", 17).has_value());
+}
+
+TEST(DecimalToFixed, SignOrDecimalPointWithoutDigitsRejected) {
+    const char* inputs[] = {"-", ".", "-."};
+    for (const char* input : inputs) {
+        SCOPED_TRACE(input);
+        EXPECT_FALSE(BinanceJsonParser::parse_decimal_to_fixed(input, 100'000'000).has_value());
+    }
 }
 
 TEST(DecimalToFixed, EmptyString) {

@@ -13,6 +13,7 @@ the repository without somebody noticing:
   * the adjudicated status must follow from the segment verdicts: CLOSED if and only if no
     segment is MISSING, NA only where the item kind allows it and only with a stated reason;
   * statuses, BKL rows and FI statuses must equal the blueprint's own tables;
+  * CI run references must follow the documented format, including in offline mode;
   * with --online, every cited PR must be merged (merge-commit prefix matches) and every cited
     CI run must be completed with conclusion success on the cited commit and workflow -- a
     cancelled, failed or still-running run is never evidence (GATE-01's own completion
@@ -129,6 +130,11 @@ class Token:
     needle: str | None  # text after '#', quotes stripped
     quoted: bool
     raw: str
+    in_open_field: bool = False
+
+    @property
+    def marks_open_work(self) -> bool:
+        return self.in_open_field or self.kind == "open"
 
 
 @dataclasses.dataclass
@@ -184,7 +190,7 @@ class LedgerFormatError(Exception):
 # --------------------------------------------------------------------------------------
 # parsing
 # --------------------------------------------------------------------------------------
-def parse_tokens(text: str) -> list[Token]:
+def parse_tokens(text: str, *, in_open_field: bool = False) -> list[Token]:
     tokens: list[Token] = []
     for m in TOKEN_RE.finditer(text):
         kind, body = m.group("kind"), m.group("body")
@@ -195,20 +201,24 @@ def parse_tokens(text: str) -> list[Token]:
             path, _, needle = body.partition("#")
             if needle[:1] in ('"', "'"):
                 needle, quoted = needle[1:-1], True
-        tokens.append(Token(kind, path, needle, quoted, m.group(0)))
+        tokens.append(Token(kind, path, needle, quoted, m.group(0), in_open_field=in_open_field))
     return tokens
 
 
 KEY_RE = re.compile(r"^([a-z][a-z0-9_.]*):\s?(.*)$")
+REPEATABLE_FIELDS = frozenset({"bkl", "legacy", "open", "refs"})
 
 
 def parse_ledger(text: str) -> tuple[dict[str, str], list[Item]]:
     """Return (front matter, items). Items are the ```ledger fenced blocks, in file order."""
     front: dict[str, str] = {}
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), start=1):
         m = re.match(r"^<!--\s*ledger-meta\s+([a-z_]+)=(.*?)\s*-->\s*$", line)
         if m:
-            front[m.group(1)] = m.group(2)
+            key, value = m.groups()
+            if key in front:
+                raise LedgerFormatError(f"line {lineno}: duplicate ledger metadata {key!r}")
+            front[key] = value
     items: list[Item] = []
     lines = text.splitlines()
     i = 0
@@ -247,9 +257,11 @@ def _parse_block(block: list[str], first_line: int) -> Item:
                 raise LedgerFormatError(f"line {first_line + offset}: duplicate segment {name!r}")
             segments[name] = _parse_segment(value, first_line + offset)
             continue
+        if key in fields and key not in REPEATABLE_FIELDS:
+            raise LedgerFormatError(f"line {first_line + offset}: duplicate field {key!r}")
         fields.setdefault(key, []).append(value)
         if key in ("open", "refs"):
-            tokens.extend(parse_tokens(value))
+            tokens.extend(parse_tokens(value, in_open_field=(key == "open")))
     item_id = (fields.get("id") or [""])[0]
     if not re.fullmatch(r"(P\d-\d{3}|SUPP-\d{3}|FI-\d{3})", item_id):
         raise LedgerFormatError(f"line {first_line}: bad or missing id {item_id!r}")
@@ -310,18 +322,24 @@ def parse_blueprint(text: str) -> Blueprint:
         bkl[m.group(1)] = (m.group(2), m.group(3))
     fi: dict[str, FiRow] = {}
     tag = ""
-    for line in text.split("\n"):
-        head = re.match(r"^###\s+(7\.[234])\s", line)
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        head = re.match(r"^(#{1,3})(?:\s+(\S+)|\s*$)", line)
         if head:
-            tag = FI_SECTIONS[head.group(1)]
+            tag = FI_SECTIONS.get(head[2] or "", "") if head[1] == "###" else ""
+            continue
+        if not tag:
             continue
         m = re.match(r"^\|\s*\*\*(FI-\d{3})\*\*\s*\|", line)
         if not m:
             continue
         cells = [c.strip() for c in line.split("|")]
         # cells: '', id, scope, stage, level, status, scenario, invariant, artifact, baseline, ''
-        if len(cells) >= 11 and tag:
-            fi[m.group(1)] = FiRow(tag, cells[4], cells[5], cells[9].strip("`* "))
+        if len(cells) < 11:
+            continue
+        case_id = m[1]
+        if case_id in fi:
+            raise LedgerFormatError(f"blueprint line {lineno}: duplicate fault case {case_id}")
+        fi[case_id] = FiRow(tag, cells[4], cells[5], cells[9].strip("`* "))
     return Blueprint(text, audit, bkl, fi)
 
 
@@ -457,9 +475,13 @@ def check_pr_token(tok: Token, item: str, backend) -> list[Finding]:
 
 
 def check_run_token(tok: Token, item: str, backend) -> list[Finding]:
-    m = RUN_RE.match(tok.path)
+    if tok.needle is not None:
+        return [Finding("E-RUN-FORMAT", item, f"bad run token {tok.raw}")]
+    m = RUN_RE.fullmatch(tok.path)
     if not m:
         return [Finding("E-RUN-FORMAT", item, f"bad run token {tok.raw}")]
+    if backend is None:
+        return []
     run_id, prefix, workflow, job = int(m.group(1)), m.group(2), m.group(3), m.group(4)
     try:
         facts = backend.run(run_id)
@@ -677,13 +699,13 @@ def check_item(item: Item, bp: Blueprint, files: Files, report: Report, *, stric
 
     tokens = item.all_tokens
     kinds_all = {t.kind for t in tokens}
-    open_like = [t for t in item.tokens if t.kind in ("open", "absent")]
+    has_open_locator = any(t.marks_open_work and t.kind in ("open", "absent") for t in item.tokens)
     if status == "CLOSED":
-        if any(t.kind == "open" for t in tokens):
-            report.add(Finding("E-STATUS", iid, "CLOSED item still carries an open: token"))
+        if any(t.marks_open_work for t in tokens):
+            report.add(Finding("E-STATUS", iid, "CLOSED item still declares unfinished work"))
         if "pr" not in kinds_all:
             report.add(Finding("E-STATUS", iid, "CLOSED item cites no merged PR"))
-    elif not open_like:
+    elif not has_open_locator:
         report.add(Finding("E-STATUS", iid, f"{status} item needs at least one open:/absent: locus token"))
     if status == "REMEDIATING":
         task = item.one("task")
@@ -721,6 +743,12 @@ def check_item(item: Item, bp: Blueprint, files: Files, report: Report, *, stric
     check_item_tokens(item, bp, files, report)
 
 
+def fault_case_has_passing_run(item: Item) -> bool:
+    return item.status == "IMPLEMENTED" and item.one("result") == "PASS" and any(
+        t.kind == "run" and not t.marks_open_work and RUN_RE.fullmatch(t.path) for t in item.all_tokens
+    )
+
+
 def check_fi_item(item: Item, bp: Blueprint, files: Files, report: Report) -> None:
     """A fault-injection case: status equals the blueprint row; a 'not yet' claim must be falsifiable."""
     iid = item.id
@@ -732,23 +760,27 @@ def check_fi_item(item: Item, bp: Blueprint, files: Files, report: Report) -> No
         report.add(Finding("E-FORMAT", iid, f"bad status {status!r}, result {result!r} or gate_tag {tag!r}"))
         return
     tokens = item.all_tokens
-    passes = status == "IMPLEMENTED" and result == "PASS" and any(t.kind == "run" for t in tokens)
-    want = "PASS" if passes else "BLOCKED"
+    want = "PASS" if fault_case_has_passing_run(item) else "BLOCKED"
     if item.one("gate_result") != want:
         report.add(
             Finding("E-GATE", iid, f"gate_result {item.one('gate_result')!r}, the rules give {want!r}")
         )
     if result == "PASS" and status != "IMPLEMENTED":
         report.add(Finding("E-STATUS", iid, "a PASS result needs status IMPLEMENTED"))
-    not_yet = [t for t in item.tokens if t.kind in ("open", "absent", "nofile") or t.kind.startswith("count")]
+    has_open_locator = any(
+        t.marks_open_work and (t.kind in ("open", "absent", "nofile") or t.kind.startswith("count"))
+        for t in item.tokens
+    )
     if status == "IMPLEMENTED":
-        if any(t.kind == "open" for t in tokens):
-            report.add(Finding("E-STATUS", iid, "IMPLEMENTED case still carries an open: token"))
-    elif not not_yet:
+        if any(t.marks_open_work for t in tokens):
+            report.add(Finding("E-STATUS", iid, "IMPLEMENTED case still declares unfinished work"))
+    elif not has_open_locator:
         report.add(
             Finding("E-STATUS", iid, f"{status} needs at least one open:/absent:/nofile:/countN: token")
         )
-    if status == "PARTIAL" and not any(t.kind in ("test", "code", "doc", "bp", "pr", "fi") for t in tokens):
+    if status == "PARTIAL" and not any(
+        not t.marks_open_work and t.kind in ("test", "code", "doc", "bp", "pr", "fi") for t in tokens
+    ):
         report.add(Finding("E-STATUS", iid, "PARTIAL needs at least one reference to what already exists"))
     row = bp.fi_rows.get(iid)
     if row is None:
@@ -793,7 +825,7 @@ def check_item_tokens(item: Item, bp: Blueprint, files: Files, report: Report) -
     # per-token checks (offline part)
     for tok in tokens:
         if tok.kind in ("pr", "run"):
-            continue  # online / ancestry, handled by check_history / check_online
+            continue  # checked by check_history and check_ci_references
         if tok.kind == "fi":
             m = FI_RE.match(tok.path)
             if not m:
@@ -838,14 +870,19 @@ def check_history(items: list[Item], report: Report) -> None:
                 report.count("pr-history")
 
 
-def check_online(items: list[Item], backend, report: Report) -> None:
+def check_ci_references(items: list[Item], backend, report: Report) -> None:
     seen: set[str] = set()
     for item in items:
         for tok in item.all_tokens:
             if tok.kind not in ("pr", "run") or tok.raw in seen:
                 continue
+            if tok.kind == "pr" and backend is None:
+                continue
             seen.add(tok.raw)
-            report.count("online-" + tok.kind)
+            if tok.kind == "run":
+                report.count("run-format")
+            if backend is not None:
+                report.count("online-" + tok.kind)
             check = check_pr_token if tok.kind == "pr" else check_run_token
             for f in check(tok, item.id, backend):
                 report.add(f)
@@ -881,6 +918,23 @@ def check_coverage(items: list[Item], bp: Blueprint, report: Report) -> None:
                     f"must be claimed by exactly one ledger item, claimed {claimed.count(bkl)}x",
                 )
             )
+
+
+def check_fi_evidence(items: list[Item], report: Report) -> None:
+    passing_ids = {
+        item.id
+        for item in items
+        if item.id.startswith("FI-") and item.one("gate_result") == "PASS" and fault_case_has_passing_run(item)
+    }
+    for item in items:
+        fault = item.segments.get("fault")
+        if fault is None or fault.verdict != "PRESENT" or fault.grade != "FI":
+            continue
+        for tok in fault.tokens:
+            if tok.kind == "fi" and (match := FI_RE.fullmatch(tok.path)) and match[1] not in passing_ids:
+                report.add(
+                    Finding("E-FI-EVIDENCE", item.id, f"PRESENT:FI requires a passing result for {match[1]}")
+                )
 
 
 # --------------------------------------------------------------------------------------
@@ -987,6 +1041,7 @@ def run_checks(
     check_coverage(items, bp, report)
     for item in items:
         check_item(item, bp, files, report, strict_fault=strict_fault)
+    check_fi_evidence(items, report)
     baseline = front.get("baseline", "")
     if not baseline:
         report.add(Finding("E-FORMAT", "-", "ledger-meta baseline is missing"))
@@ -1003,8 +1058,7 @@ def run_checks(
         ):
             report.add(Finding("E-PR-HISTORY", "-", f"fi_baseline {fi_base} is not an ancestor of HEAD"))
     check_history(items, report)
-    if online:
-        check_online(items, backend, report)
+    check_ci_references(items, backend if online else None, report)
     if check_docs:
         check_overview(ledger_text, items, report)
     return report
@@ -1281,6 +1335,64 @@ def self_test(ledger_path: Path) -> int:
 
     control("UT 级 Fault 证据没有 test: 引用", m_grade_ut_no_test, "E-GRADE")
 
+    partial_reference = "fi:FI-055=PARTIAL"
+    implemented_reference = "fi:FI-032=IMPLEMENTED"
+    partial_case = item_of(items, id="FI-055")
+    implemented_case = item_of(items, id="FI-032")
+    for name, references, result, failing_id in (
+        ("拒绝 PARTIAL 用例", partial_reference, "PASS", "FI-055"),
+        ("拒绝执行失败的用例", implemented_reference, "FAIL", "FI-032"),
+        ("拒绝尚未执行的用例", implemented_reference, "NOT_RUN", "FI-032"),
+        ("接受通过的用例", implemented_reference, "PASS", None),
+        ("混合引用中拒绝阻塞的用例", f"{implemented_reference} {partial_reference}", "PASS", "FI-055"),
+    ):
+        audit = copy.deepcopy(item_of(items, status="CLOSED"))
+        audit.segments["fault"] = Segment("PRESENT", "FI", parse_tokens(references), "")
+        case = copy.deepcopy(implemented_case)
+        case.fields["result"] = [result]
+        evidence_report = Report()
+        check_fi_evidence([audit, case, partial_case], evidence_report)
+        expected = (
+            [Finding("E-FI-EVIDENCE", audit.id, f"PRESENT:FI requires a passing result for {failing_id}")]
+            if failing_id else []
+        )
+        verdict(f"PRESENT:FI {name}", evidence_report.findings == expected, str(evidence_report.findings))
+
+    malformed_run_case = copy.deepcopy(implemented_case)
+    drop_tokens(malformed_run_case, {"run"})
+    malformed_run_case.tokens.extend(parse_tokens("run:malformed-run"))
+    malformed_run_report = Report()
+    check_fi_item(malformed_run_case, bp, files, malformed_run_report)
+    verdict(
+        "FI: PASS 要求有效格式的 run 引用",
+        [finding.code for finding in malformed_run_report.findings] == ["E-GATE"],
+        str(malformed_run_report.findings),
+    )
+
+    for name, malformed_token, online in (
+        ("离线检查接受格式有效的 Runtime run", None, False),
+        ("离线检查拒绝格式无效的 Runtime run", "run:malformed-runtime", False),
+        ("离线检查拒绝带内容后缀的 Runtime run",
+         "run:38059104630@8c616a4d7/ci-native.yml[native-build-test]#unexpected", False),
+        ("模拟在线检查仅报告一次 Runtime run 格式错误", "run:malformed-runtime", True),
+    ):
+        reference_items = copy.deepcopy(items)
+        runtime_audit = item_of(reference_items, id="P1-001")
+        if malformed_token is not None:
+            runtime_audit.segments["runtime"].tokens = parse_tokens(malformed_token)
+        backend = build_fake_backend(reference_items) if online else None
+        report = run_checks(
+            text, front, reference_items, bp, files, backend,
+            online=online, strict_fault=False, check_docs=False,
+        )
+        codes = [f.code for f in report.findings if f.item == runtime_audit.id]
+        expected_codes = ["E-RUN-FORMAT"] if malformed_token is not None else []
+        verdict(
+            name,
+            codes == expected_codes and report.checked.get("run-format", 0) > 0,
+            str(codes),
+        )
+
     control("--strict-fault 拒收 UT 级 Fault 证据", lambda its: None, "E-STRICT-FAULT", strict=True)
 
     def m_runtime_lib(its):
@@ -1423,14 +1535,72 @@ def self_test(ledger_path: Path) -> int:
 
     print("-- 故障用例（第 7 卷） --")
 
+    def synthetic_fi_row(fi_id: str) -> str:
+        return (
+            f"| **{fi_id}** | 全部 | 0 与 1A | L1 | PARTIAL | 合成场景 | "
+            "合成不变量 | 合成记录 | Pending |"
+        )
+
+    first_row = synthetic_fi_row("FI-101")
+    duplicate_registry = "\n".join(("### 7.2 PRE_D3", first_row, "### 7.3 PRE_OWNER_LIVE", first_row))
+    duplicate_control = "FI: 注册表拒绝重复编号"
+    try:
+        parse_blueprint(duplicate_registry)
+        verdict(duplicate_control, False, "没有报错")
+    except LedgerFormatError as exc:
+        verdict(duplicate_control, "blueprint line 4: duplicate fault case FI-101" in str(exc), str(exc))
+
+    official_registry = "\n".join(
+        (
+            "### 7.2 PRE_D3",
+            first_row,
+            "#### 7.2.1 说明",
+            synthetic_fi_row("FI-102"),
+            "### 7.4 CANARY",
+            synthetic_fi_row("FI-103"),
+        )
+    )
+    expected_registry = {"FI-101": "PRE_D3", "FI-102": "PRE_D3", "FI-103": "CANARY"}
+    for outside in ("### 7.5 管理面计划测试目录", "## 卷 8 小本金策略实操与风险矩阵"):
+        control_name = f"FI: 忽略注册范围外的表格行（{outside}）"
+        try:
+            parsed = parse_blueprint("\n".join((official_registry, outside, first_row)))
+            actual_registry = {fi_id: row.tag for fi_id, row in parsed.fi_rows.items()}
+            verdict(control_name, actual_registry == expected_registry, f"实际登记 {actual_registry}")
+        except LedgerFormatError as exc:
+            verdict(control_name, False, str(exc))
+
     def fi_of(its, **want) -> Item:
         for it in its:
             if it.id.startswith("FI-") and all(it.one(k) == v for k, v in want.items()):
                 return it
         raise LookupError(want)
 
-    def not_yet(tok: Token) -> bool:
-        return tok.kind in ("open", "absent", "nofile") or tok.kind.startswith("count")
+    def check_locator_status(name: str, item: Item, expected_codes: list[str]) -> None:
+        report = Report()
+        check_item(item, bp, files, report, strict_fault=False)
+        actual_codes = [finding.code for finding in report.findings]
+        verdict(name, actual_codes == expected_codes, f"实际结果 {actual_codes}")
+
+    absent = "absent:README.md#OfflineUnimplementedLedgerFixture"
+    nofile = "nofile:tools/__offline_unimplemented_ledger_fixture__.txt"
+    count = "count0:README.md#OfflineUnimplementedLedgerFixture"
+    for status, field, payload, expected in (
+        ("CLOSED", "open", absent, ["E-STATUS"]),
+        ("IMPLEMENTED", "open", absent, ["E-STATUS"]),
+        ("IMPLEMENTED", "open", nofile, ["E-STATUS"]),
+        ("IMPLEMENTED", "open", count, ["E-STATUS"]),
+        ("IMPLEMENTED", "refs", f"{absent} {count}", []),
+    ):
+        status_line = f"status: {status}\n"
+        _, modified_items = parse_ledger(text.replace(status_line, f"{status_line}{field}: {payload}\n", 1))
+        name = f"{status} 的 {field} 字段记录 {payload.partition(':')[0]} 断言"
+        check_locator_status(name, item_of(modified_items, status=status), expected)
+
+    partial = copy.deepcopy(fi_of(items, status="PARTIAL"))
+    partial.tokens = [tok for tok in partial.tokens if not tok.marks_open_work]
+    partial.tokens.extend(parse_tokens(absent))
+    check_locator_status("FI: refs 中的 absent 不能替代 PARTIAL 的待完成断言", partial, ["E-STATUS"])
 
     def bp_fi_status(b):
         b.fi_rows["FI-001"] = dataclasses.replace(b.fi_rows["FI-001"], status="NOT_TESTABLE_YET")
@@ -1454,13 +1624,13 @@ def self_test(ledger_path: Path) -> int:
 
     def m_fi_no_open(its):
         it = fi_of(its, status="PARTIAL")
-        it.tokens = [tok for tok in it.tokens if not not_yet(tok)]
+        it.tokens = [tok for tok in it.tokens if not tok.marks_open_work]
 
     control("FI: 未实装却没有任何“尚未”断言", m_fi_no_open, "E-STATUS")
 
     def m_fi_no_refs(its):
         it = fi_of(its, status="PARTIAL")
-        it.tokens = [tok for tok in it.tokens if not_yet(tok)]
+        it.tokens = [tok for tok in it.tokens if tok.marks_open_work]
 
     control("FI: PARTIAL 不引用任何已经存在的东西", m_fi_no_refs, "E-STATUS")
 
@@ -1481,7 +1651,7 @@ def self_test(ledger_path: Path) -> int:
             ["PASS"],
             ["PASS"],
         )
-        it.tokens = [tok for tok in it.tokens if tok.kind != "open"]
+        it.tokens = [tok for tok in it.tokens if not tok.marks_open_work]
 
     control("FI: IMPLEMENTED 与 PASS 没有成功 run 就记门禁 PASS", m_fi_no_run, "E-GATE")
 
@@ -1513,6 +1683,16 @@ def self_test(ledger_path: Path) -> int:
     for name, mutate, fragment in (
         ("语法: 未知的判定词", lambda s: s.replace("seg.code: PRESENT", "seg.code: MAYBE", 1), "bad verdict"),
         (
+            "语法: 重复的 status 字段",
+            lambda s: "```ledger\nid: FI-001\nstatus: PARTIAL\nstatus: IMPLEMENTED\n```\n" + s,
+            "duplicate field",
+        ),
+        (
+            "语法: adjudicated 元数据重复且冲突",
+            lambda s: "<!-- ledger-meta adjudicated=2099-01-01 -->\n" + s,
+            "duplicate ledger metadata",
+        ),
+        (
             "语法: 重复的段",
             lambda s: s.replace("seg.budget: NA", "seg.code: NA\nseg.budget: NA", 1),
             "duplicate segment",
@@ -1530,6 +1710,16 @@ def self_test(ledger_path: Path) -> int:
             verdict(name, False, "没有报错")
         except LedgerFormatError as exc:
             verdict(name, fragment in str(exc), str(exc)[:60])
+
+    first_ref = "doc:README.md#HengYuan"
+    second_ref = "code:tools/closure_ledger_check.py#parse_ledger"
+    _, split_items = parse_ledger(f"```ledger\nid: FI-001\nrefs: {first_ref}\nrefs: {second_ref}\n```")
+    expected_refs = [first_ref, second_ref]
+    verdict(
+        "语法: 多行 refs 列表保留字段与引用",
+        split_items[0].fields["refs"] == expected_refs
+        and [token.raw for token in split_items[0].tokens] == expected_refs,
+    )
 
     print()
     print(f"{total - len(failures)}/{total} 个对照有效。")

@@ -13,17 +13,20 @@
 #include <hengyuan/spsc_ring.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 static std::uint64_t now_ns() {
+    const auto elapsed = std::chrono::steady_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
 }
 
 struct BenchResult {
@@ -189,8 +192,20 @@ static BenchResult bench_validator(int iters) {
 
 int main(int argc, char* argv[]) {
     int iters = 100000;
-    if (argc > 1) iters = std::atoi(argv[1]);
-    if (iters < 1000) iters = 1000;
+    if (argc > 2) {
+        std::fputs("Usage: latency_bench [iterations]\n", stderr);
+        return 2;
+    }
+    if (argc == 2) {
+        const std::string_view input(argv[1]);
+        const char* const finish = input.data() + input.size();
+        const auto [end, error] = std::from_chars(input.data(), finish, iters);
+        if (error != std::errc{} || end != finish) {
+            std::fputs("iterations must be a valid integer in int range.\n", stderr);
+            return 2;
+        }
+    }
+    iters = std::max(iters, 1000);
 
     std::printf("=== HengYuan Native Latency Benchmark ===\n");
     std::printf("Iterations: %d\n\n", iters);

@@ -18,7 +18,7 @@
 //
 // WHAT THE PIPELINE OWNS: the rings between the halves (to-reconcile, reconcile events, sweep requests, account updates), the order tracker, the sweep job, the
 // account refresher and holder, the supervisor, the startup-recovery state machine, the readiness decision (barrier included), the sweep pump, the late-fill
-// alarm and the two durable publishers. WHAT IT DOES NOT: the durable store, the in-memory audit ring, the kill switch, PositionTruth, the in-flight registry,
+// alarm, the hot-thread Intent-orphan budget and the two durable publishers. WHAT IT DOES NOT: the durable store, the in-memory audit ring, the kill switch, PositionTruth, the in-flight registry,
 // the fill context, the user-data event ring (the session factory is built over it, so it exists first), the clock publisher and the rate-limit tracker -- those
 // are the process's and come in by reference (PipelineParts), and so does every function pointer that touches the network (query port, account fetch port,
 // symbol rules). It creates no thread and opens no connection by itself: the supervisor connects on the hot thread's poll(), through the factory it was given.
@@ -51,6 +51,7 @@
 #include <hengyuan/kill_switch.hpp>
 #include <hengyuan/late_fill_alarm.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/never_sent_runtime_budget.hpp>
 #include <hengyuan/order_fill_context.hpp>
 #include <hengyuan/order_tracker.hpp>
 #include <hengyuan/position_truth.hpp>
@@ -186,6 +187,7 @@ public:
     [[nodiscard]] const AccountHolder& holder() const noexcept { return hot_.holder; }
     [[nodiscard]] const SweepPump& sweep_pump() const noexcept { return hot_.pump; }
     [[nodiscard]] const LateFillAlarm& late_fill() const noexcept { return hot_.late_fill; }
+    [[nodiscard]] const never_sent::IntentOrphanBudget& intent_orphan_budget() const noexcept { return hot_.intent_orphan_budget; }
     [[nodiscard]] const AccountRefresher& refresher() const noexcept { return reconcile_.refresher; }
     [[nodiscard]] const SweepJob& sweep_job() const noexcept { return reconcile_.job; }
     [[nodiscard]] const OrderTracker& tracker() const noexcept { return reconcile_.tracker; }
@@ -228,7 +230,8 @@ private:
               pump(readiness, sweep_requests, holder.sweep_probe()),
               reconcile_publisher(parts.durable_port),
               user_data_publisher(parts.durable_port),
-              late_fill(parts.sink.recovered_operator_resolved(), parts.sink.recovered_operator_resolved_total(), parts.kill_switch) {}
+              late_fill(parts.sink.recovered_operator_resolved(), parts.sink.recovered_operator_resolved_total(), parts.kill_switch),
+              intent_orphan_budget(parts.sink.recovered_intent_orphans(), parts.sink.max_intent_orphans()) {}
 
         Supervisor supervisor;
         AccountHolder holder;
@@ -238,6 +241,7 @@ private:
         ReconcileDurablePublisher reconcile_publisher;
         UserDataDurablePublisher user_data_publisher;
         LateFillAlarm late_fill;
+        never_sent::IntentOrphanBudget intent_orphan_budget;
         PipelineStats stats{};
     };
 
@@ -276,6 +280,7 @@ private:
         context_.user_data_events = &parts_.user_data_events;
         context_.user_data_durable = &hot_.user_data_publisher;
         context_.late_fill = &hot_.late_fill;
+        context_.intent_orphan_budget = &hot_.intent_orphan_budget;
         context_.readiness = &hot_.readiness;
         context_.sweep = &hot_.pump;
         context_.position_truth = &parts_.position_truth;

@@ -42,14 +42,14 @@
 | F-B-002 HMAC 密钥栈副本不擦除 | P2 | 属实（`append_impl` 的 `key_block` 在所有返回路径上都没有擦除） | 队列（Tier B 级的安全卫生，需 Owner 同意热路径上的擦除成本） |
 | F-B-003 `ExportOutboxRing` 契约矛盾 | P2 | 属实：环的注释说“硬滞后围栏”，`append_impl` 与导出 worker 写成静默丢弃；目前没有进程接线该环 | Owner 决策（围栏还是尽力而为） |
 | F-B-004 恢复扫描 RSS | P2 | 潜在风险，属实的推演 | 登记为 L-63，不修 |
-| F-B-005 trade/aggTrade 缺字段取默认 | P3 | 属实（`[[maybe_unused]]` 吞掉 `E`/`t`/`a`/`m` 的错误；缺 `m` 记为主动买入） | 待做（热路径解析，Tier A 小改） |
+| F-B-005 trade/aggTrade 特定字段校验 | P3 | 校验 `E`、`t` 或 `a`、`m` 的存在和类型 | 已修。字段缺失或类型错误时返回 `MalformedJson`，计入 `malformed`，产出零事件。 |
 | F-B-006 klines 时间戳溢出 | P3 | 属实 | 已修：时间戳域 [0, INT64_MAX/4] |
 | F-B-007 供应链固定不足 | P3 | 属实 | Owner 决策 |
 | F-B-008 Windows 单次 `ReadFile` | P3 | 属实（失败关闭，所以只是不一致） | 已修：`read_exact()` |
 | F-B-009 `SetFilePointer` 返回值 | P3 | 属实 | 已修：`SetFilePointerEx` |
 | F-B-010 扫描器副本漂移 | P3 | 属实：六份逐字节相同、一份格式变体、一份两视图的 `strip()` | 已修（PR #240，同 B-001） |
 | F-B-011 容量注释 255 | INFO | 属实（`kOrderEventFrameSize == 256`） | 已修 |
-| F-B-012 `u < U` 不校验 | P3 | 属实（防御性缺口，只会造成多余的重同步） | 待做 |
+| F-B-012 深度更新序号校验 | P3 | `U` 和 `u` 必须为无符号整数，且 `U ≤ u` | 已修。解析器拒绝无效序号，`DepthManager` 在缓存或应用前拒绝倒序区间。 |
 
 ### 报告 C
 

@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import collections
+import base64
+import binascii
 import io
 import json
 import os
@@ -148,6 +150,23 @@ def key_match_case_insensitive(page: str) -> bool:
     return all(("k==='%s'" % c) in page for c in ("p", "t", "?"))
 
 
+def source_copy_matches(raw: bytes, data: dict) -> bool:
+    """Compare the embedded source with the file bytes."""
+    if not isinstance(data, dict):
+        return False
+    source = data.get("source")
+    if not isinstance(source, dict) or source.get("encoding") != "base64":
+        return False
+    content = source.get("content")
+    if not isinstance(content, str):
+        return False
+    try:
+        decoded = base64.b64decode(content, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    return decoded == raw
+
+
 def main() -> int:
     md = io.open(B.SRC, encoding="utf-8").read()
     lines = md.split("\n")
@@ -173,7 +192,7 @@ def main() -> int:
           == page[page.find("<style>"):page.find("</style>")].count("}"))
 
     # ---- B 离线 ----
-    ext = re.findall(r'(?:src|href)\s*=\s*"(?:https?:)?//', page, re.I)
+    ext = B.external_references(page)
     check("B1 无外部引用", not ext, str(ext[:3]))
     check("B2 无 import/外链样式", "@import" not in page and "<link" not in page)
 
@@ -213,7 +232,7 @@ def main() -> int:
     check("D6 任务清单逐项一致",
           {(t["id"], t["priority"], t["status"]) for t in tasks}
           == {(t["id"], t["priority"], t["status"]) for t in data["tasks"]})
-    check("D7 任务数量 71", len(tasks) == 71, str(len(tasks)))
+    check("D7 任务数量 74", len(tasks) == 74, str(len(tasks)))
     check("D8 任务卡片全部渲染", sum(page.count('class="task ') for _ in [0]) == len(tasks),
           "卡片 %d / 任务 %d" % (page.count('class="task '), len(tasks)))
     check("D9 站点卡片全部渲染", page.count('class="card c-') == len(stations),
@@ -257,14 +276,13 @@ def main() -> int:
     check("F2 无字面换行转义", "\\n" not in strip_inline_scripts(page))
     check("F3 页面无生成时间戳", not re.search(r"生成(于|时间)[：:]\s*20\d\d", page))
 
-    # ---- G 溯源 ----
-    import hashlib
+    # ---- G Source correspondence ----
     raw = io.open(B.SRC, "rb").read()
-    real = hashlib.sha256(raw).hexdigest()
-    claimed = re.search(r'name="source-sha256" content="([0-9a-f]+)"', page)
-    check("G1 源哈希可由外部工具复核", bool(claimed) and claimed.group(1) == real,
-          "页面 %s / 实测 %s" % (claimed.group(1)[:12] if claimed else "无", real[:12]))
-    check("G2 页脚展示的哈希前缀一致", real[:12] in page)
+    check("G1 页面原文与源文件逐字节一致", source_copy_matches(raw, data))
+    source_text = raw.decode("utf-8")
+    sync_date = re.search(r"\| 同步时间（本地快照） \| (\d{4}-\d{2}-\d{2}) \|", source_text)
+    check("G2 页面核对日期与文档一致",
+          bool(sync_date) and data["meta"].get("baseline") == sync_date.group(1))
 
     # ---- H 脚本可执行性 ----
     # H1 是本文件最重要的一项：脚本语法错误时，页面结构完全正常、A~G 全绿，

@@ -8,9 +8,9 @@ without v1's task-packet/ADR process. See `CLAUDE.md` for why and for the engine
 - `native/` — C++20/23 low-latency execution kernel: market data parsing, order book, risk gates,
   kill switch, a durable key-rotating audit trail (`DurableControlPlaneSink`), order lifecycle +
   reconciliation, a signed private REST client (`binance_private_rest.hpp`, L4/L5 adapters
-  implemented and unit-tested), and the live-submit orchestrator (`SubmitPort`/`QueryPort` are
-  still mock DI seams in every runnable harness — the real adapters exist but nothing in
-  `native/src/` has wired them up with real credentials yet, see below). See
+  implemented and unit-tested), and the live-submit orchestrator (native harnesses still use a mock `SubmitPort`;
+  real read-only Testnet integration has run,
+  and operator recovery has been exercised, see below). See
   `docs/NATIVE_ARCHITECTURE.md` for the module map and gate-level status.
 - `py_core/` — Python research/backtest utilities: vectorized backtest engine, risk-sizing
   simulator, a pluggable strategy framework (`py_core/strategies/`), and a read-only public-REST
@@ -50,6 +50,13 @@ without v1's task-packet/ADR process. See `CLAUDE.md` for why and for the engine
   checks, up to date with `master`, no bypass). CodeQL is GitHub's default setup and dependency
   updates come from `.github/dependabot.yml`.
 
+## Current development plan
+
+The roadmap is v2.11.0. [Research and execution planning](docs/RESEARCH_EXECUTION_PLAN.md)
+defines CNY accounting, initial spot strategies, statistical validation and phased rollout.
+Research proceeds in parallel with reliable execution. Hardware scope approval belongs to
+task 1A.9; remote write management remains deferred. Business behavior is unchanged.
+
 ## Build (native)
 
 ```powershell
@@ -86,14 +93,16 @@ POST adapter (`docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md`, rev 73) are both im
 specs are accepted as implementation blueprints; implementation-level acceptance is their
 fault-injection matrices passing against real code.
 
-Current state: the adapters exist, but `live_submit_orchestrator.hpp`'s `SubmitPort`/
-`QueryPort` are still mock dependency-injection seams in every runnable harness — nothing in
-`native/src/` has wired the real adapters up with real credentials and run them as a live
-process yet. The one exception is the Testnet-only cold-start harness
-(`live_submit_preflight_harness.cpp`), which the owner ran once on 2026-11-07 with his own
-Testnet key (reads, the signed private user-data stream and a reconcile sweep; a mock submit port,
-no order). No order has ever been submitted to any Binance environment, and no production
-credential has ever been used against this code.
+Current operating state (2026-11-15, through PR #256): native orchestrator harnesses still
+use a mock submit port. The preflight harness assembles the real adapter without invoking it.
+The 2026-11-07 Testnet run covered reads, the signed private stream and reconciliation.
+On 2026-11-15 the operator completed the R6 synthetic-Prepared resolution drill. A separate
+visibility sampler submitted one Testnet LIMIT_MAKER order; this does not validate the
+native SubmitPort order path. No production credentials or production funds were used.
+S5/S6 final authorization and NeverSent callers are implemented. Scope approval, persistent
+kill state, cancellation, minimum accounting and production integration remain unfinished.
+See docs/NATIVE_EXIT_SAFETY_RUNBOOK.md for the recorded scope and remaining checks.
+
 Creating real API keys, configuring IP allowlists, and the go/no-go for the first live order
 remain the account owner's own actions. See `CLAUDE.md`'s "Live-trading direction & boundary"
 and `docs/NATIVE_ARCHITECTURE.md`'s "Live-readiness status".
