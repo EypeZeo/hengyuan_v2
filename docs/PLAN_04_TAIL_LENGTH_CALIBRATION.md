@@ -66,6 +66,8 @@
 
 运行报告保存在本机 `%LOCALAPPDATA%/HengYuan-Research/plan04-tail-length-calibration-v1/calibration.json`，包含各项计数、配对比较和未舍入的比例与区间。
 
+[选秩与独立验证](PLAN_04_TAIL_HELDOUT_CALIBRATION.md)在两组新种子上复核按模拟选出的三个秩。
+
 ## 复现
 
 在仓库根目录运行。标准输出为 JSON，包含三个方法各项比例的计数、Wilson 区间、平均半宽和配对比较。运行进度写入标准错误。加 `--smoke` 可用每个情景 4 次重复和每种长度 99 次抽样验证流程。

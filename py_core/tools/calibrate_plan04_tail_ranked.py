@@ -53,15 +53,16 @@ class RankProtocol:
     methods: tuple[tuple[str, tuple[int, ...]], ...]
 
 
-_ORIGINAL_LEVELS = (950, 950, 950)
-_FIXED_LEVELS = (965, 965, 965)
+ORIGINAL_LEVELS = (950, 950, 950)
+FIXED_LEVELS = (965, 965, 965)
+BY_LENGTH_LEVELS = (960, 965, 980)
 _FIXED_PROTOCOL = RankProtocol(
     "plan04-tail-rank-calibration-v1", SEED, REPETITIONS, 39,
-    (("baseline", _ORIGINAL_LEVELS), ("adjusted", _FIXED_LEVELS)),
+    (("baseline", ORIGINAL_LEVELS), ("adjusted", FIXED_LEVELS)),
 )
 _LENGTH_PROTOCOL = RankProtocol(
     "plan04-tail-length-calibration-v1", 20261130, 800, 99,
-    (("baseline", _ORIGINAL_LEVELS), ("fixed_rank", _FIXED_LEVELS), ("adjusted", (960, 965, 980))),
+    (("baseline", ORIGINAL_LEVELS), ("fixed_rank", FIXED_LEVELS), ("adjusted", BY_LENGTH_LEVELS)),
 )
 
 
@@ -112,6 +113,21 @@ def compare_primary_coverage(outcomes: Sequence[PairedReplication]) -> dict:
         "discordant_adjusted_coverage": asdict(rate) if rate is not None else None,
         "criterion": "within_tolerance" if passed else "not_met",
     }
+
+
+def ranked_replications(
+    scenario: TailScenario,
+    seed: np.random.SeedSequence,
+    *,
+    repetitions: int,
+    resamples: int,
+    levels_by_method: tuple[tuple[int, ...], ...],
+    pool: ProcessPoolExecutor | None,
+) -> Iterable[tuple[ReplicationMetrics, ...] | str]:
+    """Evaluate each method on the same simulated paths and the same draws per length."""
+    levels_by_length = tuple(zip(*levels_by_method, strict=True))
+    jobs = ((scenario, child, resamples, levels_by_length) for child in seed.spawn(repetitions))
+    return pool.map(_replication, jobs) if pool is not None else map(_replication, jobs)
 
 
 def compare_long_false_positives(
@@ -174,14 +190,14 @@ def _run(protocol: RankProtocol, *, smoke: bool, workers: int) -> dict:
         raise ValueError("workers must be a positive integer")
     repeats, resamples = (4, protocol.smoke_resamples) if smoke else (protocol.repetitions, RESAMPLES)
     methods, levels = zip(*protocol.methods, strict=True)
-    levels_by_length = tuple(zip(*levels, strict=True))
     scenario_seeds = np.random.SeedSequence(protocol.seed).spawn(len(SCENARIOS))
     results = []
     executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else nullcontext()
     with executor as pool:
         for scenario, seed in zip(SCENARIOS, scenario_seeds, strict=True):
-            jobs = ((scenario, rep_seed, resamples, levels_by_length) for rep_seed in seed.spawn(repeats))
-            outcomes = pool.map(_replication, jobs) if pool is not None else map(_replication, jobs)
+            outcomes = ranked_replications(
+                scenario, seed, repetitions=repeats, resamples=resamples, levels_by_method=levels, pool=pool
+            )
             results.append(_summarize(scenario, outcomes, methods=methods, progress_total=None if smoke else repeats))
     primary = next(row for row in results if row["scenario"]["name"] == PRIMARY_SCENARIO)
     passed = (
