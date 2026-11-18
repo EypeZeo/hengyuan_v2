@@ -37,11 +37,13 @@
 
 #pragma once
 
+#include <hengyuan/audit_archive_format.hpp>
 #include <hengyuan/durable_audit_sink.hpp>  // tip anchor / store identity decoders, DurableAuditSink's file naming
 #include <hengyuan/durable_frame_codec.hpp>
 #include <hengyuan/key_ring.hpp>
 #include <hengyuan/secure_wipe.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -100,6 +102,9 @@ enum class ExportStatus : std::uint8_t {
     ArchiveSourceIncomplete = 19,  // a complete source requires frames and an anchor at the exact tip
     ArchiveIdentityMissing = 20,   // a complete source requires a store identity
     OutputSyncUncertain = 21,      // the complete file is visible, but the directory flush failed
+    MalformedArchive = 22,        // archive envelope or length is invalid
+    MigrationSourceVersion = 23,  // preparation requires a v5 source
+    ReservedMigrationPath = 24,   // ordinary exports reserve migration filenames for S7 preparation
 };
 
 inline constexpr const char* export_status_name(ExportStatus s) noexcept {
@@ -126,6 +131,9 @@ inline constexpr const char* export_status_name(ExportStatus s) noexcept {
         case ExportStatus::ArchiveSourceIncomplete: return "ArchiveSourceIncomplete";
         case ExportStatus::ArchiveIdentityMissing: return "ArchiveIdentityMissing";
         case ExportStatus::OutputSyncUncertain: return "OutputSyncUncertain";
+        case ExportStatus::MalformedArchive: return "MalformedArchive";
+        case ExportStatus::MigrationSourceVersion: return "MigrationSourceVersion";
+        case ExportStatus::ReservedMigrationPath: return "ReservedMigrationPath";
     }
     return "?";
 }
@@ -809,6 +817,21 @@ private:
 
 namespace detail {
 
+inline bool is_reserved_migration_output(const std::string& path) {
+    auto filename = std::filesystem::path(path).filename().string();
+#if defined(_WIN32)
+    // Win32 aliases can use a stream suffix, case changes, trailing dots or trailing spaces.
+    const auto stream = filename.find(':');
+    if (stream != std::string::npos) filename.resize(stream);
+    const auto last = filename.find_last_not_of(" .");
+    filename.resize(last == std::string::npos ? 0 : last + 1);
+    std::transform(filename.begin(), filename.end(), filename.begin(), [](char ch) {
+        return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + ('a' - 'A')) : ch;
+    });
+#endif
+    return std::string_view(filename).ends_with(audit_archive::kMigrationSuffix);
+}
+
 inline ExclusiveOutputFile::OpenStatus open_archive_staging(ExclusiveOutputFile& file, const std::string& destination) {
     const auto parent = std::filesystem::path(destination).parent_path();
 #if defined(_WIN32)
@@ -829,6 +852,42 @@ inline ExclusiveOutputFile::OpenStatus open_archive_staging(ExclusiveOutputFile&
 
 }  // namespace detail
 
+namespace detail {
+
+struct AuditExportInput {
+    std::vector<std::byte> log;
+    std::vector<std::byte> anchor;
+    std::vector<std::byte> identity;
+    bool anchor_present{false};
+    bool identity_present{false};
+};
+
+inline ExportStatus read_audit_export_input(const std::string& log_path, AuditExportInput& input) {
+    switch (read_file_bounded(log_path, input.log, kMaxDurableLogBytes)) {
+        case ReadFileStatus::Ok: break;
+        case ReadFileStatus::TooLarge: return ExportStatus::LogTooLarge;
+        case ReadFileStatus::NotFound:
+        case ReadFileStatus::Error: return ExportStatus::IoError;
+    }
+    switch (read_file_bounded(log_path + ".tip", input.anchor, 4096)) {
+        case ReadFileStatus::Ok: input.anchor_present = true; break;
+        case ReadFileStatus::NotFound: break;
+        case ReadFileStatus::TooLarge:
+            return ExportStatus::AnchorInvalid;
+        case ReadFileStatus::Error: return ExportStatus::IoError;
+    }
+    switch (read_file_bounded(log_path + ".storeid.tip", input.identity, 4096)) {
+        case ReadFileStatus::Ok: input.identity_present = true; break;
+        case ReadFileStatus::NotFound: break;
+        case ReadFileStatus::TooLarge:
+            return ExportStatus::StoreIdentityInvalid;
+        case ReadFileStatus::Error: return ExportStatus::IoError;
+    }
+    return ExportStatus::Ok;
+}
+
+}  // namespace detail
+
 struct ExportFileResult {
     ExportStatus status{ExportStatus::Ok};
     AuditLogVerification verification{};
@@ -841,41 +900,22 @@ inline ExportFileResult export_audit_log_file(const std::string& log_path, const
                                               const KeyRing& ring, const ExportOptions& opts = ExportOptions{}) {
     ExportFileResult result;
     try {
+        if (detail::is_reserved_migration_output(out_path)) {
+            result.status = ExportStatus::ReservedMigrationPath;
+            return result;
+        }
         switch (probe_writer_lock(log_path + ".lock")) {
             case WriterProbe::NotHeld: break;
             case WriterProbe::Held: result.status = ExportStatus::WriterLive; return result;
             case WriterProbe::Unknown: result.status = ExportStatus::WriterUnknown; return result;
         }
 
-        std::vector<std::byte> log;
-        switch (read_file_bounded(log_path, log, kMaxDurableLogBytes)) {
-            case ReadFileStatus::Ok: break;
-            case ReadFileStatus::TooLarge: result.status = ExportStatus::LogTooLarge; return result;
-            case ReadFileStatus::NotFound:
-            case ReadFileStatus::Error: result.status = ExportStatus::IoError; return result;
-        }
-        std::vector<std::byte> anchor;
-        bool anchor_present = false;
-        switch (read_file_bounded(log_path + ".tip", anchor, 4096)) {
-            case ReadFileStatus::Ok: anchor_present = true; break;
-            case ReadFileStatus::NotFound: break;
-            case ReadFileStatus::TooLarge:
-                result.status = ExportStatus::AnchorInvalid;  // a tip anchor is 77 bytes
-                return result;
-            case ReadFileStatus::Error: result.status = ExportStatus::IoError; return result;
-        }
-        std::vector<std::byte> identity;
-        bool identity_present = false;
-        switch (read_file_bounded(log_path + ".storeid.tip", identity, 4096)) {
-            case ReadFileStatus::Ok: identity_present = true; break;
-            case ReadFileStatus::NotFound: break;
-            case ReadFileStatus::TooLarge:
-                result.status = ExportStatus::StoreIdentityInvalid;
-                return result;
-            case ReadFileStatus::Error: result.status = ExportStatus::IoError; return result;
-        }
+        detail::AuditExportInput input;
+        result.status = detail::read_audit_export_input(log_path, input);
+        if (result.status != ExportStatus::Ok) return result;
 
-        result.verification = verify_audit_log(log, ring, anchor_present, anchor, identity_present, identity, opts);
+        result.verification = verify_audit_log(input.log, ring, input.anchor_present, input.anchor,
+                                               input.identity_present, input.identity, opts);
         if (!result.verification.ok()) {
             result.status = result.verification.status;
             return result;
@@ -888,7 +928,7 @@ inline ExportFileResult export_audit_log_file(const std::string& log_path, const
         }
         ExclusiveOutputFile out;
         if (output_path_error || detail::open_archive_staging(out, out_path) != ExclusiveOutputFile::OpenStatus::Ok ||
-            !emit_audit_export(log, ring, result.verification, [&out](std::string_view line) { return out.write(line); })) {
+            !emit_audit_export(input.log, ring, result.verification, [&out](std::string_view line) { return out.write(line); })) {
             result.status = ExportStatus::OutputError;
             return result;
         }
