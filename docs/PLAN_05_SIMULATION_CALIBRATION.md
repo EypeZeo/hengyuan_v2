@@ -44,9 +44,15 @@ python -B -m py_core.tools.calibrate_plan05
 python -B -c 'import json; import numpy as np; from py_core.tools.calibrate_plan05 import SHARPE_SCENARIOS, calibrate_sharpe; print(json.dumps(calibrate_sharpe(SHARPE_SCENARIOS[-1], 9600, np.random.Generator(np.random.PCG64(20261119))), indent=2, allow_nan=False))'
 ```
 
+第二次独立复核固定 64,000 次、种子 `20261120`，沿用原样本长度、带宽与容差。覆盖率为 **91.67% [91.45%, 91.88%]**，整个区间低于 92% 下限，分类为 `outside_tolerance`。单侧误报率为 **7.06% [6.86%, 7.26%]**，分类为 `within_tolerance`。无估计失败，Sharpe 模拟标准差为 0.10947，平均 HAC 标准误为 0.09764。短样本情景的覆盖率未达到预设要求。
+
+```powershell
+python -B -c 'import json; import numpy as np; from py_core.tools.calibrate_plan05 import SHARPE_SCENARIOS, calibrate_sharpe; seed=20261120; out=calibrate_sharpe(SHARPE_SCENARIOS[-1], 64000, np.random.Generator(np.random.PCG64(seed))); print(json.dumps(dict(seed=seed, numpy=np.__version__, **out), indent=2, allow_nan=False))'
+```
+
 | 固定候选集合 | 胜者 HAC 误报率及 Wilson 区间 | 胜者 DSR 误报率及 Wilson 区间 |
 | --- | --- | --- |
 | 12 个独立候选 | 48.96% [46.96%, 50.96%] | 0.71% [0.44%, 1.13%] |
 | 12 个同期相关 0.6 的候选 | 25.29% [23.59%, 27.07%] | 0.58% [0.35%, 0.98%] |
 
-现行 DSR 在这两个固定集合中的误报区间低于本方案上限。配对区块抽样、跨期相关的候选集合和包含重新训练的选择流程仍需独立校准。
+现行 DSR 在这两个固定集合中的误报区间低于本方案上限。同步区块抽样的配对区间和固定候选选择结果见 [PLAN-05 配对区块校准](PLAN_05_PAIRED_BOOTSTRAP.md)。包含重新训练的选择流程需独立校准。
