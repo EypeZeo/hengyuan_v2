@@ -12,8 +12,6 @@ import numpy as np
 from py_core.research.paired_bootstrap import stationary_bootstrap_indices
 from py_core.research.plan04_risk import worst_five_percent_count
 
-_BATCH_SIZE = 128
-
 
 @dataclass(frozen=True, slots=True)
 class TailBand:
@@ -59,6 +57,37 @@ def _tail_means(values: np.ndarray, count: int) -> np.ndarray:
     return np.mean(lowest, axis=-2)
 
 
+def _ranked_tail_sums(counts: np.ndarray, ranked_values: np.ndarray, tail_count: int) -> tuple[np.ndarray, np.ndarray]:
+    cumulative = np.cumsum(counts, axis=1)
+    missing = cumulative[:, -1] < tail_count
+    np.minimum(cumulative, tail_count, out=cumulative)
+    selected = np.empty_like(cumulative)
+    selected[:, 0] = cumulative[:, 0]
+    np.subtract(cumulative[:, 1:], cumulative[:, :-1], out=selected[:, 1:])
+    sums = np.einsum("ij,j->i", selected, ranked_values)
+    return sums, missing
+
+
+def _resampled_tail_means(values: np.ndarray, indices: np.ndarray, tail_count: int) -> np.ndarray:
+    """Count each day's multiplicity and select the same lowest returns as a sorted draw."""
+    days, columns = values.shape
+    rows = np.arange(len(indices), dtype=np.intp)[:, None] * days
+    counts = np.bincount((rows + indices).ravel(), minlength=len(indices) * days).reshape(-1, days)
+    order = np.argsort(values, axis=0)
+    prefix = min(days, max(32, 3 * tail_count))
+    means = np.empty((len(indices), columns))
+    for column in range(columns):
+        ranks = order[:, column]
+        first = ranks[:prefix]
+        sums, missing = _ranked_tail_sums(counts[:, first], values[first, column], tail_count)
+        if np.any(missing):
+            sums[missing], _ = _ranked_tail_sums(
+                counts[missing][:, ranks], values[ranks, column], tail_count
+            )
+        means[:, column] = sums / tail_count
+    return means
+
+
 def bootstrap_tail_bands(
     returns: Sequence[Sequence[float]] | np.ndarray,
     *,
@@ -76,15 +105,12 @@ def bootstrap_tail_bands(
     rank = (95 * (draws + 1) + 99) // 100
     if rank > draws:
         raise ValueError("too few resamples for the simultaneous 95% tail band")
-    max_errors = np.empty(draws)
     with np.errstate(over="ignore", invalid="ignore"):
         tails = _tail_means(values, count)
         observed = tails[1::2] - tails[::2]
-        for start in range(0, draws, _BATCH_SIZE):
-            block = slice(start, start + _BATCH_SIZE)
-            resampled = _tail_means(values[indices[block]], count)
-            differences = resampled[:, 1::2] - resampled[:, ::2]
-            max_errors[block] = np.max(np.abs(differences - observed), axis=1)
+        resampled = _resampled_tail_means(values, indices, count)
+        differences = resampled[:, 1::2] - resampled[:, ::2]
+        max_errors = np.max(np.abs(differences - observed), axis=1)
         if not np.all(np.isfinite(max_errors)):
             raise ValueError("bootstrap produced a non-finite tail error")
 
