@@ -315,6 +315,7 @@ if(HY_BUILD_TESTS)
 
     enable_testing()
     include(GoogleTest)
+    add_test(NAME LiveSubmitEvidence COMMAND live_submit_evidence_harness)
 
     # gtest_discover_tests RUNS each test binary at build time to enumerate its
     # tests. The default 5s timeout is routinely exceeded under a sanitizer

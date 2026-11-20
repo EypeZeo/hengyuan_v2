@@ -2,19 +2,8 @@
 // live_submit_evidence_harness.cpp — exercises orchestrate_submit() end-to-end
 // for all 4 dry-run-before-live evidence paths (D12-9 checklist item 5).
 //
-// Governance: L1. This is NOT a testnet harness yet — it uses a mock
-// SubmitPort, exactly like the GTest suite does, because no real network
-// SubmitPort implementation exists (see SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md)
-// and no testnet credentials were provided. What this DOES do that the unit
-// tests don't: run the actual orchestrator end-to-end as a standalone binary,
-// with real wall-clock timestamps and a real build-hash, producing a real
-// populated DryRunEvidenceChain and printing its state — closer to what a
-// real dry-run-before-live evidence run would look like, minus the network.
-//
-// To point this at Binance testnet once a real SubmitPort exists: replace
-// mock_submit() with a call into BinancePrivateRestClient configured against
-// testnet.binance.vision, and load real (testnet-only) credentials via
-// SecureEnvLoader — neither of which exists yet.
+// Governance: L1. The executable uses an in-process SubmitPort and a
+// temporary durable store to check the orchestrator independently of Binance.
 //
 // SIMULATION ONLY. No network. No secret. No real order.
 
@@ -62,14 +51,23 @@ std::uint32_t build_stamp() noexcept {
 // The one knob that decides which of the 4 paths this run exercises.
 enum class Scenario { Submit, Reject, Ambiguous, Kill };
 
-SubmitOutcome g_mock_outcome{SubmitOutcome::Accepted};
+constexpr std::uint32_t kHarnessRulesVersion = 1;
+
+struct MockSubmitState {
+    SubmitOutcome outcome{SubmitOutcome::Accepted};
+    unsigned calls{0};
+};
+
+std::uint32_t mock_rules_version(void*) noexcept { return kHarnessRulesVersion; }
 
 SubmitResponse mock_submit(const char* /*coid*/, std::uint32_t /*sym*/,
                            OrderSide /*side*/, OrderType /*type*/,
                            std::int64_t /*price*/, std::int64_t /*qty*/,
                            const SymbolRules& /*rules_snapshot*/,
-                           void* /*ud*/) {
-    switch (g_mock_outcome) {
+                           void* userdata) {
+    auto& mock = *static_cast<MockSubmitState*>(userdata);
+    ++mock.calls;
+    switch (mock.outcome) {
         case SubmitOutcome::Accepted:     return {SubmitOutcome::Accepted, 999001, 0};
         case SubmitOutcome::Rejected:     return {SubmitOutcome::Rejected, 0, -1013};
         case SubmitOutcome::Timeout:      return {SubmitOutcome::Timeout, 0, 0};
@@ -149,6 +147,7 @@ struct Fixture {
     InFlightRegistry in_flight;
     SymbolRules rules{};
     AccountSnapshot account{};
+    MockSubmitState mock{};
     OrchestratorContext ctx{};
     std::uint32_t seq{0};
 
@@ -182,6 +181,8 @@ struct Fixture {
         rules.max_qty_ticks = 1'000'000;
         rules.step_size_ticks = 10;
         rules.min_notional_ticks = 1000;
+        rules.qty_scale = kBalanceScale;
+        rules.rules_version = kHarnessRulesVersion;
 
         const AssetBalanceInput usdt[] = {{"USDT", 999'999, 0}};
         if (make_account_snapshot(900, /*can_trade=*/true, usdt, account) != AccountSnapshotError::None) {
@@ -212,7 +213,7 @@ struct Fixture {
         ctx.symbol_id = 1;
         ctx.mode = ExecutionMode::DryRun;
         ctx.order_weight = 1;
-        ctx.submit_port = {mock_submit, nullptr};
+        ctx.submit_port = {mock_submit, &mock, mock_rules_version};
     }
 
     ~Fixture() {
@@ -235,28 +236,41 @@ struct Fixture {
     }
 };
 
-void run_scenario(Scenario s, std::uint32_t stamp) {
+bool run_scenario(Scenario s, std::uint32_t stamp) {
     Fixture fx;
     fx.bind_confirmation();
 
     const char* label = "?";
+    OrchestratorGate expected_gate = OrchestratorGate::Passed;
+    OrderState expected_state = OrderState::Intent;
+    bool hold_slot = false;
+    unsigned expected_calls = 1;
 
     switch (s) {
         case Scenario::Submit:
             label = "SubmitSuccess";
-            g_mock_outcome = SubmitOutcome::Accepted;
+            expected_gate = OrchestratorGate::SubmitAccepted;
+            expected_state = OrderState::Accepted;
+            hold_slot = true;
             break;
         case Scenario::Reject:
             label = "SubmitReject";
-            g_mock_outcome = SubmitOutcome::Rejected;
+            fx.mock.outcome = SubmitOutcome::Rejected;
+            expected_gate = OrchestratorGate::SubmitRejected;
+            expected_state = OrderState::Rejected;
             break;
         case Scenario::Ambiguous:
             label = "SubmitAmbiguous";
-            g_mock_outcome = SubmitOutcome::Timeout;
+            fx.mock.outcome = SubmitOutcome::Timeout;
+            expected_gate = OrchestratorGate::SubmitAmbiguous;
+            expected_state = OrderState::Ambiguous;
+            hold_slot = true;
             break;
         case Scenario::Kill:
             label = "KillSwitch";
             fx.kill_switch.trigger();
+            expected_gate = OrchestratorGate::KillSwitchNotNormal;
+            expected_calls = 0;
             break;
     }
 
@@ -279,10 +293,21 @@ void run_scenario(Scenario s, std::uint32_t stamp) {
 
     auto result = orchestrate_submit(fx.ctx);
 
+    const bool slot_held = !result.order.client_order_id.empty() &&
+                           fx.in_flight.is_in_flight(result.order.client_order_id.view());
     std::printf("  orchestrate_submit(): gate=%s  order_state=%s  audit_records=%zu\n",
                 gate_name(result.gate),
                 order_state_name(result.order.state),
                 fx.audit.count());
+    const bool passed = result.gate == expected_gate && result.order.state == expected_state &&
+                        fx.mock.calls == expected_calls && slot_held == hold_slot;
+    if (!passed) {
+        std::fprintf(stderr, "%s: expected gate=%s, state=%s, calls=%u, slot=%d; got calls=%u, slot=%d, pretrade=%u\n",
+                     label, gate_name(expected_gate), order_state_name(expected_state), expected_calls,
+                     static_cast<int>(hold_slot), fx.mock.calls, static_cast<int>(slot_held),
+                     static_cast<unsigned>(result.pre_trade_detail));
+    }
+    return passed;
 }
 
 }  // namespace
@@ -290,24 +315,17 @@ void run_scenario(Scenario s, std::uint32_t stamp) {
 int main() {
     std::printf("=== Live Submit Orchestrator — Dry-Run Evidence Harness ===\n");
     std::printf("SIMULATION ONLY. Mock SubmitPort. No network. No real order.\n");
-    std::printf("(Real testnet execution requires a SubmitPort implementation per\n");
-    std::printf(" SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md, and testnet credentials\n");
-    std::printf(" neither of which this harness has.)\n");
     std::printf("Gate 2b (SubmitReadyToken) is wired to a SYNTHETIC readiness here: this harness has no private\n");
     std::printf("user-data stream, so the stream/sweep part of the gate is exercised by the unit tests, not by this run.\n\n");
 
     auto stamp = build_stamp();
     std::printf("Build stamp: 0x%08X (derived from __DATE__ __TIME__)\n\n", stamp);
 
-    run_scenario(Scenario::Submit, stamp);
-    run_scenario(Scenario::Reject, stamp);
-    run_scenario(Scenario::Ambiguous, stamp);
-    run_scenario(Scenario::Kill, stamp);
+    unsigned passed = 0;
+    for (const auto scenario : {Scenario::Submit, Scenario::Reject, Scenario::Ambiguous, Scenario::Kill}) {
+        if (run_scenario(scenario, stamp)) ++passed;
+    }
 
-    std::printf("\nAll 4 evidence paths exercised in this process. Each scenario above\n");
-    std::printf("used a freshly constructed Fixture, so live_ready() per-scenario\n");
-    std::printf("reflects that single scenario's evidence chain, not a cumulative one\n");
-    std::printf("— a real dry-run-before-live run would need all 4 to be true within\n");
-    std::printf("the SAME long-lived evidence chain instance the live runtime uses.\n");
-    return 0;
+    std::printf("\n%u/4 offline execution scenarios passed.\n", passed);
+    return passed == 4 ? 0 : 1;
 }
