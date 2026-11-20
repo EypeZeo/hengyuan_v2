@@ -35,10 +35,12 @@
 #include "test_helpers/server_time_body.hpp"
 #include "test_helpers/tls_response_acceptor.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <initializer_list>
 #include <limits>
@@ -74,7 +76,9 @@ using hy::QueryOutcome;
 using hy::QueryResult;
 using hy::QuerySigningError;
 using hy::SecureEnvLoader;
+using hy::SpotCancelIdentity;
 using hy::SymbolRules;
+using hy::build_spot_cancel_query;
 using hy::build_exchange_info_target;
 using hy::fetch_clock_pair;
 using hy::is_snapshot_fresh;
@@ -85,6 +89,7 @@ using hy::parse_balance_decimal_to_ticks;
 using hy::parse_exchange_info_response;
 using hy::format_ticks_to_decimal;
 using hy::parse_order_query_response;
+using hy::parse_spot_cancel_response;
 using hy::parse_server_time_response;
 using hy::parse_submit_order_response;
 using hy::query_order_adapter;
@@ -135,8 +140,10 @@ OrderExpectation make_btcusdt_expectation(std::string_view coid) {
     rules.quote_scale = 8;
 
     OrderExpectation exp{};
-    std::strncpy(exp.client_order_id.id, coid.data(),
-                 std::min(coid.size(), sizeof(exp.client_order_id.id) - 1));
+    if (!coid.empty()) {
+        std::memcpy(exp.client_order_id.id, coid.data(),
+                    std::min(coid.size(), sizeof(exp.client_order_id.id) - 1));
+    }
     exp.symbol_id = 1;
     exp.side = OrderSide::Buy;
     exp.order_type = OrderType::Limit;
@@ -144,6 +151,44 @@ OrderExpectation make_btcusdt_expectation(std::string_view coid) {
     exp.intended_qty_ticks = 100'000;      // "0.100000" at qty_scale=6
     exp.rules_snapshot_at_submit = rules;
     return exp;
+}
+
+constexpr std::string_view kSpotCancelOriginalClientId = "spot-cancel-original";
+constexpr std::string_view kSpotCancelAliasClientId = "spot-cancel-alias";
+constexpr std::int64_t kSpotCancelExchangeOrderId = 12345;
+
+SpotCancelIdentity make_spot_cancel_identity(std::string_view alias = kSpotCancelAliasClientId,
+                                             std::int64_t order_id = kSpotCancelExchangeOrderId) {
+    SpotCancelIdentity cancel{};
+    cancel.exchange_order_id = order_id;
+    if (!alias.empty()) {
+        std::memcpy(cancel.cancel_client_order_id.id, alias.data(),
+                    std::min(alias.size(), sizeof(cancel.cancel_client_order_id.id) - 1));
+    }
+    return cancel;
+}
+
+std::string make_spot_cancel_response(std::string_view executed_qty = "0.000000",
+                                     std::string_view cumulative_quote_qty = "0.00000000",
+                                     std::string_view status = "CANCELED",
+                                     std::string_view symbol = "BTCUSDT",
+                                     std::int64_t order_id = kSpotCancelExchangeOrderId,
+                                     std::string_view client_order_id = kSpotCancelAliasClientId,
+                                     std::string_view orig_client_order_id = kSpotCancelOriginalClientId,
+                                     std::int64_t order_list_id = -1) {
+    return std::string(R"({"symbol":")") + std::string(symbol) + R"(","orderId":)" +
+           std::to_string(order_id) + R"(,"clientOrderId":")" + std::string(client_order_id) +
+           R"(","price":"50000.12","origQty":"0.100000","executedQty":")" +
+           std::string(executed_qty) + R"(","cummulativeQuoteQty":")" +
+           std::string(cumulative_quote_qty) + R"(","status":")" + std::string(status) +
+           R"(","side":"BUY","type":"LIMIT","timeInForce":"GTC","origClientOrderId":")" +
+           std::string(orig_client_order_id) + R"(","orderListId":)" + std::to_string(order_list_id) + "}";
+}
+
+std::string replace_once(std::string body, std::string_view before, std::string_view after) {
+    const auto position = body.find(before);
+    if (position != std::string::npos) body.replace(position, before.size(), after);
+    return body;
 }
 
 // Same price_scale=2/qty_scale=6/quote_scale=8 triple as make_btcusdt_expectation() above,
@@ -1366,6 +1411,107 @@ TEST(ParseOrderQueryResponse, UnrecognizedStatusIsInconclusive) {
         R"("side":"BUY","type":"LIMIT","timeInForce":"GTC"})",
         expected);
     EXPECT_EQ(result.outcome, QueryOutcome::Inconclusive);
+}
+
+// --- Spot cancel identity and DELETE /api/v3/order response validation ---
+
+TEST(BuildSpotCancelQuery, CanonicalizesBothOrderIdsAliasWindowAndSymbol) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    const auto query = build_spot_cancel_query(expected, cancel, 5000);
+
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->bytes(),
+              "newClientOrderId=spot-cancel-alias&orderId=12345&origClientOrderId=spot-cancel-original&"
+              "recvWindow=5000&symbol=BTCUSDT");
+}
+
+TEST(BuildSpotCancelQuery, RejectsInvalidOrderIdentityAliasAndReceiveWindow) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto valid_cancel = make_spot_cancel_identity();
+
+    EXPECT_FALSE(build_spot_cancel_query(expected, make_spot_cancel_identity(kSpotCancelAliasClientId, 0), 5000));
+    EXPECT_FALSE(build_spot_cancel_query(expected, make_spot_cancel_identity(kSpotCancelAliasClientId, -1), 5000));
+    EXPECT_FALSE(build_spot_cancel_query(expected, make_spot_cancel_identity(""), 5000));
+    EXPECT_FALSE(build_spot_cancel_query(expected, make_spot_cancel_identity(kSpotCancelOriginalClientId), 5000));
+    EXPECT_FALSE(build_spot_cancel_query(expected, valid_cancel, 0));
+    EXPECT_FALSE(build_spot_cancel_query(expected, valid_cancel, -1));
+    EXPECT_FALSE(build_spot_cancel_query(expected, valid_cancel, 60'001));
+}
+
+TEST(ParseSpotCancelResponse, AcceptsDocumentedCanceledResponseWithZeroFill) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+
+    // The body is the documented HTTP 200 DELETE response for an order canceled before any fill.
+    const auto result = parse_spot_cancel_response(make_spot_cancel_response(), expected, cancel);
+
+    ASSERT_EQ(result.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.confirmed_state, OrderState::Cancelled);
+    EXPECT_EQ(result.exchange_order_id, kSpotCancelExchangeOrderId);
+    EXPECT_EQ(result.filled_qty_ticks, 0);
+    EXPECT_EQ(result.avg_fill_price_ticks, 0);
+}
+
+TEST(ParseSpotCancelResponse, AcceptsDocumentedCanceledResponseWithPartialFill) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+
+    // A 200 CANCELED reply can report fills completed before cancellation took effect.
+    const auto result = parse_spot_cancel_response(
+        make_spot_cancel_response("0.050000", "2500.00600000"), expected, cancel);
+
+    ASSERT_EQ(result.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.confirmed_state, OrderState::Cancelled);
+    EXPECT_EQ(result.exchange_order_id, kSpotCancelExchangeOrderId);
+    EXPECT_EQ(result.filled_qty_ticks, 50'000);
+    EXPECT_EQ(result.avg_fill_price_ticks, 5'000'012);
+}
+
+TEST(ParseSpotCancelResponse, RejectsSymbolOrderIdentityAliasListAndStatusMismatches) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    const std::string valid = make_spot_cancel_response();
+    const std::pair<std::string_view, std::string> mismatches[] = {
+        {"symbol", replace_once(valid, "BTCUSDT", "ETHUSDT")},
+        {"original client order id", replace_once(valid, "spot-cancel-original", "other-original")},
+        {"cancel alias", replace_once(valid, "spot-cancel-alias", "other-alias")},
+        {"numeric order id", replace_once(valid, "\"orderId\":12345", "\"orderId\":12346")},
+        {"order list id", replace_once(valid, "\"orderListId\":-1", "\"orderListId\":7")},
+        {"status", replace_once(valid, "\"status\":\"CANCELED\"", "\"status\":\"PARTIALLY_FILLED\"")},
+    };
+
+    for (const auto& [field, body] : mismatches) {
+        EXPECT_EQ(parse_spot_cancel_response(body, expected, cancel).outcome, QueryOutcome::Inconclusive) << field;
+    }
+}
+
+TEST(ParseSpotCancelResponse, RejectsFullInvalidAndUnpricedFills) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    const std::pair<std::string_view, std::string_view> invalid_fills[] = {
+        {"0.100000", "5000.01200000"},      // fully filled, so CANCELED cannot describe this order
+        {"0.101000", "5050.01212000"},      // execution exceeds the submitted quantity
+        {"-0.010000", "-500.00120000"},     // negative execution and quote amounts
+        {"0.050000", "0.00000000"},         // positive execution without a positive average price
+    };
+
+    for (const auto& [executed_qty, cumulative_quote_qty] : invalid_fills) {
+        EXPECT_EQ(parse_spot_cancel_response(
+                      make_spot_cancel_response(executed_qty, cumulative_quote_qty), expected, cancel)
+                      .outcome,
+                  QueryOutcome::Inconclusive)
+            << "executedQty=" << executed_qty;
+    }
+}
+
+TEST(ParseSpotCancelResponse, ErrorBodyNeverBecomesSuccessfulCancellation) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+
+    EXPECT_EQ(parse_spot_cancel_response(R"({"code":-2011,"msg":"Unknown order sent."})", expected, cancel).outcome,
+              QueryOutcome::Inconclusive);
+    EXPECT_EQ(parse_spot_cancel_response("", expected, cancel).outcome, QueryOutcome::Inconclusive);
 }
 
 // --- parse_submit_order_response() -- TODO 1A.3 / SUBMITPORT spec §4.2 ---

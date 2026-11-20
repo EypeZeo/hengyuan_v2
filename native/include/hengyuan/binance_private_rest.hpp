@@ -84,6 +84,7 @@
 #endif
 
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -390,6 +391,50 @@ inline bool is_valid_exchange_info_symbol(std::string_view s) noexcept {
     return true;
 }
 
+struct SpotCancelIdentity {
+    std::int64_t exchange_order_id{0};
+    ClientOrderId cancel_client_order_id{};
+};
+
+namespace detail {
+
+inline bool valid_spot_cancel_identity(const OrderExpectation& expected, const SpotCancelIdentity& cancel) noexcept {
+    const auto& original = expected.client_order_id;
+    const auto& alias = cancel.cancel_client_order_id;
+    const auto& rules = expected.rules_snapshot_at_submit;
+    return cancel.exchange_order_id > 0 && !original.empty() && !alias.empty() &&
+           original.id[kClientOrderIdLen] == '\0' && alias.id[kClientOrderIdLen] == '\0' &&
+           original.view() != alias.view() && rules.symbol[kSymbolNameLen - 1] == '\0' &&
+           is_valid_exchange_info_symbol(rules.symbol_name()) && expected.order_type == OrderType::Limit &&
+           expected.intended_qty_ticks > 0 && expected.intended_price_ticks > 0 &&
+           (expected.side == OrderSide::Buy || expected.side == OrderSide::Sell);
+}
+
+}  // namespace detail
+
+// The signed DELETE uses both order identifiers and supplies a distinct, caller-owned alias.
+inline std::optional<CanonicalUnsignedQuery> build_spot_cancel_query(
+    const OrderExpectation& expected, const SpotCancelIdentity& cancel, std::int64_t recv_window_ms) noexcept {
+    if (!detail::valid_spot_cancel_identity(expected, cancel) || recv_window_ms <= 0 || recv_window_ms > 60'000) {
+        return std::nullopt;
+    }
+    std::array<char, 24> order_id{};
+    std::array<char, 8> window{};
+    const auto order_text = std::to_chars(order_id.data(), order_id.data() + order_id.size(), cancel.exchange_order_id);
+    const auto window_text = std::to_chars(window.data(), window.data() + window.size(), recv_window_ms);
+    if (order_text.ec != std::errc{} || window_text.ec != std::errc{}) return std::nullopt;
+    const std::pair<std::string_view, std::string_view> params[] = {
+        {"symbol", expected.rules_snapshot_at_submit.symbol_name()},
+        {"orderId", {order_id.data(), static_cast<std::size_t>(order_text.ptr - order_id.data())}},
+        {"origClientOrderId", expected.client_order_id.view()},
+        {"newClientOrderId", cancel.cancel_client_order_id.view()},
+        {"recvWindow", {window.data(), static_cast<std::size_t>(window_text.ptr - window.data())}},
+    };
+    auto [error, query] = build_canonical_query(params);
+    if (error != QuerySigningError::Ok) return std::nullopt;
+    return query;
+}
+
 // RFC 3986 percent-encoding, used only for the `symbols` JSON-array query parameter below --
 // see build_exchange_info_target()'s own comment for why this is needed at all.
 inline void percent_encode_append(std::string_view s, std::string& out) {
@@ -639,8 +684,10 @@ inline PrivateRestError parse_exchange_info_response(std::string_view body,
 // QueryOutcome::Inconclusive. A richer error channel would be dead code; the caller
 // (query_order() below) never distinguishes any of these cases from one another, matching
 // §6.1.2's own "every one of the following collapses to Inconclusive" framing.
-inline QueryResult parse_order_query_response(std::string_view body,
-                                               const OrderExpectation& expected) noexcept {
+namespace detail {
+
+inline QueryResult parse_spot_order_observation(std::string_view body, const OrderExpectation& expected,
+                                                const SpotCancelIdentity* cancel) noexcept {
     auto padded = simdjson::padded_string(body);
     simdjson::ondemand::parser parser;
     simdjson::ondemand::document doc;
@@ -670,7 +717,19 @@ inline QueryResult parse_order_query_response(std::string_view body,
     // lookup. Any mismatch is exactly as untrustworthy as a schema failure -- a response that
     // identifies itself by clientOrderId but disagrees on symbol/side/price/qty/timeInForce is
     // not evidence about THIS order.
-    if (client_order_id_sv != expected.client_order_id.view()) return {};
+    if (cancel) {
+        std::string_view original_id;
+        std::int64_t order_list_id = 0;
+        if (doc["origClientOrderId"].get_string().get(original_id) != simdjson::SUCCESS ||
+            doc["orderListId"].get_int64().get(order_list_id) != simdjson::SUCCESS ||
+            order_list_id != -1 || original_id != expected.client_order_id.view() ||
+            client_order_id_sv != cancel->cancel_client_order_id.view() ||
+            order_id != cancel->exchange_order_id || status_sv != "CANCELED") {
+            return {};
+        }
+    } else if (client_order_id_sv != expected.client_order_id.view()) {
+        return {};
+    }
     if (symbol_sv != expected.rules_snapshot_at_submit.symbol_name()) return {};
     if (side_sv != std::string_view(order_side_name(expected.side))) return {};
     // OrderType is frozen to exactly one member (Limit, ADR-019 D7 M7) -- no parser needed,
@@ -704,6 +763,7 @@ inline QueryResult parse_order_query_response(std::string_view body,
                                             executed_qty_ticks)) {
         return {};
     }
+    if (cancel && (executed_qty_ticks < 0 || executed_qty_ticks >= expected.intended_qty_ticks)) return {};
 
     QueryResult result{};
     result.outcome = QueryOutcome::Found;
@@ -711,6 +771,11 @@ inline QueryResult parse_order_query_response(std::string_view body,
     result.exchange_order_id = order_id;
 
     if (executed_qty_ticks == 0) {
+        std::int64_t quote_ticks = 0;
+        if (cancel && (!parse_decimal_to_ticks_with_scale(cumulative_quote_qty_sv,
+                              expected.rules_snapshot_at_submit.quote_scale, quote_ticks) || quote_ticks != 0)) {
+            return {};
+        }
         result.filled_qty_ticks = 0;
         result.avg_fill_price_ticks = 0;
         return result;
@@ -730,10 +795,24 @@ inline QueryResult parse_order_query_response(std::string_view body,
                                  avg_fill_price_ticks)) {
         return {};  // overflow, or a scale combination too extreme to represent -- Inconclusive
     }
+    if (cancel && avg_fill_price_ticks <= 0) return {};
 
     result.filled_qty_ticks = executed_qty_ticks;
     result.avg_fill_price_ticks = avg_fill_price_ticks;
     return result;
+}
+
+}  // namespace detail
+
+inline QueryResult parse_order_query_response(std::string_view body, const OrderExpectation& expected) noexcept {
+    return detail::parse_spot_order_observation(body, expected, nullptr);
+}
+
+// Only the success body of a single ordinary order cancel can become a Canceled observation.
+inline QueryResult parse_spot_cancel_response(std::string_view body, const OrderExpectation& expected,
+                                               const SpotCancelIdentity& cancel) noexcept {
+    if (!detail::valid_spot_cancel_identity(expected, cancel)) return {};
+    return detail::parse_spot_order_observation(body, expected, &cancel);
 }
 
 // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §4.2: schema + field-match validation for a
