@@ -65,6 +65,7 @@ enum class AuditEventType : std::uint8_t {
     // Named "NeverSent" and not "NotSent" on purpose: QueryOutcome::NotSent (order_tracker.hpp) already means "a reconcile
     // QUERY never left this process", a statement about a query, and the two must never be mistaken for each other.
     OrderNeverSent = 23,
+    OrderCancelPrepared = 24,  // v6: local cancel intent persisted before sending
 };
 
 inline const char* audit_event_name(AuditEventType t) noexcept {
@@ -93,6 +94,7 @@ inline const char* audit_event_name(AuditEventType t) noexcept {
         case AuditEventType::UserDataStreamEventObserved: return "USER_DATA_STREAM_EVENT_OBSERVED";
         case AuditEventType::OrderOperatorResolved: return "ORDER_OPERATOR_RESOLVED";
         case AuditEventType::OrderNeverSent: return "ORDER_NEVER_SENT";
+        case AuditEventType::OrderCancelPrepared: return "ORDER_CANCEL_PREPARED";
     }
     return "UNKNOWN";
 }

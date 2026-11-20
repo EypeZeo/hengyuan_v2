@@ -438,7 +438,8 @@ TEST(AuditEventTypeBounds, EachVersionHasItsOwnNewestEventType) {
     constexpr auto kNewestV5 = static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
     constexpr auto kOperatorV6 = static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved);
     constexpr auto kNewestV6 = static_cast<std::uint8_t>(AuditEventType::OrderNeverSent);
-    static_assert(kNewestV5 == 21 && kOperatorV6 == 22 && kNewestV6 == 23,
+    constexpr auto kCancelPreparedV6 = static_cast<std::uint8_t>(AuditEventType::OrderCancelPrepared);
+    static_assert(kNewestV5 == 21 && kOperatorV6 == 22 && kNewestV6 == 23 && kCancelPreparedV6 == 24,
                   "the wire values are ABI; renumbering reinterprets every frame");
 
     EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV5, kFrameFormatVersion));
@@ -449,8 +450,11 @@ TEST(AuditEventTypeBounds, EachVersionHasItsOwnNewestEventType) {
     EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV5, kFrameFormatVersionV6));
     EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kOperatorV6, kFrameFormatVersionV6));
     EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kNewestV6, kFrameFormatVersionV6));
-    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kNewestV6 + 1, kFrameFormatVersionV6))
-        << "v6 raises the bound by exactly the two values it adds";
+    EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(kCancelPreparedV6, kFrameFormatVersionV6));
+    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kCancelPreparedV6, kFrameFormatVersion))
+        << "the cancel-prepared event must not exist in a v5 frame";
+    EXPECT_FALSE(detail::is_legal_audit_event_type_for_version(kCancelPreparedV6 + 1, kFrameFormatVersionV6))
+        << "v6 raises the bound by exactly the three values it adds";
     for (std::uint8_t e = 0; e <= kNewestV5; ++e) {
         EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(e, kFrameFormatVersion)) << unsigned{e};
         EXPECT_TRUE(detail::is_legal_audit_event_type_for_version(e, kFrameFormatVersionV6)) << unsigned{e};
@@ -483,11 +487,30 @@ TEST(AuditRecordCodecV6, OperatorEventDecodesOnlyWhenTheFrameIsV6) {
     EXPECT_FALSE(decode_audit_record(buf, decoded, 7));
 }
 
+TEST(AuditRecordCodecV6, CancelPreparedEventDecodesOnlyWhenTheFrameIsV6) {
+    AuditRecord rec = make_sample_record();
+    rec.event_type = AuditEventType::OrderCancelPrepared;
+    rec.resulting_state = OrderState::CancelRequested;
+    rec.set_detail("HY-CANCEL-ALIAS|BTCUSDT");
+    rec.detail_code = (static_cast<std::int64_t>(8) << 16) | (static_cast<std::int64_t>(6) << 8) | 8;
+    std::array<std::byte, kAuditRecordWireSize> buf{};
+    encode_audit_record(buf, rec);
+
+    AuditRecord decoded{};
+    ASSERT_TRUE(decode_audit_record(buf, decoded, kFrameFormatVersionV6));
+    EXPECT_EQ(decoded.event_type, AuditEventType::OrderCancelPrepared);
+    EXPECT_EQ(decoded.resulting_state, OrderState::CancelRequested);
+    EXPECT_EQ(decoded.detail_code, rec.detail_code);
+    EXPECT_STREQ(decoded.detail_msg, rec.detail_msg);
+    EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersion)) << "v5 must refuse event 24";
+    EXPECT_FALSE(decode_audit_record(buf, decoded)) << "the two-argument form is the v5 bound";
+}
+
 TEST(AuditRecordCodecV6, EventTypeOneAboveTheV6BoundIsStillRejected) {
     AuditRecord rec = make_sample_record();
     std::array<std::byte, kAuditRecordWireSize> buf{};
     encode_audit_record(buf, rec);
-    buf[8] = std::byte{24};  // event_type is payload offset 8; 24 is one past OrderNeverSent (23), the newest v6 event
+    buf[8] = std::byte{25};  // event_type is payload offset 8; 25 is one past OrderCancelPrepared (24), the newest v6 event
     AuditRecord decoded{};
     EXPECT_FALSE(decode_audit_record(buf, decoded, kFrameFormatVersionV6));
 }
@@ -591,7 +614,7 @@ TEST(OrderEventFrameCodecV6, EncoderRefusesVersionsAndEventTypesTheReaderWouldRe
             << "version " << unsigned{version};
     }
     AuditRecord beyond = make_sample_record();
-    beyond.event_type = static_cast<AuditEventType>(24);  // one past the v6 bound (OrderNeverSent = 23)
+    beyond.event_type = static_cast<AuditEventType>(25);  // one past the v6 bound (OrderCancelPrepared = 24)
     EXPECT_EQ(encode_order_event_frame(buf, 1, 0, FrameTimeKind::ServerCorrectedUtc, 1000, beyond, kZeroMac, key,
                                        kFrameFormatVersionV6),
               0u);

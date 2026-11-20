@@ -2434,7 +2434,10 @@ TEST_F(BoundCredentialsFixture, QuerySpotCancelOrderUsesNumericIdAndValidatesCan
     PrivateRestConfig cfg;
     cfg.port = std::to_string(server.port());
 
-    const auto result = client.query_spot_cancel_order(expected, cancel, cfg);
+    auto recovered = expected;
+    recovered.pending_cancel.alias = cancel.cancel_client_order_id;
+    recovered.cancel_exchange_order_id = cancel.exchange_order_id;
+    const auto result = client.query_order(recovered, cfg);
     ASSERT_EQ(result.outcome, QueryOutcome::Found);
     EXPECT_EQ(result.confirmed_state, OrderState::Cancelled);
     EXPECT_EQ(result.exchange_order_id, kSpotCancelExchangeOrderId);

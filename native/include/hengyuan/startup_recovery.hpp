@@ -208,8 +208,13 @@ inline RecoveryApplyResult apply_recovery(std::span<const OrderRecoveryCheckpoin
     for (const OrderRecoveryCheckpoint& cp : checkpoints) {
         const std::string_view coid = cp.client_order_id.view();
 
-        const SymbolRules rules = rules_for(cp.symbol_id);
+        SymbolRules rules = rules_for(cp.symbol_id);
         if (rules.rules_version == 0) break;
+        if (cp.pending_cancel.present()) {
+            if (rules.symbol[kSymbolNameLen - 1] != '\0' ||
+                rules.symbol_name() != std::string_view(cp.pending_cancel.symbol)) break;
+            cp.pending_cancel.apply_rules(rules);
+        }
 
         // register_submit_handle(), not repopulate_in_flight_registry(): the reconcile ring needs
         // the handle so drain_reconcile_events() can release the slot when the order finishes.
@@ -267,7 +272,8 @@ inline RecoveredOrderTally tally_recovered_orders(const InFlightRegistry& in_fli
                 state = record.state;
             }
         });
-        if (tracked && (state == OrderState::Accepted || state == OrderState::PartialFill)) {
+        if (tracked && !cp.pending_cancel.present() &&
+            (state == OrderState::Accepted || state == OrderState::PartialFill)) {
             ++t.known_live;
         } else {
             ++t.unconfirmed;
@@ -309,7 +315,7 @@ inline RecoveredOrderTally tally_recovered_orders_by_shadow(const InFlightRegist
         const OrderState state = entry->shadow.state;
         if (is_exchange_final(state)) {
             ++t.resolved;
-        } else if (state == OrderState::Accepted || state == OrderState::PartialFill) {
+        } else if (!cp.pending_cancel.present() && (state == OrderState::Accepted || state == OrderState::PartialFill)) {
             ++t.known_live;
         } else {
             ++t.unconfirmed;

@@ -176,6 +176,8 @@ public:
 #endif
     }
 
+    const std::string& log_path() const noexcept { return log_path_; }
+
     ~DurableLogStore() {
         close_log();
         release_lock();

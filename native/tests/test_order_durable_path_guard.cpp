@@ -199,11 +199,30 @@ TEST(OrderDurablePathGuard, TheScansOwnHelpersBehave) {
 
 // --- who appends a frame of an order's life -----------------------------------------------------------------------------------------------------
 
+TEST(OrderDurablePathGuard, RecoveredTestnetCancelWritesPreparationBeforeSending) {
+    const std::map<std::string, std::size_t> expected = {
+        {"include/hengyuan/binance_private_rest.hpp", 1},
+    };
+    EXPECT_EQ(calls_by_file("append_cancel_prepared"), expected);
+    const auto* file = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(file, nullptr);
+    const auto entry = file->code.find("DurableSpotCancelResult cancel_recovered_testnet_order(");
+    ASSERT_NE(entry, std::string::npos);
+    const auto prepare = file->code.find("sink.append_cancel_prepared(", entry);
+    ASSERT_NE(prepare, std::string::npos);
+    const auto ack = file->code.find("if (!out.prepared.acked()) return out;", prepare);
+    ASSERT_NE(ack, std::string::npos);
+    const auto send = file->code.find("out.exchange = cancel_testnet_spot_order(", ack);
+    ASSERT_NE(send, std::string::npos);
+    EXPECT_NE(file->code.find("sink.append_durable(terminal, now_ms)", send), std::string::npos);
+}
+
 TEST(OrderDurablePathGuard, EveryProductionAppendOfAnOrderFrameIsOneOfTheKnownWriters) {
     // The calls of the durable port's append_durable(). The orchestrator's two are the sink adapter of the port and the ONE function every frame of an
     // order's life goes through (append_order_frame); the other two are the publishers' own append(). The offline R6 generator is allowed two setup
     // writes for its synthetic Intent and Prepared records; it never sends an order. Any other writer must be reviewed and added here.
     const std::map<std::string, std::size_t> expected = {
+        {"include/hengyuan/binance_private_rest.hpp", 1},        // terminal ACK for an exclusive Testnet cancellation
         {"include/hengyuan/binance_user_data_event.hpp", 1},     // UserDataDurablePublisher::append
         {"include/hengyuan/live_submit_orchestrator.hpp", 2},    // durable_audit_sink_append_adapter() and detail::append_order_frame()
         {"include/hengyuan/order_tracker.hpp", 1},               // ReconcileDurablePublisher::append

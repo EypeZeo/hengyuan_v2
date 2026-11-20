@@ -193,17 +193,12 @@ inline bool is_readable_order_event_version(std::uint8_t version) noexcept {
 // ExecutionJournal research; unrelated to that decision, fixed here since it's a one-line
 // bound correction with an existing regression-test template to extend.
 //
-// v6 (D5 / R1) raises the bound to OrderOperatorResolved (22), and (Q23 S2/S3) to OrderNeverSent (23) -- the two events
-// only a v6 frame may carry; any version this build does not read has no legal event at all.
+// v6 admits OrderOperatorResolved (22), OrderNeverSent (23) and OrderCancelPrepared (24).
+// Any version this build does not read has no legal event.
 inline bool is_legal_audit_event_type_for_version(std::uint8_t v, std::uint8_t version) noexcept {
     if (version == kFrameFormatVersion) return v <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
     if (version == kFrameFormatVersionV6) {
-        // The two events only a v6 frame may carry are consecutive, so ONE bound covers exactly them (an enumerator is only
-        // ever appended): a v6-only event inserted between them would have to be handled here on purpose.
-        static_assert(static_cast<std::uint8_t>(AuditEventType::OrderNeverSent) ==
-                          static_cast<std::uint8_t>(AuditEventType::OrderOperatorResolved) + 1,
-                      "v6's event bound must cover exactly OrderOperatorResolved and OrderNeverSent");
-        return v <= static_cast<std::uint8_t>(AuditEventType::OrderNeverSent);
+        return v <= static_cast<std::uint8_t>(AuditEventType::OrderCancelPrepared);
     }
     return false;
 }

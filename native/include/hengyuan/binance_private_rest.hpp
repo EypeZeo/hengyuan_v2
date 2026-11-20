@@ -401,6 +401,12 @@ struct SpotCancelResult {
     PrivateRestError error{PrivateRestError::None};
 };
 
+struct DurableSpotCancelResult {
+    AuditAppendResult prepared;
+    AuditAppendResult terminal;
+    SpotCancelResult exchange{QueryResult::not_sent(), PrivateRestError::None};
+};
+
 // Reserve the advertised weight before transport, including when the outcome is unknown.
 inline constexpr std::uint32_t kSpotCancelCallWeight = 1;
 
@@ -1824,6 +1830,10 @@ public:
     // the fail-closed direction is the one that counts.
     QueryResult query_order(const OrderExpectation& expected,
                              const PrivateRestConfig& cfg) noexcept {
+        if (expected.pending_cancel.present()) {
+            return query_spot_cancel_order(
+                expected, {expected.cancel_exchange_order_id, expected.pending_cancel.alias}, cfg);
+        }
         return query_order_impl(expected, cfg, nullptr);
     }
 
@@ -1987,6 +1997,77 @@ public:
         } catch (...) {
             return started ? SpotCancelResult{{}, PrivateRestError::Read}
                            : not_sent(PrivateRestError::InvalidConfig);
+        }
+    }
+
+    // Verify the account and the recovered working order under the exclusive store open.
+    // A durable preparation prevents a second DELETE, even if the first result is unknown.
+    DurableSpotCancelResult cancel_recovered_testnet_order(
+        DurableAuditSink& sink, std::string_view coid, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        DurableSpotCancelResult out{};
+        out.exchange.error = PrivateRestError::InvalidConfig;
+        if (binding_.environment() != BinanceEnvironment::Testnet || !rate_limiter_ || !sink.is_open() ||
+            sink.fenced() || now_ms <= 0) return out;
+        const auto store_binding = sink.read_binding();
+        if (store_binding.status != StoreBindingStatus::Bound ||
+            store_binding.binding.environment != StoreEnvironment::Testnet) return out;
+        const auto entries = sink.recovered_checkpoints();
+        const auto found = std::find_if(entries.begin(), entries.end(),
+                                        [coid](const auto& cp) { return cp.client_order_id.view() == coid; });
+        if (found == entries.end() || found->pending_cancel.present() ||
+            !cancel_prepared::working(found->resulting_state) || found->mode != ExecutionMode::Live) return out;
+
+        OrderExpectation expected = OrderExpectation::from(checkpoint_to_order_record(*found));
+        expected.rules_snapshot_at_submit = rules;
+        const SpotCancelIdentity identity{found->exchange_order_id, alias};
+        if (!detail::valid_spot_cancel_identity(expected, identity) ||
+            !cancel_prepared::valid_alias(alias.view())) return out;
+        try {
+            AccountSnapshot account;
+            std::uint64_t uid = 0;
+            const auto account_error = fetch_account(account, uid, cfg);
+            if (account_error != PrivateRestError::None) {
+                out.exchange.error = account_error;
+                return out;
+            }
+            if (!account.can_trade() || judge_store_binding(store_binding, StoreEnvironment::Testnet, uid) !=
+                                           BindingJudgement::Match) return out;
+
+            const auto working = query_spot_cancel_order(expected, identity, cfg);
+            if (working.outcome != QueryOutcome::Found || working.confirmed_state != found->resulting_state ||
+                working.filled_qty_ticks != found->filled_qty_ticks ||
+                working.avg_fill_price_ticks != found->avg_fill_price_ticks) return out;
+
+            out.prepared = sink.append_cancel_prepared(coid, alias, rules, now_ms);
+            if (!out.prepared.acked()) return out;
+
+            out.exchange = cancel_testnet_spot_order(expected, identity, cfg);
+            const auto& observation = out.exchange.observation;
+            if (observation.outcome != QueryOutcome::Found) return out;
+            if (observation.filled_qty_ticks < working.filled_qty_ticks) {
+                out.exchange = {{}, PrivateRestError::MalformedResponse};
+                return out;
+            }
+
+            AuditRecord terminal{};
+            terminal.timestamp_ms = now_ms;
+            terminal.event_type = AuditEventType::OrderCancelled;
+            terminal.mode = ExecutionMode::Live;
+            terminal.symbol_id = expected.symbol_id;
+            terminal.set_client_order_id(coid);
+            terminal.exchange_order_id = identity.exchange_order_id;
+            terminal.price_ticks = expected.intended_price_ticks;
+            terminal.qty_ticks = expected.intended_qty_ticks;
+            terminal.resulting_state = observation.confirmed_state;
+            terminal.filled_qty_ticks = observation.filled_qty_ticks;
+            terminal.avg_fill_price_ticks = observation.avg_fill_price_ticks;
+            terminal.side = expected.side;
+            out.terminal = sink.append_durable(terminal, now_ms);
+            return out;
+        } catch (...) {
+            out.exchange = {out.prepared.acked() ? QueryResult{} : QueryResult::not_sent(), PrivateRestError::Read};
+            return out;
         }
     }
 

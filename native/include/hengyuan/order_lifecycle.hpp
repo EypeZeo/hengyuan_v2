@@ -286,6 +286,24 @@ struct ClientOrderId {
     bool empty() const noexcept { return id[0] == '\0'; }
 };
 
+// The immutable identity of one recorded cancel attempt.
+struct PendingSpotCancel {
+    ClientOrderId alias{};
+    char symbol[kSymbolNameLen]{};
+    std::uint8_t price_scale{0};
+    std::uint8_t qty_scale{0};
+    std::uint8_t quote_scale{0};
+
+    bool present() const noexcept { return !alias.empty(); }
+
+    void apply_rules(SymbolRules& rules) const noexcept {
+        std::memcpy(rules.symbol, symbol, sizeof(symbol));
+        rules.price_scale = price_scale;
+        rules.qty_scale = qty_scale;
+        rules.quote_scale = quote_scale;
+    }
+};
+
 // Generate a deterministic client order ID from components.
 // Format: HY-{timestamp_ms}-{seq}-{symbol_hash4}
 // This is NOT a UUID — it's deterministic so the same intent always
@@ -354,6 +372,7 @@ struct OrderRecord {
     // unknown_quarantine_due() lets it trigger only after this process has sent the order at least
     // one query (see there).
     bool wall_anchor_recovered{false};
+    PendingSpotCancel pending_cancel{};
 
     TransitionResult transition_to(OrderState next) noexcept {
         auto result = validate_transition(state, next);
@@ -470,6 +489,8 @@ struct OrderExpectation {
     std::int64_t intended_price_ticks{0};
     std::int64_t intended_qty_ticks{0};
     SymbolRules rules_snapshot_at_submit{};
+    PendingSpotCancel pending_cancel{};
+    std::int64_t cancel_exchange_order_id{0};
 
     static OrderExpectation from(const OrderRecord& rec) noexcept {
         OrderExpectation exp{};
@@ -480,6 +501,11 @@ struct OrderExpectation {
         exp.intended_price_ticks = rec.intended_price_ticks;
         exp.intended_qty_ticks = rec.intended_qty_ticks;
         exp.rules_snapshot_at_submit = rec.rules_snapshot_at_submit;
+        if (rec.pending_cancel.present()) {
+            exp.pending_cancel = rec.pending_cancel;
+            exp.cancel_exchange_order_id = rec.exchange_order_id;
+            exp.pending_cancel.apply_rules(exp.rules_snapshot_at_submit);
+        }
         return exp;
     }
 };

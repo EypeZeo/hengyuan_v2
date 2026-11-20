@@ -219,8 +219,10 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     （不降、不超 `intended_qty_ticks`、无意图量则拒绝任何成交），比恢复扫描严——扫描只对“同状态重复帧”检查，状态转移帧只看 `validate_transition()`，所以
     转移帧上的超量或回退会被它静默接受（蓝图附录 D 的 L-51，随 M4 合入后的文档同步登记；收紧扫描是格式兼容性决定，不在 M4）。任务 1A.7-C0 已补
     `CancelRequested → Accepted / PartialFill`（L4 §6.6 的撤单未赢观察），同状态累计成交增长也会写帧；REST 的当前快照允许双向收敛，
-    WS 则把无新增成交量的迟到 `NEW/PARTIALLY_FILLED` 判为 Stale，只有更大累计量能证明撤单中的新成交，避免旧报告把状态倒退。树里仍没有
-    DELETE 撤单执行器、alias 或 `CANCEL_UNKNOWN` 承载，本切片不宣称撤单通道已完成。
+    WS 则把无新增成交量的迟到 `NEW/PARTIALLY_FILLED` 判为 Stale，只有更大累计量能证明撤单中的新成交，避免旧报告把状态倒退。
+  - **持久撤单准备**：`OrderCancelPrepared` 属于 v6 订单帧，记录工作单的数字订单号、撤单别名、标的和精度。写入限定为独占打开后对恢复出的实际工作单的首个追加。
+    Testnet 执行入口核对绑定账户和交易所工作状态，收到准备帧 ACK 才发出一次 DELETE。重启查询使用保存的数字订单号和精度。查询仍为工作状态时可持久化累计成交的增长，
+    订单留在撤单待确认状态。终态未写入时保留恢复记录和在途资源。已有的交易所 `PENDING_CANCEL` 观察仍遵循其原有状态转换规则。
   - **`UserDataDurablePublisher`**（`binance_user_data_event.hpp`）+ `drain_user_data_events(..., durable)`：一份报告被解析、与本次排空里同一订单的其他报告合并
     （最新的胜出：较新的替换、较旧的丢弃、互相矛盾的拒绝后者；一串成交只落一帧）、按影子规划、写入、ACK 之后才 `consume_delta()`/`apply_fill()` 并写环记录
     （持久模式下环里的记录就是落盘的帧，带**累计**成交量；旧的内存优先路径仍写增量记录）。队头阻塞与对账发布者一致：有观察未持久时排空**什么也不弹**（环满、

@@ -1914,6 +1914,7 @@ struct OrderRecoveryCheckpoint {
     //                        order starts at the send, not at the moment the process gave up waiting.
     ExecutionMode mode{ExecutionMode::DryRun};
     std::int64_t send_started_utc_ms{0};
+    PendingSpotCancel pending_cancel{};
 };
 static_assert(std::is_trivially_copyable_v<OrderRecoveryCheckpoint>);
 static_assert(std::is_standard_layout_v<OrderRecoveryCheckpoint>);

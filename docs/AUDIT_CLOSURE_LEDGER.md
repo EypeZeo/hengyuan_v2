@@ -1599,7 +1599,7 @@ gate_result: BLOCKED
 baseline: 58b60d0
 open: absent:native/include/hengyuan/*.hpp#CancelUnknown
 refs: test:native/tests/test_binance_private_rest.cpp#CancelTestnetSpotOrderPreservesInconclusiveAfterHttpFailure
-note: 原生 Testnet REST 适配器在发送后的 HTTP 错误下返回结果不明。交易进程仍需持久状态、恢复交接和撤单期间部分成交的组合验证。
+note: 已绑定的独占 Testnet 日志保存撤单意图，并支持按数字订单号恢复。交易主进程仍需只减风险状态下的自动触发，以及超时与部分成交的 Testnet 组合验证。
 ```
 
 ```ledger

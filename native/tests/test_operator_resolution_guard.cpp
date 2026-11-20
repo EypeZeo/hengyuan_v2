@@ -320,10 +320,9 @@ TEST(OperatorResolutionGuard, TheScannerHelpersHaveKnownAnswers) {
     EXPECT_TRUE(call_args(code_only("// enc(a, b)\nconst char* s = \"enc(a, b)\";"), "enc").empty());
 }
 
-TEST(OperatorResolutionGuard, TheOperatorEventIsNamedOnlyByItsDefinitionTheCodecAndTheReader) {
+TEST(OperatorResolutionGuard, TheOperatorEventIsNamedOnlyByItsDefinitionAndItsOwners) {
     expect_named_only_in("OrderOperatorResolved",
                          {{kTrail, 2, "the enumerator and its name in audit_event_name()"},
-                          {kCodec, 1, "is_legal_audit_event_type_for_version(): the one version that may carry it"},
                           {kSink, 2, "the recovery scan recognising the frame, and append_operator_resolution() recognising "
                                      "the one record it may write (R3-0) -- neither constructs one"},
                           {kFlow, 1, "the one frame the tool builds, from a checkpoint and a conclusion (R3a)"}});
@@ -411,18 +410,17 @@ TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedByTheRecoveryScanAndByThe
         }
     }
     for (const std::string& f : elsewhere) ADD_FAILURE() << f << " names write_version_";
-    EXPECT_EQ(assignments, 3u)
-        << "write_version_ is set exactly three times: from the highest version the recovery scan saw, and to 6 right after "
-           "append_operator_resolution() has had an operator frame acknowledged, and to 6 right after append_never_sent() has "
-           "had a closure frame acknowledged (Q23 S4: this was two until then, and moving it is a reviewed edit of this "
-           "test). A fourth assignment is a way to write the first v6 frame of a store without a v6 frame ever having been "
-           "there (or to go back to v5 after one)";
+    EXPECT_EQ(assignments, 4u)
+        << "write_version_ is set exactly four times: from the highest version the recovery scan saw, and to 6 only after "
+           "append_cancel_prepared(), append_operator_resolution(), or append_never_sent() has had its v6 frame acknowledged. "
+           "A further assignment is a way to write the first v6 frame of a store without a v6 frame ever having been there "
+           "(or to go back to v5 after one)";
     const std::string scan = function_body(sink->code, "run_recovery_scan_impl");
     ASSERT_FALSE(scan.empty());
     EXPECT_EQ(count_assignments(scan, "write_version_"), 1u) << "the first assignment belongs to the recovery scan";
-    // ...and each of the other two comes AFTER its append was acknowledged, never before: a refused or failed append leaves
+    // ...and each of the other three comes AFTER its append was acknowledged, never before: a refused or failed append leaves
     // the version alone.
-    for (const char* writer : {"append_operator_resolution", "append_never_sent"}) {
+    for (const char* writer : {"append_cancel_prepared", "append_operator_resolution", "append_never_sent"}) {
         const std::string append = function_body(sink->code, writer);
         ASSERT_FALSE(append.empty()) << writer;
         EXPECT_EQ(count_assignments(append, "write_version_"), 1u) << "one assignment belongs to " << writer << "()";
@@ -434,7 +432,7 @@ TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedByTheRecoveryScanAndByThe
     }
 }
 
-TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAndHasThreeCallers) {
+TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAndHasFourCallers) {
     std::size_t total_calls = 0;
     for (const SourceFile& f : production_sources()) {
         const std::vector<std::vector<std::string>> calls = call_args(f.code, "encode_order_event_frame");
@@ -449,12 +447,12 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAnd
     }
     EXPECT_EQ(total_calls, 1u);
 
-    // append_impl() is where that version comes from: the store's write version for append_durable(), 6 for the operator
-    // frame and for the Q23 closure frame -- and each 6 is passed only from inside its own writer.
+    // append_impl() is where that version comes from: the store's write version for append_durable(), 6 for the cancel,
+    // operator, and Q23 closure frames -- and each 6 is passed only from inside its own writer.
     const SourceFile* sink = find_source(kSink);
     ASSERT_NE(sink, nullptr);
     const std::vector<std::vector<std::string>> impl_calls = call_args(sink->code, "append_impl");
-    ASSERT_EQ(impl_calls.size(), 3u);
+    ASSERT_EQ(impl_calls.size(), 4u);
     std::size_t with_write_version = 0;
     std::size_t with_v6 = 0;
     for (const std::vector<std::string>& args : impl_calls) {
@@ -463,8 +461,8 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAnd
         if (args.back() == "kFrameFormatVersionV6") ++with_v6;
     }
     EXPECT_EQ(with_write_version, 1u);
-    EXPECT_EQ(with_v6, 2u);
-    for (const char* writer : {"append_operator_resolution", "append_never_sent"}) {
+    EXPECT_EQ(with_v6, 3u);
+    for (const char* writer : {"append_cancel_prepared", "append_operator_resolution", "append_never_sent"}) {
         EXPECT_EQ(count_identifier(function_body(sink->code, writer), "kFrameFormatVersionV6"), 2u)
             << writer << ": the append call and the assignment after it";
     }
@@ -1152,10 +1150,12 @@ TEST(OperatorResolutionGuard, TheBindingIsReadByTheToolOnceAndJudgedByTheFlowOnc
     expect_named_only_in("read_store_binding",
                          {{kBinding, 1, "the definition"},
                           {kBindingWriter, 3, "bind_store() reads before and after it writes, ensure_store_binding() once"},
-                          {kTool, 1, "the one read, with the audit sink's own identity"}});
+                          {kTool, 1, "the one read, with the audit sink's own identity"},
+                          {kSink, 1, "recovered Testnet cancellation reads the held store's binding"}});
     expect_named_only_in("judge_store_binding", {{kBinding, 1, "the definition"},
                                                 {kBindingWriter, 1, "ensure_store_binding()"},
-                                                {kFlow, 1, "resolve_order(): the one judgement of a resolution"}});
+                                                {kFlow, 1, "resolve_order(): the one judgement of a resolution"},
+                                                {"include/hengyuan/binance_private_rest.hpp", 1, "recovered Testnet cancellation"}});
 
     // the tool reads the audit log's own sidecar with the sink's own identity, and hands the session what it read
     const SourceFile* tool = find_source(kTool);

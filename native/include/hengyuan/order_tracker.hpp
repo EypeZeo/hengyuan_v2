@@ -741,6 +741,15 @@ inline void poll_once(OrderTracker& tracker,
         ++queries_this_tick;
 
         QueryResult result = query_port.call(OrderExpectation::from(record));
+        if (record.pending_cancel.present() && result.outcome == QueryOutcome::Found) {
+            if (result.exchange_order_id != record.exchange_order_id) {
+                result = {};
+            } else if (result.confirmed_state == OrderState::Accepted ||
+                       result.confirmed_state == OrderState::PartialFill) {
+                // A working order can still be affected by the recorded cancel.
+                result.confirmed_state = OrderState::CancelRequested;
+            }
+        }
 
         // query_attempts is incremented on every query that was actually SENT (Inconclusive
         // included) -- this must happen whether or not the result turns out usable below,
