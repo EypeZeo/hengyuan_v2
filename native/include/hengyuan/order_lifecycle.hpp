@@ -211,7 +211,16 @@ constexpr TransitionResult validate_transition(OrderState from, OrderState to) n
                 return TransitionResult::Ok;
             break;
         case OrderState::CancelRequested:
-            if (to == OrderState::Cancelled ||
+            // PENDING_CANCEL is an observation, not a promise that the cancel
+            // will win. A later authoritative NEW / PARTIALLY_FILLED report
+            // means the order is still working (the cancel failed or a fill
+            // arrived first); cumulative fill fields, not this state label,
+            // carry the accounting delta. This is L4 §6.6's observation matrix
+            // and 5.9.5's CANCEL_REQUESTED -> PARTIALLY_FILLED edge, not a local
+            // "undo cancel" operation and never a transition out of Cancelled.
+            if (to == OrderState::Accepted ||
+                to == OrderState::PartialFill ||
+                to == OrderState::Cancelled ||
                 to == OrderState::Filled ||   // filled before cancel arrived
                 to == OrderState::Expired)
                 return TransitionResult::Ok;

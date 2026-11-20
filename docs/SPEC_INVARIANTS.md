@@ -217,8 +217,10 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     就会破坏回放或自相矛盾，拒绝）。前缀只在它为真的地方给：`Submitting` 到只有 `Ambiguous` 才到得了的状态，或恢复订单中两种可能末帧不都合法的目标；
     `Accepted`/`PartialFill` 永不补（`→ Ambiguous` 不是边，也不是事实）；影子仍为 `Intent` = 有写者漏了 ACK 点，一律拒绝。**写者侧对每一帧都检查成交量**
     （不降、不超 `intended_qty_ticks`、无意图量则拒绝任何成交），比恢复扫描严——扫描只对“同状态重复帧”检查，状态转移帧只看 `validate_transition()`，所以
-    转移帧上的超量或回退会被它静默接受（蓝图附录 D 的 L-51，随 M4 合入后的文档同步登记；收紧扫描是格式兼容性决定，不在 M4）。已知局限（L-52）：
-    `CancelRequested` 之后的 `PARTIALLY_FILLED` 是 Unreachable（没有这条边），树里还没有撤单路径，有了那天再决定。
+    转移帧上的超量或回退会被它静默接受（蓝图附录 D 的 L-51，随 M4 合入后的文档同步登记；收紧扫描是格式兼容性决定，不在 M4）。任务 1A.7-C0 已补
+    `CancelRequested → Accepted / PartialFill`（L4 §6.6 的撤单未赢观察），同状态累计成交增长也会写帧；REST 的当前快照允许双向收敛，
+    WS 则把无新增成交量的迟到 `NEW/PARTIALLY_FILLED` 判为 Stale，只有更大累计量能证明撤单中的新成交，避免旧报告把状态倒退。树里仍没有
+    DELETE 撤单执行器、alias 或 `CANCEL_UNKNOWN` 承载，本切片不宣称撤单通道已完成。
   - **`UserDataDurablePublisher`**（`binance_user_data_event.hpp`）+ `drain_user_data_events(..., durable)`：一份报告被解析、与本次排空里同一订单的其他报告合并
     （最新的胜出：较新的替换、较旧的丢弃、互相矛盾的拒绝后者；一串成交只落一帧）、按影子规划、写入、ACK 之后才 `consume_delta()`/`apply_fill()` 并写环记录
     （持久模式下环里的记录就是落盘的帧，带**累计**成交量；旧的内存优先路径仍写增量记录）。队头阻塞与对账发布者一致：有观察未持久时排空**什么也不弹**（环满、
@@ -503,10 +505,9 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       时钟域，生产接线必须先把它定为服务器校正后的 UTC。
     - **仍未覆盖**：路径 ③ `drain_user_data_events()`（同样只写内存审计环；Owner 2026-10-13 决定并入“私网流迁移”
       一起设计，其持久帧同样必须满足回放合法性）；同步 POST 路径（路径 ①）的逐分支复核已补齐（测试
-      LiveSubmitOutcomeAckTest）；读代码时发现的既有缺口，本片不动：
-      `poll_once()` 不再轮询 `CancelRequested` 状态的订单（只轮询 `Ambiguous` 与 `Accepted`/`PartialFill`），
-      所以一旦观察到 `PENDING_CANCEL`，该订单的槽位要等重启才会重新被对账（Binance 现货文档把该状态标为
-      目前未使用）。
+      LiveSubmitOutcomeAckTest）。**后续任务 1A.7-C0 已处理当时的另一个缺口**：`poll_once()` 现在轮询
+      `CancelRequested`，支持其回到 `Accepted`/`PartialFill` 或进入终态；同状态累计成交增长、环满重试和 sweep answered
+      都走统一事件路径。真实 DELETE、撤单结果未知及 Testnet 验收仍不属于该切片。
   - **[SAFE-03 切片 2 已落地：只有 Intent 的孤儿不再是未决订单；重复单在写 Intent 帧之前就被拒]**（SUBMITPORT 规格
     第 9 轮“Intent-only orphans”——规格里写了、代码里从未实现的那一条）：`orchestrate_submit()` 在 Gate 10b 把
     `Intent` 帧持久确认**在** CONFIRM、端口校验、在途登记、真实限流扣费**之前**，所以这些本地拒绝

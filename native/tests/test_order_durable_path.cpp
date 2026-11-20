@@ -97,7 +97,7 @@ constexpr std::array<TableRow, 14> kTable{{
     {OrderState::Ambiguous, false, "WWWWWWW"},            // every target is a legal edge from Ambiguous
     {OrderState::PartialFill, false, ".WWWW.W"},          // never back to Accepted
     {OrderState::Filled, false, "..W...."},
-    {OrderState::CancelRequested, false, "..WWW.W"},      // KNOWN LIMIT: no PartialFill edge out of CancelRequested
+    {OrderState::CancelRequested, false, "WWWWW.W"},      // cancel can fail or race a fill; Rejected remains submit-time only
     {OrderState::Cancelled, false, "....W.."},
     {OrderState::Expired, false, "......W"},
     {OrderState::Reconciled, false, "......."},           // unreachable by design: nothing ever targets it
@@ -156,6 +156,22 @@ TEST(DurablePath, TheFillDecidesBetweenNothingNewAndSomethingToWrite) {
     const DurablePath more = plan(exact(OrderState::PartialFill, 4), OrderState::PartialFill, 6);
     EXPECT_EQ(more.status, PathStatus::Write);
     EXPECT_FALSE(more.ambiguous_first);
+    // A pending cancel can report more cumulative fill without changing state;
+    // a larger fill also makes a subsequent PARTIALLY_FILLED report new for WS.
+    EXPECT_EQ(plan(exact(OrderState::CancelRequested, 4), OrderState::CancelRequested, 6).status, PathStatus::Write);
+    EXPECT_EQ(plan(exact(OrderState::CancelRequested, 4), OrderState::PartialFill, 6).status, PathStatus::Write);
+    EXPECT_EQ(plan(exact(OrderState::Accepted, 0), OrderState::CancelRequested, 0).status, PathStatus::Write);
+    // At an unchanged fill, WS can only be delivering an older working report
+    // after PENDING_CANCEL. A REST snapshot is different: it is the current
+    // cancel-failure answer and both reversible directions must be recorded.
+    EXPECT_EQ(plan(exact(OrderState::CancelRequested, 4), OrderState::PartialFill, 4).status, PathStatus::Stale);
+    EXPECT_EQ(plan(exact(OrderState::CancelRequested, 0), OrderState::Accepted, 0).status, PathStatus::Stale);
+    EXPECT_EQ(plan_resolution(exact(OrderState::CancelRequested, 4), OrderState::PartialFill, 4, kIntended).status,
+              PathStatus::Write);
+    EXPECT_EQ(plan_resolution(exact(OrderState::CancelRequested, 0), OrderState::Accepted, 0, kIntended).status,
+              PathStatus::Write);
+    EXPECT_EQ(plan_resolution(exact(OrderState::Accepted, 0), OrderState::CancelRequested, 0, kIntended).status,
+              PathStatus::Write);
     // a later state with no new fill: one frame
     EXPECT_EQ(plan(exact(OrderState::PartialFill, 4), OrderState::Cancelled, 4).status, PathStatus::Write);
     // an older observation delivered late (a NEW after a PARTIALLY_FILLED, a FILLED event repeated, a lower cumulative): stale
@@ -222,7 +238,7 @@ TEST(DurablePath, AResolutionMayAlsoEscalateButOnlyWhereTheStateMachineLetsIt) {
     }
 }
 
-TEST(DurablePath, AResolutionAndAnObservationAgreeOnEveryStateThatBothCanName) {
+TEST(DurablePath, ResolutionAndObservationDifferOnlyForStaleWorkingReportsAfterPendingCancel) {
     for (const OrderState from : kAllStates) {
         for (const bool maybe : {false, true}) {
             if (maybe && from != OrderState::Ambiguous) continue;
@@ -232,6 +248,19 @@ TEST(DurablePath, AResolutionAndAnObservationAgreeOnEveryStateThatBothCanName) {
                         const DurableShadow log{from, maybe, shadow_filled};
                         const DurablePath o = plan(log, target, cumulative);
                         const DurablePath r = plan_resolution(log, target, cumulative, kIntended);
+                        const bool old_working_report =
+                            from == OrderState::CancelRequested &&
+                            (target == OrderState::Accepted || target == OrderState::PartialFill) && cumulative >= 0 &&
+                            cumulative <= shadow_filled;
+                        if (old_working_report) {
+                            // WS: no new cumulative fill, so an older working
+                            // report is stale. REST: a current snapshot proves
+                            // cancel failure at equal fill; a lower fill is a
+                            // contradiction rather than something to write.
+                            ASSERT_EQ(o.status, PathStatus::Stale);
+                            ASSERT_EQ(r.status, cumulative == shadow_filled ? PathStatus::Write : PathStatus::Unreachable);
+                            continue;
+                        }
                         ASSERT_EQ(o.status, r.status);
                         ASSERT_EQ(o.ambiguous_first, r.ambiguous_first);
                     }
@@ -320,16 +349,17 @@ bool replays(const DurableShadow& log, const DurablePath& path, OrderState targe
     return true;
 }
 
-// Is there ANY legal route -- the frame itself, or one intermediate frame of any state that carries no new fill -- from what the log may hold to the
-// observation? Wider than the planner, which only ever bridges with Ambiguous: a refusal is shown to leave nothing on the table.
+// Is there a route the writer may actually emit -- the observed frame itself, or the one Ambiguous prefix the planner can prove is true? Other
+// intermediate states are not candidates: now that Accepted/PartialFill <-> CancelRequested is reversible, inventing a CancelRequested frame would
+// otherwise make a forbidden PartialFill -> Accepted regression look "reachable" through a cancel that never happened.
 bool route_exists(const DurableShadow& log, OrderState target, std::int64_t cumulative) {
     std::array<OrderState, 2> starts{};
     const std::size_t n = possible_last_states(log, starts);
     for (std::size_t i = 0; i < n; ++i) {
         bool ok = scan_accepts(starts[i], log.filled_qty_ticks, target, cumulative);
-        for (const OrderState via : kAllStates) {
-            if (ok) break;
-            ok = scan_accepts(starts[i], log.filled_qty_ticks, via, log.filled_qty_ticks) && scan_accepts(via, log.filled_qty_ticks, target, cumulative);
+        if (!ok) {
+            ok = scan_accepts(starts[i], log.filled_qty_ticks, OrderState::Ambiguous, log.filled_qty_ticks) &&
+                 scan_accepts(OrderState::Ambiguous, log.filled_qty_ticks, target, cumulative);
         }
         if (!ok) return false;
     }

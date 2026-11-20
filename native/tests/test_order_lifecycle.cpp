@@ -115,6 +115,18 @@ TEST(OrderLifecycle, CancelRequestedToFilled) {
               TransitionResult::Ok);
 }
 
+TEST(OrderLifecycle, CancelRequestedCanResolveToStillWorkingStates) {
+    // L4 §6.6 / task 1A.7: PENDING_CANCEL is not CANCELED. A subsequent NEW or
+    // PARTIALLY_FILLED observation means the cancel did not win; the order is
+    // still live and its resources stay held.
+    EXPECT_EQ(validate_transition(OrderState::CancelRequested, OrderState::Accepted),
+              TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::CancelRequested, OrderState::PartialFill),
+              TransitionResult::Ok);
+    EXPECT_EQ(validate_transition(OrderState::CancelRequested, OrderState::Cancelled),
+              TransitionResult::Ok);
+}
+
 // --- Ambiguous transitions (M6) ---
 
 // docs/SPEC_INVARIANTS.md's "Reconciled" entry: SUBMITPORT spec round 24 is
@@ -531,7 +543,7 @@ TEST(RecoveredOrder, AnOrderWhoseAnchorWasNotRecoveredIsUnaffected) {
 //   * is_terminal(from) short-circuits to AlreadyTerminal for all 13 targets,
 //     regardless of `to`. Seven terminal states x 13 = 91 pairs (NeverSent, Q23 S2/S3,
 //     is the seventh).
-//   * The 28 Ok transitions are listed explicitly in kValidTransitions below.
+//   * The 30 Ok transitions are listed explicitly in kValidTransitions below.
 //   * Everything else is InvalidTransition.
 namespace {
 
@@ -595,7 +607,9 @@ constexpr Transition kValidTransitions[] = {
     {OrderState::PartialFill,     OrderState::CancelRequested},
     {OrderState::PartialFill,     OrderState::Cancelled},  // audit STATE-TRANS-011, as above
     {OrderState::PartialFill,     OrderState::Expired},
-    // CancelRequested: cancel may lose the race to a fill or an expiry.
+    // CancelRequested: the cancel may fail, or lose the race to a fill/expiry.
+    {OrderState::CancelRequested, OrderState::Accepted},
+    {OrderState::CancelRequested, OrderState::PartialFill},
     {OrderState::CancelRequested, OrderState::Cancelled},
     {OrderState::CancelRequested, OrderState::Filled},
     {OrderState::CancelRequested, OrderState::Expired},
@@ -605,8 +619,9 @@ constexpr std::size_t kValidCount = sizeof(kValidTransitions) / sizeof(kValidTra
 // operator/exchange cancel with no local CancelRequested) -> 25 (L4 §6.5 --
 // Ambiguous->CancelRequested, confirmed PENDING_CANCEL discovered via reconciliation)
 // -> 26 (TODO 1A.3 -- Submitting->PartialFill, immediate partial fill on POST response)
-// -> 28 (Q23 S2/S3 -- Intent->NeverSent and Submitting->NeverSent).
-static_assert(kValidCount == 28, "the Ok set changed size — update deliberately");
+// -> 28 (Q23 S2/S3 -- Intent->NeverSent and Submitting->NeverSent)
+// -> 30 (task 1A.7 -- CancelRequested->Accepted/PartialFill, L4 §6.6 cancel-failure observations).
+static_assert(kValidCount == 30, "the Ok set changed size — update deliberately");
 
 bool is_listed_valid(OrderState from, OrderState to) {
     for (std::size_t i = 0; i < kValidCount; ++i) {
@@ -645,9 +660,10 @@ TEST(TransitionRelation, EveryPairOfStatesMatchesTheTable) {
     // 24 -> 25: Ambiguous->CancelRequested (L4 §6.5, confirmed PENDING_CANCEL).
     // 25 -> 26: Submitting->PartialFill (TODO 1A.3, immediate partial fill on POST response).
     // 26 -> 28: Intent->NeverSent and Submitting->NeverSent (Q23 S2/S3).
-    EXPECT_EQ(ok_count, 28);
+    // 28 -> 30: CancelRequested->Accepted/PartialFill (task 1A.7, L4 §6.6).
+    EXPECT_EQ(ok_count, 30);
     EXPECT_EQ(terminal_count, 91) << "7 terminal states x 13 targets";
-    EXPECT_EQ(invalid_count, 50);
+    EXPECT_EQ(invalid_count, 48);
 }
 
 // Called out separately because these four were the specific blind spot: no test

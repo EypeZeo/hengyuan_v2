@@ -179,6 +179,7 @@ OrderRecord make_live_record(const char* coid, OrderState state,
     rec.state = OrderState::Submitting;
     rec.transition_to(OrderState::Accepted);
     if (state == OrderState::PartialFill) rec.transition_to(OrderState::PartialFill);
+    if (state == OrderState::CancelRequested) rec.transition_to(OrderState::CancelRequested);
     return rec;
 }
 }  // namespace
@@ -234,6 +235,108 @@ TEST_F(OrderTrackerTest, AcceptedOrderDiscoversCancelRequestedViaLivePoll) {
     // CancelRequested is not exchange-final -- the cancel is still in flight on Binance's side,
     // so the order must stay tracked, unlike the *Cancelled tests above.
     EXPECT_EQ(tracker_.count(), 1u);
+}
+
+TEST_F(OrderTrackerTest, CancelRequestedOrderKeepsPollingUntilExchangeFinal) {
+    auto rec = make_live_record("HY-CANCEL", OrderState::CancelRequested);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 4}, rec, 0));
+
+    // PENDING_CANCEL again: a definite answer, but no state/fill change and no
+    // resolution event. Most importantly, this state remains pollable.
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::CancelRequested, 555, 0, 0};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    ReconcileEvent ev{};
+    EXPECT_FALSE(outbound_.try_pop(ev));
+    EXPECT_EQ(tracker_.count(), 1u);
+    EXPECT_EQ(g_mock_query_call_count, 1);
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 0, 0};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
+              1000 + policy_.live_poll_interval_ms);
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.prior_state, OrderState::CancelRequested);
+    EXPECT_EQ(ev.resulting_state, OrderState::Cancelled);
+    EXPECT_EQ(tracker_.count(), 0u);
+    EXPECT_EQ(g_mock_query_call_count, 2);
+}
+
+TEST_F(OrderTrackerTest, CancelRequestedCanResolveToStillWorkingStates) {
+    for (const auto target : {OrderState::Accepted, OrderState::PartialFill}) {
+        SCOPED_TRACE(order_state_name(target));
+        OrderTracker tracker;
+        ToReconcileRing inbound;
+        ReconcileEventRing outbound;
+        auto rec = make_live_record("HY-CANCEL", OrderState::CancelRequested);
+        ASSERT_TRUE(tracker.track(InFlightHandle{2, 4}, rec, 0));
+
+        g_mock_query_result = QueryResult{QueryOutcome::Found, target, 555,
+                                           target == OrderState::PartialFill ? 40 : 0,
+                                           target == OrderState::PartialFill ? 5000 : 0};
+        poll_once(tracker, inbound, outbound, query_port_, policy_, 1000);
+
+        ReconcileEvent ev{};
+        ASSERT_TRUE(outbound.try_pop(ev));
+        EXPECT_EQ(ev.prior_state, OrderState::CancelRequested);
+        EXPECT_EQ(ev.resulting_state, target);
+        EXPECT_EQ(tracker.count(), 1u) << "a failed cancel leaves the order working, not resolved";
+        ASSERT_TRUE(tracked_record(tracker, "HY-CANCEL").has_value());
+        EXPECT_EQ(tracked_record(tracker, "HY-CANCEL")->state, target);
+    }
+}
+
+TEST_F(OrderTrackerTest, ProgressivePartialFillWithoutStateChangePublishesOnlyTheDelta) {
+    auto rec = make_live_record("HY-PROGRESS", OrderState::PartialFill);
+    rec.filled_qty_ticks = 40;
+    rec.avg_fill_price_ticks = 5000;
+    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 4}, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::PartialFill, 555, 60, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+
+    ReconcileEvent ev{};
+    ASSERT_TRUE(outbound_.try_pop(ev)) << "a larger cumulative fill is new information even when status is unchanged";
+    EXPECT_EQ(ev.prior_state, OrderState::PartialFill);
+    EXPECT_EQ(ev.resulting_state, OrderState::PartialFill);
+    EXPECT_EQ(ev.filled_qty_ticks, 60);
+    EXPECT_EQ(ev.fill_delta_qty_ticks, 20);
+    EXPECT_EQ(tracker_.count(), 1u);
+    EXPECT_EQ(tracked_record(tracker_, "HY-PROGRESS")->filled_qty_ticks, 60);
+
+    // The identical snapshot on the next poll has no new delta and emits nothing.
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
+              1000 + policy_.live_poll_interval_ms);
+    EXPECT_FALSE(outbound_.try_pop(ev));
+}
+
+TEST_F(OrderTrackerTest, CancelRequestedProgressiveFillPublishesDeltaAndKeepsResources) {
+    InFlightRegistry in_flight;
+    AuditRingSink audit;
+    PositionTruth truth;
+    auto rec = make_live_record("HY-CANCEL-FILL", OrderState::CancelRequested);
+    rec.filled_qty_ticks = 40;
+    rec.avg_fill_price_ticks = 5000;
+    const InFlightHandle h = in_flight.register_submit_handle(rec.client_order_id.view());
+    ASSERT_TRUE(h.valid());
+    ASSERT_TRUE(tracker_.track(h, rec, 0));
+
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::CancelRequested, 555, 60, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    drain_reconcile_events(in_flight, &audit, outbound_, 1000, &truth);
+
+    EXPECT_EQ(truth.net_qty_ticks(1), 20) << "only 60 - 40 is newly credited";
+    EXPECT_TRUE(in_flight.is_in_flight("HY-CANCEL-FILL"));
+    EXPECT_EQ(tracker_.count(), 1u);
+
+    // The final CANCELED snapshot repeats cumulative 60: release the slot but
+    // do not credit that quantity a second time.
+    g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 60, 5000};
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
+              1000 + policy_.live_poll_interval_ms);
+    drain_reconcile_events(in_flight, &audit, outbound_, 2000, &truth);
+
+    EXPECT_EQ(truth.net_qty_ticks(1), 20);
+    EXPECT_FALSE(in_flight.is_in_flight("HY-CANCEL-FILL"));
+    EXPECT_EQ(tracker_.count(), 0u);
 }
 
 TEST_F(OrderTrackerTest, PartialFillOrderReachesCancelled) {
@@ -301,7 +404,7 @@ TEST_F(OrderTrackerTest, LiveOrderRespectsFlatPollInterval) {
     EXPECT_EQ(g_mock_query_call_count, 2);
 }
 
-TEST_F(OrderTrackerTest, LivePartialFillGrowthUpdatesRecordWithoutEvent) {
+TEST_F(OrderTrackerTest, LivePartialFillGrowthPublishesEventBeforeTerminal) {
     auto rec = make_live_record("HY-LIVE", OrderState::PartialFill);
     ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
 
@@ -309,15 +412,19 @@ TEST_F(OrderTrackerTest, LivePartialFillGrowthUpdatesRecordWithoutEvent) {
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
 
     ReconcileEvent ev{};
-    EXPECT_FALSE(outbound_.try_pop(ev));
+    ASSERT_TRUE(outbound_.try_pop(ev));
+    EXPECT_EQ(ev.resulting_state, OrderState::PartialFill);
+    EXPECT_EQ(ev.fill_delta_qty_ticks, 60);
     EXPECT_EQ(tracker_.count(), 1u);
 
-    // ...and it still reaches a terminal state afterwards.
+    // ...and it still reaches a terminal state afterwards, with only the
+    // remaining cumulative delta rather than the full 100 a second time.
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
               1000 + policy_.live_poll_interval_ms);
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::Filled);
+    EXPECT_EQ(ev.fill_delta_qty_ticks, 40);
     EXPECT_EQ(tracker_.count(), 0u);
 }
 
@@ -505,6 +612,31 @@ TEST_F(OrderTrackerTest, NegativeFilledQtyRejected) {
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
 
     EXPECT_EQ(tracker_.count(), 1u);
+}
+
+TEST_F(OrderTrackerTest, CumulativeFillCannotRegressDuringCancelFillRace) {
+    for (const auto target : {OrderState::PartialFill, OrderState::CancelRequested}) {
+        SCOPED_TRACE(order_state_name(target));
+        OrderTracker tracker;
+        ToReconcileRing inbound;
+        ReconcileEventRing outbound;
+        auto rec = make_live_record("HY-REGRESS", OrderState::CancelRequested);
+        rec.filled_qty_ticks = 40;
+        rec.avg_fill_price_ticks = 5000;
+        ASSERT_TRUE(tracker.track(InFlightHandle{2, 4}, rec, 0));
+
+        // Both the same-state report and the otherwise-legal reverse transition
+        // would compute a negative delta if the cumulative high-water mark were
+        // not checked before any state mutation.
+        g_mock_query_result = QueryResult{QueryOutcome::Found, target, 555, 20, 5000};
+        poll_once(tracker, inbound, outbound, query_port_, policy_, 1000);
+
+        ReconcileEvent ev{};
+        EXPECT_FALSE(outbound.try_pop(ev));
+        ASSERT_TRUE(tracked_record(tracker, "HY-REGRESS").has_value());
+        EXPECT_EQ(tracked_record(tracker, "HY-REGRESS")->state, OrderState::CancelRequested);
+        EXPECT_EQ(tracked_record(tracker, "HY-REGRESS")->filled_qty_ticks, 40);
+    }
 }
 
 TEST_F(OrderTrackerTest, NonzeroPriceWithZeroFilledQtyRejected) {
@@ -1502,6 +1634,33 @@ TEST_F(DrainDurableTest, LiveAndEscalatedResolutionsAreMadeDurableToo) {
     EXPECT_EQ(truth_.net_qty_ticks(3), 40) << "the partial fill reached PositionTruth, after its ACK";
 }
 
+TEST_F(DrainDurableTest, CancelRequestedFillProgressIsDurableBeforeDeltaAndFinalRelease) {
+    const InFlightHandle h = admit("HY-CANCEL");
+    push("HY-CANCEL", h, OrderState::CancelRequested, OrderState::CancelRequested, /*filled=*/60);
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-CANCEL", DurableShadow{OrderState::CancelRequested, false, 40}));
+    ASSERT_EQ(fill_context_.consume_delta("HY-CANCEL", 40), 40);  // 40 was already published before this test's new report
+    truth_.apply_fill(3, OrderSide::Buy, 40);
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 1u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::CancelRequested);
+    EXPECT_EQ(probe_.frames[0].filled_qty_ticks, 60);
+    EXPECT_EQ(probe_.seen[0].net_qty, 40) << "the new 20 is not visible before its durable ACK";
+    EXPECT_EQ(truth_.net_qty_ticks(3), 60);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-CANCEL")) << "PENDING_CANCEL still holds every resource";
+
+    push("HY-CANCEL", h, OrderState::Cancelled, OrderState::CancelRequested, /*filled=*/60);
+    ASSERT_TRUE(fill_context_.seed_shadow("HY-CANCEL", DurableShadow{OrderState::CancelRequested, false, 60}));
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 2u);
+    EXPECT_EQ(probe_.frames[1].resulting_state, OrderState::Cancelled);
+    EXPECT_EQ(probe_.frames[1].filled_qty_ticks, 60);
+    EXPECT_EQ(truth_.net_qty_ticks(3), 60) << "the final snapshot repeats cumulative 60, so adds zero";
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-CANCEL"));
+}
+
 TEST_F(DrainDurableTest, TheDurableFrameAndTheAuditRingRecordCarryTheSameResolution) {
     const InFlightHandle h = admit("HY-A", /*symbol_id=*/9, OrderSide::Sell);
     push("HY-A", h, OrderState::Filled, OrderState::Accepted, /*filled=*/100, /*symbol_id=*/9, OrderSide::Sell,
@@ -1603,6 +1762,11 @@ TEST_F(DrainDurableTest, NoAmbiguousFrameWhereTheResolutionIsLegalFromSubmitting
         {OrderState::Accepted, OrderState::CancelRequested},
         {OrderState::PartialFill, OrderState::Filled},    {OrderState::PartialFill, OrderState::Cancelled},
         {OrderState::PartialFill, OrderState::Expired},   {OrderState::PartialFill, OrderState::CancelRequested},
+        {OrderState::CancelRequested, OrderState::Accepted},
+        {OrderState::CancelRequested, OrderState::PartialFill},
+        {OrderState::CancelRequested, OrderState::Filled},
+        {OrderState::CancelRequested, OrderState::Cancelled},
+        {OrderState::CancelRequested, OrderState::Expired},
         {OrderState::Intent, OrderState::Cancelled},  // "prior not provided"
     };
     int n = 0;

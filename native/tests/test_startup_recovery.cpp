@@ -91,6 +91,15 @@ AuditRecord make_partial_fill(const char* coid, std::uint32_t symbol_id, std::in
     return rec;
 }
 
+AuditRecord make_cancel_requested(const char* coid, std::uint32_t symbol_id, std::int64_t exch_id,
+                                  std::int64_t filled_qty, std::int64_t avg_price) {
+    AuditRecord rec = make_partial_fill(coid, symbol_id, exch_id, filled_qty, avg_price);
+    rec.timestamp_ms = 1004;
+    rec.event_type = AuditEventType::OrderCancelRequested;
+    rec.resulting_state = OrderState::CancelRequested;
+    return rec;
+}
+
 std::vector<std::byte> test_key() {
     static const char kKey[] = "startup-recovery-test-key";
     std::vector<std::byte> k(sizeof(kKey) - 1);
@@ -1120,6 +1129,47 @@ TEST_F(DurableReconcileLogTest, SeveralRecoveredOrdersResolvedInOneTickEachGetTh
         EXPECT_EQ(life->in_flight.count(), 0u);
         EXPECT_EQ(publisher.acked_frames(), 3u) << "A: Ambiguous re-record + Cancelled; B: Cancelled";
         EXPECT_EQ(publisher.failed_appends(), 0u);
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(after.recovered_checkpoints().empty());
+}
+
+TEST_F(DurableReconcileLogTest, RecoveredCancelRequestedPublishesFillProgressThenFinalExactlyOnce) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-C", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-C", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-C", 1, 556), 1002).acked());
+        ASSERT_TRUE(sink.append_durable(make_partial_fill("HY-C", 1, 556, 4, 100), 1003).acked());
+        ASSERT_TRUE(sink.append_durable(make_cancel_requested("HY-C", 1, 556, 4, 100), 1004).acked());
+    }
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+        ASSERT_EQ(sink.recovered_checkpoints().size(), 1u);
+        EXPECT_EQ(sink.recovered_checkpoints()[0].resulting_state, OrderState::CancelRequested);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 4) << "recovery seeds the already-published cumulative fill once";
+        ReconcileDurablePublisher publisher(port_of(sink));
+
+        exchange_says(OrderState::CancelRequested, 6);
+        tick_life(*life, publisher, 0);
+
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 6) << "same-state progress publishes only 6 - 4 after its ACK";
+        EXPECT_EQ(publisher.acked_frames(), 1u);
+        EXPECT_TRUE(life->in_flight.is_in_flight("HY-C"));
+        ASSERT_NE(life->fill_context.find("HY-C"), nullptr);
+        EXPECT_EQ(life->fill_context.find("HY-C")->shadow.state, OrderState::CancelRequested);
+        EXPECT_EQ(life->fill_context.find("HY-C")->shadow.filled_qty_ticks, 6);
+
+        exchange_says(OrderState::Cancelled, 6);
+        tick_life(*life, publisher, policy_.live_poll_interval_ms);
+
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 6) << "the terminal snapshot repeats cumulative 6 and adds nothing";
+        EXPECT_EQ(publisher.acked_frames(), 2u);
+        EXPECT_FALSE(life->in_flight.is_in_flight("HY-C"));
     }
     DurableAuditSink after(path_, *key_ring_, 1);
     EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);

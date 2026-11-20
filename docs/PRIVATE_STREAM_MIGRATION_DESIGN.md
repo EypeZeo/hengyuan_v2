@@ -312,7 +312,7 @@ M5a-2 的两组改动（a-2a、a-2b）合在一个 PR（#229，合并提交 `bdb
 7. **`validate_transition()` 与 `is_terminal()` 改成 `constexpr`**（行为不变），规划器才能在编译期求值并被 `static_assert`。
 8. **没有新的跨线程状态**，因此没有新的 TSan 负控：影子、待定表、发布者都是热线程独占。`thread` 层仍跑既有的并发用例（它们的热线程现在也带影子）。
 
-**仍未做 / 留给后续：** 同步 fsync 进入 WS 排空路径的时延没有测量（R4；合并让 fsync 次数与订单数而不是成交数成正比，但仍在热线程上）；撤单路径不存在，`CancelRequested` 之后的 `PARTIALLY_FILLED` 是 Unreachable（L-52）；
+**仍未做 / 留给后续：** 同步 fsync 进入 WS 排空路径的时延没有测量（R4；合并让 fsync 次数与订单数而不是成交数成正比，但仍在热线程上）；真实撤单执行器仍不存在。任务 1A.7-C0 已补 `CancelRequested → Accepted / PartialFill` 的持久回放，以及同状态累计成交增长事件，WS 在撤单中报告部分成交不再是 Unreachable；这只是观察收敛底座，不是 DELETE 撤单通道；
 没有生产进程运行这条排空（M5 接线、Testnet 联调）。
 
 ## 7. 切片计划
