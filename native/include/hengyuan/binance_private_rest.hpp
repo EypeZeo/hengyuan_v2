@@ -405,6 +405,7 @@ struct DurableSpotCancelResult {
     AuditAppendResult prepared;
     AuditAppendResult terminal;
     SpotCancelResult exchange{QueryResult::not_sent(), PrivateRestError::None};
+    AuditAppendResult not_sent;
 };
 
 // Reserve the advertised weight before transport, including when the outcome is unknown.
@@ -2044,6 +2045,10 @@ public:
 
             out.exchange = cancel_testnet_spot_order(expected, identity, cfg);
             const auto& observation = out.exchange.observation;
+            if (observation.outcome == QueryOutcome::NotSent) {
+                out.not_sent = sink.append_cancel_not_sent(now_ms);
+                return out;
+            }
             if (observation.outcome != QueryOutcome::Found) return out;
             if (observation.filled_qty_ticks < working.filled_qty_ticks) {
                 out.exchange = {{}, PrivateRestError::MalformedResponse};

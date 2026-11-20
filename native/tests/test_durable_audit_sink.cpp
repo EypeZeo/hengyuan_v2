@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 #include <hengyuan/durable_audit_sink.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -147,6 +148,19 @@ AuditRecord make_cancelled(const char* coid, std::uint32_t symbol_id, std::int64
     return rec;
 }
 
+AuditRecord make_cancel_not_sent(const char* coid, std::uint32_t symbol_id, std::int64_t exch_id,
+                                 const char* alias = "CANCEL-ALIAS", const char* symbol = "BTCUSDT",
+                                 OrderState restored_state = OrderState::Accepted) {
+    AuditRecord rec = make_accepted(coid, symbol_id, exch_id);
+    rec.event_type = AuditEventType::OrderCancelNotSent;
+    rec.price_ticks = 100;
+    rec.qty_ticks = 10;
+    rec.resulting_state = restored_state;
+    rec.detail_code = (static_cast<std::int64_t>(8) << 16) | (static_cast<std::int64_t>(6) << 8) | 4;
+    std::snprintf(rec.detail_msg, sizeof(rec.detail_msg), "%s|%s", alias, symbol);
+    return rec;
+}
+
 constexpr std::array<std::byte, kMacLen> kZeroMac{};
 
 }  // namespace
@@ -246,20 +260,38 @@ protected:
     // readable, indistinguishable from a deliberate tail-deletion attack,
     // correctly Corrupt (see AnchorAheadOfTruncatedLogIsCorruptTailDeletion).
     void append_prefix_of_a_real_frame(const AuditRecord& rec, std::uint64_t sequence_number,
-                                        std::array<std::byte, kMacLen> prev_mac, std::size_t prefix_len) {
+                                        std::array<std::byte, kMacLen> prev_mac, std::size_t prefix_len,
+                                        std::uint8_t format_version = kFrameFormatVersion) {
         std::array<std::byte, kOrderEventFrameSize> full_frame{};
         std::array<std::byte, kKeyBlockSize> key_block{};
         ASSERT_TRUE(key_ring_->active_key(1, key_block));
         std::span<const std::byte> key(key_block.data(), key_block.size());
         auto n = encode_order_event_frame(full_frame, /*key_id=*/1u, sequence_number,
                                            FrameTimeKind::ServerCorrectedUtc,
-                                           2000, rec, prev_mac, key);
+                                           2000, rec, prev_mac, key, format_version);
         ASSERT_EQ(n, kOrderEventFrameSize);
         ASSERT_LE(prefix_len, kOrderEventFrameSize);
 
         std::ofstream f(base_path_, std::ios::binary | std::ios::app);
         ASSERT_TRUE(f.is_open());
         f.write(reinterpret_cast<const char*>(full_frame.data()), static_cast<std::streamsize>(prefix_len));
+    }
+
+    std::array<std::byte, kMacLen> frame_mac(std::uint64_t sequence_number) const {
+        std::array<std::byte, kMacLen> result{};
+        std::ifstream f(base_path_, std::ios::binary);
+        if (!f.is_open()) {
+            ADD_FAILURE() << "failed to open the durable log while reading a fixture MAC";
+            return result;
+        }
+        const auto offset = static_cast<std::streamoff>((sequence_number + 1) * kOrderEventFrameSize - kMacLen);
+        f.seekg(offset);
+        f.read(reinterpret_cast<char*>(result.data()), static_cast<std::streamsize>(result.size()));
+        if (f.gcount() != static_cast<std::streamsize>(result.size())) {
+            ADD_FAILURE() << "fixture log did not contain the requested frame MAC";
+            result.fill(std::byte{});
+        }
+        return result;
     }
 
     void truncate_log_to(std::size_t new_size) {
@@ -451,6 +483,81 @@ TEST_F(DurableAuditSinkTest, CancelPreparedRejectsInvalidAliasAndRawAppend) {
     EXPECT_FALSE(sink.append_cancel_prepared("HY-MISSING", valid_alias, rules, 2001).acked());
     EXPECT_EQ(sink.write_format_version(), kFrameFormatVersion);
     EXPECT_TRUE(sink.append_cancel_prepared("HY-A", valid_alias, rules, 2002).acked());
+}
+
+TEST_F(DurableAuditSinkTest, CancelNotSentV6IsRejectedByGenericAppend) {
+    DurableAuditSink sink(base_path_, *key_ring_, 1);
+    const auto raw = make_cancel_not_sent("HY-A", 1, 555);
+
+    EXPECT_FALSE(sink.append_durable(raw, 2000).acked())
+        << "OrderCancelNotSent is a v6-only typed restoration event";
+    EXPECT_FALSE(sink.fenced());
+    EXPECT_EQ(sink.frame_count(), 0u);
+    EXPECT_EQ(sink.write_format_version(), kFrameFormatVersion);
+}
+
+TEST_F(DurableAuditSinkTest, RecoveryRejectsAuthenticatedCancelNotSentWithoutPrepared) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-OTHER", 200, 20, 2), 1000).acked());
+    }
+
+    // The existing fixture encoder creates a fully authenticated v6 frame. The tip remains one frame behind,
+    // which is the durable late-fsync window, so the reader reaches the event-order rule under test.
+    append_prefix_of_a_real_frame(make_cancel_not_sent("HY-A", 1, 555), /*sequence_number=*/1, frame_mac(0),
+                                  kOrderEventFrameSize, kFrameFormatVersionV6);
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt)
+        << "an authenticated no-send event without a preceding preparation is an invalid replay";
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(DurableAuditSinkTest, RecoveryRejectsAuthenticatedCancelNotSentAfterASeparateFrame) {
+    const ClientOrderId alias = make_cancel_alias("CANCEL-ALIAS");
+    const SymbolRules rules = make_cancel_rules("BTCUSDT", 8, 6, 4);
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
+    }
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_cancel_prepared("HY-A", alias, rules, 2000).acked());
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-B", 200, 20, 2), 2001).acked());
+    }
+
+    append_prefix_of_a_real_frame(make_cancel_not_sent("HY-A", 1, 555), /*sequence_number=*/5, frame_mac(4),
+                                  kOrderEventFrameSize, kFrameFormatVersionV6);
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt)
+        << "a no-send restoration must be immediately adjacent to its preparation";
+    EXPECT_TRUE(restarted.fenced());
+}
+
+TEST_F(DurableAuditSinkTest, RecoveryRejectsAuthenticatedCancelNotSentWithWrongAlias) {
+    const ClientOrderId alias = make_cancel_alias("CANCEL-ALIAS");
+    const SymbolRules rules = make_cancel_rules("BTCUSDT", 8, 6, 4);
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
+    }
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_cancel_prepared("HY-A", alias, rules, 2000).acked());
+    }
+
+    append_prefix_of_a_real_frame(make_cancel_not_sent("HY-A", 1, 555, "OTHER-ALIAS"), /*sequence_number=*/4,
+                                  frame_mac(3), kOrderEventFrameSize, kFrameFormatVersionV6);
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Corrupt)
+        << "a no-send restoration must preserve the preparation identity";
+    EXPECT_TRUE(restarted.fenced());
 }
 
 TEST_F(DurableAuditSinkTest, CancelPreparedRequiresTheFirstAppendAfterRecovery) {

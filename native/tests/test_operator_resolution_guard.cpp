@@ -432,7 +432,7 @@ TEST(OperatorResolutionGuard, TheWriteVersionIsAssignedByTheRecoveryScanAndByThe
     }
 }
 
-TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAndHasFourCallers) {
+TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAndHasFiveAppendImplCalls) {
     std::size_t total_calls = 0;
     for (const SourceFile& f : production_sources()) {
         const std::vector<std::vector<std::string>> calls = call_args(f.code, "encode_order_event_frame");
@@ -447,12 +447,12 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAnd
     }
     EXPECT_EQ(total_calls, 1u);
 
-    // append_impl() is where that version comes from: the store's write version for append_durable(), 6 for the cancel,
-    // operator, and Q23 closure frames -- and each 6 is passed only from inside its own writer.
+    // append_impl() is where that version comes from: the store's write version for append_durable() and the proven
+    // cancellation restoration, and 6 for the cancel preparation, operator, and Q23 closure frames.
     const SourceFile* sink = find_source(kSink);
     ASSERT_NE(sink, nullptr);
     const std::vector<std::vector<std::string>> impl_calls = call_args(sink->code, "append_impl");
-    ASSERT_EQ(impl_calls.size(), 4u);
+    ASSERT_EQ(impl_calls.size(), 5u);
     std::size_t with_write_version = 0;
     std::size_t with_v6 = 0;
     for (const std::vector<std::string>& args : impl_calls) {
@@ -460,13 +460,17 @@ TEST(OperatorResolutionGuard, TheOnlyProductionEncoderCallPassesItsOwnVersionAnd
         if (args.back() == "write_version_") ++with_write_version;
         if (args.back() == "kFrameFormatVersionV6") ++with_v6;
     }
-    EXPECT_EQ(with_write_version, 1u);
+    EXPECT_EQ(with_write_version, 2u);
     EXPECT_EQ(with_v6, 3u);
     for (const char* writer : {"append_cancel_prepared", "append_operator_resolution", "append_never_sent"}) {
         EXPECT_EQ(count_identifier(function_body(sink->code, writer), "kFrameFormatVersionV6"), 2u)
             << writer << ": the append call and the assignment after it";
     }
     EXPECT_EQ(count_identifier(function_body(sink->code, "append_durable"), "write_version_"), 1u);
+    const std::string not_sent = function_body(sink->code, "append_cancel_not_sent");
+    ASSERT_FALSE(not_sent.empty());
+    EXPECT_EQ(count_identifier(not_sent, "write_version_"), 1u)
+        << "proven pre-write refusal restores the store's current format version";
 }
 
 TEST(OperatorResolutionGuard, FormatVersionSixIsNamedOnlyByCodecSinkAndReadOnlyExport) {

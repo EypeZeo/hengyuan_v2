@@ -28,10 +28,12 @@ inline bool valid_symbol(std::string_view symbol) noexcept {
     return true;
 }
 
-// This event uses detail_msg for alias|symbol and detail_code for the three decimal scales.
+// Both cancel events use detail_msg for alias|symbol and detail_code for the three decimal scales.
 inline std::optional<PendingSpotCancel> decode(const AuditRecord& record) noexcept {
-    if (record.event_type != AuditEventType::OrderCancelPrepared ||
-        record.resulting_state != OrderState::CancelRequested || record.exchange_order_id <= 0 ||
+    const bool prepared = record.event_type == AuditEventType::OrderCancelPrepared &&
+                          record.resulting_state == OrderState::CancelRequested;
+    const bool not_sent = record.event_type == AuditEventType::OrderCancelNotSent && working(record.resulting_state);
+    if ((!prepared && !not_sent) || record.exchange_order_id <= 0 ||
         record.mode != ExecutionMode::Live || record.client_order_id[kClientOrderIdLen] != '\0' ||
         record.detail_msg[sizeof(record.detail_msg) - 1] != '\0' ||
         record.detail_code < 0 || record.detail_code > 0xFFFFFF) return std::nullopt;
@@ -53,6 +55,11 @@ inline std::optional<PendingSpotCancel> decode(const AuditRecord& record) noexce
     std::memcpy(pending.alias.id, alias.data(), alias.size());
     std::memcpy(pending.symbol, symbol.data(), symbol.size());
     return pending;
+}
+
+inline bool same_identity(const PendingSpotCancel& a, const PendingSpotCancel& b) noexcept {
+    return a.alias.view() == b.alias.view() && std::string_view(a.symbol) == std::string_view(b.symbol) &&
+           a.price_scale == b.price_scale && a.qty_scale == b.qty_scale && a.quote_scale == b.quote_scale;
 }
 
 inline bool matches_working_order(const AuditRecord& record, OrderState state, ExecutionMode mode,

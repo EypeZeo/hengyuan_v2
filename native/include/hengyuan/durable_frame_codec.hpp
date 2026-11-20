@@ -193,12 +193,12 @@ inline bool is_readable_order_event_version(std::uint8_t version) noexcept {
 // ExecutionJournal research; unrelated to that decision, fixed here since it's a one-line
 // bound correction with an existing regression-test template to extend.
 //
-// v6 admits OrderOperatorResolved (22), OrderNeverSent (23) and OrderCancelPrepared (24).
+// v6 admits operator resolution (22), NeverSent (23) and the two cancel events (24 and 25).
 // Any version this build does not read has no legal event.
 inline bool is_legal_audit_event_type_for_version(std::uint8_t v, std::uint8_t version) noexcept {
     if (version == kFrameFormatVersion) return v <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
     if (version == kFrameFormatVersionV6) {
-        return v <= static_cast<std::uint8_t>(AuditEventType::OrderCancelPrepared);
+        return v <= static_cast<std::uint8_t>(AuditEventType::OrderCancelNotSent);
     }
     return false;
 }

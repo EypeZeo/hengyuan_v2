@@ -217,6 +217,35 @@ TEST(OrderDurablePathGuard, RecoveredTestnetCancelWritesPreparationBeforeSending
     EXPECT_NE(file->code.find("sink.append_durable(terminal, now_ms)", send), std::string::npos);
 }
 
+TEST(OrderDurablePathGuard, ProvenNotSentCancelRestoresOnlyAfterPreparationAndTransport) {
+    const std::map<std::string, std::size_t> expected = {
+        {"include/hengyuan/binance_private_rest.hpp", 1},
+    };
+    EXPECT_EQ(calls_by_file("append_cancel_not_sent"), expected);
+
+    const auto* file = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(file, nullptr);
+    const auto entry = file->code.find("DurableSpotCancelResult cancel_recovered_testnet_order(");
+    ASSERT_NE(entry, std::string::npos);
+    const auto prepare = file->code.find("sink.append_cancel_prepared(", entry);
+    ASSERT_NE(prepare, std::string::npos);
+    const auto prepared_ack = file->code.find("if (!out.prepared.acked()) return out;", prepare);
+    ASSERT_NE(prepared_ack, std::string::npos);
+    const auto send = file->code.find("out.exchange = cancel_testnet_spot_order(", prepared_ack);
+    ASSERT_NE(send, std::string::npos);
+    const auto not_sent_branch = file->code.find("if (observation.outcome == QueryOutcome::NotSent)", send);
+    ASSERT_NE(not_sent_branch, std::string::npos);
+    const auto not_sent = file->code.find("out.not_sent = sink.append_cancel_not_sent(now_ms);", not_sent_branch);
+    ASSERT_NE(not_sent, std::string::npos);
+    const auto not_sent_call = file->code.find("sink.append_cancel_not_sent(", not_sent_branch);
+    ASSERT_NE(not_sent_call, std::string::npos);
+    EXPECT_EQ(file->code.find("sink.append_cancel_not_sent(", entry), not_sent_call);
+    EXPECT_LT(prepared_ack, send);
+    EXPECT_LT(send, not_sent_branch);
+    EXPECT_LT(not_sent_branch, not_sent);
+    EXPECT_LT(not_sent, not_sent_call);
+}
+
 TEST(OrderDurablePathGuard, EveryProductionAppendOfAnOrderFrameIsOneOfTheKnownWriters) {
     // The calls of the durable port's append_durable(). The orchestrator's two are the sink adapter of the port and the ONE function every frame of an
     // order's life goes through (append_order_frame); the other two are the publishers' own append(). The offline R6 generator is allowed two setup

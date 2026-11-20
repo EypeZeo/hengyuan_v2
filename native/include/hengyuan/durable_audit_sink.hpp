@@ -589,7 +589,8 @@ public:
     // auto-retries. now_ms is caller-supplied (this codebase's established
     // clock-injection style, not read from a global clock here).
     AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) noexcept {
-        if (rec.event_type == AuditEventType::OrderCancelPrepared) return {};
+        if (rec.event_type == AuditEventType::OrderCancelPrepared ||
+            rec.event_type == AuditEventType::OrderCancelNotSent) return {};
         if (rec.event_type == AuditEventType::OrderIntentCreated) {
             if (!attempt_watermark_.permits(rec.client_order_id)) return {};
         }
@@ -639,6 +640,10 @@ public:
         const auto result = append_impl(record, now_ms, kFrameFormatVersionV6);
         if (result.acked()) {
             write_version_ = kFrameFormatVersionV6;
+            auto restoration = record;
+            restoration.event_type = AuditEventType::OrderCancelNotSent;
+            restoration.resulting_state = cp.resulting_state;
+            cancel_restore_ = CancelRestore{restoration, static_cast<std::size_t>(found - entries.begin()), result.sequence};
             cp.pending_cancel = *pending;
             cp.resulting_state = OrderState::CancelRequested;
         }
@@ -791,6 +796,31 @@ public:
     }
 
 private:
+    friend class BinancePrivateRestClient;
+
+    struct CancelRestore {
+        AuditRecord record;
+        std::size_t checkpoint_index;
+        std::uint64_t prepared_sequence;
+    };
+
+    // Only the transport caller can attest that its synchronous cancel never reached the write stage.
+    // A recovered preparation has no such authority, even when the order still appears to be working.
+    AuditAppendResult append_cancel_not_sent(std::int64_t now_ms) noexcept {
+        if (!cancel_restore_ || next_sequence_ == 0 ||
+            next_sequence_ - 1 != cancel_restore_->prepared_sequence) return {};
+        auto restore = *cancel_restore_;
+        cancel_restore_.reset();
+        restore.record.timestamp_ms = now_ms;
+        const auto result = append_impl(restore.record, now_ms, write_version_);
+        if (result.acked()) {
+            auto& cp = checkpoints_[restore.checkpoint_index];
+            cp.pending_cancel = {};
+            cp.resulting_state = restore.record.resulting_state;
+        }
+        return result;
+    }
+
     // The generic writer passes the store version. The typed writers for cancel preparation,
     // operator resolution and NeverSent pass v6.
     AuditAppendResult append_impl(const AuditRecord& rec, std::int64_t now_ms, std::uint8_t version) noexcept {
@@ -1068,6 +1098,8 @@ private:
         // D5 / R1: an OrderOperatorResolved frame was accepted for this COID. It must be that COID's last frame.
         bool operator_resolved{false};
         PendingSpotCancel pending_cancel{};
+        OrderState before_cancel{OrderState::Intent};
+        std::uint64_t cancel_prepared_sequence{0};
         // (No flag for an accepted OrderNeverSent frame: see the scan, where the state NeverSent does that job.)
         // R-10 / L-30: the header time of the FIRST frame that put this order in Submitting and in
         // Ambiguous, kept only when that frame's time is a ServerCorrectedUtc reading (anything
@@ -1321,7 +1353,22 @@ private:
                     return RecoveryScanStatus::Corrupt;
                 }
                 rs.pending_cancel = *pending;
+                rs.before_cancel = rs.state;
+                rs.cancel_prepared_sequence = frame.sequence_number;
                 rs.state = OrderState::CancelRequested;
+            } else if (frame.record.event_type == AuditEventType::OrderCancelNotSent) {
+                const auto restored = cancel_prepared::decode(frame.record);
+                if (!rs.pending_cancel.present() || rs.state != OrderState::CancelRequested || !restored ||
+                    frame.sequence_number == 0 || frame.sequence_number - 1 != rs.cancel_prepared_sequence ||
+                    frame.record.resulting_state != rs.before_cancel ||
+                    !cancel_prepared::same_identity(*restored, rs.pending_cancel) ||
+                    !cancel_prepared::matches_working_order(
+                        frame.record, rs.before_cancel, rs.mode, rs.symbol_id, rs.side, rs.intended_price_ticks,
+                        rs.intended_qty_ticks, rs.exchange_order_id, rs.filled_qty_ticks, rs.avg_fill_price_ticks)) {
+                    return RecoveryScanStatus::Corrupt;
+                }
+                rs.state = rs.before_cancel;
+                rs.pending_cancel = {};
             } else if (!rs.established) {
                 // A COID starts with its Intent frame. The operator event is never one: refused even when it
                 // claims resulting_state Intent. (The OrderNeverSent event is refused by the pairing rule above and the
@@ -1918,6 +1965,7 @@ private:
     RecoveryOverflow recovery_overflow_{};
     std::size_t intent_orphan_count_{0};
     bool appended_since_recovery_{false};
+    std::optional<CancelRestore> cancel_restore_;
     std::size_t never_sent_count_{0};  // Q23 S2/S3: orders an OrderNeverSent frame closed (see recovered_never_sent())
     std::uint64_t torn_tail_bytes_{0};
     std::uint64_t rotation_torn_tail_bytes_{0};
