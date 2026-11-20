@@ -1026,9 +1026,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: open:native/include/hengyuan/binance_private_rest.hpp#'rules.is_trading = (status_sv == "TRADING");' absent:native/include/hengyuan/binance_private_rest.hpp#cancel_order
-refs: test:native/tests/test_account_truth.cpp#SymbolNotTrading
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：非 TRADING 的标的一律不是 is_trading，预检拒绝任何新订单（含平仓新单）已有单测；“允许撤单与改单”一半无从测试——全树没有撤单路径，CANCEL_ONLY 也没有被单独区分。
+open: open:native/include/hengyuan/binance_private_rest.hpp#'rules.is_trading = (status_sv == "TRADING");' open:native/include/hengyuan/binance_private_rest.hpp#'binding_.environment() != BinanceEnvironment::Testnet'
+refs: test:native/tests/test_account_truth.cpp#SymbolNotTrading test:native/tests/test_binance_private_rest.cpp#CancelTestnetSpotOrderUsesEmergencyDeleteWithBothIdentities
+note: 非 TRADING 标的的新增订单由预检拒绝。Testnet 单笔撤单适配器已验证，交易进程尚未接入 CANCEL_ONLY 下的撤单与改单执行。
 ```
 
 ```ledger
@@ -1303,9 +1303,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/include/hengyuan/binance_private_rest.hpp#cancel_order
-refs: test:native/tests/test_order_lifecycle.cpp#CancelRequestedToFilled test:native/tests/test_order_lifecycle.cpp#InvalidTransitionDoesNotChangeState test:native/tests/test_order_tracker.cpp#AcceptedOrderDiscoversCancelRequestedViaLivePoll
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：生命周期允许撤单中直接转为成交且禁止非法回退，对账轮询能发现撤单中状态的单测已存在；撤单路径本身不存在，所以“并发竞争”只能在状态机层面验证。
+open: absent:native/include/hengyuan/*.hpp#CancelUnknown
+refs: test:native/tests/test_order_lifecycle.cpp#CancelRequestedToFilled test:native/tests/test_order_lifecycle.cpp#InvalidTransitionDoesNotChangeState test:native/tests/test_order_tracker.cpp#AcceptedOrderDiscoversCancelRequestedViaLivePoll test:native/tests/test_binance_private_rest.cpp#QuerySpotCancelOrderUsesNumericIdAndValidatesCanceledIdentity
+note: 本地测试覆盖撤单期间的状态变化、累计成交和数字订单号复查。独立 Testnet 样本验证了零成交撤单。交易进程中的撤单与成交并发及结果未知的恢复仍待验证。
 ```
 
 ```ledger
@@ -1597,8 +1597,9 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: absent:native/include/hengyuan/*.hpp#cancel_order absent:native/include/hengyuan/*.hpp#CancelUnknown
-note: 全树没有撤单路径（蓝图 L-42）；撤单与成交竞态的收敛属 FI-034，仅可撤单时禁止新单属 FI-016。
+open: absent:native/include/hengyuan/*.hpp#CancelUnknown
+refs: test:native/tests/test_binance_private_rest.cpp#CancelTestnetSpotOrderPreservesInconclusiveAfterHttpFailure
+note: 原生 Testnet REST 适配器在发送后的 HTTP 错误下返回结果不明。交易进程仍需持久状态、恢复交接和撤单期间部分成交的组合验证。
 ```
 
 ```ledger

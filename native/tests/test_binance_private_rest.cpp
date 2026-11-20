@@ -77,6 +77,7 @@ using hy::QueryResult;
 using hy::QuerySigningError;
 using hy::SecureEnvLoader;
 using hy::SpotCancelIdentity;
+using hy::SpotCancelResult;
 using hy::SymbolRules;
 using hy::build_spot_cancel_query;
 using hy::build_exchange_info_target;
@@ -2353,6 +2354,194 @@ TEST_F(BoundCredentialsFixture, QueryOrderRealSuccessPathSignsAndParses) {
     EXPECT_LT(pos_recv, pos_symbol);
     EXPECT_LT(pos_symbol, pos_ts);
     EXPECT_LT(pos_ts, pos_sig);
+}
+
+// --- Single-order cancel path: task 1A.7 C1 ---
+
+TEST_F(BoundCredentialsFixture, CancelTestnetSpotOrderUsesEmergencyDeleteWithBothIdentities) {
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        make_spot_cancel_response("0.000000", "0.00000000"));
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+
+    const auto result = client.cancel_testnet_spot_order(expected, cancel, cfg);
+    ASSERT_EQ(result.error, PrivateRestError::None);
+    ASSERT_EQ(result.observation.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.observation.confirmed_state, OrderState::Cancelled);
+    const auto requests = server.requests();
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests[0].method, "DELETE");
+    EXPECT_EQ(requests[0].api_key_header, kSyntheticApiKey);
+    EXPECT_EQ(requests[0].target.substr(0, 14), "/api/v3/order?");
+    const auto& target = requests[0].target;
+    const auto p_order = target.find("orderId=12345");
+    const auto p_original = target.find("origClientOrderId=spot-cancel-original");
+    const auto p_alias = target.find("newClientOrderId=spot-cancel-alias");
+    const auto p_window = target.find("recvWindow=");
+    const auto p_timestamp = target.find("timestamp=");
+    const auto p_signature = target.find("signature=");
+    ASSERT_NE(p_order, std::string::npos);
+    ASSERT_NE(p_original, std::string::npos);
+    ASSERT_NE(p_alias, std::string::npos);
+    ASSERT_NE(p_window, std::string::npos);
+    ASSERT_NE(p_timestamp, std::string::npos);
+    ASSERT_NE(p_signature, std::string::npos);
+    EXPECT_LT(p_alias, p_order);
+    EXPECT_LT(p_order, p_original);
+    EXPECT_LT(p_original, p_window);
+    EXPECT_LT(p_window, p_timestamp);
+    EXPECT_LT(p_timestamp, p_signature);
+}
+
+TEST_F(BoundCredentialsFixture, CancelTestnetSpotOrderPreservesInconclusiveAfterHttpFailure) {
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 504,
+        R"({"code":-1007,"msg":"Timeout waiting for response from backend server."})");
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+
+    const auto result = client.cancel_testnet_spot_order(expected, cancel, cfg);
+    EXPECT_EQ(result.error, PrivateRestError::HttpStatus);
+    EXPECT_EQ(result.observation.outcome, QueryOutcome::Inconclusive);
+    EXPECT_EQ(server.requests().size(), 1u);
+}
+
+TEST_F(BoundCredentialsFixture, QuerySpotCancelOrderUsesNumericIdAndValidatesCanceledIdentity) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        make_spot_cancel_response("0.050000", "2500.00600000"));
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+
+    const auto result = client.query_spot_cancel_order(expected, cancel, cfg);
+    ASSERT_EQ(result.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.confirmed_state, OrderState::Cancelled);
+    EXPECT_EQ(result.exchange_order_id, kSpotCancelExchangeOrderId);
+    EXPECT_EQ(result.filled_qty_ticks, 50'000);
+    const auto requests = server.requests();
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests[0].method, "GET");
+    EXPECT_NE(requests[0].target.find("orderId=12345"), std::string::npos);
+    EXPECT_NE(requests[0].target.find("symbol=BTCUSDT"), std::string::npos);
+    EXPECT_EQ(requests[0].target.find("origClientOrderId="), std::string::npos);
+}
+
+TEST_F(BoundCredentialsFixture, CancelTestnetSpotOrderRequiresTrackerAndSendsNothingWithoutOne) {
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+
+    const auto result = client.cancel_testnet_spot_order(
+        make_btcusdt_expectation(kSpotCancelOriginalClientId), make_spot_cancel_identity(), PrivateRestConfig{});
+    EXPECT_EQ(result.error, PrivateRestError::InvalidConfig);
+    EXPECT_EQ(result.observation.outcome, QueryOutcome::NotSent);
+}
+
+TEST_F(BoundCredentialsFixture, QuerySpotCancelOrderRejectsWrongOrderIdListAndWorkingAlias) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    const std::pair<std::string_view, std::string> invalid_bodies[] = {
+        {"wrong exchange order id", replace_once(make_spot_cancel_response(), "\"orderId\":12345", "\"orderId\":12346")},
+        {"wrong order list id", replace_once(make_spot_cancel_response(), "\"orderListId\":-1", "\"orderListId\":12")},
+        {"working order with cancel alias",
+         replace_once(make_spot_cancel_response(), "\"status\":\"CANCELED\"", "\"status\":\"NEW\"")},
+    };
+
+    for (const auto& [label, body] : invalid_bodies) {
+        hy::test_helpers::TlsResponseAcceptor server(
+            fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200, body);
+        BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+        use_fixtures(client);
+        hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+        PrivateRestConfig cfg;
+        cfg.port = std::to_string(server.port());
+
+        const auto result = client.query_spot_cancel_order(expected, cancel, cfg);
+        EXPECT_EQ(result.outcome, QueryOutcome::Inconclusive) << label;
+        EXPECT_EQ(server.requests().size(), 1u) << label;
+    }
+}
+
+TEST_F(BoundCredentialsFixture, QuerySpotCancelOrderRecognizesOriginalClientIdStillNew) {
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+    const auto body = make_spot_cancel_response("0.000000", "0.00000000", "NEW", "BTCUSDT",
+                                                kSpotCancelExchangeOrderId, kSpotCancelOriginalClientId,
+                                                kSpotCancelOriginalClientId);
+    hy::test_helpers::TlsResponseAcceptor server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200, body);
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds());
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server.port());
+
+    const auto result = client.query_spot_cancel_order(expected, cancel, cfg);
+    ASSERT_EQ(result.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.confirmed_state, OrderState::Accepted);
+    EXPECT_EQ(result.exchange_order_id, kSpotCancelExchangeOrderId);
+}
+
+TEST_F(BoundCredentialsFixture, CancelTestnetSpotOrderConsumesOnlyEmergencyBudget) {
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(10, 0, 10, 0, 10, 0));  // one request in the 10% Emergency lane
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    const auto expected = make_btcusdt_expectation(kSpotCancelOriginalClientId);
+    const auto cancel = make_spot_cancel_identity();
+
+    hy::test_helpers::TlsResponseAcceptor first_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        make_spot_cancel_response());
+    PrivateRestConfig first_cfg;
+    first_cfg.port = std::to_string(first_server.port());
+    ASSERT_EQ(client.cancel_testnet_spot_order(expected, cancel, first_cfg).error, PrivateRestError::None);
+    ASSERT_EQ(first_server.requests().size(), 1u);
+
+    hy::test_helpers::TlsResponseAcceptor second_server(
+        fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"), 200,
+        make_spot_cancel_response());
+    PrivateRestConfig second_cfg;
+    second_cfg.port = std::to_string(second_server.port());
+    const auto second = client.cancel_testnet_spot_order(expected, cancel, second_cfg);
+    EXPECT_EQ(second.error, PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(second.observation.outcome, QueryOutcome::NotSent);
+    EXPECT_TRUE(second_server.requests().empty());
+    EXPECT_TRUE(limiter.can_send_order(hy::RateLimitLane::Reconciliation, 1));
+}
+
+TEST_F(BoundCredentialsFixture, CancelTestnetSpotOrderRefusesWithoutEmergencyBudget) {
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(0, 0, 0, 0, 0, 0));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    const auto result = client.cancel_testnet_spot_order(
+        make_btcusdt_expectation(kSpotCancelOriginalClientId), make_spot_cancel_identity(), PrivateRestConfig{});
+    EXPECT_EQ(result.error, PrivateRestError::RateLimitExhausted);
+    EXPECT_EQ(result.observation.outcome, QueryOutcome::NotSent);
 }
 
 // --- query_order() rate-limit gate (Batch H, H1) ---
