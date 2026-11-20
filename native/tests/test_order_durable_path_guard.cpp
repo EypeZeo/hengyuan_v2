@@ -328,13 +328,12 @@ TEST(OrderDurablePathGuard, EveryShadowMoveIsOneOfTheKnownCalls) {
 }
 
 TEST(OrderDurablePathGuard, EveryTrackOfAnOrderCarriesItsIntendedQuantity) {
-    // Seven arguments: the seventh is the quantity the order was sent with, the bound a planned fill is held against. Left out, it defaults to 0 =
-    // unknown, and every fill of the order is refused.
+    // The seventh argument carries the submitted quantity, followed by the symbol for Live cancellation targets.
     for (const SourceFile& f : production_sources()) {
         for (const std::vector<std::string>& args : call_args(f.code, "track")) {
             if (f.rel == "include/hengyuan/order_fill_context.hpp") continue;  // not a call of ours
             if (args.empty() || (args[0].find("coid") == std::string::npos)) continue;  // another class's track(): not the fill table's
-            EXPECT_EQ(args.size(), 7u) << f.rel << ": track() of the fill context without the intended quantity";
+            EXPECT_EQ(args.size(), 8u) << f.rel << ": track() must carry the intended quantity and cancellation symbol";
         }
     }
     const SourceFile* orchestrator = find_source("include/hengyuan/live_submit_orchestrator.hpp");
@@ -342,9 +341,9 @@ TEST(OrderDurablePathGuard, EveryTrackOfAnOrderCarriesItsIntendedQuantity) {
     ASSERT_NE(orchestrator, nullptr);
     ASSERT_NE(recovery, nullptr);
     ASSERT_EQ(call_args(orchestrator->code, "track").size(), 1u);
-    EXPECT_EQ(call_args(orchestrator->code, "track")[0].back(), "ctx.qty_ticks");
+    EXPECT_EQ(call_args(orchestrator->code, "track")[0].at(6), "ctx.qty_ticks");
     ASSERT_EQ(call_args(recovery->code, "track").size(), 1u);
-    EXPECT_EQ(call_args(recovery->code, "track")[0].back(), "cp.intended_qty_ticks");
+    EXPECT_EQ(call_args(recovery->code, "track")[0].at(6), "cp.intended_qty_ticks");
 }
 
 TEST(OrderDurablePathGuard, NothingButTheFillContextAssignsAShadow) {

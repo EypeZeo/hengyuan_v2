@@ -611,7 +611,7 @@ public:
         auto entries = std::span(checkpoints_).first(checkpoint_count_);
         const auto found = std::find_if(entries.begin(), entries.end(),
                                         [coid](const auto& cp) { return cp.client_order_id.view() == coid; });
-        if (found == entries.end() || found->pending_cancel.present()) return {};
+        if (found == entries.end() || found->pending_cancel.present() || found->exchange_order_id_conflict) return {};
         auto& cp = *found;
         AuditRecord record{};
         record.event_type = AuditEventType::OrderCancelPrepared;
@@ -1098,6 +1098,7 @@ private:
         // D5 / R1: an OrderOperatorResolved frame was accepted for this COID. It must be that COID's last frame.
         bool operator_resolved{false};
         PendingSpotCancel pending_cancel{};
+        bool exchange_order_id_conflict{false};
         OrderState before_cancel{OrderState::Intent};
         std::uint64_t cancel_prepared_sequence{0};
         // (No flag for an accepted OrderNeverSent frame: see the scan, where the state NeverSent does that job.)
@@ -1346,7 +1347,7 @@ private:
             }
             if (cancel_frame) {
                 const auto pending = cancel_prepared::decode(frame.record);
-                if (!rs.established || rs.pending_cancel.present() || !pending ||
+                if (!rs.established || rs.pending_cancel.present() || rs.exchange_order_id_conflict || !pending ||
                     !cancel_prepared::matches_working_order(
                         frame.record, rs.state, rs.mode, rs.symbol_id, rs.side, rs.intended_price_ticks,
                         rs.intended_qty_ticks, rs.exchange_order_id, rs.filled_qty_ticks, rs.avg_fill_price_ticks)) {
@@ -1423,9 +1424,9 @@ private:
                 rs.avg_fill_price_ticks = frame.record.avg_fill_price_ticks;
             }
             if (frame.record.exchange_order_id != 0) {
-                if (rs.pending_cancel.present() && frame.record.exchange_order_id != rs.exchange_order_id) {
-                    return RecoveryScanStatus::Corrupt;
-                }
+                const bool conflict = rs.exchange_order_id != 0 && frame.record.exchange_order_id != rs.exchange_order_id;
+                if (conflict && rs.pending_cancel.present()) return RecoveryScanStatus::Corrupt;
+                rs.exchange_order_id_conflict |= conflict;
                 rs.exchange_order_id = frame.record.exchange_order_id;
             }
 
@@ -1548,6 +1549,7 @@ private:
             cp.avg_fill_price_ticks = rs.avg_fill_price_ticks;
             cp.symbol_id = rs.symbol_id;
             cp.exchange_order_id = rs.exchange_order_id;
+            cp.exchange_order_id_conflict = rs.exchange_order_id_conflict;
             cp.side = rs.side;
             // D5 / R3-0: two facts the scan already holds and used to drop (OrderRecoveryCheckpoint's own comment says why
             // the offline operator tool needs them). submitting_utc_ms is the first Submitting frame's time, kept only

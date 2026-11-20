@@ -560,6 +560,24 @@ TEST_F(DurableAuditSinkTest, RecoveryRejectsAuthenticatedCancelNotSentWithWrongA
     EXPECT_TRUE(restarted.fenced());
 }
 
+TEST_F(DurableAuditSinkTest, ConflictingExchangeIdsRemainIneligibleForCancelAfterRestart) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-A", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-A", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 555), 1002).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-A", 1, 777), 1003).acked());
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 1u);
+    EXPECT_TRUE(restarted.recovered_checkpoints()[0].exchange_order_id_conflict);
+    EXPECT_FALSE(restarted.append_cancel_prepared("HY-A", make_cancel_alias("CANCEL-ALIAS"),
+                                                    make_cancel_rules("BTCUSDT", 2, 6, 8), 2000).acked());
+    EXPECT_EQ(restarted.frame_count(), 4u);
+}
+
 TEST_F(DurableAuditSinkTest, CancelPreparedRequiresTheFirstAppendAfterRecovery) {
     const ClientOrderId alias = make_cancel_alias("CANCEL-ALIAS");
     const SymbolRules rules = make_cancel_rules("BTCUSDT", 8, 6, 4);

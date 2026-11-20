@@ -226,6 +226,10 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **撤单请求未发送**：同步调用确认未进入请求写入阶段后，可在同一独占打开期间追加 v6 的 `OrderCancelNotSent`。该帧必须紧随同一撤单准备帧，并匹配订单身份、
     撤单别名、原工作状态和累计成交。收到该帧的 ACK 才清除待确认撤单，保留原订单及在途资源。重开日志后可发起新撤单。写入阶段及之后的错误、进程中断或该帧未获确认，
     均沿用只读恢复流程。
+  - **主进程撤单请求**：`PrivateStreamPipeline::hot_tick()` 在排空订单事件后检查 `Triggered` 或 `Latched`，每次最多暂存一个请求。候选须为日志已确认的实单，
+    处于 `Accepted` 或 `PartialFill`，且具备一致的数字订单号。原撤单尚待确认的订单、模拟订单和身份冲突订单不参与选择。
+    `take_automatic_cancel()` 领取前复查在途代次、熔断修订号和预验授权。授权须匹配环境、账户、存储身份、运行身份和品种，且交易所时间上界在有效期内。
+    同一个在途代次最多领取一次。调用发生在主线程，网络发送由撤单执行器负责。
   - **`UserDataDurablePublisher`**（`binance_user_data_event.hpp`）+ `drain_user_data_events(..., durable)`：一份报告被解析、与本次排空里同一订单的其他报告合并
     （最新的胜出：较新的替换、较旧的丢弃、互相矛盾的拒绝后者；一串成交只落一帧）、按影子规划、写入、ACK 之后才 `consume_delta()`/`apply_fill()` 并写环记录
     （持久模式下环里的记录就是落盘的帧，带**累计**成交量；旧的内存优先路径仍写增量记录）。队头阻塞与对账发布者一致：有观察未持久时排空**什么也不弹**（环满、

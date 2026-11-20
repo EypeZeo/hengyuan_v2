@@ -990,7 +990,7 @@ private:
                 shadows.durable_acked(coid, OrderState::Ambiguous, e->shadow.filled_qty_ticks);
             }
             if (!append(record, now_ms)) return false;
-            shadows.durable_acked(coid, pending_.resulting_state, pending_.filled_qty_ticks);
+            shadows.durable_acked(coid, pending_.resulting_state, pending_.filled_qty_ticks, record.exchange_order_id);
         } else if (plan.status == PathStatus::Stale) {
             ++stale_skipped_;
         } else {

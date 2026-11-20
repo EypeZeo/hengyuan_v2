@@ -451,7 +451,8 @@ namespace detail {
     if (!ctx.durable_audit.is_valid()) [[unlikely]] return false;
     if (!ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) [[unlikely]] return false;
     if (ctx.fill_context != nullptr) {
-        ctx.fill_context->durable_acked(std::string_view(ar.client_order_id), ar.resulting_state, ar.filled_qty_ticks);
+        ctx.fill_context->durable_acked(std::string_view(ar.client_order_id), ar.resulting_state, ar.filled_qty_ticks,
+                                        ar.exchange_order_id);
     }
     return true;
 }
@@ -878,7 +879,10 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                                        ctx.pre_trade_rules_snapshot.price_scale,
                                        ctx.pre_trade_rules_snapshot.qty_scale,
                                        ctx.pre_trade_rules_snapshot.quote_scale,
-                                       ctx.qty_ticks);  // M4: the bound a planned fill is held against
+                                       ctx.qty_ticks,
+                                       ctx.mode == ExecutionMode::Live &&
+                                               ctx.pre_trade_rules_snapshot.symbol[kSymbolNameLen - 1] == '\0'
+                                           ? ctx.pre_trade_rules_snapshot.symbol_name() : std::string_view{});
     }
 
     // Gate 12d (spec §3/§6.2): real durable Ack for OrderSubmitPrepared, before

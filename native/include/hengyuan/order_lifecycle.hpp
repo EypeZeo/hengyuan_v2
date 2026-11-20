@@ -648,6 +648,15 @@ public:
 
     std::size_t count() const noexcept { return count_; }
 
+    // The visitor must not mutate this registry. False stops the bounded scan.
+    template <typename Visitor>
+    void visit_active(Visitor&& visitor) const noexcept {
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            const auto& slot = slots_[i];
+            if (slot.active && !visitor(InFlightHandle{i, slot.generation}, std::string_view(slot.id))) return;
+        }
+    }
+
 private:
     static constexpr std::size_t kNotFound = static_cast<std::size_t>(-1);
 

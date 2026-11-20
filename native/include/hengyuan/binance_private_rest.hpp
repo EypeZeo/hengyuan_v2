@@ -2016,7 +2016,7 @@ public:
         const auto entries = sink.recovered_checkpoints();
         const auto found = std::find_if(entries.begin(), entries.end(),
                                         [coid](const auto& cp) { return cp.client_order_id.view() == coid; });
-        if (found == entries.end() || found->pending_cancel.present() ||
+        if (found == entries.end() || found->pending_cancel.present() || found->exchange_order_id_conflict ||
             !cancel_prepared::working(found->resulting_state) || found->mode != ExecutionMode::Live) return out;
 
         OrderExpectation expected = OrderExpectation::from(checkpoint_to_order_record(*found));

@@ -23,7 +23,7 @@ When `KillSwitch` state moves out of `Normal` (see `kill_switch.hpp`), `exit_saf
 | `Rearm` | Always forbidden — requires the re-arm ceremony, a separate human action |
 | `AutoResume` | Always forbidden (ADR-015) |
 
-`determine_emergency_policy()` always returns `OperatorManualOnly` in the current implementation — there is no automated cancel-all-open-orders path. This is deliberate: `EmergencyCancelPolicy::CancelAllKnownOpen` exists as an enum value but is not wired to anything, precisely because automated cancellation during a kill event is exactly the kind of action that should require a human decision, not a background process making it for you.
+`PrivateStreamPipeline` can stage a single cancellation request after `Triggered` or `Latched`. Both staging and claim require an active, preverified cancellation approval bound to the environment, account, store, runtime activation and symbol. The standalone Testnet executor handles the durable order attempt. Main-loop transport and production approval verification remain separate integration steps. `determine_emergency_policy()` continues to return `OperatorManualOnly` for account-wide cancellation.
 
 ## 3. Operator manual takeover — step by step
 
