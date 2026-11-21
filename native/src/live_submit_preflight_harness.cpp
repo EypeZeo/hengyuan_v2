@@ -340,6 +340,7 @@ const char* private_rest_error_name(PrivateRestError e) noexcept {
         case PrivateRestError::SigningFailed: return "SigningFailed";
         case PrivateRestError::ClockSkewTooLarge: return "ClockSkewTooLarge";
         case PrivateRestError::RateLimitExhausted: return "RateLimitExhausted";
+        case PrivateRestError::CancelNotAuthorized: return "CancelNotAuthorized";
     }
     return "?";
 }

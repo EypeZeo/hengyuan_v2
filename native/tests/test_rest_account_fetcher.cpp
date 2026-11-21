@@ -75,6 +75,7 @@ constexpr PrivateRestError kAllErrors[] = {
     PrivateRestError::TlsHandshake,  PrivateRestError::Write,             PrivateRestError::Read,              PrivateRestError::HttpStatus,
     PrivateRestError::JsonParse,     PrivateRestError::MalformedResponse, PrivateRestError::CapacityExceeded,  PrivateRestError::ClockNotFresh,
     PrivateRestError::SigningFailed, PrivateRestError::ClockSkewTooLarge, PrivateRestError::RateLimitExhausted,
+    PrivateRestError::CancelNotAuthorized,
 };
 
 }  // namespace
@@ -90,7 +91,8 @@ TEST(AccountFetchOutcomeOf, EveryErrorHasItsAnswer) {
             case PrivateRestError::ClockNotFresh:
             case PrivateRestError::SigningFailed:
             case PrivateRestError::ClockSkewTooLarge:
-            case PrivateRestError::RateLimitExhausted: expected = AccountFetchOutcome::NotSent; break;
+            case PrivateRestError::RateLimitExhausted:
+            case PrivateRestError::CancelNotAuthorized: expected = AccountFetchOutcome::NotSent; break;
             default: expected = AccountFetchOutcome::Failed; break;
         }
         EXPECT_EQ(account_fetch_outcome_of(e), expected) << static_cast<int>(e);
@@ -102,7 +104,8 @@ TEST(AccountFetchOutcomeOf, EveryErrorHasItsAnswer) {
 
 TEST(AccountFetchOutcomeOf, ASuccessIsNeverInventedFromAValueNoOneDefined) {
     EXPECT_EQ(account_fetch_outcome_of(static_cast<PrivateRestError>(200)), AccountFetchOutcome::Failed);
-    EXPECT_EQ(account_fetch_outcome_of(static_cast<PrivateRestError>(15)), AccountFetchOutcome::Failed) << "the first value past the last enumerator";
+    constexpr auto after_last = static_cast<PrivateRestError>(static_cast<int>(kAllErrors[std::size(kAllErrors) - 1]) + 1);
+    EXPECT_EQ(account_fetch_outcome_of(after_last), AccountFetchOutcome::Failed);
 }
 
 // --- the adapter, against a scripted client -----------------------------------------------------------------------------------------

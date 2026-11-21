@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_private_rest.hpp>
 #include <hengyuan/durable_audit_sink.hpp>
+#include <hengyuan/owner_cancel_approval.hpp>
 #include <hengyuan/store_binding_writer.hpp>
 
 #include "binance_environment_test_hooks.hpp"
@@ -56,6 +57,9 @@
 #include <utility>
 #include <vector>
 
+#include <openssl/evp.h>
+#include <openssl/x509.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -65,6 +69,12 @@
 
 using hy::AccountSnapshot;
 using hy::AssetBalance;
+using hy::AutomaticCancelRequest;
+using hy::ClockOffsetPublisher;
+using hy::InFlightHandle;
+using hy::KillSwitch;
+using hy::OwnerCancelInstallResult;
+using hy::StoreBindingStatus;
 using hy::AuditEventType;
 using hy::AuditRecord;
 using hy::BinancePrivateRestClient;
@@ -2666,8 +2676,9 @@ protected:
                                          kSpotCancelOriginalClientId);
     }
 
-    auto make_server(int delete_status) const {
-        using Server = hy::test_helpers::TlsRoutingAcceptor;
+    using Server = hy::test_helpers::TlsRoutingAcceptor;
+
+    auto make_server(int delete_status, Server::BeforeHandshakeHandler before_handshake = {}) const {
         return std::make_unique<Server>(
             fixture_path("test_leaf_cert_testnet_host.pem"), fixture_path("test_leaf_key_testnet_host.pem"),
             [delete_status](const auto& request) {
@@ -2681,9 +2692,65 @@ protected:
                     }
                 }
                 return Server::Reply::answer(404, "{}");
-            });
+            }, std::move(before_handshake));
     }
 };
+
+struct OwnerCancelSigningFixture {
+    EVP_PKEY* key{nullptr};
+    std::vector<unsigned char> public_der;
+
+    OwnerCancelSigningFixture() {
+        key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1");
+        EXPECT_NE(key, nullptr);
+        if (!key) return;
+        unsigned char* encoded = nullptr;
+        const int size = i2d_PUBKEY(key, &encoded);
+        EXPECT_GT(size, 0);
+        if (size <= 0 || !encoded) return;
+        public_der.assign(encoded, encoded + size);
+        OPENSSL_free(encoded);
+    }
+
+    ~OwnerCancelSigningFixture() {
+        EVP_PKEY_free(key);
+    }
+
+    std::vector<unsigned char> sign(std::span<const std::byte> payload) const {
+        EVP_MD_CTX* context = EVP_MD_CTX_new();
+        EXPECT_NE(context, nullptr);
+        EXPECT_EQ(EVP_DigestSignInit(context, nullptr, EVP_sha256(), nullptr, key), 1);
+        std::size_t size = 0;
+        EXPECT_EQ(EVP_DigestSign(context, nullptr, &size,
+                                 reinterpret_cast<const unsigned char*>(payload.data()), payload.size()), 1);
+        std::vector<unsigned char> signature(size);
+        EXPECT_EQ(EVP_DigestSign(context, signature.data(), &size,
+                                 reinterpret_cast<const unsigned char*>(payload.data()), payload.size()), 1);
+        signature.resize(size);
+        EVP_MD_CTX_free(context);
+        return signature;
+    }
+};
+
+std::unique_ptr<hy::OwnerCancelAuthority> install_owner_cancel_grant(
+    DurableAuditSink& sink, OwnerCancelSigningFixture& signer, std::uint64_t key_id,
+    std::int64_t deadline_ms, const ClockOffsetPublisher& clock, std::uint64_t serial = 1) {
+    const auto binding = sink.read_binding();
+    EXPECT_EQ(binding.status, StoreBindingStatus::Bound);
+    auto authority = hy::OwnerCancelAuthority::create(
+        binding.binding, sink.store_uuid_lo(), sink.store_uuid_hi(), key_id,
+        std::span<const unsigned char>(signer.public_der.data(), signer.public_der.size()), 120'000);
+    EXPECT_NE(authority, nullptr);
+    if (!authority) return {};
+
+    const auto payload = authority->signing_payload("BTCUSDT", serial, deadline_ms);
+    EXPECT_TRUE(payload.has_value());
+    if (!payload) return {};
+    const auto signature = signer.sign(*payload);
+    EXPECT_EQ(authority->install(*payload, signature, clock, fetch_clock_pair()),
+              OwnerCancelInstallResult::Installed);
+    return authority;
+}
 
 }  // namespace
 
@@ -2841,6 +2908,195 @@ TEST_F(DurableCancelFixture, NotSentClosureWriteFailureKeepsPreparedCancelAcross
         EXPECT_TRUE(checkpoints[0].pending_cancel.present());
     }
     EXPECT_EQ(server->request_count(), 2u) << "the proven pre-write refusal sent no DELETE";
+}
+
+TEST_F(DurableCancelFixture, OwnerAuthorizedRecoveredCancelPersistsBeforeOneDelete) {
+    seed_working_order();
+    OwnerCancelSigningFixture signer;
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));
+    const auto server = make_server(200);
+
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "USDT"})));
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server->port());
+
+    DurableAuditSink sink(audit_path_, *key_ring_, 1);
+    ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+    const auto now_ms = fetch_clock_pair().system_ms();
+    const auto authority = install_owner_cancel_grant(sink, signer, 41, now_ms + 60'000, client.clock_publisher());
+    ASSERT_NE(authority, nullptr);
+
+    AutomaticCancelRequest request{};
+    request.handle = InFlightHandle{0, 1};
+    request.client_order_id = make_btcusdt_expectation(kSpotCancelOriginalClientId).client_order_id;
+    request.exchange_order_id = kSpotCancelExchangeOrderId;
+    request.symbol_id = sink.recovered_checkpoints().front().symbol_id;
+    request.approval_serial = 1;
+    request.subject = authority->subject();
+    std::memcpy(request.symbol, "BTCUSDT", 7);
+
+    KillSwitch kill;
+    kill.trigger();
+    request.kill_revision = kill.revision();
+    request.approval_not_after_ms = now_ms + 60'000;
+    const auto result = client.cancel_authorized_recovered_order(
+        sink, request, *authority, kill, make_spot_cancel_identity().cancel_client_order_id,
+        make_btcusdt_rules(), now_ms, cfg);
+    EXPECT_TRUE(result.prepared.acked());
+    EXPECT_TRUE(result.terminal.acked());
+    EXPECT_FALSE(result.not_sent.acked());
+    EXPECT_EQ(result.exchange.observation.outcome, QueryOutcome::Found);
+    EXPECT_EQ(result.exchange.observation.confirmed_state, OrderState::Cancelled);
+    const auto requests = server->requests();
+    ASSERT_EQ(requests.size(), 3u);
+    EXPECT_EQ(requests[0].method, "GET");
+    EXPECT_EQ(requests[1].method, "GET");
+    EXPECT_EQ(requests[2].method, "DELETE");
+}
+
+TEST_F(DurableCancelFixture, OwnerAuthorizedRecoveredCancelRejectsIdentityBeforeNetwork) {
+    seed_working_order();
+    OwnerCancelSigningFixture signer;
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));
+    const auto server = make_server(200);
+
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "USDT"})));
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server->port());
+
+    DurableAuditSink sink(audit_path_, *key_ring_, 1);
+    ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+    const auto now_ms = fetch_clock_pair().system_ms();
+    const auto authority = install_owner_cancel_grant(sink, signer, 41, now_ms + 60'000, client.clock_publisher());
+    ASSERT_NE(authority, nullptr);
+
+    AutomaticCancelRequest request{};
+    request.handle = InFlightHandle{0, 1};
+    request.client_order_id = make_btcusdt_expectation(kSpotCancelOriginalClientId).client_order_id;
+    request.exchange_order_id = kSpotCancelExchangeOrderId + 1;
+    request.symbol_id = sink.recovered_checkpoints().front().symbol_id;
+    request.approval_serial = 1;
+    request.subject = authority->subject();
+    std::memcpy(request.symbol, "BTCUSDT", 7);
+
+    KillSwitch kill;
+    kill.trigger();
+    request.kill_revision = kill.revision();
+    request.approval_not_after_ms = now_ms + 60'000;
+    const auto result = client.cancel_authorized_recovered_order(
+        sink, request, *authority, kill, make_spot_cancel_identity().cancel_client_order_id,
+        make_btcusdt_rules(), now_ms, cfg);
+    EXPECT_FALSE(result.prepared.acked());
+    EXPECT_FALSE(result.terminal.acked());
+    EXPECT_EQ(result.exchange.error, PrivateRestError::InvalidConfig);
+    EXPECT_EQ(server->request_count(), 0u);
+}
+
+TEST_F(DurableCancelFixture, OwnerRevocationStopsRecoveredCancelBeforeNetwork) {
+    seed_working_order();
+    OwnerCancelSigningFixture signer;
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));
+    const auto server = make_server(200);
+
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "USDT"})));
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server->port());
+
+    DurableAuditSink sink(audit_path_, *key_ring_, 1);
+    ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+    const auto now_ms = fetch_clock_pair().system_ms();
+    const auto authority = install_owner_cancel_grant(sink, signer, 41, now_ms + 60'000, client.clock_publisher());
+    ASSERT_NE(authority, nullptr);
+    authority->revoke(1);
+
+    AutomaticCancelRequest request{};
+    request.handle = InFlightHandle{0, 1};
+    request.client_order_id = make_btcusdt_expectation(kSpotCancelOriginalClientId).client_order_id;
+    request.exchange_order_id = kSpotCancelExchangeOrderId;
+    request.symbol_id = sink.recovered_checkpoints().front().symbol_id;
+    request.approval_serial = 1;
+    request.subject = authority->subject();
+    std::memcpy(request.symbol, "BTCUSDT", 7);
+
+    KillSwitch kill;
+    kill.trigger();
+    request.kill_revision = kill.revision();
+    request.approval_not_after_ms = now_ms + 60'000;
+    const auto result = client.cancel_authorized_recovered_order(
+        sink, request, *authority, kill, make_spot_cancel_identity().cancel_client_order_id,
+        make_btcusdt_rules(), now_ms, cfg);
+    EXPECT_FALSE(result.prepared.acked());
+    EXPECT_FALSE(result.terminal.acked());
+    EXPECT_EQ(result.exchange.error, PrivateRestError::CancelNotAuthorized);
+    EXPECT_EQ(server->request_count(), 0u);
+}
+
+TEST_F(DurableCancelFixture, AuthorizationExpiresAfterPreparationAndTlsWritesNoDelete) {
+    seed_working_order();
+    OwnerCancelSigningFixture signer;
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "USDT"})));
+    const auto server = make_server(200, [&client](std::size_t connection) {
+        if (connection == 3) {
+            // Publish a fresh sample ahead of the grant deadline while DELETE waits for TLS.
+            hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client, 61'000);
+        }
+        return Server::BeforeHandshakeAction::Continue;
+    });
+
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server->port());
+    const auto now_ms = fetch_clock_pair().system_ms();
+    const auto deadline_ms = now_ms + 60'000;
+    {
+        DurableAuditSink sink(audit_path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+        const auto authority = install_owner_cancel_grant(sink, signer, 41, deadline_ms, client.clock_publisher());
+        ASSERT_NE(authority, nullptr);
+        KillSwitch kill;
+        kill.trigger();
+        AutomaticCancelRequest request{};
+        request.handle = InFlightHandle{0, 1};
+        request.client_order_id = make_btcusdt_expectation(kSpotCancelOriginalClientId).client_order_id;
+        request.exchange_order_id = kSpotCancelExchangeOrderId;
+        request.symbol_id = sink.recovered_checkpoints().front().symbol_id;
+        request.kill_revision = kill.revision();
+        request.approval_serial = 1;
+        request.subject = authority->subject();
+        std::memcpy(request.symbol, "BTCUSDT", 7);
+        request.approval_not_after_ms = deadline_ms;
+
+        const auto result = client.cancel_authorized_recovered_order(
+            sink, request, *authority, kill, make_spot_cancel_identity().cancel_client_order_id,
+            make_btcusdt_rules(), now_ms, cfg);
+        EXPECT_TRUE(result.prepared.acked());
+        EXPECT_TRUE(result.not_sent.acked());
+        EXPECT_FALSE(result.terminal.acked());
+        EXPECT_EQ(result.exchange.error, PrivateRestError::CancelNotAuthorized);
+        EXPECT_EQ(result.exchange.observation.outcome, QueryOutcome::NotSent);
+        EXPECT_EQ(server->connection_count(), 3u);
+        EXPECT_EQ(server->request_count(), 2u);
+    }
+    const DurableAuditSink recovered(audit_path_, *key_ring_, 1);
+    ASSERT_EQ(recovered.recovered_checkpoints().size(), 1u);
+    EXPECT_EQ(recovered.recovered_checkpoints().front().resulting_state, OrderState::Accepted);
+    EXPECT_FALSE(recovered.recovered_checkpoints().front().pending_cancel.present());
 }
 
 // --- query_order() rate-limit gate (Batch H, H1) ---

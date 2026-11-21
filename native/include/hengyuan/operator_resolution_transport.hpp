@@ -359,6 +359,7 @@ private:
             case PrivateRestError::JsonParse: return "JsonParse: invalid server time response or clock sample";
             case PrivateRestError::ClockSkewTooLarge: return "ClockSkewTooLarge: exchange and local clocks differ too much";
             case PrivateRestError::RateLimitExhausted: return "local rate limit reached";
+            case PrivateRestError::CancelNotAuthorized: return "cancel authority unavailable";
             case PrivateRestError::InvalidConfig: return "invalid REST configuration";
             case PrivateRestError::ClockNotFresh: return "signing clock is not fresh";
             case PrivateRestError::SigningFailed: return "request signing failed";

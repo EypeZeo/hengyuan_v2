@@ -58,6 +58,7 @@
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
+#include <hengyuan/owner_cancel_approval.hpp>
 #include <hengyuan/rest_test_seam.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
 
@@ -176,6 +177,7 @@ enum class PrivateRestError : std::uint8_t {
     ClockSkewTooLarge = 13,  // §2.2: the fetched offset exceeds the transport policy's recv window --
                               // not published (a broken local clock or a wrong serverTime)
     RateLimitExhausted = 14, // the local rate-limit budget refused this request: nothing was sent (L4 §7.4)
+    CancelNotAuthorized = 15,
 };
 
 enum class TlsHandshakeFailure : std::uint8_t {
@@ -1193,9 +1195,15 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
 // passes http::verb::post -- Binance's POST /api/v3/order accepts the fully-signed query
 // string exactly like GET does (no request body needed), so this is the only change a POST
 // caller needs; the body stays http::empty_body for both verbs.
+struct CancelWriteCheck {
+    bool (*permits)(const void*) noexcept{nullptr};
+    const void* context{nullptr};
+};
+
 inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_body_coro(
     EndpointPermit permit, RateLimitPermit budget, std::string target, std::string api_key,
-    PrivateRestConfig cfg, RestTestSeam seam, http::verb verb = http::verb::get) {
+    PrivateRestConfig cfg, RestTestSeam seam, http::verb verb = http::verb::get,
+    CancelWriteCheck cancel_check = {}) {
     static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
@@ -1254,6 +1262,9 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         // there is no decompression-bomb surface to bound in the first place.
         req.set("X-MBX-APIKEY", api_key);
 
+        if (cancel_check.permits && !cancel_check.permits(cancel_check.context)) {
+            co_return PrivateRestError::CancelNotAuthorized;
+        }
         current_stage = PrivateRestError::Write;
         beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_write_timeout_ms()));
         co_await http::async_write(stream, req, net::use_awaitable);
@@ -1939,12 +1950,57 @@ public:
     // One Testnet attempt. The caller retains the immutable order identity and alias for reconciliation.
     SpotCancelResult cancel_testnet_spot_order(const OrderExpectation& expected, const SpotCancelIdentity& cancel,
                                               const PrivateRestConfig& cfg) noexcept {
+        return cancel_spot_order_once(expected, cancel, cfg, nullptr);
+    }
+
+    DurableSpotCancelResult cancel_recovered_testnet_order(
+        DurableAuditSink& sink, std::string_view coid, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        return cancel_recovered_order(sink, coid, alias, rules, now_ms, cfg, nullptr);
+    }
+
+    // Runs on the execution owner after it obtains a fresh, exclusive open of the order log.
+    // The authority and kill switch are owned by that same caller for the duration of the send.
+    DurableSpotCancelResult cancel_authorized_recovered_order(
+        DurableAuditSink& sink, const AutomaticCancelRequest& request, const OwnerCancelAuthority& authority,
+        const KillSwitch& kill_switch, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        if (!request.handle.valid() || request.handle.generation == 0 ||
+            request.client_order_id.id[kClientOrderIdLen] != '\0') {
+            return {{}, {}, {QueryResult::not_sent(), PrivateRestError::InvalidConfig}, {}};
+        }
+        const CancelAuthorization authorization{request, authority, kill_switch, clock_pub_};
+        return cancel_recovered_order(sink, request.client_order_id.view(), alias, rules, now_ms, cfg, &authorization);
+    }
+
+private:
+    struct CancelAuthorization {
+        const AutomaticCancelRequest& request;
+        const OwnerCancelAuthority& authority;
+        const KillSwitch& kill_switch;
+        const ClockOffsetPublisher& clock;
+
+        bool permits() const noexcept {
+            return emergency_cancel_requested(kill_switch.state()) &&
+                   request.kill_revision == kill_switch.revision() &&
+                   authority.permits(request, clock, fetch_clock_pair());
+        }
+
+        static bool check_write(const void* context) noexcept {
+            return static_cast<const CancelAuthorization*>(context)->permits();
+        }
+    };
+
+    SpotCancelResult cancel_spot_order_once(const OrderExpectation& expected, const SpotCancelIdentity& cancel,
+                                           const PrivateRestConfig& cfg,
+                                           const CancelAuthorization* authorization) noexcept {
         const auto not_sent = [](PrivateRestError error) {
             return SpotCancelResult{QueryResult::not_sent(), error};
         };
-        if (binding_.environment() != BinanceEnvironment::Testnet || !rate_limiter_) {
+        if (!rate_limiter_ || (!authorization && binding_.environment() != BinanceEnvironment::Testnet)) {
             return not_sent(PrivateRestError::InvalidConfig);
         }
+        if (authorization && !authorization->permits()) return not_sent(PrivateRestError::CancelNotAuthorized);
         const auto permit = endpoint_permit(ResponseKind::SignedJson);
         if (!permit) return not_sent(PrivateRestError::InvalidConfig);
         if (!creds_) return not_sent(PrivateRestError::SigningFailed);
@@ -1972,10 +2028,12 @@ public:
 
             net::io_context ioc;
             std::variant<std::string, PrivateRestError> outcome = PrivateRestError::Read;
+            const detail::CancelWriteCheck final_check = authorization
+                ? detail::CancelWriteCheck{&CancelAuthorization::check_write, authorization} : detail::CancelWriteCheck{};
             net::co_spawn(
                 ioc,
                 detail::fetch_signed_body_coro(*permit, *budget, target, std::string(key_buf.data(), key_len),
-                                               cfg, test_seam_, http::verb::delete_),
+                                               cfg, test_seam_, http::verb::delete_, final_check),
                 [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> answer) {
                     if (eptr) std::rethrow_exception(eptr);
                     outcome = std::move(answer);
@@ -1985,7 +2043,7 @@ public:
 
             if (const auto* error = std::get_if<PrivateRestError>(&outcome)) {
                 if (*error == PrivateRestError::Resolve || *error == PrivateRestError::Connect ||
-                    *error == PrivateRestError::TlsHandshake) {
+                    *error == PrivateRestError::TlsHandshake || *error == PrivateRestError::CancelNotAuthorized) {
                     return not_sent(*error);
                 }
                 return {{}, *error};
@@ -2003,21 +2061,40 @@ public:
 
     // Verify the account and the recovered working order under the exclusive store open.
     // A durable preparation prevents a second DELETE, even if the first result is unknown.
-    DurableSpotCancelResult cancel_recovered_testnet_order(
+    DurableSpotCancelResult cancel_recovered_order(
         DurableAuditSink& sink, std::string_view coid, const ClientOrderId& alias, const SymbolRules& rules,
-        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        std::int64_t now_ms, const PrivateRestConfig& cfg, const CancelAuthorization* authorization) noexcept {
         DurableSpotCancelResult out{};
-        out.exchange.error = PrivateRestError::InvalidConfig;
-        if (binding_.environment() != BinanceEnvironment::Testnet || !rate_limiter_ || !sink.is_open() ||
-            sink.fenced() || now_ms <= 0) return out;
+        out.exchange = {QueryResult::not_sent(), PrivateRestError::InvalidConfig};
+        const auto environment = binding_.environment() == BinanceEnvironment::Testnet
+                                 ? StoreEnvironment::Testnet : StoreEnvironment::Production;
+        if ((!authorization && environment != StoreEnvironment::Testnet) || !rate_limiter_ || !sink.is_open() ||
+            sink.open_mode() != AuditSinkOpenMode::Trading || sink.fenced() || sink.appended_since_recovery_ ||
+            rules.symbol[kSymbolNameLen - 1] != '\0' || now_ms <= 0) return out;
+        if (sink.recovery_status() != RecoveryScanStatus::Recovered) return out;
         const auto store_binding = sink.read_binding();
         if (store_binding.status != StoreBindingStatus::Bound ||
-            store_binding.binding.environment != StoreEnvironment::Testnet) return out;
+            store_binding.binding.environment != environment) return out;
+        if (authorization) {
+            const auto& request = authorization->request;
+            if (request.subject.environment != environment ||
+                request.subject.account_uid != store_binding.binding.account_uid ||
+                request.subject.store_uuid_lo != sink.store_uuid_lo() ||
+                request.subject.store_uuid_hi != sink.store_uuid_hi()) return out;
+            if (!authorization->permits()) {
+                out.exchange.error = PrivateRestError::CancelNotAuthorized;
+                return out;
+            }
+            if (rules.symbol_name() != std::string_view(request.symbol)) return out;
+        }
         const auto entries = sink.recovered_checkpoints();
         const auto found = std::find_if(entries.begin(), entries.end(),
                                         [coid](const auto& cp) { return cp.client_order_id.view() == coid; });
         if (found == entries.end() || found->pending_cancel.present() || found->exchange_order_id_conflict ||
             !cancel_prepared::working(found->resulting_state) || found->mode != ExecutionMode::Live) return out;
+
+        if (authorization && (found->exchange_order_id != authorization->request.exchange_order_id ||
+                              found->symbol_id != authorization->request.symbol_id)) return out;
 
         OrderExpectation expected = OrderExpectation::from(checkpoint_to_order_record(*found));
         expected.rules_snapshot_at_submit = rules;
@@ -2032,7 +2109,7 @@ public:
                 out.exchange.error = account_error;
                 return out;
             }
-            if (!account.can_trade() || judge_store_binding(store_binding, StoreEnvironment::Testnet, uid) !=
+            if (!account.can_trade() || judge_store_binding(store_binding, environment, uid) !=
                                            BindingJudgement::Match) return out;
 
             const auto working = query_spot_cancel_order(expected, identity, cfg);
@@ -2040,10 +2117,14 @@ public:
                 working.filled_qty_ticks != found->filled_qty_ticks ||
                 working.avg_fill_price_ticks != found->avg_fill_price_ticks) return out;
 
+            if (authorization && !authorization->permits()) {
+                out.exchange.error = PrivateRestError::CancelNotAuthorized;
+                return out;
+            }
             out.prepared = sink.append_cancel_prepared(coid, alias, rules, now_ms);
             if (!out.prepared.acked()) return out;
 
-            out.exchange = cancel_testnet_spot_order(expected, identity, cfg);
+            out.exchange = cancel_spot_order_once(expected, identity, cfg, authorization);
             const auto& observation = out.exchange.observation;
             if (observation.outcome == QueryOutcome::NotSent) {
                 out.not_sent = sink.append_cancel_not_sent(now_ms);
@@ -2076,6 +2157,7 @@ public:
         }
     }
 
+public:
     // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §2: signed, single attempt -- no internal retry
     // (the same "retry loop lives in the caller, not here" discipline query_order() already
     // follows; SubmitPort::call() is invoked exactly once per orchestrate_submit() attempt).

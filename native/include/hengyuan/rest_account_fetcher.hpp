@@ -46,6 +46,7 @@ namespace hy {
         case PrivateRestError::SigningFailed:
         case PrivateRestError::ClockSkewTooLarge:
         case PrivateRestError::RateLimitExhausted:
+        case PrivateRestError::CancelNotAuthorized:
             return AccountFetchOutcome::NotSent;
         // the network was tried, or the answer cannot be used
         case PrivateRestError::Resolve:

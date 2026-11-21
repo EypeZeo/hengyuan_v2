@@ -23,7 +23,21 @@ When `KillSwitch` state moves out of `Normal` (see `kill_switch.hpp`), `exit_saf
 | `Rearm` | Always forbidden — requires the re-arm ceremony, a separate human action |
 | `AutoResume` | Always forbidden (ADR-015) |
 
-`PrivateStreamPipeline` can stage a single cancellation request after `Triggered` or `Latched`. Both staging and claim require an active, preverified cancellation approval bound to the environment, account, store, runtime activation and symbol. The standalone Testnet executor handles the durable order attempt. Main-loop transport and production approval verification remain separate integration steps. `determine_emergency_policy()` continues to return `OperatorManualOnly` for account-wide cancellation.
+`PrivateStreamPipeline` can stage a single cancellation request after `Triggered` or `Latched`. Both staging and claim require an active approval bound to the environment, account, store, runtime activation and symbol. `determine_emergency_policy()` returns `OperatorManualOnly` for account-wide cancellation.
+
+### Owner approval for a recovered order
+
+The control owner provisions a trusted P-256 public key as DER SubjectPublicKeyInfo and sets the maximum grant duration. `OwnerCancelAuthority::create()` allocates a new activation ID. `signing_payload()` produces the binary grant for a symbol, increasing serial number and absolute expiry in exchange milliseconds. The grant is specific to spot cancellation. It encodes a NUL-terminated domain string, version and environment bytes, seven little-endian 64-bit fields (key ID, account UID, store UUID low and high words, activation ID, serial and expiry), and a NUL-padded 20-byte symbol.
+
+An enrolled P-256 YubiKey PIV signing key can sign the exact binary file with PIN entry on the Owner's device. The signer returns the DER ECDSA signature. [YubiKey PIV Tool signing](https://docs.yubico.com/software/yubikey/tools/pivtool/piv-tool-command.html#sign-data)
+
+```powershell
+yubico-piv-tool -a verify-pin --sign -s 9c -A ECCP256 -H SHA256 -i owner-cancel.grant -o owner-cancel.sig
+```
+
+`OwnerCancelAuthority::install()` verifies the signature and expiry against the pinned key and a fresh exchange clock. The active grant is replaced only by a valid grant with a higher serial. Local revocation clears affected grants and prevents their reinstallation during this activation. Each new activation requires a new signature.
+
+The control thread can pass a claimed request to `BinancePrivateRestClient::cancel_authorized_recovered_order()` after reopening the order log exclusively in Trading mode. It checks the current kill switch revision, store and signed account identity, recovered working order and exact approval. The durable preparation precedes DELETE. The final check runs after TLS handshake and before HTTP write; a refusal there records `OrderCancelNotSent`. An uncertain send is reconciled by numeric order ID after reopening the log. Provisioning the production public key and scheduling the exclusive store handoff from the live trading loop remain separate operational steps.
 
 ## 3. Operator manual takeover — step by step
 
