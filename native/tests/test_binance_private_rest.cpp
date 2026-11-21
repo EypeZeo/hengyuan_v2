@@ -3174,6 +3174,69 @@ TEST_F(DurableCancelFixture, HandedOffCancelRefreshesAfterAppendAndKeepsExclusiv
     EXPECT_EQ(requests[2].method, "DELETE");
 }
 
+TEST_F(DurableCancelFixture, HandedOffTerminalRefreshNeverCancelsTheStaleWorkingCheckpoint) {
+    seed_working_order();
+    OwnerCancelSigningFixture signer;
+    hy::SpotRateLimitTracker limiter;
+    ASSERT_TRUE(limiter.configure(1000, 0, 1000, 0, 1000, 0));
+    const auto server = make_server(200);
+
+    BinancePrivateRestClient client(EnvironmentBinding::testnet(), make_creds(), &limiter);
+    use_fixtures(client);
+    hy::BinancePrivateRestClientTestHooks::publish_fresh_clock(client);
+    ASSERT_TRUE(client.set_account_scope(scope_of({"BTC", "USDT"})));
+    PrivateRestConfig cfg;
+    cfg.port = std::to_string(server->port());
+
+    auto sink = std::make_unique<DurableAuditSink>(audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(sink->is_open());
+    ASSERT_EQ(sink->recovery_status(), RecoveryScanStatus::Recovered);
+
+    // The last producer made the order exchange-final before the handoff. The
+    // executor must use this new scan, not the working checkpoint it inherited.
+    auto observed = make_durable_cancel_intent();
+    observed.timestamp_ms = 1003;
+    observed.event_type = AuditEventType::OrderFilled;
+    observed.resulting_state = OrderState::Filled;
+    observed.exchange_order_id = kSpotCancelExchangeOrderId;
+    observed.filled_qty_ticks = observed.qty_ticks;
+    observed.avg_fill_price_ticks = observed.price_ticks;
+    ASSERT_TRUE(sink->append_durable(observed, observed.timestamp_ms).acked());
+
+    const auto now_ms = fetch_clock_pair().system_ms();
+    const auto authority = install_owner_cancel_grant(
+        *sink, signer, 41, now_ms + 60'000, client.clock_publisher());
+    ASSERT_NE(authority, nullptr);
+
+    AutomaticCancelRequest request{};
+    request.handle = InFlightHandle{0, 1};
+    request.client_order_id = make_btcusdt_expectation(kSpotCancelOriginalClientId).client_order_id;
+    request.exchange_order_id = kSpotCancelExchangeOrderId;
+    request.symbol_id = 1;
+    request.approval_serial = 1;
+    request.subject = authority->subject();
+    std::memcpy(request.symbol, "BTCUSDT", 7);
+
+    KillSwitch kill;
+    kill.trigger();
+    request.kill_revision = kill.revision();
+    request.approval_not_after_ms = now_ms + 60'000;
+
+    const auto result = client.cancel_handed_off_order(
+        std::move(sink), request, *authority, kill, make_spot_cancel_identity().cancel_client_order_id,
+        make_btcusdt_rules(), now_ms, cfg);
+    EXPECT_FALSE(result.prepared.acked());
+    EXPECT_FALSE(result.terminal.acked());
+    EXPECT_FALSE(result.not_sent.acked());
+    EXPECT_EQ(result.exchange.error, PrivateRestError::InvalidConfig);
+    EXPECT_EQ(result.exchange.observation.outcome, QueryOutcome::NotSent);
+    EXPECT_EQ(server->request_count(), 0u) << "a terminal order in the refreshed log needs no account query and no DELETE";
+
+    const DurableAuditSink recovered(audit_path_, *key_ring_, 1);
+    EXPECT_EQ(recovered.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(recovered.recovered_checkpoints().empty());
+}
+
 TEST_F(DurableCancelFixture, HandedOffUncertainDeleteReopensByNumericIdWithoutSecondDelete) {
     seed_working_order();
     OwnerCancelSigningFixture signer;
