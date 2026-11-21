@@ -760,6 +760,20 @@ TEST(SubmitReadinessGuard, ThePreflightHarnessCanOnlyHandItsOrderFillTheMockPort
     EXPECT_EQ(count_substring(stripped("// ctx.confirmation.confirmed = true;\n"), "ctx.confirmation"), 0u) << "prose";
 }
 
+TEST(SubmitReadinessGuard, AccountPolicyPersistenceUsesFreshExchangeUtcNotProcessUptime) {
+    const SourceFile* f = find_source("src/live_submit_preflight_harness.cpp");
+    ASSERT_NE(f, nullptr);
+    const auto changed = f->code.find("if (!risk.policy() || *risk.policy() != requested) {");
+    ASSERT_NE(changed, std::string::npos);
+    const auto time = f->code.find("account_policy_clock = issue_clock_ready_token(client.clock_publisher(), fetch_clock_pair())", changed);
+    ASSERT_NE(time, std::string::npos);
+    const auto refusal = f->code.find("if (!account_policy_clock || account_policy_clock->server_ms() <= 0)", time);
+    ASSERT_NE(refusal, std::string::npos);
+    EXPECT_NE(f->code.find("append_account_risk_policy(*account_policy, 0, account_policy_clock->server_ms())", refusal),
+              std::string::npos);
+    EXPECT_EQ(count_substring(f->code, "append_account_risk_policy("), 1u);
+}
+
 TEST(SubmitReadinessGuard, PreflightAndPrivatePipelineShareOneSubmitAuthority) {
     const SourceFile* harness = find_source("src/live_submit_preflight_harness.cpp");
     const SourceFile* pipeline = find_source("include/hengyuan/private_stream_pipeline.hpp");

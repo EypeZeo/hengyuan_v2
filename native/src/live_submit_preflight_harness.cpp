@@ -1184,10 +1184,16 @@ int main(int argc, char* argv[]) {
         if (account_policy) {
             const auto& risk = durable_audit_sink->account_risk();
             const account_risk_audit::Policy requested{account_policy->policy().limits, 0};
-            if ((!risk.policy() || *risk.policy() != requested) &&
-                !durable_audit_sink->append_account_risk_policy(*account_policy, 0, get_now_ms()).acked()) {
-                std::fputs("FATAL: the account policy write was not acknowledged.\n", stderr);
-                return 1;
+            if (!risk.policy() || *risk.policy() != requested) {
+                const auto account_policy_clock = issue_clock_ready_token(client.clock_publisher(), fetch_clock_pair());
+                if (!account_policy_clock || account_policy_clock->server_ms() <= 0) {
+                    std::fputs("FATAL: no fresh exchange UTC time for the account policy write.\n", stderr);
+                    return 1;
+                }
+                if (!durable_audit_sink->append_account_risk_policy(*account_policy, 0, account_policy_clock->server_ms()).acked()) {
+                    std::fputs("FATAL: the account policy write was not acknowledged.\n", stderr);
+                    return 1;
+                }
             }
             std::printf("Account risk: policy=%" PRIu64 " day=%" PRId64 " used=%" PRId64 " exit_reserved=%" PRId64 "\n",
                         requested.limits.version, risk.latest_day(), risk.day_used(), risk.base_reserved());

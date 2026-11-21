@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -232,6 +233,26 @@ std::optional<hy::TradeScopeBudget> empty_budget(const hy::VerifiedTradeScope& s
     return hy::TradeScopeBudget::rebuild(scope, std::span<const hy::TradeScopeBudgetRecord>{});
 }
 
+std::vector<std::byte> read_file_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input.is_open()) return {};
+    const auto end = input.tellg();
+    if (end < 0) return {};
+    std::vector<std::byte> bytes(static_cast<std::size_t>(end));
+    input.seekg(0);
+    if (!bytes.empty()) input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!input) return {};
+    return bytes;
+}
+
+bool write_file_bytes(const std::filesystem::path& path, std::span<const std::byte> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) return false;
+    if (!bytes.empty()) output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    return !output.fail();
+}
+
 class TradeScopeExecutionTest : public ::testing::Test {
 protected:
     static constexpr std::uint32_t kAuditKeyId = 1;
@@ -300,6 +321,18 @@ protected:
             std::error_code error;
             std::filesystem::remove_all(directory_, error);
         }
+    }
+
+    void close_trading_sink() {
+        execution_.reset();
+        sink_.reset();
+    }
+
+    bool reopen_trading_sink() {
+        sink_ = std::make_unique<hy::DurableAuditSink>(audit_path_, *key_ring_, kAuditKeyId,
+                                                       hy::kMaxIntentOrphans, hy::AuditSinkOpenMode::Trading,
+                                                       hy::NeverSentWrites::Enabled);
+        return sink_->is_open();
     }
 
     std::optional<hy::VerifiedTradeScope> signed_scope(
@@ -901,6 +934,241 @@ TEST_F(TradeScopeExecutionTest, DurableNeverSentRefundsAccountAndScopeChargesAft
     EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
     ASSERT_NE(sink_->trade_scope_balance(scope.serial), nullptr);
     EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 0);
+}
+
+TEST_F(TradeScopeExecutionTest, CompletePreparedAndClosureFramesReplayOnceWithOlderTip) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto policy = make_account_risk_policy(
+        binding_.store, kAccountRiskTestKeyId, {84, 300'000'000, 200'000'000, 100'000'000, 100});
+    const auto verified_policy = sign_and_verify_account_risk_policy(policy, signer_);
+    ASSERT_TRUE(verified_policy.has_value());
+    ASSERT_TRUE(sink_->append_account_risk_policy(*verified_policy, kSymbolId, kAccountRiskTestDayStart).acked());
+    const auto scope = make_account_period_scope(binding_.store, policy.limits.version, 400,
+                                                 hy::TradeScopeSides::Sell);
+    ASSERT_TRUE(sink_->append_trade_scope_install(scope, kSymbolId, kAccountRiskTestDayStart + 1).acked());
+
+    const auto scoped_time = kAccountRiskTestDayStart + 10;
+    const auto scoped_intent = make_account_intent_record("HY-LATE-PREPARED", 100, 100, kSymbolId,
+                                                          hy::OrderSide::Sell, scoped_time);
+    ASSERT_TRUE(sink_->append_durable(scoped_intent, scoped_time).acked());
+    const auto tip_before_prepared = read_file_bytes(audit_path_ + ".tip");
+    ASSERT_FALSE(tip_before_prepared.empty());
+    const auto prepared = make_account_period_prepared(scoped_intent, false, scope.serial, rules_for(), scoped_time);
+    ASSERT_TRUE(sink_->append_durable(prepared, scoped_time).acked());
+
+    close_trading_sink();
+    ASSERT_TRUE(write_file_bytes(audit_path_ + ".tip", tip_before_prepared));
+    ASSERT_TRUE(reopen_trading_sink());
+    ASSERT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Recovered);
+    ASSERT_TRUE(sink_->account_risk().policy().has_value());
+    EXPECT_EQ(sink_->account_risk().policy()->limits.version, policy.limits.version);
+    ASSERT_EQ(sink_->recovered_checkpoints().size(), 1U);
+    EXPECT_STREQ(sink_->recovered_checkpoints()[0].client_order_id.id, "HY-LATE-PREPARED");
+    EXPECT_EQ(sink_->recovered_checkpoints()[0].resulting_state, hy::OrderState::Ambiguous);
+    EXPECT_EQ(sink_->recovered_torn_tail_bytes(), 0U);
+    EXPECT_EQ(sink_->recovered_intent_orphans(), 0U);
+    EXPECT_EQ(sink_->account_risk().latest_day(), hy::account_risk_audit::utc_day(scoped_time));
+    EXPECT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 100'000'000);
+    EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+    ASSERT_NE(sink_->trade_scope_balance(scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto exit_time = kAccountRiskTestDayStart + 20;
+    const auto exit_intent = make_account_intent_record("HY-LATE-EXIT-CLOSURE", 100, 100, kSymbolId,
+                                                        hy::OrderSide::Sell, exit_time);
+    ASSERT_TRUE(sink_->append_durable(exit_intent, exit_time).acked());
+    const auto exit_prepared = make_account_period_prepared(
+        exit_intent, true, policy.limits.version, rules_for(), exit_time);
+    ASSERT_EQ(exit_prepared.event_type, hy::AuditEventType::OrderRestrictedExitPrepared);
+    ASSERT_TRUE(sink_->append_durable(exit_prepared, exit_time).acked());
+    ASSERT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    ASSERT_EQ(sink_->account_risk().base_reserved(), 200'000'000);
+    ASSERT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto tip_before_closure = read_file_bytes(audit_path_ + ".tip");
+    ASSERT_FALSE(tip_before_closure.empty());
+    const auto closure_time = kAccountRiskTestDayStart + 30;
+    auto target = hy::never_sent::class_a_target_of(exit_intent);
+    target.state = hy::OrderState::Submitting;
+    const auto closure = hy::never_sent::class_a_closure_of(
+        exit_intent, hy::never_sent::Reason::AccountPeriodChanged, closure_time);
+    ASSERT_EQ(sink_->append_never_sent(target, closure, closure_time).status, hy::NeverSentAppendStatus::Appended);
+
+    close_trading_sink();
+    ASSERT_TRUE(write_file_bytes(audit_path_ + ".tip", tip_before_closure));
+    for (int replay = 0; replay < 2; ++replay) {
+        ASSERT_TRUE(reopen_trading_sink());
+        ASSERT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Recovered);
+        ASSERT_TRUE(sink_->account_risk().policy().has_value());
+        EXPECT_EQ(sink_->account_risk().policy()->limits.version, policy.limits.version);
+        EXPECT_EQ(sink_->recovered_torn_tail_bytes(), 0U);
+        EXPECT_EQ(sink_->recovered_intent_orphans(), 0U);
+        EXPECT_EQ(sink_->recovered_never_sent(), 1U);
+        ASSERT_EQ(sink_->recovered_checkpoints().size(), 1U);
+        EXPECT_STREQ(sink_->recovered_checkpoints()[0].client_order_id.id, "HY-LATE-PREPARED");
+        EXPECT_EQ(sink_->recovered_checkpoints()[0].resulting_state, hy::OrderState::Ambiguous);
+        EXPECT_EQ(sink_->account_risk().latest_day(), hy::account_risk_audit::utc_day(scoped_time));
+        EXPECT_EQ(sink_->account_risk().day_used(), 100'000'000);
+        EXPECT_EQ(sink_->account_risk().base_reserved(), 100'000'000);
+        EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+        EXPECT_EQ(sink_->trade_scope_high_water(), scope.serial);
+        ASSERT_NE(sink_->trade_scope_balance(scope.serial), nullptr);
+        EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 100'000'000);
+        close_trading_sink();
+    }
+}
+
+TEST_F(TradeScopeExecutionTest, TornPreparedAndClosureKeepOnlyAcknowledgedRiskChanges) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto policy = make_account_risk_policy(
+        binding_.store, kAccountRiskTestKeyId, {85, 300'000'000, 200'000'000, 100'000'000, 100});
+    const auto verified_policy = sign_and_verify_account_risk_policy(policy, signer_);
+    ASSERT_TRUE(verified_policy.has_value());
+    ASSERT_TRUE(sink_->append_account_risk_policy(*verified_policy, kSymbolId, kAccountRiskTestDayStart).acked());
+    const auto first_scope = make_account_period_scope(binding_.store, policy.limits.version, 500,
+                                                       hy::TradeScopeSides::Sell);
+    ASSERT_TRUE(sink_->append_trade_scope_install(first_scope, kSymbolId, kAccountRiskTestDayStart + 1).acked());
+
+    const auto first_time = kAccountRiskTestDayStart + 10;
+    const auto first_intent = make_account_intent_record("HY-TORN-PREPARED", 100, 100, kSymbolId,
+                                                         hy::OrderSide::Sell, first_time);
+    ASSERT_TRUE(sink_->append_durable(first_intent, first_time).acked());
+    const auto tip_after_intent = read_file_bytes(audit_path_ + ".tip");
+    ASSERT_FALSE(tip_after_intent.empty());
+    std::error_code file_error;
+    const auto log_before_prepared = std::filesystem::file_size(audit_path_, file_error);
+    ASSERT_FALSE(file_error);
+    const auto prepared = make_account_period_prepared(first_intent, false, first_scope.serial, rules_for(), first_time);
+    ASSERT_TRUE(sink_->append_durable(prepared, first_time).acked());
+    const auto log_after_prepared = std::filesystem::file_size(audit_path_, file_error);
+    ASSERT_FALSE(file_error);
+    ASSERT_GT(log_after_prepared, log_before_prepared);
+    const auto prepared_frame_size = log_after_prepared - log_before_prepared;
+    const auto prepared_prefix_size = static_cast<std::size_t>(prepared_frame_size / 2);
+    ASSERT_GT(prepared_prefix_size, 0U);
+
+    close_trading_sink();
+    std::filesystem::resize_file(audit_path_, log_before_prepared + prepared_prefix_size, file_error);
+    ASSERT_FALSE(file_error);
+    ASSERT_TRUE(write_file_bytes(audit_path_ + ".tip", tip_after_intent));
+    ASSERT_TRUE(reopen_trading_sink());
+    ASSERT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Clean);
+    ASSERT_TRUE(sink_->account_risk().policy().has_value());
+    EXPECT_EQ(sink_->account_risk().policy()->limits.version, policy.limits.version);
+    EXPECT_EQ(sink_->recovered_torn_tail_bytes(), prepared_prefix_size);
+    EXPECT_EQ(sink_->recovered_intent_orphans(), 1U);
+    EXPECT_TRUE(sink_->recovered_checkpoints().empty());
+    EXPECT_EQ(sink_->account_risk().latest_day(), -1);
+    EXPECT_EQ(sink_->account_risk().day_used(), 0);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 0);
+    EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+    EXPECT_EQ(sink_->trade_scope_high_water(), first_scope.serial);
+    ASSERT_NE(sink_->trade_scope_balance(first_scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(first_scope.serial)->usage.used_notional, 0);
+
+    const auto second_scope = make_account_period_scope(binding_.store, policy.limits.version, 501,
+                                                        hy::TradeScopeSides::Sell);
+    ASSERT_TRUE(sink_->append_trade_scope_install(second_scope, kSymbolId, kAccountRiskTestDayStart + 20).acked());
+    const auto second_time = kAccountRiskTestDayStart + 30;
+    const auto second_intent = make_account_intent_record("HY-TORN-CLOSURE", 100, 100, kSymbolId,
+                                                          hy::OrderSide::Sell, second_time);
+    ASSERT_TRUE(sink_->append_durable(second_intent, second_time).acked());
+    const auto second_prepared = make_account_period_prepared(
+        second_intent, false, second_scope.serial, rules_for(), second_time);
+    ASSERT_TRUE(sink_->append_durable(second_prepared, second_time).acked());
+    ASSERT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    ASSERT_EQ(sink_->account_risk().base_reserved(), 100'000'000);
+    ASSERT_EQ(sink_->trade_scope_balance(first_scope.serial)->usage.used_notional, 0);
+    ASSERT_EQ(sink_->trade_scope_balance(second_scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto tip_before_closure = read_file_bytes(audit_path_ + ".tip");
+    ASSERT_FALSE(tip_before_closure.empty());
+    const auto log_before_closure = std::filesystem::file_size(audit_path_, file_error);
+    ASSERT_FALSE(file_error);
+    const auto closure_time = kAccountRiskTestDayStart + 40;
+    auto target = hy::never_sent::class_a_target_of(second_intent);
+    target.state = hy::OrderState::Submitting;
+    const auto closure = hy::never_sent::class_a_closure_of(
+        second_intent, hy::never_sent::Reason::AccountPeriodChanged, closure_time);
+    ASSERT_EQ(sink_->append_never_sent(target, closure, closure_time).status, hy::NeverSentAppendStatus::Appended);
+    const auto log_after_closure = std::filesystem::file_size(audit_path_, file_error);
+    ASSERT_FALSE(file_error);
+    ASSERT_GT(log_after_closure, log_before_closure);
+    const auto closure_frame_size = log_after_closure - log_before_closure;
+    const auto closure_prefix_size = static_cast<std::size_t>(closure_frame_size / 2);
+    ASSERT_GT(closure_prefix_size, 0U);
+
+    close_trading_sink();
+    std::filesystem::resize_file(audit_path_, log_before_closure + closure_prefix_size, file_error);
+    ASSERT_FALSE(file_error);
+    ASSERT_TRUE(write_file_bytes(audit_path_ + ".tip", tip_before_closure));
+    ASSERT_TRUE(reopen_trading_sink());
+    ASSERT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Recovered);
+    ASSERT_TRUE(sink_->account_risk().policy().has_value());
+    EXPECT_EQ(sink_->account_risk().policy()->limits.version, policy.limits.version);
+    EXPECT_EQ(sink_->recovered_torn_tail_bytes(), closure_prefix_size);
+    EXPECT_EQ(sink_->recovered_intent_orphans(), 1U);
+    EXPECT_EQ(sink_->recovered_never_sent(), 0U);
+    ASSERT_EQ(sink_->recovered_checkpoints().size(), 1U);
+    EXPECT_STREQ(sink_->recovered_checkpoints()[0].client_order_id.id, "HY-TORN-CLOSURE");
+    EXPECT_EQ(sink_->recovered_checkpoints()[0].resulting_state, hy::OrderState::Ambiguous);
+    EXPECT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 100'000'000);
+    EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+    EXPECT_EQ(sink_->trade_scope_high_water(), second_scope.serial);
+    ASSERT_NE(sink_->trade_scope_balance(second_scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(second_scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto third_scope = make_account_period_scope(binding_.store, policy.limits.version, 502,
+                                                       hy::TradeScopeSides::Sell);
+    ASSERT_TRUE(sink_->append_trade_scope_install(third_scope, kSymbolId, kAccountRiskTestDayStart + 50).acked());
+    const auto third_time = kAccountRiskTestDayStart + 60;
+    const auto third_intent = make_account_intent_record("HY-COMPLETE-CLOSURE-AFTER-TORN", 100, 100, kSymbolId,
+                                                         hy::OrderSide::Sell, third_time);
+    ASSERT_TRUE(sink_->append_durable(third_intent, third_time).acked());
+    const auto third_prepared = make_account_period_prepared(
+        third_intent, false, third_scope.serial, rules_for(), third_time);
+    ASSERT_TRUE(sink_->append_durable(third_prepared, third_time).acked());
+    ASSERT_EQ(sink_->account_risk().day_used(), 200'000'000);
+    ASSERT_EQ(sink_->account_risk().base_reserved(), 200'000'000);
+    ASSERT_EQ(sink_->trade_scope_balance(second_scope.serial)->usage.used_notional, 100'000'000);
+    ASSERT_EQ(sink_->trade_scope_balance(third_scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto final_closure_time = kAccountRiskTestDayStart + 70;
+    auto final_target = hy::never_sent::class_a_target_of(third_intent);
+    final_target.state = hy::OrderState::Submitting;
+    const auto final_closure = hy::never_sent::class_a_closure_of(
+        third_intent, hy::never_sent::Reason::AccountPeriodChanged, final_closure_time);
+    ASSERT_EQ(sink_->append_never_sent(final_target, final_closure, final_closure_time).status,
+              hy::NeverSentAppendStatus::Appended);
+    ASSERT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    ASSERT_EQ(sink_->account_risk().base_reserved(), 100'000'000);
+    ASSERT_EQ(sink_->trade_scope_balance(second_scope.serial)->usage.used_notional, 100'000'000);
+    ASSERT_EQ(sink_->trade_scope_balance(third_scope.serial)->usage.used_notional, 0);
+
+    close_trading_sink();
+    for (int replay = 0; replay < 2; ++replay) {
+        ASSERT_TRUE(reopen_trading_sink());
+        ASSERT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Recovered);
+        ASSERT_TRUE(sink_->account_risk().policy().has_value());
+        EXPECT_EQ(sink_->account_risk().policy()->limits.version, policy.limits.version);
+        EXPECT_EQ(sink_->recovered_torn_tail_bytes(), 0U);
+        EXPECT_EQ(sink_->recovered_intent_orphans(), 1U);
+        EXPECT_EQ(sink_->recovered_never_sent(), 1U);
+        ASSERT_EQ(sink_->recovered_checkpoints().size(), 1U);
+        EXPECT_STREQ(sink_->recovered_checkpoints()[0].client_order_id.id, "HY-TORN-CLOSURE");
+        EXPECT_EQ(sink_->recovered_checkpoints()[0].resulting_state, hy::OrderState::Ambiguous);
+        EXPECT_EQ(sink_->account_risk().day_used(), 100'000'000);
+        EXPECT_EQ(sink_->account_risk().base_reserved(), 100'000'000);
+        EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+        EXPECT_EQ(sink_->trade_scope_high_water(), third_scope.serial);
+        ASSERT_NE(sink_->trade_scope_balance(second_scope.serial), nullptr);
+        EXPECT_EQ(sink_->trade_scope_balance(second_scope.serial)->usage.used_notional, 100'000'000);
+        ASSERT_NE(sink_->trade_scope_balance(third_scope.serial), nullptr);
+        EXPECT_EQ(sink_->trade_scope_balance(third_scope.serial)->usage.used_notional, 0);
+        close_trading_sink();
+    }
 }
 
 TEST_F(TradeScopeExecutionTest, RestrictedExitAndOrdinaryScopedSellShareDurableBaseReservation) {
