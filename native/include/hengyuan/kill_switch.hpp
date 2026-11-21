@@ -34,11 +34,18 @@ inline const char* kill_persistence_health_name(KillPersistenceHealth health) no
     return "?";
 }
 
+struct TradeScopeEpoch {
+    std::uint64_t value{0};
+
+    bool operator==(const TradeScopeEpoch&) const noexcept = default;
+};
+
 struct KillSwitchSnapshot {
     KillState state{KillState::Normal};
     std::uint64_t revision{0};
     std::uint64_t arm_count{0};
     std::uint64_t trigger_count{0};
+    TradeScopeEpoch scope_epoch{};
 };
 
 using KillSwitchPersistFn = bool (*)(void* user_data, const KillSwitchSnapshot& snapshot) noexcept;
@@ -68,9 +75,15 @@ public:
         return can_open_locked();
     }
 
-    std::optional<std::uint64_t> open_revision() const noexcept {
+    std::optional<TradeScopeEpoch> trade_scope_epoch() const noexcept {
         std::lock_guard lock(state_mutex_);
-        if (!can_open_locked()) return std::nullopt;
+        if (!can_open_locked() || persistence_health_ != KillPersistenceHealth::Ready) return std::nullopt;
+        return published_.scope_epoch;
+    }
+
+    std::optional<std::uint64_t> open_revision(std::optional<TradeScopeEpoch> scope = {}) const noexcept {
+        std::lock_guard lock(state_mutex_);
+        if (!can_open_locked() || !scope_is_current_locked(scope)) return std::nullopt;
         return published_.revision;
     }
 
@@ -93,9 +106,10 @@ public:
     // The callback consumes the final in-memory authorization. It cannot do I/O
     // or call back into the switch. A successful claim precedes the next state publication.
     template <typename Claim>
-    bool claim_normal(std::uint64_t expected_revision, Claim&& claim) const noexcept {
+    bool claim_normal(std::uint64_t expected_revision, Claim&& claim,
+                      std::optional<TradeScopeEpoch> scope = {}) const noexcept {
         std::lock_guard lock(state_mutex_);
-        return permits_normal_locked(expected_revision) && claim();
+        return published_.revision == expected_revision && can_open_locked() && scope_is_current_locked(scope) && claim();
     }
 
     // Startup only, before the switch is shared. The persistence port outlives the switch.
@@ -103,8 +117,11 @@ public:
                            KillPersistenceHealth health) noexcept {
         std::lock_guard writer(writer_mutex_);
         persistence_ = port;
-        if (!port.fn) health = KillPersistenceHealth::Corrupt;
-        if (health != KillPersistenceHealth::Ready) recovered.state = KillState::Latched;
+        if (!port.fn || recovered.scope_epoch.value > recovered.revision) health = KillPersistenceHealth::Corrupt;
+        if (health != KillPersistenceHealth::Ready) {
+            recovered.state = KillState::Latched;
+            recovered.scope_epoch = TradeScopeEpoch{recovered.revision};
+        }
         publish(recovered, health);
     }
 
@@ -189,8 +206,8 @@ private:
                 persistence_health_ == KillPersistenceHealth::Ready);
     }
 
-    bool permits_normal_locked(std::uint64_t expected_revision) const noexcept {
-        return published_.revision == expected_revision && can_open_locked();
+    bool scope_is_current_locked(std::optional<TradeScopeEpoch> scope) const noexcept {
+        return !scope || (persistence_health_ == KillPersistenceHealth::Ready && published_.scope_epoch == *scope);
     }
 
     static void advance_revision(KillSwitchSnapshot& next) noexcept {
@@ -208,6 +225,9 @@ private:
     // short publication and final-claim sections.
     bool commit(const KillSwitchSnapshot& prior, KillSwitchSnapshot next) noexcept {
         if (persistence_health() == KillPersistenceHealth::Corrupt) return false;
+        if (next.state == KillState::Triggered || next.state == KillState::Latched) {
+            next.scope_epoch = TradeScopeEpoch{next.revision};
+        }
         if (!persistence_.fn) {
             publish(next, KillPersistenceHealth::Disabled);
             return true;
@@ -221,6 +241,7 @@ private:
             return true;
         }
         next.state = KillState::Latched;
+        next.scope_epoch = TradeScopeEpoch{next.revision};
         publish(next, KillPersistenceHealth::Degraded);
         return false;
     }

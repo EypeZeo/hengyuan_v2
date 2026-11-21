@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -33,6 +34,8 @@ struct FakeMonotonicClock {
         return static_cast<FakeMonotonicClock*>(user_data)->now_ms;
     }
 };
+
+bool persist_trade_scope(void*, const hy::KillSwitchSnapshot&) noexcept { return true; }
 
 struct DynamicReadinessState {
     std::uint64_t generation{1};
@@ -121,6 +124,7 @@ enum class PreparedMutation : std::uint8_t {
     None,
     KillTrigger,
     KillTriggerAndReset,
+    ScopedKillTriggerAndReset,
     AuthorityRevoke,
     FeedDisconnect,
     FeedGenerationChange,
@@ -155,6 +159,7 @@ struct MutationState {
     bool invoked{false};
     bool limiter_configured{false};
     bool replacement_registered{false};
+    hy::PersistentResetResult scope_reset_result{hy::PersistentResetResult::StateChanged};
 };
 
 void mutate_after_prepared(void* user_data, const AuditRecord&) noexcept {
@@ -167,6 +172,14 @@ void mutate_after_prepared(void* user_data, const AuditRecord&) noexcept {
             state.kill_switch->trigger();
             state.kill_switch->operator_reset();
             break;
+        case PreparedMutation::ScopedKillTriggerAndReset: {
+            state.kill_switch->trigger();
+            const auto revision = state.kill_switch->persistent_reset_revision();
+            if (revision) {
+                state.scope_reset_result = state.kill_switch->reset_persistent(*revision, []() noexcept { return true; });
+            }
+            break;
+        }
         case PreparedMutation::AuthorityRevoke: state.readiness->authority().revoke(); break;
         case PreparedMutation::FeedDisconnect: state.feed->connected = false; break;
         case PreparedMutation::FeedGenerationChange: ++state.feed->generation; break;
@@ -256,6 +269,13 @@ protected:
     }
 
     void use_dynamic_readiness() noexcept { ctx_.readiness = &dynamic_readiness_.readiness(); }
+
+    std::optional<hy::TradeScopeEpoch> attach_persistent_scope() noexcept {
+        hy::KillSwitchSnapshot recovered{};
+        kill_switch_.attach_persistent({&persist_trade_scope, nullptr}, recovered, hy::KillPersistenceHealth::Ready);
+        ctx_.trade_scope_epoch = kill_switch_.trade_scope_epoch();
+        return ctx_.trade_scope_epoch;
+    }
 
     void arm_mutation(PreparedMutation mutation, std::int64_t new_clock_ms = 10) noexcept {
         mutation_ = {};
@@ -395,6 +415,52 @@ TEST_F(SubmitFinalGateTest, ContextKillSwitchRevisionIsCheckedSeparatelyFromRead
     const auto result = run_refusal(Reason::ReadinessRevoked);
     EXPECT_EQ(kill_switch_.state(), hy::KillState::Normal);
     EXPECT_EQ(result.not_ready_reason, hy::NotReadyReason::FinalCheckFailed);
+}
+
+TEST_F(SubmitFinalGateTest, TriggerAndApprovedResetInvalidateThePreparedTradeScope) {
+    const auto original_scope = attach_persistent_scope();
+    ASSERT_TRUE(original_scope.has_value());
+    arm_mutation(PreparedMutation::ScopedKillTriggerAndReset);
+
+    const auto result = run_refusal(Reason::ReadinessRevoked);
+    EXPECT_EQ(mutation_.scope_reset_result, hy::PersistentResetResult::Applied);
+    EXPECT_EQ(result.not_ready_reason, hy::NotReadyReason::TradeScopeInvalidated);
+    const auto fresh_scope = kill_switch_.trade_scope_epoch();
+    ASSERT_TRUE(fresh_scope.has_value());
+    EXPECT_NE(*fresh_scope, *original_scope);
+}
+
+TEST_F(SubmitFinalGateTest, AFreshTradeScopeStillRequiresASigningReadyContext) {
+    const auto scope = attach_persistent_scope();
+    ASSERT_TRUE(scope.has_value());
+    ctx_.signer_ready = false;
+
+    const OrchestratorResult result = hy::orchestrate_submit(ctx_);
+    EXPECT_EQ(result.gate, OrchestratorGate::SignerNotReady);
+    EXPECT_EQ(submit_calls_, 0u);
+}
+
+TEST_F(SubmitFinalGateTest, AFreshTradeScopeStillRequiresOperatorConfirmation) {
+    const auto scope = attach_persistent_scope();
+    ASSERT_TRUE(scope.has_value());
+    ctx_.confirmation.confirmed = false;
+
+    const OrchestratorResult result = hy::orchestrate_submit(ctx_);
+    EXPECT_EQ(result.gate, OrchestratorGate::OperatorNotConfirmed);
+    EXPECT_EQ(submit_calls_, 0u);
+}
+
+TEST_F(SubmitFinalGateTest, AFreshTradeScopeSubmitsWhenOriginalOrderGatesHold) {
+    const auto scope = attach_persistent_scope();
+    ASSERT_TRUE(scope.has_value());
+    ASSERT_TRUE(ctx_.signer_ready);
+    ASSERT_TRUE(ctx_.confirmation.confirmed);
+
+    const OrchestratorResult result = hy::orchestrate_submit(ctx_);
+    EXPECT_EQ(result.gate, OrchestratorGate::SubmitAccepted);
+    EXPECT_EQ(submit_calls_, 1u);
+    EXPECT_TRUE(ctx_.signer_ready);
+    EXPECT_TRUE(ctx_.confirmation.confirmed);
 }
 
 TEST_F(SubmitFinalGateTest, FinalAuditAvailabilityIsRecheckedAfterPrepared) {

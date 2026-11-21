@@ -5,6 +5,7 @@
 #include <hengyuan/binance_signer.hpp>
 #include <hengyuan/owner_cancel_approval.hpp>
 #include <hengyuan/owner_reset_approval.hpp>
+#include <hengyuan/production_reset_key.hpp>
 #include <hengyuan/spot_cancel_control.hpp>
 #include <hengyuan/store_binding_writer.hpp>
 #include "binance_clock_sync_test_hooks.hpp"
@@ -177,6 +178,7 @@ void remove_enrollment_store_files(const std::string& log_path, const std::strin
              log_path + ".binding.tip",
              log_path + ".binding.tip.tmp",
              log_path + ".owner-cancel.pub",
+             hy::ProductionResetKey::enrollment_path(log_path),
              kek_path,
              wrapped_keys_path,
          }) {
@@ -525,6 +527,172 @@ TEST(OwnerCancelEnrollment, BindsGeneratedP256KeyToOneProductionStoreExactlyOnce
         ASSERT_NE(opened.sink, nullptr);
         EXPECT_EQ(hy::spot_cancel_control::load_authority(second.log_path, *opened.sink), nullptr);
     }
+
+    std::remove(der_path.c_str());
+}
+
+TEST(ProductionResetKey, EnrollsOfflineP256AndVerifiesOnlyTheEnrolledProductionScope) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    const std::string der_path = EnrollmentStoreFixture::new_prefix() + ".owner-reset.der";
+    ASSERT_TRUE(write_binary_file(
+        der_path, std::span<const std::byte>(reinterpret_cast<const std::byte*>(fixture.public_der.data()),
+                                             fixture.public_der.size())));
+
+    EnrollmentStoreFixture store("production-reset");
+    constexpr auto environment = hy::StoreEnvironment::Production;
+    constexpr std::uint64_t account_uid = 8'765'432'100;
+    constexpr std::uint64_t owner_key_id = 23;
+    ASSERT_TRUE(store.create_bound_store(environment, account_uid));
+
+    const auto files = store.files();
+    ASSERT_EQ(hy::ProductionResetKey::enroll(files, owner_key_id, der_path), hy::ExportStatus::Ok);
+    const std::string reset_enrollment = hy::ProductionResetKey::enrollment_path(store.log_path);
+    ASSERT_TRUE(hy::spot_cancel_control::is_regular_file(reset_enrollment));
+
+    auto opened = hy::spot_cancel_control::open_existing_store(files, environment);
+    ASSERT_NE(opened.sink, nullptr);
+    const auto binding = opened.sink->read_binding();
+    ASSERT_EQ(binding.status, hy::StoreBindingStatus::Bound);
+    ASSERT_EQ(binding.binding.environment, environment);
+    ASSERT_EQ(binding.binding.account_uid, account_uid);
+    ASSERT_TRUE(opened.sink->store_uuid_lo() != 0 || opened.sink->store_uuid_hi() != 0);
+
+    auto authority = hy::ProductionResetKey::load(store.log_path, *opened.sink);
+    ASSERT_NE(authority, nullptr);
+
+    const hy::OperatorResetTarget target{
+        {environment, account_uid, opened.sink->store_uuid_lo(), opened.sink->store_uuid_hi()}, 17};
+    const hy::OperatorResetTarget other_store{
+        {environment, account_uid, opened.sink->store_uuid_lo() ^ 1ULL, opened.sink->store_uuid_hi()}, 17};
+    auto wrong_account = target;
+    ++wrong_account.scope.account_uid;
+    EXPECT_FALSE(authority->prepare(other_store, 2'000'000).has_value());
+    EXPECT_FALSE(authority->prepare(wrong_account, 2'000'000).has_value());
+    EXPECT_FALSE(authority->prepare(reset_target(17), 2'000'000).has_value());
+
+    const auto drill_authority = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(drill_authority, nullptr);
+    EXPECT_FALSE(drill_authority->prepare(target, 2'000'000).has_value());
+
+    const auto challenge = authority->prepare(target, 2'000'000);
+    ASSERT_TRUE(challenge.has_value());
+    const auto signature = fixture.sign(reset_bytes(*challenge));
+    ASSERT_FALSE(signature.empty());
+    const auto port = authority->approval_port();
+    const auto approval = port.verify(
+        port.context, std::span<const unsigned char>(signature.data(), signature.size()));
+    ASSERT_TRUE(approval.has_value());
+    EXPECT_EQ(approval->target.scope, target.scope);
+    EXPECT_EQ(approval->target.revision, target.revision);
+    EXPECT_EQ(approval->not_after_ms, 2'000'000 + hy::kOwnerResetValidityMs);
+
+    std::remove(der_path.c_str());
+}
+
+TEST(ProductionResetKey, RefusesDuplicateUnboundTestnetAndCopiedEnrollment) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    const std::string der_path = EnrollmentStoreFixture::new_prefix() + ".owner-reset.der";
+    ASSERT_TRUE(write_binary_file(
+        der_path, std::span<const std::byte>(reinterpret_cast<const std::byte*>(fixture.public_der.data()),
+                                             fixture.public_der.size())));
+
+    EnrollmentStoreFixture unbound("unbound");
+    EnrollmentStoreFixture testnet("testnet");
+    EnrollmentStoreFixture first("first-production");
+    EnrollmentStoreFixture second("second-production");
+    constexpr std::uint64_t owner_key_id = 23;
+    ASSERT_TRUE(testnet.create_bound_store(hy::StoreEnvironment::Testnet, 8'765'432'100));
+    ASSERT_TRUE(first.create_bound_store(hy::StoreEnvironment::Production, 8'765'432'100));
+    ASSERT_TRUE(second.create_bound_store(hy::StoreEnvironment::Production, 8'765'432'100));
+
+    EXPECT_EQ(hy::ProductionResetKey::enroll(unbound.files(), owner_key_id, der_path),
+              hy::ExportStatus::OutputError);
+    EXPECT_EQ(hy::ProductionResetKey::enroll(testnet.files(), owner_key_id, der_path),
+              hy::ExportStatus::OutputError);
+
+    const auto first_files = first.files();
+    ASSERT_EQ(hy::ProductionResetKey::enroll(first_files, owner_key_id, der_path), hy::ExportStatus::Ok);
+    EXPECT_EQ(hy::ProductionResetKey::enroll(first_files, owner_key_id, der_path),
+              hy::ExportStatus::OutputExists);
+
+    const auto first_enrollment = hy::ProductionResetKey::enrollment_path(first.log_path);
+    const auto second_enrollment = hy::ProductionResetKey::enrollment_path(second.log_path);
+    ASSERT_TRUE(std::filesystem::copy_file(first_enrollment, second_enrollment,
+                                           std::filesystem::copy_options::overwrite_existing));
+    auto opened = hy::spot_cancel_control::open_existing_store(second.files(), hy::StoreEnvironment::Production);
+    ASSERT_NE(opened.sink, nullptr);
+    EXPECT_EQ(hy::ProductionResetKey::load(second.log_path, *opened.sink), nullptr);
+
+    std::remove(der_path.c_str());
+}
+
+TEST(ProductionResetKey, KeepsCancellationEnrollmentSeparateFromResetEnrollment) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    const std::string der_path = EnrollmentStoreFixture::new_prefix() + ".owner-reset.der";
+    ASSERT_TRUE(write_binary_file(
+        der_path, std::span<const std::byte>(reinterpret_cast<const std::byte*>(fixture.public_der.data()),
+                                             fixture.public_der.size())));
+
+    EnrollmentStoreFixture store("purpose-separation");
+    constexpr auto environment = hy::StoreEnvironment::Production;
+    constexpr std::uint64_t account_uid = 8'765'432'100;
+    constexpr std::uint64_t owner_key_id = 23;
+    ASSERT_TRUE(store.create_bound_store(environment, account_uid));
+    const auto files = store.files();
+
+    ASSERT_EQ(hy::spot_cancel_control::enroll(files, environment, owner_key_id, der_path),
+              hy::ExportStatus::Ok);
+    const auto cancel_path = hy::spot_cancel_control::enrollment_path(store.log_path);
+    const auto reset_path = hy::ProductionResetKey::enrollment_path(store.log_path);
+    EXPECT_NE(cancel_path, reset_path);
+    ASSERT_TRUE(hy::spot_cancel_control::is_regular_file(cancel_path));
+    ASSERT_TRUE(std::filesystem::copy_file(cancel_path, reset_path));
+    {
+        auto opened = hy::spot_cancel_control::open_existing_store(files, environment);
+        ASSERT_NE(opened.sink, nullptr);
+        EXPECT_EQ(hy::ProductionResetKey::load(store.log_path, *opened.sink), nullptr);
+    }
+    ASSERT_TRUE(std::filesystem::remove(reset_path));
+
+    ASSERT_EQ(hy::ProductionResetKey::enroll(files, owner_key_id, der_path), hy::ExportStatus::Ok);
+    ASSERT_TRUE(hy::spot_cancel_control::is_regular_file(reset_path));
+    auto reopened = hy::spot_cancel_control::open_existing_store(files, environment);
+    ASSERT_NE(reopened.sink, nullptr);
+    EXPECT_NE(hy::ProductionResetKey::load(store.log_path, *reopened.sink), nullptr);
+
+    std::remove(der_path.c_str());
+}
+
+TEST(ProductionResetKey, RefusesLiveStoreWriterAndInvalidPublicKey) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    const std::string der_path = EnrollmentStoreFixture::new_prefix() + ".owner-reset.der";
+    ASSERT_TRUE(write_binary_file(
+        der_path, std::span<const std::byte>(reinterpret_cast<const std::byte*>(fixture.public_der.data()),
+                                             fixture.public_der.size())));
+
+    EnrollmentStoreFixture store("lock-refusal");
+    ASSERT_TRUE(store.create_bound_store(hy::StoreEnvironment::Production, 8'765'432'100));
+    const auto files = store.files();
+    auto held = hy::spot_cancel_control::open_existing_store(files, hy::StoreEnvironment::Production);
+    ASSERT_NE(held.sink, nullptr);
+    EXPECT_EQ(hy::ProductionResetKey::enroll(files, 23, der_path), hy::ExportStatus::OutputError);
+    held.sink.reset();
+
+    const std::array<std::byte, 1> invalid_der{std::byte{0}};
+    ASSERT_TRUE(write_binary_file(der_path, invalid_der));
+    EXPECT_EQ(hy::ProductionResetKey::enroll(files, 23, der_path), hy::ExportStatus::OutputError);
 
     std::remove(der_path.c_str());
 }

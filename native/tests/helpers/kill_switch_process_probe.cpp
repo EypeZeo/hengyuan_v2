@@ -66,7 +66,8 @@ int main(int argc, char** argv) {
         const auto expected_state = persisted ? hy::KillState::Triggered : hy::KillState::Latched;
         const auto snapshot = kill.snapshot();
         if (snapshot.state != expected_state || snapshot.revision != kRestrictionRevision ||
-            snapshot.trigger_count != (persisted ? 1u : 0u) || !final_claim_is_blocked(kill)) {
+            snapshot.trigger_count != (persisted ? 1u : 0u) || snapshot.scope_epoch.value != 2u ||
+            !final_claim_is_blocked(kill)) {
             return fail("The fresh process did not recover the expected restriction.");
         }
         return 0;

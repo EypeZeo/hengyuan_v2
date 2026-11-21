@@ -172,7 +172,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **未接线 = 拒单**（`ctx.readiness == nullptr` → `NotReadyReason::Unwired`），与周围所有可空字段的“未接线 = 行为不变”
     相反，这是刻意的反向：一个忘了接就绪门的调用点不能是静默放行。拒绝落审计环为 `PreflightFailed`，`detail_code` =
     `NotReadyReason`，`detail_msg` = 原因名；先于任何 durable 写入（没有 Intent 帧）、先于任何发送。
-  - 原因的优先级是固定的（`NoProbe` > `KillSwitchNotNormal` > `StartupNotReady` > `FeedDown` / `BarrierSweeping` >
+  - 原因的优先级是固定的（`NoProbe` > `KillSwitchNotNormal` > `TradeScopeInvalidated` > `StartupNotReady` > `FeedDown` / `BarrierSweeping` >
     `ClockNotReady`），`authorize()` 每次决定前先用新读到的 `FeedObservation` 刷新屏障，所以正确性不依赖主循环有没有跑过。
     `GenerationMismatch` 是屏障 `observe()` 之后结构上不可达的防御分支（保留是为了屏障将来被改动时令牌不会悄悄变弱）。
   - 两个 `gate_name()` 穷举 switch（`live_submit_evidence_harness.cpp`、`live_submit_preflight_harness.cpp`）补了 `NotReady` 的
@@ -1022,9 +1022,12 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
   - **SAFE-04 持久熔断**：限制先在内存中生效，收到持久写入确认后才发布已确认状态。写入期间拒绝新增提交授权，撤单循环等待写入结束。操作员重置只有在写入确认后才发布正常状态。持久模式启动时，缺失记录或历史正常记录均转为锁存。无法读取、无法独占或临时文件尚未收敛时，保持锁存并保留原有文件。最终提交授权与状态发布按同一把短锁排序，已经领取最终授权的请求按在途请求处理。
     - 子进程测试分别在限制写入确认后及限制发布、写入之前异常退出。新进程恢复相同的已确认限制，或从历史正常记录恢复为锁存，并拒绝旧版本的提交授权。TLC 检查 1,348 个不同状态，四项故障变体和两项可达性检查均返回预期结果。参见 [SAFE-04 模型](../formal/README.md#safe-04-persistent-kill-switch-and-final-submit-claim)。
     - 操作员重置由私有流进程在恢复完成、账户新鲜且当前订阅已对账后消费。重置授权签名绑定环境、账户、存储身份、当前熔断修订号、有效期及本次运行生成的随机值。签名核验后在持久写入的临界区复查修订号、恢复条件和保守估计的交易所时间。持久化失败时保留锁存并推进修订号。原生程序的 `--owner-reset-drill` 使用独立 Testnet 临时存储，参数依次为 P-256 公钥 DER 文件、控制目录、Testnet 只读操作员凭据文件和可选的运行秒数。
+    - 生产重置公钥由 `--enroll-reset-owner PRODUCTION` 登记。命令独占打开已绑定的订单存储，并从该存储读取账户与 UUID。登记文件使用重置专用格式，已有文件时拒绝登记。生产验签实例只为与登记相同的环境、账户和存储签发挑战。
+    - `Triggered` 和 `Latched` 推进 `scope_epoch`，熔断记录把状态与代次一起写入。重置继承限制后的代次，`Armed` 在本次运行中只暂停新的提交。持久模式的冷启动以恢复后的修订号使已签发范围失效，包括中断时只来得及写入 `Armed` 的情况。v1 熔断记录以修订号恢复代次。
     - 2026-11-21，Windows 原生程序在 Spot Testnet 使用只读凭据和临时软件 P-256 密钥完成签名重置演练。存储绑定返回 BoundNew，重置返回 Applied，修订号由 0 变为 1，进程退出码为 0。
   - **Q23 S5：发送前最终授权与类 B 拒绝。** `orchestrate_submit()` 在 `Prepared` 持久确认之后调用 `SubmitReadiness::claim()`。就绪状态与原令牌的签发者、订阅代次、屏障 epoch、熔断 revision 必须相符；最终检查包含授权期限、原确认的有效期、原在途句柄、限流预留、账户和规则，以及审计、签名与深度状态。期限采用单调时钟，默认 5000 ms，在就绪状态读取完成后检查。提交、Prepared 和内存审计使用同一份原订单参数。
     - `SubmitAuthority` 的 epoch 使用 acquire/release 原子操作，claim 和 revoke 在同一原子值上排序。撤销使此前签发的令牌失效；一次成功的 claim 消费该 epoch。WebSocket 会话在停止请求、错误与结束事件时公布停止状态并撤销；预检程序为会话与 `PrivateStreamPipeline` 传入同一个 authority。`KillSwitch` 的发布锁按顺序仲裁最终提交授权和状态变化。写盘与发布使用独立的锁，状态读取无需等待磁盘同步。
+    - 有范围代次的提交在 `authorize()` 检查代次，最终 `claim()` 在熔断发布的同一临界区重新核对它并消费提交令牌。范围签发、预算及范围替换需要独立的实现，当前的提交仍须有逐单确认。
     - `FinalAuthorizationRefused` 返回具体 `final_refusal`。仅 `ClosureAppendStatus::Appended` 将订单变为 `NeverSent`，按原槽位代次释放在途登记，并移除对应成交上下文、退回仍有效的原限流窗口额度。其他关闭结果保留 `Submitting` 和资源。成功 claim 之后不写关闭帧；恢复时，仅有 Prepared 的订单继续进入不确定结果处理。
     - `OrderReservation` 不可复制、不可直接构造，绑定所属限流器、配置代次与窗口截止。过期、重新配置或消费后的票据不能授权发送；旧票据不能退回新窗口的额度。全部新增发送检查保持无动态内存分配。
     - 回归包括撤销与 claim 的两种次序、同 epoch 单次消费、发布可见性、断流与代次变化、熔断触发后重置、授权与确认期限、槽位复用、限流配置变更、追加失败及实际文件恢复。`test_submit_authority_concurrency.cpp` 同时加入本地 TSan 和 ARM64 CI 的重复测试；`tsan_control_relaxed_submit_authority.cpp` 将发布所需的内存序降为 relaxed，验证 TSan 能报告数据竞争。

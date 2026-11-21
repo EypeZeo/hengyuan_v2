@@ -50,6 +50,16 @@ Use an existing, healthy, bound order log and its KEK and wrapped-key file. The 
 
 For Spot Testnet use `TESTNET` in both commands and its independent account, log and key. The credentials file uses `HENGYUAN_BINANCE_LIVE_API_KEY` and `HENGYUAN_BINANCE_LIVE_SECRET` in Production, or `HENGYUAN_BINANCE_TESTNET_API_KEY` and `HENGYUAN_BINANCE_TESTNET_SECRET` in Testnet. For a working order the process prints the payload and corresponding signature paths. Sign that payload using the registered hardware key and write the signature to the printed path. The process installs the grant in memory and handles one claimed cancellation before exiting. To recover after an interruption, start the same cancellation command against the same log. Existing pending attempts are reconciled without a signature. New attempts require a signature for the current activation.
 
+### Register a production reset key
+
+Use the DER SubjectPublicKeyInfo of the Owner’s P-256 signing key. Run the command with the producer stopped and the existing, bound production order store available for exclusive access.
+
+```powershell
+& $exe --enroll-reset-owner PRODUCTION $log $auditKeyId $kekFile $wrappedKeyFile $ownerKeyId $resetPublicDer
+```
+
+The command publishes `<log>.owner-reset.pub` in the trusted order store directory and refuses an existing registration. `ProductionResetKey::load()` checks the record against the bound environment, account UID, and store UUID before preparing a reset challenge. The running production process still needs a reset request handler.
+
 ## 3. Operator manual takeover — step by step
 
 **Precondition for this section to matter at all:** you must already have the Binance mobile app installed, logged in, with 2FA configured, on a phone you actually carry. If that's not true yet, that's a real precondition, not a checkbox — go set it up before treating this runbook as complete.

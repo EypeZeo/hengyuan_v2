@@ -93,6 +93,7 @@
 #include <hengyuan/holding_state_tracker.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/owner_reset_approval.hpp>
+#include <hengyuan/production_reset_key.hpp>
 #include <hengyuan/preflight_probe.hpp>
 #include <hengyuan/private_stream_pipeline.hpp>
 #include <hengyuan/public_feed_pipeline.hpp>
@@ -572,22 +573,29 @@ std::optional<CancelRuntimeOptions> parse_cancel_runtime(int argc, char* argv[])
     return opt;
 }
 
-int enroll_cancel_owner(int argc, char* argv[]) {
-    if (argc != 9) {
-        std::fprintf(stderr, "usage: %s --enroll-cancel-owner <TESTNET|PRODUCTION> <log> <audit-key-id> <kek-file> <wrapped-key-file> <owner-key-id> <public-key.der>\n", argv[0]);
+int enroll_owner_key(int argc, char* argv[], bool reset_key) {
+    const char* command = reset_key ? "--enroll-reset-owner" : "--enroll-cancel-owner";
+    const auto env = argc == 9 ? cancel_control::parse_environment(argv[2]) : std::nullopt;
+    if (!env || (reset_key && *env != StoreEnvironment::Production)) {
+        std::fprintf(stderr, "usage: %s %s %s <log> <audit-key-id> <kek-file> <wrapped-key-file> <owner-key-id> <public-key.der>\n",
+                     argv[0], command, reset_key ? "PRODUCTION" : "<TESTNET|PRODUCTION>");
         return 1;
     }
-    const auto env = cancel_control::parse_environment(argv[2]);
     cancel_control::StoreFiles files{argv[3], 0, argv[5], argv[6]};
     std::uint64_t owner_id = 0;
-    if (!env || !cancel_control::parse_id(argv[4], files.audit_key_id) ||
-        !cancel_control::parse_id(argv[7], owner_id)) return 1;
-    const auto result = cancel_control::enroll(files, *env, owner_id, argv[8]);
+    if (!cancel_control::parse_id(argv[4], files.audit_key_id) ||
+        !cancel_control::parse_id(argv[7], owner_id)) {
+        std::fputs("Audit and owner key IDs must be positive integers.\n", stderr);
+        return 1;
+    }
+    const auto result = reset_key ? ProductionResetKey::enroll(files, owner_id, argv[8])
+                                  : cancel_control::enroll(files, *env, owner_id, argv[8]);
+    const char* purpose = reset_key ? "reset" : "cancellation";
     if (result == ExportStatus::Ok) {
-        std::printf("Owner public key registered for %s\n", argv[2]);
+        std::printf("Owner %s public key registered for %s\n", purpose, argv[2]);
         return 0;
     }
-    std::fprintf(stderr, "Owner public key registration failed (status=%u)\n", static_cast<unsigned>(result));
+    std::fprintf(stderr, "Owner %s public key registration failed (%s)\n", purpose, export_status_name(result));
     return 1;
 }
 
@@ -772,7 +780,8 @@ int main(int argc, char* argv[]) {
                      argv[0]);
         return 1;
     }
-    if (std::string_view(argv[1]) == "--enroll-cancel-owner") return enroll_cancel_owner(argc, argv);
+    if (std::string_view(argv[1]) == "--enroll-cancel-owner") return enroll_owner_key(argc, argv, false);
+    if (std::string_view(argv[1]) == "--enroll-reset-owner") return enroll_owner_key(argc, argv, true);
     const bool cancel_only = std::string_view(argv[1]) == "--cancel-only";
     const bool reset_drill = std::string_view(argv[1]) == "--owner-reset-drill";
     const bool trade_preflight = !cancel_only && !reset_drill;
