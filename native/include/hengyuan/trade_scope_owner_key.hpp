@@ -58,6 +58,21 @@ public:
         return TradeScopeOwnerKey(subject, registration->key_id, std::move(registration->der));
     }
 
+    [[nodiscard]] std::optional<VerifiedAccountRiskPolicy> load_account_policy(
+        const std::string& path, std::uint64_t version, bool& missing) const {
+        std::vector<std::byte> payload, signature;
+        const auto grant_path = path + ".account.grant";
+        const auto signature_path = path + ".account.sig";
+        const auto grant = read_file_bounded(grant_path, payload, AccountRiskPolicyBytes{}.size());
+        const auto sig = read_file_bounded(signature_path, signature, owner_signature::kMaxSignatureBytes);
+        missing = grant == ReadFileStatus::NotFound && sig == ReadFileStatus::NotFound;
+        if (grant != ReadFileStatus::Ok || sig != ReadFileStatus::Ok ||
+            !spot_owner_key_store::is_regular_file(grant_path) || !spot_owner_key_store::is_regular_file(signature_path))
+            return std::nullopt;
+        return VerifiedAccountRiskPolicy::verify(payload, spot_owner_key_store::unsigned_bytes(signature),
+                                                 public_key(), subject_, key_id_, version);
+    }
+
     [[nodiscard]] const OperatorResetScope& subject() const noexcept { return subject_; }
     [[nodiscard]] std::uint64_t key_id() const noexcept { return key_id_; }
     [[nodiscard]] std::span<const unsigned char> public_key() const noexcept {

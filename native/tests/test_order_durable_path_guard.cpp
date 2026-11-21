@@ -309,12 +309,13 @@ TEST(OrderDurablePathGuard, TheOrchestratorAppendsEveryFrameOfAnOrdersLifeThroug
     ASSERT_NE(f, nullptr);
     // the seven frames: Intent (Gate 10b), Prepared (12d), and the five outcome branches (Accepted, Rejected, Timeout, NetworkError, StaleRulesVersion)
     EXPECT_EQ(call_args(f->code, "append_order_frame").size(), 7u);
-    // ... each as `if (!detail::append_order_frame(ctx, ar))`: the result is the ACK, nothing else is read
+    // Every call uses the append acknowledgement to stop on failure.
     std::size_t acked_checks = 0;
     for (std::size_t pos = f->code.find("append_order_frame(ctx, ar)"); pos != std::string::npos; pos = f->code.find("append_order_frame(ctx, ar)", pos + 1)) {
         ++acked_checks;
     }
-    EXPECT_EQ(acked_checks, 7u);
+    EXPECT_EQ(acked_checks, 6u);
+    EXPECT_NE(f->code.find("if (!detail::append_order_frame(ctx, prepared))"), std::string::npos);
     // inside it: the append, THEN the shadow, and the shadow only if the append was acknowledged
     const std::size_t def = f->code.find("inline bool append_order_frame(");
     ASSERT_NE(def, std::string::npos);

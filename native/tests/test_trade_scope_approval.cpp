@@ -34,6 +34,8 @@
 namespace {
 
 constexpr std::int64_t kExchangeUpperMs = 1'000'000;
+constexpr std::int64_t kAccountRiskTestDayStart = 20'000LL * hy::account_risk_audit::kUtcDayMs;
+constexpr std::uint64_t kAccountRiskTestKeyId = 0x4143434f554e5452ULL;
 
 struct P256Fixture {
     EVP_PKEY* key{nullptr};
@@ -122,6 +124,70 @@ std::optional<hy::VerifiedTradeScope> verify_grant(
     const auto signature = signer.sign(std::span<const std::byte>(*payload));
     return verify_payload(*payload, std::span<const unsigned char>(signature.data(), signature.size()),
                           signer, expected, policy, exchange_upper_ms);
+}
+
+hy::AccountRiskPolicy make_account_risk_policy(const hy::OperatorResetScope& store, std::uint64_t key_id,
+                                              hy::AccountRiskLimits limits) {
+    hy::AccountRiskPolicy policy{};
+    policy.store = store;
+    policy.key_id = key_id;
+    policy.limits = limits;
+    return policy;
+}
+
+std::optional<hy::VerifiedAccountRiskPolicy> verify_account_risk_policy_payload(
+    std::span<const std::byte> payload, std::span<const unsigned char> signature, const P256Fixture& signer,
+    const hy::OperatorResetScope& expected_store, std::uint64_t expected_key_id, std::uint64_t expected_version) {
+    return hy::VerifiedAccountRiskPolicy::verify(
+        payload, signature, std::span<const unsigned char>(signer.public_der.data(), signer.public_der.size()),
+        expected_store, expected_key_id, expected_version);
+}
+
+std::optional<hy::VerifiedAccountRiskPolicy> sign_and_verify_account_risk_policy(
+    const hy::AccountRiskPolicy& policy, const P256Fixture& signer) {
+    const auto payload = hy::encode_account_risk_policy(policy);
+    if (!payload) return std::nullopt;
+    const auto signature = signer.sign(std::span<const std::byte>(*payload));
+    if (signature.empty()) return std::nullopt;
+    return verify_account_risk_policy_payload(
+        std::span<const std::byte>(*payload), std::span<const unsigned char>(signature.data(), signature.size()),
+        signer, policy.store, policy.key_id, policy.limits.version);
+}
+
+hy::TradeScopeGrant make_account_period_scope(const hy::OperatorResetScope& store, std::uint64_t policy_version,
+                                             std::uint64_t serial, hy::TradeScopeSides sides) {
+    auto grant = make_grant();
+    grant.binding.store = store;
+    grant.binding.policy_version = policy_version;
+    grant.serial = serial;
+    grant.sides = sides;
+    grant.limits = {100'000'000, 250'000'000, 200'000'000, 10'000};
+    return grant;
+}
+
+hy::AuditRecord make_account_intent_record(std::string_view order_id, std::int64_t price, std::int64_t quantity,
+                                           std::uint32_t symbol_id, hy::OrderSide side,
+                                           std::int64_t timestamp_ms) {
+    hy::AuditRecord record{};
+    record.timestamp_ms = timestamp_ms;
+    record.event_type = hy::AuditEventType::OrderIntentCreated;
+    record.mode = hy::ExecutionMode::Live;
+    record.symbol_id = symbol_id;
+    record.set_client_order_id(order_id);
+    record.price_ticks = price;
+    record.qty_ticks = quantity;
+    record.resulting_state = hy::OrderState::Intent;
+    record.side = side;
+    return record;
+}
+
+hy::AuditRecord make_account_period_prepared(const hy::AuditRecord& intent, bool restricted_exit,
+                                             std::uint64_t authorization, const hy::SymbolRules& rules,
+                                             std::int64_t exchange_ms) {
+    auto record = intent;
+    hy::account_risk_audit::tag_prepared(record, restricted_exit, authorization, rules, exchange_ms);
+    record.resulting_state = hy::OrderState::Submitting;
+    return record;
 }
 
 void expect_u64_le(const hy::TradeScopeGrantBytes& bytes, std::size_t offset, std::uint64_t value) {
@@ -637,6 +703,269 @@ TEST(TradeScopeBudget, AcceptsIntegerBoundaryWithoutOverflow) {
     EXPECT_EQ(budget->used_notional(), 0);
     EXPECT_EQ(budget->available_notional(), kMax);
     EXPECT_TRUE(budget->reserve("one", 1));
+}
+
+TEST_F(TradeScopeExecutionTest, AccountRiskPolicySignatureBindsStoreVersionAndLimits) {
+    ASSERT_NE(signer_.key, nullptr);
+    ASSERT_FALSE(signer_.public_der.empty());
+    const auto policy = make_account_risk_policy(
+        binding_.store, kAccountRiskTestKeyId, {77, 250'000'000, 0, 0, 0});
+    const auto payload = hy::encode_account_risk_policy(policy);
+    ASSERT_TRUE(payload.has_value());
+    const auto signature = signer_.sign(std::span<const std::byte>(*payload));
+    ASSERT_FALSE(signature.empty());
+    const auto signature_view = std::span<const unsigned char>(signature.data(), signature.size());
+
+    const auto verified = verify_account_risk_policy_payload(
+        std::span<const std::byte>(*payload), signature_view, signer_, policy.store, policy.key_id,
+        policy.limits.version);
+    ASSERT_TRUE(verified.has_value());
+    EXPECT_EQ(verified->policy(), policy);
+
+    auto wrong_store = policy.store;
+    ++wrong_store.account_uid;
+    EXPECT_FALSE(verify_account_risk_policy_payload(
+        std::span<const std::byte>(*payload), signature_view, signer_, wrong_store, policy.key_id,
+        policy.limits.version).has_value());
+    EXPECT_FALSE(verify_account_risk_policy_payload(
+        std::span<const std::byte>(*payload), signature_view, signer_, policy.store, policy.key_id + 1,
+        policy.limits.version).has_value());
+    EXPECT_FALSE(verify_account_risk_policy_payload(
+        std::span<const std::byte>(*payload), signature_view, signer_, policy.store, policy.key_id,
+        policy.limits.version + 1).has_value());
+
+    constexpr std::size_t kStoreFieldsOffset = sizeof(hy::kAccountRiskDomain) + 2 + sizeof(hy::kAccountRiskSymbol);
+    constexpr std::size_t kPolicyVersionOffset = kStoreFieldsOffset + 4 * sizeof(std::uint64_t);
+    constexpr std::size_t kDailyCapOffset = kStoreFieldsOffset + 5 * sizeof(std::uint64_t);
+    auto changed_store_payload = *payload;
+    changed_store_payload[kStoreFieldsOffset] ^= std::byte{1};
+    auto changed_store = policy.store;
+    changed_store.account_uid ^= 1;
+    EXPECT_FALSE(verify_account_risk_policy_payload(
+        std::span<const std::byte>(changed_store_payload), signature_view, signer_, changed_store, policy.key_id,
+        policy.limits.version).has_value());
+
+    auto changed_version_payload = *payload;
+    changed_version_payload[kPolicyVersionOffset] ^= std::byte{1};
+    EXPECT_FALSE(verify_account_risk_policy_payload(
+        std::span<const std::byte>(changed_version_payload), signature_view, signer_, policy.store, policy.key_id,
+        policy.limits.version - 1).has_value());
+
+    auto changed_limit_payload = *payload;
+    changed_limit_payload[kDailyCapOffset] ^= std::byte{1};
+    EXPECT_FALSE(verify_account_risk_policy_payload(
+        std::span<const std::byte>(changed_limit_payload), signature_view, signer_, policy.store, policy.key_id,
+        policy.limits.version).has_value());
+
+    auto foreign_policy = policy;
+    ++foreign_policy.store.account_uid;
+    const auto foreign_payload = hy::encode_account_risk_policy(foreign_policy);
+    ASSERT_TRUE(foreign_payload.has_value());
+    const auto foreign_signature = signer_.sign(std::span<const std::byte>(*foreign_payload));
+    ASSERT_FALSE(foreign_signature.empty());
+    const auto verified_foreign = verify_account_risk_policy_payload(
+        std::span<const std::byte>(*foreign_payload),
+        std::span<const unsigned char>(foreign_signature.data(), foreign_signature.size()), signer_,
+        foreign_policy.store, foreign_policy.key_id, foreign_policy.limits.version);
+    ASSERT_TRUE(verified_foreign.has_value());
+    EXPECT_FALSE(sink_->append_account_risk_policy(*verified_foreign, kSymbolId, kAccountRiskTestDayStart).acked());
+    EXPECT_FALSE(sink_->account_risk().policy().has_value());
+}
+
+TEST_F(TradeScopeExecutionTest, AccountPeriodCapSurvivesScopeReplacementAndResetsAtUtcDayBoundary) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto policy = make_account_risk_policy(
+        binding_.store, kAccountRiskTestKeyId, {81, 100'000'000, 0, 0, 0});
+    const auto verified_policy = sign_and_verify_account_risk_policy(policy, signer_);
+    ASSERT_TRUE(verified_policy.has_value());
+    ASSERT_TRUE(sink_->append_account_risk_policy(*verified_policy, kSymbolId, kAccountRiskTestDayStart).acked());
+
+    const auto first_scope = make_account_period_scope(binding_.store, policy.limits.version, 100,
+                                                       hy::TradeScopeSides::Buy);
+    ASSERT_TRUE(sink_->append_trade_scope_install(first_scope, kSymbolId, kAccountRiskTestDayStart + 1).acked());
+    const auto first_time = kAccountRiskTestDayStart + 10;
+    const auto first_intent = make_account_intent_record("HY-ACCOUNT-DAY-1", 100, 100, kSymbolId,
+                                                         hy::OrderSide::Buy, first_time);
+    ASSERT_TRUE(sink_->append_durable(first_intent, first_time).acked());
+    const auto first_prepared = make_account_period_prepared(
+        first_intent, false, first_scope.serial, rules_for(), first_time);
+    ASSERT_EQ(first_prepared.event_type, hy::AuditEventType::OrderAccountScopedPrepared);
+    ASSERT_TRUE(sink_->append_durable(first_prepared, first_time).acked());
+    ASSERT_EQ(sink_->account_risk().day_used(), policy.limits.daily_quote_cap);
+
+    const auto replacement = make_account_period_scope(binding_.store, policy.limits.version, 101,
+                                                       hy::TradeScopeSides::Buy);
+    ASSERT_TRUE(sink_->append_trade_scope_install(replacement, kSymbolId, kAccountRiskTestDayStart + 20).acked());
+    const auto capped_time = kAccountRiskTestDayStart + 30;
+    const auto capped_intent = make_account_intent_record("HY-ACCOUNT-DAY-2", 100, 100, kSymbolId,
+                                                          hy::OrderSide::Buy, capped_time);
+    ASSERT_TRUE(sink_->append_durable(capped_intent, capped_time).acked());
+    const auto capped_prepared = make_account_period_prepared(
+        capped_intent, false, replacement.serial, rules_for(), capped_time);
+    const auto frames_before_cap_refusal = sink_->frame_count();
+    EXPECT_FALSE(sink_->append_durable(capped_prepared, capped_time).acked());
+    EXPECT_EQ(sink_->frame_count(), frames_before_cap_refusal);
+    EXPECT_FALSE(sink_->fenced());
+    ASSERT_NE(sink_->trade_scope_balance(replacement.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(replacement.serial)->usage.used_notional, 0);
+
+    execution_.reset();
+    sink_.reset();
+    sink_ = std::make_unique<hy::DurableAuditSink>(audit_path_, *key_ring_, kAuditKeyId,
+                                                   hy::kMaxIntentOrphans, hy::AuditSinkOpenMode::Trading,
+                                                   hy::NeverSentWrites::Enabled);
+    ASSERT_TRUE(sink_->is_open());
+    EXPECT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Recovered);
+    ASSERT_TRUE(sink_->account_risk().policy().has_value());
+    EXPECT_EQ(sink_->account_risk().policy()->limits.version, policy.limits.version);
+    EXPECT_EQ(sink_->account_risk().latest_day(), hy::account_risk_audit::utc_day(first_time));
+    EXPECT_EQ(sink_->account_risk().day_used(), policy.limits.daily_quote_cap);
+    EXPECT_EQ(sink_->recovered_intent_orphans(), 1U);
+    EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+    EXPECT_EQ(sink_->trade_scope_high_water(), replacement.serial);
+    ASSERT_NE(sink_->trade_scope_balance(first_scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(first_scope.serial)->usage.used_notional, 100'000'000);
+    ASSERT_NE(sink_->trade_scope_balance(replacement.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(replacement.serial)->usage.used_notional, 0);
+
+    const auto next_day = kAccountRiskTestDayStart + hy::account_risk_audit::kUtcDayMs;
+    const auto next_scope = make_account_period_scope(binding_.store, policy.limits.version, 102,
+                                                      hy::TradeScopeSides::Buy);
+    ASSERT_TRUE(sink_->append_trade_scope_install(next_scope, kSymbolId, next_day).acked());
+    const auto next_day_intent = make_account_intent_record("HY-ACCOUNT-NEXT-DAY", 100, 100, kSymbolId,
+                                                            hy::OrderSide::Buy, next_day);
+    ASSERT_TRUE(sink_->append_durable(next_day_intent, next_day).acked());
+    const auto next_day_prepared = make_account_period_prepared(
+        next_day_intent, false, next_scope.serial, rules_for(), next_day);
+    ASSERT_TRUE(sink_->append_durable(next_day_prepared, next_day).acked());
+    EXPECT_EQ(sink_->account_risk().latest_day(), hy::account_risk_audit::utc_day(next_day));
+    EXPECT_EQ(sink_->account_risk().day_used(), policy.limits.daily_quote_cap);
+    ASSERT_NE(sink_->trade_scope_balance(next_scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(next_scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto same_day_replacement = make_account_period_scope(binding_.store, policy.limits.version, 103,
+                                                                hy::TradeScopeSides::Buy);
+    ASSERT_TRUE(sink_->append_trade_scope_install(same_day_replacement, kSymbolId, next_day + 1).acked());
+    const auto second_capped_time = next_day + 2;
+    const auto second_capped_intent = make_account_intent_record(
+        "HY-ACCOUNT-NEXT-DAY-2", 100, 100, kSymbolId, hy::OrderSide::Buy, second_capped_time);
+    ASSERT_TRUE(sink_->append_durable(second_capped_intent, second_capped_time).acked());
+    const auto second_capped_prepared = make_account_period_prepared(
+        second_capped_intent, false, same_day_replacement.serial, rules_for(), second_capped_time);
+    EXPECT_FALSE(sink_->append_durable(second_capped_prepared, second_capped_time).acked());
+}
+
+TEST_F(TradeScopeExecutionTest, DurableNeverSentRefundsAccountAndScopeChargesAfterReplay) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto policy = make_account_risk_policy(
+        binding_.store, kAccountRiskTestKeyId, {82, 300'000'000, 0, 0, 0});
+    const auto verified_policy = sign_and_verify_account_risk_policy(policy, signer_);
+    ASSERT_TRUE(verified_policy.has_value());
+    ASSERT_TRUE(sink_->append_account_risk_policy(*verified_policy, kSymbolId, kAccountRiskTestDayStart).acked());
+    const auto scope = make_account_period_scope(binding_.store, policy.limits.version, 200,
+                                                 hy::TradeScopeSides::Buy);
+    ASSERT_TRUE(sink_->append_trade_scope_install(scope, kSymbolId, kAccountRiskTestDayStart + 1).acked());
+
+    const auto prepared_time = kAccountRiskTestDayStart + 10;
+    const auto intent = make_account_intent_record("HY-ACCOUNT-REFUND", 100, 100, kSymbolId,
+                                                   hy::OrderSide::Buy, prepared_time);
+    ASSERT_TRUE(sink_->append_durable(intent, prepared_time).acked());
+    const auto prepared = make_account_period_prepared(intent, false, scope.serial, rules_for(), prepared_time);
+    ASSERT_TRUE(sink_->append_durable(prepared, prepared_time).acked());
+    ASSERT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    ASSERT_NE(sink_->trade_scope_balance(scope.serial), nullptr);
+    ASSERT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto closure_time = kAccountRiskTestDayStart + 20;
+    auto target = hy::never_sent::class_a_target_of(intent);
+    target.state = hy::OrderState::Submitting;
+    const auto closure = hy::never_sent::class_a_closure_of(
+        intent, hy::never_sent::Reason::AccountPeriodChanged, closure_time);
+    const auto closed = sink_->append_never_sent(target, closure, closure_time);
+    ASSERT_EQ(closed.status, hy::NeverSentAppendStatus::Appended);
+    EXPECT_EQ(sink_->account_risk().day_used(), 0);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 0);
+    EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 0);
+
+    execution_.reset();
+    sink_.reset();
+    sink_ = std::make_unique<hy::DurableAuditSink>(audit_path_, *key_ring_, kAuditKeyId,
+                                                   hy::kMaxIntentOrphans, hy::AuditSinkOpenMode::Trading,
+                                                   hy::NeverSentWrites::Enabled);
+    ASSERT_TRUE(sink_->is_open());
+    EXPECT_EQ(sink_->recovered_never_sent(), 1U);
+    ASSERT_TRUE(sink_->account_risk().policy().has_value());
+    EXPECT_EQ(sink_->account_risk().day_used(), 0);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 0);
+    EXPECT_EQ(sink_->trade_scope_high_water(), scope.serial);
+    EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+    ASSERT_NE(sink_->trade_scope_balance(scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 0);
+}
+
+TEST_F(TradeScopeExecutionTest, RestrictedExitAndOrdinaryScopedSellShareDurableBaseReservation) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto policy = make_account_risk_policy(
+        binding_.store, kAccountRiskTestKeyId, {83, 300'000'000, 200'000'000, 100'000'000, 100});
+    const auto verified_policy = sign_and_verify_account_risk_policy(policy, signer_);
+    ASSERT_TRUE(verified_policy.has_value());
+    ASSERT_TRUE(sink_->append_account_risk_policy(*verified_policy, kSymbolId, kAccountRiskTestDayStart).acked());
+    const auto scope = make_account_period_scope(binding_.store, policy.limits.version, 300,
+                                                 hy::TradeScopeSides::Sell);
+    ASSERT_TRUE(sink_->append_trade_scope_install(scope, kSymbolId, kAccountRiskTestDayStart + 1).acked());
+
+    const auto ordinary_time = kAccountRiskTestDayStart + 10;
+    const auto ordinary_intent = make_account_intent_record("HY-ORDINARY-SELL", 100, 100, kSymbolId,
+                                                            hy::OrderSide::Sell, ordinary_time);
+    ASSERT_TRUE(sink_->append_durable(ordinary_intent, ordinary_time).acked());
+    const auto ordinary_prepared = make_account_period_prepared(
+        ordinary_intent, false, scope.serial, rules_for(), ordinary_time);
+    ASSERT_EQ(ordinary_prepared.event_type, hy::AuditEventType::OrderAccountScopedPrepared);
+    ASSERT_TRUE(sink_->append_durable(ordinary_prepared, ordinary_time).acked());
+    EXPECT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 100'000'000);
+    ASSERT_NE(sink_->trade_scope_balance(scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto exit_time = kAccountRiskTestDayStart + 20;
+    const auto exit_intent = make_account_intent_record("HY-RESTRICTED-EXIT", 100, 100, kSymbolId,
+                                                        hy::OrderSide::Sell, exit_time);
+    ASSERT_TRUE(sink_->append_durable(exit_intent, exit_time).acked());
+    const auto exit_prepared = make_account_period_prepared(
+        exit_intent, true, policy.limits.version, rules_for(), exit_time);
+    ASSERT_EQ(exit_prepared.event_type, hy::AuditEventType::OrderRestrictedExitPrepared);
+    ASSERT_TRUE(sink_->append_durable(exit_prepared, exit_time).acked());
+    EXPECT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 200'000'000);
+    EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 100'000'000);
+
+    const auto blocked_time = kAccountRiskTestDayStart + 30;
+    const auto blocked_intent = make_account_intent_record("HY-EXIT-BASE-CAP", 100, 100, kSymbolId,
+                                                           hy::OrderSide::Sell, blocked_time);
+    ASSERT_TRUE(sink_->append_durable(blocked_intent, blocked_time).acked());
+    const auto blocked_prepared = make_account_period_prepared(
+        blocked_intent, true, policy.limits.version, rules_for(), blocked_time);
+    const auto frames_before_blocked_exit = sink_->frame_count();
+    EXPECT_FALSE(sink_->append_durable(blocked_prepared, blocked_time).acked());
+    EXPECT_EQ(sink_->frame_count(), frames_before_blocked_exit);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 200'000'000);
+
+    execution_.reset();
+    sink_.reset();
+    sink_ = std::make_unique<hy::DurableAuditSink>(audit_path_, *key_ring_, kAuditKeyId,
+                                                   hy::kMaxIntentOrphans, hy::AuditSinkOpenMode::Trading,
+                                                   hy::NeverSentWrites::Enabled);
+    ASSERT_TRUE(sink_->is_open());
+    ASSERT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Recovered);
+    EXPECT_EQ(sink_->recovered_checkpoints().size(), 2U);
+    EXPECT_EQ(sink_->recovered_intent_orphans(), 1U);
+    ASSERT_TRUE(sink_->account_risk().policy().has_value());
+    EXPECT_EQ(sink_->account_risk().latest_day(), hy::account_risk_audit::utc_day(ordinary_time));
+    EXPECT_EQ(sink_->account_risk().day_used(), 100'000'000);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 200'000'000);
+    EXPECT_EQ(sink_->active_trade_scope_serial(), 0U);
+    ASSERT_NE(sink_->trade_scope_balance(scope.serial), nullptr);
+    EXPECT_EQ(sink_->trade_scope_balance(scope.serial)->usage.used_notional, 100'000'000);
 }
 
 TEST_F(TradeScopeExecutionTest, RefusesGrantWithDifferentActivation) {

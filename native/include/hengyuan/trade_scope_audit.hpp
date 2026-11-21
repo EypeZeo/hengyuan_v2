@@ -63,6 +63,10 @@ inline bool permits_side(TradeScopeSides sides, OrderSide side) noexcept {
            (side == OrderSide::Sell && (sides == TradeScopeSides::Sell || sides == TradeScopeSides::Both));
 }
 
+inline bool is_scoped_prepared(AuditEventType event) noexcept {
+    return event == AuditEventType::OrderScopedPrepared || event == AuditEventType::OrderAccountScopedPrepared;
+}
+
 inline bool is_control_event(AuditEventType event) noexcept {
     return event == AuditEventType::TradeScopeInstalled || event == AuditEventType::TradeScopeRevoked;
 }
@@ -152,13 +156,14 @@ public:
     [[nodiscard]] std::optional<std::int64_t> charge_for(const AuditRecord& record) const noexcept {
         const auto serial = serial_of(record);
         const auto* scope = serial != 0 && serial == active_serial_ ? find(serial) : nullptr;
-        if (!scope || record.event_type != AuditEventType::OrderScopedPrepared ||
+        if (!scope || !is_scoped_prepared(record.event_type) ||
             record.mode != ExecutionMode::Live || record.resulting_state != OrderState::Submitting ||
             record.client_order_id[0] == '\0' || record.symbol_id != scope->symbol_id ||
             !permits_side(scope->sides, record.side) || record.exchange_order_id != 0 || record.filled_qty_ticks != 0 ||
             record.avg_fill_price_ticks != 0 || record.detail_msg[0] < '0' || record.detail_msg[0] > '1' ||
             record.detail_msg[1] < '0' || record.detail_msg[1] > '9' ||
-            !empty_bytes(std::span(record.detail_msg).subspan(2))) return std::nullopt;
+            !empty_bytes(std::span(record.detail_msg).subspan(
+                record.event_type == AuditEventType::OrderAccountScopedPrepared ? 4 : 2))) return std::nullopt;
         const int scale = 10 * (record.detail_msg[0] - '0') + (record.detail_msg[1] - '0');
         const auto amount = quote_notional(record.price_ticks, record.qty_ticks, scale);
         if (!amount || !scope->usage.can_charge(*amount)) return std::nullopt;

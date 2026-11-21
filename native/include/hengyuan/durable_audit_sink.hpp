@@ -64,6 +64,7 @@
 #include <hengyuan/position_truth.hpp>
 #include <hengyuan/secure_wipe.hpp>
 #include <hengyuan/store_binding.hpp>
+#include <hengyuan/account_risk_audit.hpp>
 #include <hengyuan/trade_scope_audit.hpp>
 
 #include <array>
@@ -587,9 +588,26 @@ public:
         return trade_scopes_.find(serial);
     }
 
+    const account_risk_audit::Ledger& account_risk() const noexcept { return account_risk_; }
+
+    AuditAppendResult append_account_risk_policy(const VerifiedAccountRiskPolicy& verified, std::uint32_t symbol_id,
+                                                 std::int64_t now_ms) noexcept {
+        if (!trade_scope_writes_available()) return {};
+        const auto& policy = verified.policy();
+        const auto& subject = policy.store;
+        const auto binding = read_binding();
+        if (judge_store_binding(binding, subject.environment, subject.account_uid) != BindingJudgement::Match ||
+            subject.store_uuid_lo != store_uuid_lo_ || subject.store_uuid_hi != store_uuid_hi_) return {};
+        const account_risk_audit::Policy stored{policy.limits, symbol_id};
+        return append_scope_control(account_risk_audit::policy_record(stored, now_ms), now_ms);
+    }
+
     AuditAppendResult append_trade_scope_install(const TradeScopeGrant& grant, std::uint32_t symbol_id,
                                                 std::int64_t now_ms) noexcept {
         if (!trade_scope_writes_available() || !valid_trade_scope_grant(grant)) return {};
+        if (const auto& policy = account_risk_.policy(); policy &&
+            (grant.binding.policy_version != policy->limits.version || symbol_id != policy->symbol_id ||
+             std::string_view(grant.symbol.data()) != kAccountRiskSymbol)) return {};
         const auto binding = read_binding();
         const auto& subject = grant.binding.store;
         if (judge_store_binding(binding, subject.environment, subject.account_uid) != BindingJudgement::Match ||
@@ -619,32 +637,50 @@ public:
     // auto-retries. now_ms is caller-supplied (this codebase's established
     // clock-injection style, not read from a global clock here).
     AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) noexcept {
-        if (rec.event_type == AuditEventType::OrderCancelPrepared ||
-            rec.event_type == AuditEventType::OrderCancelNotSent ||
-            trade_scope_audit::is_control_event(rec.event_type)) return {};
-        if (rec.event_type == AuditEventType::OrderIntentCreated) {
-            if (!attempt_watermark_.permits(rec.client_order_id)) return {};
-        }
+        const auto type = rec.event_type;
+        if (type == AuditEventType::OrderCancelPrepared || type == AuditEventType::OrderCancelNotSent ||
+            type == AuditEventType::AccountRiskPolicyInstalled || trade_scope_audit::is_control_event(type)) return {};
+        if (type == AuditEventType::OrderIntentCreated && !attempt_watermark_.permits(rec.client_order_id)) return {};
+
+        const bool legacy = rec.mode == ExecutionMode::Live && type == AuditEventType::OrderSubmitPrepared;
+        const bool account_prepared = account_risk_audit::is_account_prepared(type);
+        const bool scoped = trade_scope_audit::is_scoped_prepared(type);
+        if (account_risk_.policy() && (legacy || type == AuditEventType::OrderScopedPrepared)) return {};
+
         std::optional<std::int64_t> charge;
-        if (rec.event_type == AuditEventType::OrderScopedPrepared) {
+        std::optional<account_risk_audit::Debit> debit;
+        if (scoped || account_prepared) {
             if (!trade_scope_writes_available()) return {};
-            charge = trade_scopes_.charge_for(rec);
-            if (!charge) return {};
-        }
-        const auto result = append_impl(rec, now_ms, write_version_);
-        if (charge) {
-            if (!result.acked()) {
-                trade_scope_write_uncertain_ = true;
-            } else {
-                const auto serial = trade_scope_audit::serial_of(rec);
-                if (!trade_scopes_.charge(serial, *charge)) {
-                    trade_scope_write_uncertain_ = true;
-                    return {};
-                }
-                last_scope_charge_ = {serial, *charge, {}};
-                std::memcpy(last_scope_charge_.order.id, rec.client_order_id, kClientOrderIdLen + 1);
+            if (scoped) {
+                charge = trade_scopes_.charge_for(rec);
+                if (!charge) return {};
+            }
+            if (account_prepared) {
+                debit = account_risk_.debit_for(rec, now_ms);
+                if (!debit) return {};
             }
         }
+
+        const auto result = append_impl(rec, now_ms, write_version_);
+        if (scoped || account_prepared) {
+            if (!result.acked()) {
+                trade_scope_write_uncertain_ = true;
+                return result;
+            }
+            const auto serial = scoped ? trade_scope_audit::serial_of(rec) : 0;
+            if (charge && !trade_scopes_.charge(serial, *charge)) {
+                trade_scope_write_uncertain_ = true;
+                return {};
+            }
+            if (debit) {
+                account_risk_.charge(*debit);
+            } else {
+                debit = account_risk_.charge_legacy(now_ms, *charge);
+            }
+            last_scope_charge_ = {serial, charge.value_or(0), *debit, {}};
+            std::memcpy(last_scope_charge_.order.id, rec.client_order_id, kClientOrderIdLen + 1);
+        }
+        if (legacy && result.acked()) account_risk_.note_unmetered(now_ms);
         return result;
     }
 
@@ -823,10 +859,10 @@ public:
         // A failed closure may reach disk; prevent restarting its generated identity.
         attempt_watermark_.observe(rec.client_order_id);
         out.append = append_impl(rec, now_ms, kFrameFormatVersionV6);
-        const bool refunds_scope = last_scope_charge_.serial != 0 &&
-                                   last_scope_charge_.order.view() == rec.client_order_id;
-        if (refunds_scope) {
-            if (out.append.acked() && trade_scopes_.refund(last_scope_charge_.serial, last_scope_charge_.amount)) {
+        if (last_scope_charge_.order.view() == rec.client_order_id) {
+            const auto& charge = last_scope_charge_;
+            if (out.append.acked() && (charge.serial == 0 || trade_scopes_.refund(charge.serial, charge.amount)) &&
+                account_risk_.refund(charge.account)) {
                 last_scope_charge_ = {};
             } else {
                 trade_scope_write_uncertain_ = true;
@@ -859,13 +895,26 @@ private:
     friend class BinancePrivateRestClient;
 
     AuditAppendResult append_scope_control(const AuditRecord& record, std::int64_t now_ms) noexcept {
-        try {
-            if (!trade_scopes_.stage_control(record)) return {};
-        } catch (...) {
-            return {};
+        const bool account = record.event_type == AuditEventType::AccountRiskPolicyInstalled;
+        const auto policy = account ? account_risk_audit::decode_policy(record) : std::nullopt;
+        if (account) {
+            if (!policy || !account_risk_.can_install(*policy)) return {};
+        } else {
+            try {
+                if (!trade_scopes_.stage_control(record)) return {};
+            } catch (...) {
+                return {};
+            }
         }
         const auto result = append_impl(record, now_ms, kFrameFormatVersionV6);
-        trade_scopes_.finish_control(record, result.acked());
+        if (policy) {
+            if (result.acked()) {
+                account_risk_.install(*policy);
+                trade_scopes_.retire_active();
+            }
+        } else {
+            trade_scopes_.finish_control(record, result.acked());
+        }
         if (!result.acked()) {
             trade_scope_write_uncertain_ = true;
             return result;
@@ -1187,6 +1236,7 @@ private:
     struct ReplayState {
         std::uint64_t scope_serial{0};
         std::int64_t scope_charge{0};
+        account_risk_audit::Debit account_debit{};
         bool intent_created{false};
         bool established{false};
         OrderState state{OrderState::Intent};
@@ -1343,6 +1393,7 @@ private:
 
     RecoveryScanStatus run_recovery_scan_impl(const std::string& path) {
         trade_scopes_ = {};
+        account_risk_ = {};
         last_scope_charge_ = {};
         std::vector<std::byte> content;
         if (!read_entire_log(content)) return RecoveryScanStatus::IoError;
@@ -1426,9 +1477,19 @@ private:
             }
             max_version_seen = frame.format_version;
 
-            if (trade_scope_audit::is_control_event(frame.record.event_type)) {
-                if (!trade_scopes_.stage_control(frame.record)) return RecoveryScanStatus::Corrupt;
-                trade_scopes_.finish_control(frame.record, true);
+            const auto type = frame.record.event_type;
+            const auto utc_ms = frame_wall_time_ms(frame.time_kind, frame.recorded_utc_ms);
+            if (type == AuditEventType::AccountRiskPolicyInstalled || trade_scope_audit::is_control_event(type)) {
+                if (type == AuditEventType::AccountRiskPolicyInstalled) {
+                    const auto policy = account_risk_audit::decode_policy(frame.record);
+                    if (!policy || !account_risk_.can_install(*policy) || frame.record.timestamp_ms != utc_ms)
+                        return RecoveryScanStatus::Corrupt;
+                    account_risk_.install(*policy);
+                    trade_scopes_.retire_active();
+                } else {
+                    if (!trade_scopes_.stage_control(frame.record)) return RecoveryScanStatus::Corrupt;
+                    trade_scopes_.finish_control(frame.record, true);
+                }
                 macs_by_sequence.push_back(frame.mac);
                 running_prev_mac = frame.mac;
                 ++expected_seq;
@@ -1464,18 +1525,35 @@ private:
                  frame.record.filled_qty_ticks > rs.intended_qty_ticks)) {
                 return RecoveryScanStatus::Corrupt;
             }
-            if (frame.record.event_type == AuditEventType::OrderScopedPrepared) {
-                const auto charge = trade_scopes_.charge_for(frame.record);
+            const bool scoped = trade_scope_audit::is_scoped_prepared(type);
+            const bool account_prepared = account_risk_audit::is_account_prepared(type);
+            const bool legacy = frame.record.mode == ExecutionMode::Live && type == AuditEventType::OrderSubmitPrepared;
+            if (account_risk_.policy() && (legacy || type == AuditEventType::OrderScopedPrepared))
+                return RecoveryScanStatus::Corrupt;
+            if (legacy) account_risk_.note_unmetered(utc_ms);
+            if (scoped || account_prepared) {
+                const auto& record = frame.record;
                 if (!rs.established || !rs.intent_created || rs.state != OrderState::Intent ||
-                    rs.exchange_order_id != 0 || rs.filled_qty_ticks != 0 || !charge ||
-                    rs.symbol_id != frame.record.symbol_id || rs.side != frame.record.side ||
-                    rs.mode != frame.record.mode || rs.intended_price_ticks != frame.record.price_ticks ||
-                    rs.intended_qty_ticks != frame.record.qty_ticks) return RecoveryScanStatus::Corrupt;
-                rs.scope_serial = trade_scope_audit::serial_of(frame.record);
-                if (!trade_scopes_.charge(rs.scope_serial, *charge)) return RecoveryScanStatus::Corrupt;
-                rs.scope_charge = *charge;
+                    rs.exchange_order_id != 0 || rs.filled_qty_ticks != 0 ||
+                    rs.symbol_id != record.symbol_id || rs.side != record.side || rs.mode != record.mode ||
+                    rs.intended_price_ticks != record.price_ticks || rs.intended_qty_ticks != record.qty_ticks)
+                    return RecoveryScanStatus::Corrupt;
+                if (scoped) {
+                    const auto charge = trade_scopes_.charge_for(record);
+                    rs.scope_serial = trade_scope_audit::serial_of(record);
+                    if (!charge || !trade_scopes_.charge(rs.scope_serial, *charge)) return RecoveryScanStatus::Corrupt;
+                    rs.scope_charge = *charge;
+                }
+                if (account_prepared) {
+                    const auto debit = account_risk_.debit_for(record, utc_ms);
+                    if (!debit) return RecoveryScanStatus::Corrupt;
+                    account_risk_.charge(*debit);
+                    rs.account_debit = *debit;
+                } else {
+                    rs.account_debit = account_risk_.charge_legacy(utc_ms, rs.scope_charge);
+                }
                 rs.state = OrderState::Submitting;
-            } else if (rs.scope_serial != 0 && frame.record.event_type == AuditEventType::OrderSubmitPrepared) {
+            } else if (rs.scope_serial != 0 && type == AuditEventType::OrderSubmitPrepared) {
                 return RecoveryScanStatus::Corrupt;
             } else if (cancel_frame) {
                 const auto pending = cancel_prepared::decode(frame.record);
@@ -1543,6 +1621,7 @@ private:
                 }
                 if (rs.scope_serial != 0 && !trade_scopes_.refund(rs.scope_serial, rs.scope_charge))
                     return RecoveryScanStatus::Corrupt;
+                if (!account_risk_.refund(rs.account_debit)) return RecoveryScanStatus::Corrupt;
                 rs.state = OrderState::NeverSent;
                 ++never_sent_count_;
             } else if (frame.record.resulting_state == rs.state) {
@@ -2083,9 +2162,11 @@ private:
     struct ScopeCharge {
         std::uint64_t serial{0};
         std::int64_t amount{0};
+        account_risk_audit::Debit account{};
         ClientOrderId order{};
     };
     trade_scope_audit::Ledger trade_scopes_;
+    account_risk_audit::Ledger account_risk_;
     ScopeCharge last_scope_charge_{};
     bool trade_scope_write_uncertain_{false};
 

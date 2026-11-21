@@ -1560,7 +1560,10 @@ if(HY_BUILD_TESTS)
         hengyuan_set_warnings(test_binance_signer)
         gtest_discover_tests(test_binance_signer)
 
-        add_executable(test_trade_scope_approval tests/test_trade_scope_approval.cpp)
+        add_executable(test_trade_scope_approval
+            tests/test_trade_scope_approval.cpp
+            tests/test_account_risk_submit.cpp
+        )
         target_link_libraries(test_trade_scope_approval PRIVATE
             hengyuan_core OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST} GTest::gtest_main)
         target_include_directories(test_trade_scope_approval SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})

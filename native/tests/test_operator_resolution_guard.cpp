@@ -1163,7 +1163,7 @@ TEST(OperatorResolutionGuard, TheBindingIsReadByTheToolOnceAndJudgedByTheFlowOnc
                           {kTool, 1, "the one read, with the audit sink's own identity"},
                           {kSink, 1, "recovered Testnet cancellation reads the held store's binding"}});
     expect_named_only_in("judge_store_binding", {{kBinding, 1, "the definition"},
-                                                 {kSink, 1, "the scope installation checks the bound store"},
+                                                 {kSink, 2, "scope and account policy installation check the bound store"},
                                                 {kBindingWriter, 1, "ensure_store_binding()"},
                                                 {kFlow, 1, "resolve_order(): the one judgement of a resolution"},
                                                 {"include/hengyuan/binance_private_rest.hpp", 1, "durable cancellation checks the exchange account"},

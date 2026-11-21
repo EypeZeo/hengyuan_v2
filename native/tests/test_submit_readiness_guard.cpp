@@ -781,8 +781,8 @@ TEST(SubmitReadinessGuard, PreparedAckAndFinalClaimPrecedeTheOnlySubmitCall) {
     const SourceFile* orchestrator = find_source("include/hengyuan/live_submit_orchestrator.hpp");
     ASSERT_NE(orchestrator, nullptr);
     const std::string& code = orchestrator->code;
-    const std::size_t prepared = code.find("ar.event_type = AuditEventType::OrderSubmitPrepared;");
-    const std::size_t prepared_ack = code.find("if (!detail::append_order_frame(ctx, ar))", prepared);
+    const std::size_t prepared = code.find("prepared.event_type = AuditEventType::OrderSubmitPrepared;");
+    const std::size_t prepared_ack = code.find("if (!detail::append_order_frame(ctx, prepared))", prepared);
     const std::size_t transition = code.find("result.order.transition_to(OrderState::Submitting);", prepared_ack);
     const std::size_t claim = code.find("ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check, at_claim)", transition);
     const std::size_t refusal = code.find("if (final_refusal)", claim);
@@ -799,6 +799,9 @@ TEST(SubmitReadinessGuard, PreparedAckAndFinalClaimPrecedeTheOnlySubmitCall) {
     EXPECT_LT(prepared, prepared_ack);
     EXPECT_LT(prepared_ack, transition);
     EXPECT_LT(transition, claim);
+    const auto final_account_check = code.find("scope->permits_account_claim(account_policy_version, prepared.timestamp_ms)", transition);
+    ASSERT_NE(final_account_check, std::string::npos);
+    EXPECT_LT(final_account_check, claim);
     EXPECT_LT(claim, refusal);
     EXPECT_LT(refusal, submitted_audit);
     EXPECT_LT(submitted_audit, submit);
