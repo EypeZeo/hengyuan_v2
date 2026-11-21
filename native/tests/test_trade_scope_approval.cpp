@@ -1,18 +1,30 @@
 // SPDX-License-Identifier: proprietary
 // Trade-scope grant signature, binding, encoding, and budget regressions.
 #include <gtest/gtest.h>
+#include <hengyuan/account_truth.hpp>
+#include <hengyuan/binance_clock_sync.hpp>
+#include <hengyuan/durable_audit_sink.hpp>
+#include <hengyuan/durable_kill_switch.hpp>
 #include <hengyuan/owner_trade_scope_approval.hpp>
+#include <hengyuan/store_binding_writer.hpp>
 #include <hengyuan/trade_scope_budget.hpp>
+#include <hengyuan/trade_scope_execution.hpp>
+#include <hengyuan/trade_scope_owner_key.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -78,7 +90,7 @@ hy::TradeScopeGrant make_grant() {
     }
     grant.binding.key_id = 0x2122232425262728ULL;
     grant.serial = 0x3132333435363738ULL;
-    grant.issued_at_ms = 900'000;
+    grant.issued_at_ms = kExchangeUpperMs;
     grant.not_after_ms = 1'030'000;
     constexpr std::string_view symbol = "BTCUSDT";
     std::copy(symbol.begin(), symbol.end(), grant.symbol.begin());
@@ -153,6 +165,128 @@ hy::ClosureAppendResult appended_closure(hy::AuditAppendResult append = acked_ap
 std::optional<hy::TradeScopeBudget> empty_budget(const hy::VerifiedTradeScope& scope) {
     return hy::TradeScopeBudget::rebuild(scope, std::span<const hy::TradeScopeBudgetRecord>{});
 }
+
+class TradeScopeExecutionTest : public ::testing::Test {
+protected:
+    static constexpr std::uint32_t kAuditKeyId = 1;
+    static constexpr std::uint64_t kAccountUid = 71;
+    static constexpr std::uint32_t kSymbolId = 7;
+    static constexpr hy::TradeScopeLimits kRuntimeLimits{100'000'000, 250'000'000, 200'000'000, 100};
+
+    void SetUp() override {
+        static std::atomic<std::uint64_t> sequence{0};
+        const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+        directory_ = std::filesystem::temp_directory_path() /
+                     ("hy-trade-scope-execution-" + std::to_string(ticks) + "-" +
+                      std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
+        ASSERT_TRUE(std::filesystem::create_directory(directory_));
+        audit_path_ = (directory_ / "audit.log").string();
+
+        std::array<std::byte, hy::kKekSize> kek{};
+        for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x20 + i);
+        key_ring_ = std::make_unique<hy::KeyRing>(kek);
+        std::array<std::byte, hy::kKeyBlockSize> key{};
+        for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::byte>(0x51 + i);
+        hy::WrappedKeyRecord wrapped{};
+        ASSERT_EQ(key_ring_->add_key(kAuditKeyId, key, wrapped), hy::KeyRingAddStatus::Ok);
+
+        sink_ = std::make_unique<hy::DurableAuditSink>(audit_path_, *key_ring_, kAuditKeyId,
+                                                       hy::kMaxIntentOrphans, hy::AuditSinkOpenMode::Trading,
+                                                       hy::NeverSentWrites::Enabled);
+        ASSERT_TRUE(sink_->is_open());
+        ASSERT_TRUE(sink_->trade_scope_writes_available());
+        const auto bind_now = hy::fetch_clock_pair();
+        ASSERT_TRUE(hy::store_may_be_used(hy::ensure_store_binding(
+            *sink_, audit_path_, *key_ring_, hy::StoreEnvironment::Testnet, kAccountUid, bind_now.system_ms())));
+        const auto store_binding = sink_->read_binding();
+        ASSERT_EQ(store_binding.status, hy::StoreBindingStatus::Bound);
+        ASSERT_EQ(store_binding.binding.environment, hy::StoreEnvironment::Testnet);
+        ASSERT_EQ(store_binding.binding.account_uid, kAccountUid);
+
+        hy::DurableKillSwitchConfig kill_config{audit_path_, hy::StoreEnvironment::Testnet, kAccountUid,
+                                                sink_->store_uuid_lo(), sink_->store_uuid_hi(), kAuditKeyId, true};
+        kill_store_ = std::make_unique<hy::DurableKillSwitchStore>(kill_config, *key_ring_);
+        ASSERT_TRUE(kill_store_->recover(kill_switch_));
+        ASSERT_EQ(kill_switch_.persistence_health(), hy::KillPersistenceHealth::Ready);
+        ASSERT_EQ(kill_switch_.state(), hy::KillState::Normal);
+
+        const auto clock_sample = hy::fetch_clock_pair();
+        hy::ClockOffsetSnapshot clock_snapshot{};
+        clock_snapshot.error_bound_ms = 1;
+        clock_snapshot.system_at_fetch_ms = clock_sample.system_ms();
+        clock_snapshot.steady_at_fetch_ms = clock_sample.steady_ms();
+        ASSERT_TRUE(clock_.publish(clock_snapshot));
+
+        binding_ = make_grant().binding;
+        binding_.store = {hy::StoreEnvironment::Testnet, kAccountUid, sink_->store_uuid_lo(), sink_->store_uuid_hi()};
+        binding_.scope_epoch = kill_switch_.snapshot().scope_epoch;
+        execution_ = std::make_unique<hy::TradeScopeExecution>(*sink_, kill_switch_, authority_, clock_, binding_);
+        ASSERT_TRUE(execution_->current_binding().has_value());
+        ASSERT_TRUE(execution_->exchange_upper().has_value());
+    }
+
+    void TearDown() override {
+        execution_.reset();
+        kill_store_.reset();
+        sink_.reset();
+        key_ring_.reset();
+        if (!directory_.empty()) {
+            std::error_code error;
+            std::filesystem::remove_all(directory_, error);
+        }
+    }
+
+    std::optional<hy::VerifiedTradeScope> signed_scope(
+        hy::TradeScopeBinding binding, std::uint64_t serial,
+        hy::TradeScopeSides sides = hy::TradeScopeSides::Buy,
+        hy::TradeScopeLimits limits = kRuntimeLimits) const {
+        const auto upper = execution_->exchange_upper();
+        if (!upper || *upper <= 0 || *upper > std::numeric_limits<std::int64_t>::max() - 30'000) return std::nullopt;
+        auto grant = make_grant();
+        grant.binding = binding;
+        grant.serial = serial;
+        grant.issued_at_ms = *upper;
+        grant.not_after_ms = *upper + 30'000;
+        grant.sides = sides;
+        grant.limits = limits;
+        const auto payload = hy::encode_trade_scope_grant(grant);
+        if (!payload) return std::nullopt;
+        const auto signature = signer_.sign(std::span<const std::byte>(*payload));
+        if (signature.empty()) return std::nullopt;
+        return verify_payload(std::span<const std::byte>(*payload),
+                              std::span<const unsigned char>(signature.data(), signature.size()), signer_, binding,
+                              hy::TradeScopePolicy{limits, 60'000}, upper);
+    }
+
+    hy::SymbolRules rules_for(std::string_view symbol = "BTCUSDT") const {
+        hy::SymbolRules rules{};
+        std::copy(symbol.begin(), symbol.end(), rules.symbol);
+        rules.price_scale = 2;
+        rules.qty_scale = 2;
+        return rules;
+    }
+
+    hy::ExposureLimits exposure(std::int64_t current = 0) const {
+        hy::ExposureLimits limits{};
+        limits.total_exposure_notional_cap = 300'000'000;
+        limits.current_exposure_notional = current;
+        return limits;
+    }
+
+    std::int64_t now_ms() const { return hy::fetch_clock_pair().system_ms(); }
+
+    std::filesystem::path directory_;
+    std::string audit_path_;
+    std::unique_ptr<hy::KeyRing> key_ring_;
+    std::unique_ptr<hy::DurableAuditSink> sink_;
+    std::unique_ptr<hy::DurableKillSwitchStore> kill_store_;
+    hy::KillSwitch kill_switch_;
+    hy::SubmitAuthority authority_;
+    hy::ClockOffsetPublisher clock_;
+    hy::TradeScopeBinding binding_{};
+    P256Fixture signer_;
+    std::unique_ptr<hy::TradeScopeExecution> execution_;
+};
 
 }  // namespace
 
@@ -503,4 +637,143 @@ TEST(TradeScopeBudget, AcceptsIntegerBoundaryWithoutOverflow) {
     EXPECT_EQ(budget->used_notional(), 0);
     EXPECT_EQ(budget->available_notional(), kMax);
     EXPECT_TRUE(budget->reserve("one", 1));
+}
+
+TEST_F(TradeScopeExecutionTest, RefusesGrantWithDifferentActivation) {
+    ASSERT_NE(signer_.key, nullptr);
+    auto wrong_binding = binding_;
+    wrong_binding.activation[0] ^= std::byte{0x80};
+    const auto scope = signed_scope(wrong_binding, 1);
+    ASSERT_TRUE(scope.has_value());
+
+    const auto authority_epoch = authority_.epoch();
+    EXPECT_EQ(execution_->install(*scope, rules_for(), kSymbolId, now_ms()), hy::TradeScopeChange::Refused);
+    EXPECT_EQ(sink_->trade_scope_high_water(), 0U);
+    EXPECT_EQ(authority_.epoch(), authority_epoch);
+    EXPECT_EQ(execution_->active(), nullptr);
+}
+
+TEST_F(TradeScopeExecutionTest, TargetedRevocationAdvancesHighWaterAndInvalidatesOldClaim) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto first = signed_scope(binding_, 40);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_EQ(execution_->install(*first, rules_for(), kSymbolId, now_ms()), hy::TradeScopeChange::Applied);
+    ASSERT_TRUE(execution_->permits_claim(40));
+
+    const auto stale_claim_epoch = authority_.epoch();
+    EXPECT_EQ(execution_->revoke(42, now_ms()), hy::TradeScopeChange::Applied);
+    EXPECT_EQ(authority_.claim(stale_claim_epoch), false);
+    EXPECT_EQ(sink_->trade_scope_high_water(), 42U);
+    EXPECT_EQ(sink_->active_trade_scope_serial(), 40U);
+    ASSERT_NE(execution_->active(), nullptr);
+    EXPECT_EQ(execution_->active()->serial, 40U);
+    EXPECT_TRUE(execution_->permits_claim(40));
+
+    const auto skipped = signed_scope(binding_, 41);
+    ASSERT_TRUE(skipped.has_value());
+    EXPECT_EQ(execution_->install(*skipped, rules_for(), kSymbolId, now_ms()), hy::TradeScopeChange::Refused);
+    const auto after_high_water = signed_scope(binding_, 43);
+    ASSERT_TRUE(after_high_water.has_value());
+    EXPECT_EQ(execution_->install(*after_high_water, rules_for(), kSymbolId, now_ms()),
+              hy::TradeScopeChange::Applied);
+    EXPECT_EQ(sink_->trade_scope_high_water(), 43U);
+    EXPECT_TRUE(execution_->permits_claim(43));
+    EXPECT_FALSE(execution_->permits_claim(40));
+}
+
+TEST_F(TradeScopeExecutionTest, ReplacementInvalidatesThePreviousScope) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto old_scope = signed_scope(binding_, 50, hy::TradeScopeSides::Buy);
+    ASSERT_TRUE(old_scope.has_value());
+    ASSERT_EQ(execution_->install(*old_scope, rules_for(), kSymbolId, now_ms()), hy::TradeScopeChange::Applied);
+    ASSERT_TRUE(execution_->permits_claim(50));
+
+    const auto replacement = signed_scope(binding_, 51, hy::TradeScopeSides::Sell);
+    ASSERT_TRUE(replacement.has_value());
+    EXPECT_EQ(execution_->install(*replacement, rules_for(), kSymbolId, now_ms()),
+              hy::TradeScopeChange::Applied);
+
+    ASSERT_NE(execution_->active(), nullptr);
+    EXPECT_EQ(execution_->active()->serial, 51U);
+    EXPECT_EQ(execution_->active()->sides, hy::TradeScopeSides::Sell);
+    EXPECT_FALSE(execution_->permits_claim(50));
+    EXPECT_TRUE(execution_->permits_claim(51));
+}
+
+TEST_F(TradeScopeExecutionTest, SignedScopeAuthorizesOnlyPermittedOrderAndGrantExposure) {
+    ASSERT_NE(signer_.key, nullptr);
+    const auto scope = signed_scope(binding_, 60, hy::TradeScopeSides::Buy, kRuntimeLimits);
+    ASSERT_TRUE(scope.has_value());
+    ASSERT_EQ(execution_->install(*scope, rules_for(), kSymbolId, now_ms()), hy::TradeScopeChange::Applied);
+
+    const auto rules = rules_for();
+    EXPECT_TRUE(execution_->authorizes(60, rules, hy::OrderSide::Buy, hy::OrderType::Limit,
+                                       10'000, 1, 10'000, exposure()));
+    EXPECT_FALSE(execution_->authorizes(60, rules_for("ETHUSDT"), hy::OrderSide::Buy, hy::OrderType::Limit,
+                                        10'000, 1, 10'000, exposure()));
+    EXPECT_FALSE(execution_->authorizes(60, rules, hy::OrderSide::Sell, hy::OrderType::Limit,
+                                        10'000, 1, 10'000, exposure()));
+    EXPECT_FALSE(execution_->authorizes(60, rules, hy::OrderSide::Buy, static_cast<hy::OrderType>(255),
+                                        10'000, 1, 10'000, exposure()));
+    EXPECT_FALSE(execution_->authorizes(60, rules, hy::OrderSide::Buy, hy::OrderType::Limit,
+                                        10'000, 1, 10'000, exposure(100'000'001)));
+    EXPECT_FALSE(execution_->authorizes(60, rules, hy::OrderSide::Buy, hy::OrderType::Limit,
+                                        10'001, 1, 10'001, exposure()));
+    EXPECT_FALSE(execution_->authorizes(60, rules, hy::OrderSide::Buy, hy::OrderType::Limit,
+                                        10'000, 1, 9'899, exposure()));
+
+    EXPECT_TRUE(execution_->can_reserve(60, rules, 10'000, 1));
+    EXPECT_FALSE(execution_->can_reserve(60, rules, 10'001, 1));
+}
+
+TEST_F(TradeScopeExecutionTest, ProductionKeyRequiresTheCurrentStoresFirstOrderDeclaration) {
+    namespace files = hy::spot_owner_key_store;
+    const files::StoreFiles production{(directory_ / "production.log").string(), kAuditKeyId,
+                                      (directory_ / "production.kek").string(), (directory_ / "production.keys").string()};
+    const auto public_path = (directory_ / "owner.der").string();
+    const auto draft_path = (directory_ / "first-order.grant").string();
+    const auto signature_path = production.log + ".first-order.sig";
+    const auto owner_key_id = std::uint64_t{41};
+    ASSERT_FALSE(signer_.public_der.empty());
+
+    std::array<std::byte, hy::kKekSize> kek{};
+    std::array<std::byte, hy::kKeyBlockSize> audit_key{};
+    kek.fill(std::byte{0x51});
+    audit_key.fill(std::byte{0x62});
+    hy::KeyRing keys(kek);
+    hy::WrappedKeyRecord wrapped{};
+    ASSERT_EQ(keys.add_key(kAuditKeyId, audit_key, wrapped), hy::KeyRingAddStatus::Ok);
+    ASSERT_EQ(files::publish_file(production.kek, kek), hy::ExportStatus::Ok);
+    ASSERT_EQ(files::publish_file(production.wrapped_keys, hy::encode_audit_key_file(std::span(&wrapped, 1))),
+              hy::ExportStatus::Ok);
+    ASSERT_EQ(files::publish_file(public_path, std::as_bytes(std::span(signer_.public_der))), hy::ExportStatus::Ok);
+    {
+        hy::DurableAuditSink sink(production.log, keys, kAuditKeyId);
+        ASSERT_TRUE(sink.is_open());
+        ASSERT_TRUE(hy::store_may_be_used(hy::ensure_store_binding(
+            sink, production.log, keys, hy::StoreEnvironment::Production, kAccountUid, now_ms())));
+    }
+    ASSERT_EQ(hy::TradeScopeOwnerKey::enroll(production, hy::StoreEnvironment::Production, owner_key_id, public_path),
+              hy::ExportStatus::Ok);
+    ASSERT_EQ(hy::TradeScopeOwnerKey::publish_first_order_draft(production, draft_path), hy::ExportStatus::Ok);
+    auto store = files::open_existing_store(production, hy::StoreEnvironment::Production);
+    ASSERT_NE(store.sink, nullptr);
+    EXPECT_FALSE(hy::TradeScopeOwnerKey::load(production.log, *store.sink));
+    const hy::OperatorResetScope wrong_store{hy::StoreEnvironment::Testnet, kAccountUid,
+                                           store.sink->store_uuid_lo(), store.sink->store_uuid_hi()};
+    const auto wrong_signature = signer_.sign(hy::scope_first_order_declaration(wrong_store, owner_key_id));
+    ASSERT_FALSE(wrong_signature.empty());
+    ASSERT_EQ(files::publish_file(signature_path, std::as_bytes(std::span(wrong_signature))), hy::ExportStatus::Ok);
+    EXPECT_FALSE(hy::TradeScopeOwnerKey::load(production.log, *store.sink));
+    ASSERT_TRUE(std::filesystem::remove(signature_path));
+
+    std::vector<std::byte> declaration;
+    ASSERT_EQ(hy::read_file_bounded(draft_path, declaration, hy::ScopeFirstOrderBytes{}.size()), hy::ReadFileStatus::Ok);
+    const auto signature = signer_.sign(declaration);
+    ASSERT_FALSE(signature.empty());
+    ASSERT_EQ(files::publish_file(signature_path, std::as_bytes(std::span(signature))), hy::ExportStatus::Ok);
+    const auto owner = hy::TradeScopeOwnerKey::load(production.log, *store.sink);
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_EQ(owner->subject().environment, hy::StoreEnvironment::Production);
+    EXPECT_EQ(owner->key_id(), owner_key_id);
 }

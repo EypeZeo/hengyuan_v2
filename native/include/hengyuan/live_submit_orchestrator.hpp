@@ -46,6 +46,7 @@
 #include <hengyuan/spot_rate_limit_budget.hpp>
 #include <hengyuan/submit_readiness.hpp>
 #include <hengyuan/sweep_pump.hpp>
+#include <hengyuan/trade_scope_execution.hpp>
 #include <hengyuan/transport_policy.hpp>
 
 #include <chrono>
@@ -283,6 +284,8 @@ enum class OrchestratorGate : std::uint8_t {
     FinalAuthorizationRefused = 24,
     InFlightCapacityExceeded = 25,
     IntentOrphanBudgetExceeded = 26,
+    TradeScopeNotAuthorized = 27,
+    TradeScopeBudgetExhausted = 28,
 };
 
 struct OrchestratorResult {
@@ -383,8 +386,12 @@ struct OrchestratorContext {
     // an older generation is dropped. test_submit_readiness_guard.cpp pins that every OrchestratorContext built under include/ and src/ sets it.
     SubmitReadiness* readiness{nullptr};
 
-    // Captured when a caller admits a trade scope. Gate 11 still checks the order confirmation.
+    // Scope mode requires the current grant from the pipeline's execution owner.
     std::optional<TradeScopeEpoch> trade_scope_epoch{};
+    TradeScopeExecution* trade_scope{nullptr};
+    bool trade_scope_required{false};
+    std::int64_t scope_reference_price_ticks{0};
+    std::int64_t order_wall_ms{0};
 
     // Private-stream migration M3b (sweep_pump.hpp): the hot thread's side of the barrier sweep. Nullable like the fields around it: unset means
     // orchestrate_submit() does not move the sweep, and the barrier completes only if somebody else drives it (the synthetic readiness scripts the
@@ -452,7 +459,8 @@ namespace detail {
 // shadow at Intent, which is what that frame says.
 [[nodiscard]] inline bool append_order_frame(OrchestratorContext& ctx, const AuditRecord& ar) noexcept {
     if (!ctx.durable_audit.is_valid()) [[unlikely]] return false;
-    if (!ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()) [[unlikely]] return false;
+    const auto time = ctx.order_wall_ms > 0 ? ctx.order_wall_ms : ctx.now_ms;
+    if (!ctx.durable_audit.append_durable(ar, time).acked()) [[unlikely]] return false;
     if (ctx.fill_context != nullptr) {
         ctx.fill_context->durable_acked(std::string_view(ar.client_order_id), ar.resulting_state, ar.filled_qty_ticks,
                                         ar.exchange_order_id);
@@ -467,8 +475,9 @@ namespace detail {
                                                            never_sent::Reason reason, OrderRecord& order) noexcept {
     auto target = never_sent::class_a_target_of(intent);
     target.state = order.state;
+    const auto time = ctx.order_wall_ms > 0 ? ctx.order_wall_ms : ctx.now_ms;
     const ClosureAppendResult r = ctx.durable_audit.append_never_sent(
-        target, never_sent::class_a_closure_of(intent, reason, ctx.now_ms), ctx.now_ms);
+        target, never_sent::class_a_closure_of(intent, reason, time), time);
     if (r.status == ClosureAppendStatus::Appended || r.status == ClosureAppendStatus::Failed) {
         ctx.recently_closed.remember(std::string_view(intent.client_order_id));
     }
@@ -566,7 +575,16 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     const auto authorization_started = ctx.monotonic_now ? ctx.monotonic_now(ctx.monotonic_clock) : -1;
     const auto authorization_wall_ms = ctx.now_ms;
     const KillSwitch* const authorized_kill_switch = ctx.kill_switch;
-    const auto authorized_scope_epoch = ctx.trade_scope_epoch;
+    const auto* const scope = ctx.trade_scope_required ? ctx.trade_scope : nullptr;
+    const auto* const grant = scope ? scope->active() : nullptr;
+    if (ctx.trade_scope_required &&
+        (!grant || !ctx.readiness || !scope->matches(ctx.readiness->authority(), ctx.durable_audit.user_data) ||
+         ctx.durable_audit.closure_fn == nullptr || ctx.mode != ExecutionMode::Live || ctx.order_wall_ms <= 0)) {
+        result.gate = OrchestratorGate::TradeScopeNotAuthorized;
+        return result;
+    }
+    const auto scope_serial = grant ? grant->serial : 0;
+    const auto authorized_scope_epoch = grant ? std::optional(grant->binding.scope_epoch) : ctx.trade_scope_epoch;
     std::optional<SubmitReadyToken> ready_token;
     {
         NotReadyReason why = NotReadyReason::Unwired;
@@ -685,7 +703,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     }
 
     // Gate 9: Generate idempotent clientOrderId
-    auto coid = make_client_order_id(ctx.now_ms, ctx.sequence, ctx.symbol_id);
+    const auto order_time = ctx.order_wall_ms > 0 ? ctx.order_wall_ms : ctx.now_ms;
+    auto coid = make_client_order_id(order_time, ctx.sequence, ctx.symbol_id);
     result.order.client_order_id = coid;
     result.order.symbol_id = ctx.symbol_id;
     result.order.intended_price_ticks = ctx.price_ticks;
@@ -746,7 +765,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     AuditRecord intent_frame{};  // Q23 S6: kept for the class A closure -- what the log holds of this order, if a local gate refuses it below
     {
         AuditRecord& ar = intent_frame;
-        ar.timestamp_ms = ctx.now_ms;
+        ar.timestamp_ms = order_time;
         ar.event_type = AuditEventType::OrderIntentCreated;
         ar.mode = ctx.mode;
         ar.symbol_id = ctx.symbol_id;
@@ -776,14 +795,33 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     const OrderConfirmation confirmed_order = ctx.confirmation;
     std::int64_t confirm_notional = 0;
     (void)checked_notional(intent_frame.price_ticks, intent_frame.qty_ticks, confirm_notional);
-    if (!confirmed_order.confirmed) {
+    const auto scope_authorizes = [&]() noexcept {
+        return scope && ctx.trade_scope == scope && scope->authorizes(
+            scope_serial, result.order.rules_snapshot_at_submit, intent_frame.side, result.order.order_type,
+            intent_frame.price_ticks, intent_frame.qty_ticks, ctx.scope_reference_price_ticks, ctx.exposure_limits);
+    };
+    if (scope) {
+        if (!scope_authorizes()) {
+            result.gate = OrchestratorGate::TradeScopeNotAuthorized;
+            result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::TradeScopeRefused, result);
+            return result;
+        }
+        // This thread owns both installation and submission. No other order
+        // can spend this allowance before its Prepared append is attempted.
+        if (!scope->can_reserve(scope_serial, result.order.rules_snapshot_at_submit,
+                                intent_frame.price_ticks, intent_frame.qty_ticks)) {
+            result.gate = OrchestratorGate::TradeScopeBudgetExhausted;
+            result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::TradeScopeBudgetExhausted, result);
+            return result;
+        }
+    } else if (!confirmed_order.confirmed) {
         result.gate = OrchestratorGate::OperatorNotConfirmed;
         result.closure = detail::close_class_a_never_sent(ctx, intent_frame, never_sent::Reason::ConfirmationMissing, result);
         return result;
     }
-    if (!confirmed_order.authorizes(intent_frame.symbol_id, intent_frame.side, result.order.order_type,
-                                     intent_frame.price_ticks, intent_frame.qty_ticks,
-                                     confirm_notional, authorization_wall_ms)) {
+    if (!scope && !confirmed_order.authorizes(intent_frame.symbol_id, intent_frame.side, result.order.order_type,
+                                              intent_frame.price_ticks, intent_frame.qty_ticks,
+                                              confirm_notional, authorization_wall_ms)) {
         result.gate = OrchestratorGate::ConfirmationMismatch;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
@@ -899,6 +937,11 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         AuditRecord ar = intent_frame;
         ar.event_type = AuditEventType::OrderSubmitPrepared;
         ar.resulting_state = OrderState::Submitting;  // target state this record authorizes; not applied yet
+        if (scope) {
+            const auto& rules = result.order.rules_snapshot_at_submit;
+            const int native_scale = static_cast<int>(rules.price_scale) + static_cast<int>(rules.qty_scale);
+            trade_scope_audit::tag_prepared(ar, scope_serial, native_scale);
+        }
 
         if (!detail::append_order_frame(ctx, ar)) {
             // Never release the in-flight slot here -- a Failed result may still
@@ -925,14 +968,17 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             final_refusal = never_sent::Reason::AuthorizationExpired;
         } else {
             final_wall += final_steady - authorization_started;
-            if (!confirmed_order.authorizes(intent_frame.symbol_id, intent_frame.side, result.order.order_type,
-                                             intent_frame.price_ticks, intent_frame.qty_ticks, confirm_notional, final_wall)) {
+            if (scope && !scope_authorizes()) {
+                final_refusal = never_sent::Reason::TradeScopeInvalidated;
+            } else if (!scope && !confirmed_order.authorizes(
+                           intent_frame.symbol_id, intent_frame.side, result.order.order_type,
+                           intent_frame.price_ticks, intent_frame.qty_ticks, confirm_notional, final_wall)) {
                 final_refusal = never_sent::Reason::ConfirmationExpired;
             } else if (ctx.in_flight != slot_owner || !slot_owner->owns(in_flight_handle, coid.view())) {
                 final_refusal = never_sent::Reason::SlotOwnershipLost;
             } else if (!ctx.rate_limiter || !ctx.rate_limiter->reservation_valid(*reservation)) {
                 final_refusal = never_sent::Reason::ReservationLost;
-            } else if (ctx.trade_scope_epoch != authorized_scope_epoch ||
+            } else if ((!scope && ctx.trade_scope_epoch != authorized_scope_epoch) ||
                        ctx.kill_switch != authorized_kill_switch || ctx.kill_switch->open_revision() != kill_revision) {
                 final_refusal = never_sent::Reason::ReadinessRevoked;
             } else if (!ctx.account || validate_pre_trade(result.order.rules_snapshot_at_submit, intent_frame.side,
@@ -947,8 +993,13 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
         }
         return !final_refusal.has_value();
     };
+    const auto at_claim = [&]() noexcept {
+        if (!scope || scope->permits_claim(scope_serial)) return true;
+        final_refusal = never_sent::Reason::TradeScopeInvalidated;
+        return false;
+    };
     result.not_ready_reason = ctx.readiness
-                                  ? ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check)
+                                  ? ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check, at_claim)
                                   : NotReadyReason::Unwired;
     if (result.not_ready_reason != NotReadyReason::None && !final_refusal) {
         final_refusal = never_sent::Reason::ReadinessRevoked;

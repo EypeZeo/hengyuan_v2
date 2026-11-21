@@ -25,8 +25,9 @@ constexpr std::int64_t kMinDrillTimeMs = 1'577'836'800'000;  // 2020-01-01 UTC
 constexpr std::int64_t kMaxDrillTimeMs = 4'102'444'800'000;  // 2100-01-01 UTC
 
 void usage(std::FILE* out) {
-    std::fputs("Usage: hy_r6_prepare_drill --output-dir <new-directory> --uid <Testnet-account-uid>\n"
+    std::fputs("Usage: hy_r6_prepare_drill --output-dir <new-directory> --uid <Testnet-account-uid> [--empty]\n"
                "Creates a synthetic Prepared BTCUSDT order and local keys for the R6 Testnet drill.\n"
+               "Use --empty to create a bound store without a synthetic order.\n"
                "Use a private parent directory. No credentials or exchange connection are used.\n", out);
 }
 
@@ -45,7 +46,7 @@ bool write_bytes(const std::string& path, std::span<const std::byte> bytes) {
     return write_file(path, {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
 }
 
-int create_drill(const std::filesystem::path& directory, std::uint64_t uid) {
+int create_drill(const std::filesystem::path& directory, std::uint64_t uid, bool empty) {
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     if (now_ms < kMinDrillTimeMs + 1'000 || now_ms > kMaxDrillTimeMs) {
@@ -108,6 +109,10 @@ int create_drill(const std::filesystem::path& directory, std::uint64_t uid) {
             return failure("The symbol snapshot was not acknowledged.");
         }
 
+        if (empty) {
+            std::puts("Empty Testnet store created. audit_key_id=1 control_key_id=1");
+            return 0;
+        }
         hy::AuditRecord order{};
         order.timestamp_ms = now_ms;
         // The resolver treats this as a possible exchange order. Storage and network
@@ -143,7 +148,8 @@ int main(int argc, char** argv) {
         usage(stdout);
         return 0;
     }
-    if (argc != 5 || std::string_view(argv[1]) != "--output-dir" ||
+    const bool empty = argc == 6 && std::string_view(argv[5]) == "--empty";
+    if ((argc != 5 && !empty) || std::string_view(argv[1]) != "--output-dir" ||
         argv[2][0] == '\0' || std::string_view(argv[3]) != "--uid") {
         usage(stderr);
         return 2;
@@ -157,7 +163,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        return create_drill(argv[2], uid);
+        return create_drill(argv[2], uid, empty);
     } catch (const std::exception& e) {
         return failure(e.what());
     }

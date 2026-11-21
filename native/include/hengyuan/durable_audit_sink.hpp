@@ -64,6 +64,7 @@
 #include <hengyuan/position_truth.hpp>
 #include <hengyuan/secure_wipe.hpp>
 #include <hengyuan/store_binding.hpp>
+#include <hengyuan/trade_scope_audit.hpp>
 
 #include <array>
 #include <cstdio>
@@ -573,6 +574,35 @@ public:
     // Format used by append_durable(). Recovery selects v6 once it finds v6 frames or verifies an S7 migration archive.
     std::uint8_t write_format_version() const noexcept { return write_version_; }
 
+    bool trade_scope_writes_available() const noexcept {
+        return log_open_ && !fenced_ && !store_identity_degraded_ && !trade_scope_write_uncertain_ &&
+               open_mode_ == AuditSinkOpenMode::Trading && never_sent_writes_ == NeverSentWrites::Enabled;
+    }
+
+    std::uint64_t trade_scope_high_water() const noexcept { return trade_scopes_.high_water(); }
+    std::uint64_t active_trade_scope_serial() const noexcept { return trade_scopes_.active_serial(); }
+    std::span<const trade_scope_audit::Balance> trade_scope_balances() const noexcept { return trade_scopes_.balances(); }
+
+    const trade_scope_audit::Balance* trade_scope_balance(std::uint64_t serial) const noexcept {
+        return trade_scopes_.find(serial);
+    }
+
+    AuditAppendResult append_trade_scope_install(const TradeScopeGrant& grant, std::uint32_t symbol_id,
+                                                std::int64_t now_ms) noexcept {
+        if (!trade_scope_writes_available() || !valid_trade_scope_grant(grant)) return {};
+        const auto binding = read_binding();
+        const auto& subject = grant.binding.store;
+        if (judge_store_binding(binding, subject.environment, subject.account_uid) != BindingJudgement::Match ||
+            subject.store_uuid_lo != store_uuid_lo_ || subject.store_uuid_hi != store_uuid_hi_) return {};
+        return append_scope_control(trade_scope_audit::install_record(grant, symbol_id, now_ms), now_ms);
+    }
+
+    AuditAppendResult append_trade_scope_revocation(std::uint64_t serial, std::int64_t now_ms) noexcept {
+        if (!trade_scope_writes_available()) return {};
+        return append_scope_control(trade_scope_audit::control_record(AuditEventType::TradeScopeRevoked, serial, now_ms),
+                                    now_ms);
+    }
+
     // SAFE-03 crash-window slice (blueprint L-36): how many bytes of a torn tail -- the partial frame a crash in the
     // middle of an append left behind -- recovery cut off the end of the main log (and, for the second accessor, off
     // the key-rotation sidecar) before the first new append. append_durable() appends at the PHYSICAL end of the
@@ -590,11 +620,32 @@ public:
     // clock-injection style, not read from a global clock here).
     AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) noexcept {
         if (rec.event_type == AuditEventType::OrderCancelPrepared ||
-            rec.event_type == AuditEventType::OrderCancelNotSent) return {};
+            rec.event_type == AuditEventType::OrderCancelNotSent ||
+            trade_scope_audit::is_control_event(rec.event_type)) return {};
         if (rec.event_type == AuditEventType::OrderIntentCreated) {
             if (!attempt_watermark_.permits(rec.client_order_id)) return {};
         }
-        return append_impl(rec, now_ms, write_version_);
+        std::optional<std::int64_t> charge;
+        if (rec.event_type == AuditEventType::OrderScopedPrepared) {
+            if (!trade_scope_writes_available()) return {};
+            charge = trade_scopes_.charge_for(rec);
+            if (!charge) return {};
+        }
+        const auto result = append_impl(rec, now_ms, write_version_);
+        if (charge) {
+            if (!result.acked()) {
+                trade_scope_write_uncertain_ = true;
+            } else {
+                const auto serial = trade_scope_audit::serial_of(rec);
+                if (!trade_scopes_.charge(serial, *charge)) {
+                    trade_scope_write_uncertain_ = true;
+                    return {};
+                }
+                last_scope_charge_ = {serial, *charge, {}};
+                std::memcpy(last_scope_charge_.order.id, rec.client_order_id, kClientOrderIdLen + 1);
+            }
+        }
+        return result;
     }
 
     // The first append after an exclusive open may prepare a recovered working order.
@@ -772,6 +823,15 @@ public:
         // A failed closure may reach disk; prevent restarting its generated identity.
         attempt_watermark_.observe(rec.client_order_id);
         out.append = append_impl(rec, now_ms, kFrameFormatVersionV6);
+        const bool refunds_scope = last_scope_charge_.serial != 0 &&
+                                   last_scope_charge_.order.view() == rec.client_order_id;
+        if (refunds_scope) {
+            if (out.append.acked() && trade_scopes_.refund(last_scope_charge_.serial, last_scope_charge_.amount)) {
+                last_scope_charge_ = {};
+            } else {
+                trade_scope_write_uncertain_ = true;
+            }
+        }
         if (!out.append.acked()) {
             out.status = NeverSentAppendStatus::AppendFailed;
             return out;
@@ -797,6 +857,22 @@ public:
 
 private:
     friend class BinancePrivateRestClient;
+
+    AuditAppendResult append_scope_control(const AuditRecord& record, std::int64_t now_ms) noexcept {
+        try {
+            if (!trade_scopes_.stage_control(record)) return {};
+        } catch (...) {
+            return {};
+        }
+        const auto result = append_impl(record, now_ms, kFrameFormatVersionV6);
+        trade_scopes_.finish_control(record, result.acked());
+        if (!result.acked()) {
+            trade_scope_write_uncertain_ = true;
+            return result;
+        }
+        write_version_ = kFrameFormatVersionV6;
+        return result;
+    }
 
     // The execution owner has quiesced the original writers and transferred the sink.
     // Refresh the checkpoints without releasing the process lock or opening another path.
@@ -1109,6 +1185,9 @@ private:
     // --- Per-COID replay state, scan-local only (never persisted as
     // instance state beyond the final checkpoints_ output) ---
     struct ReplayState {
+        std::uint64_t scope_serial{0};
+        std::int64_t scope_charge{0};
+        bool intent_created{false};
         bool established{false};
         OrderState state{OrderState::Intent};
         std::int64_t intended_price_ticks{0};
@@ -1263,6 +1342,8 @@ private:
     }
 
     RecoveryScanStatus run_recovery_scan_impl(const std::string& path) {
+        trade_scopes_ = {};
+        last_scope_charge_ = {};
         std::vector<std::byte> content;
         if (!read_entire_log(content)) return RecoveryScanStatus::IoError;
         std::optional<detail::DecodedTipAnchor> archive_tip;
@@ -1345,6 +1426,16 @@ private:
             }
             max_version_seen = frame.format_version;
 
+            if (trade_scope_audit::is_control_event(frame.record.event_type)) {
+                if (!trade_scopes_.stage_control(frame.record)) return RecoveryScanStatus::Corrupt;
+                trade_scopes_.finish_control(frame.record, true);
+                macs_by_sequence.push_back(frame.mac);
+                running_prev_mac = frame.mac;
+                ++expected_seq;
+                offset += frame_size;
+                continue;
+            }
+
             std::string coid(frame.record.client_order_id);
             if (frame.record.event_type == AuditEventType::OrderNeverSent) attempt_watermark_.observe(coid);
             auto [it, inserted] = per_coid.try_emplace(coid);
@@ -1373,7 +1464,20 @@ private:
                  frame.record.filled_qty_ticks > rs.intended_qty_ticks)) {
                 return RecoveryScanStatus::Corrupt;
             }
-            if (cancel_frame) {
+            if (frame.record.event_type == AuditEventType::OrderScopedPrepared) {
+                const auto charge = trade_scopes_.charge_for(frame.record);
+                if (!rs.established || !rs.intent_created || rs.state != OrderState::Intent ||
+                    rs.exchange_order_id != 0 || rs.filled_qty_ticks != 0 || !charge ||
+                    rs.symbol_id != frame.record.symbol_id || rs.side != frame.record.side ||
+                    rs.mode != frame.record.mode || rs.intended_price_ticks != frame.record.price_ticks ||
+                    rs.intended_qty_ticks != frame.record.qty_ticks) return RecoveryScanStatus::Corrupt;
+                rs.scope_serial = trade_scope_audit::serial_of(frame.record);
+                if (!trade_scopes_.charge(rs.scope_serial, *charge)) return RecoveryScanStatus::Corrupt;
+                rs.scope_charge = *charge;
+                rs.state = OrderState::Submitting;
+            } else if (rs.scope_serial != 0 && frame.record.event_type == AuditEventType::OrderSubmitPrepared) {
+                return RecoveryScanStatus::Corrupt;
+            } else if (cancel_frame) {
                 const auto pending = cancel_prepared::decode(frame.record);
                 if (!rs.established || rs.pending_cancel.present() || rs.exchange_order_id_conflict || !pending ||
                     !cancel_prepared::matches_working_order(
@@ -1405,6 +1509,7 @@ private:
                 if (operator_frame) return RecoveryScanStatus::Corrupt;
                 if (frame.record.resulting_state != OrderState::Intent) return RecoveryScanStatus::Corrupt;
                 rs.established = true;
+                rs.intent_created = frame.record.event_type == AuditEventType::OrderIntentCreated;
                 rs.state = OrderState::Intent;
                 rs.intended_price_ticks = frame.record.price_ticks;
                 rs.intended_qty_ticks = frame.record.qty_ticks;
@@ -1436,6 +1541,8 @@ private:
                 if (never_sent::check_closure(closure_target_of(rs), frame.record) != never_sent::ClosureCheck::Ok) {
                     return RecoveryScanStatus::Corrupt;
                 }
+                if (rs.scope_serial != 0 && !trade_scopes_.refund(rs.scope_serial, rs.scope_charge))
+                    return RecoveryScanStatus::Corrupt;
                 rs.state = OrderState::NeverSent;
                 ++never_sent_count_;
             } else if (frame.record.resulting_state == rs.state) {
@@ -1504,6 +1611,7 @@ private:
 
         next_sequence_ = expected_seq;
         tip_mac_ = macs_by_sequence.back();
+        trade_scopes_.retire_active();
         // D5 / R1: from here on this sink writes the version its store's tip already has -- 5 for every store that
         // exists today, 6 only once a v6 frame is in the log. That is what keeps the "versions never go back" rule
         // above consistent with this class's own appends: the first v6 frame (the operator tool's) followed by the
@@ -1971,6 +2079,15 @@ private:
     std::uint64_t next_sequence_{0};
     OrderAttemptWatermark attempt_watermark_{};
     std::array<std::byte, kMacLen> tip_mac_{};
+
+    struct ScopeCharge {
+        std::uint64_t serial{0};
+        std::int64_t amount{0};
+        ClientOrderId order{};
+    };
+    trade_scope_audit::Ledger trade_scopes_;
+    ScopeCharge last_scope_charge_{};
+    bool trade_scope_write_uncertain_{false};
 
     std::array<OrderRecoveryCheckpoint, kMaxInFlight> checkpoints_{};
     std::size_t checkpoint_count_{0};

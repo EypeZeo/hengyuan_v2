@@ -261,7 +261,7 @@ TEST(NeverSentGuard, TheClosureRuleIsAppliedByTheRecoveryScanAndTheNeverSentWrit
         << "append_durable() judges no frame's legality (it never has)";
 }
 
-TEST(NeverSentGuard, TheClosureWriterIsReachedOnlyThroughThePortAndTheSwitchIsTurnedOnByTwoHarnessesAlone) {
+TEST(NeverSentGuard, TheClosureWriterIsReachedOnlyThroughThePortAndReviewedRuntimeSetups) {
     // Q23 S4 built the writer; S6 (class A) is its first caller. Every caller is a producer of the frame, so each is added here with
     // the reason, by the PR that wires it. The route: DurableAuditSink::append_never_sent() <- the sink adapter of the port (in the
     // orchestrator header) <- DurableOrderAuditPort::append_never_sent() <- detail::close_never_sent() <- the six local refusals.
@@ -271,17 +271,14 @@ TEST(NeverSentGuard, TheClosureWriterIsReachedOnlyThroughThePortAndTheSwitchIsTu
                           {kOrchestrator, 2, "the sink adapter of the port, and detail::close_never_sent() (the one caller)"}});
     expect_named_only_in("close_never_sent", {{kOrchestrator, 3, "the generic definition, its class-A wrapper, and the S5 final authorization refusal"}});
     expect_named_only_in("close_class_a_never_sent",
-                         {{kOrchestrator, 7, "the class-A counting wrapper and the six local refusal call sites"}});
+                         {{kOrchestrator, 9, "the class-A counting wrapper and its reviewed local refusal call sites"}});
     // The frame is built and judged in one place: the rules header's class_a_* functions, used by the orchestrator's helper alone.
     expect_named_only_in("class_a_closure_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});
     expect_named_only_in("class_a_target_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});
-    // The switch is a constructor argument: the only way to pass Enabled is to name the enum, so a process that turns the writer
-    // on shows up here. In the sink: the enum, the constructor parameter and its default, the accessor, the member and its
-    // initialiser, and the one check inside append_never_sent(). Elsewhere: the two Testnet-only harnesses (one mention each,
-    // `NeverSentWrites::Enabled` in the construction of their audit sink). A production trading process is not one of them yet.
-    expect_named_only_in("NeverSentWrites", {{kSink, 7, "the enum, the constructor, the accessor, the member, the check"},
-                                             {kPreflightHarness, 1, "the Testnet-only cold-start harness turns the writer on"},
-                                             {kEvidenceHarness, 1, "the dry-run evidence harness turns the writer on"}});
+    expect_named_only_in("NeverSentWrites", {{kSink, 8, "the constructor, closure writer, and scope write availability"},
+                                             {kPreflightHarness, 2, "the scratch preflight and bound scope runtime"},
+                                             {kEvidenceHarness, 1, "the dry-run evidence harness"},
+                                             {"include/hengyuan/spot_owner_key_store.hpp", 2, "the default-disabled bound store loader"}});
     // The default really is Disabled, and the only check of it refuses everything but Enabled.
     const SourceFile* sink = find_source(kSink);
     ASSERT_NE(sink, nullptr);

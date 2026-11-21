@@ -318,7 +318,7 @@ TEST(OrderDurablePathGuard, TheOrchestratorAppendsEveryFrameOfAnOrdersLifeThroug
     // inside it: the append, THEN the shadow, and the shadow only if the append was acknowledged
     const std::size_t def = f->code.find("inline bool append_order_frame(");
     ASSERT_NE(def, std::string::npos);
-    const std::size_t append = find_after(f->code, "ctx.durable_audit.append_durable(ar, ctx.now_ms).acked()", def);
+    const std::size_t append = find_after(f->code, "ctx.durable_audit.append_durable(ar, time).acked()", def);
     const std::size_t acked = find_after(f->code, "ctx.fill_context->durable_acked(", def);
     ASSERT_NE(append, std::string::npos);
     ASSERT_NE(acked, std::string::npos);

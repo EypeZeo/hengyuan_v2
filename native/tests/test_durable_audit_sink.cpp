@@ -15,15 +15,21 @@
 
 #include <gtest/gtest.h>
 #include <hengyuan/durable_audit_sink.hpp>
+#include <hengyuan/never_sent_rules.hpp>
+#include <hengyuan/store_binding_writer.hpp>
+#include <hengyuan/trade_scope_audit.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -161,6 +167,38 @@ AuditRecord make_cancel_not_sent(const char* coid, std::uint32_t symbol_id, std:
     return rec;
 }
 
+constexpr std::uint64_t kTradeScopeTestAccountUid = 71;
+constexpr std::uint32_t kTradeScopeTestSymbolId = 7;
+constexpr std::int64_t kTradeScopeTestMaxOrderNotional = 1'000'000'000;
+constexpr std::int64_t kTradeScopeTestBudgetNotional = 2'000'000'000;
+
+TradeScopeGrant make_trade_scope_grant(const DurableAuditSink& sink, std::uint64_t serial) {
+    TradeScopeGrant grant{};
+    grant.binding.store = {StoreEnvironment::Testnet, kTradeScopeTestAccountUid,
+                           sink.store_uuid_lo(), sink.store_uuid_hi()};
+    grant.binding.activation[0] = std::byte{1};
+    grant.binding.scope_epoch.value = 9;
+    grant.binding.policy_version = 3;
+    grant.binding.strategy_version[0] = std::byte{2};
+    grant.binding.key_id = 1;
+    grant.serial = serial;
+    grant.issued_at_ms = 500;
+    grant.not_after_ms = 50'000;
+    constexpr char kSymbol[] = "BTCUSDT";
+    std::copy(std::begin(kSymbol), std::end(kSymbol) - 1, grant.symbol.begin());
+    grant.sides = TradeScopeSides::Both;
+    grant.limits = {kTradeScopeTestMaxOrderNotional, kTradeScopeTestBudgetNotional,
+                    kTradeScopeTestBudgetNotional, 100};
+    return grant;
+}
+
+AuditRecord make_scoped_prepared(const char* coid, std::int64_t price, std::int64_t qty,
+                                 std::uint32_t symbol_id, std::uint64_t serial, int native_scale) {
+    auto rec = make_submitted(coid, price, qty, symbol_id);
+    trade_scope_audit::tag_prepared(rec, serial, native_scale);
+    return rec;
+}
+
 constexpr std::array<std::byte, kMacLen> kZeroMac{};
 
 }  // namespace
@@ -292,6 +330,49 @@ protected:
             result.fill(std::byte{});
         }
         return result;
+    }
+
+    std::array<std::byte, kMacLen> append_authenticated_frame(
+        const AuditRecord& rec, std::uint64_t sequence_number,
+        const std::array<std::byte, kMacLen>& prev_mac, std::uint8_t format_version) {
+        std::array<std::byte, kOrderEventFrameSize> frame{};
+        std::array<std::byte, kKeyBlockSize> key_block{};
+        std::array<std::byte, kMacLen> mac{};
+        if (!key_ring_->active_key(1, key_block)) {
+            ADD_FAILURE() << "failed to load the fixture key for an authenticated frame";
+            return mac;
+        }
+        const auto encoded = encode_order_event_frame(
+            frame, 1u, sequence_number, FrameTimeKind::ServerCorrectedUtc, 2000, rec, prev_mac,
+            std::span<const std::byte>(key_block.data(), key_block.size()), format_version);
+        if (encoded != kOrderEventFrameSize) {
+            ADD_FAILURE() << "failed to encode the fixture frame";
+            return mac;
+        }
+        std::ofstream f(base_path_, std::ios::binary | std::ios::app);
+        if (!f.is_open()) {
+            ADD_FAILURE() << "failed to open the durable log for an authenticated frame";
+            return mac;
+        }
+        f.write(reinterpret_cast<const char*>(frame.data()), static_cast<std::streamsize>(frame.size()));
+        if (!f.good()) {
+            ADD_FAILURE() << "failed to write the authenticated fixture frame";
+            return mac;
+        }
+        std::copy_n(frame.end() - static_cast<std::ptrdiff_t>(kMacLen), kMacLen, mac.begin());
+        return mac;
+    }
+
+    void write_authenticated_tip(std::uint64_t sequence_number, const std::array<std::byte, kMacLen>& mac) {
+        std::array<std::byte, kKeyBlockSize> key_block{};
+        ASSERT_TRUE(key_ring_->active_key(1, key_block));
+        std::array<std::byte, kTipAnchorSize> anchor{};
+        detail::encode_tip_anchor(anchor, sequence_number, mac, 1u,
+                                  std::span<const std::byte>(key_block.data(), key_block.size()));
+        std::ofstream f(base_path_ + ".tip", std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(f.is_open());
+        f.write(reinterpret_cast<const char*>(anchor.data()), static_cast<std::streamsize>(anchor.size()));
+        ASSERT_TRUE(f.good());
     }
 
     void truncate_log_to(std::size_t new_size) {
@@ -2494,4 +2575,227 @@ TEST_F(DurableAuditSinkTest, ASidecarAnchorAtTheTipWhoseMacIsNotTheSidecarsFence
     DurableAuditSink restarted(base_path_, *key_ring_, 3);
     ASSERT_TRUE(restarted.is_open());
     EXPECT_TRUE(restarted.rotation_fenced()) << "a genuine anchor of another history is not this sidecar's anchor";
+}
+
+TEST_F(DurableAuditSinkTest, MixedLegacyAndScopedPreparedReplayChargesQuoteAndRequiresReactivation) {
+    constexpr std::uint64_t serial = 0xF123456789ABCDEFULL;
+    constexpr std::int64_t expected_quote_charge = 827'115'000;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1, kMaxIntentOrphans, AuditSinkOpenMode::Trading,
+                              NeverSentWrites::Enabled);
+        ASSERT_TRUE(sink.is_open());
+        ASSERT_EQ(ensure_store_binding(sink, base_path_, *key_ring_, StoreEnvironment::Testnet,
+                                       kTradeScopeTestAccountUid, 900), EnsureBindingStatus::BoundNew);
+        ASSERT_TRUE(sink.trade_scope_writes_available());
+
+        const auto grant = make_trade_scope_grant(sink, serial);
+        const auto installed = sink.append_trade_scope_install(grant, kTradeScopeTestSymbolId, 900);
+        ASSERT_TRUE(installed.acked());
+        EXPECT_EQ(installed.sequence, 0u);
+
+        const auto legacy_intent = make_intent("HY-LEGACY", 100, 10, 3);
+        ASSERT_TRUE(sink.append_durable(legacy_intent, 1000).acked());
+        auto legacy_prepared = make_submitted("HY-LEGACY", 100, 10, 3);
+        legacy_prepared.event_type = AuditEventType::OrderSubmitPrepared;
+        ASSERT_TRUE(sink.append_durable(legacy_prepared, 1001).acked());
+
+        const auto scoped_intent = make_intent("HY-SCOPED", 12'345, 67, kTradeScopeTestSymbolId);
+        ASSERT_TRUE(sink.append_durable(scoped_intent, 1002).acked());
+        const auto scoped_prepared =
+            make_scoped_prepared("HY-SCOPED", 12'345, 67, kTradeScopeTestSymbolId, serial, 5);
+        const auto prepared_append = sink.append_durable(scoped_prepared, 1003);
+        ASSERT_TRUE(prepared_append.acked());
+        EXPECT_EQ(prepared_append.sequence, 4u);
+
+        const auto* balance = sink.trade_scope_balance(serial);
+        ASSERT_NE(balance, nullptr);
+        EXPECT_EQ(balance->usage.used_notional, expected_quote_charge);
+        EXPECT_EQ(balance->usage.available(), kTradeScopeTestBudgetNotional - expected_quote_charge);
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1, kMaxIntentOrphans, AuditSinkOpenMode::Trading,
+                               NeverSentWrites::Enabled);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 2u);
+    for (const auto& checkpoint : restarted.recovered_checkpoints()) {
+        EXPECT_EQ(checkpoint.resulting_state, OrderState::Ambiguous);
+    }
+    EXPECT_EQ(restarted.trade_scope_high_water(), serial);
+    EXPECT_EQ(restarted.active_trade_scope_serial(), 0u);
+    EXPECT_EQ(restarted.frame_count(), 5u);
+
+    const auto* recovered_balance = restarted.trade_scope_balance(serial);
+    ASSERT_NE(recovered_balance, nullptr);
+    EXPECT_EQ(recovered_balance->usage.used_notional, expected_quote_charge);
+    EXPECT_EQ(recovered_balance->usage.available(), kTradeScopeTestBudgetNotional - expected_quote_charge);
+
+    const auto unactivated =
+        make_scoped_prepared("HY-NO-ACTIVATION", 12'345, 67, kTradeScopeTestSymbolId, serial, 5);
+    EXPECT_FALSE(restarted.append_durable(unactivated, 1100).acked());
+    EXPECT_EQ(restarted.frame_count(), 5u);
+    EXPECT_EQ(restarted.active_trade_scope_serial(), 0u);
+}
+
+TEST_F(DurableAuditSinkTest, NeverSentReplayRefundsOnlyItsExactScopedCharge) {
+    constexpr std::uint64_t serial = 0x9000000000000041ULL;
+    constexpr std::int64_t kept_quote_charge = 827'115'000;
+    constexpr std::int64_t closed_quote_charge = 222'000;
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1, kMaxIntentOrphans, AuditSinkOpenMode::Trading,
+                              NeverSentWrites::Enabled);
+        ASSERT_TRUE(sink.is_open());
+        ASSERT_EQ(ensure_store_binding(sink, base_path_, *key_ring_, StoreEnvironment::Testnet,
+                                       kTradeScopeTestAccountUid, 900), EnsureBindingStatus::BoundNew);
+        const auto grant = make_trade_scope_grant(sink, serial);
+        ASSERT_TRUE(sink.append_trade_scope_install(grant, kTradeScopeTestSymbolId, 900).acked());
+
+        const auto kept_intent = make_intent("HY-SCOPE-KEEP", 12'345, 67, kTradeScopeTestSymbolId);
+        ASSERT_TRUE(sink.append_durable(kept_intent, 1000).acked());
+        ASSERT_TRUE(sink.append_durable(
+            make_scoped_prepared("HY-SCOPE-KEEP", 12'345, 67, kTradeScopeTestSymbolId, serial, 5), 1001).acked());
+
+        const auto closed_intent = make_intent("HY-SCOPE-CLOSE", 111, 2, kTradeScopeTestSymbolId);
+        ASSERT_TRUE(sink.append_durable(closed_intent, 1002).acked());
+        ASSERT_TRUE(sink.append_durable(
+            make_scoped_prepared("HY-SCOPE-CLOSE", 111, 2, kTradeScopeTestSymbolId, serial, 5), 1003).acked());
+        const auto* before_closure = sink.trade_scope_balance(serial);
+        ASSERT_NE(before_closure, nullptr);
+        EXPECT_EQ(before_closure->usage.used_notional, kept_quote_charge + closed_quote_charge);
+
+        auto target = never_sent::class_a_target_of(closed_intent);
+        target.state = OrderState::Submitting;
+        const auto closure = never_sent::class_a_closure_of(
+            closed_intent, never_sent::Reason::TradeScopeRefused, 1004);
+        const auto closed = sink.append_never_sent(target, closure, 1004);
+        ASSERT_EQ(closed.status, NeverSentAppendStatus::Appended);
+        EXPECT_EQ(closed.append.sequence, 5u);
+
+        const auto* balance = sink.trade_scope_balance(serial);
+        ASSERT_NE(balance, nullptr);
+        EXPECT_EQ(balance->usage.used_notional, kept_quote_charge);
+        EXPECT_EQ(balance->usage.available(),
+                  kTradeScopeTestBudgetNotional - kept_quote_charge);
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1, kMaxIntentOrphans, AuditSinkOpenMode::Trading,
+                               NeverSentWrites::Enabled);
+    ASSERT_TRUE(restarted.is_open());
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 1u);
+    EXPECT_STREQ(restarted.recovered_checkpoints()[0].client_order_id.id, "HY-SCOPE-KEEP");
+    EXPECT_EQ(restarted.recovered_checkpoints()[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(restarted.recovered_never_sent(), 1u);
+    EXPECT_EQ(restarted.trade_scope_high_water(), serial);
+    EXPECT_EQ(restarted.active_trade_scope_serial(), 0u);
+    const auto* balance = restarted.trade_scope_balance(serial);
+    ASSERT_NE(balance, nullptr);
+    EXPECT_EQ(balance->usage.used_notional, kept_quote_charge);
+    EXPECT_EQ(balance->usage.available(), kTradeScopeTestBudgetNotional - kept_quote_charge);
+}
+
+TEST_F(DurableAuditSinkTest, ScopeReplacementAndRevocationAdvanceSerialAndDurableSequence) {
+    {
+        DurableAuditSink sink(base_path_, *key_ring_, 1, kMaxIntentOrphans, AuditSinkOpenMode::Trading,
+                              NeverSentWrites::Enabled);
+        ASSERT_TRUE(sink.is_open());
+        ASSERT_EQ(ensure_store_binding(sink, base_path_, *key_ring_, StoreEnvironment::Testnet,
+                                       kTradeScopeTestAccountUid, 900), EnsureBindingStatus::BoundNew);
+
+        const auto first = make_trade_scope_grant(sink, 41);
+        const auto second = make_trade_scope_grant(sink, 42);
+        const auto third = make_trade_scope_grant(sink, 43);
+        const auto install_first = sink.append_trade_scope_install(first, kTradeScopeTestSymbolId, 900);
+        ASSERT_TRUE(install_first.acked());
+        EXPECT_EQ(install_first.sequence, 0u);
+        EXPECT_EQ(sink.active_trade_scope_serial(), 41u);
+
+        const auto install_second = sink.append_trade_scope_install(second, kTradeScopeTestSymbolId, 901);
+        ASSERT_TRUE(install_second.acked());
+        EXPECT_EQ(install_second.sequence, 1u);
+        EXPECT_EQ(sink.active_trade_scope_serial(), 42u);
+        EXPECT_EQ(sink.trade_scope_high_water(), 42u);
+
+        const auto revoke_old = sink.append_trade_scope_revocation(41, 902);
+        ASSERT_TRUE(revoke_old.acked());
+        EXPECT_EQ(revoke_old.sequence, 2u);
+        EXPECT_EQ(sink.active_trade_scope_serial(), 42u);
+        EXPECT_EQ(sink.trade_scope_high_water(), 42u);
+
+        const auto revoke_current = sink.append_trade_scope_revocation(42, 903);
+        ASSERT_TRUE(revoke_current.acked());
+        EXPECT_EQ(revoke_current.sequence, 3u);
+        EXPECT_EQ(sink.active_trade_scope_serial(), 0u);
+        EXPECT_EQ(sink.trade_scope_high_water(), 42u);
+
+        EXPECT_FALSE(sink.append_trade_scope_install(second, kTradeScopeTestSymbolId, 904).acked())
+            << "a revoked serial at the high-water mark cannot be installed again";
+        EXPECT_EQ(sink.frame_count(), 4u);
+        const auto install_third = sink.append_trade_scope_install(third, kTradeScopeTestSymbolId, 905);
+        ASSERT_TRUE(install_third.acked());
+        EXPECT_EQ(install_third.sequence, 4u);
+        EXPECT_EQ(sink.active_trade_scope_serial(), 43u);
+        EXPECT_EQ(sink.trade_scope_high_water(), 43u);
+    }
+
+    DurableAuditSink restarted(base_path_, *key_ring_, 1, kMaxIntentOrphans, AuditSinkOpenMode::Trading,
+                               NeverSentWrites::Enabled);
+    ASSERT_TRUE(restarted.is_open());
+    EXPECT_EQ(restarted.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_EQ(restarted.frame_count(), 5u);
+    EXPECT_EQ(restarted.trade_scope_high_water(), 43u);
+    EXPECT_EQ(restarted.active_trade_scope_serial(), 0u);
+}
+
+TEST_F(DurableAuditSinkTest, AuthenticatedWrongScopePreparedIsRejectedDuringReplay) {
+    TradeScopeGrant grant{};
+    {
+        DurableAuditSink seed(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(seed.is_open());
+        grant = make_trade_scope_grant(seed, 41);
+    }
+
+    const auto installed = trade_scope_audit::install_record(grant, kTradeScopeTestSymbolId, 900);
+    const auto intent = make_intent("HY-BAD-SCOPE", 12'345, 67, kTradeScopeTestSymbolId);
+    const auto wrong_scope_prepared =
+        make_scoped_prepared("HY-BAD-SCOPE", 12'345, 67, kTradeScopeTestSymbolId, 42, 5);
+    auto mac = append_authenticated_frame(installed, 0, kZeroMac, kFrameFormatVersionV6);
+    ASSERT_NE(mac, kZeroMac);
+    mac = append_authenticated_frame(intent, 1, mac, kFrameFormatVersionV6);
+    ASSERT_NE(mac, kZeroMac);
+    mac = append_authenticated_frame(wrong_scope_prepared, 2, mac, kFrameFormatVersionV6);
+    ASSERT_NE(mac, kZeroMac);
+    write_authenticated_tip(2, mac);
+
+    DurableAuditSink reopened(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(reopened.is_open());
+    EXPECT_EQ(reopened.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(reopened.fenced());
+}
+
+TEST_F(DurableAuditSinkTest, AuthenticatedScopedPreparedWithMismatchedIntentMetadataIsRejectedDuringReplay) {
+    TradeScopeGrant grant{};
+    {
+        DurableAuditSink seed(base_path_, *key_ring_, 1);
+        ASSERT_TRUE(seed.is_open());
+        grant = make_trade_scope_grant(seed, 41);
+    }
+
+    const auto installed = trade_scope_audit::install_record(grant, kTradeScopeTestSymbolId, 900);
+    const auto intent = make_intent("HY-BAD-METADATA", 12'345, 67, kTradeScopeTestSymbolId);
+    auto mismatched_prepared =
+        make_scoped_prepared("HY-BAD-METADATA", 12'345, 67, kTradeScopeTestSymbolId, 41, 5);
+    ++mismatched_prepared.price_ticks;
+    auto mac = append_authenticated_frame(installed, 0, kZeroMac, kFrameFormatVersionV6);
+    ASSERT_NE(mac, kZeroMac);
+    mac = append_authenticated_frame(intent, 1, mac, kFrameFormatVersionV6);
+    ASSERT_NE(mac, kZeroMac);
+    mac = append_authenticated_frame(mismatched_prepared, 2, mac, kFrameFormatVersionV6);
+    ASSERT_NE(mac, kZeroMac);
+    write_authenticated_tip(2, mac);
+
+    DurableAuditSink reopened(base_path_, *key_ring_, 1);
+    ASSERT_TRUE(reopened.is_open());
+    EXPECT_EQ(reopened.recovery_status(), RecoveryScanStatus::Corrupt);
+    EXPECT_TRUE(reopened.fenced());
 }

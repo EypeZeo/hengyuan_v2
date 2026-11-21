@@ -37,7 +37,8 @@ inline bool is_regular_file(const std::string& path) {
     return std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)) && !ec;
 }
 
-inline OpenStore open_existing_store(const StoreFiles& files, StoreEnvironment environment) {
+inline OpenStore open_existing_store(const StoreFiles& files, StoreEnvironment environment,
+                                     NeverSentWrites closure_writes = NeverSentWrites::Disabled) {
     if (!is_regular_file(files.log) || !is_regular_file(files.log + ".storeid.tip") ||
         !is_regular_file(files.log + ".binding.tip") ||
         !is_regular_file(files.kek) || !is_regular_file(files.wrapped_keys)) return {};
@@ -53,7 +54,8 @@ inline OpenStore open_existing_store(const StoreFiles& files, StoreEnvironment e
         ScopedSecureWipe wipe(key);
         if (!keys->active_key(files.audit_key_id, key)) return {};
     }
-    auto sink = std::make_unique<DurableAuditSink>(files.log, *keys, files.audit_key_id);
+    auto sink = std::make_unique<DurableAuditSink>(files.log, *keys, files.audit_key_id, kMaxIntentOrphans,
+                                                  AuditSinkOpenMode::Trading, closure_writes);
     const auto binding = sink->read_binding();
     if (!sink->is_open() || sink->fenced() || sink->store_identity_degraded() ||
         binding.status != StoreBindingStatus::Bound || binding.binding.environment != environment) return {};

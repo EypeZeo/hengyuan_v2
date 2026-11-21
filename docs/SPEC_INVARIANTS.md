@@ -1028,7 +1028,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - 2026-11-21，Windows 原生程序在 Spot Testnet 使用只读凭据和临时软件 P-256 密钥完成签名重置演练。存储绑定返回 BoundNew，重置返回 Applied，修订号由 0 变为 1，进程退出码为 0。
   - **Q23 S5：发送前最终授权与类 B 拒绝。** `orchestrate_submit()` 在 `Prepared` 持久确认之后调用 `SubmitReadiness::claim()`。就绪状态与原令牌的签发者、订阅代次、屏障 epoch、熔断 revision 必须相符；最终检查包含授权期限、原确认的有效期、原在途句柄、限流预留、账户和规则，以及审计、签名与深度状态。期限采用单调时钟，默认 5000 ms，在就绪状态读取完成后检查。提交、Prepared 和内存审计使用同一份原订单参数。
     - `SubmitAuthority` 的 epoch 使用 acquire/release 原子操作，claim 和 revoke 在同一原子值上排序。撤销使此前签发的令牌失效；一次成功的 claim 消费该 epoch。WebSocket 会话在停止请求、错误与结束事件时公布停止状态并撤销；预检程序为会话与 `PrivateStreamPipeline` 传入同一个 authority。`KillSwitch` 的发布锁按顺序仲裁最终提交授权和状态变化。写盘与发布使用独立的锁，状态读取无需等待磁盘同步。
-    - 有范围代次的提交在 `authorize()` 检查代次，最终 `claim()` 在熔断发布的同一临界区重新核对它并消费提交令牌。范围签发、预算及范围替换需要独立的实现，当前的提交仍须有逐单确认。
+    - 有范围代次的提交在 `authorize()` 检查代次，最终 `claim()` 在熔断发布的同一临界区重新核对它并消费提交令牌。范围模式使用 `TradeScopeExecution`，先按本次运行身份安装已验签的范围，再在最终临界区复查范围有效期与熔断代次并消费同一份提交权。
     - `FinalAuthorizationRefused` 返回具体 `final_refusal`。仅 `ClosureAppendStatus::Appended` 将订单变为 `NeverSent`，按原槽位代次释放在途登记，并移除对应成交上下文、退回仍有效的原限流窗口额度。其他关闭结果保留 `Submitting` 和资源。成功 claim 之后不写关闭帧；恢复时，仅有 Prepared 的订单继续进入不确定结果处理。
     - `OrderReservation` 不可复制、不可直接构造，绑定所属限流器、配置代次与窗口截止。过期、重新配置或消费后的票据不能授权发送；旧票据不能退回新窗口的额度。全部新增发送检查保持无动态内存分配。
     - 回归包括撤销与 claim 的两种次序、同 epoch 单次消费、发布可见性、断流与代次变化、熔断触发后重置、授权与确认期限、槽位复用、限流配置变更、追加失败及实际文件恢复。`test_submit_authority_concurrency.cpp` 同时加入本地 TSan 和 ARM64 CI 的重复测试；`tsan_control_relaxed_submit_authority.cpp` 将发布所需的内存序降为 relaxed，验证 TSan 能报告数据竞争。
@@ -1037,6 +1037,8 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - Linux 验证在 tokyo-vps 的独立临时目录运行。ASan/UBSan 串行构建使用 -O2 -g1 -DNDEBUG -fno-var-tracking-assignments，并启用 -fsanitize=address,undefined、-fno-sanitize-recover=all 与 -fno-omit-frame-pointer；运行时启用内存泄漏、返回后的栈访问和严格字符串检查，检测到错误时立即终止。
 
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
+
+- 范围模式在同一日志追加安装、撤销和 `OrderScopedPrepared` 帧。后者用原订单的价格、数量和保存的精度计费。扫描重建最大序号与各范围占用，拒绝同一订单重复扣款、未安装序号和参数不匹配。已确认的 `NeverSent` 归还对应占用。重启后需要本次运行身份的签名重新安装范围。
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/
 `OrderTracker` 的在途订单追踪全部丢失。两份 spec 里"durable 审计日志"字面上是一整套很大的子系统

@@ -2,7 +2,7 @@
 #pragma once
 
 #include <hengyuan/durable_order_audit_port.hpp>
-#include <hengyuan/owner_trade_scope_approval.hpp>
+#include <hengyuan/trade_scope_audit.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -32,8 +32,7 @@ public:
     TradeScopeBudget(const TradeScopeBudget&) = delete;
     TradeScopeBudget& operator=(const TradeScopeBudget&) = delete;
     TradeScopeBudget(TradeScopeBudget&& other) noexcept
-        : serial_(other.serial_), limits_(other.limits_), entries_(std::move(other.entries_)),
-          used_notional_(std::exchange(other.used_notional_, 0)),
+        : serial_(other.serial_), usage_(std::exchange(other.usage_, {})), entries_(std::move(other.entries_)),
           rebuild_required_(std::exchange(other.rebuild_required_, true)) {
         other.entries_.clear();
     }
@@ -57,24 +56,22 @@ public:
     }
 
     [[nodiscard]] std::uint64_t serial() const noexcept { return serial_; }
-    [[nodiscard]] std::int64_t used_notional() const noexcept { return used_notional_; }
+    [[nodiscard]] std::int64_t used_notional() const noexcept { return usage_.used_notional; }
     [[nodiscard]] std::int64_t available_notional() const noexcept {
-        return rebuild_required_ ? 0 : limits_.budget_notional - used_notional_;
+        return rebuild_required_ ? 0 : usage_.available();
     }
     [[nodiscard]] bool rebuild_required() const noexcept { return rebuild_required_; }
 
     [[nodiscard]] bool reserve(std::string_view order_id, std::int64_t notional) {
-        if (!valid_order_id(order_id) || notional <= 0 || notional > limits_.max_order_notional ||
-            notional > available_notional() ||
+        if (!valid_order_id(order_id) || rebuild_required_ || !usage_.can_charge(notional) ||
             !entries_.try_emplace(std::string(order_id), Entry{notional, Phase::Reserved}).second) return false;
-        used_notional_ += notional;
-        return true;
+        return usage_.charge(notional);
     }
 
     [[nodiscard]] bool release_unprepared(std::string_view order_id) noexcept {
         const auto entry = entries_.find(order_id);
         if (entry == entries_.end() || entry->second.phase != Phase::Reserved) return false;
-        used_notional_ -= entry->second.notional;
+        if (!usage_.refund(entry->second.notional)) return false;
         entries_.erase(entry);
         return true;
     }
@@ -119,7 +116,8 @@ private:
         Phase phase;
     };
 
-    TradeScopeBudget(std::uint64_t serial, TradeScopeLimits limits) noexcept : serial_(serial), limits_(limits) {}
+    TradeScopeBudget(std::uint64_t serial, TradeScopeLimits limits) noexcept
+        : serial_(serial), usage_{limits.max_order_notional, limits.budget_notional, 0} {}
 
     static bool valid_order_id(std::string_view order_id) noexcept {
         return !order_id.empty() && order_id.size() <= kClientOrderIdLen &&
@@ -136,15 +134,14 @@ private:
     bool refund(std::string_view order_id) noexcept {
         const auto entry = entries_.find(order_id);
         if (entry == entries_.end() || entry->second.phase != Phase::Prepared) return false;
-        used_notional_ -= entry->second.notional;
+        if (!usage_.refund(entry->second.notional)) return false;
         entry->second.phase = Phase::Refunded;
         return true;
     }
 
     const std::uint64_t serial_;
-    const TradeScopeLimits limits_;
+    TradeScopeUsage usage_;
     std::map<std::string, Entry, std::less<>> entries_;
-    std::int64_t used_notional_{0};
     bool rebuild_required_{false};
 };
 

@@ -478,10 +478,12 @@ TEST(SubmitReadinessGuard, TheScopedTradeEpochFlowsFromContextThroughTheFinalCla
 
     const std::vector<std::vector<std::string>> claims{{
         "token.kill_revision_",
-        "[&]() noexcept { return authority().claim(token.epoch_); }",
+        "[&]() noexcept { return guard() && authority().claim(token.epoch_); }",
         "token.scope_epoch_",
     }};
     EXPECT_EQ(call_args(readiness->code, "kill_switch_.claim_normal"), claims);
+    EXPECT_EQ(call_args(orchestrator->code, "scope->permits_claim"),
+              (std::vector<std::vector<std::string>>{{"scope_serial"}}));
 }
 
 // --- the user-data drain is wired to the barrier where there is one ---------------------------------------------------------------------------
@@ -782,7 +784,7 @@ TEST(SubmitReadinessGuard, PreparedAckAndFinalClaimPrecedeTheOnlySubmitCall) {
     const std::size_t prepared = code.find("ar.event_type = AuditEventType::OrderSubmitPrepared;");
     const std::size_t prepared_ack = code.find("if (!detail::append_order_frame(ctx, ar))", prepared);
     const std::size_t transition = code.find("result.order.transition_to(OrderState::Submitting);", prepared_ack);
-    const std::size_t claim = code.find("ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check)", transition);
+    const std::size_t claim = code.find("ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check, at_claim)", transition);
     const std::size_t refusal = code.find("if (final_refusal)", claim);
     const std::size_t submitted_audit = code.find("ar.event_type = AuditEventType::OrderSubmitted;", refusal);
     const std::size_t submit = code.find("ctx.submit_port.call(", submitted_audit);
