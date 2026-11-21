@@ -37,7 +37,18 @@ yubico-piv-tool -a verify-pin --sign -s 9c -A ECCP256 -H SHA256 -i owner-cancel.
 
 `OwnerCancelAuthority::install()` verifies the signature and expiry against the pinned key and a fresh exchange clock. The active grant is replaced only by a valid grant with a higher serial. Local revocation clears affected grants and prevents their reinstallation during this activation. Each new activation requires a new signature.
 
-The control thread can pass a claimed request to `BinancePrivateRestClient::cancel_authorized_recovered_order()` after reopening the order log exclusively in Trading mode. It checks the current kill switch revision, store and signed account identity, recovered working order and exact approval. The durable preparation precedes DELETE. The final check runs after TLS handshake and before HTTP write; a refusal there records `OrderCancelNotSent`. An uncertain send is reconciled by numeric order ID after reopening the log. Provisioning the production public key and scheduling the exclusive store handoff from the live trading loop remain separate operational steps.
+The native cancellation process retains the Trading lock while handing the log to the executor. Its control thread stops the private stream, joins its producer, drains the final events and transfers ownership of the sink. The executor scans the latest committed state under the same lock, checks the current kill switch revision, store, signed account UID and order identity, and writes the preparation before sending DELETE. An authorization refusal before HTTP write records `OrderCancelNotSent`. A prepared attempt with an uncertain result is queried by numeric order ID on restart. A working observation keeps it pending.
+
+### Register and run native cancellation
+
+Use an existing, healthy, bound order log and its KEK and wrapped-key file. The native entry covers the BTCUSDT store configuration with symbol ID 0. Keep the log directory and its public-key registration writable only by the trusted local operator. On POSIX, use owner-only permissions (`0600` or `0400`) for the KEK file. Enrollment publishes a new `.owner-cancel.pub` file beside that log and refuses an existing registration. The record binds the key to the verified environment, account and log UUID. The grant directory holds only unsigned payloads and signatures.
+
+```powershell
+& $exe --enroll-cancel-owner PRODUCTION $log $auditKeyId $kekFile $wrappedKeyFile $ownerKeyId $ownerPublicDer
+& $exe --cancel-only PRODUCTION $log $auditKeyId $kekFile $wrappedKeyFile $credentialsFile $controlDir 600
+```
+
+For Spot Testnet use `TESTNET` in both commands and its independent account, log and key. The credentials file uses `HENGYUAN_BINANCE_LIVE_API_KEY` and `HENGYUAN_BINANCE_LIVE_SECRET` in Production, or `HENGYUAN_BINANCE_TESTNET_API_KEY` and `HENGYUAN_BINANCE_TESTNET_SECRET` in Testnet. For a working order the process prints the payload and corresponding signature paths. Sign that payload using the registered hardware key and write the signature to the printed path. The process installs the grant in memory and handles one claimed cancellation before exiting. To recover after an interruption, start the same cancellation command against the same log. Existing pending attempts are reconciled without a signature. New attempts require a signature for the current activation.
 
 ## 3. Operator manual takeover — step by step
 

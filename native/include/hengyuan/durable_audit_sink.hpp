@@ -798,6 +798,34 @@ public:
 private:
     friend class BinancePrivateRestClient;
 
+    // The execution owner has quiesced the original writers and transferred the sink.
+    // Refresh the checkpoints without releasing the process lock or opening another path.
+    bool prepare_cancel_handoff() noexcept {
+        if (!log_open_ || fenced_ || open_mode_ != AuditSinkOpenMode::Trading || cancel_restore_) return false;
+        const auto expected_sequence = next_sequence_;
+        next_sequence_ = 0;
+        checkpoint_count_ = 0;
+        checkpoint_resolved_.fill(false);
+        session_resolved_count_ = 0;
+        operator_resolved_count_ = 0;
+        recovery_overflow_ = {};
+        intent_orphan_count_ = 0;
+        never_sent_count_ = 0;
+        torn_tail_bytes_ = 0;
+        attempt_watermark_ = {};
+        observed_key_id_count_ = 0;
+        interrupted_rotation_ = false;
+        recovery_status_ = run_recovery_scan(log_store_.log_path());
+        if ((recovery_status_ != RecoveryScanStatus::Clean && recovery_status_ != RecoveryScanStatus::Recovered) ||
+            next_sequence_ != expected_sequence) {
+            fenced_ = true;
+            fence_reason_ = FenceReason::IoError;
+            return false;
+        }
+        appended_since_recovery_ = false;
+        return true;
+    }
+
     struct CancelRestore {
         AuditRecord record;
         std::size_t checkpoint_index;

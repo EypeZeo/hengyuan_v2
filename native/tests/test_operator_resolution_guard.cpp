@@ -1089,18 +1089,18 @@ TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
         << "the uid is the parameter of bind_store(): what the exchange reported for the key in use (rest_account_fetcher.hpp::fetch_exchange_account_uid()), never a "
            "field of a configuration";
     // the preflight harness (M5b-1) is the first process that creates the pipeline: its one bind_store() passes the uid it read from the exchange itself
-    // (fetch_exchange_account_uid() on the client that holds the key in use), the Testnet environment it is bound to, and the wall clock
+    // (fetch_exchange_account_uid() on the client that holds the key in use), the selected environment and the wall clock
     const SourceFile* harness = find_source(kPreflightHarness);
     ASSERT_NE(harness, nullptr);
     const auto harness_binds = call_args(harness->code, "bind_store");
     ASSERT_EQ(harness_binds.size(), 1u);
-    EXPECT_EQ(harness_binds[0], (std::vector<std::string>{"StoreEnvironment::Testnet", "exchange_uid", "reconcile_wall_now_ms()"}))
+    EXPECT_EQ(harness_binds[0], (std::vector<std::string>{"environment", "exchange_uid", "reconcile_wall_now_ms()"}))
         << "the uid is what the exchange reported for the key in use, never a field of a configuration";
     const auto harness_uid_reads = call_args(harness->code, "fetch_exchange_account_uid");
     ASSERT_EQ(harness_uid_reads.size(), 1u);
     EXPECT_EQ(harness_uid_reads[0], (std::vector<std::string>{"client", "exchange_uid"}));
-    EXPECT_EQ(count_identifier(harness->code, "exchange_uid"), 4u)
-        << "declared, read from the exchange, counted for the log (the value itself is never printed), handed to bind_store(): nothing else may set it";
+    EXPECT_EQ(count_identifier(harness->code, "exchange_uid"), 5u)
+        << "declared, read from the exchange, counted, compared with the persistent binding and handed to bind_store()";
     const SourceFile* prepared_drill = find_source(kPreparedDrill);
     ASSERT_NE(prepared_drill, nullptr);
     const auto prepared_drill_binds = call_args(prepared_drill->code, "ensure_store_binding");
@@ -1159,7 +1159,8 @@ TEST(OperatorResolutionGuard, TheBindingIsReadByTheToolOnceAndJudgedByTheFlowOnc
     expect_named_only_in("judge_store_binding", {{kBinding, 1, "the definition"},
                                                 {kBindingWriter, 1, "ensure_store_binding()"},
                                                 {kFlow, 1, "resolve_order(): the one judgement of a resolution"},
-                                                {"include/hengyuan/binance_private_rest.hpp", 1, "recovered Testnet cancellation"}});
+                                                {"include/hengyuan/binance_private_rest.hpp", 1, "durable cancellation checks the exchange account"},
+                                                {kPreflightHarness, 1, "cancellation startup checks the persistent binding"}});
 
     // the tool reads the audit log's own sidecar with the sink's own identity, and hands the session what it read
     const SourceFile* tool = find_source(kTool);

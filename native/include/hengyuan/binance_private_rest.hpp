@@ -1973,6 +1973,17 @@ public:
         return cancel_recovered_order(sink, request.client_order_id.view(), alias, rules, now_ms, cfg, &authorization);
     }
 
+    // Ownership transfers only after the trading loop and its producers have stopped.
+    DurableSpotCancelResult cancel_handed_off_order(
+        std::unique_ptr<DurableAuditSink> sink, const AutomaticCancelRequest& request, const OwnerCancelAuthority& authority,
+        const KillSwitch& kill_switch, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        if (!sink || !sink->prepare_cancel_handoff()) {
+            return {{}, {}, {QueryResult::not_sent(), PrivateRestError::InvalidConfig}, {}};
+        }
+        return cancel_authorized_recovered_order(*sink, request, authority, kill_switch, alias, rules, now_ms, cfg);
+    }
+
 private:
     struct CancelAuthorization {
         const AutomaticCancelRequest& request;

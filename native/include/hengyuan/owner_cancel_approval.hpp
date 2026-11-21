@@ -69,19 +69,15 @@ public:
             RAND_bytes(reinterpret_cast<unsigned char*>(&subject.activation_id),
                        static_cast<int>(sizeof(subject.activation_id))) != 1 || !subject.valid()) return {};
 
-        const auto* p = public_key_der.data();
-        PublicKey key(d2i_PUBKEY(nullptr, &p, static_cast<long>(public_key_der.size())), EVP_PKEY_free);
-        if (!key || p != public_key_der.data() + public_key_der.size() ||
-            EVP_PKEY_is_a(key.get(), "EC") != 1) return {};
-        std::array<char, 32> group{};
-        if (EVP_PKEY_get_group_name(key.get(), group.data(), group.size(), nullptr) != 1 ||
-            std::string_view(group.data()) != "prime256v1") return {};
-        const std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> check(
-            EVP_PKEY_CTX_new_from_pkey(nullptr, key.get(), nullptr), EVP_PKEY_CTX_free);
-        if (!check || EVP_PKEY_public_check(check.get()) != 1) return {};
+        auto key = decode_public_key(public_key_der);
+        if (!key) return {};
 
         return std::unique_ptr<OwnerCancelAuthority>(
             new OwnerCancelAuthority(subject, key_id, std::move(key), max_validity_ms));
+    }
+
+    static bool valid_public_key(std::span<const unsigned char> der) noexcept {
+        return static_cast<bool>(decode_public_key(der));
     }
 
     OwnerCancelAuthority(const OwnerCancelAuthority&) = delete;
@@ -151,6 +147,21 @@ public:
 
 private:
     using PublicKey = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+
+    static PublicKey decode_public_key(std::span<const unsigned char> public_key_der) noexcept {
+        if (public_key_der.empty() || public_key_der.size() > 1024) return PublicKey(nullptr, EVP_PKEY_free);
+        const auto* p = public_key_der.data();
+        PublicKey key(d2i_PUBKEY(nullptr, &p, static_cast<long>(public_key_der.size())), EVP_PKEY_free);
+        if (!key || p != public_key_der.data() + public_key_der.size() ||
+            EVP_PKEY_is_a(key.get(), "EC") != 1) return PublicKey(nullptr, EVP_PKEY_free);
+        std::array<char, 32> group{};
+        if (EVP_PKEY_get_group_name(key.get(), group.data(), group.size(), nullptr) != 1 ||
+            std::string_view(group.data()) != "prime256v1") return PublicKey(nullptr, EVP_PKEY_free);
+        const std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> check(
+            EVP_PKEY_CTX_new_from_pkey(nullptr, key.get(), nullptr), EVP_PKEY_CTX_free);
+        if (!check || EVP_PKEY_public_check(check.get()) != 1) return PublicKey(nullptr, EVP_PKEY_free);
+        return key;
+    }
 
     OwnerCancelAuthority(CancelSubject subject, std::uint64_t key_id, PublicKey key,
                          std::int64_t max_validity_ms) noexcept

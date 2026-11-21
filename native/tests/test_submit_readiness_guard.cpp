@@ -714,8 +714,18 @@ TEST(SubmitReadinessGuard, ThePreflightHarnessCanOnlyHandItsOrderFillTheMockPort
     for (const char* forbidden : {"poll_once(", "drain_hot_inputs(", "drain_reconcile_events(", "drain_user_data_events(", "supervisor().poll(", "ws_supervisor"}) {
         EXPECT_EQ(count_substring(f->code, forbidden), 0u) << "the preflight harness must not call " << forbidden << " itself";
     }
-    EXPECT_EQ(count_substring(f->code, "reconcile_tick("), 1u) << "the one loop calls the reconcile half once per cycle";
-    EXPECT_EQ(count_substring(f->code, "hot_tick("), 2u) << "...the hot half once per cycle, and once more after the sessions are gone";
+    EXPECT_EQ(count_substring(f->code, "reconcile_tick("), 2u) << "each mode calls the reconcile half once per cycle";
+    EXPECT_EQ(count_substring(f->code, "hot_tick("), 4u) << "each mode calls the hot half once per cycle and after joining";
+    const auto claim = f->code.find("request = pipeline->take_automatic_cancel()");
+    const auto shutdown = f->code.find("pipeline->supervisor().shutdown()", claim);
+    const auto join = f->code.find("io_thread.join()", shutdown);
+    const auto dispose = f->code.find("pipeline.reset()", join);
+    const auto handoff = f->code.find("client.cancel_handed_off_order(std::move(sink)", dispose);
+    ASSERT_NE(handoff, std::string::npos);
+    EXPECT_LT(claim, shutdown);
+    EXPECT_LT(shutdown, join);
+    EXPECT_LT(join, dispose);
+    EXPECT_LT(dispose, handoff);
 
     // The negative controls of this check, on text with known answers.
     const auto stripped = [](const char* t) { return code_only(t); };

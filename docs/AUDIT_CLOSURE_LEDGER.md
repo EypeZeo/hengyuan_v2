@@ -835,9 +835,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 0758969
-open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
+open: open:native/src/live_submit_preflight_harness.cpp#"scratch_store_cleanup.emplace(durable_audit_path);"
 refs: test:native/tests/test_durable_audit_sink.cpp#TornTailWriteDiscardsOnlyTheIncompleteRecord test:native/tests/test_durable_audit_sink.cpp#TornTailUnderSixBytesIsRecoveredNotCorrupt test:native/tests/test_durable_audit_sink.cpp#AnchorAheadOfTruncatedLogIsCorruptTailDeletion test:native/tests/test_startup_recovery.cpp#EachUnhealthyDurableLogConditionDegradesWithItsOwnReason test:native/tests/test_durable_audit_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_audit_sink.cpp#ACompleteButWrongFrameIsCorruptAndNothingBehindItIsCut test:native/tests/test_durable_audit_sink.cpp#AnAnchorAheadOfTheLogTogetherWithATornTailIsCorruptAndNothingIsCut test:native/tests/test_control_plane_log_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_log_store.cpp#DiscardTornTailRefusesATailOfAWholeFrameOrMoreAndLeavesTheBytes pr:177@0758969
-note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；PR #177 起撕裂尾部在锚点校验通过之后被物理截断（真实日志上验证第二帧的每个撕裂前缀长度：截断后下一次追加落在帧边界，再重启仍可回放），完整但错误的帧与锚点超前于日志的尾部删除一字节不动、整本日志 Corrupt，截断被操作系统拒绝则围栏；缺口是“拒绝启动并禁止增仓”要由在持久存储上运行启动恢复的进程才成立（M5b-1 起预检线束经流水线运行启动恢复，但存储是每次新建的临时存储，不会有撕裂尾部），且没有恢复报告产物（运行期也没有人读取 recovered_torn_tail_bytes）。
+note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；PR #177 起撕裂尾部在锚点校验通过之后被物理截断（真实日志上验证第二帧的每个撕裂前缀长度：截断后下一次追加落在帧边界，再重启仍可回放），完整但错误的帧与锚点超前于日志的尾部删除一字节不动、整本日志 Corrupt，截断被操作系统拒绝则围栏；撤单专用模式拒绝被围栏的持久日志。常规交易的增仓限制与恢复报告仍需运行验证。
 ```
 
 ```ledger
@@ -1119,9 +1119,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
+open: open:native/src/live_submit_preflight_harness.cpp#"scratch_store_cleanup.emplace(durable_audit_path);"
 refs: test:native/tests/test_startup_recovery.cpp#BootstrapsUntilClockAndExchangeInfoAreReady test:native/tests/test_durable_audit_sink.cpp#RepopulateInFlightRegistryHelperRegistersEveryCheckpoint test:native/tests/test_durable_audit_sink.cpp#SeedPositionTruthFoldsEachRecoveredCheckpointsFilledAmount
-note: 恢复状态机与日志回放辅助函数有单测；启动恢复自 M5b-1 起由预检线束经流水线运行，但该线束自述“不是恢复路径”：存储是每次运行新建的临时存储、固定测试密钥，永远没有上一次运行的订单。
+note: 恢复状态机和日志回放已有单元测试。原生撤单模式可加载持久订单日志，对待确认撤单按数字订单号恢复。策略主进程的崩溃注入仍待验证。
 ```
 
 ```ledger
@@ -1257,9 +1257,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 38d59cf
-open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
+open: open:native/src/live_submit_preflight_harness.cpp#"scratch_store_cleanup.emplace(durable_audit_path);"
 refs: test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderResolvedToCancelledLeavesALogThatReplaysClean test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_order_tracker.cpp#AnUnacknowledgedAppendPublishesNothingAndTheNextDrainRetriesTheSameResolution code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher pr:169@38d59cf
-note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。用户数据流排空函数的同形缺口由 M4 补上（PR #224，9675b6c：先持久确认再折进持仓真值，规划器保证写出的日志可回放，单元测试级）。仍缺：启动恢复状态机自 M5b-1 起只由预检线束运行，存储是临时存储、没有上一次运行的订单，所以没有端到端的重启运行日志，判定信号是单元测试。
+note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。用户数据流排空函数的同形缺口由 M4 补上（PR #224，9675b6c：先持久确认再折进持仓真值，规划器保证写出的日志可回放，单元测试级）。撤单专用模式可用同一持久日志启动恢复。对账终态持久确认前的主进程崩溃注入与重启验证仍待完成。
 ```
 
 ```ledger

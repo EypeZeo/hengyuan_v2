@@ -58,8 +58,8 @@
 // GETs (clock, exchangeInfo, account; the sweep queries only the orders this run's scratch store
 // holds, and a fresh scratch store holds none).
 //
-// Testnet only: no --production flag, .env read from a fixed process-cwd-relative path per
-// ADR-019 D4 (docs/PRIVATE_STREAM_JOINT_RUN.md is the owner's runbook for a Testnet run).
+// Default preflight uses Testnet and reads .env from the process working directory.
+// The explicit cancellation mode takes the existing store and credential paths.
 //
 // Usage: run from the repository root (so ./.env resolves), after `chmod 600 .env`:
 //   ./live_submit_preflight_harness <spec_toml_path> [duration_seconds=60] [interval=1h]
@@ -76,10 +76,9 @@
 // ("[startup probe]" in the log) and expects the same OperatorNotConfirmed. Every probe, from either source, writes an Intent frame to this run's
 // scratch store before the confirmation gate (Gate 10b) -- that is the real durable path, and the store is deleted at exit.
 //
-// NOT covered here, deliberately (each is its own batch): recovery over a PERSISTENT store (this one is a scratch store with a fixed test key: there
-// is never anything to recover, and the audit key's provisioning is the owner's decision) and the target-position planner (this file still probes
-// on HoldingStateTracker transitions); operator confirmation. An AI session compiles this file but never runs it with real credentials: the
-// Testnet joint run is the owner's, with Testnet credentials.
+// The default preflight probes still use a scratch store. The explicit --cancel-only mode opens an existing
+// bound store, runs private-stream recovery, and sends at most one Owner-authorized cancellation after the
+// producers have stopped. --enroll-cancel-owner registers its public key locally.
 
 #include <hengyuan/binance_clock_sync.hpp>
 #include <hengyuan/binance_klines_rest.hpp>
@@ -96,10 +95,12 @@
 #include <hengyuan/public_feed_pipeline.hpp>
 #include <hengyuan/public_feed_policy.hpp>
 #include <hengyuan/rest_account_fetcher.hpp>
+#include <hengyuan/spot_cancel_control.hpp>
 #include <hengyuan/strategy_spec_evaluator.hpp>
 #include <hengyuan/strategy_spec_toml_parser.hpp>
 #include <hengyuan/verified_dry_run_evidence.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -108,6 +109,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -521,6 +524,148 @@ void print_private_stream_report(PrivatePipeline& pipeline, const WsApiSessionFa
                 (reconciled_once && account_by_sweep && recovery_ready && order_path) ? "yes" : "no");
 }
 
+namespace cancel_control = hy::spot_cancel_control;
+
+struct CancelRuntimeOptions {
+    StoreEnvironment environment{};
+    cancel_control::StoreFiles store;
+    std::string credentials;
+    std::filesystem::path control_dir;
+    std::uint32_t duration_seconds{600};
+};
+
+std::optional<CancelRuntimeOptions> parse_cancel_runtime(int argc, char* argv[]) {
+    if (argc != 9 && argc != 10) return std::nullopt;
+    const auto env = cancel_control::parse_environment(argv[2]);
+    if (!env) return std::nullopt;
+    CancelRuntimeOptions opt{*env, {argv[3], 0, argv[5], argv[6]}, argv[7], argv[8]};
+    std::error_code error;
+    if (!cancel_control::parse_id(argv[4], opt.store.audit_key_id) ||
+        !std::filesystem::is_directory(opt.control_dir, error) || error ||
+        (argc == 10 && !cancel_control::parse_id(argv[9], opt.duration_seconds))) return std::nullopt;
+    return opt;
+}
+
+int enroll_cancel_owner(int argc, char* argv[]) {
+    if (argc != 9) {
+        std::fprintf(stderr, "usage: %s --enroll-cancel-owner <TESTNET|PRODUCTION> <log> <audit-key-id> <kek-file> <wrapped-key-file> <owner-key-id> <public-key.der>\n", argv[0]);
+        return 1;
+    }
+    const auto env = cancel_control::parse_environment(argv[2]);
+    cancel_control::StoreFiles files{argv[3], 0, argv[5], argv[6]};
+    std::uint64_t owner_id = 0;
+    if (!env || !cancel_control::parse_id(argv[4], files.audit_key_id) ||
+        !cancel_control::parse_id(argv[7], owner_id)) return 1;
+    const auto result = cancel_control::enroll(files, *env, owner_id, argv[8]);
+    if (result == ExportStatus::Ok) {
+        std::printf("Owner public key registered for %s\n", argv[2]);
+        return 0;
+    }
+    std::fprintf(stderr, "Owner public key registration failed (status=%u)\n", static_cast<unsigned>(result));
+    return 1;
+}
+
+struct CancelGrantInput {
+    OwnerCancelGrantBytes payload;
+    std::string signature_path;
+};
+
+std::optional<CancelGrantInput> publish_cancel_grant(const CancelRuntimeOptions& options,
+                                                    const OwnerCancelAuthority& authority,
+                                                    const ClockOffsetPublisher& clock) {
+    const auto upper = cancel_server_time_upper_bound(clock, fetch_clock_pair());
+    std::int64_t deadline = 0;
+    if (!upper || !checked_add_i64(*upper, cancel_control::kMaxGrantMs, deadline)) return std::nullopt;
+    const auto payload = authority.signing_payload("BTCUSDT", 1, deadline);
+    if (!payload) return std::nullopt;
+    const auto request_path = options.control_dir /
+        ("owner-cancel-" + std::to_string(authority.subject().activation_id) + ".grant");
+    auto signature_path = request_path;
+    signature_path.replace_extension(".sig");
+    if (cancel_control::publish_file(request_path.string(), *payload) != ExportStatus::Ok) return std::nullopt;
+    std::printf("Owner grant: %s\nExpected signature: %s\n", request_path.string().c_str(), signature_path.string().c_str());
+    return CancelGrantInput{*payload, signature_path.string()};
+}
+
+int run_cancel_only(const CancelRuntimeOptions& options, boost::asio::io_context& ioc,
+                    std::unique_ptr<PrivatePipeline>& pipeline, std::unique_ptr<DurableAuditSink>& sink,
+                    OwnerCancelAuthority* authority, BinancePrivateRestClient& client,
+                    KillSwitch& kill_switch, const InFlightRegistry& in_flight, const SymbolRules& rules) {
+    // The persistent log is already exclusively open and the exchange UID has been checked.
+    // Only startup recovery and cancellation run in this mode.
+    kill_switch.latch();
+    const auto checkpoints = sink->recovered_checkpoints();
+    if (checkpoints.empty()) {
+        std::puts("No unresolved orders in the log.");
+        return 0;
+    }
+    const bool has_working = std::any_of(checkpoints.begin(), checkpoints.end(), [](const auto& cp) {
+        return cp.mode == ExecutionMode::Live && cp.symbol_id == 0 && !cp.pending_cancel.present() &&
+               !cp.exchange_order_id_conflict && cancel_prepared::working(cp.resulting_state);
+    });
+    const auto grant = authority && has_working ? publish_cancel_grant(options, *authority, client.clock_publisher())
+                                               : std::nullopt;
+    if (has_working && !grant) std::fputs("Owner grant unavailable. Reconciling existing orders.\n", stderr);
+
+    auto io_guard = boost::asio::make_work_guard(ioc);
+    std::thread io_thread([&ioc] { ioc.run(); });
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(options.duration_seconds);
+    auto next_clock_sync = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    std::optional<AutomaticCancelRequest> request;
+    bool installed = false;
+    std::vector<std::byte> signature;
+    try {
+        while (!g_stop.load() && std::chrono::steady_clock::now() < end) {
+            if (std::chrono::steady_clock::now() >= next_clock_sync) {
+                const auto error = client.sync_clock();
+                next_clock_sync = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(error == PrivateRestError::None ? 60 : 10);
+            }
+            if (grant && !installed && cancel_control::is_regular_file(grant->signature_path) &&
+                read_file_bounded(grant->signature_path, signature, cancel_control::kMaxOwnerSignatureBytes) == ReadFileStatus::Ok) {
+                installed = authority->install(grant->payload, cancel_control::unsigned_bytes(signature),
+                                               client.clock_publisher(), fetch_clock_pair()) == OwnerCancelInstallResult::Installed;
+                if (installed) std::puts("Owner grant installed.");
+            }
+            const auto steady = PrivateSession::steady_now_ms();
+            const auto wall = reconcile_wall_now_ms();
+            pipeline->hot_tick(steady, wall);
+            request = pipeline->take_automatic_cancel();
+            if (request || (pipeline->recovery_applied() && pipeline->recovery_result().ok() && in_flight.count() == 0)) break;
+            if (pipeline->supervisor().state() == FeedState::Terminal) break;
+            pipeline->reconcile_tick(steady, wall);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Cancellation loop stopped: %s.\n", e.what());
+        request.reset();
+    }
+
+    pipeline->supervisor().shutdown();
+    io_guard.reset();
+    io_thread.join();
+    pipeline->hot_tick(PrivateSession::steady_now_ms(), reconcile_wall_now_ms());
+    if (request && !in_flight.owns(request->handle, request->client_order_id.view())) request.reset();
+
+    if (!request) {
+        const bool complete = pipeline->recovery_applied() && pipeline->recovery_result().ok() && in_flight.count() == 0;
+        std::puts(complete ? "Recovered orders reconciled." : "Unresolved orders retained for recovery.");
+        return complete ? 0 : 2;
+    }
+    const auto alias = cancel_control::new_cancel_alias();
+    if (!authority || !alias || g_stop.load()) return 2;
+    pipeline.reset();
+    const auto result = client.cancel_handed_off_order(std::move(sink), *request, *authority, kill_switch,
+                                                       *alias, rules, reconcile_wall_now_ms(), {});
+    if (result.terminal.acked()) {
+        std::puts("Cancellation confirmed and recorded.");
+        return 0;
+    }
+    std::fprintf(stderr, "Cancellation unresolved (prepared=%d, not-sent=%d, REST=%s). Restart recovery to query pending orders.\n",
+                 result.prepared.acked(), result.not_sent.acked(), private_rest_error_name(result.exchange.error));
+    return 2;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -534,8 +679,16 @@ int main(int argc, char* argv[]) {
                      argv[0]);
         return 1;
     }
+    if (std::string_view(argv[1]) == "--enroll-cancel-owner") return enroll_cancel_owner(argc, argv);
+    const bool cancel_only = std::string_view(argv[1]) == "--cancel-only";
+    const auto cancel_options = cancel_only ? parse_cancel_runtime(argc, argv) : std::nullopt;
+    if (cancel_only && !cancel_options) {
+        std::fprintf(stderr, "usage: %s --cancel-only <TESTNET|PRODUCTION> <log> <audit-key-id> <kek-file> <wrapped-key-file> <credentials-file> <control-dir> [duration-seconds]\n", argv[0]);
+        return 1;
+    }
+    const auto environment = cancel_options ? cancel_options->environment : StoreEnvironment::Testnet;
     const std::string spec_path = argv[1];
-    int duration_s = argc >= 3 ? std::atoi(argv[2]) : 60;
+    int duration_s = !cancel_only && argc >= 3 ? std::atoi(argv[2]) : 60;
     if (duration_s <= 0) duration_s = 60;
     // No maximum run time: the public feeds are supervised and roll their connections over before
     // Binance's 24 h connection limit on their own.
@@ -553,8 +706,9 @@ int main(int argc, char* argv[]) {
     };
 
     // --- Load spec + fail-closed market-binding check (批次 6a-2's own established pattern) --
-    std::string toml_text;
-    {
+    SpecLoadResult load_result{};
+    StreamingEvaluator evaluator;
+    if (!cancel_only) {
         std::ifstream f(spec_path, std::ios::binary);
         if (!f) {
             std::fprintf(stderr, "FATAL: could not open spec file: %s\n", spec_path.c_str());
@@ -562,31 +716,39 @@ int main(int argc, char* argv[]) {
         }
         std::ostringstream ss;
         ss << f.rdbuf();
-        toml_text = ss.str();
-    }
-    const SpecLoadResult load_result = load_strategy_spec(toml_text);
-    if (!load_result.ok()) {
-        std::fprintf(stderr, "FATAL: spec load failed (status=%d): %s\n",
-                     static_cast<int>(load_result.status), spec_path.c_str());
-        return 1;
-    }
-    if (!market_binding_matches(load_result.market, ManualMarket::CryptoSpot, "BTCUSDT", interval)) {
-        std::fprintf(stderr,
-                     "FATAL: spec [market] binding (symbol=%s, timeframe=%s) does not match "
-                     "this harness's fixed BTCUSDT/%s subscription -- refusing to start.\n",
-                     load_result.market.symbol, load_result.market.timeframe, interval.c_str());
-        return 1;
-    }
-    StreamingEvaluator evaluator;
-    if (!evaluator.init(load_result.dag)) {
-        std::fprintf(stderr, "FATAL: StreamingEvaluator::init() failed (capacity exceeded).\n");
-        return 1;
+        load_result = load_strategy_spec(ss.str());
+        if (!load_result.ok()) {
+            std::fprintf(stderr, "FATAL: spec load failed (status=%d): %s\n",
+                         static_cast<int>(load_result.status), spec_path.c_str());
+            return 1;
+        }
+        if (!market_binding_matches(load_result.market, ManualMarket::CryptoSpot, "BTCUSDT", interval)) {
+            std::fprintf(stderr,
+                         "FATAL: spec [market] binding (symbol=%s, timeframe=%s) does not match "
+                         "this harness's fixed BTCUSDT/%s subscription -- refusing to start.\n",
+                         load_result.market.symbol, load_result.market.timeframe, interval.c_str());
+            return 1;
+        }
+        if (!evaluator.init(load_result.dag)) {
+            std::fprintf(stderr, "FATAL: StreamingEvaluator::init() failed (capacity exceeded).\n");
+            return 1;
+        }
     }
     HoldingStateTracker tracker;
 
     // --- The cold-start chain ------------------------------------------------------------
     SecureEnvLoader loader;
-    EnvironmentBinding binding = EnvironmentBinding::testnet();
+    const auto binding = environment == StoreEnvironment::Testnet ? EnvironmentBinding::testnet()
+                                                                   : EnvironmentBinding::production();
+    std::optional<ScratchStoreCleanup> scratch_store_cleanup;
+    cancel_control::OpenStore store;
+    if (cancel_options) {
+        store = cancel_control::open_existing_store(cancel_options->store, environment);
+        if (!store.sink) {
+            std::fputs("FATAL: persistent audit store could not be opened in the selected environment.\n", stderr);
+            return 1;
+        }
+    }
 
     // --- The four dry-run drills, for real (批次 6 6b-0b) ------------------------------------------
     // Before the process reads a credential or touches the network (and before any io thread or feed
@@ -595,7 +757,7 @@ int main(int argc, char* argv[]) {
     // read-only chain()).
     const std::uint32_t stamp = build_stamp();
     VerifiedDryRunEvidence verified_evidence;
-    {
+    if (!cancel_only) {
         const DryRunReport drills = verified_evidence.run_all(stamp, drill_startup_now_ms(get_now_ms()), binding.environment(),
                                                               durable_audit_temp_path() + "_drill");
         static constexpr const char* kDrillNames[kEvidencePathCount] = {"SubmitSuccess", "SubmitReject",
@@ -613,15 +775,18 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    std::printf("Dry-run evidence earned: all_paths_exercised=%s consistent_build=%s live_ready=%s\n",
-                verified_evidence.chain().all_paths_exercised() ? "true" : "false",
-                verified_evidence.chain().consistent_build() ? "true" : "false",
-                verified_evidence.chain().live_ready() ? "true" : "false");
+    if (!cancel_only) {
+        std::printf("Dry-run evidence earned: all_paths_exercised=%s consistent_build=%s live_ready=%s\n",
+                    verified_evidence.chain().all_paths_exercised() ? "true" : "false",
+                    verified_evidence.chain().consistent_build() ? "true" : "false",
+                    verified_evidence.chain().live_ready() ? "true" : "false");
+    }
 
     std::array<std::string_view, 2> allowed_keys{binding.api_key_env_key(), binding.secret_env_key()};
     EnvAllowlist allowlist{allowed_keys.data(), allowed_keys.size()};
 
-    const auto load_env_result = loader.load(".env", allowlist);
+    const char* credentials_file = cancel_options ? cancel_options->credentials.c_str() : ".env";
+    const auto load_env_result = loader.load(credentials_file, allowlist);
     if (load_env_result.status != EnvLoadStatus::Ok) {
         print_env_load_error(load_env_result.status);
         return 1;
@@ -780,39 +945,30 @@ int main(int argc, char* argv[]) {
     KillSwitch kill_switch;
     kill_switch.operator_reset();
 
-    // Real DurableAuditSink -- every probe writes its Intent frame here before the confirmation gate (Gate 10b), and
-    // nothing else is ever written (confirmation is never bound), so an ephemeral per-run temp file (cleaned at
-    // shutdown, and by ScratchStoreCleanup on every early return) is appropriate here, unlike a genuine production
-    // audit trail.
-    //
-    // DEMO-ONLY, and NOT a recovery path (外部复核 P0-06): the pipeline's StartupRecovery runs over this log (so the
-    // state machine and the store binding are exercised), but a fresh temp log with a fixture KEK can never contain a
-    // previous run's orders, so nothing is ever recovered -- that part of the path runs empty. Anything that may submit
-    // for real must run the same sequence over a PERSISTENT log (6b-0d builds and tests that; the 6b-2 harness wires
-    // it, once the owner has decided how the audit key is provisioned).
-    const std::string durable_audit_path = durable_audit_temp_path();
-    remove_durable_audit_files(durable_audit_path);
-    ScratchStoreCleanup scratch_store_cleanup(durable_audit_path);
-    std::array<std::byte, kKekSize> kek{};
-    for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x20 + i);
-    // unique_ptr, not stack values -- same "explicit reset() before removing the temp file,
-    // never a manual destructor call on a stack object" discipline as
-    // live_submit_evidence_harness.cpp's own Fixture (a stack DurableAuditSink would double-
-    // destruct if this file ever needed to close it before main() returns, which shutdown does).
-    auto key_ring = std::make_unique<KeyRing>(kek);
-    WrappedKeyRecord key_rec{};
-    key_ring->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}},
-                       key_rec);
-    // Q23 S6: this Testnet-only harness is one of the two processes that turn the closure writer on (the other is live_submit_evidence_harness):
-    // an order a local gate refuses after its Intent frame is closed as never sent instead of being left as an Intent orphan.
-    // test_never_sent_guard.cpp pins that no other production source names NeverSentWrites.
-    auto durable_audit_sink = std::make_unique<DurableAuditSink>(durable_audit_path, *key_ring, 1, kMaxIntentOrphans,
-                                                                 AuditSinkOpenMode::Trading, NeverSentWrites::Enabled);
+    const std::string durable_audit_path = cancel_options ? cancel_options->store.log : durable_audit_temp_path();
+    if (cancel_options) {
+        if (judge_store_binding(store.sink->read_binding(), environment, exchange_uid) != BindingJudgement::Match) {
+            std::fputs("FATAL: persistent audit store belongs to a different exchange account.\n", stderr);
+            return 1;
+        }
+    } else {
+        remove_durable_audit_files(durable_audit_path);
+        scratch_store_cleanup.emplace(durable_audit_path);
+        std::array<std::byte, kKekSize> kek{};
+        for (std::size_t i = 0; i < kek.size(); ++i) kek[i] = static_cast<std::byte>(0x20 + i);
+        store.keys = std::make_unique<KeyRing>(kek);
+        WrappedKeyRecord key_rec{};
+        store.keys->add_key(1, std::vector<std::byte>{std::byte{0x01}, std::byte{0x02}, std::byte{0x03}}, key_rec);
+        store.sink = std::make_unique<DurableAuditSink>(durable_audit_path, *store.keys, 1, kMaxIntentOrphans,
+                                                       AuditSinkOpenMode::Trading, NeverSentWrites::Enabled);
+    }
+    auto& durable_audit_sink = store.sink;
+    auto authority = cancel_only ? cancel_control::load_authority(durable_audit_path, *durable_audit_sink) : nullptr;
 
     // --- The private-stream pipeline (M5b-1, private_stream_pipeline.hpp) ----------------------------------------
     // Everything below is the process's and outlives it. The pipeline creates no thread and opens no connection by
     // itself: the supervisor connects on hot_tick(), through ws_factory, on this thread.
-    PipelineParts parts{*durable_audit_sink, durable_audit_path, *key_ring, make_durable_order_audit_port(*durable_audit_sink),
+    PipelineParts parts{*durable_audit_sink, durable_audit_path, *store.keys, make_durable_order_audit_port(*durable_audit_sink),
                         audit, kill_switch, position_truth, in_flight, fill_context, user_data_events,
                         client.clock_publisher(), &rate_limiter};
     parts.query_port = QueryPort{&query_order_adapter, &client};
@@ -821,6 +977,7 @@ int main(int argc, char* argv[]) {
 
     PipelineConfig pipeline_cfg;
     pipeline_cfg.submit_authority = submit_authority;
+    if (authority) pipeline_cfg.automatic_cancel = authority->config();
     // The supervision the public feeds get: reconnect with backoff, a planned rollover well inside the 24 h limit of
     // a Binance connection, and an end to the run -- exit code 2, not a silent blind loop -- once ten attempts in a
     // row have failed.
@@ -835,12 +992,9 @@ int main(int argc, char* argv[]) {
     auto private_pipeline = std::make_unique<PrivatePipeline>(
         parts, pipeline_cfg, [&ws_factory](std::uint64_t generation) { return ws_factory(generation); });
 
-    // The store binding: this run's scratch store, bound to the account the EXCHANGE says this key trades as (this
-    // harness is Testnet-only, like the binding above). The verdict gates readiness -- an unbound store never lets the
-    // process become ready -- and a refusal means the process must not run. Nothing has been started yet, so there is
-    // nothing to undo.
+    // Bind the scratch store, or recheck the existing persistent binding, against the exchange's account UID.
     const EnsureBindingStatus binding_status =
-        private_pipeline->bind_store(StoreEnvironment::Testnet, exchange_uid, reconcile_wall_now_ms());
+        private_pipeline->bind_store(environment, exchange_uid, reconcile_wall_now_ms());
     const std::string_view binding_status_text = ensure_binding_status_name(binding_status);
     std::printf("Store binding: %.*s\n", static_cast<int>(binding_status_text.size()), binding_status_text.data());
     if (!store_may_be_used(binding_status)) {
@@ -850,6 +1004,10 @@ int main(int argc, char* argv[]) {
     }
     // exchangeInfo is loaded (above) and registry_rules_for answers: recovery may scale what it recovers.
     private_pipeline->set_exchange_info_loaded(true);
+    if (cancel_options) {
+        return run_cancel_only(*cancel_options, ioc, private_pipeline, durable_audit_sink, authority.get(),
+                               client, kill_switch, in_flight, rules);
+    }
 
     // --- Both public feeds, supervised (批次 6b-0f) --------------------------------------------
     // The io_context needs a work guard: the sessions are created LATER, by the supervisors'
@@ -1202,8 +1360,6 @@ int main(int argc, char* argv[]) {
 
     private_pipeline.reset();    // it points at the store: let go of it first
     durable_audit_sink.reset();  // close before removing the temp file
-    key_ring.reset();
-    remove_durable_audit_files(durable_audit_path);
 
     return exit_code;
 }
