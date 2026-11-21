@@ -448,11 +448,11 @@ status: REMEDIATING
 task: SAFE-04
 gate: 实盘发单风控
 gate_result: BLOCKED
-open: absent:formal/*.tla#"MODULE kill_switch"
+open: open:docs/HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md#"目标主机的进程与主机重启验证待完成"
 refs: code:native/include/hengyuan/kill_switch.hpp#KillSwitch test:native/tests/test_kill_switch.cpp#OnlyOperatorResetClears
 seg.code: PRESENT code:native/include/hengyuan/durable_kill_switch.hpp#DurableKillSwitchStore -- 已接入持久状态恢复、限制发布与最终提交授权的排序
 seg.contract: PRESENT doc:docs/SPEC_INVARIANTS.md#KillSwitch bp:"任务 SAFE-04" -- 任务已定义持久锁存与线性化次序
-seg.fault: MISSING fi:FI-023=PARTIAL fi:FI-036=PARTIAL -- 目标主机重启与形式化验证待完成
+seg.fault: MISSING fi:FI-023=PARTIAL fi:FI-036=PARTIAL -- 子进程恢复与形式化检查已通过，目标主机重启与 CI 线程检测运行记录待补充
 seg.test: PRESENT test:native/tests/test_durable_kill_switch.cpp#RestrictiveWriteKeepsReadersAvailableAndBlocksNormalClaims -- 覆盖写入未返回时的读与授权、重置发布和恢复
 seg.runtime: MISSING -- 目标主机重启后的锁存验证待完成
 seg.budget: MISSING -- 持久确认进入风控路径的时延未测量
@@ -1136,8 +1136,8 @@ result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
 open: nofile:docs/drills/*safe-04*
-refs: test:native/tests/test_durable_kill_switch.cpp#NonNormalStateAndRevisionSurviveRestartWithoutAutomaticReset test:native/tests/test_durable_kill_switch.cpp#PreviouslyPersistedNormalStateIsLatchedOnDefaultRestart
-note: 持久锁存、重置和重开日志已有本地测试。目标主机的进程与主机重启验证待完成。
+refs: test:native/tests/test_durable_kill_switch.cpp#NonNormalStateAndRevisionSurviveRestartWithoutAutomaticReset test:native/tests/test_durable_kill_switch.cpp#PreviouslyPersistedNormalStateIsLatchedOnDefaultRestart test:native/CMakeLists.txt#KillSwitchProcessRecovery
+note: 已验证限制写入前后异常退出时的新进程恢复。目标主机的进程与主机重启验证待完成。
 ```
 
 ```ledger
@@ -1335,9 +1335,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: nofile:formal/kill_switch.tla
-refs: test:native/tests/test_durable_kill_switch.cpp#SnapshotsRemainConsistentWhileTheSwitchEscalates test:native/tests/test_submit_readiness.cpp#KillPublishedDuringFinalCheckPreventsClaim
-note: 已有并发读写和最终授权交错用例。形式化模型及其负向用例待完成。
+open: open:docs/HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md#"CI 线程检测运行记录待补充"
+refs: test:native/tests/test_durable_kill_switch.cpp#SnapshotsRemainConsistentWhileTheSwitchEscalates test:native/tests/test_submit_readiness.cpp#KillPublishedDuringFinalCheckPreventsClaim code:formal/kill_switch.tla#ClaimMatchesPublication
+note: 并发读写、最终授权交错和形式化模型已通过本地验证。CI 线程检测运行记录待补充。
 ```
 
 ```ledger

@@ -1123,3 +1123,29 @@ wipe that keeps the old set of closed orders.
 
 - `scope_approval.tla` — the model.
 - `scope_approval*.cfg` — see the table above.
+
+## SAFE-04 persistent kill switch and final submit claim
+
+`kill_switch.tla` represents one persistent switch, one candidate token and one
+request at a time. It groups Armed, Triggered and Latched as Restricted. It
+distinguishes the publication of a restriction, the durable write and the
+acknowledgement of that write. A restart starts a new generation with restricted
+authorization, including when the most recent verified record is Normal. A claim
+that precedes a restriction can complete as an in-flight request.
+
+| Config | Expected TLC result |
+|---|---|
+| `kill_switch.cfg` | No error. A claim matches the current Normal publication and revision. Normal requires a durable reset in the current process. |
+| `kill_switch_stale_check_bug.cfg` | `ClaimMatchesPublication` violated when a claim accepts an earlier readiness check. |
+| `kill_switch_no_revision_bug.cfg` | `ClaimMatchesPublication` violated when a claim accepts a token issued before the revision changed. |
+| `kill_switch_early_reset_bug.cfg` | `ResetRequiresDurableWrite` violated when the reset becomes visible before the write. |
+| `kill_switch_restore_normal_bug.cfg` | `RestartRequiresNewReset` violated when recovery reopens a persisted Normal record. |
+| `kill_switch_probe_reset.cfg` | `ClaimAfterResetIsUnreachable` violated. A reset and a fresh token can lead to a claim. |
+| `kill_switch_probe_inflight.cfg` | `SendAfterRestrictionIsUnreachable` violated. A request that already claimed authorization can send after publication. |
+
+TLC explored 1,495 distinct states through two process generations and revision
+five. All six controls exited with code 12 and the listed invariant violation.
+CI requires those exact results. The model treats an operator reset request as
+already authorized and assumes the meaning of a successful durable write. The
+native CTest `KillSwitchProcessRecovery` exercises the filesystem records across
+child-process exits before and after writing a restriction.
