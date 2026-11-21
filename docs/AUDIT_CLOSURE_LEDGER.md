@@ -225,14 +225,16 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-056** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-057** | PRE_D3 | L2 | PARTIAL | NOT_RUN | BLOCKED | 58b60d0 |
 | **FI-058** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 1e104d7 |
+| **FI-059** | PRE_OWNER_LIVE | L1 | PARTIAL | NOT_RUN | BLOCKED | 01043c3 |
+| **FI-060** | PRE_OWNER_LIVE | L1 | PARTIAL | NOT_RUN | BLOCKED | 01043c3 |
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | PRE_D3 | 38 | 4 | 25 | 9 | BLOCKED |
-| PRE_OWNER_LIVE | 14 | 0 | 3 | 11 | BLOCKED |
+| PRE_OWNER_LIVE | 16 | 0 | 5 | 11 | BLOCKED |
 | CANARY | 6 | 0 | 0 | 6 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 26，PARTIAL 28，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 26，PARTIAL 30，IMPLEMENTED 4，合计 60，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -1681,4 +1683,36 @@ baseline: 1e104d7
 open: absent:native/tests/*.cpp#SIGKILL
 refs: test:native/tests/test_binance_private_rest.cpp#AReplysStatusAndExecutedQuantityMustAgreeWithEachOtherAndWithWhatWasSent test:native/tests/test_live_submit_orchestrator.cpp#AReplyThatNamesAStateNoNewOrderCanBeInIsAnUnknownResultNotADurableFrame test:native/tests/test_live_submit_orchestrator.cpp#AnExpiredInMatchReplyLeavesALogTheNextStartCanRecoverFrom pr:241@1e104d7
 note: PARTIAL：解析器只认 NEW（成交为零）、PARTIALLY_FILLED（严格居中）、FILLED（等于发出量），编排器另有守卫把不是 Submitting 合法后继的回复按未知结果处理，真实日志上一份过期回复之后重开恢复为 Recovered（均为单测，PR #241）；没有任何测试强杀进程，也从未对真实交易所观察过这类回复。
+```
+
+```ledger
+id: FI-059
+title: 交易范围签名或执行身份不符
+gate_tag: PRE_OWNER_LIVE
+scope: 现货
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 01043c3
+open: open:docs/SCOPE_APPROVAL_DESIGN.md#"范围安装及撤销待接入生产进程"
+refs: code:native/include/hengyuan/owner_trade_scope_approval.hpp#VerifiedTradeScope test:native/tests/test_trade_scope_approval.cpp#TradeScopeGrant
+note: 规范载荷、P-256 签名、执行身份、政策上限与有效期已有离线测试。生产安装和设备验证待完成。
+```
+
+```ledger
+id: FI-060
+title: 交易范围额度确认与恢复
+gate_tag: PRE_OWNER_LIVE
+scope: 现货
+stage: 1A
+level: L1
+status: PARTIAL
+result: NOT_RUN
+gate_result: BLOCKED
+baseline: 01043c3
+open: open:docs/SCOPE_APPROVAL_DESIGN.md#"订单日志的范围序号编码与真实追加接口待接入"
+refs: code:native/include/hengyuan/trade_scope_budget.hpp#TradeScopeBudget test:native/tests/test_trade_scope_approval.cpp#TradeScopeBudget
+note: 单范围额度计算已覆盖预占、未确认写入、NeverSent 归还与事件重放。实际订单日志收费和重启回归待接入。
 ```

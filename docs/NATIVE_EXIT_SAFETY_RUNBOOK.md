@@ -58,7 +58,21 @@ Use the DER SubjectPublicKeyInfo of the Owner’s P-256 signing key. Run the com
 & $exe --enroll-reset-owner PRODUCTION $log $auditKeyId $kekFile $wrappedKeyFile $ownerKeyId $resetPublicDer
 ```
 
-The command publishes `<log>.owner-reset.pub` in the trusted order store directory and refuses an existing registration. `ProductionResetKey::load()` checks the record against the bound environment, account UID, and store UUID before preparing a reset challenge. The running production process still needs a reset request handler.
+The command publishes `<log>.owner-reset.pub` in the trusted order store directory and refuses an existing registration. `ProductionResetKey::load()` checks the record against the bound environment, account UID, and store UUID before preparing a reset challenge.
+
+### Run the production reset process
+
+Use the same bound order store and a local, operator-controlled control directory. The read-only credentials file supplies `HENGYUAN_OPERATOR_LIVE_API_KEY` and `HENGYUAN_OPERATOR_LIVE_API_SECRET` for the account bound to that store.
+
+```powershell
+& $exe --owner-reset PRODUCTION $log $auditKeyId $kekFile $wrappedKeyFile $operatorCredentials $controlDir
+```
+
+The process holds the store lock. After recovery and reconciliation, it publishes an `owner-reset-*.grant` challenge for the current persistent kill switch revision. Sign the complete challenge using the enrolled key. Publish the complete DER signature by renaming it to the `.sig` path printed by the process. An expired request, a changed revision or a refused signature prompts a new challenge once the account and private stream are ready.
+
+`Owner reset result: Applied` confirms the persistent state update. The process continues to service the private stream and future reset requests until stopped. An optional final argument limits runtime in seconds. A cold restart recovers the persistent restriction and requires a fresh challenge.
+
+On 2026-11-21 the Spot Testnet reset drill verified the exchange account, bound an isolated order store, and reported an authenticated kill-switch record. The temporary software P-256 signature was accepted. The revision advanced from 0 to 1 with result `Applied` and exit code 0.
 
 ## 3. Operator manual takeover — step by step
 

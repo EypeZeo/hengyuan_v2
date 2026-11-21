@@ -25,7 +25,7 @@ using OwnerResetChallengeBytes =
     std::array<std::byte, sizeof(kOwnerResetDomain) + 2 + 5 * sizeof(std::uint64_t) +
                                OwnerResetActivation{}.size()>;
 
-// One challenge for this runtime. A new process creates a fresh activation.
+// One active challenge at a time. Each challenge has a fresh random identifier.
 class OwnerResetAuthority {
 public:
     static std::unique_ptr<OwnerResetAuthority> create(std::span<const unsigned char> public_key_der) {
@@ -36,6 +36,20 @@ public:
     OwnerResetAuthority& operator=(const OwnerResetAuthority&) = delete;
 
     [[nodiscard]] const OwnerResetActivation& activation() const noexcept { return activation_; }
+
+    [[nodiscard]] std::optional<OperatorResetApproval> pending_approval() const noexcept {
+        if (!pending_) return std::nullopt;
+        return pending_->approval;
+    }
+
+    [[nodiscard]] bool renew_request() noexcept {
+        if (!pending_) return false;
+        OwnerResetActivation next{};
+        if (RAND_bytes(next.data(), static_cast<int>(next.size())) != 1 || next == activation_) return false;
+        pending_.reset();
+        activation_ = next;
+        return true;
+    }
 
     [[nodiscard]] OperatorResetApprovalPort approval_port() noexcept {
         return {&verify_current, this};

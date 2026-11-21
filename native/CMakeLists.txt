@@ -253,6 +253,11 @@ if(HY_BUILD_DEMO)
     hengyuan_set_warnings(hy_operator_resolve)
     hengyuan_allow_third_party_tsan_fences(hy_operator_resolve)
 
+    add_executable(hy_scope src/hy_scope.cpp)
+    target_link_libraries(hy_scope PRIVATE hengyuan_core simdjson OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST})
+    target_include_directories(hy_scope SYSTEM PRIVATE ${_simdjson_inc} ${OPENSSL_INCLUDE_DIR})
+    hengyuan_set_warnings(hy_scope)
+
     add_executable(hy_r6_prepare_drill src/hy_r6_prepare_drill.cpp)
     target_link_libraries(hy_r6_prepare_drill PRIVATE hengyuan_core)
     hengyuan_set_warnings(hy_r6_prepare_drill)
@@ -1554,6 +1559,13 @@ if(HY_BUILD_TESTS)
         target_include_directories(test_binance_signer PRIVATE tests)
         hengyuan_set_warnings(test_binance_signer)
         gtest_discover_tests(test_binance_signer)
+
+        add_executable(test_trade_scope_approval tests/test_trade_scope_approval.cpp)
+        target_link_libraries(test_trade_scope_approval PRIVATE
+            hengyuan_core OpenSSL::Crypto ${HY_OPENSSL_WIN32_LIBS_NO_BOOST} GTest::gtest_main)
+        target_include_directories(test_trade_scope_approval SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+        hengyuan_set_warnings(test_trade_scope_approval)
+        gtest_discover_tests(test_trade_scope_approval)
 
         # Batch 4 round 1: EnvironmentBinding + BoundHmacCredentials (depends
         # on BinanceSigner, hence OpenSSL) and §2.1 query signing.

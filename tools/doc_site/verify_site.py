@@ -227,8 +227,8 @@ def main() -> int:
     check("D4 故障用例逐项一致",
           {(f["id"], f["gate"], f["impl"]) for f in fi}
           == {(f["id"], f["gate"], f["impl"]) for f in data["fi"]})
-    check("D5 故障用例 58 条且完备", len(fi) == 58
-          and sorted(int(f["id"][3:]) for f in fi) == list(range(1, 59)), str(len(fi)))
+    check("D5 故障用例 60 条且完备", len(fi) == 60
+          and sorted(int(f["id"][3:]) for f in fi) == list(range(1, 61)), str(len(fi)))
     check("D6 任务清单逐项一致",
           {(t["id"], t["priority"], t["status"]) for t in tasks}
           == {(t["id"], t["priority"], t["status"]) for t in data["tasks"]})
