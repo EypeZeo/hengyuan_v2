@@ -3,7 +3,7 @@
 // order right now?". orchestrate_submit() asks for a SubmitReadyToken (Gate 2b) and refuses without one; unwired is refused too.
 //
 // The token is issued only when ALL of these hold at the moment of the call:
-//   * the operator kill switch is Normal (the in-memory breaker; SAFE-04 will replace it with a persistent one -- design R10);
+//   * the operator kill switch is Normal, and any supplied trade scope epoch is current in its persistent state;
 //   * StartupRecovery is Ready AND its live prerequisites hold right now (StartupRecovery::submit_enabled): the durable log is open and not
 //     fenced, the clock is synced, the account snapshot is fresh, the user-data stream is connected;
 //   * the ReconnectBarrier is Reconciled(G), and the live feed is on that same generation G and connected: a subscription that was swept is the
@@ -55,8 +55,9 @@ enum class NotReadyReason : std::uint8_t {
     ClockNotReady = 8,        // no fresh signing timestamp can be issued
     EpochChanged = 9,
     FinalCheckFailed = 10,
+    TradeScopeInvalidated = 11,
 };
-inline constexpr std::size_t kNotReadyReasonCount = 11;
+inline constexpr std::size_t kNotReadyReasonCount = 12;
 
 [[nodiscard]] constexpr const char* not_ready_reason_name(NotReadyReason r) noexcept {
     switch (r) {
@@ -71,6 +72,7 @@ inline constexpr std::size_t kNotReadyReasonCount = 11;
         case NotReadyReason::EpochChanged: return "EpochChanged";
         case NotReadyReason::FinalCheckFailed: return "FinalCheckFailed";
         case NotReadyReason::ClockNotReady: return "ClockNotReady";
+        case NotReadyReason::TradeScopeInvalidated: return "TradeScopeInvalidated";
     }
     return "?";
 }
@@ -110,15 +112,17 @@ public:
 private:
     friend class SubmitReadiness;
     constexpr SubmitReadyToken(std::uint64_t generation, std::int64_t issued_at_ms, std::uint64_t epoch,
-                               std::uint64_t barrier_epoch, std::uint64_t kill_revision, const void* issuer) noexcept
+                               std::uint64_t barrier_epoch, std::uint64_t kill_revision,
+                               std::optional<TradeScopeEpoch> scope_epoch, const void* issuer) noexcept
         : generation_(generation), issued_at_ms_(issued_at_ms), epoch_(epoch), barrier_epoch_(barrier_epoch),
-          kill_revision_(kill_revision), issuer_(issuer) {}
+          kill_revision_(kill_revision), scope_epoch_(scope_epoch), issuer_(issuer) {}
 
     std::uint64_t generation_;
     std::int64_t issued_at_ms_;
     std::uint64_t epoch_;
     std::uint64_t barrier_epoch_;
     std::uint64_t kill_revision_;
+    std::optional<TradeScopeEpoch> scope_epoch_;
     const void* issuer_;
 };
 
@@ -154,14 +158,15 @@ public:
         return feed.sampled_at_ms;
     }
 
-    [[nodiscard]] ReadinessResult authorize(std::int64_t now_ms) noexcept {
-        auto result = evaluate(now_ms);
+    [[nodiscard]] ReadinessResult authorize(std::int64_t now_ms,
+                                           std::optional<TradeScopeEpoch> scope_epoch = {}) noexcept {
+        auto result = evaluate(now_ms, scope_epoch);
         if (result.ready()) ++stats_.authorized;
         return result;
     }
 
 private:
-    [[nodiscard]] ReadinessResult evaluate(std::int64_t now_ms) noexcept {
+    [[nodiscard]] ReadinessResult evaluate(std::int64_t now_ms, std::optional<TradeScopeEpoch> scope_epoch) noexcept {
         if (!probe_.is_valid()) return refuse(NotReadyReason::NoProbe);
 
         const auto epoch = authority().epoch();
@@ -170,8 +175,12 @@ private:
         const FeedObservation feed = probe_.feed(probe_.user_data);
         barrier_.observe(feed);
 
-        const auto kill_revision = kill_switch_.open_revision();
-        if (!kill_revision) return refuse(NotReadyReason::KillSwitchNotNormal);
+        const auto kill_revision = kill_switch_.open_revision(scope_epoch);
+        if (!kill_revision) {
+            const auto reason = scope_epoch && kill_switch_.can_open()
+                                    ? NotReadyReason::TradeScopeInvalidated : NotReadyReason::KillSwitchNotNormal;
+            return refuse(reason);
+        }
         if (!recovery_.submit_enabled(probe_.recovery(probe_.user_data))) return refuse(NotReadyReason::StartupNotReady);
         switch (barrier_.state()) {
             case BarrierState::Down: return refuse(NotReadyReason::FeedDown);
@@ -186,7 +195,8 @@ private:
         if (epoch == SubmitAuthority::exhausted() || authority().epoch() != epoch) return refuse(NotReadyReason::EpochChanged);
         ReadinessResult result{};
         result.reason = NotReadyReason::None;
-        result.token = std::optional<SubmitReadyToken>(SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, this));
+        result.token = std::optional<SubmitReadyToken>(
+            SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, scope_epoch, this));
         return result;
     }
 
@@ -198,7 +208,7 @@ public:
 
     template <typename FinalCheck>
     [[nodiscard]] NotReadyReason claim(const SubmitReadyToken& token, std::int64_t now_ms, FinalCheck&& final_check) noexcept {
-        const auto current = evaluate(now_ms);
+        const auto current = evaluate(now_ms, token.scope_epoch_);
         if (!current.ready()) return current.reason;
         if (token.issuer_ != this || token.generation_ != current.token->generation_ ||
             token.barrier_epoch_ != current.token->barrier_epoch_ ||
@@ -206,7 +216,8 @@ public:
             return refuse(NotReadyReason::EpochChanged).reason;
         }
         if (!final_check()) return refuse(NotReadyReason::FinalCheckFailed).reason;
-        if (!kill_switch_.claim_normal(token.kill_revision_, [&]() noexcept { return authority().claim(token.epoch_); })) {
+        if (!kill_switch_.claim_normal(token.kill_revision_, [&]() noexcept { return authority().claim(token.epoch_); },
+                                       token.scope_epoch_)) {
             return refuse(NotReadyReason::EpochChanged).reason;
         }
         ++stats_.claimed;

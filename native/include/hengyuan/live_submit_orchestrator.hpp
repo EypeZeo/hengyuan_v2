@@ -383,6 +383,9 @@ struct OrchestratorContext {
     // an older generation is dropped. test_submit_readiness_guard.cpp pins that every OrchestratorContext built under include/ and src/ sets it.
     SubmitReadiness* readiness{nullptr};
 
+    // Captured when a caller admits a trade scope. Gate 11 still checks the order confirmation.
+    std::optional<TradeScopeEpoch> trade_scope_epoch{};
+
     // Private-stream migration M3b (sweep_pump.hpp): the hot thread's side of the barrier sweep. Nullable like the fields around it: unset means
     // orchestrate_submit() does not move the sweep, and the barrier completes only if somebody else drives it (the synthetic readiness scripts the
     // whole exchange; a live process wires the pump, M5). Set, every call first refreshes the barrier and posts the sweep request if one is due, and
@@ -563,11 +566,12 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     const auto authorization_started = ctx.monotonic_now ? ctx.monotonic_now(ctx.monotonic_clock) : -1;
     const auto authorization_wall_ms = ctx.now_ms;
     const KillSwitch* const authorized_kill_switch = ctx.kill_switch;
+    const auto authorized_scope_epoch = ctx.trade_scope_epoch;
     std::optional<SubmitReadyToken> ready_token;
     {
         NotReadyReason why = NotReadyReason::Unwired;
         if (ctx.readiness != nullptr) {
-            ReadinessResult readiness_result = ctx.readiness->authorize(ctx.now_ms);
+            ReadinessResult readiness_result = ctx.readiness->authorize(ctx.now_ms, authorized_scope_epoch);
             ready_token = std::move(readiness_result.token);
             why = readiness_result.reason;
         }
@@ -928,7 +932,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 final_refusal = never_sent::Reason::SlotOwnershipLost;
             } else if (!ctx.rate_limiter || !ctx.rate_limiter->reservation_valid(*reservation)) {
                 final_refusal = never_sent::Reason::ReservationLost;
-            } else if (ctx.kill_switch != authorized_kill_switch || ctx.kill_switch->open_revision() != kill_revision) {
+            } else if (ctx.trade_scope_epoch != authorized_scope_epoch ||
+                       ctx.kill_switch != authorized_kill_switch || ctx.kill_switch->open_revision() != kill_revision) {
                 final_refusal = never_sent::Reason::ReadinessRevoked;
             } else if (!ctx.account || validate_pre_trade(result.order.rules_snapshot_at_submit, intent_frame.side,
                                           intent_frame.price_ticks, intent_frame.qty_ticks, *ctx.account,

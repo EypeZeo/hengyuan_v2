@@ -426,9 +426,10 @@ TEST(SubmitReadinessGuard, SyntheticReadinessIsUsedOnlyByTheListedDrillsAndHarne
 TEST(SubmitReadinessGuard, TheTokenHasOneMintSiteAndOneFriend) {
     const SourceFile* header = find_source("include/hengyuan/submit_readiness.hpp");
     ASSERT_NE(header, nullptr);
-    const std::size_t evaluator = header->code.find("ReadinessResult evaluate(std::int64_t now_ms) noexcept");
+    const std::size_t evaluator = header->code.find(
+        "ReadinessResult evaluate(std::int64_t now_ms, std::optional<TradeScopeEpoch> scope_epoch) noexcept");
     const std::size_t mint = header->code.find(
-        "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, this)");
+        "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, scope_epoch, this)");
     const std::size_t claim_api = header->code.find("public:", evaluator);
     ASSERT_NE(evaluator, std::string::npos);
     ASSERT_NE(mint, std::string::npos);
@@ -436,17 +437,17 @@ TEST(SubmitReadinessGuard, TheTokenHasOneMintSiteAndOneFriend) {
     EXPECT_LT(evaluator, mint) << "the evaluator is the one token issuer";
     EXPECT_LT(mint, claim_api) << "authorize() and claim() share this evaluator rather than minting separately";
     EXPECT_EQ(count_substring(header->code,
-                              "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, this)"),
+                              "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, scope_epoch, this)"),
               1u);
-    // The private token constructor now binds stream generation, issue time, authority epoch, barrier epoch, kill revision and issuer.
+    // The private token constructor binds stream generation, issue time, authority epoch, barrier epoch, kill revision, scope and issuer.
     std::size_t two_argument_constructions = 0;
-    std::size_t six_argument_constructions = 0;
+    std::size_t seven_argument_constructions = 0;
     for (const std::vector<std::string>& args : call_args(header->code, "SubmitReadyToken")) {
         if (args.size() == 2) ++two_argument_constructions;
-        if (args.size() == 6) ++six_argument_constructions;
+        if (args.size() == 7) ++seven_argument_constructions;
     }
     EXPECT_EQ(two_argument_constructions, 0u);
-    EXPECT_EQ(six_argument_constructions, 1u);
+    EXPECT_EQ(seven_argument_constructions, 1u);
     EXPECT_EQ(count_substring(header->code, "SubmitReadyToken{"), 0u);
     EXPECT_EQ(count_substring(header->code, "friend"), 1u);
     EXPECT_EQ(count_substring(header->code, "friend class SubmitReadiness;"), 1u) << "the one friend is the issuer";
@@ -458,6 +459,29 @@ TEST(SubmitReadinessGuard, TheTokenHasOneMintSiteAndOneFriend) {
         EXPECT_EQ(count_substring(f.code, "friend class SubmitReadyToken"), 0u) << f.rel;
         EXPECT_EQ(count_substring(f.code, "SubmitReadyToken{"), 0u) << f.rel << " brace-constructs a SubmitReadyToken";
     }
+}
+
+TEST(SubmitReadinessGuard, TheScopedTradeEpochFlowsFromContextThroughTheFinalClaim) {
+    const SourceFile* orchestrator = find_source("include/hengyuan/live_submit_orchestrator.hpp");
+    const SourceFile* readiness = find_source("include/hengyuan/submit_readiness.hpp");
+    ASSERT_NE(orchestrator, nullptr);
+    ASSERT_NE(readiness, nullptr);
+
+    const std::vector<std::vector<std::string>> authorizations{{"ctx.now_ms", "authorized_scope_epoch"}};
+    EXPECT_EQ(call_args(orchestrator->code, "ctx.readiness->authorize"), authorizations);
+
+    const std::vector<std::vector<std::string>> evaluations{
+        {"now_ms", "scope_epoch"},
+        {"now_ms", "token.scope_epoch_"},
+    };
+    EXPECT_EQ(call_args(readiness->code, "evaluate"), evaluations);
+
+    const std::vector<std::vector<std::string>> claims{{
+        "token.kill_revision_",
+        "[&]() noexcept { return authority().claim(token.epoch_); }",
+        "token.scope_epoch_",
+    }};
+    EXPECT_EQ(call_args(readiness->code, "kill_switch_.claim_normal"), claims);
 }
 
 // --- the user-data drain is wired to the barrier where there is one ---------------------------------------------------------------------------

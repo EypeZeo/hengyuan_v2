@@ -3,7 +3,7 @@
 //
 // One small, atomic record per audit store, signed by that store's key ring:
 //   [version][store uuid][environment][account uid][state][revision]
-//   [arm count][trigger count][key id][HMAC-SHA256]
+//   [arm count][trigger count][trade scope epoch][key id][HMAC-SHA256]
 //
 // The tip is replaced through DurableLogStore::write_tip_anchor(), so a state
 // transition is acknowledged only after its file and rename are durable. The
@@ -35,9 +35,11 @@
 
 namespace hy {
 
-inline constexpr std::uint8_t kDurableKillSwitchVersion = 1;
-inline constexpr std::size_t kDurableKillSwitchContentSize =
+inline constexpr std::uint8_t kDurableKillSwitchVersion = 2;
+inline constexpr std::size_t kDurableKillSwitchV1ContentSize =
     1 + 8 + 8 + 1 + 8 + 1 + 8 + 8 + 8 + 4;
+inline constexpr std::size_t kDurableKillSwitchV1RecordSize = kDurableKillSwitchV1ContentSize + kMacLen;
+inline constexpr std::size_t kDurableKillSwitchContentSize = kDurableKillSwitchV1ContentSize + sizeof(std::uint64_t);
 inline constexpr std::size_t kDurableKillSwitchRecordSize = kDurableKillSwitchContentSize + kMacLen;
 
 struct DurableKillSwitchConfig {
@@ -108,7 +110,10 @@ public:
                 ++recovered.revision;
             }
         }
-        if (tip == FileState::Missing || restrict_at_start) {
+        // A process can stop before persisting a trigger from Armed, too.
+        const bool retire_scope = !config_.allow_normal_start && recovered.scope_epoch.value != recovered.revision;
+        if (retire_scope) recovered.scope_epoch = TradeScopeEpoch{recovered.revision};
+        if (tip == FileState::Missing || restrict_at_start || retire_scope) {
             status_ = KillPersistenceHealth::Degraded;
             if (!write(recovered)) return attach(kill_switch, recovered, KillPersistenceHealth::Degraded);
         }
@@ -146,7 +151,8 @@ private:
         if (status() == KillPersistenceHealth::Corrupt || !valid_config()) return false;
         if ((snapshot.state != KillState::Normal && snapshot.state != KillState::Armed &&
              snapshot.state != KillState::Triggered && snapshot.state != KillState::Latched) ||
-            snapshot.arm_count > snapshot.revision || snapshot.trigger_count > snapshot.revision) {
+            snapshot.arm_count > snapshot.revision || snapshot.trigger_count > snapshot.revision ||
+            snapshot.scope_epoch.value > snapshot.revision) {
             status_ = KillPersistenceHealth::Degraded;
             return false;
         }
@@ -162,6 +168,7 @@ private:
         detail::write_u64_le(p, snapshot.revision);
         detail::write_u64_le(p, snapshot.arm_count);
         detail::write_u64_le(p, snapshot.trigger_count);
+        detail::write_u64_le(p, snapshot.scope_epoch.value);
         detail::write_u32_le(p, config_.key_id);
 
         std::array<std::byte, kKeyBlockSize> key_block{};
@@ -184,9 +191,12 @@ private:
     }
 
     bool decode(std::span<const std::byte> raw, KillSwitchSnapshot& out) const noexcept {
-        if (raw.size() != kDurableKillSwitchRecordSize) return false;
+        if (raw.empty()) return false;
         const std::byte* p = raw.data();
-        if (detail::read_u8(p) != kDurableKillSwitchVersion) return false;
+        const auto version = detail::read_u8(p);
+        const bool legacy = version == 1 && raw.size() == kDurableKillSwitchV1RecordSize;
+        const bool current = version == kDurableKillSwitchVersion && raw.size() == kDurableKillSwitchRecordSize;
+        if (!legacy && !current) return false;
         const auto uuid_lo = detail::read_u64_le(p);
         const auto uuid_hi = detail::read_u64_le(p);
         const auto environment = static_cast<StoreEnvironment>(detail::read_u8(p));
@@ -195,25 +205,26 @@ private:
         const auto revision = detail::read_u64_le(p);
         const auto arm_count = detail::read_u64_le(p);
         const auto trigger_count = detail::read_u64_le(p);
+        const TradeScopeEpoch scope_epoch{legacy ? revision : detail::read_u64_le(p)};
         const auto key_id = detail::read_u32_le(p);
         if (uuid_lo != config_.store_uuid_lo || uuid_hi != config_.store_uuid_hi ||
             environment != config_.environment || account_uid != config_.account_uid ||
             key_id != config_.key_id ||
             (state != KillState::Normal && state != KillState::Armed &&
              state != KillState::Triggered && state != KillState::Latched) ||
-            arm_count > revision || trigger_count > revision) return false;
+            arm_count > revision || trigger_count > revision || scope_epoch.value > revision) return false;
 
         std::array<std::byte, kKeyBlockSize> key_block{};
         ScopedSecureWipe wipe_key_block(key_block);
         if (!keys_.active_key(key_id, key_block)) return false;
         const auto expected_mac = crypto::hmac_sha256(
             std::span<const std::byte>(key_block.data(), key_block.size()),
-            std::span<const std::byte>(raw.data(), kDurableKillSwitchContentSize));
+            raw.first(raw.size() - kMacLen));
         std::array<std::byte, kMacLen> actual_mac{};
         detail::read_bytes(p, actual_mac.data(), actual_mac.size());
         if (!crypto::constant_time_equal(expected_mac, actual_mac)) return false;
 
-        out = KillSwitchSnapshot{state, revision, arm_count, trigger_count};
+        out = KillSwitchSnapshot{state, revision, arm_count, trigger_count, scope_epoch};
         return true;
     }
 

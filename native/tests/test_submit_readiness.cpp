@@ -78,6 +78,8 @@ static_assert(!ObservableFeedSession<NoLostSession>);
 
 constexpr std::int64_t kT = 10'000;  // an arbitrary steady-clock reading, ms
 
+bool persist_trade_scope(void*, const KillSwitchSnapshot&) noexcept { return true; }
+
 }  // namespace
 
 // --- the adapter: PublicFeedSupervisor + session -> FeedObservation -------------------------------------------------------
@@ -902,6 +904,59 @@ TEST(SubmitReadyToken, ClaimRejectsAChangedKillSwitchRevisionEvenAfterReset) {
     EXPECT_EQ(synthetic.readiness().claim(*issued.token, 10), NotReadyReason::EpochChanged);
 }
 
+TEST(SubmitReadyToken, PersistentTradeScopeSurvivesArmingButNotTriggerAndReset) {
+    KillSwitch kill_switch;
+    EXPECT_FALSE(kill_switch.trade_scope_epoch().has_value());
+    KillSwitchSnapshot recovered{};
+    kill_switch.attach_persistent({&persist_trade_scope, nullptr}, recovered, KillPersistenceHealth::Ready);
+    const auto initial_scope = kill_switch.trade_scope_epoch();
+    ASSERT_TRUE(initial_scope.has_value());
+
+    SyntheticReadiness synthetic(kill_switch, 3);
+    ReadinessResult issued_before_arm = synthetic.readiness().authorize(9, initial_scope);
+    ASSERT_TRUE(issued_before_arm.ready());
+
+    kill_switch.arm();
+    EXPECT_EQ(kill_switch.state(), KillState::Armed);
+    EXPECT_FALSE(kill_switch.trade_scope_epoch().has_value());
+    EXPECT_EQ(synthetic.readiness().authorize(10, initial_scope).reason, NotReadyReason::KillSwitchNotNormal);
+
+    const auto arm_reset_revision = kill_switch.persistent_reset_revision();
+    ASSERT_TRUE(arm_reset_revision.has_value());
+    EXPECT_EQ(kill_switch.reset_persistent(*arm_reset_revision, []() noexcept { return true; }),
+              PersistentResetResult::Applied);
+    EXPECT_EQ(kill_switch.trade_scope_epoch(), initial_scope);
+    EXPECT_EQ(synthetic.readiness().claim(*issued_before_arm.token, 11), NotReadyReason::EpochChanged);
+    ReadinessResult issued_before_trigger = synthetic.readiness().authorize(11, initial_scope);
+    ASSERT_TRUE(issued_before_trigger.ready());
+
+    kill_switch.trigger();
+    EXPECT_EQ(kill_switch.state(), KillState::Triggered);
+    EXPECT_FALSE(kill_switch.trade_scope_epoch().has_value());
+    EXPECT_EQ(synthetic.readiness().authorize(12, initial_scope).reason, NotReadyReason::KillSwitchNotNormal);
+    const TradeScopeEpoch retired_scope = kill_switch.snapshot().scope_epoch;
+    EXPECT_NE(retired_scope, *initial_scope);
+
+    const auto trigger_reset_revision = kill_switch.persistent_reset_revision();
+    ASSERT_TRUE(trigger_reset_revision.has_value());
+    EXPECT_EQ(kill_switch.reset_persistent(*trigger_reset_revision, []() noexcept { return true; }),
+              PersistentResetResult::Applied);
+    const auto fresh_scope = kill_switch.trade_scope_epoch();
+    ASSERT_TRUE(fresh_scope.has_value());
+    EXPECT_NE(*fresh_scope, *initial_scope);
+    EXPECT_EQ(*fresh_scope, retired_scope);
+
+    const ReadinessResult stale_authorization = synthetic.readiness().authorize(13, initial_scope);
+    EXPECT_FALSE(stale_authorization.ready());
+    EXPECT_EQ(stale_authorization.reason, NotReadyReason::TradeScopeInvalidated);
+    EXPECT_EQ(synthetic.readiness().claim(*issued_before_trigger.token, 13), NotReadyReason::TradeScopeInvalidated);
+
+    ReadinessResult fresh_authorization = synthetic.readiness().authorize(14, fresh_scope);
+    ASSERT_TRUE(fresh_authorization.ready());
+    ASSERT_TRUE(fresh_authorization.token.has_value());
+    EXPECT_EQ(synthetic.readiness().claim(*fresh_authorization.token, 15), NotReadyReason::None);
+}
+
 TEST(SubmitReadyToken, AFailedFinalCheckDoesNotConsumeTheAuthorizationEpoch) {
     KillSwitch kill_switch;
     SyntheticReadiness synthetic(kill_switch, 3);
@@ -955,7 +1010,7 @@ TEST(SubmitReadyToken, KillPublishedDuringFinalCheckPreventsClaim) {
 }
 
 TEST(NotReadyReasonNames, EveryReasonHasADistinctNameAndTheCountMatches) {
-    static_assert(kNotReadyReasonCount == static_cast<std::size_t>(NotReadyReason::FinalCheckFailed) + 1U,
+    static_assert(kNotReadyReasonCount == static_cast<std::size_t>(NotReadyReason::TradeScopeInvalidated) + 1U,
                   "kNotReadyReasonCount must follow the last enumerator");
     std::vector<std::string_view> seen;
     for (std::size_t i = 0; i < kNotReadyReasonCount; ++i) {

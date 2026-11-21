@@ -29,11 +29,7 @@ using OwnerResetChallengeBytes =
 class OwnerResetAuthority {
 public:
     static std::unique_ptr<OwnerResetAuthority> create(std::span<const unsigned char> public_key_der) {
-        auto key = owner_signature::decode_p256(public_key_der);
-        if (!key) return {};
-        OwnerResetActivation activation{};
-        if (RAND_bytes(activation.data(), static_cast<int>(activation.size())) != 1) return {};
-        return std::unique_ptr<OwnerResetAuthority>(new OwnerResetAuthority(std::move(key), activation));
+        return create_for_scope(public_key_der, std::nullopt);
     }
 
     OwnerResetAuthority(const OwnerResetAuthority&) = delete;
@@ -48,7 +44,9 @@ public:
     [[nodiscard]] std::optional<OwnerResetChallengeBytes> prepare(const OperatorResetTarget& target,
                                                                   std::int64_t server_upper_ms) noexcept {
         std::int64_t deadline = 0;
-        if (pending_ || !target.scope.valid() || server_upper_ms <= 0 ||
+        const bool matches_scope = enrolled_scope_ ? target.scope == *enrolled_scope_
+                                                   : target.scope.environment == StoreEnvironment::Testnet;
+        if (pending_ || !target.scope.valid() || !matches_scope || server_upper_ms <= 0 ||
             !checked_add_i64(server_upper_ms, kOwnerResetValidityMs, deadline)) return std::nullopt;
 
         Challenge challenge{};
@@ -68,13 +66,25 @@ public:
     }
 
 private:
+    friend class ProductionResetKey;
+
     struct Challenge {
         OperatorResetApproval approval;
         OwnerResetChallengeBytes bytes;
     };
 
-    OwnerResetAuthority(owner_signature::PublicKey key, OwnerResetActivation activation) noexcept
-        : key_(std::move(key)), activation_(activation) {}
+    static std::unique_ptr<OwnerResetAuthority> create_for_scope(std::span<const unsigned char> public_key_der,
+                                                                std::optional<OperatorResetScope> scope) {
+        auto key = owner_signature::decode_p256(public_key_der);
+        if (!key) return {};
+        OwnerResetActivation activation{};
+        if (RAND_bytes(activation.data(), static_cast<int>(activation.size())) != 1) return {};
+        return std::unique_ptr<OwnerResetAuthority>(new OwnerResetAuthority(std::move(key), activation, scope));
+    }
+
+    OwnerResetAuthority(owner_signature::PublicKey key, OwnerResetActivation activation,
+                        std::optional<OperatorResetScope> scope) noexcept
+        : key_(std::move(key)), activation_(activation), enrolled_scope_(scope) {}
 
     static std::optional<OperatorResetApproval> verify_current(void* context,
                                                               std::span<const unsigned char> signature) noexcept {
@@ -86,6 +96,7 @@ private:
 
     owner_signature::PublicKey key_;
     OwnerResetActivation activation_;
+    const std::optional<OperatorResetScope> enrolled_scope_;
     std::optional<Challenge> pending_;
 };
 

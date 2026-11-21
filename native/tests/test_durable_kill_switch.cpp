@@ -245,6 +245,86 @@ TEST_F(DurableKillSwitchTest, OnlyExplicitOperatorResetPublishesNormalAndKeepsRe
     }
 }
 
+TEST_F(DurableKillSwitchTest, DefaultRestartOfPersistedArmedStateRetiresItsTradeScope) {
+    {
+        auto store = make_store();
+        hy::KillSwitch kill;
+        ASSERT_TRUE(store->recover(kill));
+        ASSERT_EQ(kill.state(), hy::KillState::Normal);
+
+        const auto initial_scope = kill.trade_scope_epoch();
+        ASSERT_TRUE(initial_scope.has_value());
+        ASSERT_EQ(initial_scope->value, 0u);
+
+        kill.trigger();
+        ASSERT_EQ(kill.state(), hy::KillState::Triggered);
+        ASSERT_EQ(kill.snapshot().scope_epoch.value, 1u);
+        ASSERT_EQ(kill.reset_persistent(kill.revision(), []() noexcept { return true; }),
+                  hy::PersistentResetResult::Applied);
+        ASSERT_EQ(kill.state(), hy::KillState::Normal);
+
+        const auto reset_scope = kill.trade_scope_epoch();
+        ASSERT_TRUE(reset_scope.has_value());
+        ASSERT_EQ(reset_scope->value, 1u);
+
+        kill.arm();
+        ASSERT_EQ(kill.state(), hy::KillState::Armed);
+        EXPECT_EQ(kill.snapshot().scope_epoch.value, 1u);
+        EXPECT_FALSE(kill.trade_scope_epoch().has_value());
+    }
+
+    auto restart_config = this->config();
+    restart_config.allow_normal_start = false;
+    hy::DurableKillSwitchStore restart_store(restart_config, *keys_);
+    hy::KillSwitch restarted;
+    ASSERT_TRUE(restart_store.recover(restarted));
+
+    const auto recovered = restarted.snapshot();
+    EXPECT_NE(recovered.state, hy::KillState::Normal);
+    EXPECT_FALSE(restarted.can_open());
+    EXPECT_GT(recovered.scope_epoch.value, 1u);
+    EXPECT_EQ(recovered.scope_epoch.value, recovered.revision);
+    EXPECT_FALSE(restarted.trade_scope_epoch().has_value());
+}
+
+TEST_F(DurableKillSwitchTest, DurableResetPreservesTheNewScopeAndRejectsClaimsFromTheOldScope) {
+    auto store = make_store();
+    hy::KillSwitch kill;
+    ASSERT_TRUE(store->recover(kill));
+
+    int claim_calls = 0;
+    ASSERT_TRUE(kill.claim_normal(0, [&]() noexcept {
+        ++claim_calls;
+        return true;
+    }, hy::TradeScopeEpoch{0}));
+    ASSERT_EQ(claim_calls, 1);
+
+    kill.trigger();
+    ASSERT_EQ(kill.snapshot().scope_epoch.value, 1u);
+    ASSERT_EQ(kill.reset_persistent(kill.revision(), []() noexcept { return true; }),
+              hy::PersistentResetResult::Applied);
+    ASSERT_EQ(kill.state(), hy::KillState::Normal);
+    ASSERT_EQ(kill.revision(), 2u);
+    ASSERT_EQ(kill.snapshot().scope_epoch.value, 1u);
+
+    const auto current_scope = kill.trade_scope_epoch();
+    ASSERT_TRUE(current_scope.has_value());
+    EXPECT_EQ(current_scope->value, 1u);
+    EXPECT_FALSE(kill.open_revision(hy::TradeScopeEpoch{0}).has_value());
+    ASSERT_EQ(kill.open_revision(hy::TradeScopeEpoch{1}), 2u);
+
+    EXPECT_FALSE(kill.claim_normal(2, [&]() noexcept {
+        ++claim_calls;
+        return true;
+    }, hy::TradeScopeEpoch{0}));
+    EXPECT_EQ(claim_calls, 1);
+    EXPECT_TRUE(kill.claim_normal(2, [&]() noexcept {
+        ++claim_calls;
+        return true;
+    }, hy::TradeScopeEpoch{1}));
+    EXPECT_EQ(claim_calls, 2);
+}
+
 TEST_F(DurableKillSwitchTest, WriteFailureLatchesUntilAnExplicitDurableReset) {
     {
         auto store = make_store();
@@ -356,7 +436,9 @@ TEST(KillSwitchPersistencePort, PublishesOnlyAfterThePortAcknowledges) {
     kill.trigger();
     EXPECT_EQ(probe.calls, 1);
     EXPECT_EQ(probe.offered.state, hy::KillState::Triggered);
+    EXPECT_EQ(probe.offered.scope_epoch.value, 1u);
     EXPECT_EQ(kill.state(), hy::KillState::Latched) << "the failed Triggered write cannot publish a weaker state";
+    EXPECT_EQ(kill.snapshot().scope_epoch.value, 1u);
     EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Degraded);
 }
 
