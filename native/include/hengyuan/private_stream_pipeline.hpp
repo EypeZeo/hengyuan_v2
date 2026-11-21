@@ -53,6 +53,7 @@
 #include <hengyuan/late_fill_alarm.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/never_sent_runtime_budget.hpp>
+#include <hengyuan/operator_reset.hpp>
 #include <hengyuan/order_fill_context.hpp>
 #include <hengyuan/order_tracker.hpp>
 #include <hengyuan/position_truth.hpp>
@@ -101,6 +102,7 @@ struct PipelineConfig {
     std::int64_t reconcile_deadline_ms{60'000};  // how long recovered orders may stay unconfirmed before the state machine degrades
     std::shared_ptr<SubmitAuthority> submit_authority{};
     AutoCancelConfig automatic_cancel{};
+    OperatorResetApprovalPort operator_reset{};
 };
 
 // What the process owns, by reference: every referent outlives the pipeline. The function-pointer ports are values.
@@ -172,6 +174,11 @@ public:
             ? CancelSubject{environment, exchange_uid, parts_.sink.store_uuid_lo(), parts_.sink.store_uuid_hi(),
                             config_.automatic_cancel.activation_id}
             : CancelSubject{};
+        if (config_.operator_reset.verify && store_may_be_used(binding_status_)) {
+            reset_scope_ = {environment, exchange_uid, parts_.sink.store_uuid_lo(), parts_.sink.store_uuid_hi()};
+        } else {
+            reset_scope_ = {};
+        }
         return binding_status_;
     }
 
@@ -182,11 +189,52 @@ public:
     // Equal in every wiring field to the context the hot tick drains with.
     [[nodiscard]] auto make_context() const noexcept { return context_; }  // an OrchestratorContext, by value (`auto`: the guards count the type's constructions)
 
+    // Called by the same owner as hot_tick, between ticks. File and signature
+    // checks stay out of the submit path.
+    [[nodiscard]] std::optional<OperatorResetTarget> operator_reset_target() noexcept {
+        if (!config_.operator_reset.verify || !reset_readiness()) return std::nullopt;
+        const auto revision = parts_.kill_switch.persistent_reset_revision();
+        if (!revision || !reset_scope_matches_store()) return std::nullopt;
+        return OperatorResetTarget{reset_scope_, *revision};
+    }
+
+    [[nodiscard]] OperatorResetResult apply_operator_reset(std::span<const unsigned char> signature) noexcept {
+        using Result = OperatorResetResult;
+        const auto port = config_.operator_reset;
+        if (!port.verify) return Result::Unavailable;
+        const auto approval = port.verify(port.context, signature);
+        if (!approval) return Result::InvalidSignature;
+        if (approval->target.scope != reset_scope_ || !reset_scope_matches_store()) return Result::WrongStore;
+
+        Result refusal = Result::NotReady;
+        const auto reset = parts_.kill_switch.reset_persistent(approval->target.revision, [&]() noexcept {
+            const auto upper = approval_server_time_upper_bound(parts_.clock, fetch_clock_pair());
+            if (!upper) {
+                refusal = Result::ClockUnavailable;
+                return false;
+            }
+            if (approval->not_after_ms <= *upper) {
+                refusal = Result::Expired;
+                return false;
+            }
+            return reset_readiness();
+        });
+        switch (reset) {
+            case PersistentResetResult::Applied: return Result::Applied;
+            case PersistentResetResult::Unavailable: return Result::Unavailable;
+            case PersistentResetResult::StateChanged: return Result::StateChanged;
+            case PersistentResetResult::Refused: return refusal;
+            case PersistentResetResult::WriteFailed: return Result::WriteFailed;
+        }
+        return Result::Unavailable;
+    }
+
     // The process owner claims an intent for its cancellation executor. No transport runs on this tick.
     [[nodiscard]] std::optional<AutomaticCancelRequest> take_automatic_cancel() noexcept {
         auto request = std::exchange(hot_.pending_cancel, std::nullopt);
-        if (!request || !can_stage_cancel() || request->subject != cancel_subject_ ||
-            request->kill_revision != parts_.kill_switch.revision() ||
+        const auto kill = parts_.kill_switch.cancel_snapshot();
+        if (!request || !kill || !can_stage_cancel(kill->state) || request->subject != cancel_subject_ ||
+            request->kill_revision != kill->revision ||
             !parts_.in_flight.owns(request->handle, request->client_order_id.view())) return std::nullopt;
 
         const auto* order = parts_.fill_context.find(request->client_order_id.view());
@@ -325,15 +373,33 @@ private:
         context_.exposure_limits = config_.exposure_limits;
     }
 
-    bool can_stage_cancel() const noexcept {
+    bool reset_readiness() noexcept {
+        const auto feed = read_feed(this);
+        auto& barrier = hot_.readiness.barrier();
+        barrier.observe(feed);
+        return exchange_info_loaded_ && feed.connected && feed.generation != 0 &&
+               barrier.state() == BarrierState::Reconciled && barrier.reconciled_generation() == feed.generation &&
+               hot_.recovery.submit_enabled(observe_recovery(feed, feed.sampled_at_ms));
+    }
+
+    bool reset_scope_matches_store() const noexcept {
+        if (!store_bound() || !reset_scope_.valid()) return false;
+        const auto binding = parts_.sink.read_binding();
+        return binding.status == StoreBindingStatus::Bound &&
+               OperatorResetScope{binding.binding.environment, binding.binding.account_uid,
+                                  parts_.sink.store_uuid_lo(), parts_.sink.store_uuid_hi()} == reset_scope_;
+    }
+
+    bool can_stage_cancel(KillState kill_state) const noexcept {
         return config_.automatic_cancel.approvals.fn && cancel_subject_.valid() &&
                recovery_applied_ && apply_result_.ok() && parts_.sink.is_open() && !parts_.sink.fenced() &&
-               emergency_cancel_requested(parts_.kill_switch.state());
+               emergency_cancel_requested(kill_state);
     }
 
     void stage_automatic_cancel() noexcept {
         hot_.pending_cancel.reset();
-        if (!can_stage_cancel() || parts_.in_flight.count() == 0) return;
+        const auto kill = parts_.kill_switch.cancel_snapshot();
+        if (!kill || !can_stage_cancel(kill->state) || parts_.in_flight.count() == 0) return;
         const auto upper = cancel_server_time_upper_bound(parts_.clock, fetch_clock_pair());
         if (!upper) return;
 
@@ -349,7 +415,7 @@ private:
             std::memcpy(request.client_order_id.id, coid.data(), coid.size());
             request.exchange_order_id = order->exchange_order_id;
             request.symbol_id = order->symbol_id;
-            request.kill_revision = parts_.kill_switch.revision();
+            request.kill_revision = kill->revision;
             request.approval_serial = approval->serial;
             request.subject = cancel_subject_;
             std::memcpy(request.symbol, order->cancel_symbol, sizeof(request.symbol));
@@ -391,6 +457,7 @@ private:
     RecoveryApplyResult apply_result_{};
     EnsureBindingStatus binding_status_{EnsureBindingStatus::NotRun};
     CancelSubject cancel_subject_{};
+    OperatorResetScope reset_scope_{};
     bool recovery_applied_{false};
     bool exchange_info_loaded_{false};
 };

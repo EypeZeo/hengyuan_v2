@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <hengyuan/binance_signer.hpp>
 #include <hengyuan/owner_cancel_approval.hpp>
+#include <hengyuan/owner_reset_approval.hpp>
 #include <hengyuan/spot_cancel_control.hpp>
 #include <hengyuan/store_binding_writer.hpp>
 #include "binance_clock_sync_test_hooks.hpp"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <openssl/evp.h>
 #include <openssl/x509.h>
 #include <array>
@@ -139,6 +141,14 @@ hy::AutomaticCancelRequest request_for(const hy::CancelApproval& approval) {
 
 std::span<const std::byte> grant_bytes(const hy::OwnerCancelGrantBytes& grant) {
     return std::span<const std::byte>(grant.data(), grant.size());
+}
+
+std::span<const std::byte> reset_bytes(const hy::OwnerResetChallengeBytes& challenge) {
+    return std::span<const std::byte>(challenge.data(), challenge.size());
+}
+
+hy::OperatorResetTarget reset_target(std::uint64_t revision = 9) {
+    return {{hy::StoreEnvironment::Testnet, 42, 0x1122334455667788ULL, 0x8877665544332211ULL}, revision};
 }
 
 bool write_binary_file(const std::string& path, std::span<const std::byte> bytes) {
@@ -344,6 +354,129 @@ TEST(OwnerCancelApproval, FreshAuthorityUsesDifferentActivationScope) {
     fresh_clock(publisher);
     EXPECT_EQ(second->install(grant_bytes(*grant), signature, publisher, clock_now()),
               hy::OwnerCancelInstallResult::WrongScope);
+}
+
+TEST(OwnerResetApproval, AcceptsOnlyPreparedCanonicalChallenge) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    auto authority = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(authority, nullptr);
+    const auto target = reset_target(9);
+    constexpr std::int64_t server_upper_ms = 1'000'000;
+    const auto challenge = authority->prepare(target, server_upper_ms);
+    ASSERT_TRUE(challenge.has_value());
+
+    const auto signature = fixture.sign(reset_bytes(*challenge));
+    ASSERT_FALSE(signature.empty());
+    const auto port = authority->approval_port();
+    const auto approval = port.verify(
+        port.context, std::span<const unsigned char>(signature.data(), signature.size()));
+    ASSERT_TRUE(approval.has_value());
+    EXPECT_EQ(approval->target.scope, target.scope);
+    EXPECT_EQ(approval->target.revision, target.revision);
+    EXPECT_EQ(approval->not_after_ms, server_upper_ms + hy::kOwnerResetValidityMs);
+
+    EXPECT_FALSE(authority->prepare(target, server_upper_ms).has_value());
+
+    auto tampered_domain = *challenge;
+    tampered_domain[0] ^= std::byte{1};
+    const auto domain_signature = fixture.sign(reset_bytes(tampered_domain));
+    ASSERT_FALSE(domain_signature.empty());
+    EXPECT_FALSE(port.verify(
+        port.context, std::span<const unsigned char>(domain_signature.data(), domain_signature.size())));
+
+    auto tampered_revision = *challenge;
+    constexpr std::size_t revision_offset = sizeof(hy::kOwnerResetDomain) + 2 + 3 * sizeof(std::uint64_t);
+    tampered_revision[revision_offset] ^= std::byte{1};
+    const auto revision_signature = fixture.sign(reset_bytes(tampered_revision));
+    ASSERT_FALSE(revision_signature.empty());
+    EXPECT_FALSE(port.verify(
+        port.context, std::span<const unsigned char>(revision_signature.data(), revision_signature.size())));
+
+    auto tampered_expiry = *challenge;
+    constexpr std::size_t expiry_offset = sizeof(hy::kOwnerResetDomain) + 2 + 4 * sizeof(std::uint64_t);
+    tampered_expiry[expiry_offset] ^= std::byte{1};
+    const auto expiry_signature = fixture.sign(reset_bytes(tampered_expiry));
+    ASSERT_FALSE(expiry_signature.empty());
+    EXPECT_FALSE(port.verify(
+        port.context, std::span<const unsigned char>(expiry_signature.data(), expiry_signature.size())));
+}
+
+TEST(OwnerResetApproval, RejectsWrongKeyAndPreviousProcessChallenge) {
+    P256Fixture fixture;
+    P256Fixture wrong_key;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_NE(wrong_key.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    auto first = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(first, nullptr);
+    const auto target = reset_target(17);
+    const auto first_challenge = first->prepare(target, 2'000'000);
+    ASSERT_TRUE(first_challenge.has_value());
+    const auto first_signature = fixture.sign(reset_bytes(*first_challenge));
+    ASSERT_FALSE(first_signature.empty());
+
+    const auto first_port = first->approval_port();
+    const auto wrong_key_signature = wrong_key.sign(reset_bytes(*first_challenge));
+    ASSERT_FALSE(wrong_key_signature.empty());
+    EXPECT_FALSE(first_port.verify(
+        first_port.context,
+        std::span<const unsigned char>(wrong_key_signature.data(), wrong_key_signature.size())));
+
+    auto second = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(second, nullptr);
+    const auto second_challenge = second->prepare(target, 2'000'000);
+    ASSERT_TRUE(second_challenge.has_value());
+    const auto second_port = second->approval_port();
+    EXPECT_FALSE(second_port.verify(
+        second_port.context, std::span<const unsigned char>(first_signature.data(), first_signature.size())));
+
+    const auto second_signature = fixture.sign(reset_bytes(*second_challenge));
+    ASSERT_FALSE(second_signature.empty());
+    const auto second_approval = second_port.verify(
+        second_port.context, std::span<const unsigned char>(second_signature.data(), second_signature.size()));
+    ASSERT_TRUE(second_approval.has_value());
+    EXPECT_EQ(second_approval->target.scope, target.scope);
+    EXPECT_EQ(second_approval->target.revision, target.revision);
+}
+
+TEST(OwnerResetApproval, RejectsCancellationSignature) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    const hy::StoreBinding binding{hy::StoreEnvironment::Testnet, 42, 100};
+    auto cancellation = hy::OwnerCancelAuthority::create(binding, 7, 8, 11, fixture.public_der, 60'000);
+    ASSERT_NE(cancellation, nullptr);
+    const auto cancel_approval = approval_for(cancellation->subject(), 1, 1'030'000);
+    const auto cancel_grant = cancellation->signing_payload(
+        "BTCUSDT", cancel_approval.serial, cancel_approval.not_after_ms);
+    ASSERT_TRUE(cancel_grant.has_value());
+    const auto cancellation_signature = fixture.sign(grant_bytes(*cancel_grant));
+    ASSERT_FALSE(cancellation_signature.empty());
+
+    auto reset = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(reset, nullptr);
+    ASSERT_TRUE(reset->prepare(reset_target(), 3'000'000).has_value());
+    const auto port = reset->approval_port();
+    EXPECT_FALSE(port.verify(
+        port.context,
+        std::span<const unsigned char>(cancellation_signature.data(), cancellation_signature.size())));
+}
+
+TEST(OwnerResetApproval, RefusesInvalidKeyAndExpiryOverflow) {
+    const std::array<unsigned char, 1> invalid_der{0};
+    EXPECT_EQ(hy::OwnerResetAuthority::create(invalid_der), nullptr);
+
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+    auto authority = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(authority, nullptr);
+    EXPECT_FALSE(authority->prepare(reset_target(), std::numeric_limits<std::int64_t>::max()).has_value());
 }
 
 TEST(OwnerCancelEnrollment, BindsGeneratedP256KeyToOneProductionStoreExactlyOnce) {

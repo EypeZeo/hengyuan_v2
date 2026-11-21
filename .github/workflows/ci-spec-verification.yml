@@ -201,7 +201,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
-    # Sum-ceiling across 13 sequential models (7 when consolidated), was 7 x independent 20-min caps
+    # Sum-ceiling across 14 sequential models (7 when consolidated), was 7 x independent 20-min caps
     # possible in parallel before this consolidation -- see this file's header
     # comment for why billed minutes (not wall-clock) is the thing being
     # optimized here.
@@ -218,7 +218,7 @@ jobs:
 
       # tla2tools.jar is gitignored (a 2MB binary does not belong in the tree),
       # so CI fetches the pinned release the same way the local setup does.
-      # ONE fetch for all 13 models below, not 13.
+      # Share the pinned jar across all model checks.
       - name: Cache TLA+ tools
         id: cache-tla
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -741,6 +741,40 @@ jobs:
           done
           exit $fail
 
+      - name: "Model: kill_switch (persistent restriction and final submit claim, SAFE-04)"
+        id: m_kill_switch
+        continue-on-error: true
+        working-directory: formal
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tlc = @('-XX:+UseParallelGC', '-cp', 'tools/tla2tools.jar', 'tlc2.TLC', '-workers', '2')
+          java @tlc -config kill_switch.cfg kill_switch.tla
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $controls = [ordered]@{
+              'kill_switch_stale_check_bug.cfg' = 'ClaimMatchesPublication'
+              'kill_switch_no_revision_bug.cfg' = 'ClaimMatchesPublication'
+              'kill_switch_early_reset_bug.cfg' = 'ResetRequiresDurableWrite'
+              'kill_switch_restore_normal_bug.cfg' = 'RestartRequiresNewReset'
+              'kill_switch_probe_reset.cfg' = 'ClaimAfterResetIsUnreachable'
+              'kill_switch_probe_inflight.cfg' = 'SendAfterRestrictionIsUnreachable'
+          }
+          $failed = $false
+          foreach ($control in $controls.GetEnumerator()) {
+              $output = java @tlc -config $control.Key kill_switch.tla 2>&1
+              $result = $LASTEXITCODE
+              $expected = "Invariant $($control.Value) is violated"
+              if ($result -eq 12 -and ($output | Select-String -SimpleMatch $expected)) {
+                  Write-Output "$($control.Key) reported '$expected'"
+              } else {
+                  Write-Output "::error::$($control.Key) exited $result, expected exit 12 and '$expected'"
+                  Write-Output $output
+                  $failed = $true
+              }
+          }
+          exit ([int]$failed)
+
       # Aggregate: turns any individual model's failure into an overall job
       # failure. `if: always()` so this runs even though every model step
       # above is `continue-on-error: true`. Each model's own pass/fail is
@@ -764,6 +798,7 @@ jobs:
           [ "${{ steps.m_notsent_closure.outcome }}" = "failure" ] && { echo "::error::notsent_closure failed"; fail=1; }
           [ "${{ steps.m_operator_resolution.outcome }}" = "failure" ] && { echo "::error::operator_resolution failed"; fail=1; }
           [ "${{ steps.m_scope_approval.outcome }}" = "failure" ] && { echo "::error::scope_approval failed"; fail=1; }
+          [ "${{ steps.m_kill_switch.outcome }}" = "failure" ] && { echo "::error::kill_switch failed"; fail=1; }
           exit $fail
 
   # Always runs and is the only check of this workflow meant to be a required status check: it passes only if

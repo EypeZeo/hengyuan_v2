@@ -125,7 +125,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P2-001** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-002** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-003** | MEDIUM | lib | REMEDIATING | 下单状态转换 | BLOCKED | code, fault, test, runtime |
-| **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | code, fault, test, runtime, budget |
+| **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | fault, runtime, budget |
 | **P2-005** | MEDIUM | lib | REMEDIATING | 订单跟踪器 | BLOCKED | code, fault, test, runtime |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
 | **P2-007** | MEDIUM | build | PARTIAL | CI 增强 | BLOCKED | code, test |
@@ -189,7 +189,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-020** | PRE_OWNER_LIVE | L2 | PARTIAL | NOT_RUN | BLOCKED | 62c4647 |
 | **FI-021** | PRE_OWNER_LIVE | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-022** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-023** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-023** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-024** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-025** | CANARY | L4 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-026** | CANARY | L4 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -202,7 +202,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **FI-033** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 2a7e383 |
 | **FI-034** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-035** | PRE_OWNER_LIVE | L1 与 L2 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
-| **FI-036** | PRE_D3 | L0 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
+| **FI-036** | PRE_D3 | L0 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-037** | PRE_D3 | L0 | IMPLEMENTED | PASS | PASS | 8de0dad |
 | **FI-038** | PRE_D3 | L1 | PARTIAL | NOT_RUN | BLOCKED | 6cb56bd |
 | **FI-039** | PRE_D3 | L1 | NOT_TESTABLE_YET | NOT_RUN | BLOCKED | 6cb56bd |
@@ -228,11 +228,11 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 
 | 门禁标签 | 适用用例 | IMPLEMENTED | PARTIAL | NOT_TESTABLE_YET | 门禁结果 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| PRE_D3 | 38 | 4 | 23 | 11 | BLOCKED |
+| PRE_D3 | 38 | 4 | 25 | 9 | BLOCKED |
 | PRE_OWNER_LIVE | 14 | 0 | 3 | 11 | BLOCKED |
 | CANARY | 6 | 0 | 0 | 6 | BLOCKED |
 
-故障用例计数：NOT_TESTABLE_YET 28，PARTIAL 26，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
+故障用例计数：NOT_TESTABLE_YET 26，PARTIAL 28，IMPLEMENTED 4，合计 58，其中门禁 PASS 4 条。
 <!-- overview:end -->
 
 ## 3 复验发现（与蓝图原文不一致之处）
@@ -448,13 +448,13 @@ status: REMEDIATING
 task: SAFE-04
 gate: 实盘发单风控
 gate_result: BLOCKED
-open: open:native/include/hengyuan/kill_switch.hpp#"KillState state_{KillState::Normal};" absent:native/include/hengyuan/kill_switch.hpp#std::atomic
+open: open:docs/HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md#"目标主机的进程与主机重启验证待完成"
 refs: code:native/include/hengyuan/kill_switch.hpp#KillSwitch test:native/tests/test_kill_switch.cpp#OnlyOperatorResetClears
-seg.code: MISSING -- state_ 是普通字段，风控写与下单读之间存在数据竞争；内存锁存已实现且仅由操作员重置解除，缺的是跨重启持久化与“持久确认后发布”的次序
+seg.code: PRESENT code:native/include/hengyuan/durable_kill_switch.hpp#DurableKillSwitchStore -- 已接入持久状态恢复、限制发布与最终提交授权的排序
 seg.contract: PRESENT doc:docs/SPEC_INVARIANTS.md#KillSwitch bp:"任务 SAFE-04" -- 任务已定义持久锁存与线性化次序
-seg.fault: MISSING fi:FI-023=NOT_TESTABLE_YET fi:FI-036=NOT_TESTABLE_YET -- 持久锁存与跨线程次序均无可执行用例
-seg.test: MISSING test:native/tests/test_kill_switch.cpp#LatchedIsTerminal_NoAutoRearm -- 现有 7 个用例是单线程状态机测试，没有线程检测压力用例
-seg.runtime: MISSING -- 无线程检测压力日志，无重启后保持锁定的运行日志
+seg.fault: MISSING fi:FI-023=PARTIAL fi:FI-036=PARTIAL -- 子进程恢复与形式化检查已通过，目标主机重启与 CI 线程检测运行记录待补充
+seg.test: PRESENT test:native/tests/test_durable_kill_switch.cpp#RestrictiveWriteKeepsReadersAvailableAndBlocksNormalClaims -- 覆盖写入未返回时的读与授权、重置发布和恢复
+seg.runtime: MISSING -- 目标主机重启后的锁存验证待完成
 seg.budget: MISSING -- 持久确认进入风控路径的时延未测量
 closure: SAFE-04 完成；FI-036 的线程检测压力日志与 FI-023 的重启保持锁定日志取得
 ```
@@ -1131,12 +1131,13 @@ gate_tag: PRE_D3
 scope: 全部
 stage: 0 与 1A
 level: L1
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: open:native/include/hengyuan/kill_switch.hpp#"KillState state_{KillState::Normal};" absent:native/include/hengyuan/kill_switch.hpp#std::atomic
-note: 内存锁存已具备（见 P2-004），持久化与线性化次序都不存在。
+open: nofile:docs/drills/*safe-04*
+refs: test:native/tests/test_durable_kill_switch.cpp#NonNormalStateAndRevisionSurviveRestartWithoutAutomaticReset test:native/tests/test_durable_kill_switch.cpp#PreviouslyPersistedNormalStateIsLatchedOnDefaultRestart test:native/CMakeLists.txt#KillSwitchProcessRecovery
+note: 已验证限制写入前后异常退出时的新进程恢复，以及 Spot Testnet 上绑定当前存储和修订号的签名重置。目标主机的进程与主机重启验证待完成。
 ```
 
 ```ledger
@@ -1330,12 +1331,13 @@ gate_tag: PRE_D3
 scope: 全部
 stage: 0
 level: L0
-status: NOT_TESTABLE_YET
+status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: open:native/include/hengyuan/kill_switch.hpp#"KillState state_{KillState::Normal};" absent:native/include/hengyuan/kill_switch.hpp#std::atomic
-note: 没有线程检测压力用例；熔断状态仍是普通字段（P2-004）。
+open: open:docs/HengYuan_v2_全自动量化实盘系统实施指南与TODOLIST.md#"CI 线程检测运行记录待补充"
+refs: test:native/tests/test_durable_kill_switch.cpp#SnapshotsRemainConsistentWhileTheSwitchEscalates test:native/tests/test_submit_readiness.cpp#KillPublishedDuringFinalCheckPreventsClaim code:formal/kill_switch.tla#ClaimMatchesPublication
+note: 并发读写、最终授权交错和形式化模型已通过本地验证。CI 线程检测运行记录待补充。
 ```
 
 ```ledger
