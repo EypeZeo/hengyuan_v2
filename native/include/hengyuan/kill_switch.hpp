@@ -48,6 +48,14 @@ struct KillSwitchPersistencePort {
     void* user_data{nullptr};
 };
 
+enum class PersistentResetResult {
+    Applied,
+    Unavailable,
+    StateChanged,
+    Refused,
+    WriteFailed,
+};
+
 class KillSwitch {
 public:
     KillState state() const noexcept { return snapshot().state; }
@@ -135,6 +143,7 @@ public:
 
     void operator_reset() noexcept {
         std::lock_guard writer(writer_mutex_);
+        if (persistence_health() != KillPersistenceHealth::Disabled) return;
         const auto prior = snapshot();
         auto next = prior;
         advance_revision(next);
@@ -142,7 +151,38 @@ public:
         commit(prior, next);
     }
 
+    [[nodiscard]] std::optional<std::uint64_t> persistent_reset_revision() const noexcept {
+        std::lock_guard lock(state_mutex_);
+        if (!reset_store_available(persistence_health_) || !resettable(published_)) return std::nullopt;
+        return published_.revision;
+    }
+
+    // Run the final authorization check after entering the writer order.
+    // The check cannot call back into the switch or perform disk or network I/O.
+    template <typename Authorize>
+    [[nodiscard]] PersistentResetResult reset_persistent(std::uint64_t expected_revision,
+                                                         Authorize&& authorize) noexcept {
+        std::lock_guard writer(writer_mutex_);
+        const auto prior = snapshot();
+        if (!reset_store_available(persistence_health())) return PersistentResetResult::Unavailable;
+        if (prior.revision != expected_revision || !resettable(prior)) return PersistentResetResult::StateChanged;
+        if (!authorize()) return PersistentResetResult::Refused;
+
+        auto next = prior;
+        advance_revision(next);
+        next.state = KillState::Normal;
+        return commit(prior, next) ? PersistentResetResult::Applied : PersistentResetResult::WriteFailed;
+    }
+
 private:
+    static bool reset_store_available(KillPersistenceHealth health) noexcept {
+        return health == KillPersistenceHealth::Ready || health == KillPersistenceHealth::Degraded;
+    }
+
+    static bool resettable(const KillSwitchSnapshot& snapshot) noexcept {
+        return snapshot.state != KillState::Normal && snapshot.revision < std::numeric_limits<std::uint64_t>::max() - 1;
+    }
+
     bool can_open_locked() const noexcept {
         return published_.state == KillState::Normal &&
                (persistence_health_ == KillPersistenceHealth::Disabled ||
@@ -166,11 +206,11 @@ private:
 
     // The writer lock serializes transitions. Readers contend only with the
     // short publication and final-claim sections.
-    void commit(const KillSwitchSnapshot& prior, KillSwitchSnapshot next) noexcept {
-        if (persistence_health() == KillPersistenceHealth::Corrupt) return;
+    bool commit(const KillSwitchSnapshot& prior, KillSwitchSnapshot next) noexcept {
+        if (persistence_health() == KillPersistenceHealth::Corrupt) return false;
         if (!persistence_.fn) {
             publish(next, KillPersistenceHealth::Disabled);
-            return;
+            return true;
         }
 
         auto restricted = next;
@@ -178,10 +218,11 @@ private:
         publish(restricted, KillPersistenceHealth::Writing);
         if (persistence_.fn(persistence_.user_data, next)) {
             publish(next, KillPersistenceHealth::Ready);
-        } else {
-            next.state = KillState::Latched;
-            publish(next, KillPersistenceHealth::Degraded);
+            return true;
         }
+        next.state = KillState::Latched;
+        publish(next, KillPersistenceHealth::Degraded);
+        return false;
     }
 
     std::mutex writer_mutex_;

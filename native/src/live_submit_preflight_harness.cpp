@@ -79,6 +79,7 @@
 // The default preflight probes still use a scratch store. The explicit --cancel-only mode opens an existing
 // bound store, runs private-stream recovery, and sends at most one Owner-authorized cancellation after the
 // producers have stopped. --enroll-cancel-owner registers its public key locally.
+// --owner-reset-drill exercises a signed reset against a fresh Testnet scratch store.
 
 #include <hengyuan/binance_clock_sync.hpp>
 #include <hengyuan/binance_klines_rest.hpp>
@@ -91,6 +92,7 @@
 #include <hengyuan/feed_validity_gate.hpp>
 #include <hengyuan/holding_state_tracker.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
+#include <hengyuan/owner_reset_approval.hpp>
 #include <hengyuan/preflight_probe.hpp>
 #include <hengyuan/private_stream_pipeline.hpp>
 #include <hengyuan/public_feed_pipeline.hpp>
@@ -528,6 +530,28 @@ void print_private_stream_report(PrivatePipeline& pipeline, const WsApiSessionFa
 
 namespace cancel_control = hy::spot_cancel_control;
 
+struct ResetDrillOptions {
+    std::filesystem::path control_dir;
+    std::string credentials;
+    std::unique_ptr<OwnerResetAuthority> authority;
+    std::uint32_t duration_seconds{600};
+};
+
+std::optional<ResetDrillOptions> parse_reset_drill(int argc, char* argv[]) {
+    if (argc != 5 && argc != 6) return std::nullopt;
+    ResetDrillOptions options{argv[3], argv[4], nullptr};
+    std::error_code error;
+    if (!cancel_control::is_regular_file(argv[2]) ||
+        !std::filesystem::is_directory(std::filesystem::symlink_status(options.control_dir, error)) || error ||
+        (argc == 6 && !cancel_control::parse_id(argv[5], options.duration_seconds))) return std::nullopt;
+
+    std::vector<std::byte> der;
+    if (read_file_bounded(argv[2], der, owner_signature::kMaxPublicKeyBytes) != ReadFileStatus::Ok) return std::nullopt;
+    options.authority = OwnerResetAuthority::create(cancel_control::unsigned_bytes(der));
+    if (!options.authority) return std::nullopt;
+    return options;
+}
+
 struct CancelRuntimeOptions {
     StoreEnvironment environment{};
     cancel_control::StoreFiles store;
@@ -668,6 +692,73 @@ int run_cancel_only(const CancelRuntimeOptions& options, boost::asio::io_context
     return 2;
 }
 
+int run_owner_reset_drill(const ResetDrillOptions& options, boost::asio::io_context& ioc,
+                          PrivatePipeline& pipeline, BinancePrivateRestClient& client, const KillSwitch& kill_switch) {
+    std::string name = "owner-reset-";
+    constexpr std::string_view hex_digits = "0123456789abcdef";
+    for (const auto byte : options.authority->activation()) {
+        name.push_back(hex_digits[byte >> 4]);
+        name.push_back(hex_digits[byte & 15]);
+    }
+    const auto challenge_path = (options.control_dir / (name + ".grant")).string();
+    const auto signature_path = (options.control_dir / (name + ".sig")).string();
+
+    auto io_guard = boost::asio::make_work_guard(ioc);
+    std::thread io_thread([&ioc] { ioc.run(); });
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(options.duration_seconds);
+    auto next_clock_sync = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    bool challenge_published = false;
+    int exit_code = 2;
+    try {
+        while (!g_stop.load() && std::chrono::steady_clock::now() < end) {
+            if (std::chrono::steady_clock::now() >= next_clock_sync) {
+                const auto error = client.sync_clock();
+                next_clock_sync = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(error == PrivateRestError::None ? 60 : 10);
+            }
+            const auto steady = PrivateSession::steady_now_ms();
+            const auto wall = reconcile_wall_now_ms();
+            pipeline.hot_tick(steady, wall);
+            if (!challenge_published) {
+                const auto target = pipeline.operator_reset_target();
+                const auto upper = approval_server_time_upper_bound(client.clock_publisher(), fetch_clock_pair());
+                if (target && upper) {
+                    const auto challenge = options.authority->prepare(*target, *upper);
+                    if (!challenge || cancel_control::publish_file(challenge_path, *challenge) != ExportStatus::Ok) {
+                        std::fputs("Owner reset challenge could not be published.\n", stderr);
+                        break;
+                    }
+                    challenge_published = true;
+                    std::printf("Owner reset challenge for revision %" PRIu64 ": %s\nExpected signature: %s\n",
+                                target->revision, challenge_path.c_str(), signature_path.c_str());
+                }
+            }
+            if (challenge_published && cancel_control::is_regular_file(signature_path)) {
+                std::vector<std::byte> signature;
+                const auto result =
+                    read_file_bounded(signature_path, signature, owner_signature::kMaxSignatureBytes) == ReadFileStatus::Ok
+                        ? pipeline.apply_operator_reset(cancel_control::unsigned_bytes(signature))
+                        : OperatorResetResult::InvalidSignature;
+                std::printf("Owner reset result: %s (revision %" PRIu64 ")\n",
+                            operator_reset_result_name(result), kill_switch.revision());
+                if (result == OperatorResetResult::Applied) exit_code = 0;
+                break;
+            }
+            if (pipeline.supervisor().state() == FeedState::Terminal) break;
+            pipeline.reconcile_tick(steady, wall);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Owner reset drill stopped: %s.\n", e.what());
+    }
+
+    pipeline.supervisor().shutdown();
+    io_guard.reset();
+    io_thread.join();
+    if (exit_code != 0) std::fputs("The scratch store did not accept an operator reset.\n", stderr);
+    return exit_code;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -683,6 +774,15 @@ int main(int argc, char* argv[]) {
     }
     if (std::string_view(argv[1]) == "--enroll-cancel-owner") return enroll_cancel_owner(argc, argv);
     const bool cancel_only = std::string_view(argv[1]) == "--cancel-only";
+    const bool reset_drill = std::string_view(argv[1]) == "--owner-reset-drill";
+    const bool trade_preflight = !cancel_only && !reset_drill;
+    const auto reset_options = reset_drill ? parse_reset_drill(argc, argv) : std::nullopt;
+    if (reset_drill && !reset_options) {
+        std::fprintf(stderr, "usage: %s --owner-reset-drill <public-key.der> <control-dir> <read-only-testnet-credentials-file> [duration-seconds]\n",
+                     argv[0]);
+        std::fputs("The control directory and P-256 public key must be valid.\n", stderr);
+        return 1;
+    }
     const auto cancel_options = cancel_only ? parse_cancel_runtime(argc, argv) : std::nullopt;
     if (cancel_only && !cancel_options) {
         std::fprintf(stderr, "usage: %s --cancel-only <TESTNET|PRODUCTION> <log> <audit-key-id> <kek-file> <wrapped-key-file> <credentials-file> <control-dir> [duration-seconds]\n", argv[0]);
@@ -690,7 +790,7 @@ int main(int argc, char* argv[]) {
     }
     const auto environment = cancel_options ? cancel_options->environment : StoreEnvironment::Testnet;
     const std::string spec_path = argv[1];
-    int duration_s = !cancel_only && argc >= 3 ? std::atoi(argv[2]) : 60;
+    int duration_s = trade_preflight && argc >= 3 ? std::atoi(argv[2]) : 60;
     if (duration_s <= 0) duration_s = 60;
     // No maximum run time: the public feeds are supervised and roll their connections over before
     // Binance's 24 h connection limit on their own.
@@ -710,7 +810,7 @@ int main(int argc, char* argv[]) {
     // --- Load spec + fail-closed market-binding check (批次 6a-2's own established pattern) --
     SpecLoadResult load_result{};
     StreamingEvaluator evaluator;
-    if (!cancel_only) {
+    if (trade_preflight) {
         std::ifstream f(spec_path, std::ios::binary);
         if (!f) {
             std::fprintf(stderr, "FATAL: could not open spec file: %s\n", spec_path.c_str());
@@ -740,8 +840,9 @@ int main(int argc, char* argv[]) {
 
     // --- The cold-start chain ------------------------------------------------------------
     SecureEnvLoader loader;
-    const auto binding = environment == StoreEnvironment::Testnet ? EnvironmentBinding::testnet()
-                                                                   : EnvironmentBinding::production();
+    const auto binding = reset_drill ? EnvironmentBinding::operator_testnet()
+                                    : (environment == StoreEnvironment::Testnet ? EnvironmentBinding::testnet()
+                                                                                 : EnvironmentBinding::production());
     std::optional<ScratchStoreCleanup> scratch_store_cleanup;
     cancel_control::OpenStore store;
     if (cancel_options) {
@@ -759,7 +860,7 @@ int main(int argc, char* argv[]) {
     // read-only chain()).
     const std::uint32_t stamp = build_stamp();
     VerifiedDryRunEvidence verified_evidence;
-    if (!cancel_only) {
+    if (trade_preflight) {
         const DryRunReport drills = verified_evidence.run_all(stamp, drill_startup_now_ms(get_now_ms()), binding.environment(),
                                                               durable_audit_temp_path() + "_drill");
         static constexpr const char* kDrillNames[kEvidencePathCount] = {"SubmitSuccess", "SubmitReject",
@@ -777,7 +878,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    if (!cancel_only) {
+    if (trade_preflight) {
         std::printf("Dry-run evidence earned: all_paths_exercised=%s consistent_build=%s live_ready=%s\n",
                     verified_evidence.chain().all_paths_exercised() ? "true" : "false",
                     verified_evidence.chain().consistent_build() ? "true" : "false",
@@ -787,7 +888,9 @@ int main(int argc, char* argv[]) {
     std::array<std::string_view, 2> allowed_keys{binding.api_key_env_key(), binding.secret_env_key()};
     EnvAllowlist allowlist{allowed_keys.data(), allowed_keys.size()};
 
-    const char* credentials_file = cancel_options ? cancel_options->credentials.c_str() : ".env";
+    const char* credentials_file = ".env";
+    if (cancel_options) credentials_file = cancel_options->credentials.c_str();
+    if (reset_options) credentials_file = reset_options->credentials.c_str();
     const auto load_env_result = loader.load(credentials_file, allowlist);
     if (load_env_result.status != EnvLoadStatus::Ok) {
         print_env_load_error(load_env_result.status);
@@ -819,12 +922,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    SubmitAdapterContext submit_ctx{&client, &registry};
-    // Constructed to prove H5's composite adapters still assemble against a real, freshly
-    // refreshed SymbolRegistry. NEVER assigned to ctx.submit_port below (see this file's header
-    // comment).
-    SubmitPort real_submit_port_unused = make_binance_submit_port(submit_ctx);
-
     DemoControlPlaneSink cp_sink;
     ParsedExchangeInfo parsed{};
 
@@ -848,13 +945,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Read-only diagnostic: proves H5's composite adapters genuinely reach a real, freshly
-    // refreshed SymbolRegistry, and (with -Werror=unused-but-set-variable active on the GCC
-    // tier) keeps the compiler from flagging real_submit_port_unused as constructed-but-never-
-    // read. Still never assigned to ctx.submit_port anywhere below.
-    std::printf("Real SubmitPort assembled (never used for ctx.submit_port): rules_version=%u, valid=%d\n",
-                real_submit_port_unused.current_rules_version(),
-                real_submit_port_unused.is_valid() ? 1 : 0);
+    if (!reset_drill) {
+        // Assemble the adapter for the diagnostic. The order preflight uses the mock.
+        SubmitAdapterContext submit_ctx{&client, &registry};
+        const SubmitPort real_submit_port_unused = make_binance_submit_port(submit_ctx);
+        std::printf("Real SubmitPort assembled (never used for ctx.submit_port): rules_version=%u, valid=%d\n",
+                    real_submit_port_unused.current_rules_version(),
+                    real_submit_port_unused.is_valid() ? 1 : 0);
+    }
 
     // The one real, freshly-fetched SymbolRules this whole harness validates against --
     // captured once, right after refresh_from_exchange_info(), same "one snapshot, never
@@ -968,7 +1066,7 @@ int main(int argc, char* argv[]) {
     durable_kill_store.emplace(
         DurableKillSwitchConfig{durable_audit_path, environment, exchange_uid,
                                 durable_audit_sink->store_uuid_lo(), durable_audit_sink->store_uuid_hi(),
-                                cancel_options ? cancel_options->store.audit_key_id : 1, !cancel_only},
+                                cancel_options ? cancel_options->store.audit_key_id : 1, trade_preflight},
         *store.keys);
     const bool kill_store_ready = durable_kill_store->recover(kill_switch);
     std::printf("Kill-switch persistence: %s (authenticated=%s)\n",
@@ -989,6 +1087,7 @@ int main(int argc, char* argv[]) {
     PipelineConfig pipeline_cfg;
     pipeline_cfg.submit_authority = submit_authority;
     if (authority) pipeline_cfg.automatic_cancel = authority->config();
+    if (reset_options) pipeline_cfg.operator_reset = reset_options->authority->approval_port();
     // The supervision the public feeds get: reconnect with backoff, a planned rollover well inside the 24 h limit of
     // a Binance connection, and an end to the run -- exit code 2, not a silent blind loop -- once ten attempts in a
     // row have failed.
@@ -1018,6 +1117,11 @@ int main(int argc, char* argv[]) {
     if (cancel_options) {
         return run_cancel_only(*cancel_options, ioc, private_pipeline, durable_audit_sink, authority.get(),
                                client, kill_switch, in_flight, rules);
+    }
+
+    if (reset_options) {
+        if (!kill_store_ready) return 1;
+        return run_owner_reset_drill(*reset_options, ioc, *private_pipeline, client, kill_switch);
     }
 
     // --- Both public feeds, supervised (批次 6b-0f) --------------------------------------------

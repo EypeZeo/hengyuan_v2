@@ -3,10 +3,9 @@
 
 #include <hengyuan/automatic_cancel.hpp>
 #include <hengyuan/durable_frame_codec.hpp>
+#include <hengyuan/owner_p256_signature.hpp>
 
-#include <openssl/evp.h>
 #include <openssl/rand.h>
-#include <openssl/x509.h>
 
 #include <algorithm>
 #include <array>
@@ -65,11 +64,11 @@ public:
         StoreBinding binding, std::uint64_t uuid_lo, std::uint64_t uuid_hi, std::uint64_t key_id,
         std::span<const unsigned char> public_key_der, std::int64_t max_validity_ms) {
         CancelSubject subject{binding.environment, binding.account_uid, uuid_lo, uuid_hi, 0};
-        if (key_id == 0 || public_key_der.empty() || public_key_der.size() > 1024 || max_validity_ms <= 0 ||
+        if (key_id == 0 || max_validity_ms <= 0 ||
             RAND_bytes(reinterpret_cast<unsigned char*>(&subject.activation_id),
                        static_cast<int>(sizeof(subject.activation_id))) != 1 || !subject.valid()) return {};
 
-        auto key = decode_public_key(public_key_der);
+        auto key = owner_signature::decode_p256(public_key_der);
         if (!key) return {};
 
         return std::unique_ptr<OwnerCancelAuthority>(
@@ -77,7 +76,7 @@ public:
     }
 
     static bool valid_public_key(std::span<const unsigned char> der) noexcept {
-        return static_cast<bool>(decode_public_key(der));
+        return static_cast<bool>(owner_signature::decode_p256(der));
     }
 
     OwnerCancelAuthority(const OwnerCancelAuthority&) = delete;
@@ -119,7 +118,7 @@ public:
             return Result::MalformedGrant;
         }
         if (key_id != key_id_ || grant.subject != subject_) return Result::WrongScope;
-        if (!verify(payload, signature)) return Result::InvalidSignature;
+        if (!owner_signature::verify_p256(*key_, payload, signature)) return Result::InvalidSignature;
         if (grant.serial <= highest_serial_) return Result::StaleSerial;
         const auto upper = cancel_server_time_upper_bound(clock, now);
         if (!upper) return Result::ClockUnavailable;
@@ -146,24 +145,7 @@ public:
     }
 
 private:
-    using PublicKey = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
-
-    static PublicKey decode_public_key(std::span<const unsigned char> public_key_der) noexcept {
-        if (public_key_der.empty() || public_key_der.size() > 1024) return PublicKey(nullptr, EVP_PKEY_free);
-        const auto* p = public_key_der.data();
-        PublicKey key(d2i_PUBKEY(nullptr, &p, static_cast<long>(public_key_der.size())), EVP_PKEY_free);
-        if (!key || p != public_key_der.data() + public_key_der.size() ||
-            EVP_PKEY_is_a(key.get(), "EC") != 1) return PublicKey(nullptr, EVP_PKEY_free);
-        std::array<char, 32> group{};
-        if (EVP_PKEY_get_group_name(key.get(), group.data(), group.size(), nullptr) != 1 ||
-            std::string_view(group.data()) != "prime256v1") return PublicKey(nullptr, EVP_PKEY_free);
-        const std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> check(
-            EVP_PKEY_CTX_new_from_pkey(nullptr, key.get(), nullptr), EVP_PKEY_CTX_free);
-        if (!check || EVP_PKEY_public_check(check.get()) != 1) return PublicKey(nullptr, EVP_PKEY_free);
-        return key;
-    }
-
-    OwnerCancelAuthority(CancelSubject subject, std::uint64_t key_id, PublicKey key,
+    OwnerCancelAuthority(CancelSubject subject, std::uint64_t key_id, owner_signature::PublicKey key,
                          std::int64_t max_validity_ms) noexcept
         : subject_(subject), key_id_(key_id), key_(std::move(key)), max_validity_ms_(max_validity_ms) {}
 
@@ -173,17 +155,9 @@ private:
         return std::nullopt;
     }
 
-    bool verify(std::span<const std::byte> payload, std::span<const unsigned char> signature) const noexcept {
-        if (signature.empty() || signature.size() > 72) return false;
-        const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-        return ctx && EVP_DigestVerifyInit(ctx.get(), nullptr, EVP_sha256(), nullptr, key_.get()) == 1 &&
-               EVP_DigestVerify(ctx.get(), signature.data(), signature.size(),
-                                reinterpret_cast<const unsigned char*>(payload.data()), payload.size()) == 1;
-    }
-
     CancelSubject subject_;
     std::uint64_t key_id_;
-    PublicKey key_;
+    owner_signature::PublicKey key_;
     std::int64_t max_validity_ms_;
     std::uint64_t highest_serial_{0};
     std::optional<CancelApproval> active_;

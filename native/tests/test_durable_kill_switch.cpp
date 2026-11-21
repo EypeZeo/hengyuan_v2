@@ -183,7 +183,7 @@ TEST_F(DurableKillSwitchTest, TipDirectoryFailsClosedWithoutReplacingTheUnsafeEn
     EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Corrupt);
     EXPECT_TRUE(std::filesystem::is_directory(tip_path()));
 
-    kill.operator_reset();
+    EXPECT_EQ(kill.reset_persistent(0, []() noexcept { return true; }), hy::PersistentResetResult::Unavailable);
     EXPECT_EQ(kill.state(), hy::KillState::Latched);
     EXPECT_TRUE(std::filesystem::is_directory(tip_path()));
 }
@@ -220,7 +220,8 @@ TEST_F(DurableKillSwitchTest, OnlyExplicitOperatorResetPublishesNormalAndKeepsRe
         hy::KillSwitch kill;
         ASSERT_TRUE(store->recover(kill));
         kill.trigger();
-        kill.operator_reset();
+        EXPECT_EQ(kill.reset_persistent(kill.revision(), []() noexcept { return true; }),
+                  hy::PersistentResetResult::Applied);
         EXPECT_EQ(kill.state(), hy::KillState::Normal);
         EXPECT_EQ(kill.revision(), 2u);
     }
@@ -257,7 +258,8 @@ TEST_F(DurableKillSwitchTest, WriteFailureLatchesUntilAnExplicitDurableReset) {
         EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Degraded);
 
         std::filesystem::remove_all(tip_path());
-        kill.operator_reset();
+        EXPECT_EQ(kill.reset_persistent(kill.revision(), []() noexcept { return true; }),
+                  hy::PersistentResetResult::Applied);
         EXPECT_EQ(kill.state(), hy::KillState::Normal);
         EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Ready);
         EXPECT_EQ(kill.revision(), 2u);
@@ -280,7 +282,7 @@ TEST_F(DurableKillSwitchTest, CorruptRecoveryNeverOverwritesEvidence) {
     EXPECT_EQ(kill.state(), hy::KillState::Latched);
     EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Corrupt);
 
-    kill.operator_reset();
+    EXPECT_EQ(kill.reset_persistent(0, []() noexcept { return true; }), hy::PersistentResetResult::Unavailable);
     EXPECT_EQ(kill.state(), hy::KillState::Latched);
     EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Corrupt);
     EXPECT_EQ(store->status(), hy::KillPersistenceHealth::Corrupt);
@@ -295,7 +297,7 @@ TEST_F(DurableKillSwitchTest, StaleTemporaryFileBlocksFreshNormalInitialization)
     EXPECT_EQ(kill.state(), hy::KillState::Latched);
     EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Corrupt);
 
-    kill.operator_reset();
+    EXPECT_EQ(kill.reset_persistent(0, []() noexcept { return true; }), hy::PersistentResetResult::Unavailable);
     EXPECT_EQ(kill.state(), hy::KillState::Latched);
     EXPECT_FALSE(std::filesystem::exists(tip_path()));
     EXPECT_EQ(read_text(tmp_path()), "uncertain previous migration");
@@ -314,7 +316,7 @@ TEST_F(DurableKillSwitchTest, AnotherAccountsStoreCannotBeRecoveredOrReset) {
     hy::KillSwitch kill;
     EXPECT_FALSE(other.recover(kill));
     EXPECT_EQ(kill.state(), hy::KillState::Latched);
-    kill.operator_reset();
+    EXPECT_EQ(kill.reset_persistent(0, []() noexcept { return true; }), hy::PersistentResetResult::Unavailable);
     EXPECT_EQ(kill.state(), hy::KillState::Latched);
     EXPECT_EQ(other.status(), hy::KillPersistenceHealth::Corrupt);
 }
@@ -356,6 +358,100 @@ TEST(KillSwitchPersistencePort, PublishesOnlyAfterThePortAcknowledges) {
     EXPECT_EQ(probe.offered.state, hy::KillState::Triggered);
     EXPECT_EQ(kill.state(), hy::KillState::Latched) << "the failed Triggered write cannot publish a weaker state";
     EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Degraded);
+}
+
+TEST(KillSwitchPersistencePort, PersistentResetRejectsStaleAndUnauthorizedRequestsBeforePersisting) {
+    struct Probe {
+        int persistence_calls{0};
+        int authorization_calls{0};
+    } probe;
+    hy::KillSwitch kill;
+    kill.attach_persistent(
+        {[](void* user_data, const hy::KillSwitchSnapshot&) noexcept {
+             ++static_cast<Probe*>(user_data)->persistence_calls;
+             return true;
+         },
+         &probe},
+        {}, hy::KillPersistenceHealth::Ready);
+
+    kill.trigger();
+    ASSERT_EQ(kill.state(), hy::KillState::Triggered);
+    ASSERT_EQ(kill.revision(), 1u);
+    ASSERT_EQ(probe.persistence_calls, 1);
+
+    EXPECT_EQ(kill.reset_persistent(0, [&]() noexcept {
+                      ++probe.authorization_calls;
+                      return true;
+                  }),
+              hy::PersistentResetResult::StateChanged);
+    EXPECT_EQ(probe.authorization_calls, 0);
+    EXPECT_EQ(probe.persistence_calls, 1);
+
+    EXPECT_EQ(kill.reset_persistent(1, [&]() noexcept {
+                      ++probe.authorization_calls;
+                      return false;
+                  }),
+              hy::PersistentResetResult::Refused);
+    EXPECT_EQ(probe.authorization_calls, 1);
+    EXPECT_EQ(probe.persistence_calls, 1);
+    EXPECT_EQ(kill.state(), hy::KillState::Triggered);
+    EXPECT_EQ(kill.revision(), 1u);
+
+    EXPECT_EQ(kill.reset_persistent(1, [&]() noexcept {
+                      ++probe.authorization_calls;
+                      return true;
+                  }),
+              hy::PersistentResetResult::Applied);
+    EXPECT_EQ(probe.authorization_calls, 2);
+    EXPECT_EQ(probe.persistence_calls, 2);
+    EXPECT_EQ(kill.state(), hy::KillState::Normal);
+    EXPECT_EQ(kill.revision(), 2u);
+}
+
+TEST(KillSwitchPersistencePort, LegacyOperatorResetCannotClearPersistentLatch) {
+    struct Probe {
+        int persistence_calls{0};
+    } probe;
+    hy::KillSwitch kill;
+    kill.attach_persistent(
+        {[](void* user_data, const hy::KillSwitchSnapshot&) noexcept {
+             ++static_cast<Probe*>(user_data)->persistence_calls;
+             return true;
+         },
+         &probe},
+        {hy::KillState::Latched, 7, 0, 1}, hy::KillPersistenceHealth::Ready);
+
+    kill.operator_reset();
+
+    EXPECT_EQ(kill.state(), hy::KillState::Latched);
+    EXPECT_EQ(kill.revision(), 7u);
+    EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Ready);
+    EXPECT_EQ(probe.persistence_calls, 0);
+}
+
+TEST(KillSwitchPersistencePort, FailedPersistentResetConsumesThePriorRevision) {
+    struct Probe {
+        int persistence_calls{0};
+    } probe;
+    hy::KillSwitch kill;
+    kill.attach_persistent(
+        {[](void* user_data, const hy::KillSwitchSnapshot&) noexcept {
+             ++static_cast<Probe*>(user_data)->persistence_calls;
+             return false;
+         },
+         &probe},
+        {hy::KillState::Triggered, 4, 0, 1}, hy::KillPersistenceHealth::Ready);
+
+    EXPECT_EQ(kill.reset_persistent(4, []() noexcept { return true; }),
+              hy::PersistentResetResult::WriteFailed);
+    EXPECT_EQ(kill.state(), hy::KillState::Latched);
+    EXPECT_EQ(kill.revision(), 5u);
+    EXPECT_EQ(kill.persistence_health(), hy::KillPersistenceHealth::Degraded);
+    EXPECT_EQ(probe.persistence_calls, 1);
+
+    EXPECT_EQ(kill.reset_persistent(4, []() noexcept { return true; }),
+              hy::PersistentResetResult::StateChanged);
+    EXPECT_EQ(probe.persistence_calls, 1);
 }
 
 TEST(KillSwitchConcurrency, RestrictiveWriteKeepsReadersAvailableAndBlocksNormalClaims) {
@@ -404,7 +500,11 @@ TEST(KillSwitchConcurrency, RestrictiveWriteKeepsReadersAvailableAndBlocksNormal
     };
 
     check_pending(1, [&] { kill.trigger(); });
-    check_pending(2, [&] { kill.operator_reset(); });
+    hy::PersistentResetResult reset_result = hy::PersistentResetResult::StateChanged;
+    check_pending(2, [&] {
+        reset_result = kill.reset_persistent(1, []() noexcept { return true; });
+    });
+    EXPECT_EQ(reset_result, hy::PersistentResetResult::Applied);
     EXPECT_EQ(probe.calls, 2);
     EXPECT_EQ(kill.state(), hy::KillState::Normal);
     EXPECT_EQ(kill.revision(), 2u);

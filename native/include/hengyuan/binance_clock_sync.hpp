@@ -270,4 +270,16 @@ inline bool try_get_pessimistic_server_now_ms(const ClockOffsetPublisher& pub,
     return server_now_ms_pessimistic(s, now.system_ms(), out);
 }
 
+// Conservative exchange time for checking the expiry of a signed approval.
+inline std::optional<std::int64_t> approval_server_time_upper_bound(const ClockOffsetPublisher& clock,
+                                                                  ClockPairSample now) noexcept {
+    const auto snapshot = clock.load();
+    std::int64_t upper = 0;
+    if (!is_snapshot_fresh(snapshot, now) || snapshot.error_bound_ms < 0 ||
+        !server_now_ms_for_signing(snapshot, now.system_ms(), upper) ||
+        !checked_add_i64(upper, snapshot.error_bound_ms, upper) ||
+        !checked_add_i64(upper, kMaxClockDriftMs, upper) || upper <= 0) return std::nullopt;
+    return upper;
+}
+
 }  // namespace hy

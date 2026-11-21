@@ -76,7 +76,11 @@ int main(int argc, char** argv) {
     if (kill.state() != hy::KillState::Latched || kill.revision() != 0 || kill.can_open()) {
         return fail("A new store did not start latched.");
     }
-    kill.operator_reset();
+    if (kill.reset_persistent(kill.revision(), []() noexcept { return true; }) !=
+            hy::PersistentResetResult::Applied ||
+        kill.state() != hy::KillState::Normal) {
+        return fail("The persisted reset did not publish Normal.");
+    }
     if (kill.open_revision() != kNormalRevision) return fail("The persisted reset did not publish Normal.");
 
     if (phase == "exit-before-persist") {

@@ -79,7 +79,10 @@ BeginWrite(target) ==
     /\ UNCHANGED <<disk, token, request>>
 
 Restrict == BeginWrite("Restricted")
-RequestReset == BeginWrite("Normal")
+RequestReset ==
+    /\ runtime.state = "Restricted"
+    /\ runtime.revision < MaxRevision - 1
+    /\ BeginWrite("Normal")
 
 NewRecord == [state |-> write.target, revision |-> runtime.revision]
 

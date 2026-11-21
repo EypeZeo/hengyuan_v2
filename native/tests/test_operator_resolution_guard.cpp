@@ -186,6 +186,7 @@ constexpr const char* kFlow = "include/hengyuan/operator_resolution_flow.hpp";
 constexpr const char* kTransport = "include/hengyuan/operator_resolution_transport.hpp";
 constexpr const char* kClient = "include/hengyuan/binance_private_rest.hpp";
 constexpr const char* kEnvironment = "include/hengyuan/binance_environment.hpp";
+constexpr const char* kPreflightHarness = "src/live_submit_preflight_harness.cpp";
 constexpr const char* kCli = "include/hengyuan/operator_resolution_cli.hpp";
 constexpr const char* kTerminal = "include/hengyuan/operator_resolution_terminal.hpp";
 constexpr const char* kTool = "include/hengyuan/operator_resolution_tool.hpp";
@@ -826,9 +827,8 @@ TEST(OperatorResolutionGuard, ThePortsHaveNoFreeTextAccountSummaryLeft) {
 //  17. The tool's headers and entry point are a closed set: each is included by exactly the files that need it; the three headers that need
 //      no Boost have an exact include list (so nothing heavy, and nothing of the trading path, comes in unnoticed); the entry point is a
 //      thin main() that connects them to the process.
-//  18. The tool's credentials: EnvironmentBinding's two operator factories are named by the binding header (the definitions) and the
-//      tool's real exchange (the one use each) and nothing else, the private helper that builds them by nothing but the factories, and
-//      nothing of the tool names the trading factories.
+//  18. The two operator bindings are used by the resolver. The Testnet binding is also used by the reset drill.
+//      The factories alone construct the read-only bindings, and the resolver uses only those factories.
 //  19. The order of events in the tool: the exchange (credentials) is asked for before the key material is read, the KEK is wiped once the ring
 //      holds it, both logs are open -- the audit log in OperatorOpen mode -- before the session begins, --list never begins one, and the
 //      procedure runs once.
@@ -906,8 +906,13 @@ TEST(OperatorResolutionGuard, NothingOfTheToolReachesTheTradingPath) {
     }
 }
 
-TEST(OperatorResolutionGuard, TheToolsBindingsAreNamedByTheBindingHeaderAndTheToolsRealExchangeAlone) {
-    expect_named_only_in("operator_testnet", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the one use"}});
+TEST(OperatorResolutionGuard, ReadOnlyBindingsAreLimitedToTheResolverAndResetDrill) {
+    expect_named_only_in("operator_testnet", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the resolver"},
+                                             {kPreflightHarness, 1, "the reset drill"}});
+    const SourceFile* harness = find_source(kPreflightHarness);
+    ASSERT_NE(harness, nullptr);
+    EXPECT_NE(function_body(harness->code, "main").find("reset_drill ? EnvironmentBinding::operator_testnet()"),
+              std::string::npos);
     expect_named_only_in("operator_production", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the one use"}});
     expect_named_only_in("with_credential_env_keys", {{kEnvironment, 3, "the definition and the two operator factories"}});
     // ...and nothing of the tool names the TRADING factories: it cannot ask for the key that places orders
@@ -1053,7 +1058,6 @@ namespace {
 constexpr const char* kBinding = "include/hengyuan/store_binding.hpp";
 constexpr const char* kBindingWriter = "include/hengyuan/store_binding_writer.hpp";
 constexpr const char* kPipelineFile = "include/hengyuan/private_stream_pipeline.hpp";
-constexpr const char* kPreflightHarness = "src/live_submit_preflight_harness.cpp";
 constexpr const char* kPreparedDrill = "src/hy_r6_prepare_drill.cpp";
 
 const char* const kOperatorFiles[] = {kFrame, kRules, kEvidence, kResponse, kConfirmation, kPorts,        kBundle,

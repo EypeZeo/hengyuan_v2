@@ -714,8 +714,8 @@ TEST(SubmitReadinessGuard, ThePreflightHarnessCanOnlyHandItsOrderFillTheMockPort
     for (const char* forbidden : {"poll_once(", "drain_hot_inputs(", "drain_reconcile_events(", "drain_user_data_events(", "supervisor().poll(", "ws_supervisor"}) {
         EXPECT_EQ(count_substring(f->code, forbidden), 0u) << "the preflight harness must not call " << forbidden << " itself";
     }
-    EXPECT_EQ(count_substring(f->code, "reconcile_tick("), 2u) << "each mode calls the reconcile half once per cycle";
-    EXPECT_EQ(count_substring(f->code, "hot_tick("), 4u) << "each mode calls the hot half once per cycle and after joining";
+    EXPECT_EQ(count_substring(f->code, "reconcile_tick("), 3u) << "each mode calls the reconcile half once per cycle";
+    EXPECT_EQ(count_substring(f->code, "hot_tick("), 5u) << "one call per mode and two shutdown drains";
     const auto claim = f->code.find("request = pipeline->take_automatic_cancel()");
     const auto shutdown = f->code.find("pipeline->supervisor().shutdown()", claim);
     const auto join = f->code.find("io_thread.join()", shutdown);

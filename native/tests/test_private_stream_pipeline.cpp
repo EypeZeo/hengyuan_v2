@@ -13,6 +13,7 @@
 //   * the wiring: the context the pipeline makes carries every field the private stream needs, and they are the objects the pipeline itself drains with.
 #include <gtest/gtest.h>
 
+#include <hengyuan/durable_kill_switch.hpp>
 #include <hengyuan/preflight_probe.hpp>
 #include <hengyuan/private_stream_pipeline.hpp>
 
@@ -23,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -198,6 +200,23 @@ struct AutomaticCancelApprovalSource {
     [[nodiscard]] CancelApprovalPort port() noexcept { return CancelApprovalPort{&read, this}; }
 };
 
+struct OperatorResetApprovalSource {
+    std::optional<OperatorResetApproval> approval;
+    std::array<unsigned char, 3> accepted_signature{0x41, 0x52, 0x37};
+
+    static std::optional<OperatorResetApproval> verify(void* user_data, std::span<const unsigned char> signature) noexcept {
+        auto* source = static_cast<OperatorResetApprovalSource*>(user_data);
+        if (!source->approval || signature.size() != source->accepted_signature.size()) return std::nullopt;
+        for (std::size_t i = 0; i < signature.size(); ++i) {
+            if (signature[i] != source->accepted_signature[i]) return std::nullopt;
+        }
+        return source->approval;
+    }
+
+    [[nodiscard]] OperatorResetApprovalPort port() noexcept { return OperatorResetApprovalPort{&verify, this}; }
+    [[nodiscard]] std::span<const unsigned char> signature() const noexcept { return accepted_signature; }
+};
+
 }  // namespace
 
 class PipelineTest : public ::testing::Test {
@@ -211,6 +230,7 @@ protected:
 
     // The process-owned parts. The sink is declared before the pipeline so the pipeline is destroyed first.
     std::unique_ptr<DurableAuditSink> sink_;
+    std::unique_ptr<DurableKillSwitchStore> kill_store_;
     AuditRingSink audit_;
     KillSwitch kill_;
     PositionTruth truth_;
@@ -222,6 +242,7 @@ protected:
     FakeAccount account_;
     FakeExchange exchange_;
     AutomaticCancelApprovalSource approvals_;
+    OperatorResetApprovalSource reset_approvals_;
     std::vector<std::shared_ptr<FakeSession>> sessions_;
     std::unique_ptr<Pipeline> pipe_;
 
@@ -248,12 +269,13 @@ protected:
 
     void TearDown() override {
         pipe_.reset();
+        kill_store_.reset();
         sink_.reset();
         std::error_code ec;
         for (const std::string& base : used_paths_) {
             for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".keyrotations", ".keyrotations.lock", ".keyrotations.tip", ".keyrotations.tip.tmp",
                                        ".storeid", ".storeid.lock", ".storeid.tip", ".storeid.tip.tmp", ".binding", ".binding.lock", ".binding.tip",
-                                       ".binding.tip.tmp"}) {
+                                       ".binding.tip.tmp", ".kill-switch", ".kill-switch.lock", ".kill-switch.tip", ".kill-switch.tip.tmp"}) {
                 std::filesystem::remove(base + suffix, ec);
             }
         }
@@ -269,6 +291,17 @@ protected:
         sink_ = std::make_unique<DurableAuditSink>(path_, *ring_, kKeyId, max_intent_orphans, AuditSinkOpenMode::Trading);
     }
 
+    [[nodiscard]] DurableKillSwitchConfig persistent_kill_config(bool allow_normal_start = false) const {
+        return DurableKillSwitchConfig{path_, StoreEnvironment::Testnet, kUid, sink_->store_uuid_lo(), sink_->store_uuid_hi(), kKeyId,
+                                       allow_normal_start};
+    }
+
+    void attach_persistent_kill(bool allow_normal_start = false) {
+        ASSERT_NE(sink_, nullptr);
+        kill_store_ = std::make_unique<DurableKillSwitchStore>(persistent_kill_config(allow_normal_start), *ring_);
+        ASSERT_TRUE(kill_store_->recover(kill_));
+    }
+
     // An order that was submitted and never answered: the log's last frame is Submitting, which a restart recovers as Ambiguous.
     void leave_an_unanswered_order(const char* coid) {
         {
@@ -279,7 +312,7 @@ protected:
     }
 
     void build(PipelineRulesLookup rules = PipelineRulesLookup{&rules_for_test, nullptr}, const ClockOffsetPublisher* clock = nullptr,
-               AutoCancelConfig automatic_cancel = {}) {
+               AutoCancelConfig automatic_cancel = {}, OperatorResetApprovalPort operator_reset = {}) {
         ASSERT_NE(sink_, nullptr);
         PipelineParts parts{*sink_, path_, *ring_, make_durable_order_audit_port(*sink_), audit_, kill_, truth_, in_flight_, fill_, user_events_,
                             clock != nullptr ? *clock : clock_};
@@ -292,6 +325,7 @@ protected:
         config.exposure_limits.single_order_notional_cap = 777'000;  // a value nobody else sets: the context must carry the configured limits
         config.reconcile_deadline_ms = 60'000;
         config.automatic_cancel = automatic_cancel;
+        config.operator_reset = operator_reset;
         pipe_ = std::make_unique<Pipeline>(parts, config, [this](std::uint64_t) {
             auto s = std::make_shared<FakeSession>();
             sessions_.push_back(s);
@@ -337,6 +371,18 @@ protected:
             cycle();
             if (!sessions_.empty() && !sessions_.back()->connected) sessions_.back()->connected = true;
             if (pipe_->readiness().authorize(g_now).ready()) return true;
+        }
+        return false;
+    }
+
+    bool run_until_recovery_ready(int max_cycles = 30) {
+        for (int i = 0; i < max_cycles; ++i) {
+            cycle();
+            if (!sessions_.empty() && !sessions_.back()->connected) sessions_.back()->connected = true;
+            if (pipe_->recovery().state() == RunState::Ready && !sessions_.empty() && sessions_.back()->connected &&
+                pipe_->readiness().barrier().state() == BarrierState::Reconciled) {
+                return true;
+            }
         }
         return false;
     }
@@ -503,6 +549,98 @@ TEST_F(PipelineTest, AStaleAccountTakesTheProcessOutOfReadinessAgain) {
     pipe_->reconcile_tick(g_now);
     pipe_->hot_tick(g_now);
     EXPECT_TRUE(pipe_->readiness().authorize(g_now).ready());
+}
+
+TEST_F(PipelineTest, OperatorResetWaitsForRecoverySweepAndDurablyOpensTheExactLatestTarget) {
+    open_sink();
+    attach_persistent_kill();
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, nullptr, {}, reset_approvals_.port());
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    ASSERT_EQ(kill_.state(), KillState::Latched);
+    ASSERT_FALSE(kill_.can_open());
+
+    EXPECT_FALSE(pipe_->operator_reset_target());
+    EXPECT_EQ(pipe_->apply_operator_reset(reset_approvals_.signature()), OperatorResetResult::InvalidSignature);
+
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_EQ(sessions_.size(), 1U);
+    EXPECT_FALSE(pipe_->operator_reset_target()) << "the private stream has not connected";
+    sessions_[0]->connected = true;
+    pipe_->hot_tick(g_now += 10);
+    EXPECT_EQ(pipe_->readiness().barrier().state(), BarrierState::Sweeping);
+    EXPECT_FALSE(pipe_->operator_reset_target()) << "the private-stream sweep is still outstanding";
+
+    {
+        DurableKillSwitchStore competing(persistent_kill_config(), *ring_);
+        KillSwitch competing_kill;
+        EXPECT_FALSE(competing.recover(competing_kill)) << "the startup owner keeps the sidecar lock through the sweep";
+    }
+
+    ASSERT_TRUE(run_until_recovery_ready(60));
+    ASSERT_EQ(pipe_->readiness().barrier().state(), BarrierState::Reconciled);
+    const auto target = pipe_->operator_reset_target();
+    ASSERT_TRUE(target.has_value());
+    reset_approvals_.approval = OperatorResetApproval{*target, std::numeric_limits<std::int64_t>::max()};
+
+    EXPECT_EQ(pipe_->apply_operator_reset(reset_approvals_.signature()), OperatorResetResult::Applied);
+    EXPECT_EQ(kill_.state(), KillState::Normal);
+    EXPECT_TRUE(kill_.can_open());
+    EXPECT_EQ(kill_.persistence_health(), KillPersistenceHealth::Ready);
+    EXPECT_EQ(kill_store_->status(), KillPersistenceHealth::Ready);
+    EXPECT_TRUE(pipe_->readiness().authorize(g_now).ready());
+}
+
+TEST_F(PipelineTest, OperatorResetRejectsInvalidScopeStaleRevisionAndExpiredApproval) {
+    open_sink();
+    attach_persistent_kill();
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, nullptr, {}, reset_approvals_.port());
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    ASSERT_TRUE(run_until_recovery_ready(60));
+
+    const auto initial = pipe_->operator_reset_target();
+    ASSERT_TRUE(initial.has_value());
+    reset_approvals_.approval = OperatorResetApproval{*initial, std::numeric_limits<std::int64_t>::max()};
+    EXPECT_EQ(pipe_->apply_operator_reset(std::span<const unsigned char>{}), OperatorResetResult::InvalidSignature);
+
+    auto wrong_scope = *initial;
+    wrong_scope.scope.environment = StoreEnvironment::Production;
+    reset_approvals_.approval = OperatorResetApproval{wrong_scope, std::numeric_limits<std::int64_t>::max()};
+    EXPECT_EQ(pipe_->apply_operator_reset(reset_approvals_.signature()), OperatorResetResult::WrongStore);
+
+    kill_.latch();
+    EXPECT_EQ(kill_.state(), KillState::Latched);
+    EXPECT_GT(kill_.revision(), initial->revision);
+    reset_approvals_.approval = OperatorResetApproval{*initial, std::numeric_limits<std::int64_t>::max()};
+    EXPECT_EQ(pipe_->apply_operator_reset(reset_approvals_.signature()), OperatorResetResult::StateChanged);
+
+    const auto latest = pipe_->operator_reset_target();
+    ASSERT_TRUE(latest.has_value());
+    reset_approvals_.approval = OperatorResetApproval{*latest, 0};
+    EXPECT_EQ(pipe_->apply_operator_reset(reset_approvals_.signature()), OperatorResetResult::Expired);
+    EXPECT_EQ(kill_.state(), KillState::Latched);
+}
+
+TEST_F(PipelineTest, OperatorResetRemainsLatchedWhenFeedReadinessIsLost) {
+    open_sink();
+    attach_persistent_kill();
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, nullptr, {}, reset_approvals_.port());
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    ASSERT_TRUE(run_until_recovery_ready(60));
+
+    const auto target = pipe_->operator_reset_target();
+    ASSERT_TRUE(target.has_value());
+    reset_approvals_.approval = OperatorResetApproval{*target, std::numeric_limits<std::int64_t>::max()};
+    ASSERT_FALSE(sessions_.empty());
+    sessions_.back()->connected = false;
+    pipe_->hot_tick(g_now += 10);
+    EXPECT_EQ(pipe_->readiness().barrier().state(), BarrierState::Down);
+    EXPECT_FALSE(pipe_->operator_reset_target());
+    EXPECT_EQ(pipe_->apply_operator_reset(reset_approvals_.signature()), OperatorResetResult::NotReady);
+    EXPECT_EQ(kill_.state(), KillState::Latched);
+    EXPECT_EQ(kill_.revision(), target->revision);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------

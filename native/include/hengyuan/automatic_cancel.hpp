@@ -77,13 +77,7 @@ inline bool is_confirmed_cancel_target(const OrderFillContextEntry& order) noexc
 
 inline std::optional<std::int64_t> cancel_server_time_upper_bound(const ClockOffsetPublisher& clock,
                                                                 ClockPairSample now) noexcept {
-    const auto snapshot = clock.load();
-    std::int64_t upper = 0;
-    if (!is_snapshot_fresh(snapshot, now) || snapshot.error_bound_ms < 0 ||
-        !server_now_ms_for_signing(snapshot, now.system_ms(), upper) ||
-        !checked_add_i64(upper, snapshot.error_bound_ms, upper) ||
-        !checked_add_i64(upper, kMaxClockDriftMs, upper) || upper <= 0) return std::nullopt;
-    return upper;
+    return approval_server_time_upper_bound(clock, now);
 }
 
 inline bool permits_automatic_cancel(const CancelApproval& approval, const CancelSubject& subject,

@@ -1137,7 +1137,7 @@ gate_result: BLOCKED
 baseline: 6cb56bd
 open: nofile:docs/drills/*safe-04*
 refs: test:native/tests/test_durable_kill_switch.cpp#NonNormalStateAndRevisionSurviveRestartWithoutAutomaticReset test:native/tests/test_durable_kill_switch.cpp#PreviouslyPersistedNormalStateIsLatchedOnDefaultRestart test:native/CMakeLists.txt#KillSwitchProcessRecovery
-note: 已验证限制写入前后异常退出时的新进程恢复。目标主机的进程与主机重启验证待完成。
+note: 已验证限制写入前后异常退出时的新进程恢复，以及 Spot Testnet 上绑定当前存储和修订号的签名重置。目标主机的进程与主机重启验证待完成。
 ```
 
 ```ledger

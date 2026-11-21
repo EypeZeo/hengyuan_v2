@@ -1143,9 +1143,10 @@ that precedes a restriction can complete as an in-flight request.
 | `kill_switch_probe_reset.cfg` | `ClaimAfterResetIsUnreachable` violated. A reset and a fresh token can lead to a claim. |
 | `kill_switch_probe_inflight.cfg` | `SendAfterRestrictionIsUnreachable` violated. A request that already claimed authorization can send after publication. |
 
-TLC explored 1,495 distinct states through two process generations and revision
+TLC explored 1,348 distinct states through two process generations and revision
 five. All six controls exited with code 12 and the listed invariant violation.
 CI requires those exact results. The model treats an operator reset request as
-already authorized and assumes the meaning of a successful durable write. The
+already authorized, allows it only while restricted with revision capacity, and
+assumes the meaning of a successful durable write. The
 native CTest `KillSwitchProcessRecovery` exercises the filesystem records across
 child-process exits before and after writing a restriction.
