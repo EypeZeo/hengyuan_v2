@@ -1019,8 +1019,9 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     - 回归范围：六种拒绝原因、关闭返回状态、追加失败、恢复结果、重复订单号、无动态分配，以及 Q19 的拒绝写入成本。发送前最终授权与 Prepared 之后的类 B 拒绝由 S5 实现。
     - 验证（2026-11-14）：MSVC Release 完整构建通过，CTest 登记 3718 项，执行 3715 项、零失败，其中 1 项跳过，另外 3 项禁用；Q19 成本用例显式运行通过。GCC-14 普通构建与 ASan/UBSan 的相关回归通过，规格引用、枚举对应和并发目标检查通过。32 次拒绝的平均耗时：Windows 禁用关闭写入时 4.06 ms，启用时 7.90 ms；WSL2 对应为 6.02 ms 与 11.63 ms。每次日志增长分别为 256 与 512 字节；测量反映该主机的同步文件写入。
 
+  - **SAFE-04 持久熔断**：限制先在内存中生效，收到持久写入确认后才发布已确认状态。写入期间拒绝新增提交授权，撤单循环等待写入结束。操作员重置只有在写入确认后才发布正常状态。持久模式启动时，缺失记录或历史正常记录均转为锁存。无法读取、无法独占或临时文件尚未收敛时，保持锁存并保留原有文件。最终提交授权与状态发布按同一把短锁排序，已经领取最终授权的请求按在途请求处理。
   - **Q23 S5：发送前最终授权与类 B 拒绝。** `orchestrate_submit()` 在 `Prepared` 持久确认之后调用 `SubmitReadiness::claim()`。就绪状态与原令牌的签发者、订阅代次、屏障 epoch、熔断 revision 必须相符；最终检查包含授权期限、原确认的有效期、原在途句柄、限流预留、账户和规则，以及审计、签名与深度状态。期限采用单调时钟，默认 5000 ms，在就绪状态读取完成后检查。提交、Prepared 和内存审计使用同一份原订单参数。
-    - `SubmitAuthority` 的 epoch 使用 acquire/release 原子操作，claim 和 revoke 在同一原子值上排序。撤销使此前签发的令牌失效；一次成功的 claim 消费该 epoch。WebSocket 会话在停止请求、错误与结束事件时公布停止状态并撤销；预检程序为会话与 `PrivateStreamPipeline` 传入同一个 authority。`KillSwitch` 保持热线程所有权，通过递增 revision 记录触发及重置。
+    - `SubmitAuthority` 的 epoch 使用 acquire/release 原子操作，claim 和 revoke 在同一原子值上排序。撤销使此前签发的令牌失效；一次成功的 claim 消费该 epoch。WebSocket 会话在停止请求、错误与结束事件时公布停止状态并撤销；预检程序为会话与 `PrivateStreamPipeline` 传入同一个 authority。`KillSwitch` 的发布锁按顺序仲裁最终提交授权和状态变化。写盘与发布使用独立的锁，状态读取无需等待磁盘同步。
     - `FinalAuthorizationRefused` 返回具体 `final_refusal`。仅 `ClosureAppendStatus::Appended` 将订单变为 `NeverSent`，按原槽位代次释放在途登记，并移除对应成交上下文、退回仍有效的原限流窗口额度。其他关闭结果保留 `Submitting` 和资源。成功 claim 之后不写关闭帧；恢复时，仅有 Prepared 的订单继续进入不确定结果处理。
     - `OrderReservation` 不可复制、不可直接构造，绑定所属限流器、配置代次与窗口截止。过期、重新配置或消费后的票据不能授权发送；旧票据不能退回新窗口的额度。全部新增发送检查保持无动态内存分配。
     - 回归包括撤销与 claim 的两种次序、同 epoch 单次消费、发布可见性、断流与代次变化、熔断触发后重置、授权与确认期限、槽位复用、限流配置变更、追加失败及实际文件恢复。`test_submit_authority_concurrency.cpp` 同时加入本地 TSan 和 ARM64 CI 的重复测试；`tsan_control_relaxed_submit_authority.cpp` 将发布所需的内存序降为 relaxed，验证 TSan 能报告数据竞争。

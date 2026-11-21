@@ -170,7 +170,8 @@ private:
         const FeedObservation feed = probe_.feed(probe_.user_data);
         barrier_.observe(feed);
 
-        if (kill_switch_.state() != KillState::Normal) return refuse(NotReadyReason::KillSwitchNotNormal);
+        const auto kill_revision = kill_switch_.open_revision();
+        if (!kill_revision) return refuse(NotReadyReason::KillSwitchNotNormal);
         if (!recovery_.submit_enabled(probe_.recovery(probe_.user_data))) return refuse(NotReadyReason::StartupNotReady);
         switch (barrier_.state()) {
             case BarrierState::Down: return refuse(NotReadyReason::FeedDown);
@@ -185,7 +186,7 @@ private:
         if (epoch == SubmitAuthority::exhausted() || authority().epoch() != epoch) return refuse(NotReadyReason::EpochChanged);
         ReadinessResult result{};
         result.reason = NotReadyReason::None;
-        result.token = std::optional<SubmitReadyToken>(SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), kill_switch_.revision(), this));
+        result.token = std::optional<SubmitReadyToken>(SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, this));
         return result;
     }
 
@@ -205,7 +206,9 @@ public:
             return refuse(NotReadyReason::EpochChanged).reason;
         }
         if (!final_check()) return refuse(NotReadyReason::FinalCheckFailed).reason;
-        if (!authority().claim(token.epoch_)) return refuse(NotReadyReason::EpochChanged).reason;
+        if (!kill_switch_.claim_normal(token.kill_revision_, [&]() noexcept { return authority().claim(token.epoch_); })) {
+            return refuse(NotReadyReason::EpochChanged).reason;
+        }
         ++stats_.claimed;
         return NotReadyReason::None;
     }

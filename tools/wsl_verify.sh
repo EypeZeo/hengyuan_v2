@@ -149,6 +149,7 @@ run_thread() {
         test_migrated_v2_started_publisher test_ws_api_mailbox_concurrency \
         test_sweep_concurrency test_account_refresh_concurrency \
         test_private_stream_pipeline_concurrency test_submit_authority_concurrency \
+        test_durable_kill_switch \
         tsan_control_relaxed_ring tsan_control_export_worker_dual_consumer \
         tsan_control_relaxed_mailbox tsan_control_relaxed_submit_authority
 

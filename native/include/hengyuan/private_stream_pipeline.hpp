@@ -185,8 +185,9 @@ public:
     // The process owner claims an intent for its cancellation executor. No transport runs on this tick.
     [[nodiscard]] std::optional<AutomaticCancelRequest> take_automatic_cancel() noexcept {
         auto request = std::exchange(hot_.pending_cancel, std::nullopt);
-        if (!request || !can_stage_cancel() || request->subject != cancel_subject_ ||
-            request->kill_revision != parts_.kill_switch.revision() ||
+        const auto kill = parts_.kill_switch.cancel_snapshot();
+        if (!request || !kill || !can_stage_cancel(kill->state) || request->subject != cancel_subject_ ||
+            request->kill_revision != kill->revision ||
             !parts_.in_flight.owns(request->handle, request->client_order_id.view())) return std::nullopt;
 
         const auto* order = parts_.fill_context.find(request->client_order_id.view());
@@ -325,15 +326,16 @@ private:
         context_.exposure_limits = config_.exposure_limits;
     }
 
-    bool can_stage_cancel() const noexcept {
+    bool can_stage_cancel(KillState kill_state) const noexcept {
         return config_.automatic_cancel.approvals.fn && cancel_subject_.valid() &&
                recovery_applied_ && apply_result_.ok() && parts_.sink.is_open() && !parts_.sink.fenced() &&
-               emergency_cancel_requested(parts_.kill_switch.state());
+               emergency_cancel_requested(kill_state);
     }
 
     void stage_automatic_cancel() noexcept {
         hot_.pending_cancel.reset();
-        if (!can_stage_cancel() || parts_.in_flight.count() == 0) return;
+        const auto kill = parts_.kill_switch.cancel_snapshot();
+        if (!kill || !can_stage_cancel(kill->state) || parts_.in_flight.count() == 0) return;
         const auto upper = cancel_server_time_upper_bound(parts_.clock, fetch_clock_pair());
         if (!upper) return;
 
@@ -349,7 +351,7 @@ private:
             std::memcpy(request.client_order_id.id, coid.data(), coid.size());
             request.exchange_order_id = order->exchange_order_id;
             request.symbol_id = order->symbol_id;
-            request.kill_revision = parts_.kill_switch.revision();
+            request.kill_revision = kill->revision;
             request.approval_serial = approval->serial;
             request.subject = cancel_subject_;
             std::memcpy(request.symbol, order->cancel_symbol, sizeof(request.symbol));

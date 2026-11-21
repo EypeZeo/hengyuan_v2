@@ -939,6 +939,21 @@ TEST(SubmitReadyToken, RevocationDuringFinalCheckWinsTheClaimCompareExchange) {
     EXPECT_EQ(synthetic.readiness().stats().claimed, claimed_before);
 }
 
+TEST(SubmitReadyToken, KillPublishedDuringFinalCheckPreventsClaim) {
+    KillSwitch kill_switch;
+    SyntheticReadiness synthetic(kill_switch, 3);
+    const auto issued = synthetic.readiness().authorize(9);
+    ASSERT_TRUE(issued.token.has_value());
+    const auto epoch = synthetic.readiness().authority().epoch();
+
+    EXPECT_EQ(synthetic.readiness().claim(*issued.token, 10, [&]() noexcept {
+                  kill_switch.trigger();
+                  return true;
+              }), NotReadyReason::EpochChanged);
+    EXPECT_EQ(synthetic.readiness().authority().epoch(), epoch);
+    EXPECT_EQ(synthetic.readiness().stats().claimed, 0u);
+}
+
 TEST(NotReadyReasonNames, EveryReasonHasADistinctNameAndTheCountMatches) {
     static_assert(kNotReadyReasonCount == static_cast<std::size_t>(NotReadyReason::FinalCheckFailed) + 1U,
                   "kNotReadyReasonCount must follow the last enumerator");

@@ -1099,8 +1099,9 @@ TEST(OperatorResolutionGuard, TheToolReadsABindingAndNothingOfItEverWritesOne) {
     const auto harness_uid_reads = call_args(harness->code, "fetch_exchange_account_uid");
     ASSERT_EQ(harness_uid_reads.size(), 1u);
     EXPECT_EQ(harness_uid_reads[0], (std::vector<std::string>{"client", "exchange_uid"}));
-    EXPECT_EQ(count_identifier(harness->code, "exchange_uid"), 5u)
-        << "declared, read from the exchange, counted, compared with the persistent binding and handed to bind_store()";
+    EXPECT_EQ(count_identifier(harness->code, "exchange_uid"), 6u)
+        << "declared, read from the exchange, counted, compared with the persistent binding, handed to the kill-switch store "
+           "(SAFE-04: DurableKillSwitchConfig, which binds the sidecar to the account) and handed to bind_store()";
     const SourceFile* prepared_drill = find_source(kPreparedDrill);
     ASSERT_NE(prepared_drill, nullptr);
     const auto prepared_drill_binds = call_args(prepared_drill->code, "ensure_store_binding");

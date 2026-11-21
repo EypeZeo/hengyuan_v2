@@ -428,7 +428,7 @@ TEST(SubmitReadinessGuard, TheTokenHasOneMintSiteAndOneFriend) {
     ASSERT_NE(header, nullptr);
     const std::size_t evaluator = header->code.find("ReadinessResult evaluate(std::int64_t now_ms) noexcept");
     const std::size_t mint = header->code.find(
-        "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), kill_switch_.revision(), this)");
+        "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, this)");
     const std::size_t claim_api = header->code.find("public:", evaluator);
     ASSERT_NE(evaluator, std::string::npos);
     ASSERT_NE(mint, std::string::npos);
@@ -436,7 +436,7 @@ TEST(SubmitReadinessGuard, TheTokenHasOneMintSiteAndOneFriend) {
     EXPECT_LT(evaluator, mint) << "the evaluator is the one token issuer";
     EXPECT_LT(mint, claim_api) << "authorize() and claim() share this evaluator rather than minting separately";
     EXPECT_EQ(count_substring(header->code,
-                              "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), kill_switch_.revision(), this)"),
+                              "SubmitReadyToken(feed.generation, now_ms, epoch, barrier_.epoch(), *kill_revision, this)"),
               1u);
     // The private token constructor now binds stream generation, issue time, authority epoch, barrier epoch, kill revision and issuer.
     std::size_t two_argument_constructions = 0;

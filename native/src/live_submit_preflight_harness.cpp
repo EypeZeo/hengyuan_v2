@@ -87,6 +87,7 @@
 #include <hengyuan/binance_ws_api_session_factory.hpp>
 #include <hengyuan/depth_manager.hpp>
 #include <hengyuan/env_loader.hpp>
+#include <hengyuan/durable_kill_switch.hpp>
 #include <hengyuan/feed_validity_gate.hpp>
 #include <hengyuan/holding_state_tracker.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
@@ -286,7 +287,8 @@ void remove_durable_audit_files(const std::string& base_path) {
     for (const char* suffix : {"", ".lock", ".tip", ".tip.tmp", ".keyrotations", ".keyrotations.lock",
                                ".keyrotations.tip", ".keyrotations.tip.tmp", ".storeid", ".storeid.lock",
                                ".storeid.tip", ".storeid.tip.tmp", ".binding", ".binding.lock", ".binding.tip",
-                               ".binding.tip.tmp"}) {
+                               ".binding.tip.tmp", ".kill-switch", ".kill-switch.lock", ".kill-switch.tip",
+                               ".kill-switch.tip.tmp"}) {
         std::remove((base_path + suffix).c_str());
     }
 }
@@ -941,9 +943,9 @@ int main(int argc, char* argv[]) {
     PositionTruth position_truth;
     OrderFillContext fill_context;
 
-    // --- Real KillSwitch (Normal) ---------------------------------------------------------------------------------
+    // --- Real KillSwitch; recovery below decides whether Normal may be published ---------------------------------
+    std::optional<DurableKillSwitchStore> durable_kill_store;
     KillSwitch kill_switch;
-    kill_switch.operator_reset();
 
     const std::string durable_audit_path = cancel_options ? cancel_options->store.log : durable_audit_temp_path();
     if (cancel_options) {
@@ -963,6 +965,15 @@ int main(int argc, char* argv[]) {
                                                        AuditSinkOpenMode::Trading, NeverSentWrites::Enabled);
     }
     auto& durable_audit_sink = store.sink;
+    durable_kill_store.emplace(
+        DurableKillSwitchConfig{durable_audit_path, environment, exchange_uid,
+                                durable_audit_sink->store_uuid_lo(), durable_audit_sink->store_uuid_hi(),
+                                cancel_options ? cancel_options->store.audit_key_id : 1, !cancel_only},
+        *store.keys);
+    const bool kill_store_ready = durable_kill_store->recover(kill_switch);
+    std::printf("Kill-switch persistence: %s (authenticated=%s)\n",
+                kill_persistence_health_name(kill_switch.persistence_health()), kill_store_ready ? "yes" : "no");
+    if (!kill_store_ready) std::fputs("Kill-switch state is unavailable; remaining Latched.\n", stderr);
     auto authority = cancel_only ? cancel_control::load_authority(durable_audit_path, *durable_audit_sink) : nullptr;
 
     // --- The private-stream pipeline (M5b-1, private_stream_pipeline.hpp) ----------------------------------------

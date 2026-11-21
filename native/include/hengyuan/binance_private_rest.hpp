@@ -1992,8 +1992,9 @@ private:
         const ClockOffsetPublisher& clock;
 
         bool permits() const noexcept {
-            return emergency_cancel_requested(kill_switch.state()) &&
-                   request.kill_revision == kill_switch.revision() &&
+            const auto kill = kill_switch.cancel_snapshot();
+            return kill && emergency_cancel_requested(kill->state) &&
+                   request.kill_revision == kill->revision &&
                    authority.permits(request, clock, fetch_clock_pair());
         }
 

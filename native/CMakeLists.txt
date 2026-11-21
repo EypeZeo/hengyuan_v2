@@ -384,6 +384,11 @@ if(HY_BUILD_TESTS)
     hengyuan_set_warnings(test_kill_switch)
     gtest_discover_tests(test_kill_switch)
 
+    add_executable(test_durable_kill_switch tests/test_durable_kill_switch.cpp)
+    target_link_libraries(test_durable_kill_switch PRIVATE hengyuan_core GTest::gtest_main)
+    hengyuan_set_warnings(test_durable_kill_switch)
+    gtest_discover_tests(test_durable_kill_switch PROPERTIES LABELS concurrency)
+
     add_executable(test_risk_gate tests/test_risk_gate.cpp)
     target_link_libraries(test_risk_gate PRIVATE hengyuan_core GTest::gtest_main)
     hengyuan_set_warnings(test_risk_gate)

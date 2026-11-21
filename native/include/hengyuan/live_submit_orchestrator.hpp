@@ -545,7 +545,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     }
 
     // Gate 2: Kill switch Normal
-    if (!ctx.kill_switch || ctx.kill_switch->state() != KillState::Normal) {
+    const auto kill_revision = ctx.kill_switch ? ctx.kill_switch->open_revision() : std::nullopt;
+    if (!kill_revision) {
         result.gate = OrchestratorGate::KillSwitchNotNormal;
         AuditRecord ar{};
         ar.timestamp_ms = ctx.now_ms;
@@ -561,7 +562,6 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // its generation travels back in the result. Unwired is a refusal, not a pass-through (the reverse of the nullable fields above).
     const auto authorization_started = ctx.monotonic_now ? ctx.monotonic_now(ctx.monotonic_clock) : -1;
     const auto authorization_wall_ms = ctx.now_ms;
-    const auto kill_revision = ctx.kill_switch->revision();
     const KillSwitch* const authorized_kill_switch = ctx.kill_switch;
     std::optional<SubmitReadyToken> ready_token;
     {
@@ -928,8 +928,7 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
                 final_refusal = never_sent::Reason::SlotOwnershipLost;
             } else if (!ctx.rate_limiter || !ctx.rate_limiter->reservation_valid(*reservation)) {
                 final_refusal = never_sent::Reason::ReservationLost;
-            } else if (ctx.kill_switch != authorized_kill_switch || ctx.kill_switch->state() != KillState::Normal ||
-                       ctx.kill_switch->revision() != kill_revision) {
+            } else if (ctx.kill_switch != authorized_kill_switch || ctx.kill_switch->open_revision() != kill_revision) {
                 final_refusal = never_sent::Reason::ReadinessRevoked;
             } else if (!ctx.account || validate_pre_trade(result.order.rules_snapshot_at_submit, intent_frame.side,
                                           intent_frame.price_ticks, intent_frame.qty_ticks, *ctx.account,

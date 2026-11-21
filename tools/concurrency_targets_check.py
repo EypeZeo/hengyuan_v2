@@ -59,6 +59,9 @@ ARM64_EXEMPT: dict[str, str] = {
         "std::shared_mutex only: the ordering is the lock's, and the reader/writer logic is covered by "
         "the TSan job; there is no lock-free handoff for a weak-memory run to observe"
     ),
+    "test_durable_kill_switch": (
+        "state and claim ordering use a mutex, with the real filesystem exercised by the TSan job"
+    ),
     "test_compaction_lease": _FILE_LEASE,
     "test_compaction_intent_store": _FILE_LEASE,
     "test_seal_journal_store_lease": _FILE_LEASE,
