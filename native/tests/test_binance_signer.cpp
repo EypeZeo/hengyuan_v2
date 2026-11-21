@@ -5,6 +5,7 @@
 #include <hengyuan/binance_signer.hpp>
 #include <hengyuan/owner_cancel_approval.hpp>
 #include <hengyuan/owner_reset_approval.hpp>
+#include <hengyuan/owner_reset_request_files.hpp>
 #include <hengyuan/production_reset_key.hpp>
 #include <hengyuan/spot_cancel_control.hpp>
 #include <hengyuan/store_binding_writer.hpp>
@@ -159,6 +160,16 @@ bool write_binary_file(const std::string& path, std::span<const std::byte> bytes
     return output.good();
 }
 
+std::vector<std::byte> read_binary_file(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    std::vector<std::byte> bytes;
+    char value = 0;
+    while (input.get(value)) bytes.push_back(static_cast<std::byte>(static_cast<unsigned char>(value)));
+    if (!input.eof()) bytes.clear();
+    return bytes;
+}
+
 void remove_enrollment_store_files(const std::string& log_path, const std::string& kek_path,
                                    const std::string& wrapped_keys_path) {
     for (const auto& path : {
@@ -248,6 +259,25 @@ struct EnrollmentStoreFixture {
                hy::EnsureBindingStatus::BoundNew;
     }
 
+};
+
+struct OwnerResetRequestDirectoryFixture {
+    std::filesystem::path directory{EnrollmentStoreFixture::new_prefix() + "_owner_reset_requests"};
+    bool ready{false};
+
+    OwnerResetRequestDirectoryFixture() {
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        ready = !error;
+    }
+
+    ~OwnerResetRequestDirectoryFixture() {
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+    }
+
+    OwnerResetRequestDirectoryFixture(const OwnerResetRequestDirectoryFixture&) = delete;
+    OwnerResetRequestDirectoryFixture& operator=(const OwnerResetRequestDirectoryFixture&) = delete;
 };
 
 }  // namespace
@@ -479,6 +509,173 @@ TEST(OwnerResetApproval, RefusesInvalidKeyAndExpiryOverflow) {
     auto authority = hy::OwnerResetAuthority::create(fixture.public_der);
     ASSERT_NE(authority, nullptr);
     EXPECT_FALSE(authority->prepare(reset_target(), std::numeric_limits<std::int64_t>::max()).has_value());
+}
+
+TEST(OwnerResetRequestFiles, PublishesSignedChallengeAndConsumesItOnce) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+    auto authority = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(authority, nullptr);
+    OwnerResetRequestDirectoryFixture directory;
+    ASSERT_TRUE(directory.ready);
+
+    hy::OwnerResetRequestFiles requests(*authority, directory.directory);
+    const auto target = reset_target(21);
+    constexpr std::int64_t server_upper_ms = 4'000'000;
+    ASSERT_EQ(requests.publish(target, server_upper_ms), hy::ExportStatus::Ok);
+    ASSERT_FALSE(requests.challenge_path().empty());
+    ASSERT_FALSE(requests.signature_path().empty());
+    ASSERT_TRUE(std::filesystem::is_regular_file(requests.challenge_path()));
+    EXPECT_FALSE(std::filesystem::exists(requests.signature_path()));
+
+    const auto pending = requests.pending_approval();
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->target.scope, target.scope);
+    EXPECT_EQ(pending->target.revision, target.revision);
+    EXPECT_EQ(pending->not_after_ms, server_upper_ms + hy::kOwnerResetValidityMs);
+
+    const auto challenge = read_binary_file(requests.challenge_path());
+    ASSERT_EQ(challenge.size(), sizeof(hy::OwnerResetChallengeBytes));
+    const auto signature = fixture.sign(challenge);
+    ASSERT_FALSE(signature.empty());
+    ASSERT_TRUE(write_binary_file(
+        requests.signature_path(),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(signature.data()), signature.size())));
+
+    const auto port = authority->approval_port();
+    int apply_calls = 0;
+    std::optional<hy::OperatorResetApproval> verified;
+    const auto applied = requests.apply_if_ready([&](std::span<const unsigned char> bytes) {
+        ++apply_calls;
+        verified = port.verify(port.context, bytes);
+        return verified ? hy::OperatorResetResult::Applied : hy::OperatorResetResult::InvalidSignature;
+    });
+    ASSERT_TRUE(applied.has_value());
+    EXPECT_EQ(*applied, hy::OperatorResetResult::Applied);
+    ASSERT_TRUE(verified.has_value());
+    EXPECT_EQ(verified->target.scope, target.scope);
+    EXPECT_EQ(verified->target.revision, target.revision);
+    EXPECT_EQ(apply_calls, 1);
+
+    EXPECT_FALSE(requests.apply_if_ready([&](std::span<const unsigned char>) {
+        ++apply_calls;
+        return hy::OperatorResetResult::Applied;
+    }).has_value());
+    EXPECT_EQ(apply_calls, 1);
+}
+
+TEST(OwnerResetRequestFiles, RejectsInvalidSignatureAndConsumesTheAttempt) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+    auto authority = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(authority, nullptr);
+    OwnerResetRequestDirectoryFixture directory;
+    ASSERT_TRUE(directory.ready);
+
+    hy::OwnerResetRequestFiles requests(*authority, directory.directory);
+    ASSERT_EQ(requests.publish(reset_target(22), 5'000'000), hy::ExportStatus::Ok);
+    const std::array<std::byte, 3> invalid_signature{std::byte{1}, std::byte{2}, std::byte{3}};
+    ASSERT_TRUE(write_binary_file(requests.signature_path(), invalid_signature));
+
+    const auto port = authority->approval_port();
+    int verify_calls = 0;
+    const auto result = requests.apply_if_ready([&](std::span<const unsigned char> bytes) {
+        ++verify_calls;
+        return port.verify(port.context, bytes) ? hy::OperatorResetResult::Applied
+                                                : hy::OperatorResetResult::InvalidSignature;
+    });
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, hy::OperatorResetResult::InvalidSignature);
+    EXPECT_EQ(verify_calls, 1);
+    EXPECT_FALSE(requests.apply_if_ready([&](std::span<const unsigned char>) {
+        ++verify_calls;
+        return hy::OperatorResetResult::Applied;
+    }).has_value());
+    EXPECT_EQ(verify_calls, 1);
+}
+
+TEST(OwnerResetRequestFiles, RejectsSignatureFileOverTheBoundedSize) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+    auto authority = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(authority, nullptr);
+    OwnerResetRequestDirectoryFixture directory;
+    ASSERT_TRUE(directory.ready);
+
+    hy::OwnerResetRequestFiles requests(*authority, directory.directory);
+    ASSERT_EQ(requests.publish(reset_target(23), 6'000'000), hy::ExportStatus::Ok);
+    const std::vector<std::byte> oversized_signature(hy::owner_signature::kMaxSignatureBytes + 1,
+                                                     std::byte{0x42});
+    ASSERT_TRUE(write_binary_file(requests.signature_path(), oversized_signature));
+
+    int apply_calls = 0;
+    const auto result = requests.apply_if_ready([&](std::span<const unsigned char>) {
+        ++apply_calls;
+        return hy::OperatorResetResult::Applied;
+    });
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, hy::OperatorResetResult::InvalidSignature);
+    EXPECT_EQ(apply_calls, 0);
+    EXPECT_FALSE(requests.apply_if_ready([&](std::span<const unsigned char>) {
+        ++apply_calls;
+        return hy::OperatorResetResult::Applied;
+    }).has_value());
+    EXPECT_EQ(apply_calls, 0);
+}
+
+TEST(OwnerResetRequestFiles, RenewRejectsOldSignatureAndAcceptsNewChallengeSignature) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+    auto authority = hy::OwnerResetAuthority::create(fixture.public_der);
+    ASSERT_NE(authority, nullptr);
+    OwnerResetRequestDirectoryFixture directory;
+    ASSERT_TRUE(directory.ready);
+
+    hy::OwnerResetRequestFiles requests(*authority, directory.directory);
+    const auto target = reset_target(24);
+    ASSERT_EQ(requests.publish(target, 7'000'000), hy::ExportStatus::Ok);
+    const auto old_challenge_path = requests.challenge_path();
+    const auto old_signature_path = requests.signature_path();
+    const auto old_challenge = read_binary_file(old_challenge_path);
+    ASSERT_EQ(old_challenge.size(), sizeof(hy::OwnerResetChallengeBytes));
+    const auto old_signature = fixture.sign(old_challenge);
+    ASSERT_FALSE(old_signature.empty());
+    ASSERT_TRUE(write_binary_file(
+        old_signature_path,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(old_signature.data()), old_signature.size())));
+
+    ASSERT_TRUE(requests.renew());
+    EXPECT_TRUE(requests.challenge_path().empty());
+    EXPECT_TRUE(requests.signature_path().empty());
+    EXPECT_FALSE(requests.pending_approval().has_value());
+    EXPECT_FALSE(requests.apply_if_ready([](std::span<const unsigned char>) {
+        return hy::OperatorResetResult::Applied;
+    }).has_value());
+
+    ASSERT_EQ(requests.publish(target, 7'000'000), hy::ExportStatus::Ok);
+    EXPECT_NE(requests.challenge_path(), old_challenge_path);
+    EXPECT_NE(requests.signature_path(), old_signature_path);
+    const auto new_challenge = read_binary_file(requests.challenge_path());
+    ASSERT_EQ(new_challenge.size(), sizeof(hy::OwnerResetChallengeBytes));
+    EXPECT_NE(new_challenge, old_challenge);
+
+    const auto port = authority->approval_port();
+    EXPECT_FALSE(port.verify(port.context, old_signature).has_value());
+    const auto new_signature = fixture.sign(new_challenge);
+    ASSERT_FALSE(new_signature.empty());
+    ASSERT_TRUE(write_binary_file(
+        requests.signature_path(),
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(new_signature.data()), new_signature.size())));
+    const auto result = requests.apply_if_ready([&](std::span<const unsigned char> bytes) {
+        return port.verify(port.context, bytes) ? hy::OperatorResetResult::Applied
+                                                : hy::OperatorResetResult::InvalidSignature;
+    });
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, hy::OperatorResetResult::Applied);
 }
 
 TEST(OwnerCancelEnrollment, BindsGeneratedP256KeyToOneProductionStoreExactlyOnce) {

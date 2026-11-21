@@ -151,8 +151,8 @@ public:
     // D5 slice R3b-2: the bindings of the OFFLINE operator tool (hy_operator_resolve). Everything but the two credential names is the
     // trading twin's, by construction (they are copies of it): the same host, the same WebSocket hosts, the same transport policy, so the
     // tool cannot reach a host the trading process could not, and the same environment. The credential names are the tool's own: it reads
-    // a read-only API key. The loader allowlist accepts the names for the selected environment. The signed reset drill
-    // shares the Testnet read-only binding. The source guard checks both call sites.
+    // a read-only API key. The loader allowlist accepts the names for the selected environment. The signed reset modes
+    // use the read-only binding for their environment.
     static EnvironmentBinding operator_testnet() noexcept {
         return testnet().with_credential_env_keys("HENGYUAN_OPERATOR_TESTNET_API_KEY", "HENGYUAN_OPERATOR_TESTNET_API_SECRET");
     }

@@ -1,6 +1,6 @@
 # 范围批准（Scope Approval）：以 Owner 本机签署的范围代替逐单 CONFIRM（R-25）
 
-状态：设计，未实现。对应主路书 v2.11.0 的任务 1A.9，独立于 E4 远程管理。当前逐单 OrderConfirmation 保持，全部启用条件满足后才切换范围模式。具体金额、期限和设备能力待确定。
+状态为实现中，对应主路书 v2.11.0 的任务 1A.9。已实现单品种限价范围的规范编码、P-256 验签和额度计算。当前执行入口使用逐单 `OrderConfirmation`。范围安装、订单收费记录接入和设备验证仍待完成。具体金额和期限由执行侧政策提供。
 
 ## 1. 目标与原则
 
@@ -15,13 +15,13 @@
 5. **失败关闭。**签名、存储、时钟、账本任何一项不可信，就拒绝；不降级为“没有范围检查”，也不降级为“用本地时钟”。
 6. **范围只管增加风险的订单。**只减风险的退出不消耗新增风险额度，按 §7.1 的受限政策处理（它走 `5.9.5` 的通道，依赖任务 1A.7）；否则范围过期、被撤销或额度耗尽时，反而平不了仓。
 
-## 2. 树内现状（2026-11-15，PR #256）
+## 2. 当前实现
 
 | 事实 | 位置 |
 | :-- | :-- |
 | Gate 11 的逐单确认是 `OrderConfirmation` 值类型，随 `OrchestratorContext::confirmation` 每次调用传入：绑定品种、方向、类型、价格与数量（ticks）、`max_notional`、`valid_until_ms`；缺失 → `OperatorNotConfirmed`，不符 → `ConfirmationMismatch`。它是进程内的值：没有签名、没有持久、没有序号、没有累计额度 | `live_submit_orchestrator.hpp:OrderConfirmation`、`orchestrate_submit` Gate 11 |
-| S5 已在 Prepared 持久确认后复查动态条件；SubmitReadyToken 的 claim 与撤销使用同一个 SubmitAuthority epoch。范围状态、验签和额度尚未接入 | live_submit_orchestrator.hpp、submit_readiness.hpp、submit_authority.hpp |
-| 熔断是进程内字段，重启即回到 `Normal`；梯度 `Normal → Armed → Triggered → Latched`，`can_open()` 只在 `Normal` 为真，只有 `operator_reset()` 解除；持久锁存是 SAFE-04，未做 | `kill_switch.hpp:KillSwitch` |
+| S5 在 Prepared 持久确认后复查动态条件。SubmitReadyToken 的 claim 检查熔断修订号和随订单传入的范围代次。范围安装及生产额度消费待接入 | live_submit_orchestrator.hpp、submit_readiness.hpp、submit_authority.hpp |
+| 熔断状态与范围代次持久保存。默认冷启动限制开仓并使旧范围失效。生产重置在当前进程验证账户、存储、熔断修订号和签名 | `durable_kill_switch.hpp:DurableKillSwitchStore`、`private_stream_pipeline.hpp:apply_operator_reset` |
 | 存储与环境、账户的绑定：旁文件 `<log>.binding.tip`（环境、账户 uid、存储 uuid，HMAC 签名）与 `<log>.storeid` | `store_binding.hpp:StoreBinding` |
 | 服务器校正的时间只来自新鲜的时钟快照：`issue_clock_ready_token()`；快照 TTL 5 分钟、墙钟与稳态钟的漂移容忍 1000 ms，`error_bound_ms = rtt/2 + kClockSlopMs（100 ms）`。**已有的 `try_get_pessimistic_server_now_ms()` 给的是下界**（只会落后于交易所，为“K 线是否已收盘”服务），**不能**用于过期判定（§7） | `binance_clock_sync.hpp` |
 | 机器硬上限：单笔名义额与总敞口；每品种持仓上限 | `account_truth.hpp:ExposureLimits`、`risk_gate.hpp` |
@@ -29,8 +29,8 @@
 | 帧 256 字节、载荷 165 字节，`detail_code`（int64）的含义随事件类型；版本规则见 NotSent 设计 §5 | `durable_frame_codec.hpp` |
 | 控制面日志 sink：机制层，不含业务规则 | `control_plane_log_sink.hpp` |
 | 操作员工具 `hy_operator_resolve`：离线，与存活进程互斥 | `src/hy_operator_resolve.cpp`、D5 |
-| **验签代码不存在**：`native/` 里没有任何非对称验签；OpenSSL 只在 `HY_BUILD_DEMO` 下被查找。引入须按蓝图 `5.6` 选型 | `native/CMakeLists.txt` |
-| 没有任何“范围／授予／序号／额度”的类型、帧或测试 | — |
+| `hy_scope` 生成规范签署载荷并展示字段。`VerifiedTradeScope` 使用 P-256 公钥验证身份、签名、有效期和政策上限 | `native/src/hy_scope.cpp`、`owner_trade_scope_approval.hpp` |
+| `TradeScopeBudget` 计算单个范围的占用、持久确认和 `NeverSent` 归还，并从已验证的有序事件重算。范围和订单日志接入待完成 | `trade_scope_budget.hpp` |
 
 ## 3. 范围对象（grant）
 
@@ -53,7 +53,7 @@
 | `budget_notional` | 累计“可能已跨越”的名义额上限（§5） |
 | `max_exposure_notional` | 本范围下的总敞口上限，按 `ExposureLimits` 同样的口径在准入时检查 |
 | `max_price_deviation_bps` | 订单价格相对参考价的最大偏离；没有参考价则拒绝 |
-| `strategy_version_hash` | 32 字节，绑定策略构建与参数版本（D6） |
+| `strategy_version` | 32 字节，由执行侧提供的策略构建与参数版本标识（D6） |
 | `key_id`、`sig_alg`、`signature` | 见下 |
 
 **被签字节**＝域分隔前缀（`"HY-SCOPE-GRANT"` 加分隔符）‖ 版本 ‖ 上表除签名外的全部字段。域分隔把“范围”与“首单声明”（§10）及日后任何别的签署物分开；`environment` 在被签字节里，所以 Testnet 的签名在 Production 上验不过，即使两把公钥被放错了表。
@@ -61,6 +61,17 @@
 **公钥与算法。**执行侧只存公钥，按环境分表：Production 的表只放硬件密钥的公钥；Testnet 的表可以放一把独立的软件测试密钥，`key_id` 命名空间与 Production 不相交，**Production 构建的配置里出现 Testnet 的 `key_id`（反之亦然）= 启动失败**。`sig_alg` 版本化，执行侧只接受构建里列出的算法。**设备能力未核**：硬件密钥能签哪些算法、能否不依赖厂商运行时做原始签名，必须在实现前在真实设备上核实并登记（登记簿不入库，`5.4.3`；外部事实复核债务，G.5）。一般性地说（公开规格的概括，未对具体设备核验，同样记入 G.5 的复核债务）：FIDO2 断言的签名覆盖认证器数据与客户端数据哈希，不是调用方任意给定的字节；PIV／PKCS#11 类接口则由调用方给出被签的数据或摘要。两者的验签代码不同，选哪个是 S-A 的第一个决定。
 
 ## 4. 签署、安装与撤销（本机流程，没有审批服务）
+
+`hy_scope draft <draft.json> <grant>` 生成单品种限价单的规范载荷并打印签署内容。输入字段如下。
+
+- `environment`、`account_uid`、`store_uuid_lo`、`store_uuid_hi`、`key_id` 取自登记的执行身份。环境使用 `TESTNET` 或 `PRODUCTION`。
+- `activation` 和 `strategy_version` 分别使用 32 和 64 个十六进制字符表示执行侧提供的标识。其余身份字段为 `scope_epoch`、`policy_version`、`serial`。
+- `issued_at_ms`、`not_after_ms` 使用 UTC 毫秒整数。`symbol` 填交易所品种，`sides` 使用 `BUY`、`SELL` 或 `BOTH`。
+- `max_order_notional`、`budget_notional`、`max_exposure_notional` 使用该品种计价资产的同一整数单位。`max_price_deviation_bps` 使用基点。
+
+`hy_scope inspect <grant>` 显示签署字段。`hy_scope verify <grant> <signature.der> <public-key.der>` 核验发回的 DER 签名。运行侧的 `VerifiedTradeScope` 还要求执行身份、范围代次、策略版本和政策版本匹配，并按交易所时间上界及政策限制验收。
+
+范围安装及撤销待接入生产进程。
 
 - **签署**在 Owner 本机完成。界面从最终规范对象生成完整可读内容，显示账户、环境、品种、金额、期限、策略版本、运行激活身份和退出政策。初期将签署终端纳入信任范围；若要求防御该终端被控制，需要独立设备获取并显示完整对象。普通硬件密钥的触摸或 PIN 不提供交易参数的可信显示。接口原型先核实设备支持的协议，采用完整的协议验证规则。
 - **传输**：文件经任何通道到执行主机。**通道不需要可信**：签名自证，篡改一个字节就验不过。
@@ -70,6 +81,8 @@
 - **撤销**：`hy_scope revoke <serial>`，**无需签名**（收紧永远便宜；谁能连上本机套接字谁能撤销，这是操作系统访问控制的事）。执行核心先在内存里标记，使此后的 claim 全部失败；再追加 `ScopeRevoked`，并把高水位提到不小于该序号（对一份从未安装的序号同样有效，它因此永远装不上）；**持久 ACK 之后才向命令行返回成功**。返回内容含“撤销生效时已 claim 的订单”：它们可能已在途，设计不承诺撤回（R-22）。命令行没有收到成功，就是撤销状态未知，Owner 必须当作“可能仍然有效”，需要立刻停手时用熔断。
 
 ## 5. 额度（budget）
+
+`TradeScopeBudget` 当前处理单个已经验签的范围。它在控制或恢复线程运行，按订单标识预占额度。开始追加 Prepared 后，写入结果不明会保留额度并要求重算。余额按已验证的有序 Prepared 与 NeverSent 事件重建，拒绝跨范围、重复收费或重复归还事件。订单日志的范围序号编码与真实追加接口待接入。
 
 - **语义**：每份范围的累计“可能已跨越的名义额”，窗口就是它的有效期；本层不承担账户期间预算；需要的日历或滚动预算由独立账户状态维护。单位是计价资产最小单位的整数，全程 checked 算术（Engineering Mandate §5）：计数器不得回绕，下溢与溢出是缺陷。
 - **收费的时点**：`Prepared` 帧携带 `scope_serial`（0 表示该单由逐单 CONFIRM 授权，非 0 表示范围）；金额由同一帧里的价格与数量重算，不另存。收费因此**与 Prepared 同一次追加**，热路径没有新增的持久追加。帧里放在哪个字段（`detail_code` 或载荷升版）由实现切片定，须过 `tools/spec_enum_diff.py` 与恢复扫描。
@@ -142,9 +155,9 @@
 
 **“独立验收”**（R-20“新授权合同须单独验收”的含义，本文的定义）：① 模型与它全部必败配置在 CI 绿（本切片）；② 实现切片的 `SCP-*` 全部通过，含 `thread` 与 `address` 层级，撤销与 claim 的 TSan 负控仍然失败；③ 关键行的变异检查全部被杀死；④ 阶段 1 的影子记录与阶段 2 的 Testnet 运行记录；⑤ 任务 1A.6、SAFE-04、1A.7、SAFE-07 已完成并验收；⑥ 一次独立于实现者的评审没有 P0 与 P1（评审者由 Owner 指定）；⑦ Owner 明确批准进入阶段 3。
 
-## 11. 计划的故障用例（`SCP-*`，没有 FI 编号）
+## 11. 范围批准故障用例（`SCP-*`）
 
-与蓝图 `7.5` 的 `SEC-*` 同一规则：它们是计划目录，不是 FI；每个切片开工时按 `7.1` 的“注册表维护”规则（FAULT-REG-01）登记成 FI，同一次提交同步卷 7、站点、任务、交互视图的计数与 `docs/AUDIT_CLOSURE_LEDGER.md`。“模型”列是它在 `scope_approval.tla` 里对应的必败配置或变异。
+FI-059 登记签名、身份和有效期检查。FI-060 登记额度的预占、归还与重算。其余计划场景按实现进度登记。模型列对应 `scope_approval.tla` 的故障配置或变异。
 
 | 标签 | 断言 | 模型 |
 | :-- | :-- | :-- |
@@ -188,7 +201,7 @@
 | `RequireClockToken` | 时钟令牌无效时仍用本地时钟 | §7 |
 | `PessimisticExpiry` | 直接比较原始读数，不加不确定度 | §7 |
 
-**环境假设**（不在模型里）：A1 签名方案可靠；A2 尖端锚点检测日志截断，**不**检测整份旧副本的恢复（§9）；A3 持久熔断存在且不被重启清除（SAFE-04，今天没有）；A4 同一时刻只有一个执行进程（任务 6.7）；A5 D5 工具只对确实从未发出的订单出具证明。
+**环境假设**（不在模型里）：A1 签名方案可靠；A2 尖端锚点检测日志截断，**不**检测整份旧副本的恢复（§9）；A3 持久熔断存在且由 SAFE-04 在冷启动时恢复；A4 同一时刻只有一个执行进程（任务 6.7）；A5 D5 工具只对确实从未发出的订单出具证明。
 
 **新增设计的模型覆盖**：运行激活身份、跨范围账户期间预算、到期后退出生命周期和完整虚拟机旧快照的独立外部状态尚未包含在现有模型中，S-B/S-C/S-D 需要补充模型与实现测试。完整旧快照防护需要独立信任域，不能依赖随虚拟机一起恢复的状态。
 
@@ -202,7 +215,7 @@
 
 | 片 | 内容 | 验证与负控 |
 | :-- | :-- | :-- |
-| S-A 验签与规范编码 | 验签库选型（`5.6`，引入新依赖）、规范编码、域分隔、测试向量；签名接口的选择（原始字节还是 FIDO2 断言） | MSVC + GCC `none`；字节级向量；`SCP-SIG-*` |
+| S-A 验签与规范编码 | P-256、规范编码、域分隔和测试向量已实现。Owner 硬件签名接口待实测 | MSVC + GCC `none`；字节级向量；`SCP-SIG-*` |
 | S-B 状态与持久 | `ScopeStore`：安装、撤销、高水位、运行激活、账户政策、熔断重放规则、恢复折叠；范围帧与订单帧的耦合方式（D9）；与 SAFE-04 的锁存帧对接 | `none` + `address`；恢复表每一行一个用例；`SCP-BIND/REPLAY/SUPERSEDE/KILL/ROLL-01` |
 | S-C 收费与计数 | `Prepared` 携带序号、范围与账户期间预算、恢复重建、归还规则、checked 算术 | `address`；崩溃点注入；`SCP-BUDGET-*` |
 | S-D 最终门第八项 | `scope_epoch`、激活身份、账户政策与 claim 的一致性；复用已经实现的 SubmitAuthority claim/revoke；受限退出与任务 1A.7 联合验证 | `thread` + arm64 重复；**新增一个 TSan 负控**；变异检查；`SCP-REVOKE-02` |

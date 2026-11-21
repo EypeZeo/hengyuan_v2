@@ -117,6 +117,7 @@ constexpr const char* kLifecycle = "include/hengyuan/order_lifecycle.hpp";
 constexpr const char* kCodec = "include/hengyuan/durable_frame_codec.hpp";
 constexpr const char* kRules = "include/hengyuan/never_sent_rules.hpp";
 constexpr const char* kSink = "include/hengyuan/durable_audit_sink.hpp";
+constexpr const char* kScopeBudget = "include/hengyuan/trade_scope_budget.hpp";
 constexpr const char* kPort = "include/hengyuan/durable_order_audit_port.hpp";
 constexpr const char* kOrchestrator = "include/hengyuan/live_submit_orchestrator.hpp";
 constexpr const char* kPreflightHarness = "src/live_submit_preflight_harness.cpp";
@@ -195,15 +196,22 @@ TEST(NeverSentGuard, TheScannerHelpersHaveKnownAnswers) {
     EXPECT_TRUE(function_body(code_only("int f(int a);"), "f").empty()) << "a declaration has no body";
 }
 
-TEST(NeverSentGuard, TheNeverSentEventIsNamedOnlyByItsDefinitionTheRuleAndTheReader) {
+TEST(NeverSentGuard, TheNeverSentEventIsNamedOnlyByItsDefinitionAndReviewedReaders) {
     expect_named_only_in("OrderNeverSent",
                          {{kTrail, 2, "the enumerator and its name in audit_event_name()"},
                           {kRules, 3, "pairing_holds() and check_closing_frame() read the event; class_a_closure_of() is the one place a "
                                       "closing frame is built (Q23 S6), from the Intent it closes"},
-                          {kSink, 2, "the recovery scan observes the closure id for the watermark and routes the closure frame"}});
+                          {kSink, 2, "the recovery scan observes the closure id for the watermark and routes the closure frame"},
+                          {kScopeBudget, 1, "the ledger classifies an acknowledged closure for refund"}});
+
+    const SourceFile* budget = find_source(kScopeBudget);
+    ASSERT_NE(budget, nullptr);
+    const auto refund = function_body(budget->code, "acknowledge_never_sent");
+    EXPECT_EQ(count_identifier(refund, "OrderNeverSent"), 1u);
+    EXPECT_EQ(count_identifier(refund, "NeverSent"), 1u);
 }
 
-TEST(NeverSentGuard, TheNeverSentStateIsNamedByItsModelTheCodecTheRuleTheReaderAndTheClassAResultTransition) {
+TEST(NeverSentGuard, TheNeverSentStateIsNamedOnlyByItsModelAndReviewedReaders) {
     expect_named_only_in("NeverSent",
                          {{kLifecycle, 6, "the enumerator, order_state_name(), is_terminal(), is_resolved() and the two edges "
                                           "of validate_transition()"},
@@ -211,7 +219,8 @@ TEST(NeverSentGuard, TheNeverSentStateIsNamedByItsModelTheCodecTheRuleTheReaderA
                           {kRules, 4, "check_order_closable() asks the state machine about the edge; pairing_holds() and "
                                       "check_closing_frame() read the frame's state; class_a_closure_of() sets it"},
                           {kOrchestrator, 1, "an acknowledged class A closure advances the returned OrderRecord"},
-                          {kSink, 1, "the recovery scan, after the rule accepted the frame"}});
+                          {kSink, 1, "the recovery scan, after the rule accepted the frame"},
+                          {kScopeBudget, 1, "the ledger classifies an acknowledged closure for refund"}});
 }
 
 TEST(NeverSentGuard, LiveCodeDoesNotConstructTheEventAndOnlyTheOrchestratorRecordsItsAcknowledgedClosure) {

@@ -906,14 +906,17 @@ TEST(OperatorResolutionGuard, NothingOfTheToolReachesTheTradingPath) {
     }
 }
 
-TEST(OperatorResolutionGuard, ReadOnlyBindingsAreLimitedToTheResolverAndResetDrill) {
+TEST(OperatorResolutionGuard, ReadOnlyBindingsAreLimitedToTheResolverAndResetModes) {
     expect_named_only_in("operator_testnet", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the resolver"},
                                              {kPreflightHarness, 1, "the reset drill"}});
     const SourceFile* harness = find_source(kPreflightHarness);
     ASSERT_NE(harness, nullptr);
     EXPECT_NE(function_body(harness->code, "main").find("reset_drill ? EnvironmentBinding::operator_testnet()"),
               std::string::npos);
-    expect_named_only_in("operator_production", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the one use"}});
+    EXPECT_NE(function_body(harness->code, "main").find("production_reset ? EnvironmentBinding::operator_production()"),
+              std::string::npos);
+    expect_named_only_in("operator_production", {{kEnvironment, 1, "the definition"}, {kRealExchange, 1, "the resolver"},
+                                                {kPreflightHarness, 1, "the persistent reset process"}});
     expect_named_only_in("with_credential_env_keys", {{kEnvironment, 3, "the definition and the two operator factories"}});
     // ...and nothing of the tool names the TRADING factories: it cannot ask for the key that places orders
     for (const char* f : kToolFiles) {
