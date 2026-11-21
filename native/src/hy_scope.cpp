@@ -2,12 +2,16 @@
 #include <hengyuan/owner_p256_signature.hpp>
 #include <hengyuan/spot_owner_key_store.hpp>
 #include <hengyuan/trade_scope_grant.hpp>
+#include <hengyuan/trade_scope_owner_key.hpp>
+#include <hengyuan/trade_scope_request_files.hpp>
 
 #include <simdjson.h>
 
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cstdio>
 #include <optional>
@@ -108,6 +112,31 @@ void print_grant(const TradeScopeGrant& grant) {
                 static_cast<unsigned>(limits.max_price_deviation_bps));
 }
 
+int request_runtime(const std::filesystem::path& directory, std::string_view operation,
+                    std::span<const std::byte> data) {
+    auto request = hy::scope_files::publish_request(directory, operation, data);
+    if (!request) {
+        std::fputs("Could not publish request. Check the active control directory.\n", stderr);
+        return 1;
+    }
+    request->replace_extension(".result");
+    std::printf("Waiting for %s\n", request->string().c_str());
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < end) {
+        if (files::is_regular_file(request->string())) {
+            std::vector<std::byte> result;
+            if (hy::read_file_bounded(request->string(), result, 4096) != hy::ReadFileStatus::Ok || result.empty()) break;
+            const std::string_view reply(reinterpret_cast<const char*>(result.data()), result.size());
+            std::printf("%.*s\n", static_cast<int>(reply.size()), reply.data());
+            if (operation != "order") return reply.starts_with("Applied ") ? 0 : 1;
+            return reply.starts_with("accepted ") ? 0 : 2;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::fputs("Result unavailable. Inspect this request's result before issuing another.\n", stderr);
+    return 2;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -125,6 +154,52 @@ int main(int argc, char** argv) {
             return 1;
         }
         print_grant(*draft);
+        return 0;
+    }
+
+    if (command == "install" && argc == 5) {
+        std::vector<std::byte> grant, signature;
+        if (hy::read_file_bounded(argv[3], grant, hy::TradeScopeGrantBytes{}.size()) != hy::ReadFileStatus::Ok ||
+            !hy::decode_trade_scope_grant(grant) ||
+            hy::read_file_bounded(argv[4], signature, hy::owner_signature::kMaxSignatureBytes) != hy::ReadFileStatus::Ok ||
+            signature.empty()) {
+            std::fputs("Invalid scope grant or signature file.\n", stderr);
+            return 1;
+        }
+        grant.insert(grant.end(), signature.begin(), signature.end());
+        return request_runtime(argv[2], "install", grant);
+    }
+
+    if (command == "revoke" && argc == 4) {
+        const std::string_view serial_text = argv[3];
+        std::uint64_t serial = 0;
+        if (!hy::scope_files::parse_number(serial_text, serial)) {
+            std::fputs("A positive scope serial is required.\n", stderr);
+            return 1;
+        }
+        return request_runtime(argv[2], "revoke", std::as_bytes(std::span(serial_text)));
+    }
+
+    if (command == "submit" && argc == 6) {
+        const std::string_view side = argv[3];
+        std::int64_t price = 0, quantity = 0;
+        if ((side != "BUY" && side != "SELL") || !hy::scope_files::parse_number(argv[4], price) ||
+            !hy::scope_files::parse_number(argv[5], quantity)) {
+            std::fputs("Order needs BUY or SELL and positive price and quantity ticks.\n", stderr);
+            return 1;
+        }
+        const auto text = std::string(side) + " " + std::to_string(price) + " " + std::to_string(quantity);
+        return request_runtime(argv[2], "order", std::as_bytes(std::span(text)));
+    }
+
+    if (command == "first-order-draft" && argc == 7) {
+        files::StoreFiles production{argv[2], 0, argv[4], argv[5]};
+        if (!hy::scope_files::parse_number(argv[3], production.audit_key_id)) return 1;
+        const auto result = hy::TradeScopeOwnerKey::publish_first_order_draft(production, argv[6]);
+        if (result != hy::ExportStatus::Ok) {
+            std::fprintf(stderr, "Could not publish first-order declaration (%s).\n", hy::export_status_name(result));
+            return 1;
+        }
         return 0;
     }
 
@@ -158,6 +233,10 @@ int main(int argc, char** argv) {
     }
 
     std::fputs("Usage\n  hy_scope draft <draft.json> <grant>\n  hy_scope inspect <grant>\n"
-               "  hy_scope verify <grant> <signature.der> <public-key.der>\n", stderr);
+               "  hy_scope verify <grant> <signature.der> <public-key.der>\n"
+               "  hy_scope first-order-draft <log> <audit-key-id> <kek> <wrapped-keys> <declaration>\n"
+               "  hy_scope install <active-control-dir> <grant> <signature.der>\n"
+               "  hy_scope revoke <active-control-dir> <serial>\n"
+               "  hy_scope submit <active-control-dir> <BUY|SELL> <price-ticks> <quantity-ticks>\n", stderr);
     return 1;
 }

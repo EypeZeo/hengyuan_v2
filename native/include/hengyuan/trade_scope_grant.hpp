@@ -69,7 +69,7 @@ inline bool valid_trade_scope_grant(const TradeScopeGrant& grant) noexcept {
     return binding.store.valid() && binding.key_id != 0 && binding.policy_version != 0 &&
            std::any_of(binding.activation.begin(), binding.activation.end(), nonzero) &&
            std::any_of(binding.strategy_version.begin(), binding.strategy_version.end(), nonzero) &&
-           grant.serial != 0 && grant.issued_at_ms > 0 && grant.not_after_ms > 0 &&
+           grant.serial != 0 && grant.issued_at_ms > 0 && grant.not_after_ms > grant.issued_at_ms &&
            cancel_prepared::valid_symbol(symbol) &&
            std::all_of(symbol_end, grant.symbol.end(), [](char c) { return c == '\0'; }) &&
            (grant.sides == TradeScopeSides::Buy || grant.sides == TradeScopeSides::Sell ||
@@ -140,5 +140,25 @@ inline std::optional<TradeScopeGrant> decode_trade_scope_grant(std::span<const s
     if (!valid_trade_scope_grant(grant)) return std::nullopt;
     return grant;
 }
+
+struct TradeScopePolicy {
+    TradeScopeLimits limits{};
+    std::int64_t max_validity_ms{0};
+};
+
+class VerifiedTradeScope {
+public:
+    [[nodiscard]] static std::optional<VerifiedTradeScope> verify(
+        std::span<const std::byte> payload, std::span<const unsigned char> signature,
+        std::span<const unsigned char> enrolled_public_key, const TradeScopeBinding& expected,
+        const TradeScopePolicy& policy, std::optional<std::int64_t> exchange_upper_ms) noexcept;
+
+    [[nodiscard]] const TradeScopeGrant& grant() const noexcept { return grant_; }
+
+private:
+    explicit VerifiedTradeScope(const TradeScopeGrant& grant) noexcept : grant_(grant) {}
+
+    TradeScopeGrant grant_;
+};
 
 }  // namespace hy

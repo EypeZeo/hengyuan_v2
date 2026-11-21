@@ -153,6 +153,11 @@ public:
     // tool cannot reach a host the trading process could not, and the same environment. The credential names are the tool's own: it reads
     // a read-only API key. The loader allowlist accepts the names for the selected environment. The signed reset modes
     // use the read-only binding for their environment.
+    static EnvironmentBinding scope_testnet() noexcept {
+        return testnet().with_credential_env_keys("HENGYUAN_R6_TESTNET_TRADE_API_KEY",
+                                                 "HENGYUAN_R6_TESTNET_TRADE_API_SECRET");
+    }
+
     static EnvironmentBinding operator_testnet() noexcept {
         return testnet().with_credential_env_keys("HENGYUAN_OPERATOR_TESTNET_API_KEY", "HENGYUAN_OPERATOR_TESTNET_API_SECRET");
     }

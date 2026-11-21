@@ -93,6 +93,7 @@
 #include <hengyuan/holding_state_tracker.hpp>
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/owner_reset_request_files.hpp>
+#include <hengyuan/scope_trading_runtime.hpp>
 #include <hengyuan/production_reset_key.hpp>
 #include <hengyuan/preflight_probe.hpp>
 #include <hengyuan/private_stream_pipeline.hpp>
@@ -191,6 +192,8 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::SubmitFilled: return "SubmitFilled";
         case OrchestratorGate::NotReady: return "NotReady";
         case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
+        case OrchestratorGate::TradeScopeNotAuthorized: return "TradeScopeNotAuthorized";
+        case OrchestratorGate::TradeScopeBudgetExhausted: return "TradeScopeBudgetExhausted";
         case OrchestratorGate::InFlightCapacityExceeded: return "InFlightCapacityExceeded";
         case OrchestratorGate::IntentOrphanBudgetExceeded: return "IntentOrphanBudgetExceeded";
     }
@@ -573,8 +576,12 @@ std::optional<BoundRuntimeOptions> parse_bound_runtime(int argc, char* argv[], s
     return opt;
 }
 
-int enroll_owner_key(int argc, char* argv[], bool reset_key) {
-    const char* command = reset_key ? "--enroll-reset-owner" : "--enroll-cancel-owner";
+enum class OwnerKeyPurpose { Cancel, Reset, Scope };
+
+int enroll_owner_key(int argc, char* argv[], OwnerKeyPurpose purpose) {
+    const bool reset_key = purpose == OwnerKeyPurpose::Reset;
+    const char* command = reset_key ? "--enroll-reset-owner" :
+                          purpose == OwnerKeyPurpose::Scope ? "--enroll-scope-owner" : "--enroll-cancel-owner";
     const auto env = argc == 9 ? cancel_control::parse_environment(argv[2]) : std::nullopt;
     if (!env || (reset_key && *env != StoreEnvironment::Production)) {
         std::fprintf(stderr, "usage: %s %s %s <log> <audit-key-id> <kek-file> <wrapped-key-file> <owner-key-id> <public-key.der>\n",
@@ -588,14 +595,15 @@ int enroll_owner_key(int argc, char* argv[], bool reset_key) {
         std::fputs("Audit and owner key IDs must be positive integers.\n", stderr);
         return 1;
     }
-    const auto result = reset_key ? ProductionResetKey::enroll(files, owner_id, argv[8])
-                                  : cancel_control::enroll(files, *env, owner_id, argv[8]);
-    const char* purpose = reset_key ? "reset" : "cancellation";
+    const auto result = reset_key ? ProductionResetKey::enroll(files, owner_id, argv[8]) :
+                        purpose == OwnerKeyPurpose::Scope ? TradeScopeOwnerKey::enroll(files, *env, owner_id, argv[8]) :
+                        cancel_control::enroll(files, *env, owner_id, argv[8]);
+    const char* purpose_name = reset_key ? "reset" : purpose == OwnerKeyPurpose::Scope ? "scope" : "cancellation";
     if (result == ExportStatus::Ok) {
-        std::printf("Owner %s public key registered for %s\n", purpose, argv[2]);
+        std::printf("Owner %s public key registered for %s\n", purpose_name, argv[2]);
         return 0;
     }
-    std::fprintf(stderr, "Owner %s public key registration failed (%s)\n", purpose, export_status_name(result));
+    std::fprintf(stderr, "Owner %s public key registration failed (%s)\n", purpose_name, export_status_name(result));
     return 1;
 }
 
@@ -700,6 +708,38 @@ int run_cancel_only(const BoundRuntimeOptions& options, boost::asio::io_context&
     return 2;
 }
 
+bool poll_owner_reset(OwnerResetRequestFiles& files, PrivatePipeline& pipeline, const KillSwitch& kill_switch,
+                      const ClockOffsetPublisher& clock, std::optional<OperatorResetResult>& result) {
+    const auto upper = approval_server_time_upper_bound(clock, fetch_clock_pair());
+    const auto pending = files.pending_approval();
+    if (pending) {
+        if (pending->target.revision != kill_switch.revision()) {
+            result = OperatorResetResult::StateChanged;
+        } else if (upper && pending->not_after_ms <= *upper) {
+            result = OperatorResetResult::Expired;
+        } else {
+            result = files.apply_if_ready([&pipeline](std::span<const unsigned char> signature) {
+                return pipeline.apply_operator_reset(signature);
+            });
+        }
+    } else if (upper) {
+        if (const auto target = pipeline.operator_reset_target()) {
+            const auto status = files.publish(*target, *upper);
+            if (status != ExportStatus::Ok) {
+                std::fprintf(stderr, "Owner reset challenge could not be published (%s).\n", export_status_name(status));
+                return false;
+            }
+            std::printf("Owner reset challenge for revision %" PRIu64 ": %s\nExpected signature: %s\n",
+                        target->revision, files.challenge_path().c_str(), files.signature_path().c_str());
+        }
+    }
+    if (result) {
+        std::printf("Owner reset result: %s (revision %" PRIu64 ")\n",
+                    operator_reset_result_name(*result), kill_switch.revision());
+    }
+    return true;
+}
+
 int run_owner_reset(const std::filesystem::path& control_dir, std::uint32_t duration_seconds,
                     bool drill, OwnerResetAuthority& authority, boost::asio::io_context& ioc,
                     PrivatePipeline& pipeline, BinancePrivateRestClient& client, const KillSwitch& kill_switch) {
@@ -725,35 +765,12 @@ int run_owner_reset(const std::filesystem::path& control_dir, std::uint32_t dura
                 break;
             }
 
-            const auto upper = approval_server_time_upper_bound(client.clock_publisher(), fetch_clock_pair());
-            const auto pending = files.pending_approval();
             std::optional<OperatorResetResult> result;
-            if (pending) {
-                if (pending->target.revision != kill_switch.revision()) {
-                    result = OperatorResetResult::StateChanged;
-                } else if (upper && pending->not_after_ms <= *upper) {
-                    result = OperatorResetResult::Expired;
-                } else {
-                    result = files.apply_if_ready([&pipeline](std::span<const unsigned char> signature) {
-                        return pipeline.apply_operator_reset(signature);
-                    });
-                }
-            } else if (upper) {
-                const auto target = pipeline.operator_reset_target();
-                if (target) {
-                    const auto status = files.publish(*target, *upper);
-                    if (status != ExportStatus::Ok) {
-                        std::fprintf(stderr, "Owner reset challenge could not be published (%s).\n", export_status_name(status));
-                        exit_code = 2;
-                        break;
-                    }
-                    std::printf("Owner reset challenge for revision %" PRIu64 ": %s\nExpected signature: %s\n",
-                                target->revision, files.challenge_path().c_str(), files.signature_path().c_str());
-                }
+            if (!poll_owner_reset(files, pipeline, kill_switch, client.clock_publisher(), result)) {
+                exit_code = 2;
+                break;
             }
             if (result) {
-                std::printf("Owner reset result: %s (revision %" PRIu64 ")\n",
-                            operator_reset_result_name(*result), kill_switch.revision());
                 if (drill) {
                     exit_code = *result == OperatorResetResult::Applied ? 0 : 2;
                     break;
@@ -793,12 +810,15 @@ int main(int argc, char* argv[]) {
                      argv[0]);
         return 1;
     }
-    if (std::string_view(argv[1]) == "--enroll-cancel-owner") return enroll_owner_key(argc, argv, false);
-    if (std::string_view(argv[1]) == "--enroll-reset-owner") return enroll_owner_key(argc, argv, true);
+    if (std::string_view(argv[1]) == "--enroll-cancel-owner") return enroll_owner_key(argc, argv, OwnerKeyPurpose::Cancel);
+    if (std::string_view(argv[1]) == "--enroll-reset-owner") return enroll_owner_key(argc, argv, OwnerKeyPurpose::Reset);
+    if (std::string_view(argv[1]) == "--enroll-scope-owner") return enroll_owner_key(argc, argv, OwnerKeyPurpose::Scope);
+    const bool scope_run = std::string_view(argv[1]) == "--scope-run";
     const bool cancel_only = std::string_view(argv[1]) == "--cancel-only";
     const bool reset_drill = std::string_view(argv[1]) == "--owner-reset-drill";
     const bool production_reset = std::string_view(argv[1]) == "--owner-reset";
-    const bool trade_preflight = !cancel_only && !reset_drill && !production_reset;
+    const bool trade_preflight = !cancel_only && !reset_drill && !production_reset && !scope_run;
+    const bool use_order_feeds = trade_preflight || scope_run;
     const auto reset_options = reset_drill ? parse_reset_drill(argc, argv) : std::nullopt;
     if (reset_drill && !reset_options) {
         std::fprintf(stderr, "usage: %s --owner-reset-drill <public-key.der> <control-dir> <read-only-testnet-credentials-file> [duration-seconds]\n",
@@ -806,9 +826,23 @@ int main(int argc, char* argv[]) {
         std::fputs("The control directory and P-256 public key must be valid.\n", stderr);
         return 1;
     }
-    const auto persistent_options = cancel_only || production_reset
-                                        ? parse_bound_runtime(argc, argv, production_reset ? 0u : 600u)
-                                        : std::nullopt;
+    auto persistent_options = cancel_only || production_reset
+                                  ? parse_bound_runtime(argc, argv, production_reset ? 0u : 600u)
+                                  : std::nullopt;
+    std::optional<ScopeRuntimePolicy> scope_policy;
+    if (scope_run) {
+        if (argc == 11 || argc == 12) persistent_options = parse_bound_runtime(9, argv, 0);
+        if (!persistent_options || (argc == 12 && !scope_files::parse_number(argv[11], persistent_options->duration_seconds))) {
+            std::fprintf(stderr, "usage: %s --scope-run <TESTNET|PRODUCTION> <log> <audit-key-id> <kek-file> "
+                                 "<wrapped-key-file> <credentials-file> <control-dir> <spec> <policy-file> [duration-seconds]\n", argv[0]);
+            return 1;
+        }
+        scope_policy = read_scope_runtime_policy(argv[10]);
+        if (!scope_policy) {
+            std::fputs("FATAL: scope runtime policy is invalid.\n", stderr);
+            return 1;
+        }
+    }
     if ((cancel_only || production_reset) &&
         (!persistent_options || (production_reset && persistent_options->environment != StoreEnvironment::Production))) {
         std::fprintf(stderr, "usage: %s %s %s <log> <audit-key-id> <kek-file> <wrapped-key-file> <credentials-file> <control-dir> [duration-seconds]\n",
@@ -816,12 +850,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     const auto environment = persistent_options ? persistent_options->environment : StoreEnvironment::Testnet;
-    const std::string spec_path = argv[1];
-    int duration_s = trade_preflight && argc >= 3 ? std::atoi(argv[2]) : 60;
-    if (duration_s <= 0) duration_s = 60;
+    const std::string spec_path = scope_run ? argv[9] : argv[1];
+    int preflight_duration = trade_preflight && argc >= 3 ? std::atoi(argv[2]) : 60;
+    if (preflight_duration <= 0) preflight_duration = 60;
+    const std::int64_t duration_s = scope_run ? static_cast<std::int64_t>(persistent_options->duration_seconds)
+                                               : static_cast<std::int64_t>(preflight_duration);
     // No maximum run time: the public feeds are supervised and roll their connections over before
     // Binance's 24 h connection limit on their own.
-    const std::string interval = argc >= 4 ? argv[3] : "1h";
+    const std::string interval = !scope_run && argc >= 4 ? argv[3] : "1h";
     int exit_code = 0;
 
     std::signal(SIGINT, signal_handler);
@@ -837,7 +873,7 @@ int main(int argc, char* argv[]) {
     // --- Load spec + fail-closed market-binding check (批次 6a-2's own established pattern) --
     SpecLoadResult load_result{};
     StreamingEvaluator evaluator;
-    if (trade_preflight) {
+    if (use_order_feeds) {
         std::ifstream f(spec_path, std::ios::binary);
         if (!f) {
             std::fprintf(stderr, "FATAL: could not open spec file: %s\n", spec_path.c_str());
@@ -869,25 +905,32 @@ int main(int argc, char* argv[]) {
     SecureEnvLoader loader;
     const auto binding = reset_drill ? EnvironmentBinding::operator_testnet()
                          : production_reset ? EnvironmentBinding::operator_production()
+                         : scope_run && environment == StoreEnvironment::Testnet ? EnvironmentBinding::scope_testnet()
                          : environment == StoreEnvironment::Testnet ? EnvironmentBinding::testnet()
                          : EnvironmentBinding::production();
     std::optional<ScratchStoreCleanup> scratch_store_cleanup;
     cancel_control::OpenStore store;
     if (persistent_options) {
-        store = cancel_control::open_existing_store(persistent_options->store, environment);
+        store = scope_run ? spot_owner_key_store::open_existing_store(persistent_options->store, environment, NeverSentWrites::Enabled)
+                          : cancel_control::open_existing_store(persistent_options->store, environment);
         if (!store.sink) {
             std::fputs("FATAL: persistent audit store could not be opened in the selected environment.\n", stderr);
             return 1;
         }
     }
 
-    auto enrolled_reset = production_reset
-                              ? ProductionResetKey::load(persistent_options->store.log, *store.sink) : nullptr;
-    if (production_reset && !enrolled_reset) {
+    const bool needs_reset_key = production_reset || (scope_run && environment == StoreEnvironment::Production);
+    auto enrolled_reset = needs_reset_key ? ProductionResetKey::load(persistent_options->store.log, *store.sink) : nullptr;
+    if (needs_reset_key && !enrolled_reset) {
         std::fputs("FATAL: production reset key registration is missing or invalid for this store.\n", stderr);
         return 1;
     }
     OwnerResetAuthority* reset_authority = reset_drill ? reset_options->authority.get() : enrolled_reset.get();
+    const auto scope_owner = scope_run ? TradeScopeOwnerKey::load(persistent_options->store.log, *store.sink) : std::nullopt;
+    if (scope_run && !scope_owner) {
+        std::fputs("FATAL: scope key registration or required first-order declaration is missing or invalid.\n", stderr);
+        return 1;
+    }
 
     // --- The four dry-run drills, for real (批次 6 6b-0b) ------------------------------------------
     // Before the process reads a credential or touches the network (and before any io thread or feed
@@ -896,7 +939,7 @@ int main(int argc, char* argv[]) {
     // read-only chain()).
     const std::uint32_t stamp = build_stamp();
     VerifiedDryRunEvidence verified_evidence;
-    if (trade_preflight) {
+    if (use_order_feeds) {
         const DryRunReport drills = verified_evidence.run_all(stamp, drill_startup_now_ms(get_now_ms()), binding.environment(),
                                                               durable_audit_temp_path() + "_drill");
         static constexpr const char* kDrillNames[kEvidencePathCount] = {"SubmitSuccess", "SubmitReject",
@@ -914,7 +957,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    if (trade_preflight) {
+    if (use_order_feeds) {
         std::printf("Dry-run evidence earned: all_paths_exercised=%s consistent_build=%s live_ready=%s\n",
                     verified_evidence.chain().all_paths_exercised() ? "true" : "false",
                     verified_evidence.chain().consistent_build() ? "true" : "false",
@@ -981,9 +1024,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!reset_drill) {
+    SubmitAdapterContext submit_ctx{&client, &registry};
+    const SubmitPort scope_submit_port = scope_run ? make_binance_submit_port(submit_ctx) : SubmitPort{};
+    if (!scope_run && !reset_drill) {
         // Assemble the adapter for the diagnostic. The order preflight uses the mock.
-        SubmitAdapterContext submit_ctx{&client, &registry};
         const SubmitPort real_submit_port_unused = make_binance_submit_port(submit_ctx);
         std::printf("Real SubmitPort assembled (never used for ctx.submit_port): rules_version=%u, valid=%d\n",
                     real_submit_port_unused.current_rules_version(),
@@ -1102,13 +1146,39 @@ int main(int argc, char* argv[]) {
     durable_kill_store.emplace(
         DurableKillSwitchConfig{durable_audit_path, environment, exchange_uid,
                                 durable_audit_sink->store_uuid_lo(), durable_audit_sink->store_uuid_hi(),
-                                persistent_options ? persistent_options->store.audit_key_id : 1, trade_preflight},
+                                persistent_options ? persistent_options->store.audit_key_id : 1,
+                                trade_preflight || (scope_run && environment == StoreEnvironment::Testnet)},
         *store.keys);
     const bool kill_store_ready = durable_kill_store->recover(kill_switch);
     std::printf("Kill-switch persistence: %s (authenticated=%s)\n",
                 kill_persistence_health_name(kill_switch.persistence_health()), kill_store_ready ? "yes" : "no");
     if (!kill_store_ready) std::fputs("Kill-switch state is unavailable; remaining Latched.\n", stderr);
     auto authority = cancel_only ? cancel_control::load_authority(durable_audit_path, *durable_audit_sink) : nullptr;
+
+    std::optional<TradeScopeExecution> scope_execution;
+    std::optional<ScopeTradingRuntime> scope_runtime;
+    std::optional<OwnerResetRequestFiles> scope_reset_files;
+    if (scope_run) {
+        if (!kill_store_ready || !durable_audit_sink->trade_scope_writes_available()) return 1;
+        const auto scope_binding = new_scope_binding(*scope_owner, *scope_policy);
+        const auto control_dir = scope_binding ? create_scope_request_directory(persistent_options->control_dir, *scope_binding)
+                                               : std::nullopt;
+        if (!control_dir) {
+            std::fputs("FATAL: could not create this run's scope control directory.\n", stderr);
+            return 1;
+        }
+        scope_execution.emplace(*durable_audit_sink, kill_switch, *submit_authority, client.clock_publisher(), *scope_binding);
+        scope_runtime.emplace(*scope_execution, *durable_audit_sink, *scope_owner, *scope_policy, *control_dir);
+        if (reset_authority) scope_reset_files.emplace(*reset_authority, *control_dir);
+        std::printf("Scope control directory: %s\n", control_dir->string().c_str());
+        std::printf("Scope recovery: high_water=%" PRIu64 " active=%" PRIu64 " unresolved=%zu\n",
+                    durable_audit_sink->trade_scope_high_water(), durable_audit_sink->active_trade_scope_serial(),
+                    durable_audit_sink->recovered_checkpoints().size());
+        for (const auto& scope_balance : durable_audit_sink->trade_scope_balances()) {
+            std::printf("Scope balance: serial=%" PRIu64 " used=%" PRId64 "\n",
+                        scope_balance.serial, scope_balance.usage.used_notional);
+        }
+    }
 
     // --- The private-stream pipeline (M5b-1, private_stream_pipeline.hpp) ----------------------------------------
     // Everything below is the process's and outlives it. The pipeline creates no thread and opens no connection by
@@ -1124,6 +1194,8 @@ int main(int argc, char* argv[]) {
     pipeline_cfg.submit_authority = submit_authority;
     if (authority) pipeline_cfg.automatic_cancel = authority->config();
     if (reset_authority) pipeline_cfg.operator_reset = reset_authority->approval_port();
+    pipeline_cfg.trade_scope_required = scope_run;
+    if (scope_execution) pipeline_cfg.trade_scope = &*scope_execution;
     // The supervision the public feeds get: reconnect with backoff, a planned rollover well inside the 24 h limit of
     // a Binance connection, and an end to the run -- exit code 2, not a silent blind loop -- once ten attempts in a
     // row have failed.
@@ -1132,8 +1204,8 @@ int main(int argc, char* argv[]) {
     // any real risk; they only need to not spuriously reject the notional a probe computes. The freshness window is
     // also the one startup recovery judges the account by.
     pipeline_cfg.exposure_limits.freshness_max_age_ms = 30000;
-    pipeline_cfg.exposure_limits.single_order_notional_cap = 1'000'000'000;
-    pipeline_cfg.exposure_limits.total_exposure_notional_cap = 1'000'000'000;
+    pipeline_cfg.exposure_limits.single_order_notional_cap = scope_policy ? scope_policy->approval.limits.max_order_notional : 1'000'000'000;
+    pipeline_cfg.exposure_limits.total_exposure_notional_cap = scope_policy ? scope_policy->approval.limits.max_exposure_notional : 1'000'000'000;
 
     auto private_pipeline = std::make_unique<PrivatePipeline>(
         parts, pipeline_cfg, [&ws_factory](std::uint64_t generation) { return ws_factory(generation); });
@@ -1155,7 +1227,7 @@ int main(int argc, char* argv[]) {
                                client, kill_switch, in_flight, rules);
     }
 
-    if (reset_authority) {
+    if (reset_authority && !scope_run) {
         if (!kill_store_ready) return 1;
         const auto& directory = reset_drill ? reset_options->control_dir : persistent_options->control_dir;
         const auto seconds = reset_drill ? reset_options->duration_seconds : persistent_options->duration_seconds;
@@ -1224,15 +1296,15 @@ int main(int argc, char* argv[]) {
     // (public_feed_pipeline.hpp's lifetime contract).
     std::thread io_thread([&ioc]() { ioc.run(); });
 
-    std::printf("=== Live Submit Preflight Harness (testnet) ===\n");
+    std::printf("=== %s (%s) ===\n", scope_run ? "Scope Trading Runtime" : "Live Submit Preflight Harness",
+                environment == StoreEnvironment::Testnet ? "Testnet" : "Production");
     std::printf("Real credentials, real clock sync, real exchangeInfo, real account read, real WebSocket API private "
                 "stream, real depth+kline WS.\n");
-    std::printf("ctx.submit_port is a MOCK, never the real make_binance_submit_port() result -- "
-                "no real network order write is possible from this process.\n");
+    if (trade_preflight) std::puts("Preflight observes gates with a mock submit port.");
     std::printf("Gate 2b (SubmitReadyToken) asks the REAL readiness: the private stream, its sweep, the account and "
                 "startup recovery are live objects here (store binding: %.*s).\n",
                 static_cast<int>(binding_status_text.size()), binding_status_text.data());
-    std::printf("Running for %d seconds (Ctrl+C to stop early).\n\n", duration_s);
+    if (duration_s > 0) std::printf("Running for %" PRId64 " seconds (Ctrl+C to stop early).\n\n", duration_s);
 
     std::int64_t next_clock_sync_ms = 60'000;
     const std::int64_t loop_start_ms = get_now_ms();
@@ -1377,7 +1449,7 @@ int main(int argc, char* argv[]) {
             std::printf("[bar close=%" PRId64 "] signal=%.4f state=%s\n", kev.close_time_ms,
                         target_position, tracker.state() == HoldingState::Long ? "LONG" : "FLAT");
 
-            if (action == SuggestedAction::None) return;
+            if (scope_run || action == SuggestedAction::None) return;
 
             // A suggested action derived from a bar is only ever probed while the feed is currently
             // trustworthy. This runs inside tick(), before that tick's depth work, so the depth side of
@@ -1437,7 +1509,35 @@ int main(int argc, char* argv[]) {
 
         // The startup probe (see the header comment): the first moment the private stream is reconciled, startup recovery is Ready and the book
         // tracks, ask the order path once with an OPEN-shaped order, so a run proves the whole chain without waiting for the strategy to flip.
-        if (!startup_probe_done && startup_probe_attempts < kStartupProbeMaxAttempts && now_ms >= next_startup_probe_ms &&
+        if (scope_runtime) {
+            try {
+                std::optional<OperatorResetResult> reset;
+                if ((scope_reset_files && (!poll_owner_reset(*scope_reset_files, *private_pipeline, kill_switch,
+                                                             client.clock_publisher(), reset) ||
+                                           (reset && !scope_reset_files->renew()))) ||
+                    !scope_runtime->service_control(rules, 0, wall_now_ms, in_flight)) {
+                    exit_code = 2;
+                    break;
+                }
+                const auto book = pipeline->depth_manager().book().top_of_book();
+                if (book && feed.validity == SupervisedFeedInvalidReason::None &&
+                    pipeline->depth_manager().state() == DepthState::Tracking &&
+                    private_pipeline->recovery().state() == RunState::Ready &&
+                    private_pipeline->readiness().barrier().state() == BarrierState::Reconciled) {
+                    const auto clock = issue_clock_ready_token(client.clock_publisher(), fetch_clock_pair());
+                    const PreflightEnvironment scope_environment{&verified_evidence.chain(), &rules, kProbeBaseAsset,
+                        kProbeQuoteAsset, true, true, 0, static_cast<std::uint32_t>(poll_ticks), steady_ms, scope_submit_port};
+                    if (clock && !scope_runtime->service_order(*private_pipeline, scope_environment, *book, clock->server_ms())) {
+                        exit_code = 2;
+                        break;
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "Scope process stopped (%s).\n", e.what());
+                exit_code = 2;
+                break;
+            }
+        } else if (!startup_probe_done && startup_probe_attempts < kStartupProbeMaxAttempts && now_ms >= next_startup_probe_ms &&
             private_pipeline->readiness().barrier().state() == BarrierState::Reconciled &&
             private_pipeline->recovery().state() == RunState::Ready && pipeline->depth_manager().state() == DepthState::Tracking &&
             feed.validity == SupervisedFeedInvalidReason::None) {
@@ -1512,6 +1612,8 @@ int main(int argc, char* argv[]) {
     print_private_stream_report(*private_pipeline, ws_factory, account_fetcher, kill_switch, watch, probes);
 
     private_pipeline.reset();    // it points at the store: let go of it first
+    scope_runtime.reset();
+    scope_execution.reset();
     durable_audit_sink.reset();  // close before removing the temp file
 
     return exit_code;

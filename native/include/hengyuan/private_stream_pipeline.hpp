@@ -103,6 +103,8 @@ struct PipelineConfig {
     std::shared_ptr<SubmitAuthority> submit_authority{};
     AutoCancelConfig automatic_cancel{};
     OperatorResetApprovalPort operator_reset{};
+    TradeScopeExecution* trade_scope{nullptr};
+    bool trade_scope_required{false};
 };
 
 // What the process owns, by reference: every referent outlives the pipeline. The function-pointer ports are values.
@@ -371,6 +373,8 @@ private:
         context_.fill_context = &parts_.fill_context;
         context_.account = &hot_.holder.view();
         context_.exposure_limits = config_.exposure_limits;
+        context_.trade_scope = config_.trade_scope;
+        context_.trade_scope_required = config_.trade_scope_required;
     }
 
     bool reset_readiness() noexcept {

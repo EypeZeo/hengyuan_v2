@@ -208,6 +208,12 @@ public:
 
     template <typename FinalCheck>
     [[nodiscard]] NotReadyReason claim(const SubmitReadyToken& token, std::int64_t now_ms, FinalCheck&& final_check) noexcept {
+        return claim(token, now_ms, final_check, []() noexcept { return true; });
+    }
+
+    template <typename FinalCheck, typename ClaimGuard>
+    [[nodiscard]] NotReadyReason claim(const SubmitReadyToken& token, std::int64_t now_ms,
+                                       FinalCheck&& final_check, ClaimGuard&& guard) noexcept {
         const auto current = evaluate(now_ms, token.scope_epoch_);
         if (!current.ready()) return current.reason;
         if (token.issuer_ != this || token.generation_ != current.token->generation_ ||
@@ -216,7 +222,8 @@ public:
             return refuse(NotReadyReason::EpochChanged).reason;
         }
         if (!final_check()) return refuse(NotReadyReason::FinalCheckFailed).reason;
-        if (!kill_switch_.claim_normal(token.kill_revision_, [&]() noexcept { return authority().claim(token.epoch_); },
+        if (!kill_switch_.claim_normal(token.kill_revision_,
+                                       [&]() noexcept { return guard() && authority().claim(token.epoch_); },
                                        token.scope_epoch_)) {
             return refuse(NotReadyReason::EpochChanged).reason;
         }

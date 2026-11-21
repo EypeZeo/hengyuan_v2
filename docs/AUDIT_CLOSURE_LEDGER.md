@@ -1632,7 +1632,7 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: open:native/tests/test_never_sent_guard.cpp#"A production trading process is not one of them yet" open:docs/NOTSENT_CLOSURE_DESIGN.md#"真实进程的完整持久化延迟注入待执行"
+open: open:docs/NOTSENT_CLOSURE_DESIGN.md#"真实进程的完整持久化延迟注入待执行"
 refs: code:native/include/hengyuan/submit_authority.hpp#SubmitAuthority test:native/tests/test_submit_readiness.cpp#RevocationDuringFinalCheckWinsTheClaimCompareExchange test:native/tests/test_submit_final_gate.cpp#RevokedAuthorityRefusesThePreparedOrder test:native/tests/test_submit_final_gate.cpp#KillTriggerAfterPreparedWritesClassBClosureAndReleasesResources test:native/tests/test_submit_final_gate.cpp#AuthorizationTtlExpiresAtTheInclusiveBoundary test:native/tests/test_submit_authority_concurrency.cpp#RevokeThenClaimRejectsTheOldEpoch
 note: S5 在 Prepared 持久确认后复核发送条件并一次性消费授权。测试覆盖撤销竞争、熔断后的持久拒绝及资源释放、授权到期边界。待对真实进程注入完整的日志、anchor 与目录同步延迟，验证目标主机时效并记录从签发到发送决定的时间线。
 ```
@@ -1696,9 +1696,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 01043c3
-open: open:docs/SCOPE_APPROVAL_DESIGN.md#"范围安装及撤销待接入生产进程"
-refs: code:native/include/hengyuan/owner_trade_scope_approval.hpp#VerifiedTradeScope test:native/tests/test_trade_scope_approval.cpp#TradeScopeGrant
-note: 规范载荷、P-256 签名、执行身份、政策上限与有效期已有离线测试。生产安装和设备验证待完成。
+open: open:docs/SCOPE_APPROVAL_DESIGN.md#"生产环境、硬件签名、账户期间额度和受限退出规则仍需验证"
+refs: code:native/include/hengyuan/trade_scope_grant.hpp#VerifiedTradeScope test:native/tests/test_trade_scope_approval.cpp#TradeScopeGrant
+note: 规范载荷、P-256 签名、执行身份与生产安装检查已有实现。生产设备与账户验证待完成。
 ```
 
 ```ledger
@@ -1712,7 +1712,7 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 01043c3
-open: open:docs/SCOPE_APPROVAL_DESIGN.md#"订单日志的范围序号编码与真实追加接口待接入"
-refs: code:native/include/hengyuan/trade_scope_budget.hpp#TradeScopeBudget test:native/tests/test_trade_scope_approval.cpp#TradeScopeBudget
-note: 单范围额度计算已覆盖预占、未确认写入、NeverSent 归还与事件重放。实际订单日志收费和重启回归待接入。
+open: open:docs/SCOPE_APPROVAL_DESIGN.md#"生产环境、硬件签名、账户期间额度和受限退出规则仍需验证"
+refs: code:native/include/hengyuan/durable_audit_sink.hpp#trade_scope_balance test:native/tests/test_durable_audit_sink.cpp#MixedLegacyAndScopedPreparedReplayChargesQuoteAndRequiresReactivation
+note: 单范围额度随 Prepared 扣除，按持久确认的 NeverSent 归还。订单日志重启恢复覆盖旧普通订单和带范围序号的订单。
 ```

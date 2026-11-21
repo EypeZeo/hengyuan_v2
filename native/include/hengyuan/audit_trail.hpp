@@ -67,6 +67,9 @@ enum class AuditEventType : std::uint8_t {
     OrderNeverSent = 23,
     OrderCancelPrepared = 24,  // v6: local cancel intent persisted before sending
     OrderCancelNotSent = 25,   // v6: restores the working order after a proven pre-write refusal
+    TradeScopeInstalled = 26,
+    TradeScopeRevoked = 27,
+    OrderScopedPrepared = 28,
 };
 
 inline const char* audit_event_name(AuditEventType t) noexcept {
@@ -97,6 +100,9 @@ inline const char* audit_event_name(AuditEventType t) noexcept {
         case AuditEventType::OrderNeverSent: return "ORDER_NEVER_SENT";
         case AuditEventType::OrderCancelPrepared: return "ORDER_CANCEL_PREPARED";
         case AuditEventType::OrderCancelNotSent: return "ORDER_CANCEL_NOT_SENT";
+        case AuditEventType::TradeScopeInstalled: return "TRADE_SCOPE_INSTALLED";
+        case AuditEventType::TradeScopeRevoked: return "TRADE_SCOPE_REVOKED";
+        case AuditEventType::OrderScopedPrepared: return "ORDER_SCOPED_PREPARED";
     }
     return "UNKNOWN";
 }
