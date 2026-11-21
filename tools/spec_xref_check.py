@@ -147,6 +147,9 @@ SEARCH_FILES = [
     REPO_ROOT / "native" / "include" / "hengyuan" / "rest_account_fetcher.hpp",
     # Private-stream migration M5a-2b (docs/SPEC_INVARIANTS.md "私网流流水线"): the composition root, its parts struct, config and the facts it reads for StartupRecovery.
     REPO_ROOT / "native" / "include" / "hengyuan" / "private_stream_pipeline.hpp",
+    # Emergency cancellation uses the kill state and Owner-signed grants.
+    REPO_ROOT / "native" / "include" / "hengyuan" / "kill_switch.hpp",
+    REPO_ROOT / "native" / "include" / "hengyuan" / "owner_cancel_approval.hpp",
     # D5 slice R1 (docs/SPEC_INVARIANTS.md "D5 切片 R1"): the frozen bit layout of an OrderOperatorResolved frame's
     # detail_code and its shape predicate are new load-bearing symbols -- the same gap every entry above closes.
     REPO_ROOT / "native" / "include" / "hengyuan" / "operator_resolution_frame.hpp",

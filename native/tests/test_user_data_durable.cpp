@@ -136,6 +136,44 @@ TEST_F(UserDataDurableTest, TheAckComesBeforeEveryMemoryEffect) {
     EXPECT_EQ(publisher_.stats().written, 1u);
 }
 
+TEST_F(UserDataDurableTest, CancelRequestedToPartialFillIsDurableBeforeOnlyTheNewDeltaIsPublished) {
+    admit("HY-C", OrderState::CancelRequested, /*filled=*/4);
+    ASSERT_EQ(fills_.consume_delta("HY-C", 4), 4);  // the log's first 4 was already published in an earlier drain
+    truth_.apply_fill(kSymbol, OrderSide::Buy, 4);
+    push(report("HY-C", OrderState::PartialFill, "6", "600"));
+
+    drain();
+
+    ASSERT_EQ(probe_.frames.size(), 1u);
+    EXPECT_EQ(probe_.frames[0].resulting_state, OrderState::PartialFill);
+    EXPECT_EQ(probe_.frames[0].filled_qty_ticks, 6);
+    ASSERT_EQ(probe_.seen.size(), 1u);
+    EXPECT_EQ(probe_.seen[0].net_qty, 4) << "the 6 - 4 delta is not visible when the sink is asked";
+    EXPECT_EQ(truth_.net_qty_ticks(kSymbol), 6) << "the shared baseline credits only the new 2";
+    EXPECT_EQ(shadow_of("HY-C").state, OrderState::PartialFill);
+    EXPECT_EQ(shadow_of("HY-C").filled_qty_ticks, 6);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-C")) << "a failed/pending cancel is not an exchange-final release";
+    EXPECT_EQ(publisher_.stats().refused_contradiction, 0u);
+}
+
+TEST_F(UserDataDurableTest, AnEqualFillWorkingReportAfterPendingCancelIsAStaleWsObservation) {
+    admit("HY-C", OrderState::CancelRequested, /*filled=*/4);
+    ASSERT_EQ(fills_.consume_delta("HY-C", 4), 4);
+    truth_.apply_fill(kSymbol, OrderSide::Buy, 4);
+    push(report("HY-C", OrderState::PartialFill, "4", "400"));
+
+    drain();
+
+    EXPECT_EQ(probe_.calls, 0) << "no new cumulative fill: this can be an old PARTIALLY_FILLED delivered after PENDING_CANCEL";
+    EXPECT_EQ(publisher_.stats().stale, 1u);
+    EXPECT_EQ(publisher_.stats().written, 0u);
+    EXPECT_EQ(shadow_of("HY-C").state, OrderState::CancelRequested);
+    EXPECT_EQ(shadow_of("HY-C").filled_qty_ticks, 4);
+    EXPECT_EQ(truth_.net_qty_ticks(kSymbol), 4);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-C"));
+    EXPECT_EQ(barrier_.state(), BarrierState::Reconciled);
+}
+
 TEST_F(UserDataDurableTest, TheFrameCarriesTheCumulativeFillAndTheRingRecordIsTheSameRecord) {
     admit("HY-A", OrderState::Accepted, 0, /*intended=*/10);
     UserDataWsEvent ev = report("HY-A", OrderState::PartialFill, "4", "400", /*exchange_order_id=*/777);

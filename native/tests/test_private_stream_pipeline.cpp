@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -152,6 +153,22 @@ AuditRecord make_submitted(const char* coid, std::int64_t price, std::int64_t qt
     return rec;
 }
 
+AuditRecord make_accepted(const char* coid, std::int64_t price, std::int64_t qty, std::uint32_t symbol_id, std::int64_t exchange_order_id,
+                          ExecutionMode mode = ExecutionMode::Live) {
+    AuditRecord rec{};
+    rec.timestamp_ms = 1002;
+    rec.event_type = AuditEventType::OrderAccepted;
+    rec.mode = mode;
+    rec.symbol_id = symbol_id;
+    rec.set_client_order_id(coid);
+    rec.exchange_order_id = exchange_order_id;
+    rec.price_ticks = price;
+    rec.qty_ticks = qty;
+    rec.resulting_state = OrderState::Accepted;
+    rec.side = OrderSide::Buy;
+    return rec;
+}
+
 std::vector<std::byte> bytes_of(const char* text) {
     std::vector<std::byte> k;
     for (const char* p = text; *p != '\0'; ++p) k.push_back(static_cast<std::byte>(*p));
@@ -171,6 +188,15 @@ void publish_fresh_clock(ClockOffsetPublisher& pub) {
     s.steady_at_fetch_ms = now.steady_ms();
     ASSERT_TRUE(pub.publish(s));
 }
+
+struct AutomaticCancelApprovalSource {
+    std::optional<CancelApproval> current;
+    static std::optional<CancelApproval> read(void* user_data, std::string_view) noexcept {
+        return static_cast<AutomaticCancelApprovalSource*>(user_data)->current;
+    }
+
+    [[nodiscard]] CancelApprovalPort port() noexcept { return CancelApprovalPort{&read, this}; }
+};
 
 }  // namespace
 
@@ -195,6 +221,7 @@ protected:
     SpotRateLimitTracker limiter_;
     FakeAccount account_;
     FakeExchange exchange_;
+    AutomaticCancelApprovalSource approvals_;
     std::vector<std::shared_ptr<FakeSession>> sessions_;
     std::unique_ptr<Pipeline> pipe_;
 
@@ -251,7 +278,8 @@ protected:
         }  // "crash"
     }
 
-    void build(PipelineRulesLookup rules = PipelineRulesLookup{&rules_for_test, nullptr}, const ClockOffsetPublisher* clock = nullptr) {
+    void build(PipelineRulesLookup rules = PipelineRulesLookup{&rules_for_test, nullptr}, const ClockOffsetPublisher* clock = nullptr,
+               AutoCancelConfig automatic_cancel = {}) {
         ASSERT_NE(sink_, nullptr);
         PipelineParts parts{*sink_, path_, *ring_, make_durable_order_audit_port(*sink_), audit_, kill_, truth_, in_flight_, fill_, user_events_,
                             clock != nullptr ? *clock : clock_};
@@ -263,11 +291,32 @@ protected:
         config.exposure_limits.freshness_max_age_ms = 30'000;
         config.exposure_limits.single_order_notional_cap = 777'000;  // a value nobody else sets: the context must carry the configured limits
         config.reconcile_deadline_ms = 60'000;
+        config.automatic_cancel = automatic_cancel;
         pipe_ = std::make_unique<Pipeline>(parts, config, [this](std::uint64_t) {
             auto s = std::make_shared<FakeSession>();
             sessions_.push_back(s);
             return s;
         });
+    }
+
+    [[nodiscard]] AutoCancelConfig automatic_cancel_config(StoreEnvironment environment = StoreEnvironment::Testnet) {
+        CancelApproval approval{};
+        approval.subject = CancelSubject{environment, kUid, sink_->store_uuid_lo(), sink_->store_uuid_hi(), 42};
+        std::snprintf(approval.symbol, sizeof(approval.symbol), "BTCUSDT");
+        approval.serial = 7;
+        approval.not_after_ms = std::numeric_limits<std::int64_t>::max();
+        approvals_.current = approval;
+        return AutoCancelConfig{42, approvals_.port()};
+    }
+
+    InFlightHandle add_live_order(const char* coid, std::int64_t exchange_order_id = 777) {
+        const InFlightHandle handle = in_flight_.register_submit_handle(coid);
+        EXPECT_TRUE(handle.valid());
+        if (!handle.valid()) return {};
+        EXPECT_TRUE(fill_.track(coid, 1, OrderSide::Buy, 2, 2, 4, 100, "BTCUSDT"));
+        if (fill_.find(coid) == nullptr) return {};
+        fill_.durable_acked(coid, OrderState::Accepted, 0, exchange_order_id);
+        return handle;
     }
 
     // One cycle of both halves at the test clock, hot first (the order of today's single-loop harnesses is: drain, ..., poll_once, drain, supervisor.poll).
@@ -596,6 +645,151 @@ TEST_F(PipelineTest, ASinkThatIsNotOpenDegradesTheStateMachine) {
     for (int i = 0; i < 5; ++i) cycle();
     EXPECT_EQ(pipe_->recovery().state(), RunState::Degraded);
     EXPECT_EQ(pipe_->recovery().degraded_reason(), DegradedReason::SinkNotOpen);
+}
+
+// -----------------------------------------------------------------------------
+// automatic cancellation authorization and claim (B7)
+// -----------------------------------------------------------------------------
+
+TEST_F(PipelineTest, AutomaticCancelWaitsForEmergencyStateAndDeduplicatesAClaimedGeneration) {
+    open_sink();
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, nullptr, automatic_cancel_config());
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_TRUE(pipe_->recovery_applied());
+
+    const InFlightHandle handle = add_live_order("HY-AUTO");
+    ASSERT_TRUE(handle.valid());
+    EXPECT_EQ(kill_.state(), KillState::Normal);
+    pipe_->hot_tick(g_now += 10);
+    EXPECT_FALSE(pipe_->take_automatic_cancel());
+
+    kill_.trigger();
+    pipe_->hot_tick(g_now += 10);
+    const auto request = pipe_->take_automatic_cancel();
+    ASSERT_TRUE(request.has_value());
+    EXPECT_EQ(request->handle.slot_index, handle.slot_index);
+    EXPECT_EQ(request->handle.generation, handle.generation);
+    EXPECT_EQ(request->client_order_id.view(), "HY-AUTO");
+    EXPECT_EQ(request->exchange_order_id, 777);
+    EXPECT_EQ(request->symbol_id, 1U);
+    EXPECT_EQ(request->kill_revision, kill_.revision());
+    EXPECT_EQ(request->approval_serial, 7U);
+    EXPECT_EQ(std::string_view(request->symbol), "BTCUSDT");
+
+    pipe_->hot_tick(g_now += 10);
+    EXPECT_FALSE(pipe_->take_automatic_cancel()) << "one cancellation request is emitted for one slot generation";
+}
+
+TEST_F(PipelineTest, AutomaticCancelAlsoRunsForLatchedState) {
+    open_sink();
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, nullptr, automatic_cancel_config());
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_TRUE(pipe_->recovery_applied());
+    ASSERT_TRUE(add_live_order("HY-LATCH").valid());
+
+    kill_.latch();
+    pipe_->hot_tick(g_now += 10);
+    const auto request = pipe_->take_automatic_cancel();
+    ASSERT_TRUE(request.has_value());
+    EXPECT_EQ(request->client_order_id.view(), "HY-LATCH");
+    EXPECT_EQ(request->kill_revision, kill_.revision());
+}
+
+TEST_F(PipelineTest, AutomaticCancelSkipsOrdersWithoutAWorkingExchangeIdAndDryRunOrders) {
+    {
+        DurableAuditSink first(path_, *ring_, kKeyId);
+        AuditRecord intent = make_intent("HY-DRY", 100, 10, 1);
+        intent.mode = ExecutionMode::DryRun;
+        AuditRecord submitted = make_submitted("HY-DRY", 100, 10, 1);
+        submitted.mode = ExecutionMode::DryRun;
+        ASSERT_TRUE(first.append_durable(intent, 1000).acked());
+        ASSERT_TRUE(first.append_durable(submitted, 1001).acked());
+        ASSERT_TRUE(first.append_durable(make_accepted("HY-DRY", 100, 10, 1, 778, ExecutionMode::DryRun), 1002).acked());
+    }
+    open_sink();
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, nullptr, automatic_cancel_config());
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundLegacyTestnet);
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_TRUE(pipe_->recovery_applied());
+    ASSERT_TRUE(add_live_order("HY-UNKNOWN", 0).valid());
+
+    kill_.trigger();
+    pipe_->hot_tick(g_now += 10);
+    EXPECT_FALSE(pipe_->take_automatic_cancel());
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-DRY"));
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-UNKNOWN"));
+    ASSERT_NE(fill_.find("HY-DRY"), nullptr);
+    ASSERT_NE(fill_.find("HY-UNKNOWN"), nullptr);
+    EXPECT_EQ(fill_.find("HY-DRY")->cancel_symbol[0], '\0') << "recovered DryRun orders have no Live cancellation symbol";
+    EXPECT_EQ(fill_.find("HY-UNKNOWN")->exchange_order_id, 0);
+}
+
+TEST_F(PipelineTest, AutomaticCancelClaimsARecoveredProductionOrderWithMatchingApproval) {
+    {
+        DurableAuditSink first(path_, *ring_, kKeyId);
+        ASSERT_EQ(ensure_store_binding(first, path_, *ring_, StoreEnvironment::Production, kUid, kBoundAt),
+                  EnsureBindingStatus::BoundNew);
+        ASSERT_TRUE(first.append_durable(make_intent("HY-PROD", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(first.append_durable(make_submitted("HY-PROD", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(first.append_durable(make_accepted("HY-PROD", 100, 10, 1, 991), 1002).acked());
+    }
+    open_sink();
+    const auto lookup = [](void* context, std::uint32_t symbol_id) noexcept {
+        auto rules = rules_for_test(context, symbol_id);
+        if (rules.rules_version != 0) std::snprintf(rules.symbol, sizeof(rules.symbol), "BTCUSDT");
+        return rules;
+    };
+    build(PipelineRulesLookup{lookup, nullptr}, nullptr, automatic_cancel_config(StoreEnvironment::Production));
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Production, kUid, kBoundAt), EnsureBindingStatus::Verified);
+    pipe_->set_exchange_info_loaded(true);
+
+    kill_.trigger();
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_TRUE(pipe_->recovery_applied());
+    kill_.operator_reset();
+    EXPECT_FALSE(pipe_->take_automatic_cancel());
+
+    kill_.trigger();
+    pipe_->hot_tick(g_now += 10);
+    const auto request = pipe_->take_automatic_cancel();
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->subject.environment, StoreEnvironment::Production);
+    EXPECT_EQ(request->subject.account_uid, kUid);
+    EXPECT_EQ(request->client_order_id.view(), "HY-PROD");
+    EXPECT_EQ(request->exchange_order_id, 991);
+}
+
+TEST_F(PipelineTest, AutomaticCancelRevalidatesApprovalSubjectExpiryAndRevocationAtClaim) {
+    open_sink();
+    build(PipelineRulesLookup{&rules_for_test, nullptr}, nullptr, automatic_cancel_config());
+    pipe_->set_exchange_info_loaded(true);
+    ASSERT_EQ(pipe_->bind_store(StoreEnvironment::Testnet, kUid, kBoundAt), EnsureBindingStatus::BoundNew);
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_TRUE(pipe_->recovery_applied());
+    ASSERT_TRUE(add_live_order("HY-RECHECK").valid());
+    const CancelApproval valid = *approvals_.current;
+
+    kill_.trigger();
+    pipe_->hot_tick(g_now += 10);
+    approvals_.current.reset();
+    EXPECT_FALSE(pipe_->take_automatic_cancel()) << "revocation after staging refuses the claim";
+
+    approvals_.current = valid;
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_TRUE(approvals_.current.has_value());
+    approvals_.current->subject.environment = StoreEnvironment::Production;
+    EXPECT_FALSE(pipe_->take_automatic_cancel()) << "a Production approval cannot authorize a Testnet store";
+
+    approvals_.current = valid;
+    pipe_->hot_tick(g_now += 10);
+    ASSERT_TRUE(approvals_.current.has_value());
+    approvals_.current->not_after_ms = 0;
+    EXPECT_FALSE(pipe_->take_automatic_cancel()) << "an expired approval refuses the claim";
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------

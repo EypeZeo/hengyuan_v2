@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -91,6 +92,15 @@ AuditRecord make_partial_fill(const char* coid, std::uint32_t symbol_id, std::in
     return rec;
 }
 
+AuditRecord make_cancel_requested(const char* coid, std::uint32_t symbol_id, std::int64_t exch_id,
+                                  std::int64_t filled_qty, std::int64_t avg_price) {
+    AuditRecord rec = make_partial_fill(coid, symbol_id, exch_id, filled_qty, avg_price);
+    rec.timestamp_ms = 1004;
+    rec.event_type = AuditEventType::OrderCancelRequested;
+    rec.resulting_state = OrderState::CancelRequested;
+    return rec;
+}
+
 std::vector<std::byte> test_key() {
     static const char kKey[] = "startup-recovery-test-key";
     std::vector<std::byte> k(sizeof(kKey) - 1);
@@ -107,12 +117,14 @@ struct FakeExchange {
     std::int64_t exchange_order_id{555};
     int calls{0};
     std::vector<std::string> asked;  // the client order id of every query, in order
+    std::vector<OrderExpectation> expectations;  // the complete captured request for each query
 };
 
 QueryResult fake_query(const OrderExpectation& exp, void* user_data) {
     auto* fx = static_cast<FakeExchange*>(user_data);
     ++fx->calls;
     fx->asked.emplace_back(exp.client_order_id.id);
+    fx->expectations.push_back(exp);
     QueryResult r{};
     r.outcome = fx->outcome;
     r.confirmed_state = fx->state;
@@ -131,6 +143,18 @@ SymbolRules rules_for_test(std::uint32_t symbol_id) {
         r.qty_scale = 2;
         r.quote_scale = 4;
     }
+    return r;
+}
+
+SymbolRules cancel_rules_for_test(std::uint32_t symbol_id, std::uint32_t version,
+                                  std::uint8_t price_scale, std::uint8_t qty_scale,
+                                  std::uint8_t quote_scale) {
+    SymbolRules r = rules_for_test(symbol_id);
+    r.rules_version = version;
+    std::memcpy(r.symbol, "BTCUSDT", sizeof("BTCUSDT") - 1);
+    r.price_scale = price_scale;
+    r.qty_scale = qty_scale;
+    r.quote_scale = quote_scale;
     return r;
 }
 
@@ -642,6 +666,155 @@ TEST_F(StartupRecoveryLogTest, KnownLiveRecoveredOrderReachesReadyButStaysInFlig
     EXPECT_EQ(in_flight_.count(), 1u);  // still in flight -> the planner's one-order rule holds
 }
 
+// B7 durable-cancel recovery: the cancel intent is written before the request leaves the process,
+// then a restart must query through the recorded cancel identity and the submit-time precision.
+// A working answer remains CancelRequested until the exchange gives an authoritative terminal
+// answer, so neither startup Ready nor the in-flight release can occur on a nonterminal snapshot.
+namespace {
+DurableOrderAuditPort port_of(DurableAuditSink& sink);
+}
+
+TEST_F(StartupRecoveryLogTest, DurableCancelRecoveryKeepsCancelIdentityPrecisionAndSlotUntilTerminal) {
+    const auto submit_rules = cancel_rules_for_test(1, 41, 2, 6, 8);
+    ClientOrderId cancel_alias{};
+    std::snprintf(cancel_alias.id, sizeof(cancel_alias.id), "%s", "HY-CANCEL-ALIAS");
+
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-CANCEL", 5000, 100, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-CANCEL", 5000, 100, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-CANCEL", 1, 555), 1002).acked());
+    }
+    {
+        // A cancel preparation is deliberately the first append of a fresh exclusive
+        // session, so it is anchored to the checkpoint reconstructed by recovery.
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+        ASSERT_TRUE(sink.append_cancel_prepared("HY-CANCEL", cancel_alias, submit_rules, 1003).acked());
+    }
+
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    ASSERT_EQ(restarted.recovered_checkpoints().size(), 1u);
+    const OrderRecoveryCheckpoint& cp = restarted.recovered_checkpoints()[0];
+    ASSERT_EQ(cp.resulting_state, OrderState::CancelRequested);
+    ASSERT_EQ(cp.exchange_order_id, 555);
+    ASSERT_EQ(cp.filled_qty_ticks, 0);
+    ASSERT_TRUE(cp.pending_cancel.present());
+    EXPECT_EQ(cp.pending_cancel.alias.view(), "HY-CANCEL-ALIAS");
+    EXPECT_EQ(std::string_view(cp.pending_cancel.symbol), "BTCUSDT");
+    EXPECT_EQ(cp.pending_cancel.price_scale, 2);
+    EXPECT_EQ(cp.pending_cancel.qty_scale, 6);
+    EXPECT_EQ(cp.pending_cancel.quote_scale, 8);
+
+    // The live registry now reports a changed scale triple. Recovery must validate the symbol,
+    // but keep the scale snapshot that was captured with the durable cancel intent.
+    const auto changed_rules = [](std::uint32_t symbol_id) {
+        return cancel_rules_for_test(symbol_id, 42, 4, 3, 7);
+    };
+    const RecoveryApplyResult applied = apply_recovery(
+        restarted.recovered_checkpoints(), in_flight_, to_reconcile_, truth_, fill_context_, changed_rules);
+    ASSERT_TRUE(applied.ok());
+    ASSERT_EQ(applied.applied, 1u);
+
+    ReconcileDurablePublisher publisher(port_of(restarted));
+    const auto durable_tick = [&](std::int64_t now_ms) {
+        poll_once(tracker_, to_reconcile_, reconcile_events_, port(), policy_, now_ms);
+        drain_reconcile_events(in_flight_, nullptr, reconcile_events_, now_ms, &truth_, &fill_context_, &publisher);
+    };
+    StartupRecovery sm(60'000);
+    exchange_.outcome = QueryOutcome::Found;
+    exchange_.state = OrderState::Accepted;
+    exchange_.exchange_order_id = 555;
+    exchange_.filled_qty = 0;
+
+    // The exchange still reports a working order. The request carries the cancel alias and the
+    // captured precision, while the tracker retains CancelRequested and the slot.
+    durable_tick(0);
+    ASSERT_EQ(exchange_.expectations.size(), 1u);
+    const OrderExpectation& first = exchange_.expectations.back();
+    EXPECT_EQ(first.pending_cancel.alias.view(), "HY-CANCEL-ALIAS");
+    EXPECT_EQ(first.cancel_exchange_order_id, 555);
+    EXPECT_EQ(first.rules_snapshot_at_submit.symbol_name(), "BTCUSDT");
+    EXPECT_EQ(first.rules_snapshot_at_submit.price_scale, 2);
+    EXPECT_EQ(first.rules_snapshot_at_submit.qty_scale, 6);
+    EXPECT_EQ(first.rules_snapshot_at_submit.quote_scale, 8);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-CANCEL"));
+    EXPECT_EQ(tracker_.count(), 1u);
+    EXPECT_EQ(sm.update(observe(restarted, applied), 0), RunState::Reconciling);
+    EXPECT_EQ(tally_recovered_orders(in_flight_, tracker_, restarted.recovered_checkpoints()).unconfirmed, 1u);
+
+    // A partial fill during the cancel race is durable progress, but it still cannot release the
+    // order. The recorded cumulative fill is preserved and only the newly observed quantity folds.
+    exchange_.state = OrderState::PartialFill;
+    exchange_.filled_qty = 40;
+    durable_tick(policy_.live_poll_interval_ms);
+    ASSERT_EQ(exchange_.expectations.size(), 2u);
+    EXPECT_EQ(exchange_.expectations.back().pending_cancel.alias.view(), "HY-CANCEL-ALIAS");
+    ASSERT_TRUE(in_flight_.is_in_flight("HY-CANCEL"));
+    EXPECT_EQ(tracker_.count(), 1u);
+    EXPECT_EQ(truth_.net_qty_ticks(1), 40);
+    EXPECT_EQ(sm.update(observe(restarted, applied), policy_.live_poll_interval_ms), RunState::Reconciling);
+
+    // A response for a different exchange order is inconclusive and must not change the durable
+    // cancel state or release its resources.
+    exchange_.exchange_order_id = 556;
+    durable_tick(2 * policy_.live_poll_interval_ms);
+    EXPECT_EQ(exchange_.calls, 3);
+    EXPECT_TRUE(in_flight_.is_in_flight("HY-CANCEL"));
+    EXPECT_EQ(tracker_.count(), 1u);
+    EXPECT_EQ(truth_.net_qty_ticks(1), 40);
+
+    // The original exchange order finally reports CANCELED. This is the first authoritative
+    // terminal answer, so the reconcile path may release the slot and finish startup recovery.
+    exchange_.exchange_order_id = 555;
+    exchange_.state = OrderState::Cancelled;
+    durable_tick(3 * policy_.live_poll_interval_ms);
+    EXPECT_FALSE(in_flight_.is_in_flight("HY-CANCEL"));
+    EXPECT_EQ(tracker_.count(), 0u);
+    EXPECT_EQ(truth_.net_qty_ticks(1), 40);
+    const auto final_tally = tally_recovered_orders(in_flight_, tracker_, restarted.recovered_checkpoints());
+    EXPECT_EQ(publisher.acked_frames(), 2u);
+    EXPECT_EQ(publisher.failed_appends(), 0u);
+    EXPECT_EQ(final_tally.resolved, 1u);
+    EXPECT_EQ(final_tally.unconfirmed, 0u);
+    EXPECT_EQ(sm.update(observe(restarted, applied), 3 * policy_.live_poll_interval_ms), RunState::Ready);
+}
+
+TEST_F(StartupRecoveryLogTest, DurableCancelRecoveryRejectsCurrentSymbolMismatch) {
+    const auto submit_rules = cancel_rules_for_test(1, 41, 2, 6, 8);
+    ClientOrderId cancel_alias{};
+    std::snprintf(cancel_alias.id, sizeof(cancel_alias.id), "%s", "HY-CANCEL-ALIAS");
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-CANCEL", 5000, 100, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-CANCEL", 5000, 100, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-CANCEL", 1, 555), 1002).acked());
+    }
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+        ASSERT_TRUE(sink.append_cancel_prepared("HY-CANCEL", cancel_alias, submit_rules, 1003).acked());
+    }
+
+    DurableAuditSink restarted(path_, *key_ring_, 1);
+    ASSERT_EQ(restarted.recovery_status(), RecoveryScanStatus::Recovered);
+    const auto wrong_symbol_rules = [](std::uint32_t symbol_id) {
+        auto rules = cancel_rules_for_test(symbol_id, 42, 4, 3, 7);
+        std::memset(rules.symbol, 0, sizeof(rules.symbol));
+        std::memcpy(rules.symbol, "ETHUSDT", sizeof("ETHUSDT") - 1);
+        return rules;
+    };
+    const RecoveryApplyResult applied = apply_recovery(
+        restarted.recovered_checkpoints(), in_flight_, to_reconcile_, truth_, fill_context_, wrong_symbol_rules);
+    EXPECT_EQ(applied.recovered, 1u);
+    EXPECT_EQ(applied.applied, 0u);
+    EXPECT_FALSE(applied.ok());
+    EXPECT_EQ(in_flight_.count(), 0u);
+    ReconcileIngress ingress{};
+    EXPECT_FALSE(to_reconcile_.try_pop(ingress));
+}
+
 // An order the exchange never answers about escalates to the operator after a few attempts. That
 // is exactly the case that must NOT become Ready, and the failure must be permanent.
 TEST_F(StartupRecoveryLogTest, AnOrderThatStaysUnknownTimesOutIntoStickyDegraded) {
@@ -1120,6 +1293,47 @@ TEST_F(DurableReconcileLogTest, SeveralRecoveredOrdersResolvedInOneTickEachGetTh
         EXPECT_EQ(life->in_flight.count(), 0u);
         EXPECT_EQ(publisher.acked_frames(), 3u) << "A: Ambiguous re-record + Cancelled; B: Cancelled";
         EXPECT_EQ(publisher.failed_appends(), 0u);
+    }
+    DurableAuditSink after(path_, *key_ring_, 1);
+    EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);
+    EXPECT_TRUE(after.recovered_checkpoints().empty());
+}
+
+TEST_F(DurableReconcileLogTest, RecoveredCancelRequestedPublishesFillProgressThenFinalExactlyOnce) {
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_TRUE(sink.append_durable(make_intent("HY-C", 100, 10, 1), 1000).acked());
+        ASSERT_TRUE(sink.append_durable(make_submitted("HY-C", 100, 10, 1), 1001).acked());
+        ASSERT_TRUE(sink.append_durable(make_accepted("HY-C", 1, 556), 1002).acked());
+        ASSERT_TRUE(sink.append_durable(make_partial_fill("HY-C", 1, 556, 4, 100), 1003).acked());
+        ASSERT_TRUE(sink.append_durable(make_cancel_requested("HY-C", 1, 556, 4, 100), 1004).acked());
+    }
+    {
+        DurableAuditSink sink(path_, *key_ring_, 1);
+        ASSERT_EQ(sink.recovery_status(), RecoveryScanStatus::Recovered);
+        ASSERT_EQ(sink.recovered_checkpoints().size(), 1u);
+        EXPECT_EQ(sink.recovered_checkpoints()[0].resulting_state, OrderState::CancelRequested);
+        auto life = std::make_unique<Life>();
+        recover(*life, sink);
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 4) << "recovery seeds the already-published cumulative fill once";
+        ReconcileDurablePublisher publisher(port_of(sink));
+
+        exchange_says(OrderState::CancelRequested, 6);
+        tick_life(*life, publisher, 0);
+
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 6) << "same-state progress publishes only 6 - 4 after its ACK";
+        EXPECT_EQ(publisher.acked_frames(), 1u);
+        EXPECT_TRUE(life->in_flight.is_in_flight("HY-C"));
+        ASSERT_NE(life->fill_context.find("HY-C"), nullptr);
+        EXPECT_EQ(life->fill_context.find("HY-C")->shadow.state, OrderState::CancelRequested);
+        EXPECT_EQ(life->fill_context.find("HY-C")->shadow.filled_qty_ticks, 6);
+
+        exchange_says(OrderState::Cancelled, 6);
+        tick_life(*life, publisher, policy_.live_poll_interval_ms);
+
+        EXPECT_EQ(life->truth.net_qty_ticks(1), 6) << "the terminal snapshot repeats cumulative 6 and adds nothing";
+        EXPECT_EQ(publisher.acked_frames(), 2u);
+        EXPECT_FALSE(life->in_flight.is_in_flight("HY-C"));
     }
     DurableAuditSink after(path_, *key_ring_, 1);
     EXPECT_EQ(after.recovery_status(), RecoveryScanStatus::Clean);

@@ -366,13 +366,13 @@ TEST(RestFreezeGuardClockToken, TheTokenIsMintedOnceAndItsTestHookIsNamedOnlyByT
 }
 
 TEST(RestFreezeGuardClockToken, EveryTimestampASignedRequestIsSignedWithWasIssuedByTheClientItself) {
-    // The private client signs in four places (account, order query, order submit, and signed_get_raw() -- the one signed GET of the offline
-    // operator tool, D5 R3b-1); each issues its own token just before. A fifth signing site that skipped the issue would not compile
+    // The private client signs in five places (account, order query, order submit, cancel, and signed_get_raw() -- the one signed GET of the offline
+    // operator tool, D5 R3b-1); each issues its own token just before. A sixth signing site that skipped the issue would not compile
     // (build_signed_query() takes only a token), and this keeps the two counts moving together.
     const SourceFile* f = find_source("include/hengyuan/binance_private_rest.hpp");
     ASSERT_NE(f, nullptr);
-    EXPECT_EQ(count_of(f->code, "build_signed_query("), 4u);
-    EXPECT_EQ(count_of(f->code, "issue_clock_ready_token("), 4u);
+    EXPECT_EQ(count_of(f->code, "build_signed_query("), 5u);
+    EXPECT_EQ(count_of(f->code, "issue_clock_ready_token("), 5u);
 }
 
 // --- D5 R3b-1: the raw GET of the offline operator tool stays a GET, and stays behind one door ---------------

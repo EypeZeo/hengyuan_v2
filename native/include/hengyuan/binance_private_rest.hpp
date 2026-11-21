@@ -58,6 +58,7 @@
 #include <hengyuan/live_submit_orchestrator.hpp>
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/order_tracker.hpp>
+#include <hengyuan/owner_cancel_approval.hpp>
 #include <hengyuan/rest_test_seam.hpp>
 #include <hengyuan/spot_rate_limit_budget.hpp>
 
@@ -84,6 +85,7 @@
 #endif
 
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -175,6 +177,7 @@ enum class PrivateRestError : std::uint8_t {
     ClockSkewTooLarge = 13,  // §2.2: the fetched offset exceeds the transport policy's recv window --
                               // not published (a broken local clock or a wrong serverTime)
     RateLimitExhausted = 14, // the local rate-limit budget refused this request: nothing was sent (L4 §7.4)
+    CancelNotAuthorized = 15,
 };
 
 enum class TlsHandshakeFailure : std::uint8_t {
@@ -388,6 +391,65 @@ inline bool is_valid_exchange_info_symbol(std::string_view s) noexcept {
         if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
     }
     return true;
+}
+
+struct SpotCancelIdentity {
+    std::int64_t exchange_order_id{0};
+    ClientOrderId cancel_client_order_id{};
+};
+
+struct SpotCancelResult {
+    QueryResult observation;
+    PrivateRestError error{PrivateRestError::None};
+};
+
+struct DurableSpotCancelResult {
+    AuditAppendResult prepared;
+    AuditAppendResult terminal;
+    SpotCancelResult exchange{QueryResult::not_sent(), PrivateRestError::None};
+    AuditAppendResult not_sent;
+};
+
+// Reserve the advertised weight before transport, including when the outcome is unknown.
+inline constexpr std::uint32_t kSpotCancelCallWeight = 1;
+
+namespace detail {
+
+inline bool valid_spot_cancel_identity(const OrderExpectation& expected, const SpotCancelIdentity& cancel) noexcept {
+    const auto& original = expected.client_order_id;
+    const auto& alias = cancel.cancel_client_order_id;
+    const auto& rules = expected.rules_snapshot_at_submit;
+    return cancel.exchange_order_id > 0 && !original.empty() && !alias.empty() &&
+           original.id[kClientOrderIdLen] == '\0' && alias.id[kClientOrderIdLen] == '\0' &&
+           original.view() != alias.view() && rules.symbol[kSymbolNameLen - 1] == '\0' &&
+           is_valid_exchange_info_symbol(rules.symbol_name()) && expected.order_type == OrderType::Limit &&
+           expected.intended_qty_ticks > 0 && expected.intended_price_ticks > 0 &&
+           (expected.side == OrderSide::Buy || expected.side == OrderSide::Sell);
+}
+
+}  // namespace detail
+
+// The signed DELETE uses both order identifiers and supplies a distinct, caller-owned alias.
+inline std::optional<CanonicalUnsignedQuery> build_spot_cancel_query(
+    const OrderExpectation& expected, const SpotCancelIdentity& cancel, std::int64_t recv_window_ms) noexcept {
+    if (!detail::valid_spot_cancel_identity(expected, cancel) || recv_window_ms <= 0 || recv_window_ms > 60'000) {
+        return std::nullopt;
+    }
+    std::array<char, 24> order_id{};
+    std::array<char, 8> window{};
+    const auto order_text = std::to_chars(order_id.data(), order_id.data() + order_id.size(), cancel.exchange_order_id);
+    const auto window_text = std::to_chars(window.data(), window.data() + window.size(), recv_window_ms);
+    if (order_text.ec != std::errc{} || window_text.ec != std::errc{}) return std::nullopt;
+    const std::pair<std::string_view, std::string_view> params[] = {
+        {"symbol", expected.rules_snapshot_at_submit.symbol_name()},
+        {"orderId", {order_id.data(), static_cast<std::size_t>(order_text.ptr - order_id.data())}},
+        {"origClientOrderId", expected.client_order_id.view()},
+        {"newClientOrderId", cancel.cancel_client_order_id.view()},
+        {"recvWindow", {window.data(), static_cast<std::size_t>(window_text.ptr - window.data())}},
+    };
+    auto [error, query] = build_canonical_query(params);
+    if (error != QuerySigningError::Ok) return std::nullopt;
+    return query;
 }
 
 // RFC 3986 percent-encoding, used only for the `symbols` JSON-array query parameter below --
@@ -639,8 +701,11 @@ inline PrivateRestError parse_exchange_info_response(std::string_view body,
 // QueryOutcome::Inconclusive. A richer error channel would be dead code; the caller
 // (query_order() below) never distinguishes any of these cases from one another, matching
 // §6.1.2's own "every one of the following collapses to Inconclusive" framing.
-inline QueryResult parse_order_query_response(std::string_view body,
-                                               const OrderExpectation& expected) noexcept {
+namespace detail {
+
+inline QueryResult parse_spot_order_observation(std::string_view body, const OrderExpectation& expected,
+                                                const SpotCancelIdentity* cancel,
+                                                bool cancel_response = false) noexcept {
     auto padded = simdjson::padded_string(body);
     simdjson::ondemand::parser parser;
     simdjson::ondemand::document doc;
@@ -670,7 +735,28 @@ inline QueryResult parse_order_query_response(std::string_view body,
     // lookup. Any mismatch is exactly as untrustworthy as a schema failure -- a response that
     // identifies itself by clientOrderId but disagrees on symbol/side/price/qty/timeInForce is
     // not evidence about THIS order.
-    if (client_order_id_sv != expected.client_order_id.view()) return {};
+    if (cancel) {
+        std::int64_t order_list_id = 0;
+        if (doc["orderListId"].get_int64().get(order_list_id) != simdjson::SUCCESS ||
+            order_list_id != -1 || order_id != cancel->exchange_order_id) {
+            return {};
+        }
+        const bool original_match = client_order_id_sv == expected.client_order_id.view();
+        const bool canceled_with_alias = client_order_id_sv == cancel->cancel_client_order_id.view() &&
+                                         status_sv == "CANCELED";
+        if (cancel_response) {
+            std::string_view original_id;
+            if (!canceled_with_alias ||
+                doc["origClientOrderId"].get_string().get(original_id) != simdjson::SUCCESS ||
+                original_id != expected.client_order_id.view()) {
+                return {};
+            }
+        } else if (!original_match && !canceled_with_alias) {
+            return {};
+        }
+    } else if (client_order_id_sv != expected.client_order_id.view()) {
+        return {};
+    }
     if (symbol_sv != expected.rules_snapshot_at_submit.symbol_name()) return {};
     if (side_sv != std::string_view(order_side_name(expected.side))) return {};
     // OrderType is frozen to exactly one member (Limit, ADR-019 D7 M7) -- no parser needed,
@@ -704,6 +790,12 @@ inline QueryResult parse_order_query_response(std::string_view body,
                                             executed_qty_ticks)) {
         return {};
     }
+    if (cancel) {
+        if (executed_qty_ticks < 0 || executed_qty_ticks > expected.intended_qty_ticks) return {};
+        if ((confirmed_state == OrderState::Filled) != (executed_qty_ticks == expected.intended_qty_ticks)) return {};
+        if (confirmed_state == OrderState::Accepted && executed_qty_ticks != 0) return {};
+        if (confirmed_state == OrderState::PartialFill && executed_qty_ticks == 0) return {};
+    }
 
     QueryResult result{};
     result.outcome = QueryOutcome::Found;
@@ -711,6 +803,11 @@ inline QueryResult parse_order_query_response(std::string_view body,
     result.exchange_order_id = order_id;
 
     if (executed_qty_ticks == 0) {
+        std::int64_t quote_ticks = 0;
+        if (cancel && (!parse_decimal_to_ticks_with_scale(cumulative_quote_qty_sv,
+                              expected.rules_snapshot_at_submit.quote_scale, quote_ticks) || quote_ticks != 0)) {
+            return {};
+        }
         result.filled_qty_ticks = 0;
         result.avg_fill_price_ticks = 0;
         return result;
@@ -730,10 +827,24 @@ inline QueryResult parse_order_query_response(std::string_view body,
                                  avg_fill_price_ticks)) {
         return {};  // overflow, or a scale combination too extreme to represent -- Inconclusive
     }
+    if (cancel && avg_fill_price_ticks <= 0) return {};
 
     result.filled_qty_ticks = executed_qty_ticks;
     result.avg_fill_price_ticks = avg_fill_price_ticks;
     return result;
+}
+
+}  // namespace detail
+
+inline QueryResult parse_order_query_response(std::string_view body, const OrderExpectation& expected) noexcept {
+    return detail::parse_spot_order_observation(body, expected, nullptr);
+}
+
+// Only the success body of a single ordinary order cancel can become a Canceled observation.
+inline QueryResult parse_spot_cancel_response(std::string_view body, const OrderExpectation& expected,
+                                               const SpotCancelIdentity& cancel) noexcept {
+    if (!detail::valid_spot_cancel_identity(expected, cancel)) return {};
+    return detail::parse_spot_order_observation(body, expected, &cancel, true);
 }
 
 // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §4.2: schema + field-match validation for a
@@ -1084,9 +1195,15 @@ fetch_server_time_coro(EndpointPermit permit, RateLimitPermit budget, PrivateRes
 // passes http::verb::post -- Binance's POST /api/v3/order accepts the fully-signed query
 // string exactly like GET does (no request body needed), so this is the only change a POST
 // caller needs; the body stays http::empty_body for both verbs.
+struct CancelWriteCheck {
+    bool (*permits)(const void*) noexcept{nullptr};
+    const void* context{nullptr};
+};
+
 inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_body_coro(
     EndpointPermit permit, RateLimitPermit budget, std::string target, std::string api_key,
-    PrivateRestConfig cfg, RestTestSeam seam, http::verb verb = http::verb::get) {
+    PrivateRestConfig cfg, RestTestSeam seam, http::verb verb = http::verb::get,
+    CancelWriteCheck cancel_check = {}) {
     static_cast<void>(budget);  // the proof is the parameter itself: see RateLimitPermit
     using namespace boost::asio::experimental::awaitable_operators;
 
@@ -1145,6 +1262,9 @@ inline net::awaitable<std::variant<std::string, PrivateRestError>> fetch_signed_
         // there is no decompression-bomb surface to bound in the first place.
         req.set("X-MBX-APIKEY", api_key);
 
+        if (cancel_check.permits && !cancel_check.permits(cancel_check.context)) {
+            co_return PrivateRestError::CancelNotAuthorized;
+        }
         current_stage = PrivateRestError::Write;
         beast::get_lowest_layer(stream).expires_after(std::chrono::milliseconds(cfg.effective_write_timeout_ms()));
         co_await http::async_write(stream, req, net::use_awaitable);
@@ -1722,6 +1842,23 @@ public:
     // the fail-closed direction is the one that counts.
     QueryResult query_order(const OrderExpectation& expected,
                              const PrivateRestConfig& cfg) noexcept {
+        if (expected.pending_cancel.present()) {
+            return query_spot_cancel_order(
+                expected, {expected.cancel_exchange_order_id, expected.pending_cancel.alias}, cfg);
+        }
+        return query_order_impl(expected, cfg, nullptr);
+    }
+
+    // Query by the immutable exchange ID after a cancel might have replaced the original client ID.
+    QueryResult query_spot_cancel_order(const OrderExpectation& expected, const SpotCancelIdentity& cancel,
+                                       const PrivateRestConfig& cfg) noexcept {
+        if (!detail::valid_spot_cancel_identity(expected, cancel)) return QueryResult::not_sent();
+        return query_order_impl(expected, cfg, &cancel);
+    }
+
+private:
+    QueryResult query_order_impl(const OrderExpectation& expected, const PrivateRestConfig& cfg,
+                                 const SpotCancelIdentity* cancel) noexcept {
         if (!creds_) return QueryResult::not_sent();
         const auto permit = endpoint_permit(ResponseKind::SignedJson);
         if (!permit) return QueryResult::not_sent();  // nothing sent (R-10)
@@ -1758,8 +1895,17 @@ public:
             if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(recv_window_buf)) {
                 return QueryResult::not_sent();
             }
+            std::array<char, 24> order_id{};
+            std::pair<std::string_view, std::string_view> order_param{
+                "origClientOrderId", expected.client_order_id.view()};
+            if (cancel) {
+                const auto id = std::to_chars(order_id.data(), order_id.data() + order_id.size(),
+                                              cancel->exchange_order_id);
+                if (id.ec != std::errc{}) return QueryResult::not_sent();
+                order_param = {"orderId", {order_id.data(), static_cast<std::size_t>(id.ptr - order_id.data())}};
+            }
             const std::pair<std::string_view, std::string_view> params[] = {
-                {"origClientOrderId", expected.client_order_id.view()},
+                order_param,
                 {"recvWindow", std::string_view(recv_window_buf, static_cast<std::size_t>(n))},
                 {"symbol", expected.rules_snapshot_at_submit.symbol_name()},
             };
@@ -1794,12 +1940,235 @@ public:
                 return {};  // network/HTTP-status/JSON-transport failure -> Inconclusive
             }
 
-            return parse_order_query_response(std::get<std::string>(outcome), expected);
+            return detail::parse_spot_order_observation(std::get<std::string>(outcome), expected, cancel);
         } catch (...) {
             return {};  // see the noexcept note above -- never let this method throw
         }
     }
 
+public:
+    // One Testnet attempt. The caller retains the immutable order identity and alias for reconciliation.
+    SpotCancelResult cancel_testnet_spot_order(const OrderExpectation& expected, const SpotCancelIdentity& cancel,
+                                              const PrivateRestConfig& cfg) noexcept {
+        return cancel_spot_order_once(expected, cancel, cfg, nullptr);
+    }
+
+    DurableSpotCancelResult cancel_recovered_testnet_order(
+        DurableAuditSink& sink, std::string_view coid, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        return cancel_recovered_order(sink, coid, alias, rules, now_ms, cfg, nullptr);
+    }
+
+    // Runs on the execution owner after it obtains a fresh, exclusive open of the order log.
+    // The authority and kill switch are owned by that same caller for the duration of the send.
+    DurableSpotCancelResult cancel_authorized_recovered_order(
+        DurableAuditSink& sink, const AutomaticCancelRequest& request, const OwnerCancelAuthority& authority,
+        const KillSwitch& kill_switch, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        if (!request.handle.valid() || request.handle.generation == 0 ||
+            request.client_order_id.id[kClientOrderIdLen] != '\0') {
+            return {{}, {}, {QueryResult::not_sent(), PrivateRestError::InvalidConfig}, {}};
+        }
+        const CancelAuthorization authorization{request, authority, kill_switch, clock_pub_};
+        return cancel_recovered_order(sink, request.client_order_id.view(), alias, rules, now_ms, cfg, &authorization);
+    }
+
+    // Ownership transfers only after the trading loop and its producers have stopped.
+    DurableSpotCancelResult cancel_handed_off_order(
+        std::unique_ptr<DurableAuditSink> sink, const AutomaticCancelRequest& request, const OwnerCancelAuthority& authority,
+        const KillSwitch& kill_switch, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg) noexcept {
+        if (!sink || !sink->prepare_cancel_handoff()) {
+            return {{}, {}, {QueryResult::not_sent(), PrivateRestError::InvalidConfig}, {}};
+        }
+        return cancel_authorized_recovered_order(*sink, request, authority, kill_switch, alias, rules, now_ms, cfg);
+    }
+
+private:
+    struct CancelAuthorization {
+        const AutomaticCancelRequest& request;
+        const OwnerCancelAuthority& authority;
+        const KillSwitch& kill_switch;
+        const ClockOffsetPublisher& clock;
+
+        bool permits() const noexcept {
+            return emergency_cancel_requested(kill_switch.state()) &&
+                   request.kill_revision == kill_switch.revision() &&
+                   authority.permits(request, clock, fetch_clock_pair());
+        }
+
+        static bool check_write(const void* context) noexcept {
+            return static_cast<const CancelAuthorization*>(context)->permits();
+        }
+    };
+
+    SpotCancelResult cancel_spot_order_once(const OrderExpectation& expected, const SpotCancelIdentity& cancel,
+                                           const PrivateRestConfig& cfg,
+                                           const CancelAuthorization* authorization) noexcept {
+        const auto not_sent = [](PrivateRestError error) {
+            return SpotCancelResult{QueryResult::not_sent(), error};
+        };
+        if (!rate_limiter_ || (!authorization && binding_.environment() != BinanceEnvironment::Testnet)) {
+            return not_sent(PrivateRestError::InvalidConfig);
+        }
+        if (authorization && !authorization->permits()) return not_sent(PrivateRestError::CancelNotAuthorized);
+        const auto permit = endpoint_permit(ResponseKind::SignedJson);
+        if (!permit) return not_sent(PrivateRestError::InvalidConfig);
+        if (!creds_) return not_sent(PrivateRestError::SigningFailed);
+
+        bool started = false;
+        try {
+            const auto query = build_spot_cancel_query(expected, cancel, cfg.recv_window_ms);
+            if (!query) return not_sent(PrivateRestError::InvalidConfig);
+            const auto clock_token = issue_clock_ready_token(clock_pub_, fetch_clock_pair());
+            if (!clock_token) return not_sent(PrivateRestError::ClockNotFresh);
+
+            auto [sign_error, signed_query] = build_signed_query(*creds_, *query, *clock_token);
+            if (sign_error != QuerySigningError::Ok) return not_sent(PrivateRestError::SigningFailed);
+
+            std::array<char, kApiKeyLen> key_buf{};
+            std::size_t key_len = 0;
+            if (!creds_->copy_api_key(key_buf, key_len) || key_len == 0) {
+                return not_sent(PrivateRestError::SigningFailed);
+            }
+
+            const std::string target = "/api/v3/order?" + std::string(signed_query.wire_bytes());
+            const auto budget = rate_limiter_->reserve_weight_only_explicit(RateLimitLane::Emergency,
+                                                                            kSpotCancelCallWeight);
+            if (!budget) return not_sent(PrivateRestError::RateLimitExhausted);
+
+            net::io_context ioc;
+            std::variant<std::string, PrivateRestError> outcome = PrivateRestError::Read;
+            const detail::CancelWriteCheck final_check = authorization
+                ? detail::CancelWriteCheck{&CancelAuthorization::check_write, authorization} : detail::CancelWriteCheck{};
+            net::co_spawn(
+                ioc,
+                detail::fetch_signed_body_coro(*permit, *budget, target, std::string(key_buf.data(), key_len),
+                                               cfg, test_seam_, http::verb::delete_, final_check),
+                [&outcome](std::exception_ptr eptr, std::variant<std::string, PrivateRestError> answer) {
+                    if (eptr) std::rethrow_exception(eptr);
+                    outcome = std::move(answer);
+                });
+            started = true;
+            ioc.run();
+
+            if (const auto* error = std::get_if<PrivateRestError>(&outcome)) {
+                if (*error == PrivateRestError::Resolve || *error == PrivateRestError::Connect ||
+                    *error == PrivateRestError::TlsHandshake || *error == PrivateRestError::CancelNotAuthorized) {
+                    return not_sent(*error);
+                }
+                return {{}, *error};
+            }
+
+            const auto observation = parse_spot_cancel_response(std::get<std::string>(outcome), expected, cancel);
+            const auto error = observation.outcome == QueryOutcome::Found
+                                   ? PrivateRestError::None : PrivateRestError::MalformedResponse;
+            return {observation, error};
+        } catch (...) {
+            return started ? SpotCancelResult{{}, PrivateRestError::Read}
+                           : not_sent(PrivateRestError::InvalidConfig);
+        }
+    }
+
+    // Verify the account and the recovered working order under the exclusive store open.
+    // A durable preparation prevents a second DELETE, even if the first result is unknown.
+    DurableSpotCancelResult cancel_recovered_order(
+        DurableAuditSink& sink, std::string_view coid, const ClientOrderId& alias, const SymbolRules& rules,
+        std::int64_t now_ms, const PrivateRestConfig& cfg, const CancelAuthorization* authorization) noexcept {
+        DurableSpotCancelResult out{};
+        out.exchange = {QueryResult::not_sent(), PrivateRestError::InvalidConfig};
+        const auto environment = binding_.environment() == BinanceEnvironment::Testnet
+                                 ? StoreEnvironment::Testnet : StoreEnvironment::Production;
+        if ((!authorization && environment != StoreEnvironment::Testnet) || !rate_limiter_ || !sink.is_open() ||
+            sink.open_mode() != AuditSinkOpenMode::Trading || sink.fenced() || sink.appended_since_recovery_ ||
+            rules.symbol[kSymbolNameLen - 1] != '\0' || now_ms <= 0) return out;
+        if (sink.recovery_status() != RecoveryScanStatus::Recovered) return out;
+        const auto store_binding = sink.read_binding();
+        if (store_binding.status != StoreBindingStatus::Bound ||
+            store_binding.binding.environment != environment) return out;
+        if (authorization) {
+            const auto& request = authorization->request;
+            if (request.subject.environment != environment ||
+                request.subject.account_uid != store_binding.binding.account_uid ||
+                request.subject.store_uuid_lo != sink.store_uuid_lo() ||
+                request.subject.store_uuid_hi != sink.store_uuid_hi()) return out;
+            if (!authorization->permits()) {
+                out.exchange.error = PrivateRestError::CancelNotAuthorized;
+                return out;
+            }
+            if (rules.symbol_name() != std::string_view(request.symbol)) return out;
+        }
+        const auto entries = sink.recovered_checkpoints();
+        const auto found = std::find_if(entries.begin(), entries.end(),
+                                        [coid](const auto& cp) { return cp.client_order_id.view() == coid; });
+        if (found == entries.end() || found->pending_cancel.present() || found->exchange_order_id_conflict ||
+            !cancel_prepared::working(found->resulting_state) || found->mode != ExecutionMode::Live) return out;
+
+        if (authorization && (found->exchange_order_id != authorization->request.exchange_order_id ||
+                              found->symbol_id != authorization->request.symbol_id)) return out;
+
+        OrderExpectation expected = OrderExpectation::from(checkpoint_to_order_record(*found));
+        expected.rules_snapshot_at_submit = rules;
+        const SpotCancelIdentity identity{found->exchange_order_id, alias};
+        if (!detail::valid_spot_cancel_identity(expected, identity) ||
+            !cancel_prepared::valid_alias(alias.view())) return out;
+        try {
+            AccountSnapshot account;
+            std::uint64_t uid = 0;
+            const auto account_error = fetch_account(account, uid, cfg);
+            if (account_error != PrivateRestError::None) {
+                out.exchange.error = account_error;
+                return out;
+            }
+            if (!account.can_trade() || judge_store_binding(store_binding, environment, uid) !=
+                                           BindingJudgement::Match) return out;
+
+            const auto working = query_spot_cancel_order(expected, identity, cfg);
+            if (working.outcome != QueryOutcome::Found || working.confirmed_state != found->resulting_state ||
+                working.filled_qty_ticks != found->filled_qty_ticks ||
+                working.avg_fill_price_ticks != found->avg_fill_price_ticks) return out;
+
+            if (authorization && !authorization->permits()) {
+                out.exchange.error = PrivateRestError::CancelNotAuthorized;
+                return out;
+            }
+            out.prepared = sink.append_cancel_prepared(coid, alias, rules, now_ms);
+            if (!out.prepared.acked()) return out;
+
+            out.exchange = cancel_spot_order_once(expected, identity, cfg, authorization);
+            const auto& observation = out.exchange.observation;
+            if (observation.outcome == QueryOutcome::NotSent) {
+                out.not_sent = sink.append_cancel_not_sent(now_ms);
+                return out;
+            }
+            if (observation.outcome != QueryOutcome::Found) return out;
+            if (observation.filled_qty_ticks < working.filled_qty_ticks) {
+                out.exchange = {{}, PrivateRestError::MalformedResponse};
+                return out;
+            }
+
+            AuditRecord terminal{};
+            terminal.timestamp_ms = now_ms;
+            terminal.event_type = AuditEventType::OrderCancelled;
+            terminal.mode = ExecutionMode::Live;
+            terminal.symbol_id = expected.symbol_id;
+            terminal.set_client_order_id(coid);
+            terminal.exchange_order_id = identity.exchange_order_id;
+            terminal.price_ticks = expected.intended_price_ticks;
+            terminal.qty_ticks = expected.intended_qty_ticks;
+            terminal.resulting_state = observation.confirmed_state;
+            terminal.filled_qty_ticks = observation.filled_qty_ticks;
+            terminal.avg_fill_price_ticks = observation.avg_fill_price_ticks;
+            terminal.side = expected.side;
+            out.terminal = sink.append_durable(terminal, now_ms);
+            return out;
+        } catch (...) {
+            out.exchange = {out.prepared.acked() ? QueryResult{} : QueryResult::not_sent(), PrivateRestError::Read};
+            return out;
+        }
+    }
+
+public:
     // SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md §2: signed, single attempt -- no internal retry
     // (the same "retry loop lives in the caller, not here" discipline query_order() already
     // follows; SubmitPort::call() is invoked exactly once per orchestrate_submit() attempt).
@@ -2013,11 +2382,9 @@ private:
     }
 
     // SAFE-01 slice 4 (L4 §7.4): the local rate-limit budget for one request, as the RateLimitPermit the
-    // network coroutines require -- so a request path that skipped the accounting does not compile. Every
-    // method below that is not POST /api/v3/order charges the Reconciliation lane, the one
-    // spot_rate_limit_budget.hpp reserves for GetOrder polling and the GetAccount/GetExchangeInfo refreshes
-    // (the clock sync is rare and tiny, and the Emergency lane stays reachable only
-    // for emergency exits). nullopt = the lane refused: the caller returns RateLimitExhausted/NotSent and
+    // network coroutines require. Read methods here charge the Reconciliation lane used for order polling,
+    // account and exchange-info refreshes, and clock synchronization. Cancellation reserves the Emergency
+    // lane separately. nullopt = the lane refused: the caller returns RateLimitExhausted/NotSent and
     // nothing has been resolved or connected. With no tracker wired in (this class's pre-H1 default)
     // the permit says so explicitly: Unaccounted. The tracker has no internal synchronization and is
     // owned by the hot/submit thread (see SpotRateLimitTracker): like query_order()/submit_order(), these

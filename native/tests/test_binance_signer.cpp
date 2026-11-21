@@ -3,10 +3,27 @@
 // SIMULATION ONLY — no real API keys, no network.
 #include <gtest/gtest.h>
 #include <hengyuan/binance_signer.hpp>
+#include <hengyuan/owner_cancel_approval.hpp>
+#include <hengyuan/spot_cancel_control.hpp>
+#include <hengyuan/store_binding_writer.hpp>
+#include "binance_clock_sync_test_hooks.hpp"
 #include "binance_signer_test_hooks.hpp"
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <openssl/evp.h>
+#include <openssl/x509.h>
+#include <array>
+#include <cstring>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 using hy::BinanceSigner;
 using hy::BinanceSignerTestHooks;
@@ -45,6 +62,339 @@ void stub_unlock(void*, std::size_t) noexcept {
 }
 
 }  // namespace
+
+namespace {
+
+struct P256Fixture {
+    EVP_PKEY* key{nullptr};
+    std::vector<unsigned char> public_der;
+
+    P256Fixture() {
+        key = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "prime256v1");
+        if (!key) return;
+        const int size = i2d_PUBKEY(key, nullptr);
+        if (size <= 0) return;
+        public_der.resize(static_cast<std::size_t>(size));
+        unsigned char* cursor = public_der.data();
+        if (i2d_PUBKEY(key, &cursor) != size) public_der.clear();
+    }
+
+    ~P256Fixture() { EVP_PKEY_free(key); }
+    P256Fixture(const P256Fixture&) = delete;
+    P256Fixture& operator=(const P256Fixture&) = delete;
+
+    std::vector<unsigned char> sign(std::span<const std::byte> payload) const {
+        std::vector<unsigned char> out;
+        if (!key) return out;
+        EVP_MD_CTX* context = EVP_MD_CTX_new();
+        if (!context) return out;
+        if (EVP_DigestSignInit(context, nullptr, EVP_sha256(), nullptr, key) != 1 ||
+            EVP_DigestSignUpdate(context, payload.data(), payload.size()) != 1) {
+            EVP_MD_CTX_free(context);
+            return out;
+        }
+        std::size_t size = 0;
+        if (EVP_DigestSignFinal(context, nullptr, &size) != 1) {
+            EVP_MD_CTX_free(context);
+            return out;
+        }
+        out.resize(size);
+        if (EVP_DigestSignFinal(context, out.data(), &size) != 1) out.clear();
+        else out.resize(size);
+        EVP_MD_CTX_free(context);
+        return out;
+    }
+};
+
+void fresh_clock(hy::ClockOffsetPublisher& publisher) {
+    hy::ClockOffsetSnapshot snapshot{};
+    snapshot.system_at_fetch_ms = 1'000'000;
+    snapshot.steady_at_fetch_ms = 2'000'000;
+    snapshot.error_bound_ms = 0;
+    EXPECT_TRUE(publisher.publish(snapshot));
+}
+
+hy::ClockPairSample clock_now() {
+    return hy::ClockPairSampleTestHooks::make(1'000'000, 2'000'000);
+}
+
+hy::CancelApproval approval_for(const hy::CancelSubject& subject, std::uint64_t serial,
+                                std::int64_t not_after) {
+    hy::CancelApproval approval{};
+    approval.subject = subject;
+    std::strncpy(approval.symbol, "BTCUSDT", sizeof(approval.symbol) - 1);
+    approval.serial = serial;
+    approval.not_after_ms = not_after;
+    return approval;
+}
+
+hy::AutomaticCancelRequest request_for(const hy::CancelApproval& approval) {
+    hy::AutomaticCancelRequest request{};
+    request.subject = approval.subject;
+    std::memcpy(request.symbol, approval.symbol, sizeof(request.symbol));
+    request.approval_serial = approval.serial;
+    request.approval_not_after_ms = approval.not_after_ms;
+    return request;
+}
+
+std::span<const std::byte> grant_bytes(const hy::OwnerCancelGrantBytes& grant) {
+    return std::span<const std::byte>(grant.data(), grant.size());
+}
+
+bool write_binary_file(const std::string& path, std::span<const std::byte> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return output.good();
+}
+
+void remove_enrollment_store_files(const std::string& log_path, const std::string& kek_path,
+                                   const std::string& wrapped_keys_path) {
+    for (const auto& path : {
+             log_path,
+             log_path + ".lock",
+             log_path + ".tip",
+             log_path + ".tip.tmp",
+             log_path + ".keyrotations",
+             log_path + ".keyrotations.lock",
+             log_path + ".keyrotations.tip",
+             log_path + ".keyrotations.tip.tmp",
+             log_path + ".storeid",
+             log_path + ".storeid.lock",
+             log_path + ".storeid.tip",
+             log_path + ".storeid.tip.tmp",
+             log_path + ".binding.lock",
+             log_path + ".binding.tip",
+             log_path + ".binding.tip.tmp",
+             log_path + ".owner-cancel.pub",
+             kek_path,
+             wrapped_keys_path,
+         }) {
+        std::remove(path.c_str());
+    }
+}
+
+struct EnrollmentStoreFixture {
+    std::string log_path;
+    std::string kek_path;
+    std::string wrapped_keys_path;
+    std::array<std::byte, hy::kKekSize> kek{};
+    std::uint32_t audit_key_id{1};
+
+    static std::string new_prefix() {
+        static std::uint64_t sequence = 0;
+        const auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        return (std::filesystem::temp_directory_path() /
+                ("hy_owner_cancel_enrollment_" + std::to_string(now) + "_" +
+                 std::to_string(++sequence)))
+            .string();
+    }
+
+    explicit EnrollmentStoreFixture(std::string label) {
+        const std::string prefix = new_prefix() + "_" + std::move(label);
+        log_path = prefix + ".log";
+        kek_path = prefix + ".kek";
+        wrapped_keys_path = prefix + ".keys";
+        remove_enrollment_store_files(log_path, kek_path, wrapped_keys_path);
+    }
+
+    ~EnrollmentStoreFixture() {
+        remove_enrollment_store_files(log_path, kek_path, wrapped_keys_path);
+    }
+
+    EnrollmentStoreFixture(const EnrollmentStoreFixture&) = delete;
+    EnrollmentStoreFixture& operator=(const EnrollmentStoreFixture&) = delete;
+
+    hy::spot_cancel_control::StoreFiles files() const {
+        return {log_path, audit_key_id, kek_path, wrapped_keys_path};
+    }
+
+    bool create_bound_store(hy::StoreEnvironment environment, std::uint64_t account_uid) {
+        for (std::size_t i = 0; i < kek.size(); ++i) {
+            kek[i] = static_cast<std::byte>(0x70 + i);
+        }
+        hy::KeyRing writer_ring(std::span<const std::byte, hy::kKekSize>(kek.data(), kek.size()));
+        std::array<std::byte, hy::kKeyBlockSize> plaintext{};
+        for (std::size_t i = 0; i < plaintext.size(); ++i) {
+            plaintext[i] = static_cast<std::byte>(0x20 + i);
+        }
+        hy::WrappedKeyRecord wrapped{};
+        if (writer_ring.add_key(audit_key_id, plaintext, wrapped) != hy::KeyRingAddStatus::Ok) return false;
+        const auto wrapped_file = hy::encode_audit_key_file({&wrapped, 1});
+        if (!write_binary_file(kek_path, std::span<const std::byte>(kek.data(), kek.size())) ||
+            !write_binary_file(wrapped_keys_path, wrapped_file)) return false;
+#ifndef _WIN32
+        std::error_code permission_error;
+        std::filesystem::permissions(kek_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, permission_error);
+        if (permission_error) return false;
+#endif
+
+        hy::DurableAuditSink sink(log_path, writer_ring, audit_key_id);
+        if (!sink.is_open() || sink.fenced()) return false;
+        return hy::ensure_store_binding(sink, log_path, writer_ring, environment, account_uid, 1'000) ==
+               hy::EnsureBindingStatus::BoundNew;
+    }
+
+};
+
+}  // namespace
+
+TEST(OwnerCancelApproval, InstallsSignedCanonicalGrantAndPermitsMatchingRequest) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+    const hy::StoreBinding binding{hy::StoreEnvironment::Testnet, 42, 100};
+    auto authority = hy::OwnerCancelAuthority::create(binding, 7, 8, 11, fixture.public_der, 60'000);
+    ASSERT_NE(authority, nullptr);
+    const auto approval = approval_for(authority->subject(), 1, 1'030'000);
+    const auto grant = authority->signing_payload("BTCUSDT", approval.serial, approval.not_after_ms);
+    ASSERT_TRUE(grant.has_value());
+    const auto signature = fixture.sign(grant_bytes(*grant));
+    ASSERT_FALSE(signature.empty());
+    hy::ClockOffsetPublisher publisher;
+    fresh_clock(publisher);
+    EXPECT_EQ(authority->install(grant_bytes(*grant), signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::Installed);
+    EXPECT_TRUE(authority->permits(request_for(approval), publisher, clock_now()));
+    auto config = authority->config();
+    const auto installed = config.approvals.read("BTCUSDT");
+    ASSERT_TRUE(installed.has_value());
+    EXPECT_EQ(installed->serial, approval.serial);
+}
+
+TEST(OwnerCancelApproval, RejectsPayloadTamperingAndWrongKeyId) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    const hy::StoreBinding binding{hy::StoreEnvironment::Testnet, 42, 100};
+    auto authority = hy::OwnerCancelAuthority::create(binding, 7, 8, 11, fixture.public_der, 60'000);
+    ASSERT_NE(authority, nullptr);
+    const auto approval = approval_for(authority->subject(), 1, 1'030'000);
+    auto grant = hy::encode_owner_cancel_grant(approval, 11);
+    ASSERT_TRUE(grant.has_value());
+    const auto signature = fixture.sign(grant_bytes(*grant));
+    ASSERT_FALSE(signature.empty());
+    hy::ClockOffsetPublisher publisher;
+    fresh_clock(publisher);
+    auto tampered = *grant;
+    tampered[0] ^= std::byte{1};
+    EXPECT_EQ(authority->install(grant_bytes(tampered), signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::MalformedGrant);
+    const auto modified_grant = authority->signing_payload("ETHUSDT", approval.serial, approval.not_after_ms);
+    ASSERT_TRUE(modified_grant.has_value());
+    EXPECT_EQ(authority->install(*modified_grant, signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::InvalidSignature);
+    P256Fixture other_key;
+    ASSERT_NE(other_key.key, nullptr);
+    const auto wrong_key_signature = other_key.sign(*grant);
+    ASSERT_FALSE(wrong_key_signature.empty());
+    EXPECT_EQ(authority->install(*grant, wrong_key_signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::InvalidSignature);
+    hy::ClockOffsetPublisher unsynchronized;
+    EXPECT_EQ(authority->install(*grant, signature, unsynchronized, clock_now()),
+              hy::OwnerCancelInstallResult::ClockUnavailable);
+    ASSERT_FALSE(authority->config().approvals.read("BTCUSDT").has_value());
+    auto wrong_key = hy::encode_owner_cancel_grant(approval, 12);
+    ASSERT_TRUE(wrong_key.has_value());
+    const auto wrong_signature = fixture.sign(grant_bytes(*wrong_key));
+    EXPECT_EQ(authority->install(grant_bytes(*wrong_key), wrong_signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::WrongScope);
+}
+
+TEST(OwnerCancelApproval, EnforcesSerialWatermarkRevocationAndExpiration) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    const hy::StoreBinding binding{hy::StoreEnvironment::Testnet, 42, 100};
+    auto authority = hy::OwnerCancelAuthority::create(binding, 7, 8, 11, fixture.public_der, 60'000);
+    ASSERT_NE(authority, nullptr);
+    hy::ClockOffsetPublisher publisher;
+    fresh_clock(publisher);
+    const auto first = approval_for(authority->subject(), 2, 1'030'000);
+    auto first_grant = hy::encode_owner_cancel_grant(first, 11);
+    ASSERT_TRUE(first_grant.has_value());
+    const auto first_signature = fixture.sign(grant_bytes(*first_grant));
+    EXPECT_EQ(authority->install(grant_bytes(*first_grant), first_signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::Installed);
+    authority->revoke(2);
+    EXPECT_FALSE(authority->permits(request_for(first), publisher, clock_now()));
+    EXPECT_EQ(authority->install(grant_bytes(*first_grant), first_signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::StaleSerial);
+    const auto expired = approval_for(authority->subject(), 3, 999'999);
+    auto expired_grant = hy::encode_owner_cancel_grant(expired, 11);
+    ASSERT_TRUE(expired_grant.has_value());
+    const auto expired_signature = fixture.sign(grant_bytes(*expired_grant));
+    EXPECT_EQ(authority->install(grant_bytes(*expired_grant), expired_signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::InvalidDeadline);
+}
+
+TEST(OwnerCancelApproval, FreshAuthorityUsesDifferentActivationScope) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    const hy::StoreBinding binding{hy::StoreEnvironment::Testnet, 42, 100};
+    auto first = hy::OwnerCancelAuthority::create(binding, 7, 8, 11, fixture.public_der, 60'000);
+    auto second = hy::OwnerCancelAuthority::create(binding, 7, 8, 11, fixture.public_der, 60'000);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_NE(first->subject().activation_id, second->subject().activation_id);
+    const auto approval = approval_for(first->subject(), 1, 1'030'000);
+    auto grant = hy::encode_owner_cancel_grant(approval, 11);
+    ASSERT_TRUE(grant.has_value());
+    const auto signature = fixture.sign(grant_bytes(*grant));
+    hy::ClockOffsetPublisher publisher;
+    fresh_clock(publisher);
+    EXPECT_EQ(second->install(grant_bytes(*grant), signature, publisher, clock_now()),
+              hy::OwnerCancelInstallResult::WrongScope);
+}
+
+TEST(OwnerCancelEnrollment, BindsGeneratedP256KeyToOneProductionStoreExactlyOnce) {
+    P256Fixture fixture;
+    ASSERT_NE(fixture.key, nullptr);
+    ASSERT_FALSE(fixture.public_der.empty());
+
+    const std::string der_path = EnrollmentStoreFixture::new_prefix() + ".owner.der";
+    ASSERT_TRUE(write_binary_file(
+        der_path, std::span<const std::byte>(reinterpret_cast<const std::byte*>(fixture.public_der.data()),
+                                             fixture.public_der.size())));
+
+    EnrollmentStoreFixture first("first");
+    EnrollmentStoreFixture second("second");
+    constexpr auto environment = hy::StoreEnvironment::Production;
+    constexpr std::uint64_t account_uid = 8'765'432'100;
+    constexpr std::uint64_t owner_key_id = 23;
+    ASSERT_TRUE(first.create_bound_store(environment, account_uid));
+    ASSERT_TRUE(second.create_bound_store(environment, account_uid));
+
+    const auto first_files = first.files();
+    ASSERT_EQ(hy::spot_cancel_control::enroll(first_files, environment, owner_key_id, der_path),
+              hy::ExportStatus::Ok);
+    const std::string first_enrollment = hy::spot_cancel_control::enrollment_path(first.log_path);
+    ASSERT_TRUE(hy::spot_cancel_control::is_regular_file(first_enrollment));
+
+    {
+        auto opened = hy::spot_cancel_control::open_existing_store(first_files, environment);
+        ASSERT_NE(opened.sink, nullptr);
+        auto authority = hy::spot_cancel_control::load_authority(first.log_path, *opened.sink);
+        ASSERT_NE(authority, nullptr);
+        EXPECT_EQ(authority->subject().environment, environment);
+        EXPECT_EQ(authority->subject().account_uid, account_uid);
+        EXPECT_TRUE(authority->subject().store_uuid_lo != 0 || authority->subject().store_uuid_hi != 0);
+    }
+
+    EXPECT_EQ(hy::spot_cancel_control::enroll(first_files, environment, owner_key_id, der_path),
+              hy::ExportStatus::OutputExists);
+
+    const std::string second_enrollment = hy::spot_cancel_control::enrollment_path(second.log_path);
+    ASSERT_TRUE(std::filesystem::copy_file(first_enrollment, second_enrollment,
+                                           std::filesystem::copy_options::overwrite_existing));
+    {
+        const auto second_files = second.files();
+        auto opened = hy::spot_cancel_control::open_existing_store(second_files, environment);
+        ASSERT_NE(opened.sink, nullptr);
+        EXPECT_EQ(hy::spot_cancel_control::load_authority(second.log_path, *opened.sink), nullptr);
+    }
+
+    std::remove(der_path.c_str());
+}
 
 TEST(BinanceSigner, UninitializedRefusesSigning) {
     BinanceSigner signer;

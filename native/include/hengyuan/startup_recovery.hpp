@@ -208,8 +208,13 @@ inline RecoveryApplyResult apply_recovery(std::span<const OrderRecoveryCheckpoin
     for (const OrderRecoveryCheckpoint& cp : checkpoints) {
         const std::string_view coid = cp.client_order_id.view();
 
-        const SymbolRules rules = rules_for(cp.symbol_id);
+        SymbolRules rules = rules_for(cp.symbol_id);
         if (rules.rules_version == 0) break;
+        if (cp.pending_cancel.present()) {
+            if (rules.symbol[kSymbolNameLen - 1] != '\0' ||
+                rules.symbol_name() != std::string_view(cp.pending_cancel.symbol)) break;
+            cp.pending_cancel.apply_rules(rules);
+        }
 
         // register_submit_handle(), not repopulate_in_flight_registry(): the reconcile ring needs
         // the handle so drain_reconcile_events() can release the slot when the order finishes.
@@ -217,13 +222,16 @@ inline RecoveryApplyResult apply_recovery(std::span<const OrderRecoveryCheckpoin
         if (!handle.valid()) break;
 
         if (!fill_context.track(coid, cp.symbol_id, cp.side, rules.price_scale, rules.qty_scale,
-                                 rules.quote_scale, cp.intended_qty_ticks)) {
+                                 rules.quote_scale, cp.intended_qty_ticks,
+                                 cp.mode == ExecutionMode::Live && !cp.pending_cancel.present() && !cp.exchange_order_id_conflict &&
+                                         rules.symbol[kSymbolNameLen - 1] == '\0'
+                                     ? rules.symbol_name() : std::string_view{})) {
             break;
         }
         // M4 (order_durable_path.hpp): what the durable log holds for this order is exactly what the scan just reported -- except that an Ambiguous
         // checkpoint may be a last frame of Submitting (the scan remaps it), which the ABI-pinned checkpoint cannot say. shadow_of_recovered() keeps
         // that doubt, and the first frame any writer makes durable for the order resolves it.
-        (void)fill_context.seed_shadow(coid, shadow_of_recovered(cp.resulting_state, cp.filled_qty_ticks));
+        (void)fill_context.seed_shadow(coid, shadow_of_recovered(cp.resulting_state, cp.filled_qty_ticks), cp.exchange_order_id);
 
         // Seed, then align the shared baseline to what was just seeded (see this file's header
         // comment on the double-count hazard). consume_delta()'s return value is the amount just
@@ -267,7 +275,8 @@ inline RecoveredOrderTally tally_recovered_orders(const InFlightRegistry& in_fli
                 state = record.state;
             }
         });
-        if (tracked && (state == OrderState::Accepted || state == OrderState::PartialFill)) {
+        if (tracked && !cp.pending_cancel.present() &&
+            (state == OrderState::Accepted || state == OrderState::PartialFill)) {
             ++t.known_live;
         } else {
             ++t.unconfirmed;
@@ -309,7 +318,7 @@ inline RecoveredOrderTally tally_recovered_orders_by_shadow(const InFlightRegist
         const OrderState state = entry->shadow.state;
         if (is_exchange_final(state)) {
             ++t.resolved;
-        } else if (state == OrderState::Accepted || state == OrderState::PartialFill) {
+        } else if (!cp.pending_cancel.present() && (state == OrderState::Accepted || state == OrderState::PartialFill)) {
             ++t.known_live;
         } else {
             ++t.unconfirmed;

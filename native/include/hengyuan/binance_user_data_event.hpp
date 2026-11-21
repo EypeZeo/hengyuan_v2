@@ -387,7 +387,7 @@ private:
             }
             const AuditRecord frame = detail::make_user_data_frame(h, *e, now_ms);
             if (!append(frame, now_ms)) return false;
-            env.fill_context->durable_acked(coid, h.ev.order_status, h.cumulative_filled_qty_ticks);
+            env.fill_context->durable_acked(coid, h.ev.order_status, h.cumulative_filled_qty_ticks, frame.exchange_order_id);
             ++stats_.written;
         }
         // The frame (or the proof that the log already holds this) is in hand: only now does the report reach memory.

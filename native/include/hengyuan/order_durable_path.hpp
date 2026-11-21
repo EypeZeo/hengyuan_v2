@@ -25,9 +25,10 @@
 // The one frame a plan may put in front of the observation is an Ambiguous frame, and only where it is TRUE -- the process did not know the outcome of
 // the submit -- never for an order the exchange has already acknowledged (Accepted / PartialFill -> Ambiguous is not an edge, and neither is it true).
 //
-// KNOWN LIMIT: a PARTIALLY_FILLED report while the log says CancelRequested is Unreachable (CancelRequested -> PartialFill is not an edge of
-// validate_transition(), which is shared with the live state machine and is not extended here). Nothing in the live process sends a cancel yet; the day one
-// does, that edge needs its own decision.
+// CANCEL / FILL RACE (task 1A.7, L4 §6.6): CancelRequested -> Accepted / PartialFill is a legal authoritative observation. PENDING_CANCEL does not prove
+// that the cancel completed; a later NEW / PARTIALLY_FILLED report leaves the order working and may carry a larger cumulative fill. The planner derives
+// those edges from validate_transition() like every other path, so a progressive fill remains replayable instead of becoming an Unreachable memory-only
+// update. A real cancel request/response path is still a separate slice; this header only preserves the exchange observation and its fill delta.
 //
 // Everything is derived from validate_transition() itself, never from a list of states, so a change of the state machine cannot leave this behind. Pure
 // functions over values: no I/O, no allocation, constexpr.
@@ -89,9 +90,20 @@ constexpr bool is_observable(OrderState s) noexcept {
 constexpr bool is_resolvable(OrderState s) noexcept { return is_observable(s) || s == OrderState::EscalatedToOperator; }
 
 // `target` is nothing later than what the log holds: it IS that state, or a state from which the log's state is reachable (an event delivered late).
-constexpr bool is_not_later(const DurableShadow& log, OrderState target) noexcept {
+// Accepted/PartialFill <-> CancelRequested needs mechanism context. A REST query is a current authoritative snapshot, so either direction may be the
+// cancel-failure observation in L4 §6.6 (`reversible_is_current=true`). A WS report has no such guarantee: an old NEW/PARTIALLY_FILLED delivered after
+// PENDING_CANCEL is stale, while PENDING_CANCEL after a working state is new. A larger cumulative fill always carries new information and bypasses this
+// stale check below; an equal-fill reverse from CancelRequested to a working state is therefore accepted only for REST, not for WS.
+constexpr bool is_not_later(const DurableShadow& log, OrderState target, bool reversible_is_current) noexcept {
     if (log.maybe_submitting) return false;  // the log may hold Submitting: nothing an observation says is known to be old
-    return replay_accepts(target, log.state);
+    if (target == log.state) return true;
+    const bool forward = replay_accepts(log.state, target);
+    const bool backward = replay_accepts(target, log.state);
+    if (forward && backward) {
+        if (reversible_is_current) return false;
+        return log.state == OrderState::CancelRequested;
+    }
+    return backward && !forward;
 }
 
 // state_path() once the caller has decided which targets are its business.
@@ -126,10 +138,10 @@ constexpr DurablePath state_path_unchecked(const DurableShadow& from, OrderState
 
 // plan_observation() / plan_resolution() once the caller has decided which targets are its business.
 constexpr DurablePath plan_unchecked(const DurableShadow& log, OrderState target, std::int64_t cumulative_filled_qty_ticks,
-                                     std::int64_t intended_qty_ticks) noexcept {
+                                     std::int64_t intended_qty_ticks, bool reversible_is_current) noexcept {
     DurablePath p{};
     if (cumulative_filled_qty_ticks < 0) return p;
-    const bool not_later = is_not_later(log, target);
+    const bool not_later = is_not_later(log, target, reversible_is_current);
     if (cumulative_filled_qty_ticks < log.filled_qty_ticks) {
         if (not_later) p.status = PathStatus::Stale;
         return p;  // else Unreachable: a lower fill with a later state contradicts the log
@@ -158,20 +170,27 @@ constexpr DurablePath state_path(const DurableShadow& from, OrderState target) n
 //   * the same cumulative fill and a state that is nothing later: Stale -- there is nothing to record;
 //   * a fill past the intended quantity, or a fill with no intended quantity known (<= 0): Unreachable -- the scan refuses it for a same-state frame
 //     and silently accepts it for a transition, and neither is a thing to write;
-//   * otherwise state_path() decides.
+//   * otherwise state_path() decides. WS delivery is not a current REST snapshot:
+//     an equal-fill NEW/PARTIALLY_FILLED after PENDING_CANCEL is stale, while a
+//     larger cumulative fill is new whichever working/cancel state it names.
 constexpr DurablePath plan_observation(const DurableShadow& log, OrderState target, std::int64_t cumulative_filled_qty_ticks,
                                        std::int64_t intended_qty_ticks) noexcept {
-    return detail::is_observable(target) ? detail::plan_unchecked(log, target, cumulative_filled_qty_ticks, intended_qty_ticks) : DurablePath{};
+    return detail::is_observable(target)
+               ? detail::plan_unchecked(log, target, cumulative_filled_qty_ticks, intended_qty_ticks, /*reversible_is_current=*/false)
+               : DurablePath{};
 }
 
 // plan_observation()'s counterpart for the reconcile path: a resolution the reconcile thread reached for an order, whose target may also be
 // EscalatedToOperator (a local decision, not an exchange report; the state machine itself lets only an Ambiguous order -- or one that may still be
 // Submitting, through an Ambiguous frame -- reach it). The fill bound is the caller's call: the reconcile thread has already held the fill against its own
 // record's intended quantity, so a caller that does not know the quantity passes std::numeric_limits<std::int64_t>::max() ("unbounded"), never 0, which
-// here as there means "refuse every fill".
+// here as there means "refuse every fill". Unlike plan_observation(), this is a current REST snapshot: an equal-fill NEW/PARTIALLY_FILLED after
+// PENDING_CANCEL is the L4 §6.6 cancel-failure answer and must be written, not discarded as an old WS report.
 constexpr DurablePath plan_resolution(const DurableShadow& log, OrderState target, std::int64_t cumulative_filled_qty_ticks,
                                       std::int64_t intended_qty_ticks) noexcept {
-    return detail::is_resolvable(target) ? detail::plan_unchecked(log, target, cumulative_filled_qty_ticks, intended_qty_ticks) : DurablePath{};
+    return detail::is_resolvable(target)
+               ? detail::plan_unchecked(log, target, cumulative_filled_qty_ticks, intended_qty_ticks, /*reversible_is_current=*/true)
+               : DurablePath{};
 }
 
 }  // namespace hy

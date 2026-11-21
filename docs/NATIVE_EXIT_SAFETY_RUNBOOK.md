@@ -23,7 +23,32 @@ When `KillSwitch` state moves out of `Normal` (see `kill_switch.hpp`), `exit_saf
 | `Rearm` | Always forbidden — requires the re-arm ceremony, a separate human action |
 | `AutoResume` | Always forbidden (ADR-015) |
 
-`determine_emergency_policy()` always returns `OperatorManualOnly` in the current implementation — there is no automated cancel-all-open-orders path. This is deliberate: `EmergencyCancelPolicy::CancelAllKnownOpen` exists as an enum value but is not wired to anything, precisely because automated cancellation during a kill event is exactly the kind of action that should require a human decision, not a background process making it for you.
+`PrivateStreamPipeline` can stage a single cancellation request after `Triggered` or `Latched`. Both staging and claim require an active approval bound to the environment, account, store, runtime activation and symbol. `determine_emergency_policy()` returns `OperatorManualOnly` for account-wide cancellation.
+
+### Owner approval for a recovered order
+
+The control owner provisions a trusted P-256 public key as DER SubjectPublicKeyInfo and sets the maximum grant duration. `OwnerCancelAuthority::create()` allocates a new activation ID. `signing_payload()` produces the binary grant for a symbol, increasing serial number and absolute expiry in exchange milliseconds. The grant is specific to spot cancellation. It encodes a NUL-terminated domain string, version and environment bytes, seven little-endian 64-bit fields (key ID, account UID, store UUID low and high words, activation ID, serial and expiry), and a NUL-padded 20-byte symbol.
+
+An enrolled P-256 YubiKey PIV signing key can sign the exact binary file with PIN entry on the Owner's device. The signer returns the DER ECDSA signature. [YubiKey PIV Tool signing](https://docs.yubico.com/software/yubikey/tools/pivtool/piv-tool-command.html#sign-data)
+
+```powershell
+yubico-piv-tool -a verify-pin --sign -s 9c -A ECCP256 -H SHA256 -i owner-cancel.grant -o owner-cancel.sig
+```
+
+`OwnerCancelAuthority::install()` verifies the signature and expiry against the pinned key and a fresh exchange clock. The active grant is replaced only by a valid grant with a higher serial. Local revocation clears affected grants and prevents their reinstallation during this activation. Each new activation requires a new signature.
+
+The native cancellation process retains the Trading lock while handing the log to the executor. Its control thread stops the private stream, joins its producer, drains the final events and transfers ownership of the sink. The executor scans the latest committed state under the same lock, checks the current kill switch revision, store, signed account UID and order identity, and writes the preparation before sending DELETE. An authorization refusal before HTTP write records `OrderCancelNotSent`. A prepared attempt with an uncertain result is queried by numeric order ID on restart. A working observation keeps it pending.
+
+### Register and run native cancellation
+
+Use an existing, healthy, bound order log and its KEK and wrapped-key file. The native entry covers the BTCUSDT store configuration with symbol ID 0. Keep the log directory and its public-key registration writable only by the trusted local operator. On POSIX, use owner-only permissions (`0600` or `0400`) for the KEK file. Enrollment publishes a new `.owner-cancel.pub` file beside that log and refuses an existing registration. The record binds the key to the verified environment, account and log UUID. The grant directory holds only unsigned payloads and signatures.
+
+```powershell
+& $exe --enroll-cancel-owner PRODUCTION $log $auditKeyId $kekFile $wrappedKeyFile $ownerKeyId $ownerPublicDer
+& $exe --cancel-only PRODUCTION $log $auditKeyId $kekFile $wrappedKeyFile $credentialsFile $controlDir 600
+```
+
+For Spot Testnet use `TESTNET` in both commands and its independent account, log and key. The credentials file uses `HENGYUAN_BINANCE_LIVE_API_KEY` and `HENGYUAN_BINANCE_LIVE_SECRET` in Production, or `HENGYUAN_BINANCE_TESTNET_API_KEY` and `HENGYUAN_BINANCE_TESTNET_SECRET` in Testnet. For a working order the process prints the payload and corresponding signature paths. Sign that payload using the registered hardware key and write the signature to the printed path. The process installs the grant in memory and handles one claimed cancellation before exiting. To recover after an interruption, start the same cancellation command against the same log. Existing pending attempts are reconciled without a signature. New attempts require a signature for the current activation.
 
 ## 3. Operator manual takeover — step by step
 

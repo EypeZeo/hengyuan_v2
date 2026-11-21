@@ -199,11 +199,77 @@ TEST(OrderDurablePathGuard, TheScansOwnHelpersBehave) {
 
 // --- who appends a frame of an order's life -----------------------------------------------------------------------------------------------------
 
+TEST(OrderDurablePathGuard, RecoveredCancelWritesPreparationBeforeSending) {
+    const std::map<std::string, std::size_t> expected = {
+        {"include/hengyuan/binance_private_rest.hpp", 1},
+    };
+    EXPECT_EQ(calls_by_file("append_cancel_prepared"), expected);
+    const auto* file = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(file, nullptr);
+    const auto entry = file->code.find("DurableSpotCancelResult cancel_recovered_order(");
+    ASSERT_NE(entry, std::string::npos);
+    const auto prepare = file->code.find("sink.append_cancel_prepared(", entry);
+    ASSERT_NE(prepare, std::string::npos);
+    const auto ack = file->code.find("if (!out.prepared.acked()) return out;", prepare);
+    ASSERT_NE(ack, std::string::npos);
+    const auto send = file->code.find("out.exchange = cancel_spot_order_once(expected, identity, cfg, authorization)", ack);
+    ASSERT_NE(send, std::string::npos);
+    EXPECT_NE(file->code.find("sink.append_durable(terminal, now_ms)", send), std::string::npos);
+}
+
+TEST(OrderDurablePathGuard, ProvenNotSentCancelRestoresOnlyAfterPreparationAndTransport) {
+    const std::map<std::string, std::size_t> expected = {
+        {"include/hengyuan/binance_private_rest.hpp", 1},
+    };
+    EXPECT_EQ(calls_by_file("append_cancel_not_sent"), expected);
+
+    const auto* file = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(file, nullptr);
+    const auto entry = file->code.find("DurableSpotCancelResult cancel_recovered_order(");
+    ASSERT_NE(entry, std::string::npos);
+    const auto prepare = file->code.find("sink.append_cancel_prepared(", entry);
+    ASSERT_NE(prepare, std::string::npos);
+    const auto prepared_ack = file->code.find("if (!out.prepared.acked()) return out;", prepare);
+    ASSERT_NE(prepared_ack, std::string::npos);
+    const auto send = file->code.find("out.exchange = cancel_spot_order_once(expected, identity, cfg, authorization)", prepared_ack);
+    ASSERT_NE(send, std::string::npos);
+    const auto not_sent_branch = file->code.find("if (observation.outcome == QueryOutcome::NotSent)", send);
+    ASSERT_NE(not_sent_branch, std::string::npos);
+    const auto not_sent = file->code.find("out.not_sent = sink.append_cancel_not_sent(now_ms);", not_sent_branch);
+    ASSERT_NE(not_sent, std::string::npos);
+    const auto not_sent_call = file->code.find("sink.append_cancel_not_sent(", not_sent_branch);
+    ASSERT_NE(not_sent_call, std::string::npos);
+    EXPECT_EQ(file->code.find("sink.append_cancel_not_sent(", entry), not_sent_call);
+    EXPECT_LT(prepared_ack, send);
+    EXPECT_LT(send, not_sent_branch);
+    EXPECT_LT(not_sent_branch, not_sent);
+    EXPECT_LT(not_sent, not_sent_call);
+}
+
+TEST(OrderDurablePathGuard, AuthorizedCancelChecksScopeAfterHandshakeBeforeRequestWrite) {
+    const auto* file = find_source("include/hengyuan/binance_private_rest.hpp");
+    ASSERT_NE(file, nullptr);
+    const auto coroutine = file->code.find("fetch_signed_body_coro(");
+    ASSERT_NE(coroutine, std::string::npos);
+    const auto handshake = file->code.find("co_await stream.async_handshake(", coroutine);
+    ASSERT_NE(handshake, std::string::npos);
+    const auto check = file->code.find("if (cancel_check.permits && !cancel_check.permits(cancel_check.context))", handshake);
+    ASSERT_NE(check, std::string::npos);
+    const auto refused = file->code.find("co_return PrivateRestError::CancelNotAuthorized;", check);
+    ASSERT_NE(refused, std::string::npos);
+    const auto write = file->code.find("co_await http::async_write(stream, req,", handshake);
+    ASSERT_NE(write, std::string::npos);
+    EXPECT_LT(refused, write);
+    EXPECT_EQ(calls_by_file("cancel_spot_order_once"),
+              (std::map<std::string, std::size_t>{{"include/hengyuan/binance_private_rest.hpp", 2}}));
+}
+
 TEST(OrderDurablePathGuard, EveryProductionAppendOfAnOrderFrameIsOneOfTheKnownWriters) {
     // The calls of the durable port's append_durable(). The orchestrator's two are the sink adapter of the port and the ONE function every frame of an
     // order's life goes through (append_order_frame); the other two are the publishers' own append(). The offline R6 generator is allowed two setup
     // writes for its synthetic Intent and Prepared records; it never sends an order. Any other writer must be reviewed and added here.
     const std::map<std::string, std::size_t> expected = {
+        {"include/hengyuan/binance_private_rest.hpp", 1},        // terminal ACK for an exclusive Testnet cancellation
         {"include/hengyuan/binance_user_data_event.hpp", 1},     // UserDataDurablePublisher::append
         {"include/hengyuan/live_submit_orchestrator.hpp", 2},    // durable_audit_sink_append_adapter() and detail::append_order_frame()
         {"include/hengyuan/order_tracker.hpp", 1},               // ReconcileDurablePublisher::append
@@ -280,13 +346,12 @@ TEST(OrderDurablePathGuard, EveryShadowMoveIsOneOfTheKnownCalls) {
 }
 
 TEST(OrderDurablePathGuard, EveryTrackOfAnOrderCarriesItsIntendedQuantity) {
-    // Seven arguments: the seventh is the quantity the order was sent with, the bound a planned fill is held against. Left out, it defaults to 0 =
-    // unknown, and every fill of the order is refused.
+    // The seventh argument carries the submitted quantity, followed by the symbol for Live cancellation targets.
     for (const SourceFile& f : production_sources()) {
         for (const std::vector<std::string>& args : call_args(f.code, "track")) {
             if (f.rel == "include/hengyuan/order_fill_context.hpp") continue;  // not a call of ours
             if (args.empty() || (args[0].find("coid") == std::string::npos)) continue;  // another class's track(): not the fill table's
-            EXPECT_EQ(args.size(), 7u) << f.rel << ": track() of the fill context without the intended quantity";
+            EXPECT_EQ(args.size(), 8u) << f.rel << ": track() must carry the intended quantity and cancellation symbol";
         }
     }
     const SourceFile* orchestrator = find_source("include/hengyuan/live_submit_orchestrator.hpp");
@@ -294,9 +359,9 @@ TEST(OrderDurablePathGuard, EveryTrackOfAnOrderCarriesItsIntendedQuantity) {
     ASSERT_NE(orchestrator, nullptr);
     ASSERT_NE(recovery, nullptr);
     ASSERT_EQ(call_args(orchestrator->code, "track").size(), 1u);
-    EXPECT_EQ(call_args(orchestrator->code, "track")[0].back(), "ctx.qty_ticks");
+    EXPECT_EQ(call_args(orchestrator->code, "track")[0].at(6), "ctx.qty_ticks");
     ASSERT_EQ(call_args(recovery->code, "track").size(), 1u);
-    EXPECT_EQ(call_args(recovery->code, "track")[0].back(), "cp.intended_qty_ticks");
+    EXPECT_EQ(call_args(recovery->code, "track")[0].at(6), "cp.intended_qty_ticks");
 }
 
 TEST(OrderDurablePathGuard, NothingButTheFillContextAssignsAShadow) {

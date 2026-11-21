@@ -2,8 +2,10 @@
 // shared by all three fill-application paths (direct POST-accept, REST reconciliation, WS
 // executionReport).
 #include <gtest/gtest.h>
+#include <hengyuan/automatic_cancel.hpp>
 #include <hengyuan/order_fill_context.hpp>
 
+#include <cstring>
 #include <string>
 
 using hy::OrderFillContext;
@@ -207,4 +209,77 @@ TEST(OrderFillContextShadow, ARemovedOrderTakesItsShadowWithItAndASlotReusedStar
     EXPECT_EQ(ctx.find("HY-C")->shadow.state, OrderState::Intent);
     EXPECT_EQ(ctx.find("HY-C")->shadow.filled_qty_ticks, 0);
     EXPECT_EQ(ctx.find("HY-C")->intended_qty_ticks, 0);
+}
+
+TEST(OrderFillContextCancel, ExchangeOrderIdAppearsOnlyWithDurableEvidenceAndConflictsRevokeTarget) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-CANCEL", 1, OrderSide::Buy, 0, 0, 0, 10, "BTCUSDT"));
+
+    const auto* before_ack = ctx.find("HY-CANCEL");
+    ASSERT_NE(before_ack, nullptr);
+    EXPECT_EQ(before_ack->exchange_order_id, 0);
+    EXPECT_FALSE(hy::is_confirmed_cancel_target(*before_ack));
+
+    ctx.durable_acked("HY-CANCEL", OrderState::Accepted, 0, 12345);
+    const auto* accepted = ctx.find("HY-CANCEL");
+    ASSERT_NE(accepted, nullptr);
+    EXPECT_EQ(accepted->exchange_order_id, 12345);
+    EXPECT_TRUE(hy::is_confirmed_cancel_target(*accepted));
+
+    ctx.durable_acked("HY-CANCEL", OrderState::PartialFill, 1, 54321);
+    const auto* conflicting = ctx.find("HY-CANCEL");
+    ASSERT_NE(conflicting, nullptr);
+    EXPECT_EQ(conflicting->exchange_order_id, 12345);
+    EXPECT_EQ(conflicting->cancel_symbol[0], '\0');
+    EXPECT_FALSE(hy::is_confirmed_cancel_target(*conflicting));
+}
+
+TEST(OrderFillContextCancel, DryRunTrackingDoesNotOptIntoAutomaticCancel) {
+    OrderFillContext ctx;
+    ASSERT_TRUE(ctx.track("HY-DRY", 1, OrderSide::Buy, 0, 0, 0, 10));
+    ctx.durable_acked("HY-DRY", OrderState::Accepted, 0, 12345);
+    EXPECT_FALSE(hy::is_confirmed_cancel_target(*ctx.find("HY-DRY")));
+
+    ASSERT_TRUE(ctx.track("HY-LIVE", 1, OrderSide::Buy, 0, 0, 0, 10, "BTCUSDT"));
+    ctx.durable_acked("HY-LIVE", OrderState::Accepted, 0, 67890);
+    EXPECT_TRUE(hy::is_confirmed_cancel_target(*ctx.find("HY-LIVE")));
+}
+
+TEST(AutomaticCancel, ApprovalRequiresBoundSubjectSymbolSerialAndUnexpiredAuthority) {
+    const hy::CancelSubject subject{
+        hy::StoreEnvironment::Testnet, 99887766, 0x1111, 0x2222, 77};
+    hy::CancelApproval approval{};
+    approval.subject = subject;
+    std::memcpy(approval.symbol, "BTCUSDT", 7);
+    approval.serial = 9;
+    approval.not_after_ms = 2000;
+
+    EXPECT_TRUE(hy::permits_automatic_cancel(approval, subject, "BTCUSDT", 2000));
+    EXPECT_TRUE(hy::permits_automatic_cancel(approval, subject, "BTCUSDT", 1999));
+
+    auto rejected = approval;
+    rejected.subject.environment = hy::StoreEnvironment::Production;
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
+    rejected = approval;
+    rejected.subject.account_uid += 1;
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
+    rejected = approval;
+    rejected.subject.store_uuid_lo += 1;
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
+    rejected = approval;
+    rejected.subject.activation_id += 1;
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
+
+    rejected = approval;
+    rejected.symbol[0] = 'E';
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
+    rejected = approval;
+    rejected.serial = 0;
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
+    rejected = approval;
+    rejected.not_after_ms = 1999;
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
+    rejected = approval;
+    rejected.symbol[hy::kSymbolNameLen - 1] = 'X';
+    EXPECT_FALSE(hy::permits_automatic_cancel(rejected, subject, "BTCUSDT", 2000));
 }

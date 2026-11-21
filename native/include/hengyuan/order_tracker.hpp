@@ -158,8 +158,8 @@ struct ReconcilePollPolicy {
     std::int64_t max_interval_ms{5000};       // saturating cap, see backoff_delay_ms()
     std::uint32_t max_queries_per_tick{16};   // throttle: don't fire all 64 at once
 
-    // Cadence for orders that are LIVE on the exchange (Accepted/PartialFill), as
-    // opposed to Ambiguous ones. Deliberately a flat interval rather than the
+    // Cadence for orders that are working on the exchange (Accepted/PartialFill/
+    // CancelRequested), as opposed to Ambiguous ones. Deliberately flat rather than the
     // exponential backoff above: backoff exists to stop hammering an endpoint over an
     // *uncertainty* that is expected to resolve quickly, while a resting order is a
     // normal steady state that may last hours -- backing off toward max_interval_ms
@@ -337,7 +337,8 @@ public:
 
 private:
     static constexpr bool is_pollable(OrderState s) noexcept {
-        return s == OrderState::Ambiguous || s == OrderState::Accepted || s == OrderState::PartialFill;
+        return s == OrderState::Ambiguous || s == OrderState::Accepted || s == OrderState::PartialFill ||
+               s == OrderState::CancelRequested;
     }
 
     static constexpr std::size_t kNotFound = static_cast<std::size_t>(-1);
@@ -405,8 +406,8 @@ struct ReconcileEvent {     // reconcile thread -> hot thread: a discovered resu
     std::int64_t fill_delta_qty_ticks{0};
 
     // SAFE-03 slice 1 (audit P1-002). The state the reconcile thread's record held BEFORE this event --
-    // Ambiguous for a resolution or escalation of an unresolved order, Accepted / PartialFill for the next step
-    // of a live one. ReconcileDurablePublisher uses it to write a frame the durable log can replay (a
+    // Ambiguous for a resolution or escalation of an unresolved order, Accepted / PartialFill / CancelRequested
+    // for the next observation of a working one. ReconcileDurablePublisher uses it to write a frame the durable log can replay (a
     // resolution of an order that was Ambiguous may need an Ambiguous frame in front of it, see there).
     // Appended at the end like the two blocks above. Intent = "not provided": no event poll_once() emits
     // carries it, and a hand-built event that leaves it gets no extra frame.
@@ -457,7 +458,8 @@ inline bool is_legal_ambiguous_target(OrderState s) noexcept {
 //     why Binance's REJECTED is submit-time only).
 inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
     if (to == from) {
-        return from == OrderState::Accepted || from == OrderState::PartialFill;
+        return from == OrderState::Accepted || from == OrderState::PartialFill ||
+               from == OrderState::CancelRequested;
     }
     switch (from) {
         case OrderState::Ambiguous:
@@ -474,6 +476,13 @@ inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
         case OrderState::PartialFill:
             return to == OrderState::Filled || to == OrderState::Cancelled ||
                    to == OrderState::Expired || to == OrderState::CancelRequested;
+        case OrderState::CancelRequested:
+            // L4 §6.6: PENDING_CANCEL can be followed by NEW or
+            // PARTIALLY_FILLED when the cancel did not win. Keep polling until
+            // an exchange-final state; never release resources on the request.
+            return to == OrderState::Accepted || to == OrderState::PartialFill ||
+                   to == OrderState::Filled || to == OrderState::Cancelled ||
+                   to == OrderState::Expired;
         default:
             return false;
     }
@@ -486,6 +495,11 @@ inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
 // is_legal_query_target()'s job, because it depends on the order's current state.
 inline bool is_valid_query_result(const QueryResult& r, const OrderRecord& rec) noexcept {
     if (r.filled_qty_ticks < 0 || r.filled_qty_ticks > rec.intended_qty_ticks) return false;
+    // Binance's executedQty is cumulative for the order, not a per-message
+    // delta. A decrease is a stale/contradictory snapshot, never negative fill
+    // flow; in particular it must not turn a cancel/fill race into a negative
+    // ReconcileEvent::fill_delta_qty_ticks.
+    if (r.filled_qty_ticks < rec.filled_qty_ticks) return false;
     if (r.avg_fill_price_ticks < 0) return false;
     if (r.filled_qty_ticks == 0 && r.avg_fill_price_ticks != 0) return false;  // inconsistent
     if (r.exchange_order_id < 0) return false;
@@ -574,8 +588,8 @@ inline bool poll_gate_closed(std::int64_t now_ms, std::int64_t last_poll_ms, std
 }  // namespace detail
 
 // Runs on the reconcile thread. Drains `inbound` into `tracker`, walks every
-// tracked non-exchange-final order, and for each state change pushes one
-// ReconcileEvent onto `outbound`. NEVER touches InFlightRegistry or AuditRingSink
+// tracked non-exchange-final order, and for each state change OR cumulative-fill
+// increase pushes one ReconcileEvent onto `outbound`. NEVER touches InFlightRegistry or AuditRingSink
 // (see file header).
 //
 // TWO KINDS OF TRACKED ORDER (audit EXEC-INFLIGHT-003):
@@ -584,7 +598,7 @@ inline bool poll_gate_closed(std::int64_t now_ms, std::int64_t last_poll_ms, std
 //     operator by the R-10 quarantine criterion (policy.quarantine: enough SENT
 //     queries AND enough time since it first became Ambiguous, or an absolute
 //     time cap -- see UnknownQuarantinePolicy in order_lifecycle.hpp).
-//   * Accepted / PartialFill -- LIVE and resting on the exchange. Polled at a flat
+//   * Accepted / PartialFill / CancelRequested -- working on the exchange. Polled at a flat
 //     live_poll_interval_ms cadence and NEVER escalated: a resting order is a
 //     normal steady state, not an anomaly, and its query_attempts must not count
 //     toward the Ambiguous escalation cap.
@@ -652,7 +666,8 @@ inline void poll_once(OrderTracker& tracker,
 
         const bool ambiguous = (record.state == OrderState::Ambiguous);
         const bool live = (record.state == OrderState::Accepted ||
-                            record.state == OrderState::PartialFill);
+                            record.state == OrderState::PartialFill ||
+                            record.state == OrderState::CancelRequested);
         if (!ambiguous && !live) return;  // e.g. EscalatedToOperator: operator owns it now
 
         auto coid = record.client_order_id.view();
@@ -726,6 +741,15 @@ inline void poll_once(OrderTracker& tracker,
         ++queries_this_tick;
 
         QueryResult result = query_port.call(OrderExpectation::from(record));
+        if (record.pending_cancel.present() && result.outcome == QueryOutcome::Found) {
+            if (result.exchange_order_id != record.exchange_order_id) {
+                result = {};
+            } else if (result.confirmed_state == OrderState::Accepted ||
+                       result.confirmed_state == OrderState::PartialFill) {
+                // A working order can still be affected by the recorded cancel.
+                result.confirmed_state = OrderState::CancelRequested;
+            }
+        }
 
         // query_attempts is incremented on every query that was actually SENT (Inconclusive
         // included) -- this must happen whether or not the result turns out usable below,
@@ -749,11 +773,14 @@ inline void poll_once(OrderTracker& tracker,
             return;
         }
 
-        // "Still in the state we already knew about" is the ordinary answer for a
-        // live resting order. Refresh the fill figures (a partial fill can grow
-        // without changing the state) and keep tracking -- no transition, no event,
-        // no slot release.
-        if (result.confirmed_state == attempted.state) {
+        // An unchanged state with an unchanged cumulative fill is the ordinary
+        // answer for a live resting order: no transition, no event, no slot
+        // release. The same state with a LARGER cumulative fill is not a no-op:
+        // PARTIALLY_FILLED can progress without changing status, and so can a
+        // PENDING_CANCEL observation. Fall through to the common event path so
+        // that delta reaches the durable log and PositionTruth exactly once.
+        const bool same_state = result.confirmed_state == attempted.state;
+        if (same_state && result.filled_qty_ticks == attempted.filled_qty_ticks) {
             attempted.exchange_order_id = result.exchange_order_id;
             attempted.filled_qty_ticks = result.filled_qty_ticks;
             attempted.avg_fill_price_ticks = result.avg_fill_price_ticks;
@@ -763,7 +790,7 @@ inline void poll_once(OrderTracker& tracker,
         }
 
         OrderRecord resolved = attempted;
-        if (resolved.transition_to(result.confirmed_state) != TransitionResult::Ok) {
+        if (!same_state && resolved.transition_to(result.confirmed_state) != TransitionResult::Ok) {
             record = attempted;  // should be unreachable given is_legal_query_target(); fail safe
             return;
         }
@@ -795,13 +822,13 @@ inline void poll_once(OrderTracker& tracker,
             if (is_exchange_final(resolved.state)) {
                 tracker.untrack(coid);
             } else {
-                // Still live (Ambiguous -> Accepted/PartialFill, or
-                // Accepted -> PartialFill). Keep tracking so this order still has a
-                // route to a terminal state -- untracking here is precisely what
-                // stranded its InFlightRegistry slot forever (audit
-                // EXEC-INFLIGHT-003). Reset the poll clock so the freshly-adopted
-                // live cadence starts from now rather than inheriting the Ambiguous
-                // backoff position.
+                // Still live (including a same-state cumulative-fill update or
+                // a CancelRequested -> Accepted/PartialFill observation). Keep
+                // tracking so this order still has a route to a terminal state --
+                // untracking here is precisely what stranded its InFlightRegistry
+                // slot forever (audit EXEC-INFLIGHT-003). Reset the poll clock so
+                // the live cadence starts from now rather than inheriting an
+                // Ambiguous backoff position.
                 record = resolved;
                 tracker.note_polled(coid, now_ms);
                 if (sweep_epoch != 0) tracker.note_answered(coid, sweep_epoch);  // identified, changed, and handed to the hot thread
@@ -963,7 +990,7 @@ private:
                 shadows.durable_acked(coid, OrderState::Ambiguous, e->shadow.filled_qty_ticks);
             }
             if (!append(record, now_ms)) return false;
-            shadows.durable_acked(coid, pending_.resulting_state, pending_.filled_qty_ticks);
+            shadows.durable_acked(coid, pending_.resulting_state, pending_.filled_qty_ticks, record.exchange_order_id);
         } else if (plan.status == PathStatus::Stale) {
             ++stale_skipped_;
         } else {
@@ -999,7 +1026,7 @@ private:
 // in-memory audit ring (the ONLY place OrderReconciled/OrderEscalated are ever emitted, matching
 // orchestrate_submit()'s own per-transition audit style), applies its fill to PositionTruth, then releases the
 // InFlightRegistry slot via mark_resolved_handle() IF AND ONLY IF is_exchange_final(resulting_state) --
-// EscalatedToOperator and the still-live Accepted/PartialFill are audited but do not release (see
+// EscalatedToOperator and the still-working Accepted/PartialFill/CancelRequested are audited but do not release (see
 // docs/SPEC_INVARIANTS.md's InFlightRegistry entry: an order that may still be live must keep its slot).
 //
 // `durable` (SAFE-03 slice 1, same trailing-default-nullptr extension as the two parameters before it): when

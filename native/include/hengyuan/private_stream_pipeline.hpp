@@ -43,6 +43,7 @@
 #pragma once
 
 #include <hengyuan/account_refresh.hpp>
+#include <hengyuan/automatic_cancel.hpp>
 #include <hengyuan/barrier_sweep.hpp>
 #include <hengyuan/binance_user_data_event.hpp>
 #include <hengyuan/durable_audit_sink.hpp>
@@ -62,9 +63,13 @@
 #include <hengyuan/submit_readiness.hpp>
 #include <hengyuan/sweep_pump.hpp>
 
+#include <array>
 #include <concepts>
 #include <cstdint>
+#include <cstring>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace hy {
@@ -95,6 +100,7 @@ struct PipelineConfig {
     ExposureLimits exposure_limits{};          // the account freshness window of StartupRecovery is the one validate_pre_trade() applies
     std::int64_t reconcile_deadline_ms{60'000};  // how long recovered orders may stay unconfirmed before the state machine degrades
     std::shared_ptr<SubmitAuthority> submit_authority{};
+    AutoCancelConfig automatic_cancel{};
 };
 
 // What the process owns, by reference: every referent outlives the pipeline. The function-pointer ports are values.
@@ -153,6 +159,7 @@ public:
         advance_recovery(now_ms, wall_now_ms);
         context_.now_ms = now_ms;
         drain_hot_inputs(context_);
+        if (config_.automatic_cancel.approvals.fn) stage_automatic_cancel();
     }
 
     // The startup binding of the store to the exchange account this process trades as. `exchange_uid` is what the exchange reported for the key in use. The
@@ -161,6 +168,10 @@ public:
     EnsureBindingStatus bind_store(StoreEnvironment environment, std::uint64_t exchange_uid, std::int64_t now_ms) noexcept {
         ++hot_.stats.binding_attempts;
         binding_status_ = ensure_store_binding(parts_.sink, parts_.log_path, parts_.key_ring, environment, exchange_uid, now_ms);
+        cancel_subject_ = store_may_be_used(binding_status_)
+            ? CancelSubject{environment, exchange_uid, parts_.sink.store_uuid_lo(), parts_.sink.store_uuid_hi(),
+                            config_.automatic_cancel.activation_id}
+            : CancelSubject{};
         return binding_status_;
     }
 
@@ -170,6 +181,29 @@ public:
     // An OrchestratorContext with every wiring field of the private stream set; the caller fills in the order and the ports and calls orchestrate_submit().
     // Equal in every wiring field to the context the hot tick drains with.
     [[nodiscard]] auto make_context() const noexcept { return context_; }  // an OrchestratorContext, by value (`auto`: the guards count the type's constructions)
+
+    // The process owner claims an intent for its cancellation executor. No transport runs on this tick.
+    [[nodiscard]] std::optional<AutomaticCancelRequest> take_automatic_cancel() noexcept {
+        auto request = std::exchange(hot_.pending_cancel, std::nullopt);
+        if (!request || !can_stage_cancel() || request->subject != cancel_subject_ ||
+            request->kill_revision != parts_.kill_switch.revision() ||
+            !parts_.in_flight.owns(request->handle, request->client_order_id.view())) return std::nullopt;
+
+        const auto* order = parts_.fill_context.find(request->client_order_id.view());
+        if (!order || !is_confirmed_cancel_target(*order) || order->symbol_id != request->symbol_id ||
+            order->exchange_order_id != request->exchange_order_id ||
+            std::string_view(order->cancel_symbol) != std::string_view(request->symbol)) return std::nullopt;
+
+        const auto upper = cancel_server_time_upper_bound(parts_.clock, fetch_clock_pair());
+        if (!upper) return std::nullopt;
+        const auto approval = config_.automatic_cancel.approvals.read(request->symbol);
+        if (!approval || !permits_automatic_cancel(*approval, cancel_subject_, request->symbol, *upper) ||
+            approval->serial != request->approval_serial ||
+            approval->not_after_ms != request->approval_not_after_ms) return std::nullopt;
+
+        hot_.cancel_claimed_generation[request->handle.slot_index] = request->handle.generation;
+        return request;
+    }
 
     // ---- the reconcile thread (or the same loop) ---------------------------------------------------------------------------------------------
 
@@ -243,6 +277,8 @@ private:
         LateFillAlarm late_fill;
         never_sent::IntentOrphanBudget intent_orphan_budget;
         PipelineStats stats{};
+        std::optional<AutomaticCancelRequest> pending_cancel;
+        std::array<std::uint32_t, kMaxInFlight> cancel_claimed_generation{};
     };
 
     // The reconcile thread's objects.
@@ -289,6 +325,40 @@ private:
         context_.exposure_limits = config_.exposure_limits;
     }
 
+    bool can_stage_cancel() const noexcept {
+        return config_.automatic_cancel.approvals.fn && cancel_subject_.valid() &&
+               recovery_applied_ && apply_result_.ok() && parts_.sink.is_open() && !parts_.sink.fenced() &&
+               emergency_cancel_requested(parts_.kill_switch.state());
+    }
+
+    void stage_automatic_cancel() noexcept {
+        hot_.pending_cancel.reset();
+        if (!can_stage_cancel() || parts_.in_flight.count() == 0) return;
+        const auto upper = cancel_server_time_upper_bound(parts_.clock, fetch_clock_pair());
+        if (!upper) return;
+
+        parts_.in_flight.visit_active([&](InFlightHandle handle, std::string_view coid) noexcept {
+            if (hot_.cancel_claimed_generation[handle.slot_index] == handle.generation) return true;
+            const auto* order = parts_.fill_context.find(coid);
+            if (!order || !is_confirmed_cancel_target(*order)) return true;
+            const auto approval = config_.automatic_cancel.approvals.read(order->cancel_symbol);
+            if (!approval || !permits_automatic_cancel(*approval, cancel_subject_, order->cancel_symbol, *upper)) return true;
+
+            AutomaticCancelRequest request{};
+            request.handle = handle;
+            std::memcpy(request.client_order_id.id, coid.data(), coid.size());
+            request.exchange_order_id = order->exchange_order_id;
+            request.symbol_id = order->symbol_id;
+            request.kill_revision = parts_.kill_switch.revision();
+            request.approval_serial = approval->serial;
+            request.subject = cancel_subject_;
+            std::memcpy(request.symbol, order->cancel_symbol, sizeof(request.symbol));
+            request.approval_not_after_ms = approval->not_after_ms;
+            hot_.pending_cancel = request;
+            return false;
+        });
+    }
+
     void advance_recovery(std::int64_t now_ms, std::int64_t wall_now_ms) noexcept {
         const FeedObservation feed = make_feed_observation(hot_.supervisor, now_ms);
         RecoveryObservation obs = observe_recovery(feed, now_ms);
@@ -320,6 +390,7 @@ private:
     OrchestratorContext context_{};
     RecoveryApplyResult apply_result_{};
     EnsureBindingStatus binding_status_{EnsureBindingStatus::NotRun};
+    CancelSubject cancel_subject_{};
     bool recovery_applied_{false};
     bool exchange_info_loaded_{false};
 };

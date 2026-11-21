@@ -742,5 +742,7 @@ TEST_F(NeverSentReaderTest, TheExportNamesTheNeverSentEventAndState) {
 TEST(NeverSentNames, TheEventAndTheStateHaveTheirOwnNames) {
     EXPECT_STREQ(audit_event_name(AuditEventType::OrderNeverSent), "ORDER_NEVER_SENT");
     EXPECT_STREQ(order_state_name(OrderState::NeverSent), "NeverSent");
-    EXPECT_STREQ(audit_event_name(static_cast<AuditEventType>(24)), "UNKNOWN") << "one past the newest event names nothing";
+    EXPECT_STREQ(audit_event_name(AuditEventType::OrderCancelPrepared), "ORDER_CANCEL_PREPARED");
+    EXPECT_STREQ(audit_event_name(AuditEventType::OrderCancelNotSent), "ORDER_CANCEL_NOT_SENT");
+    EXPECT_STREQ(audit_event_name(static_cast<AuditEventType>(26)), "UNKNOWN") << "one past the newest event names nothing";
 }

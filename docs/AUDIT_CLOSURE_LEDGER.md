@@ -835,9 +835,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 0758969
-open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
+open: open:native/src/live_submit_preflight_harness.cpp#"scratch_store_cleanup.emplace(durable_audit_path);"
 refs: test:native/tests/test_durable_audit_sink.cpp#TornTailWriteDiscardsOnlyTheIncompleteRecord test:native/tests/test_durable_audit_sink.cpp#TornTailUnderSixBytesIsRecoveredNotCorrupt test:native/tests/test_durable_audit_sink.cpp#AnchorAheadOfTruncatedLogIsCorruptTailDeletion test:native/tests/test_startup_recovery.cpp#EachUnhealthyDurableLogConditionDegradesWithItsOwnReason test:native/tests/test_durable_audit_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_audit_sink.cpp#ACompleteButWrongFrameIsCorruptAndNothingBehindItIsCut test:native/tests/test_durable_audit_sink.cpp#AnAnchorAheadOfTheLogTogetherWithATornTailIsCorruptAndNothingIsCut test:native/tests/test_control_plane_log_sink.cpp#EveryTornPrefixLengthIsCutAndTheLogKeepsGrowing test:native/tests/test_durable_log_store.cpp#DiscardTornTailRefusesATailOfAWholeFrameOrMoreAndLeavesTheBytes pr:177@0758969
-note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；PR #177 起撕裂尾部在锚点校验通过之后被物理截断（真实日志上验证第二帧的每个撕裂前缀长度：截断后下一次追加落在帧边界，再重启仍可回放），完整但错误的帧与锚点超前于日志的尾部删除一字节不动、整本日志 Corrupt，截断被操作系统拒绝则围栏；缺口是“拒绝启动并禁止增仓”要由在持久存储上运行启动恢复的进程才成立（M5b-1 起预检线束经流水线运行启动恢复，但存储是每次新建的临时存储，不会有撕裂尾部），且没有恢复报告产物（运行期也没有人读取 recovered_torn_tail_bytes）。
+note: 撕裂尾部与尾部被删能被恢复扫描区分并拒绝，不健康的日志状态在恢复状态机里各有降级原因；PR #177 起撕裂尾部在锚点校验通过之后被物理截断（真实日志上验证第二帧的每个撕裂前缀长度：截断后下一次追加落在帧边界，再重启仍可回放），完整但错误的帧与锚点超前于日志的尾部删除一字节不动、整本日志 Corrupt，截断被操作系统拒绝则围栏；撤单专用模式拒绝被围栏的持久日志。常规交易的增仓限制与恢复报告仍需运行验证。
 ```
 
 ```ledger
@@ -1026,9 +1026,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: open:native/include/hengyuan/binance_private_rest.hpp#'rules.is_trading = (status_sv == "TRADING");' absent:native/include/hengyuan/binance_private_rest.hpp#cancel_order
-refs: test:native/tests/test_account_truth.cpp#SymbolNotTrading
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：非 TRADING 的标的一律不是 is_trading，预检拒绝任何新订单（含平仓新单）已有单测；“允许撤单与改单”一半无从测试——全树没有撤单路径，CANCEL_ONLY 也没有被单独区分。
+open: open:native/include/hengyuan/binance_private_rest.hpp#'rules.is_trading = (status_sv == "TRADING");' open:native/include/hengyuan/binance_private_rest.hpp#'binding_.environment() != BinanceEnvironment::Testnet'
+refs: test:native/tests/test_account_truth.cpp#SymbolNotTrading test:native/tests/test_binance_private_rest.cpp#CancelTestnetSpotOrderUsesEmergencyDeleteWithBothIdentities
+note: 非 TRADING 标的的新增订单由预检拒绝。Testnet 单笔撤单适配器已验证，交易进程尚未接入 CANCEL_ONLY 下的撤单与改单执行。
 ```
 
 ```ledger
@@ -1119,9 +1119,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
+open: open:native/src/live_submit_preflight_harness.cpp#"scratch_store_cleanup.emplace(durable_audit_path);"
 refs: test:native/tests/test_startup_recovery.cpp#BootstrapsUntilClockAndExchangeInfoAreReady test:native/tests/test_durable_audit_sink.cpp#RepopulateInFlightRegistryHelperRegistersEveryCheckpoint test:native/tests/test_durable_audit_sink.cpp#SeedPositionTruthFoldsEachRecoveredCheckpointsFilledAmount
-note: 恢复状态机与日志回放辅助函数有单测；启动恢复自 M5b-1 起由预检线束经流水线运行，但该线束自述“不是恢复路径”：存储是每次运行新建的临时存储、固定测试密钥，永远没有上一次运行的订单。
+note: 恢复状态机和日志回放已有单元测试。原生撤单模式可加载持久订单日志，对待确认撤单按数字订单号恢复。策略主进程的崩溃注入仍待验证。
 ```
 
 ```ledger
@@ -1257,9 +1257,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 38d59cf
-open: open:native/src/live_submit_preflight_harness.cpp#"const std::string durable_audit_path = durable_audit_temp_path();"
+open: open:native/src/live_submit_preflight_harness.cpp#"scratch_store_cleanup.emplace(durable_audit_path);"
 refs: test:native/tests/test_startup_recovery.cpp#ACrashBetweenTheExchangeAnswerAndTheDurableAckLeavesTheOrderRecoverableAndItConvergesOnce test:native/tests/test_startup_recovery.cpp#AnAcknowledgedResolutionIsNotReconciledAgainAfterACrash test:native/tests/test_startup_recovery.cpp#ARecoveredSubmittingOrderResolvedToCancelledLeavesALogThatReplaysClean test:native/tests/test_order_tracker.cpp#TheDurableAckComesBeforeEveryMemoryEffect test:native/tests/test_order_tracker.cpp#AnUnacknowledgedAppendPublishesNothingAndTheNextDrainRetriesTheSameResolution code:native/include/hengyuan/order_tracker.hpp#ReconcileDurablePublisher pr:169@38d59cf
-note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。用户数据流排空函数的同形缺口由 M4 补上（PR #224，9675b6c：先持久确认再折进持仓真值，规划器保证写出的日志可回放，单元测试级）。仍缺：启动恢复状态机自 M5b-1 起只由预检线束运行，存储是临时存储、没有上一次运行的订单，所以没有端到端的重启运行日志，判定信号是单元测试。
+note: PR #169 之后对账路径的前置阻塞已解除：每个解决事件先取得持久确认再发布到内存并释放槽位，崩溃的两个位置都在真实 DurableAuditSink 日志上注入——交易所已答、持久端口未确认时崩溃，订单仍按未知恢复并恰好一次地落定；确认之后、内存发布之前崩溃，日志已终态、重启不再对账。用户数据流排空函数的同形缺口由 M4 补上（PR #224，9675b6c：先持久确认再折进持仓真值，规划器保证写出的日志可回放，单元测试级）。撤单专用模式可用同一持久日志启动恢复。对账终态持久确认前的主进程崩溃注入与重启验证仍待完成。
 ```
 
 ```ledger
@@ -1303,9 +1303,9 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 6cb56bd
-open: absent:native/include/hengyuan/binance_private_rest.hpp#cancel_order
-refs: test:native/tests/test_order_lifecycle.cpp#CancelRequestedToFilled test:native/tests/test_order_lifecycle.cpp#InvalidTransitionDoesNotChangeState test:native/tests/test_order_tracker.cpp#AcceptedOrderDiscoversCancelRequestedViaLivePoll
-note: 复验改判（NOT_TESTABLE_YET → PARTIAL）：生命周期允许撤单中直接转为成交且禁止非法回退，对账轮询能发现撤单中状态的单测已存在；撤单路径本身不存在，所以“并发竞争”只能在状态机层面验证。
+open: absent:native/include/hengyuan/*.hpp#CancelUnknown
+refs: test:native/tests/test_order_lifecycle.cpp#CancelRequestedToFilled test:native/tests/test_order_lifecycle.cpp#InvalidTransitionDoesNotChangeState test:native/tests/test_order_tracker.cpp#AcceptedOrderDiscoversCancelRequestedViaLivePoll test:native/tests/test_binance_private_rest.cpp#QuerySpotCancelOrderUsesNumericIdAndValidatesCanceledIdentity
+note: 本地测试覆盖撤单期间的状态变化、累计成交和数字订单号复查。独立 Testnet 样本验证了零成交撤单。交易进程中的撤单与成交并发及结果未知的恢复仍待验证。
 ```
 
 ```ledger
@@ -1597,8 +1597,9 @@ status: NOT_TESTABLE_YET
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 58b60d0
-open: absent:native/include/hengyuan/*.hpp#cancel_order absent:native/include/hengyuan/*.hpp#CancelUnknown
-note: 全树没有撤单路径（蓝图 L-42）；撤单与成交竞态的收敛属 FI-034，仅可撤单时禁止新单属 FI-016。
+open: absent:native/include/hengyuan/*.hpp#CancelUnknown
+refs: test:native/tests/test_binance_private_rest.cpp#CancelTestnetSpotOrderPreservesInconclusiveAfterHttpFailure
+note: 已绑定的独占 Testnet 日志保存撤单意图，并支持按数字订单号恢复。能够确认请求未进入写入阶段时，可用 OrderCancelNotSent 恢复原工作状态。交易主进程仍需只减风险状态下的自动触发，以及超时与部分成交的 Testnet 组合验证。
 ```
 
 ```ledger

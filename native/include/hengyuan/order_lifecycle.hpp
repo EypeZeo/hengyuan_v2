@@ -211,7 +211,16 @@ constexpr TransitionResult validate_transition(OrderState from, OrderState to) n
                 return TransitionResult::Ok;
             break;
         case OrderState::CancelRequested:
-            if (to == OrderState::Cancelled ||
+            // PENDING_CANCEL is an observation, not a promise that the cancel
+            // will win. A later authoritative NEW / PARTIALLY_FILLED report
+            // means the order is still working (the cancel failed or a fill
+            // arrived first); cumulative fill fields, not this state label,
+            // carry the accounting delta. This is L4 §6.6's observation matrix
+            // and 5.9.5's CANCEL_REQUESTED -> PARTIALLY_FILLED edge, not a local
+            // "undo cancel" operation and never a transition out of Cancelled.
+            if (to == OrderState::Accepted ||
+                to == OrderState::PartialFill ||
+                to == OrderState::Cancelled ||
                 to == OrderState::Filled ||   // filled before cancel arrived
                 to == OrderState::Expired)
                 return TransitionResult::Ok;
@@ -275,6 +284,24 @@ struct ClientOrderId {
     }
 
     bool empty() const noexcept { return id[0] == '\0'; }
+};
+
+// The immutable identity of one recorded cancel attempt.
+struct PendingSpotCancel {
+    ClientOrderId alias{};
+    char symbol[kSymbolNameLen]{};
+    std::uint8_t price_scale{0};
+    std::uint8_t qty_scale{0};
+    std::uint8_t quote_scale{0};
+
+    bool present() const noexcept { return !alias.empty(); }
+
+    void apply_rules(SymbolRules& rules) const noexcept {
+        std::memcpy(rules.symbol, symbol, sizeof(symbol));
+        rules.price_scale = price_scale;
+        rules.qty_scale = qty_scale;
+        rules.quote_scale = quote_scale;
+    }
 };
 
 // Generate a deterministic client order ID from components.
@@ -345,6 +372,7 @@ struct OrderRecord {
     // unknown_quarantine_due() lets it trigger only after this process has sent the order at least
     // one query (see there).
     bool wall_anchor_recovered{false};
+    PendingSpotCancel pending_cancel{};
 
     TransitionResult transition_to(OrderState next) noexcept {
         auto result = validate_transition(state, next);
@@ -461,6 +489,8 @@ struct OrderExpectation {
     std::int64_t intended_price_ticks{0};
     std::int64_t intended_qty_ticks{0};
     SymbolRules rules_snapshot_at_submit{};
+    PendingSpotCancel pending_cancel{};
+    std::int64_t cancel_exchange_order_id{0};
 
     static OrderExpectation from(const OrderRecord& rec) noexcept {
         OrderExpectation exp{};
@@ -471,6 +501,11 @@ struct OrderExpectation {
         exp.intended_price_ticks = rec.intended_price_ticks;
         exp.intended_qty_ticks = rec.intended_qty_ticks;
         exp.rules_snapshot_at_submit = rec.rules_snapshot_at_submit;
+        if (rec.pending_cancel.present()) {
+            exp.pending_cancel = rec.pending_cancel;
+            exp.cancel_exchange_order_id = rec.exchange_order_id;
+            exp.pending_cancel.apply_rules(exp.rules_snapshot_at_submit);
+        }
         return exp;
     }
 };
@@ -612,6 +647,15 @@ public:
     }
 
     std::size_t count() const noexcept { return count_; }
+
+    // The visitor must not mutate this registry. False stops the bounded scan.
+    template <typename Visitor>
+    void visit_active(Visitor&& visitor) const noexcept {
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            const auto& slot = slots_[i];
+            if (slot.active && !visitor(InFlightHandle{i, slot.generation}, std::string_view(slot.id))) return;
+        }
+    }
 
 private:
     static constexpr std::size_t kNotFound = static_cast<std::size_t>(-1);

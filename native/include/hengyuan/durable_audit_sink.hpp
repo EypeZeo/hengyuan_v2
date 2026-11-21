@@ -50,6 +50,7 @@
 #pragma once
 
 #include <hengyuan/audit_archive_format.hpp>
+#include <hengyuan/cancel_prepared.hpp>
 #include <hengyuan/control_plane_frame_codec.hpp>
 #include <hengyuan/durable_control_plane.hpp>
 #include <hengyuan/durable_frame_codec.hpp>
@@ -62,6 +63,7 @@
 #include <hengyuan/order_lifecycle.hpp>
 #include <hengyuan/position_truth.hpp>
 #include <hengyuan/secure_wipe.hpp>
+#include <hengyuan/store_binding.hpp>
 
 #include <array>
 #include <cstdio>
@@ -587,10 +589,65 @@ public:
     // auto-retries. now_ms is caller-supplied (this codebase's established
     // clock-injection style, not read from a global clock here).
     AuditAppendResult append_durable(const AuditRecord& rec, std::int64_t now_ms) noexcept {
+        if (rec.event_type == AuditEventType::OrderCancelPrepared ||
+            rec.event_type == AuditEventType::OrderCancelNotSent) return {};
         if (rec.event_type == AuditEventType::OrderIntentCreated) {
             if (!attempt_watermark_.permits(rec.client_order_id)) return {};
         }
         return append_impl(rec, now_ms, write_version_);
+    }
+
+    // The first append after an exclusive open may prepare a recovered working order.
+    // No subsequent append can use a checkpoint that is stale relative to this store.
+    AuditAppendResult append_cancel_prepared(std::string_view coid, const ClientOrderId& alias,
+                                            const SymbolRules& rules, std::int64_t now_ms) noexcept {
+        if (open_mode_ != AuditSinkOpenMode::Trading || fenced_ || !log_open_ || appended_since_recovery_ ||
+            now_ms <= 0 || coid.empty() || alias.id[kClientOrderIdLen] != '\0' ||
+            rules.symbol[kSymbolNameLen - 1] != '\0') return {};
+        const auto alias_view = alias.view();
+        const auto symbol = rules.symbol_name();
+        if (!cancel_prepared::valid_alias(alias_view) || !cancel_prepared::valid_symbol(symbol)) return {};
+
+        auto entries = std::span(checkpoints_).first(checkpoint_count_);
+        const auto found = std::find_if(entries.begin(), entries.end(),
+                                        [coid](const auto& cp) { return cp.client_order_id.view() == coid; });
+        if (found == entries.end() || found->pending_cancel.present() || found->exchange_order_id_conflict) return {};
+        auto& cp = *found;
+        AuditRecord record{};
+        record.event_type = AuditEventType::OrderCancelPrepared;
+        record.mode = ExecutionMode::Live;
+        record.timestamp_ms = now_ms;
+        record.set_client_order_id(coid);
+        record.resulting_state = OrderState::CancelRequested;
+        record.symbol_id = cp.symbol_id;
+        record.side = cp.side;
+        record.exchange_order_id = cp.exchange_order_id;
+        record.price_ticks = cp.intended_price_ticks;
+        record.qty_ticks = cp.intended_qty_ticks;
+        record.filled_qty_ticks = cp.filled_qty_ticks;
+        record.avg_fill_price_ticks = cp.avg_fill_price_ticks;
+        static_assert(kClientOrderIdLen + kSymbolNameLen < sizeof(record.detail_msg));
+        std::memcpy(record.detail_msg, alias_view.data(), alias_view.size());
+        record.detail_msg[alias_view.size()] = '|';
+        std::memcpy(record.detail_msg + alias_view.size() + 1, symbol.data(), symbol.size());
+        record.detail_code = (static_cast<std::uint32_t>(rules.price_scale) << 16) |
+                             (static_cast<std::uint32_t>(rules.qty_scale) << 8) | rules.quote_scale;
+        const auto pending = cancel_prepared::decode(record);
+        if (!pending || !cancel_prepared::matches_working_order(
+                            record, cp.resulting_state, cp.mode, cp.symbol_id, cp.side, cp.intended_price_ticks,
+                            cp.intended_qty_ticks, cp.exchange_order_id, cp.filled_qty_ticks, cp.avg_fill_price_ticks)) return {};
+
+        const auto result = append_impl(record, now_ms, kFrameFormatVersionV6);
+        if (result.acked()) {
+            write_version_ = kFrameFormatVersionV6;
+            auto restoration = record;
+            restoration.event_type = AuditEventType::OrderCancelNotSent;
+            restoration.resulting_state = cp.resulting_state;
+            cancel_restore_ = CancelRestore{restoration, static_cast<std::size_t>(found - entries.begin()), result.sequence};
+            cp.pending_cancel = *pending;
+            cp.resulting_state = OrderState::CancelRequested;
+        }
+        return result;
     }
 
     // D5 / R3-0 (docs/OPERATOR_RESOLUTION_DESIGN.md 6 step 7): the ONLY way an OrderOperatorResolved frame gets into a log,
@@ -739,9 +796,61 @@ public:
     }
 
 private:
-    // The one place a frame is appended. `version` is the format version of THIS frame: append_durable() passes the
-    // store's write version, append_operator_resolution() and append_never_sent() pass 6. (test_operator_resolution_guard.cpp
-    // pins all three callers.)
+    friend class BinancePrivateRestClient;
+
+    // The execution owner has quiesced the original writers and transferred the sink.
+    // Refresh the checkpoints without releasing the process lock or opening another path.
+    bool prepare_cancel_handoff() noexcept {
+        if (!log_open_ || fenced_ || open_mode_ != AuditSinkOpenMode::Trading || cancel_restore_) return false;
+        const auto expected_sequence = next_sequence_;
+        next_sequence_ = 0;
+        checkpoint_count_ = 0;
+        checkpoint_resolved_.fill(false);
+        session_resolved_count_ = 0;
+        operator_resolved_count_ = 0;
+        recovery_overflow_ = {};
+        intent_orphan_count_ = 0;
+        never_sent_count_ = 0;
+        torn_tail_bytes_ = 0;
+        attempt_watermark_ = {};
+        observed_key_id_count_ = 0;
+        interrupted_rotation_ = false;
+        recovery_status_ = run_recovery_scan(log_store_.log_path());
+        if ((recovery_status_ != RecoveryScanStatus::Clean && recovery_status_ != RecoveryScanStatus::Recovered) ||
+            next_sequence_ != expected_sequence) {
+            fenced_ = true;
+            fence_reason_ = FenceReason::IoError;
+            return false;
+        }
+        appended_since_recovery_ = false;
+        return true;
+    }
+
+    struct CancelRestore {
+        AuditRecord record;
+        std::size_t checkpoint_index;
+        std::uint64_t prepared_sequence;
+    };
+
+    // Only the transport caller can attest that its synchronous cancel never reached the write stage.
+    // A recovered preparation has no such authority, even when the order still appears to be working.
+    AuditAppendResult append_cancel_not_sent(std::int64_t now_ms) noexcept {
+        if (!cancel_restore_ || next_sequence_ == 0 ||
+            next_sequence_ - 1 != cancel_restore_->prepared_sequence) return {};
+        auto restore = *cancel_restore_;
+        cancel_restore_.reset();
+        restore.record.timestamp_ms = now_ms;
+        const auto result = append_impl(restore.record, now_ms, write_version_);
+        if (result.acked()) {
+            auto& cp = checkpoints_[restore.checkpoint_index];
+            cp.pending_cancel = {};
+            cp.resulting_state = restore.record.resulting_state;
+        }
+        return result;
+    }
+
+    // The generic writer passes the store version. The typed writers for cancel preparation,
+    // operator resolution and NeverSent pass v6.
     AuditAppendResult append_impl(const AuditRecord& rec, std::int64_t now_ms, std::uint8_t version) noexcept {
         AuditAppendResult result{};
         if (fenced_ || !log_open_) {
@@ -749,6 +858,7 @@ private:
             return result;
         }
 
+        appended_since_recovery_ = true;
         if (next_sequence_ >= max_order_frames_) {
             fenced_ = true;
             fence_reason_ = FenceReason::LogLimit;
@@ -952,6 +1062,10 @@ public:
     // "not currently established".
     std::uint64_t store_uuid_lo() const noexcept { return store_uuid_lo_; }
     std::uint64_t store_uuid_hi() const noexcept { return store_uuid_hi_; }
+
+    StoreBindingRead read_binding() const noexcept {
+        return read_store_binding(log_store_.log_path(), key_ring_, store_uuid_lo_, store_uuid_hi_);
+    }
     // True iff the store-identity sidecar could not be established/verified
     // (corrupt file, or a first-time generation whose durable write failed).
     // Never affects fenced()/append_durable()'s core correctness -- it only
@@ -1011,6 +1125,10 @@ private:
         ExecutionMode mode{ExecutionMode::DryRun};
         // D5 / R1: an OrderOperatorResolved frame was accepted for this COID. It must be that COID's last frame.
         bool operator_resolved{false};
+        PendingSpotCancel pending_cancel{};
+        bool exchange_order_id_conflict{false};
+        OrderState before_cancel{OrderState::Intent};
+        std::uint64_t cancel_prepared_sequence{0};
         // (No flag for an accepted OrderNeverSent frame: see the scan, where the state NeverSent does that job.)
         // R-10 / L-30: the header time of the FIRST frame that put this order in Submitting and in
         // Ambiguous, kept only when that frame's time is a ServerCorrectedUtc reading (anything
@@ -1249,7 +1367,38 @@ private:
             if (!never_sent::pairing_holds(frame.record)) return RecoveryScanStatus::Corrupt;
             const bool operator_frame = frame.record.event_type == AuditEventType::OrderOperatorResolved;
             const bool never_sent_frame = frame.record.event_type == AuditEventType::OrderNeverSent;
-            if (!rs.established) {
+            const bool cancel_frame = frame.record.event_type == AuditEventType::OrderCancelPrepared;
+            if (rs.pending_cancel.present() &&
+                (frame.record.filled_qty_ticks < rs.filled_qty_ticks ||
+                 frame.record.filled_qty_ticks > rs.intended_qty_ticks)) {
+                return RecoveryScanStatus::Corrupt;
+            }
+            if (cancel_frame) {
+                const auto pending = cancel_prepared::decode(frame.record);
+                if (!rs.established || rs.pending_cancel.present() || rs.exchange_order_id_conflict || !pending ||
+                    !cancel_prepared::matches_working_order(
+                        frame.record, rs.state, rs.mode, rs.symbol_id, rs.side, rs.intended_price_ticks,
+                        rs.intended_qty_ticks, rs.exchange_order_id, rs.filled_qty_ticks, rs.avg_fill_price_ticks)) {
+                    return RecoveryScanStatus::Corrupt;
+                }
+                rs.pending_cancel = *pending;
+                rs.before_cancel = rs.state;
+                rs.cancel_prepared_sequence = frame.sequence_number;
+                rs.state = OrderState::CancelRequested;
+            } else if (frame.record.event_type == AuditEventType::OrderCancelNotSent) {
+                const auto restored = cancel_prepared::decode(frame.record);
+                if (!rs.pending_cancel.present() || rs.state != OrderState::CancelRequested || !restored ||
+                    frame.sequence_number == 0 || frame.sequence_number - 1 != rs.cancel_prepared_sequence ||
+                    frame.record.resulting_state != rs.before_cancel ||
+                    !cancel_prepared::same_identity(*restored, rs.pending_cancel) ||
+                    !cancel_prepared::matches_working_order(
+                        frame.record, rs.before_cancel, rs.mode, rs.symbol_id, rs.side, rs.intended_price_ticks,
+                        rs.intended_qty_ticks, rs.exchange_order_id, rs.filled_qty_ticks, rs.avg_fill_price_ticks)) {
+                    return RecoveryScanStatus::Corrupt;
+                }
+                rs.state = rs.before_cancel;
+                rs.pending_cancel = {};
+            } else if (!rs.established) {
                 // A COID starts with its Intent frame. The operator event is never one: refused even when it
                 // claims resulting_state Intent. (The OrderNeverSent event is refused by the pairing rule above and the
                 // Intent requirement below: it cannot carry the state Intent, and the state NeverSent is not Intent.)
@@ -1302,7 +1451,12 @@ private:
                 rs.filled_qty_ticks = frame.record.filled_qty_ticks;
                 rs.avg_fill_price_ticks = frame.record.avg_fill_price_ticks;
             }
-            if (frame.record.exchange_order_id != 0) rs.exchange_order_id = frame.record.exchange_order_id;
+            if (frame.record.exchange_order_id != 0) {
+                const bool conflict = rs.exchange_order_id != 0 && frame.record.exchange_order_id != rs.exchange_order_id;
+                if (conflict && rs.pending_cancel.present()) return RecoveryScanStatus::Corrupt;
+                rs.exchange_order_id_conflict |= conflict;
+                rs.exchange_order_id = frame.record.exchange_order_id;
+            }
 
             // R-10 / L-30: remember when the order first entered Submitting and Ambiguous -- the
             // MAC-verified header time, and only if it is a wall time (frame_wall_time_ms(): any
@@ -1415,12 +1569,15 @@ private:
             // outcome ever landed" order means genuinely uncertain, not safely
             // still-in-progress.
             cp.resulting_state = (rs.state == OrderState::Submitting) ? OrderState::Ambiguous : rs.state;
+            cp.pending_cancel = rs.pending_cancel;
+            if (cp.pending_cancel.present()) cp.resulting_state = OrderState::CancelRequested;
             cp.intended_price_ticks = rs.intended_price_ticks;
             cp.intended_qty_ticks = rs.intended_qty_ticks;
             cp.filled_qty_ticks = rs.filled_qty_ticks;
             cp.avg_fill_price_ticks = rs.avg_fill_price_ticks;
             cp.symbol_id = rs.symbol_id;
             cp.exchange_order_id = rs.exchange_order_id;
+            cp.exchange_order_id_conflict = rs.exchange_order_id_conflict;
             cp.side = rs.side;
             // D5 / R3-0: two facts the scan already holds and used to drop (OrderRecoveryCheckpoint's own comment says why
             // the offline operator tool needs them). submitting_utc_ms is the first Submitting frame's time, kept only
@@ -1837,6 +1994,8 @@ private:
     std::size_t operator_resolved_count_{0};
     RecoveryOverflow recovery_overflow_{};
     std::size_t intent_orphan_count_{0};
+    bool appended_since_recovery_{false};
+    std::optional<CancelRestore> cancel_restore_;
     std::size_t never_sent_count_{0};  // Q23 S2/S3: orders an OrderNeverSent frame closed (see recovered_never_sent())
     std::uint64_t torn_tail_bytes_{0};
     std::uint64_t rotation_torn_tail_bytes_{0};
@@ -1922,6 +2081,8 @@ inline OrderRecord checkpoint_to_order_record(const OrderRecoveryCheckpoint& cp,
     // regardless of the real side -- a minimal PositionTruth folding recovered
     // orders (seed_position_truth(), below) needs the real direction.
     rec.side = cp.side;
+    rec.pending_cancel = cp.pending_cancel;
+    if (cp.pending_cancel.present()) cp.pending_cancel.apply_rules(rec.rules_snapshot_at_submit);
     if (cp.resulting_state == OrderState::Ambiguous) {
         rec.unknown_since_wall_ms = recovered_wall_anchor(cp.unknown_since_utc_ms, now_wall_ms);
         rec.wall_anchor_recovered = (rec.unknown_since_wall_ms != OrderRecord::kClockUnset);

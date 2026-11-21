@@ -60,6 +60,7 @@ public:
     unsigned short port() const { return acceptor_.local_endpoint().port(); }
 
     struct RequestRecord {
+        std::string method;
         std::string target;
         std::string api_key_header;  // empty if the header was absent
         std::string host_header;     // empty if the header was absent (public-REST clients assert on it)
@@ -98,6 +99,7 @@ private:
                 {
                     std::lock_guard<std::mutex> lk(mu_);
                     RequestRecord rec;
+                    rec.method = std::string(req->method_string());
                     rec.target = std::string(req->target());
                     auto it = req->find("X-MBX-APIKEY");
                     if (it != req->end()) rec.api_key_header = std::string(it->value());

@@ -195,11 +195,9 @@ TEST(NeverSentGuard, TheScannerHelpersHaveKnownAnswers) {
     EXPECT_TRUE(function_body(code_only("int f(int a);"), "f").empty()) << "a declaration has no body";
 }
 
-TEST(NeverSentGuard, TheNeverSentEventIsNamedOnlyByItsDefinitionTheCodecTheRuleAndTheReader) {
+TEST(NeverSentGuard, TheNeverSentEventIsNamedOnlyByItsDefinitionTheRuleAndTheReader) {
     expect_named_only_in("OrderNeverSent",
                          {{kTrail, 2, "the enumerator and its name in audit_event_name()"},
-                          {kCodec, 2, "is_legal_audit_event_type_for_version(): the v6 bound and the assertion that the two "
-                                      "v6-only events are consecutive"},
                           {kRules, 3, "pairing_holds() and check_closing_frame() read the event; class_a_closure_of() is the one place a "
                                       "closing frame is built (Q23 S6), from the Intent it closes"},
                           {kSink, 2, "the recovery scan observes the closure id for the watermark and routes the closure frame"}});

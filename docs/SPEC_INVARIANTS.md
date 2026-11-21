@@ -217,8 +217,25 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
     就会破坏回放或自相矛盾，拒绝）。前缀只在它为真的地方给：`Submitting` 到只有 `Ambiguous` 才到得了的状态，或恢复订单中两种可能末帧不都合法的目标；
     `Accepted`/`PartialFill` 永不补（`→ Ambiguous` 不是边，也不是事实）；影子仍为 `Intent` = 有写者漏了 ACK 点，一律拒绝。**写者侧对每一帧都检查成交量**
     （不降、不超 `intended_qty_ticks`、无意图量则拒绝任何成交），比恢复扫描严——扫描只对“同状态重复帧”检查，状态转移帧只看 `validate_transition()`，所以
-    转移帧上的超量或回退会被它静默接受（蓝图附录 D 的 L-51，随 M4 合入后的文档同步登记；收紧扫描是格式兼容性决定，不在 M4）。已知局限（L-52）：
-    `CancelRequested` 之后的 `PARTIALLY_FILLED` 是 Unreachable（没有这条边），树里还没有撤单路径，有了那天再决定。
+    转移帧上的超量或回退会被它静默接受（蓝图附录 D 的 L-51，随 M4 合入后的文档同步登记；收紧扫描是格式兼容性决定，不在 M4）。任务 1A.7-C0 已补
+    `CancelRequested → Accepted / PartialFill`（L4 §6.6 的撤单未赢观察），同状态累计成交增长也会写帧；REST 的当前快照允许双向收敛，
+    WS 则把无新增成交量的迟到 `NEW/PARTIALLY_FILLED` 判为 Stale，只有更大累计量能证明撤单中的新成交，避免旧报告把状态倒退。
+  - **持久撤单准备**：`OrderCancelPrepared` 属于 v6 订单帧，记录工作单的数字订单号、撤单别名、标的和精度。写入限定为独占打开后对恢复出的实际工作单的首个追加。
+    Testnet 执行入口核对绑定账户和交易所工作状态，收到准备帧 ACK 才发出一次 DELETE。重启查询使用保存的数字订单号和精度。查询仍为工作状态时可持久化累计成交的增长，
+    订单留在撤单待确认状态。终态未写入时保留恢复记录和在途资源。已有的交易所 `PENDING_CANCEL` 观察仍遵循其原有状态转换规则。
+  - **撤单请求未发送**：同步调用确认未进入请求写入阶段后，可在同一独占打开期间追加 v6 的 `OrderCancelNotSent`。该帧必须紧随同一撤单准备帧，并匹配订单身份、
+    撤单别名、原工作状态和累计成交。收到该帧的 ACK 才清除待确认撤单，保留原订单及在途资源。重开日志后可发起新撤单。写入阶段及之后的错误、进程中断或该帧未获确认，
+    均沿用只读恢复流程。
+  - **主进程撤单请求**：`PrivateStreamPipeline::hot_tick()` 在排空订单事件后检查 `Triggered` 或 `Latched`，每次最多暂存一个请求。候选须为日志已确认的实单，
+    处于 `Accepted` 或 `PartialFill`，且具备一致的数字订单号。原撤单尚待确认的订单、模拟订单和身份冲突订单不参与选择。
+    `take_automatic_cancel()` 领取前复查在途代次、熔断修订号和预验授权。授权须匹配环境、账户、存储身份、运行身份和品种，且交易所时间上界在有效期内。
+    同一个在途代次最多领取一次。调用发生在主线程，网络发送由撤单执行器负责。
+  - **Owner 撤单授权**：`OwnerCancelAuthority` 使用预置的环境专用 P-256 公钥验证二进制撤单授权。签名绑定账户、日志身份、进程启动标识、标的、序号与到期时间。
+    安装须使用新鲜的交易所时钟。新授权须使用更高序号，撤销的序号在本次启动期间不可重装。持久执行器重新核对熔断状态与版本、日志身份、交易所账户和已恢复工作单。
+    撤单准备帧获得写盘确认后才可发送。TLS 握手完成后、HTTP 写入前再次检查熔断状态和当前授权。此时失去授权按 `OrderCancelNotSent` 处理。
+  - **撤单日志交接**：主循环领取撤单请求后，停止私有数据流、等待生产者退出并排空剩余事件。随后销毁流水线，将日志对象移交执行器。
+    执行器在原有独占锁内重扫日志并核对最新流水序号。重启时，已有准备帧且结果未知的订单由恢复循环按数字订单号查询，仍在工作的响应保留待确认状态。
+    本地公钥登记绑定已经核验的环境、账户和日志身份，登记文件只可新建。运行时从该文件加载验签公钥。
   - **`UserDataDurablePublisher`**（`binance_user_data_event.hpp`）+ `drain_user_data_events(..., durable)`：一份报告被解析、与本次排空里同一订单的其他报告合并
     （最新的胜出：较新的替换、较旧的丢弃、互相矛盾的拒绝后者；一串成交只落一帧）、按影子规划、写入、ACK 之后才 `consume_delta()`/`apply_fill()` 并写环记录
     （持久模式下环里的记录就是落盘的帧，带**累计**成交量；旧的内存优先路径仍写增量记录）。队头阻塞与对账发布者一致：有观察未持久时排空**什么也不弹**（环满、
@@ -503,10 +520,9 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
       时钟域，生产接线必须先把它定为服务器校正后的 UTC。
     - **仍未覆盖**：路径 ③ `drain_user_data_events()`（同样只写内存审计环；Owner 2026-10-13 决定并入“私网流迁移”
       一起设计，其持久帧同样必须满足回放合法性）；同步 POST 路径（路径 ①）的逐分支复核已补齐（测试
-      LiveSubmitOutcomeAckTest）；读代码时发现的既有缺口，本片不动：
-      `poll_once()` 不再轮询 `CancelRequested` 状态的订单（只轮询 `Ambiguous` 与 `Accepted`/`PartialFill`），
-      所以一旦观察到 `PENDING_CANCEL`，该订单的槽位要等重启才会重新被对账（Binance 现货文档把该状态标为
-      目前未使用）。
+      LiveSubmitOutcomeAckTest）。**后续任务 1A.7-C0 已处理当时的另一个缺口**：`poll_once()` 现在轮询
+      `CancelRequested`，支持其回到 `Accepted`/`PartialFill` 或进入终态；同状态累计成交增长、环满重试和 sweep answered
+      都走统一事件路径。真实 DELETE、撤单结果未知及 Testnet 验收仍不属于该切片。
   - **[SAFE-03 切片 2 已落地：只有 Intent 的孤儿不再是未决订单；重复单在写 Intent 帧之前就被拒]**（SUBMITPORT 规格
     第 9 轮“Intent-only orphans”——规格里写了、代码里从未实现的那一条）：`orchestrate_submit()` 在 Gate 10b 把
     `Intent` 帧持久确认**在** CONFIRM、端口校验、在途登记、真实限流扣费**之前**，所以这些本地拒绝

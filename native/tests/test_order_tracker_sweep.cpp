@@ -47,6 +47,10 @@ OrderRecord make_record(const char* coid, OrderState target, std::int64_t qty = 
             rec.transition_to(OrderState::Accepted);
             rec.transition_to(OrderState::PartialFill);
             break;
+        case OrderState::CancelRequested:
+            rec.transition_to(OrderState::Accepted);
+            rec.transition_to(OrderState::CancelRequested);
+            break;
         case OrderState::EscalatedToOperator:
             rec.transition_to(OrderState::Ambiguous);
             rec.transition_to(OrderState::EscalatedToOperator);
@@ -139,8 +143,9 @@ TEST(OrderTrackerSweepBookkeeping, OnlyOrdersThatCanBePolledAreWaitedFor) {
     ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, make_record("HY-AMB", OrderState::Ambiguous), 0));
     ASSERT_TRUE(tracker.track(InFlightHandle{1, 1}, make_record("HY-LIVE", OrderState::Accepted), 0));
     ASSERT_TRUE(tracker.track(InFlightHandle{2, 1}, make_record("HY-PART", OrderState::PartialFill), 0));
-    ASSERT_TRUE(tracker.track(InFlightHandle{3, 1}, make_record("HY-ESC", OrderState::EscalatedToOperator), 0));
-    EXPECT_EQ(tracker.count_unanswered(1), 3U) << "the escalated one is never asked about, so the sweep does not wait for it";
+    ASSERT_TRUE(tracker.track(InFlightHandle{3, 1}, make_record("HY-CANCEL", OrderState::CancelRequested), 0));
+    ASSERT_TRUE(tracker.track(InFlightHandle{4, 1}, make_record("HY-ESC", OrderState::EscalatedToOperator), 0));
+    EXPECT_EQ(tracker.count_unanswered(1), 4U) << "CancelRequested is pollable; only the escalated one is never asked about";
     EXPECT_EQ(tracker.count_unknown_fate(), 1U) << "...but its fate is unknown, and that is reported";
 }
 
@@ -248,6 +253,27 @@ TEST_F(SweepTrackerTest, ASameStateAnswerIsDefinite_AndTheNextEpochAsksAgain) {
     events = pop_all(outbound_);
     ASSERT_EQ(events.size(), 1U);
     EXPECT_EQ(events[0].sweep_epoch, 2U);
+}
+
+TEST_F(SweepTrackerTest, CancelRequestedIsAnsweredAndItsFillProgressPrecedesTheMarker) {
+    OrderRecord rec = make_record("HY-CANCEL", OrderState::CancelRequested);
+    rec.filled_qty_ticks = 40;
+    rec.avg_fill_price_ticks = 5000;
+    track(rec);
+    exchange_.answers["HY-CANCEL"] = found(OrderState::CancelRequested, 60, 5000);
+    post(1);
+    tick(1000);
+
+    const std::vector<ReconcileEvent> events = pop_all(outbound_);
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_EQ(events[0].kind, ReconcileEventKind::Resolution);
+    EXPECT_EQ(events[0].prior_state, OrderState::CancelRequested);
+    EXPECT_EQ(events[0].resulting_state, OrderState::CancelRequested);
+    EXPECT_EQ(events[0].fill_delta_qty_ticks, 20);
+    EXPECT_TRUE(is_marker(events[1]));
+    EXPECT_EQ(events[1].sweep_unresolved, 0U);
+    EXPECT_EQ(tracker_.answered_epoch("HY-CANCEL"), 1U);
+    EXPECT_EQ(tracker_.count(), 1U) << "identified as still pending: keep polling to an exchange-final state";
 }
 
 TEST_F(SweepTrackerTest, AnAmbiguousOrderFoundStillLiveIsAnsweredAndStaysTracked) {
@@ -367,6 +393,33 @@ TEST_F(SweepTrackerTest, AResolutionTheFullRingRefusedIsNotAnAnswerAndHoldsTheMa
     EXPECT_EQ(events[0].resulting_state, OrderState::Filled);
     EXPECT_TRUE(is_marker(events[1]));
     EXPECT_FALSE(job_.running());
+}
+
+TEST_F(SweepTrackerTest, SameStateFillProgressRefusedByAFullRingIsNotAnAnswerAndKeepsItsBaseline) {
+    for (std::size_t i = 0; i < ReconcileEventRing::capacity(); ++i) ASSERT_TRUE(outbound_.try_push(ReconcileEvent{}));
+    OrderRecord rec = make_record("HY-CANCEL", OrderState::CancelRequested);
+    rec.filled_qty_ticks = 40;
+    rec.avg_fill_price_ticks = 5000;
+    track(rec);
+    exchange_.answers["HY-CANCEL"] = found(OrderState::CancelRequested, 60, 5000);
+    post(1);
+    tick(1000);
+
+    EXPECT_EQ(tracker_.answered_epoch("HY-CANCEL"), 0U);
+    EXPECT_TRUE(job_.running());
+    tracker_.for_each_active([](InFlightHandle, OrderRecord& current, std::int64_t) {
+        EXPECT_EQ(current.state, OrderState::CancelRequested);
+        EXPECT_EQ(current.filled_qty_ticks, 40) << "backpressure must leave the old baseline so the same delta is retried";
+    });
+
+    (void)pop_all(outbound_);
+    tick(1500);  // past the sweep retry interval, well inside the ordinary live cadence
+    const std::vector<ReconcileEvent> events = pop_all(outbound_);
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_EQ(events[0].resulting_state, OrderState::CancelRequested);
+    EXPECT_EQ(events[0].fill_delta_qty_ticks, 20);
+    EXPECT_TRUE(is_marker(events[1]));
+    EXPECT_EQ(tracker_.answered_epoch("HY-CANCEL"), 1U);
 }
 
 TEST_F(SweepTrackerTest, AMarkerTheFullRingRefusedIsRetriedNextTickAndNeverLost) {
