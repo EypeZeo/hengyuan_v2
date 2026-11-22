@@ -1566,6 +1566,25 @@ TEST(ParseSubmitOrderResponse, FullSuccessPathAcceptedNoFill) {
     EXPECT_EQ(resp.avg_fill_price_ticks, 0);
 }
 
+TEST(ParseSubmitOrderResponse, NonPositiveExchangeOrderIdIsNetworkError) {
+    const auto rules = make_btcusdt_rules();
+    for (const std::int64_t order_id : {0, -1}) {
+        const std::string body =
+            std::string(R"({"symbol":"BTCUSDT","orderId":)") + std::to_string(order_id) +
+            R"(,"clientOrderId":"submit-coid-invalid-id","transactTime":1700000000000,)"
+            R"("price":"50000.12","origQty":"0.100000","executedQty":"0.000000",)"
+            R"("cummulativeQuoteQty":"0.00000000","status":"NEW","side":"BUY",)"
+            R"("type":"LIMIT","timeInForce":"GTC"})";
+        const auto resp = parse_submit_order_response(body, "submit-coid-invalid-id", rules,
+                                                       OrderSide::Buy, OrderType::Limit,
+                                                       5'000'012, 100'000);
+        EXPECT_EQ(resp.outcome, SubmitOutcome::NetworkError) << "orderId=" << order_id;
+        EXPECT_EQ(resp.exchange_order_id, 0) << "orderId=" << order_id;
+        EXPECT_EQ(resp.exchange_status, OrderState::Ambiguous) << "orderId=" << order_id;
+        EXPECT_EQ(resp.filled_qty_ticks, 0) << "orderId=" << order_id;
+    }
+}
+
 TEST(ParseSubmitOrderResponse, FullSuccessPathImmediatePartialFillDerivesAvgPrice) {
     const auto rules = make_btcusdt_rules();
     const auto resp = parse_submit_order_response(

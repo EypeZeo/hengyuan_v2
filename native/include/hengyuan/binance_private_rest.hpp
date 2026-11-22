@@ -917,7 +917,7 @@ inline SubmitResponse parse_submit_order_response(std::string_view body,
     if (doc["side"].get_string().get(side_sv) != simdjson::SUCCESS) {
         return {SubmitOutcome::NetworkError, 0, -1};
     }
-    if (order_id < 0 || transact_time_ms < 0) {
+    if (order_id <= 0 || transact_time_ms < 0) {
         return {SubmitOutcome::NetworkError, 0, -1};
     }
 

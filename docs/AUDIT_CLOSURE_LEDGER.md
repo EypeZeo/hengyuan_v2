@@ -124,7 +124,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | code, fault, test, runtime, budget |
 | **P2-001** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-002** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
-| **P2-003** | MEDIUM | lib | REMEDIATING | 下单状态转换 | BLOCKED | code, fault, test, runtime |
+| **P2-003** | MEDIUM | lib | REMEDIATING | 下单状态转换 | BLOCKED | runtime |
 | **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | fault, runtime, budget |
 | **P2-005** | MEDIUM | lib | REMEDIATING | 订单跟踪器 | BLOCKED | code, fault, test, runtime |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
@@ -423,21 +423,21 @@ seg.budget: NA -- 一次指针判空，不增加可测的运行期成本
 ```ledger
 id: P2-003
 legacy: P2-003
-title: 发单状态转换缺少缺省分支，已接受分支未校验交易所订单号为正
+title: 发单结果处理与交易所订单号校验
 severity: MEDIUM
 kind: lib
 status: REMEDIATING
 task: SAFE-06
 gate: 下单状态转换
 gate_result: BLOCKED
-open: open:native/include/hengyuan/live_submit_orchestrator.hpp#"switch (resp.outcome) {" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"default:" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"resp.exchange_order_id > 0" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"resp.exchange_order_id <= 0"
-seg.code: MISSING code:native/include/hengyuan/live_submit_orchestrator.hpp#SubmitOutcome code:native/include/hengyuan/live_submit_orchestrator.hpp#"= 5, not 4" -- 转换开关没有 default 分支，Accepted 分支不校验 exchange_order_id 为正；当前 5 个枚举值（0 至 3 与 5）均被显式覆盖，无现存未定义行为；规格另定义了 RateLimited（值 4，代码里留空），加入时若漏改开关就会静默落空
-seg.contract: PRESENT doc:docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md#StaleRulesVersion bp:"任务 SAFE-06" -- 规格与任务已定义状态完备性
-seg.fault: MISSING -- 没有对应的 FI 编号
-seg.test: MISSING test:native/tests/test_live_submit_orchestrator.cpp#SubmitRejectedRouting test:native/tests/test_live_submit_orchestrator.cpp#SubmitTimeoutAmbiguous -- 现有测试逐个覆盖已有枚举值，没有“未知枚举值失败即关闭”的用例
-seg.runtime: MISSING -- 无 CI run 可引：修复尚未落地
-seg.budget: NA -- 分支完备性不增加热路径成本
-closure: SAFE-06 完成：加 default 失败即关闭与订单号校验，转换完备性测试通过
+open: open:docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md#"Post-send result validation"
+seg.code: PRESENT code:native/include/hengyuan/live_submit_orchestrator.hpp#"switch (resp.outcome) {" code:native/include/hengyuan/live_submit_orchestrator.hpp#"resp.exchange_order_id <= 0" code:native/include/hengyuan/binance_private_rest.hpp#parse_submit_order_response -- 受理回执须包含正的交易所订单号和有效状态。未知结果及无效受理回执写为 Ambiguous，保留在途槽位和预留额度，持久写入确认后交给对账。新增枚举成员必须显式处理。
+seg.contract: PRESENT doc:docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md#"Post-send result validation" bp:"任务 SAFE-06" -- 规定异常发单回执的持久化与对账顺序。
+seg.fault: PRESENT:UT test:native/tests/test_live_submit_orchestrator.cpp#UnknownOutcomeValuesBecomeAmbiguousAndAreReconciled test:native/tests/test_live_submit_orchestrator.cpp#AnUnacknowledgedUnknownOutcomeIsPublishedNowhere -- 模拟未知结果及结果帧写入未确认，核对在途状态和对账发布。
+seg.test: PRESENT test:native/tests/test_binance_private_rest.cpp#NonPositiveExchangeOrderIdIsNetworkError test:native/tests/test_live_submit_orchestrator.cpp#UnknownOutcomePersistsAmbiguousAsTheThirdFrameAndReopensWithoutNeverSent test:native/tests/test_account_risk_submit.cpp#FilledReplyWithoutExchangeOrderIdStaysAmbiguousAndKeepsExitReservation -- 核对订单号校验、重启恢复及受限退出的预留数量。
+seg.runtime: MISSING -- 待登记本项合入后的主分支 CI Native 运行结果。
+seg.budget: NA -- 回执校验使用整数和枚举比较，沿用已有的结果帧写入与对账发布。
+closure: 本项合入后，确认主分支 CI Native 通过并登记运行记录。
 ```
 
 ```ledger
