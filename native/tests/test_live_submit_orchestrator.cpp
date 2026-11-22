@@ -1452,10 +1452,12 @@ protected:
     void expect_an_unacknowledged_outcome_is_published_nowhere(const SubmitResponse& answer) {
         g_mock_response = answer;
         const ClientOrderId coid = make_client_order_id(ctx_.now_ms, ctx_.sequence, ctx_.symbol_id);
+        const int submit_calls_before = g_mock_submit_calls;
         fake_durable_audit_.outcome_should_fail = true;
 
         const OrchestratorResult r = orchestrate_submit(ctx_);
 
+        EXPECT_EQ(g_mock_submit_calls, submit_calls_before + 1) << "the rejected durable receipt followed one POST";
         EXPECT_EQ(r.gate, OrchestratorGate::AuditWriteNotAcked);
         EXPECT_EQ(r.order.state, OrderState::Submitting) << "the transition site never ran: still Submitting";
         EXPECT_EQ(r.order.filled_qty_ticks, 0) << "the fill was not written back to the order";
@@ -1507,6 +1509,21 @@ TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedStaleRulesVersionAnswerIsPublis
     expect_an_unacknowledged_outcome_is_published_nowhere(SubmitResponse{SubmitOutcome::StaleRulesVersion, 0, 0});
 }
 
+TEST_F(LiveSubmitOutcomeAckTest, AnUnacknowledgedUnknownOutcomeIsPublishedNowhere) {
+    ASSERT_TRUE(rate_limiter_.configure(/*weight=*/100, /*weight_safety=*/0, /*raw=*/100, /*raw_safety=*/0,
+                                        /*orders=*/2, /*orders_safety=*/0));
+    ASSERT_TRUE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1));
+    SubmitResponse answer{};
+    answer.outcome = static_cast<SubmitOutcome>(255);
+    answer.exchange_order_id = 4242;
+    answer.exchange_status = OrderState::Filled;
+    answer.filled_qty_ticks = 10;
+    answer.avg_fill_price_ticks = 5000;
+    expect_an_unacknowledged_outcome_is_published_nowhere(answer);
+    EXPECT_FALSE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1))
+        << "the post-send reservation remains charged even when the outcome ACK fails";
+}
+
 TEST_F(LiveSubmitOutcomeAckTest, AnOrderStuckInSubmittingIsNeverSubmittedAgain) {
     // The outcome ACK failed, so the order sits in Submitting with its slot held (until a restart recovers it as
     // Ambiguous). When the sink is back, the very same intent must be refused as in flight -- not sent a second time.
@@ -1556,7 +1573,112 @@ protected:
         ctx_.sequence = ++sequence_;
         return orchestrate_submit(ctx_);
     }
+
+    void expect_ambiguous_receipt(const SubmitResponse& answer, std::string_view detail,
+                                  std::optional<std::int64_t> detail_code = std::nullopt) {
+        g_mock_response = answer;
+        ctx_.sequence = ++sequence_;
+        const ClientOrderId coid = make_client_order_id(ctx_.now_ms, ctx_.sequence, ctx_.symbol_id);
+        const std::size_t frames_before = fake_durable_audit_.frame_count;
+        const int submit_calls_before = g_mock_submit_calls;
+
+        const OrchestratorResult r = orchestrate_submit(ctx_);
+
+        EXPECT_EQ(g_mock_submit_calls, submit_calls_before + 1);
+        EXPECT_EQ(r.gate, OrchestratorGate::SubmitNetworkError);
+        EXPECT_EQ(r.order.state, OrderState::Ambiguous);
+        EXPECT_EQ(r.order.exchange_order_id, 0) << "the receipt's exchange ID is not trusted";
+        EXPECT_EQ(r.order.filled_qty_ticks, 0) << "the receipt's fill is not trusted";
+        EXPECT_EQ(r.order.avg_fill_price_ticks, 0);
+        EXPECT_EQ(r.closure, ClosureAppendStatus::NotAttempted) << "a post-send result is not NeverSent";
+        EXPECT_TRUE(in_flight_.is_in_flight(coid.view()));
+        const auto* fill_entry = fill_context_.find(coid.view());
+        ASSERT_NE(fill_entry, nullptr);
+        EXPECT_EQ(fill_entry->shadow.state, OrderState::Ambiguous);
+        EXPECT_EQ(fill_entry->exchange_order_id, 0);
+        EXPECT_EQ(fill_entry->shadow.filled_qty_ticks, 0);
+        EXPECT_EQ(truth_.net_qty_ticks(ctx_.symbol_id), 0);
+
+        ASSERT_EQ(fake_durable_audit_.frame_count, frames_before + 3u)
+            << "Intent, Prepared, then one acknowledged Ambiguous outcome";
+        EXPECT_EQ(fake_durable_audit_.frame_states[frames_before], OrderState::Intent);
+        EXPECT_EQ(fake_durable_audit_.frame_states[frames_before + 1], OrderState::Submitting);
+        EXPECT_EQ(fake_durable_audit_.frame_states[frames_before + 2], OrderState::Ambiguous);
+        EXPECT_EQ(fake_durable_audit_.frame_events[frames_before + 2], AuditEventType::OrderAmbiguous);
+
+        const AuditRecord* outcome = audit_.last();
+        ASSERT_NE(outcome, nullptr);
+        EXPECT_EQ(outcome->event_type, AuditEventType::OrderAmbiguous);
+        EXPECT_EQ(std::string_view(outcome->detail_msg).find(detail), 0u);
+        if (detail_code) {
+            EXPECT_EQ(outcome->detail_code, *detail_code);
+        }
+
+        for (std::size_t i = 0; i < audit_.count(); ++i) {
+            const AuditRecord* record = audit_.at(i);
+            ASSERT_NE(record, nullptr);
+            if (std::string_view(record->client_order_id) != coid.view()) continue;
+            EXPECT_NE(record->event_type, AuditEventType::OrderAccepted);
+            EXPECT_NE(record->event_type, AuditEventType::OrderPartialFill);
+            EXPECT_NE(record->event_type, AuditEventType::OrderFilled);
+            EXPECT_NE(record->event_type, AuditEventType::OrderNeverSent);
+        }
+
+        ReconcileIngress ingress{};
+        ASSERT_TRUE(to_reconcile_.try_pop(ingress)) << "only the ACKed Ambiguous receipt is handed off";
+        EXPECT_EQ(ingress.record.client_order_id.view(), coid.view());
+        EXPECT_EQ(ingress.record.state, OrderState::Ambiguous);
+        EXPECT_TRUE(ingress.handle.valid());
+        EXPECT_TRUE(in_flight_.owns(ingress.handle, coid.view())) << "the exact registered handle is handed off";
+        ReconcileIngress extra{};
+        EXPECT_FALSE(to_reconcile_.try_pop(extra)) << "one order creates one reconcile entry";
+    }
 };
+
+TEST_F(LiveSubmitUnusableReplyTest, UnknownOutcomeValuesBecomeAmbiguousAndAreReconciled) {
+    ASSERT_TRUE(rate_limiter_.configure(/*weight=*/100, /*weight_safety=*/0, /*raw=*/100, /*raw_safety=*/0,
+                                        /*orders=*/3, /*orders_safety=*/0));
+    ASSERT_TRUE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1));
+
+    for (const std::uint8_t ordinal : {std::uint8_t{4}, std::uint8_t{255}}) {
+        SCOPED_TRACE(ordinal);
+        SubmitResponse answer{};
+        answer.outcome = static_cast<SubmitOutcome>(ordinal);
+        answer.exchange_order_id = 4242;
+        answer.exchange_status = OrderState::Filled;
+        answer.filled_qty_ticks = ctx_.qty_ticks;
+        answer.avg_fill_price_ticks = 5000;
+        expect_ambiguous_receipt(answer, "POST reply has an unknown outcome", static_cast<std::int64_t>(ordinal));
+    }
+
+    EXPECT_FALSE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1))
+        << "both post-send reservations remain charged after ambiguous receipts";
+}
+
+TEST_F(LiveSubmitUnusableReplyTest, AcceptedWithNonpositiveOrderIdsDoesNotTrustFill) {
+    ASSERT_TRUE(rate_limiter_.configure(/*weight=*/100, /*weight_safety=*/0, /*raw=*/100, /*raw_safety=*/0,
+                                        /*orders=*/3, /*orders_safety=*/0));
+    ASSERT_TRUE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1));
+
+    SubmitResponse zero_id{};
+    zero_id.outcome = SubmitOutcome::Accepted;
+    zero_id.exchange_order_id = 0;
+    zero_id.exchange_status = OrderState::Filled;
+    zero_id.filled_qty_ticks = ctx_.qty_ticks;
+    zero_id.avg_fill_price_ticks = 5000;
+    expect_ambiguous_receipt(zero_id, "POST reply has a nonpositive order ID");
+
+    SubmitResponse negative_id{};
+    negative_id.outcome = SubmitOutcome::Accepted;
+    negative_id.exchange_order_id = -1;
+    negative_id.exchange_status = OrderState::PartialFill;
+    negative_id.filled_qty_ticks = 4;
+    negative_id.avg_fill_price_ticks = 5000;
+    expect_ambiguous_receipt(negative_id, "POST reply has a nonpositive order ID");
+
+    EXPECT_FALSE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1))
+        << "both post-send reservations remain charged after ambiguous receipts";
+}
 
 TEST_F(LiveSubmitUnusableReplyTest, AReplyThatNamesAStateNoNewOrderCanBeInIsAnUnknownResultNotADurableFrame) {
     const OrderState kBad[] = {OrderState::Intent,        OrderState::Submitting, OrderState::Rejected,
@@ -1746,6 +1868,69 @@ TEST_F(LiveSubmitDurableIntegrationTest, AnExpiredInMatchReplyLeavesALogTheNextS
     ASSERT_EQ(cps.size(), 1u);
     EXPECT_EQ(cps[0].resulting_state, OrderState::Ambiguous);
     EXPECT_STREQ(cps[0].client_order_id.id, r.order.client_order_id.id);
+}
+
+TEST_F(LiveSubmitDurableIntegrationTest, UnknownOutcomePersistsAmbiguousAsTheThirdFrameAndReopensWithoutNeverSent) {
+    ASSERT_TRUE(rate_limiter_.configure(/*weight=*/100, /*weight_safety=*/0, /*raw=*/100, /*raw_safety=*/0,
+                                        /*orders=*/2, /*orders_safety=*/0));
+    ASSERT_TRUE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1));
+    PositionTruth truth;
+    OrderFillContext fill_context;
+    ToReconcileRing to_reconcile;
+    ctx_.position_truth = &truth;
+    ctx_.fill_context = &fill_context;
+    ctx_.to_reconcile = &to_reconcile;
+
+    g_mock_response = SubmitResponse{};
+    g_mock_response.outcome = static_cast<SubmitOutcome>(4);
+    g_mock_response.exchange_order_id = 4242;
+    g_mock_response.exchange_status = OrderState::Filled;
+    g_mock_response.filled_qty_ticks = ctx_.qty_ticks;
+    g_mock_response.avg_fill_price_ticks = 5000;
+    const OrchestratorResult result = orchestrate_submit(ctx_);
+
+    ASSERT_EQ(result.gate, OrchestratorGate::SubmitNetworkError);
+    EXPECT_EQ(g_mock_submit_calls, 1);
+    EXPECT_EQ(result.order.state, OrderState::Ambiguous);
+    EXPECT_EQ(result.order.exchange_order_id, 0);
+    EXPECT_EQ(result.order.filled_qty_ticks, 0);
+    EXPECT_EQ(truth.net_qty_ticks(ctx_.symbol_id), 0);
+    const auto* fill_entry = fill_context.find(result.order.client_order_id.view());
+    ASSERT_NE(fill_entry, nullptr);
+    EXPECT_EQ(fill_entry->shadow.state, OrderState::Ambiguous);
+    EXPECT_EQ(fill_entry->shadow.filled_qty_ticks, 0);
+    EXPECT_EQ(result.closure, ClosureAppendStatus::NotAttempted);
+    EXPECT_TRUE(in_flight_.is_in_flight(result.order.client_order_id.view()));
+    EXPECT_EQ(in_flight_.count(), 1u);
+    EXPECT_FALSE(rate_limiter_.can_send_order(RateLimitLane::Strategy, 1))
+        << "the post-send request reservation remains charged";
+
+    const AuditRecord* outcome = audit_.last();
+    ASSERT_NE(outcome, nullptr);
+    EXPECT_EQ(outcome->event_type, AuditEventType::OrderAmbiguous);
+    EXPECT_EQ(outcome->detail_code, 4);
+    EXPECT_NE(std::string_view(outcome->detail_msg).find("POST reply has an unknown outcome"), std::string_view::npos);
+    EXPECT_EQ(durable_audit_sink_->frame_count(), 3u) << "Intent, Prepared, and the acknowledged outcome frame";
+
+    ReconcileIngress ingress{};
+    ASSERT_TRUE(to_reconcile.try_pop(ingress));
+    EXPECT_EQ(ingress.record.client_order_id.view(), result.order.client_order_id.view());
+    EXPECT_EQ(ingress.record.state, OrderState::Ambiguous);
+    EXPECT_TRUE(in_flight_.owns(ingress.handle, result.order.client_order_id.view()));
+    ReconcileIngress extra{};
+    EXPECT_FALSE(to_reconcile.try_pop(extra));
+
+    durable_audit_sink_.reset();
+    auto restarted = std::make_unique<DurableAuditSink>(durable_audit_path_, *key_ring_, 1);
+    ASSERT_TRUE(restarted->is_open());
+    ASSERT_EQ(restarted->recovery_status(), RecoveryScanStatus::Recovered);
+    ASSERT_EQ(restarted->recovered_checkpoints().size(), 1u);
+    EXPECT_EQ(restarted->recovered_checkpoints()[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(restarted->recovered_checkpoints()[0].exchange_order_id, 0);
+    EXPECT_EQ(restarted->recovered_checkpoints()[0].filled_qty_ticks, 0);
+    EXPECT_STREQ(restarted->recovered_checkpoints()[0].client_order_id.id, result.order.client_order_id.id);
+    EXPECT_EQ(restarted->recovered_never_sent(), 0u);
+    EXPECT_EQ(restarted->recovered_intent_orphans(), 0u);
 }
 
 // --- SAFE-03 slice 1 on a REAL durable log: what the drain wrote must replay ---

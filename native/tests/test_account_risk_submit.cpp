@@ -5,6 +5,7 @@
 
 #include <hengyuan/durable_audit_sink.hpp>
 #include <hengyuan/owner_trade_scope_approval.hpp>
+#include <hengyuan/position_truth.hpp>
 #include <hengyuan/store_binding_writer.hpp>
 #include <hengyuan/trade_scope_execution.hpp>
 
@@ -247,6 +248,50 @@ TEST_F(AccountRiskSubmitTest, RestrictedExitAcceptsKnownSellWithoutActiveTradeGr
     EXPECT_EQ(submit_calls_, 1u);
     EXPECT_EQ(last_submit_side_, hy::OrderSide::Sell);
     EXPECT_EQ(last_submit_type_, OrderType::Limit);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 10);
+}
+
+TEST_F(AccountRiskSubmitTest, FilledReplyWithoutExchangeOrderIdStaysAmbiguousAndKeepsExitReservation) {
+    hy::PositionTruth position_truth;
+    ctx_.position_truth = &position_truth;
+    submit_response_.outcome = hy::SubmitOutcome::Accepted;
+    submit_response_.exchange_order_id = 0;
+    submit_response_.exchange_status = OrderState::Filled;
+    submit_response_.filled_qty_ticks = ctx_.qty_ticks;
+    submit_response_.avg_fill_price_ticks = ctx_.price_ticks;
+    const auto frames_before_submit = sink_->frame_count();
+
+    const OrchestratorResult result = hy::orchestrate_submit(ctx_);
+
+    EXPECT_EQ(submit_calls_, 1u);
+    EXPECT_EQ(result.gate, OrchestratorGate::SubmitNetworkError);
+    EXPECT_EQ(result.order.state, OrderState::Ambiguous);
+    EXPECT_EQ(result.order.exchange_order_id, 0);
+    EXPECT_EQ(result.order.filled_qty_ticks, 0);
+    EXPECT_EQ(result.order.avg_fill_price_ticks, 0);
+    EXPECT_EQ(result.closure, hy::ClosureAppendStatus::NotAttempted);
+    EXPECT_EQ(sink_->frame_count(), frames_before_submit + 3U);
+    EXPECT_EQ(sink_->account_risk().day_used(), 0);
+    EXPECT_EQ(sink_->account_risk().base_reserved(), 10);
+    EXPECT_EQ(position_truth.net_qty_ticks(ctx_.symbol_id), 0);
+    EXPECT_EQ(position_truth.tracked_symbol_count(), 0U);
+    EXPECT_TRUE(in_flight_.is_in_flight(result.order.client_order_id.view()));
+
+    execution_.reset();
+    sink_.reset();
+    sink_ = std::make_unique<hy::DurableAuditSink>(
+        log_path_, *key_ring_, 1, hy::kMaxIntentOrphans, hy::AuditSinkOpenMode::Trading,
+        hy::NeverSentWrites::Enabled);
+    ASSERT_TRUE(sink_->is_open());
+    ASSERT_EQ(sink_->recovery_status(), hy::RecoveryScanStatus::Recovered);
+    EXPECT_EQ(sink_->recovered_never_sent(), 0U);
+    ASSERT_EQ(sink_->recovered_checkpoints().size(), 1U);
+    EXPECT_STREQ(sink_->recovered_checkpoints()[0].client_order_id.id,
+                 result.order.client_order_id.id);
+    EXPECT_EQ(sink_->recovered_checkpoints()[0].resulting_state, OrderState::Ambiguous);
+    EXPECT_EQ(sink_->recovered_checkpoints()[0].exchange_order_id, 0);
+    EXPECT_EQ(sink_->recovered_checkpoints()[0].filled_qty_ticks, 0);
+    EXPECT_EQ(sink_->account_risk().day_used(), 0);
     EXPECT_EQ(sink_->account_risk().base_reserved(), 10);
 }
 

@@ -1101,47 +1101,37 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
     // transition to Ambiguous in the hope of reconciling in THIS process -- that
     // path is unreachable under a fenced sink"), not an oversight of this round.
     //
-    // A reply that CLAIMS Accepted but names a state no step from Submitting can reach is not a
-    // result (audit F-A-012, L-54 / TB-1). Three states are legal first steps for an order the
-    // exchange has taken: Accepted, PartialFill, Filled -- exactly validate_transition()'s
-    // Submitting row minus Rejected and Ambiguous, which have their own outcomes above. The
-    // Accepted branch writes whatever state it is given as the order's next durable frame and, for
-    // a final state, releases the in-flight slot; for CANCELED / EXPIRED / EXPIRED_IN_MATCH /
-    // PENDING_CANCEL that frame is a Submitting -> terminal edge the state machine does not have,
-    // which run_recovery_scan() answers for the WHOLE log with Corrupt at the next start (the append
-    // side does not judge transitions). The real port cannot return such a reply any more
-    // (parse_submit_order_response() refuses it, and refuses impossible quantities, as
-    // NetworkError); this guard is the orchestrator's own half, for any SubmitPort -- it decides
-    // what frame to write, so it, not the port, has to know which frames are legal. The reply is
-    // then an unknown result like any other the port could not vouch for: Ambiguous, held, handed
-    // to reconcile. Quantities stay the port's to validate (it alone knows what it sent).
-    bool reply_unusable = false;
+    // An unspecified status is the original Accepted response used by
+    // SubmitPorts that supply only the outcome and exchange order ID.
+    const OrderState target_state = resp.exchange_status == OrderState::Ambiguous
+                                        ? OrderState::Accepted : resp.exchange_status;
+    static_assert(validate_transition(OrderState::Submitting, OrderState::Accepted) == TransitionResult::Ok);
+    static_assert(validate_transition(OrderState::Submitting, OrderState::PartialFill) == TransitionResult::Ok);
+    static_assert(validate_transition(OrderState::Submitting, OrderState::Filled) == TransitionResult::Ok);
+    const char* reply_problem = nullptr;
     if (resp.outcome == SubmitOutcome::Accepted) {
-        const OrderState reply_state =
-            (resp.exchange_status == OrderState::Ambiguous) ? OrderState::Accepted : resp.exchange_status;
-        static_assert(validate_transition(OrderState::Submitting, OrderState::Accepted) == TransitionResult::Ok);
-        static_assert(validate_transition(OrderState::Submitting, OrderState::PartialFill) == TransitionResult::Ok);
-        static_assert(validate_transition(OrderState::Submitting, OrderState::Filled) == TransitionResult::Ok);
-        if (reply_state != OrderState::Accepted && reply_state != OrderState::PartialFill &&
-            reply_state != OrderState::Filled) {
-            reply_unusable = true;
+        if (resp.exchange_order_id <= 0) {
+            reply_problem = "POST reply has a nonpositive order ID - ambiguous";
+        } else if (target_state != OrderState::Accepted && target_state != OrderState::PartialFill &&
+                   target_state != OrderState::Filled) {
+            reply_problem = "POST reply named a state no new order can be in - ambiguous";
+        }
+        if (reply_problem) {
             resp = SubmitResponse{SubmitOutcome::NetworkError, 0, -1};
         }
     }
 
+    // Keep a runtime fallback for unknown values and require explicit handling
+    // when a named SubmitOutcome is added.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4061)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch-enum"
+#endif
     switch (resp.outcome) {
         case SubmitOutcome::Accepted: {
-            // TODO 1A.3: exchange_status now actually carries the real, validated status a
-            // genuine submit_order() response parsed (Accepted/PartialFill/Filled). Left at
-            // its default OrderState::Ambiguous, it means "no specific status was populated"
-            // -- true for every pre-1A.3 mock (`g_mock_response = {SubmitOutcome::Accepted,
-            // id, code}`, a 3-arg positional init that never touches this trailing field) --
-            // and falls back to the original, simpler OrderState::Accepted behavior those
-            // mocks already depend on, not a genuine ambiguous outcome.
-            const OrderState target_state = (resp.exchange_status == OrderState::Ambiguous)
-                                                 ? OrderState::Accepted
-                                                 : resp.exchange_status;
-
             AuditRecord ar{};
             ar.timestamp_ms = ctx.now_ms;
             ar.event_type = (target_state == OrderState::Filled)     ? AuditEventType::OrderFilled
@@ -1290,7 +1280,8 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             break;
         }
 
-        case SubmitOutcome::NetworkError: {
+        case SubmitOutcome::NetworkError:
+        default: {
             AuditRecord ar{};
             ar.timestamp_ms = ctx.now_ms;
             ar.event_type = AuditEventType::OrderAmbiguous;
@@ -1299,8 +1290,12 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             ar.set_client_order_id(coid.view());
             ar.resulting_state = OrderState::Ambiguous;
             ar.side = result.order.side;
-            ar.set_detail(reply_unusable ? "POST reply named a state no new order can be in - ambiguous"
-                                         : "network error - ambiguous");
+            if (resp.outcome == SubmitOutcome::NetworkError) {
+                ar.set_detail(reply_problem ? reply_problem : "network error - ambiguous");
+            } else {
+                ar.detail_code = static_cast<std::int64_t>(resp.outcome);
+                ar.set_detail("POST reply has an unknown outcome - ambiguous");
+            }
 
             if (!detail::append_order_frame(ctx, ar)) {
                 result.gate = OrchestratorGate::AuditWriteNotAcked;
@@ -1352,6 +1347,11 @@ inline OrchestratorResult orchestrate_submit(OrchestratorContext& ctx) noexcept 
             break;
         }
     }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
     return result;
 }
