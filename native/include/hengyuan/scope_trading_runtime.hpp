@@ -126,40 +126,51 @@ public:
             const auto* tracked = ctx.fill_context->find(id);
             unresolved = !tracked || tracked->shadow.state == OrderState::Submitting ||
                          tracked->shadow.state == OrderState::Ambiguous ||
+                         tracked->shadow.state == OrderState::CancelRequested ||
                          tracked->shadow.state == OrderState::EscalatedToOperator;
             return !unresolved;
         });
         if (unresolved) return true;
-        const auto request = scope_files::claim_request(directory_, "order");
+        auto request = scope_files::claim_request(directory_, "exit");
+        const bool restricted_exit = request.has_value();
+        if (!request) request = scope_files::claim_request(directory_, "order");
         if (!request) return true;
 
         std::vector<std::byte> contents;
         if (!read_request(*request, contents, 96)) return reply_to(*request, "InvalidOrder");
-        const auto probe = parse_order(view(contents), book, *environment.rules);
-        if (!probe) return reply_to(*request, "InvalidOrder");
+        const auto probe = parse_order(view(contents), book, *environment.rules, restricted_exit);
+        if (!probe || (restricted_exit && probe->side != OrderSide::Sell)) return reply_to(*request, "InvalidOrder");
         const auto reference = probe->side == OrderSide::Buy ? book.second : book.first;
         const auto risk_reference = std::max(reference, probe->price_ticks);
-        const auto exposure = marked_exposure(*ctx.account, environment, risk_reference);
+        const auto exposure = restricted_exit ? std::optional<std::int64_t>{0}
+                                                : marked_exposure(*ctx.account, environment, risk_reference);
         if (!exposure) return reply_to(*request, "AccountExposureUnavailable");
         fill_preflight_order(ctx, *probe, environment);
         ctx.order_wall_ms = wall_ms;
+        ctx.restricted_exit = restricted_exit;
         ctx.scope_reference_price_ticks = reference;
         ctx.exposure_limits.current_exposure_notional = *exposure;
 
         const auto* scope = execution_.active();
-        const auto serial = scope ? scope->serial : 0;
+        const auto serial = scope && !restricted_exit ? scope->serial : 0;
         const auto result = orchestrate_submit(ctx);
         last_order_ms_ = environment.now_ms;
         const auto* balance = sink_.trade_scope_balance(serial);
         const bool accepted = result.gate == OrchestratorGate::SubmitAccepted ||
                               result.gate == OrchestratorGate::SubmitFilled ||
                               result.gate == OrchestratorGate::SubmitPartialFill;
-        const std::string reply = std::string(accepted ? "accepted gate=" : "order_result gate=") +
+        std::string reply = std::string(accepted ? "accepted gate=" : "order_result gate=") +
                                   std::to_string(static_cast<unsigned>(result.gate)) +
                                   " state=" + std::to_string(static_cast<unsigned>(result.order.state)) +
                                   " scope=" + std::to_string(serial) +
                                   " used=" + std::to_string(balance ? balance->usage.used_notional : 0) +
                                   " order_id=" + std::to_string(result.order.exchange_order_id);
+        const auto& risk = sink_.account_risk();
+        if (risk.policy()) {
+            reply += " account_day=" + std::to_string(risk.latest_day()) +
+                     " account_used=" + std::to_string(risk.day_used()) +
+                     " exit_reserved=" + std::to_string(risk.base_reserved());
+        }
         return reply_to(*request, reply);
     }
 
@@ -221,9 +232,10 @@ private:
     }
 
     std::optional<PreflightProbe> parse_order(std::string_view payload, std::pair<std::int64_t, std::int64_t> book,
-                                               const SymbolRules& rules) const {
-        if (payload == "MIN_BUY" && owner_.subject().environment == StoreEnvironment::Testnet) {
-            return plan_preflight_probe(SuggestedAction::Open, book, rules);
+                                               const SymbolRules& rules, bool restricted_exit) const {
+        if (owner_.subject().environment == StoreEnvironment::Testnet) {
+            if (!restricted_exit && payload == "MIN_BUY") return plan_preflight_probe(SuggestedAction::Open, book, rules);
+            if (restricted_exit && payload == "MIN_EXIT") return plan_preflight_probe(SuggestedAction::Close, book, rules);
         }
         std::istringstream input{std::string(payload)};
         std::string side, price, quantity, extra;

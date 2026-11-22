@@ -112,6 +112,63 @@ void print_grant(const TradeScopeGrant& grant) {
                 static_cast<unsigned>(limits.max_price_deviation_bps));
 }
 
+void print_account_policy(const hy::AccountRiskPolicy& policy) {
+    const auto& store = policy.store;
+    const auto& limits = policy.limits;
+    std::printf("format=1\nsignature_algorithm=P256\nenvironment=%s\naccount_uid=%" PRIu64
+                "\nstore_uuid_lo=%" PRIu64 "\nstore_uuid_hi=%" PRIu64 "\nkey_id=%" PRIu64 "\n",
+                store.environment == hy::StoreEnvironment::Production ? "PRODUCTION" : "TESTNET",
+                store.account_uid, store.store_uuid_lo, store.store_uuid_hi, policy.key_id);
+    std::printf("symbol=%s\npolicy_version=%" PRIu64 "\ndaily_quote_cap=%" PRId64
+                "\nexit_base_cap=%" PRId64 "\nexit_order_quote_cap=%" PRId64 "\nexit_price_deviation_bps=%u\n",
+                hy::kAccountRiskSymbol, limits.version, limits.daily_quote_cap, limits.exit_base_cap,
+                limits.exit_order_quote_cap, static_cast<unsigned>(limits.exit_price_deviation_bps));
+}
+
+template <typename Number>
+bool parse_limit(std::string_view token, Number& value) noexcept {
+    if (token == "0") {
+        value = 0;
+        return true;
+    }
+    return hy::scope_files::parse_number(token, value);
+}
+
+int account_policy_draft(char** argv) {
+    const std::string_view environment_arg = argv[2];
+    hy::StoreEnvironment environment;
+    if (environment_arg == "TESTNET") environment = hy::StoreEnvironment::Testnet;
+    else if (environment_arg == "PRODUCTION") environment = hy::StoreEnvironment::Production;
+    else {
+        std::fputs("Select TESTNET or PRODUCTION.\n", stderr);
+        return 1;
+    }
+    files::StoreFiles config{argv[3], 0, argv[5], argv[6]};
+    hy::AccountRiskLimits limits;
+    if (!hy::scope_files::parse_number(argv[4], config.audit_key_id) ||
+        !hy::scope_files::parse_number(argv[7], limits.version) ||
+        !parse_limit(argv[8], limits.daily_quote_cap) || !parse_limit(argv[9], limits.exit_base_cap) ||
+        !parse_limit(argv[10], limits.exit_order_quote_cap) || !parse_limit(argv[11], limits.exit_price_deviation_bps) ||
+        !hy::valid_account_risk_limits(limits)) {
+        std::fputs("Invalid account policy limits.\n", stderr);
+        return 1;
+    }
+    const auto store = files::open_existing_store(config, environment);
+    const auto owner = store.sink ? hy::TradeScopeOwnerKey::load(config.log, *store.sink) : std::nullopt;
+    if (!owner) {
+        std::fputs("Could not open the bound store and its enrolled scope key.\n", stderr);
+        return 1;
+    }
+    const hy::AccountRiskPolicy policy{owner->subject(), owner->key_id(), limits};
+    const auto payload = hy::encode_account_risk_policy(policy);
+    if (!payload || files::publish_file(argv[12], *payload) != hy::ExportStatus::Ok) {
+        std::fputs("Could not publish account policy draft.\n", stderr);
+        return 1;
+    }
+    print_account_policy(policy);
+    return 0;
+}
+
 int request_runtime(const std::filesystem::path& directory, std::string_view operation,
                     std::span<const std::byte> data) {
     auto request = hy::scope_files::publish_request(directory, operation, data);
@@ -128,7 +185,7 @@ int request_runtime(const std::filesystem::path& directory, std::string_view ope
             if (hy::read_file_bounded(request->string(), result, 4096) != hy::ReadFileStatus::Ok || result.empty()) break;
             const std::string_view reply(reinterpret_cast<const char*>(result.data()), result.size());
             std::printf("%.*s\n", static_cast<int>(reply.size()), reply.data());
-            if (operation != "order") return reply.starts_with("Applied ") ? 0 : 1;
+            if (operation != "order" && operation != "exit") return reply.starts_with("Applied ") ? 0 : 1;
             return reply.starts_with("accepted ") ? 0 : 2;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -180,17 +237,20 @@ int main(int argc, char** argv) {
         return request_runtime(argv[2], "revoke", std::as_bytes(std::span(serial_text)));
     }
 
-    if (command == "submit" && argc == 6) {
-        const std::string_view side = argv[3];
+    if ((command == "submit" && argc == 6) || (command == "exit" && argc == 5)) {
+        const bool exit = command == "exit";
+        const std::string_view side = exit ? "SELL" : argv[3];
         std::int64_t price = 0, quantity = 0;
-        if ((side != "BUY" && side != "SELL") || !hy::scope_files::parse_number(argv[4], price) ||
-            !hy::scope_files::parse_number(argv[5], quantity)) {
-            std::fputs("Order needs BUY or SELL and positive price and quantity ticks.\n", stderr);
+        if ((side != "BUY" && side != "SELL") || !hy::scope_files::parse_number(argv[exit ? 3 : 4], price) ||
+            !hy::scope_files::parse_number(argv[exit ? 4 : 5], quantity)) {
+            std::fputs("Provide positive price and quantity ticks and BUY or SELL for a scoped order.\n", stderr);
             return 1;
         }
         const auto text = std::string(side) + " " + std::to_string(price) + " " + std::to_string(quantity);
-        return request_runtime(argv[2], "order", std::as_bytes(std::span(text)));
+        return request_runtime(argv[2], exit ? "exit" : "order", std::as_bytes(std::span(text)));
     }
+
+    if (command == "account-policy-draft" && argc == 13) return account_policy_draft(argv);
 
     if (command == "first-order-draft" && argc == 7) {
         files::StoreFiles production{argv[2], 0, argv[4], argv[5]};
@@ -210,8 +270,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         const auto grant = hy::decode_trade_scope_grant(payload);
-        if (!grant) {
-            std::fputs("Invalid trade scope payload.\n", stderr);
+        const auto policy = hy::decode_account_risk_policy(payload);
+        if (!grant && !policy) {
+            std::fputs("Invalid approval payload.\n", stderr);
             return 1;
         }
         if (command == "verify") {
@@ -223,12 +284,13 @@ int main(int argc, char** argv) {
             }
             const auto key = hy::owner_signature::decode_p256(files::unsigned_bytes(public_key));
             if (!key || !hy::owner_signature::verify_p256(*key, payload, files::unsigned_bytes(signature))) {
-                std::fputs("Trade scope signature refused.\n", stderr);
+                std::fputs("Approval signature refused.\n", stderr);
                 return 1;
             }
             std::puts("signature=verified");
         }
-        print_grant(*grant);
+        if (grant) print_grant(*grant);
+        else print_account_policy(*policy);
         return 0;
     }
 
@@ -237,6 +299,9 @@ int main(int argc, char** argv) {
                "  hy_scope first-order-draft <log> <audit-key-id> <kek> <wrapped-keys> <declaration>\n"
                "  hy_scope install <active-control-dir> <grant> <signature.der>\n"
                "  hy_scope revoke <active-control-dir> <serial>\n"
-               "  hy_scope submit <active-control-dir> <BUY|SELL> <price-ticks> <quantity-ticks>\n", stderr);
+               "  hy_scope submit <active-control-dir> <BUY|SELL> <price-ticks> <quantity-ticks>\n"
+               "  hy_scope account-policy-draft <TESTNET|PRODUCTION> <log> <audit-key-id> <kek> <wrapped-keys>"
+               " <version> <daily-quote-cap> <exit-base-cap> <exit-order-quote-cap> <exit-price-deviation-bps> <grant>\n"
+               "  hy_scope exit <active-control-dir> <price-ticks> <quantity-ticks>\n", stderr);
     return 1;
 }

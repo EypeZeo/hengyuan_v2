@@ -747,5 +747,8 @@ TEST(NeverSentNames, TheEventAndTheStateHaveTheirOwnNames) {
     EXPECT_STREQ(audit_event_name(AuditEventType::TradeScopeInstalled), "TRADE_SCOPE_INSTALLED");
     EXPECT_STREQ(audit_event_name(AuditEventType::TradeScopeRevoked), "TRADE_SCOPE_REVOKED");
     EXPECT_STREQ(audit_event_name(AuditEventType::OrderScopedPrepared), "ORDER_SCOPED_PREPARED");
-    EXPECT_STREQ(audit_event_name(static_cast<AuditEventType>(29)), "UNKNOWN");
+    EXPECT_STREQ(audit_event_name(AuditEventType::AccountRiskPolicyInstalled), "ACCOUNT_RISK_POLICY_INSTALLED");
+    EXPECT_STREQ(audit_event_name(AuditEventType::OrderAccountScopedPrepared), "ORDER_ACCOUNT_SCOPED_PREPARED");
+    EXPECT_STREQ(audit_event_name(AuditEventType::OrderRestrictedExitPrepared), "ORDER_RESTRICTED_EXIT_PREPARED");
+    EXPECT_STREQ(audit_event_name(static_cast<AuditEventType>(32)), "UNKNOWN");
 }

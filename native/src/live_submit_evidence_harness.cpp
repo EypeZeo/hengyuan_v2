@@ -109,6 +109,8 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
         case OrchestratorGate::TradeScopeNotAuthorized: return "TradeScopeNotAuthorized";
         case OrchestratorGate::TradeScopeBudgetExhausted: return "TradeScopeBudgetExhausted";
+        case OrchestratorGate::AccountPeriodNotAuthorized: return "AccountPeriodNotAuthorized";
+        case OrchestratorGate::RestrictedExitNotAuthorized: return "RestrictedExitNotAuthorized";
         case OrchestratorGate::InFlightCapacityExceeded: return "InFlightCapacityExceeded";
         case OrchestratorGate::IntentOrphanBudgetExceeded: return "IntentOrphanBudgetExceeded";
     }

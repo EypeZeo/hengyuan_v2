@@ -760,6 +760,20 @@ TEST(SubmitReadinessGuard, ThePreflightHarnessCanOnlyHandItsOrderFillTheMockPort
     EXPECT_EQ(count_substring(stripped("// ctx.confirmation.confirmed = true;\n"), "ctx.confirmation"), 0u) << "prose";
 }
 
+TEST(SubmitReadinessGuard, AccountPolicyPersistenceUsesFreshExchangeUtcNotProcessUptime) {
+    const SourceFile* f = find_source("src/live_submit_preflight_harness.cpp");
+    ASSERT_NE(f, nullptr);
+    const auto changed = f->code.find("if (!risk.policy() || *risk.policy() != requested) {");
+    ASSERT_NE(changed, std::string::npos);
+    const auto time = f->code.find("account_policy_clock = issue_clock_ready_token(client.clock_publisher(), fetch_clock_pair())", changed);
+    ASSERT_NE(time, std::string::npos);
+    const auto refusal = f->code.find("if (!account_policy_clock || account_policy_clock->server_ms() <= 0)", time);
+    ASSERT_NE(refusal, std::string::npos);
+    EXPECT_NE(f->code.find("append_account_risk_policy(*account_policy, 0, account_policy_clock->server_ms())", refusal),
+              std::string::npos);
+    EXPECT_EQ(count_substring(f->code, "append_account_risk_policy("), 1u);
+}
+
 TEST(SubmitReadinessGuard, PreflightAndPrivatePipelineShareOneSubmitAuthority) {
     const SourceFile* harness = find_source("src/live_submit_preflight_harness.cpp");
     const SourceFile* pipeline = find_source("include/hengyuan/private_stream_pipeline.hpp");
@@ -781,8 +795,8 @@ TEST(SubmitReadinessGuard, PreparedAckAndFinalClaimPrecedeTheOnlySubmitCall) {
     const SourceFile* orchestrator = find_source("include/hengyuan/live_submit_orchestrator.hpp");
     ASSERT_NE(orchestrator, nullptr);
     const std::string& code = orchestrator->code;
-    const std::size_t prepared = code.find("ar.event_type = AuditEventType::OrderSubmitPrepared;");
-    const std::size_t prepared_ack = code.find("if (!detail::append_order_frame(ctx, ar))", prepared);
+    const std::size_t prepared = code.find("prepared.event_type = AuditEventType::OrderSubmitPrepared;");
+    const std::size_t prepared_ack = code.find("if (!detail::append_order_frame(ctx, prepared))", prepared);
     const std::size_t transition = code.find("result.order.transition_to(OrderState::Submitting);", prepared_ack);
     const std::size_t claim = code.find("ctx.readiness->claim(*ready_token, authorization_wall_ms, final_check, at_claim)", transition);
     const std::size_t refusal = code.find("if (final_refusal)", claim);
@@ -799,6 +813,9 @@ TEST(SubmitReadinessGuard, PreparedAckAndFinalClaimPrecedeTheOnlySubmitCall) {
     EXPECT_LT(prepared, prepared_ack);
     EXPECT_LT(prepared_ack, transition);
     EXPECT_LT(transition, claim);
+    const auto final_account_check = code.find("scope->permits_account_claim(account_policy_version, prepared.timestamp_ms)", transition);
+    ASSERT_NE(final_account_check, std::string::npos);
+    EXPECT_LT(final_account_check, claim);
     EXPECT_LT(claim, refusal);
     EXPECT_LT(refusal, submitted_audit);
     EXPECT_LT(submitted_audit, submit);

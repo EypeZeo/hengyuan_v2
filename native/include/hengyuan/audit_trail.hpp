@@ -70,6 +70,9 @@ enum class AuditEventType : std::uint8_t {
     TradeScopeInstalled = 26,
     TradeScopeRevoked = 27,
     OrderScopedPrepared = 28,
+    AccountRiskPolicyInstalled = 29,
+    OrderAccountScopedPrepared = 30,
+    OrderRestrictedExitPrepared = 31,
 };
 
 inline const char* audit_event_name(AuditEventType t) noexcept {
@@ -103,6 +106,9 @@ inline const char* audit_event_name(AuditEventType t) noexcept {
         case AuditEventType::TradeScopeInstalled: return "TRADE_SCOPE_INSTALLED";
         case AuditEventType::TradeScopeRevoked: return "TRADE_SCOPE_REVOKED";
         case AuditEventType::OrderScopedPrepared: return "ORDER_SCOPED_PREPARED";
+        case AuditEventType::AccountRiskPolicyInstalled: return "ACCOUNT_RISK_POLICY_INSTALLED";
+        case AuditEventType::OrderAccountScopedPrepared: return "ORDER_ACCOUNT_SCOPED_PREPARED";
+        case AuditEventType::OrderRestrictedExitPrepared: return "ORDER_RESTRICTED_EXIT_PREPARED";
     }
     return "UNKNOWN";
 }

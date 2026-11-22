@@ -1039,6 +1039,7 @@ python tools/spec_xref_check.py is_exchange_final AuditAppendResult
 ### durable 审计日志（`DurableAuditSink`，轨道 A 第四项，最小闭环切片）
 
 - 范围模式在同一日志追加安装、撤销和 `OrderScopedPrepared` 帧。后者用原订单的价格、数量和保存的精度计费。扫描重建最大序号与各范围占用，拒绝同一订单重复扣款、未安装序号和参数不匹配。已确认的 `NeverSent` 归还对应占用。重启后需要本次运行身份的签名重新安装范围。
+- 已登记账户政策的存储使用 `OrderAccountScopedPrepared` 同时扣减范围额度和账户日额度。两者与 `OrderRestrictedExitPrepared` 经同一日志恢复。退出仅允许已签署的 BTCUSDT 限价卖出，总量受已登记数量和新鲜可用余额限制。交易所 UTC 日期由确认的时钟区间确定，并在最终取得提交授权前复查。扣款只在持久确认的 `NeverSent` 后归还。
 
 上一条提到的"`OrderTracker` 仍是纯内存态"就是这一项要关闭的缺口：进程一崩，`InFlightRegistry`/
 `OrderTracker` 的在途订单追踪全部丢失。两份 spec 里"durable 审计日志"字面上是一整套很大的子系统

@@ -198,7 +198,7 @@ inline bool is_readable_order_event_version(std::uint8_t version) noexcept {
 inline bool is_legal_audit_event_type_for_version(std::uint8_t v, std::uint8_t version) noexcept {
     if (version == kFrameFormatVersion) return v <= static_cast<std::uint8_t>(AuditEventType::UserDataStreamEventObserved);
     if (version == kFrameFormatVersionV6) {
-        return v <= static_cast<std::uint8_t>(AuditEventType::OrderScopedPrepared);
+        return v <= static_cast<std::uint8_t>(AuditEventType::OrderRestrictedExitPrepared);
     }
     return false;
 }

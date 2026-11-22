@@ -120,6 +120,8 @@ enum class Reason : std::int64_t {
     InFlightCapacityExceeded = 7,    // a different client order id found no free in-flight slot
     TradeScopeRefused = 8,
     TradeScopeBudgetExhausted = 9,
+    AccountPeriodRefused = 10,
+    RestrictedExitRefused = 11,
     ReadinessRevoked = 32,
     AuthorizationExpired = 33,
     ConfirmationExpired = 34,
@@ -128,6 +130,7 @@ enum class Reason : std::int64_t {
     AccountChanged = 37,
     PreconditionsChanged = 38,
     TradeScopeInvalidated = 39,
+    AccountPeriodChanged = 40,
 };
 
 // What the owner of a class A order knows of it: its Intent frame was acknowledged and NOTHING else happened -- no Prepared frame, no

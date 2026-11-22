@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: proprietary
 #pragma once
 
+#include <hengyuan/account_risk_policy.hpp>
 #include <hengyuan/owner_p256_signature.hpp>
 #include <hengyuan/trade_scope_grant.hpp>
 
 namespace hy {
+
+inline std::optional<VerifiedAccountRiskPolicy> VerifiedAccountRiskPolicy::verify(
+    std::span<const std::byte> payload, std::span<const unsigned char> signature,
+    std::span<const unsigned char> public_key, const OperatorResetScope& expected_store,
+    std::uint64_t expected_key_id, std::uint64_t expected_version) noexcept {
+    const auto policy = decode_account_risk_policy(payload);
+    if (!policy || policy->store != expected_store || policy->key_id != expected_key_id ||
+        policy->limits.version != expected_version) return std::nullopt;
+    const auto key = owner_signature::decode_p256(public_key);
+    if (!key || !owner_signature::verify_p256(*key, payload, signature)) return std::nullopt;
+    return VerifiedAccountRiskPolicy(*policy);
+}
 
 inline std::optional<VerifiedTradeScope> VerifiedTradeScope::verify(
     std::span<const std::byte> payload, std::span<const unsigned char> signature,

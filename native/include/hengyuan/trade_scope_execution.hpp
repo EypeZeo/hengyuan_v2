@@ -14,6 +14,18 @@ namespace hy {
 
 enum class TradeScopeChange : std::uint8_t { Applied, Refused, WriteUnconfirmed };
 
+// Use one verified sample for both ends of the exchange-time interval.
+inline std::optional<std::int64_t> account_order_time_ms(const ClockOffsetSnapshot& snapshot,
+                                                        ClockPairSample now) noexcept {
+    std::int64_t center = 0, margin = 0, lower = 0, upper = 0;
+    if (!is_snapshot_fresh(snapshot, now) || snapshot.error_bound_ms < 0 ||
+        !server_now_ms_for_signing(snapshot, now.system_ms(), center) ||
+        !checked_add_i64(snapshot.error_bound_ms, kMaxClockDriftMs, margin) ||
+        !checked_add_i64(center, -margin, lower) || !checked_add_i64(center, margin, upper) ||
+        lower <= 0 || account_risk_audit::utc_day(lower) != account_risk_audit::utc_day(upper)) return std::nullopt;
+    return center;
+}
+
 // The execution owner handles control requests and order submissions on the
 // same thread. Asynchronous stream revocations use its existing SubmitAuthority.
 class TradeScopeExecution {
@@ -59,6 +71,34 @@ public:
         return TradeScopeChange::Applied;
     }
 
+    [[nodiscard]] std::uint64_t account_policy_version() const noexcept {
+        const auto& policy = sink_.account_risk().policy();
+        return policy ? policy->limits.version : 0;
+    }
+
+    [[nodiscard]] bool permits_account_claim(std::uint64_t version, std::int64_t recorded_ms) const noexcept {
+        const auto time = account_time();
+        return permits_account_policy(version) && time &&
+               account_risk_audit::utc_day(*time) == account_risk_audit::utc_day(recorded_ms);
+    }
+
+    [[nodiscard]] std::optional<std::int64_t> account_time() const noexcept {
+        const auto now = fetch_clock_pair();
+        return account_order_time_ms(clock_.load(), now);
+    }
+
+    [[nodiscard]] bool can_reserve_account_order(const AuditRecord& prepared) const noexcept {
+        return sink_.account_risk().debit_for(prepared, prepared.timestamp_ms).has_value();
+    }
+
+    [[nodiscard]] bool authorizes_exit(std::uint64_t version, const SymbolRules& rules, OrderSide side, OrderType type,
+                                      std::int64_t price, std::int64_t reference_price) const noexcept {
+        return permits_account_policy(version) && side == OrderSide::Sell && type == OrderType::Limit &&
+               rules.symbol[kSymbolNameLen - 1] == '\0' && rules.symbol_name() == kAccountRiskSymbol &&
+               within_price_deviation(price, reference_price,
+                                      sink_.account_risk().policy()->limits.exit_price_deviation_bps);
+    }
+
     [[nodiscard]] bool matches(const SubmitAuthority& authority, const void* sink) const noexcept {
         return &authority_ == &authority && &sink_ == sink;
     }
@@ -87,10 +127,7 @@ public:
         if (!amount || *amount > active_->limits.max_order_notional ||
             !checked_add(exposure.current_exposure_notional, *amount, projected) ||
             projected > active_->limits.max_exposure_notional) return false;
-        const auto difference = price > reference_price ? price - reference_price : reference_price - price;
-        const auto bps = static_cast<std::int64_t>(active_->limits.max_price_deviation_bps);
-        const auto permitted_difference = (reference_price / 10'000) * bps + (reference_price % 10'000) * bps / 10'000;
-        return difference <= permitted_difference;
+        return within_price_deviation(price, reference_price, active_->limits.max_price_deviation_bps);
     }
 
     [[nodiscard]] bool can_reserve(std::uint64_t serial, const SymbolRules& rules,
@@ -102,6 +139,18 @@ public:
     }
 
 private:
+    [[nodiscard]] bool permits_account_policy(std::uint64_t version) const noexcept {
+        return !failed_ && version != 0 && version == binding_.policy_version &&
+               version == account_policy_version() && sink_.trade_scope_writes_available();
+    }
+
+    static bool within_price_deviation(std::int64_t price, std::int64_t reference, std::uint32_t bps) noexcept {
+        if (price <= 0 || reference <= 0) return false;
+        const auto difference = price > reference ? price - reference : reference - price;
+        const auto limit = (reference / 10'000) * bps + (reference % 10'000) * bps / 10'000;
+        return difference <= limit;
+    }
+
     TradeScopeChange write_unconfirmed() noexcept {
         failed_ = true;
         active_.reset();

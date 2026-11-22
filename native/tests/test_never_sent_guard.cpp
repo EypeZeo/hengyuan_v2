@@ -271,7 +271,7 @@ TEST(NeverSentGuard, TheClosureWriterIsReachedOnlyThroughThePortAndReviewedRunti
                           {kOrchestrator, 2, "the sink adapter of the port, and detail::close_never_sent() (the one caller)"}});
     expect_named_only_in("close_never_sent", {{kOrchestrator, 3, "the generic definition, its class-A wrapper, and the S5 final authorization refusal"}});
     expect_named_only_in("close_class_a_never_sent",
-                         {{kOrchestrator, 9, "the class-A counting wrapper and its reviewed local refusal call sites"}});
+                         {{kOrchestrator, 10, "the class-A wrapper and local refusals, including the account policy"}});
     // The frame is built and judged in one place: the rules header's class_a_* functions, used by the orchestrator's helper alone.
     expect_named_only_in("class_a_closure_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});
     expect_named_only_in("class_a_target_of", {{kRules, 1, "the definition"}, {kOrchestrator, 1, "detail::close_never_sent()"}});

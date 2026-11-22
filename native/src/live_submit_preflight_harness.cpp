@@ -194,6 +194,8 @@ const char* gate_name(OrchestratorGate g) noexcept {
         case OrchestratorGate::FinalAuthorizationRefused: return "FinalAuthorizationRefused";
         case OrchestratorGate::TradeScopeNotAuthorized: return "TradeScopeNotAuthorized";
         case OrchestratorGate::TradeScopeBudgetExhausted: return "TradeScopeBudgetExhausted";
+        case OrchestratorGate::AccountPeriodNotAuthorized: return "AccountPeriodNotAuthorized";
+        case OrchestratorGate::RestrictedExitNotAuthorized: return "RestrictedExitNotAuthorized";
         case OrchestratorGate::InFlightCapacityExceeded: return "InFlightCapacityExceeded";
         case OrchestratorGate::IntentOrphanBudgetExceeded: return "IntentOrphanBudgetExceeded";
     }
@@ -932,6 +934,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::optional<VerifiedAccountRiskPolicy> account_policy;
+    if (scope_run) {
+        bool missing = false;
+        account_policy = scope_owner->load_account_policy(argv[10], scope_policy->version, missing);
+        const auto& ledger = store.sink->account_risk();
+        const auto& previous = ledger.policy();
+        if (!account_policy && (!missing || previous || environment == StoreEnvironment::Production)) {
+            std::fputs("FATAL: the signed account policy is missing or invalid for this store.\n", stderr);
+            return 1;
+        }
+        if (account_policy) {
+            const account_risk_audit::Policy requested{account_policy->policy().limits, 0};
+            if ((!previous || *previous != requested) && !ledger.can_install(requested)) {
+                std::fputs("FATAL: the account policy cannot replace the recorded version.\n", stderr);
+                return 1;
+            }
+        }
+    }
+
     // --- The four dry-run drills, for real (批次 6 6b-0b) ------------------------------------------
     // Before the process reads a credential or touches the network (and before any io thread or feed
     // exists): a failure here is a plain `return` with nothing to undo. The verified chain is bound to
@@ -1160,6 +1181,23 @@ int main(int argc, char* argv[]) {
     std::optional<OwnerResetRequestFiles> scope_reset_files;
     if (scope_run) {
         if (!kill_store_ready || !durable_audit_sink->trade_scope_writes_available()) return 1;
+        if (account_policy) {
+            const auto& risk = durable_audit_sink->account_risk();
+            const account_risk_audit::Policy requested{account_policy->policy().limits, 0};
+            if (!risk.policy() || *risk.policy() != requested) {
+                const auto account_policy_clock = issue_clock_ready_token(client.clock_publisher(), fetch_clock_pair());
+                if (!account_policy_clock || account_policy_clock->server_ms() <= 0) {
+                    std::fputs("FATAL: no fresh exchange UTC time for the account policy write.\n", stderr);
+                    return 1;
+                }
+                if (!durable_audit_sink->append_account_risk_policy(*account_policy, 0, account_policy_clock->server_ms()).acked()) {
+                    std::fputs("FATAL: the account policy write was not acknowledged.\n", stderr);
+                    return 1;
+                }
+            }
+            std::printf("Account risk: policy=%" PRIu64 " day=%" PRId64 " used=%" PRId64 " exit_reserved=%" PRId64 "\n",
+                        requested.limits.version, risk.latest_day(), risk.day_used(), risk.base_reserved());
+        }
         const auto scope_binding = new_scope_binding(*scope_owner, *scope_policy);
         const auto control_dir = scope_binding ? create_scope_request_directory(persistent_options->control_dir, *scope_binding)
                                                : std::nullopt;

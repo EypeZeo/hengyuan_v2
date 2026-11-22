@@ -430,7 +430,7 @@ status: REMEDIATING
 task: SAFE-06
 gate: 下单状态转换
 gate_result: BLOCKED
-open: open:native/include/hengyuan/live_submit_orchestrator.hpp#"switch (resp.outcome) {" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"default:" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"exchange_order_id > 0"
+open: open:native/include/hengyuan/live_submit_orchestrator.hpp#"switch (resp.outcome) {" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"default:" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"resp.exchange_order_id > 0" absent:native/include/hengyuan/live_submit_orchestrator.hpp#"resp.exchange_order_id <= 0"
 seg.code: MISSING code:native/include/hengyuan/live_submit_orchestrator.hpp#SubmitOutcome code:native/include/hengyuan/live_submit_orchestrator.hpp#"= 5, not 4" -- 转换开关没有 default 分支，Accepted 分支不校验 exchange_order_id 为正；当前 5 个枚举值（0 至 3 与 5）均被显式覆盖，无现存未定义行为；规格另定义了 RateLimited（值 4，代码里留空），加入时若漏改开关就会静默落空
 seg.contract: PRESENT doc:docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md#StaleRulesVersion bp:"任务 SAFE-06" -- 规格与任务已定义状态完备性
 seg.fault: MISSING -- 没有对应的 FI 编号
@@ -1696,8 +1696,8 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 01043c3
-open: open:docs/SCOPE_APPROVAL_DESIGN.md#"生产环境、硬件签名、账户期间额度和受限退出规则仍需验证"
-refs: code:native/include/hengyuan/trade_scope_grant.hpp#VerifiedTradeScope test:native/tests/test_trade_scope_approval.cpp#TradeScopeGrant
+open: open:docs/SCOPE_APPROVAL_DESIGN.md#"生产账户与 YubiKey 实机签名仍待验证"
+refs: code:native/include/hengyuan/trade_scope_grant.hpp#VerifiedTradeScope test:native/tests/test_trade_scope_approval.cpp#TradeScopeGrant test:native/tests/test_trade_scope_approval.cpp#AccountRiskPolicySignatureBindsStoreVersionAndLimits
 note: 规范载荷、P-256 签名、执行身份与生产安装检查已有实现。生产设备与账户验证待完成。
 ```
 
@@ -1712,7 +1712,7 @@ status: PARTIAL
 result: NOT_RUN
 gate_result: BLOCKED
 baseline: 01043c3
-open: open:docs/SCOPE_APPROVAL_DESIGN.md#"生产环境、硬件签名、账户期间额度和受限退出规则仍需验证"
-refs: code:native/include/hengyuan/durable_audit_sink.hpp#trade_scope_balance test:native/tests/test_durable_audit_sink.cpp#MixedLegacyAndScopedPreparedReplayChargesQuoteAndRequiresReactivation
-note: 单范围额度随 Prepared 扣除，按持久确认的 NeverSent 归还。订单日志重启恢复覆盖旧普通订单和带范围序号的订单。
+open: open:docs/SCOPE_APPROVAL_DESIGN.md#"生产账户与 YubiKey 实机签名仍待验证"
+refs: code:native/include/hengyuan/durable_audit_sink.hpp#trade_scope_balance test:native/tests/test_durable_audit_sink.cpp#MixedLegacyAndScopedPreparedReplayChargesQuoteAndRequiresReactivation test:native/tests/test_trade_scope_approval.cpp#AccountPeriodCapSurvivesScopeReplacementAndResetsAtUtcDayBoundary
+note: Prepared 同时记录范围额度和账户 UTC 日额度。持久确认的 NeverSent 归还对应扣款。订单日志恢复范围序号、已用日额度和受限退出保留量。
 ```
