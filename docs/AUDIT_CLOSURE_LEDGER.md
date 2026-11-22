@@ -124,7 +124,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | code, fault, test, runtime, budget |
 | **P2-001** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-002** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
-| **P2-003** | MEDIUM | lib | REMEDIATING | 下单状态转换 | BLOCKED | runtime |
+| **P2-003** | MEDIUM | lib | CLOSED | 下单状态转换 | CLEARED | — |
 | **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | fault, runtime, budget |
 | **P2-005** | MEDIUM | lib | REMEDIATING | 订单跟踪器 | BLOCKED | code, fault, test, runtime |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
@@ -152,7 +152,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 策略回测准入 | BLOCKED | P1-004 |
 | 数据质量门禁 | BLOCKED | P1-005 |
 | REST 通信门禁 | CLEARED | — |
-| 下单状态转换 | BLOCKED | P2-003 |
+| 下单状态转换 | CLEARED | — |
 | 实盘发单风控 | BLOCKED | P2-004 |
 | 订单跟踪器 | BLOCKED | P2-005 |
 | 鲁棒性优化 | DEFERRED | P2-006 |
@@ -163,7 +163,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 6，DEFERRED 3，PARTIAL 4，CLOSED 13，合计 26。
+状态计数：REMEDIATING 5，DEFERRED 3，PARTIAL 4，CLOSED 14，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -426,18 +426,17 @@ legacy: P2-003
 title: 发单结果处理与交易所订单号校验
 severity: MEDIUM
 kind: lib
-status: REMEDIATING
+status: CLOSED
 task: SAFE-06
 gate: 下单状态转换
-gate_result: BLOCKED
-open: open:docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md#"Post-send result validation"
+gate_result: CLEARED
+refs: pr:298@5558830
 seg.code: PRESENT code:native/include/hengyuan/live_submit_orchestrator.hpp#"switch (resp.outcome) {" code:native/include/hengyuan/live_submit_orchestrator.hpp#"resp.exchange_order_id <= 0" code:native/include/hengyuan/binance_private_rest.hpp#parse_submit_order_response -- 受理回执须包含正的交易所订单号和有效状态。未知结果及无效受理回执写为 Ambiguous，保留在途槽位和预留额度，持久写入确认后交给对账。新增枚举成员必须显式处理。
 seg.contract: PRESENT doc:docs/SUBMITPORT_REAL_IMPLEMENTATION_SPEC.md#"Post-send result validation" bp:"任务 SAFE-06" -- 规定异常发单回执的持久化与对账顺序。
 seg.fault: PRESENT:UT test:native/tests/test_live_submit_orchestrator.cpp#UnknownOutcomeValuesBecomeAmbiguousAndAreReconciled test:native/tests/test_live_submit_orchestrator.cpp#AnUnacknowledgedUnknownOutcomeIsPublishedNowhere -- 模拟未知结果及结果帧写入未确认，核对在途状态和对账发布。
 seg.test: PRESENT test:native/tests/test_binance_private_rest.cpp#NonPositiveExchangeOrderIdIsNetworkError test:native/tests/test_live_submit_orchestrator.cpp#UnknownOutcomePersistsAmbiguousAsTheThirdFrameAndReopensWithoutNeverSent test:native/tests/test_account_risk_submit.cpp#FilledReplyWithoutExchangeOrderIdStaysAmbiguousAndKeepsExitReservation -- 核对订单号校验、重启恢复及受限退出的预留数量。
-seg.runtime: MISSING -- 待登记本项合入后的主分支 CI Native 运行结果。
+seg.runtime: PRESENT run:"45013300448@5558830ab/ci-native.yml[native-build-test]" -- 主分支合并提交上的 GCC-14 Release 构建及完整回归通过。
 seg.budget: NA -- 回执校验使用整数和枚举比较，沿用已有的结果帧写入与对账发布。
-closure: 本项合入后，确认主分支 CI Native 通过并登记运行记录。
 ```
 
 ```ledger
