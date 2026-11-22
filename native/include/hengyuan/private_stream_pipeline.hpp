@@ -257,10 +257,10 @@ public:
 
     // ---- the reconcile thread (or the same loop) ---------------------------------------------------------------------------------------------
 
-    void reconcile_tick(std::int64_t now_ms, std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
+    void reconcile_tick(ReconcileTime now, std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
         ++reconcile_.ticks;
-        reconcile_.refresher.tick(now_ms);
-        poll_once(reconcile_.tracker, to_reconcile_, reconcile_events_, parts_.query_port, config_.poll, now_ms, wall_now_ms, &reconcile_.job);
+        reconcile_.refresher.tick(now.time_since_epoch().count());
+        poll_once(reconcile_.tracker, to_reconcile_, reconcile_events_, parts_.query_port, config_.poll, now, wall_now_ms, &reconcile_.job);
     }
 
     // ---- what the process and the tests look at ------------------------------------------------------------------------------------------------

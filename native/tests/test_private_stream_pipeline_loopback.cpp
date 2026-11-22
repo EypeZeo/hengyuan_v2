@@ -14,6 +14,7 @@
 // The test thread plays the hot/submit thread AND (like today's single-loop harnesses) the reconcile thread: it binds the synthetic credentials, owns the rate-limit
 // tracker, polls the supervisor and ticks both halves. The io_context thread is the rig's. Teardown order: everything a session points at is declared BEFORE the rig.
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include <hengyuan/binance_clock_sync.hpp>
 #include <hengyuan/binance_ws_api_codec.hpp>
@@ -205,7 +206,7 @@ protected:
             [&] {
                 const std::int64_t now = Session::steady_now_ms();
                 pipe_->hot_tick(now);
-                pipe_->reconcile_tick(now);
+                pipe_->reconcile_tick(hy::test::reconcile_at_ms(now));
                 return pred();
             },
             timeout_ms);

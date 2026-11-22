@@ -28,6 +28,7 @@
 // Governance: L1, no network/token/order. GTest only.
 
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include <hengyuan/kill_switch.hpp>
 #include <hengyuan/order_tracker.hpp>
@@ -197,7 +198,7 @@ TEST(SweepConcurrency, TheBarrierIsReconciledOnlyOnceEveryOrderThatPrecededTheRe
         policy.quarantine.min_elapsed_ms = 3'600'000;
         std::uint64_t ticks = 0;
         while (!stop.load(std::memory_order_acquire)) {
-            poll_once(tracker, to_reconcile, events, port, policy, steady_ms(), OrderRecord::kClockUnset, &job);
+            poll_once(tracker, to_reconcile, events, port, policy, hy::test::reconcile_at_ms(steady_ms()), OrderRecord::kClockUnset, &job);
             ++ticks;
             std::this_thread::yield();
         }
@@ -376,7 +377,7 @@ TEST(SweepConcurrency, ARequestPostedRightAfterAnOrderAlwaysCoversThatOrder) {
         ReconcilePollPolicy policy{};
         policy.max_queries_per_tick = 64;
         while (!stop.load(std::memory_order_acquire)) {
-            poll_once(tracker, to_reconcile, events, port, policy, steady_ms(), OrderRecord::kClockUnset, &job);
+            poll_once(tracker, to_reconcile, events, port, policy, hy::test::reconcile_at_ms(steady_ms()), OrderRecord::kClockUnset, &job);
             std::this_thread::yield();
         }
     });

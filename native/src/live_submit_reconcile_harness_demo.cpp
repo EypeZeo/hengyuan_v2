@@ -88,7 +88,7 @@ int main(int argc, char* argv[]) {
         // This is the historical gap TODO 1A.4's own plan named explicitly: poll_once()/
         // drain_reconcile_events() had never been called from a running process anywhere in
         // native/src/ before this harness -- only from tests.
-        poll_once(tracker, to_reconcile, reconcile_events, query_port, poll_policy, now_ms,
+        poll_once(tracker, to_reconcile, reconcile_events, query_port, poll_policy, ReconcileTime{elapsed_ms},
                   reconcile_wall_now_ms());
         // Memory-only on purpose (no ReconcileDurablePublisher): this demo has no DurableAuditSink and
         // submits nothing, so the ring is always empty. The day it gets a real submit path it must pass a

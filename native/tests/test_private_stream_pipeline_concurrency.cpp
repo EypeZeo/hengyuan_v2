@@ -11,6 +11,7 @@
 //     the resolution durable, applies the fill and releases the slot -- and only then is the process ready.
 // Time is the real steady clock, as in a process. A scenario that does not finish in 20 s fails; on a healthy machine each takes well under a second (a few seconds under TSan).
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include <hengyuan/private_stream_pipeline.hpp>
 
@@ -198,7 +199,7 @@ protected:
         std::atomic<bool> stop{false};
         std::thread reconcile([&] {
             while (!stop.load(std::memory_order_acquire)) {
-                pipe_->reconcile_tick(real_now_ms());
+                pipe_->reconcile_tick(hy::test::reconcile_at_ms(real_now_ms()));
                 std::this_thread::sleep_for(std::chrono::microseconds(300));
             }
         });

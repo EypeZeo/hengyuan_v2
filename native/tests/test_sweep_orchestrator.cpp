@@ -10,6 +10,7 @@
 //   * without a durable publisher the reconcile ring is not drained at all (fail-closed, as before), so the marker waits and the barrier stays Sweeping.
 //   * the hot thread's half of the sweep -- servicing the pump, draining the marker, applying the report -- allocates nothing (Engineering Mandate 1).
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include "test_helpers/alloc_probe.hpp"
@@ -183,7 +184,7 @@ protected:
 
     // The reconcile thread's tick, by hand: takes the sweep request, sweeps the (empty) table, pushes the marker.
     void reconcile_tick() {
-        poll_once(tracker_, to_reconcile_, reconcile_events_, query_port_, poll_policy_, kNow, OrderRecord::kClockUnset, &job_);
+        poll_once(tracker_, to_reconcile_, reconcile_events_, query_port_, poll_policy_, hy::test::reconcile_at_ms(kNow), OrderRecord::kClockUnset, &job_);
     }
 };
 

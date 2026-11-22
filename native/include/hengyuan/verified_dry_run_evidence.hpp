@@ -502,7 +502,8 @@ inline DrillObservation observe_submit_ambiguous(DrillRig& rig, const DrillMocks
 
     // The real reconcile loop, with a scripted query.
     const ReconcilePollPolicy policy{};
-    poll_once(rig.tracker, rig.to_reconcile, rig.reconcile_events, rig.query_port, policy, rig.ctx.now_ms + 1);
+    const ReconcileTime reconcile_now{std::chrono::milliseconds{rig.ctx.now_ms + 1}};
+    poll_once(rig.tracker, rig.to_reconcile, rig.reconcile_events, rig.query_port, policy, reconcile_now);
     drain_reconcile_events(rig.in_flight, &rig.audit, rig.reconcile_events, rig.ctx.now_ms + 2, nullptr, nullptr,
                            &rig.reconcile_durable);
 

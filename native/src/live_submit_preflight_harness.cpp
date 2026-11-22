@@ -671,13 +671,14 @@ int run_cancel_only(const BoundRuntimeOptions& options, boost::asio::io_context&
                                                client.clock_publisher(), fetch_clock_pair()) == OwnerCancelInstallResult::Installed;
                 if (installed) std::puts("Owner grant installed.");
             }
-            const auto steady = PrivateSession::steady_now_ms();
+            const auto reconcile_now = reconcile_steady_now();
+            const auto steady = reconcile_now.time_since_epoch().count();
             const auto wall = reconcile_wall_now_ms();
             pipeline->hot_tick(steady, wall);
             request = pipeline->take_automatic_cancel();
             if (request || (pipeline->recovery_applied() && pipeline->recovery_result().ok() && in_flight.count() == 0)) break;
             if (pipeline->supervisor().state() == FeedState::Terminal) break;
-            pipeline->reconcile_tick(steady, wall);
+            pipeline->reconcile_tick(reconcile_now, wall);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     } catch (const std::exception& e) {
@@ -759,7 +760,8 @@ int run_owner_reset(const std::filesystem::path& control_dir, std::uint32_t dura
                 next_clock_sync = std::chrono::steady_clock::now() +
                                   std::chrono::seconds(error == PrivateRestError::None ? 60 : 10);
             }
-            const auto steady = PrivateSession::steady_now_ms();
+            const auto reconcile_now = reconcile_steady_now();
+            const auto steady = reconcile_now.time_since_epoch().count();
             const auto wall = reconcile_wall_now_ms();
             pipeline.hot_tick(steady, wall);
             if (pipeline.supervisor().state() == FeedState::Terminal) {
@@ -784,7 +786,7 @@ int run_owner_reset(const std::filesystem::path& control_dir, std::uint32_t dura
                 }
             }
 
-            pipeline.reconcile_tick(steady, wall);
+            pipeline.reconcile_tick(reconcile_now, wall);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     } catch (const std::exception& e) {
@@ -1446,7 +1448,8 @@ int main(int argc, char* argv[]) {
         const std::int64_t now_ms = get_now_ms();
         // The private stream's clock: milliseconds of the steady clock since ITS epoch -- what the sessions stamp
         // their activity with and what the account is stamped in. The pipeline's ticks and every probe use it.
-        const std::int64_t steady_ms = PrivateSession::steady_now_ms();
+        const auto reconcile_now = reconcile_steady_now();
+        const std::int64_t steady_ms = reconcile_now.time_since_epoch().count();
 
         if (now_ms >= next_clock_sync_ms) {
             try {
@@ -1468,7 +1471,7 @@ int main(int argc, char* argv[]) {
         // drains the rings. Then the reconcile half: the periodic account fetch, and poll_once() with the sweep.
         const std::int64_t wall_now_ms = reconcile_wall_now_ms();
         private_pipeline->hot_tick(steady_ms, wall_now_ms);
-        private_pipeline->reconcile_tick(steady_ms, wall_now_ms);
+        private_pipeline->reconcile_tick(reconcile_now, wall_now_ms);
         watch.poll(*private_pipeline, now_ms);
 
         // A private stream whose supervisor has given up is not coming back -- nothing reconnects it -- so the run

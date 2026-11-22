@@ -6,6 +6,8 @@
 #include <gtest/gtest.h>
 #include <hengyuan/order_tracker.hpp>
 
+#include "reconcile_test_clock.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +20,9 @@
 #include <vector>
 
 using namespace hy;
+
+static_assert(!std::is_convertible_v<std::int64_t, ReconcileTime>);
+static_assert(!std::is_convertible_v<std::chrono::system_clock::time_point, ReconcileTime>);
 
 // --- Mock QueryPort (mirrors test_live_submit_orchestrator.cpp's mock_submit pattern) ---
 
@@ -75,7 +80,7 @@ protected:
 
 TEST_F(OrderTrackerTest, TrackAndUntrack) {
     auto rec = make_ambiguous_record("HY-A");
-    EXPECT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    EXPECT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
     EXPECT_EQ(tracker_.count(), 1u);
     tracker_.untrack("HY-A");
     EXPECT_EQ(tracker_.count(), 0u);
@@ -83,8 +88,8 @@ TEST_F(OrderTrackerTest, TrackAndUntrack) {
 
 TEST_F(OrderTrackerTest, DuplicateCoidRejected) {
     auto rec = make_ambiguous_record("HY-A");
-    EXPECT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
-    EXPECT_FALSE(tracker_.track(InFlightHandle{1, 1}, rec, 1000));
+    EXPECT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
+    EXPECT_FALSE(tracker_.track(InFlightHandle{1, 1}, rec, test::reconcile_at_ms(1000)));
     EXPECT_EQ(tracker_.count(), 1u);
 }
 
@@ -93,10 +98,10 @@ TEST_F(OrderTrackerTest, CapacityExhaustedFailsClosed) {
     for (std::size_t i = 0; i < OrderTracker::capacity(); ++i) {
         std::snprintf(coid, sizeof(coid), "HY-%zu", i);
         auto rec = make_ambiguous_record(coid);
-        ASSERT_TRUE(tracker_.track(InFlightHandle{i, 1}, rec, 1000));
+        ASSERT_TRUE(tracker_.track(InFlightHandle{i, 1}, rec, test::reconcile_at_ms(1000)));
     }
     auto overflow = make_ambiguous_record("HY-OVERFLOW");
-    EXPECT_FALSE(tracker_.track(InFlightHandle{99, 1}, overflow, 1000));
+    EXPECT_FALSE(tracker_.track(InFlightHandle{99, 1}, overflow, test::reconcile_at_ms(1000)));
 }
 
 // --- poll_once: Found path, one case per legal target state ---
@@ -115,13 +120,13 @@ TEST_F(OrderTrackerTest, FoundResolvesToEachExchangeFinalState) {
         ReconcileEventRing outbound;
 
         auto rec = make_ambiguous_record("HY-A", 100);
-        ASSERT_TRUE(tracker.track(InFlightHandle{0, 7}, rec, 1000));
+        ASSERT_TRUE(tracker.track(InFlightHandle{0, 7}, rec, test::reconcile_at_ms(1000)));
 
         g_mock_query_result = QueryResult{QueryOutcome::Found, target, /*exchange_order_id=*/555,
                                            /*filled_qty=*/target == OrderState::Filled ? 100 : 0,
                                            /*avg_price=*/target == OrderState::Filled ? 5000 : 0};
 
-        poll_once(tracker, inbound, outbound, query_port_, policy_, /*now_ms=*/1000);
+        poll_once(tracker, inbound, outbound, query_port_, policy_, /*now_ms=*/test::reconcile_at_ms(1000));
 
         ReconcileEvent ev{};
         ASSERT_TRUE(outbound.try_pop(ev));
@@ -142,10 +147,10 @@ TEST_F(OrderTrackerTest, FoundResolvesToStillLiveStates) {
         ReconcileEventRing outbound;
 
         auto rec = make_ambiguous_record("HY-A", 100);
-        ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, rec, 1000));
+        ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
         g_mock_query_result = QueryResult{QueryOutcome::Found, target, 555, 40, 5000};
 
-        poll_once(tracker, inbound, outbound, query_port_, policy_, 1000);
+        poll_once(tracker, inbound, outbound, query_port_, policy_, test::reconcile_at_ms(1000));
 
         ReconcileEvent ev{};
         ASSERT_TRUE(outbound.try_pop(ev));
@@ -186,10 +191,10 @@ OrderRecord make_live_record(const char* coid, OrderState state,
 
 TEST_F(OrderTrackerTest, AcceptedOrderReachesFilledAndLeavesTracker) {
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{3, 9}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{3, 9}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
@@ -205,10 +210,10 @@ TEST_F(OrderTrackerTest, AcceptedOrderReachesOperatorCancelledAndLeavesTracker) 
     // CancelRequested. validate_transition() used to reject that edge outright
     // (audit STATE-TRANS-011).
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 0, 0};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
@@ -224,10 +229,10 @@ TEST_F(OrderTrackerTest, AcceptedOrderDiscoversCancelRequestedViaLivePoll) {
     // batch's external review caught: it gates poll_once() for the live-poll path (line ~450)
     // before validate_transition() is ever consulted.
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::CancelRequested, 555, 0, 0};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev)) << "state changed (Accepted -> CancelRequested), must emit";
@@ -239,12 +244,12 @@ TEST_F(OrderTrackerTest, AcceptedOrderDiscoversCancelRequestedViaLivePoll) {
 
 TEST_F(OrderTrackerTest, CancelRequestedOrderKeepsPollingUntilExchangeFinal) {
     auto rec = make_live_record("HY-CANCEL", OrderState::CancelRequested);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 4}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 4}, rec, test::reconcile_at_ms(0)));
 
     // PENDING_CANCEL again: a definite answer, but no state/fill change and no
     // resolution event. Most importantly, this state remains pollable.
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::CancelRequested, 555, 0, 0};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
     EXPECT_EQ(tracker_.count(), 1u);
@@ -252,7 +257,7 @@ TEST_F(OrderTrackerTest, CancelRequestedOrderKeepsPollingUntilExchangeFinal) {
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 0, 0};
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
-              1000 + policy_.live_poll_interval_ms);
+              test::reconcile_at_ms(1000 + policy_.live_poll_interval_ms));
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.prior_state, OrderState::CancelRequested);
     EXPECT_EQ(ev.resulting_state, OrderState::Cancelled);
@@ -267,12 +272,12 @@ TEST_F(OrderTrackerTest, CancelRequestedCanResolveToStillWorkingStates) {
         ToReconcileRing inbound;
         ReconcileEventRing outbound;
         auto rec = make_live_record("HY-CANCEL", OrderState::CancelRequested);
-        ASSERT_TRUE(tracker.track(InFlightHandle{2, 4}, rec, 0));
+        ASSERT_TRUE(tracker.track(InFlightHandle{2, 4}, rec, test::reconcile_at_ms(0)));
 
         g_mock_query_result = QueryResult{QueryOutcome::Found, target, 555,
                                            target == OrderState::PartialFill ? 40 : 0,
                                            target == OrderState::PartialFill ? 5000 : 0};
-        poll_once(tracker, inbound, outbound, query_port_, policy_, 1000);
+        poll_once(tracker, inbound, outbound, query_port_, policy_, test::reconcile_at_ms(1000));
 
         ReconcileEvent ev{};
         ASSERT_TRUE(outbound.try_pop(ev));
@@ -288,10 +293,10 @@ TEST_F(OrderTrackerTest, ProgressivePartialFillWithoutStateChangePublishesOnlyTh
     auto rec = make_live_record("HY-PROGRESS", OrderState::PartialFill);
     rec.filled_qty_ticks = 40;
     rec.avg_fill_price_ticks = 5000;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 4}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 4}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::PartialFill, 555, 60, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev)) << "a larger cumulative fill is new information even when status is unchanged";
@@ -304,7 +309,7 @@ TEST_F(OrderTrackerTest, ProgressivePartialFillWithoutStateChangePublishesOnlyTh
 
     // The identical snapshot on the next poll has no new delta and emits nothing.
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
-              1000 + policy_.live_poll_interval_ms);
+              test::reconcile_at_ms(1000 + policy_.live_poll_interval_ms));
     EXPECT_FALSE(outbound_.try_pop(ev));
 }
 
@@ -317,10 +322,10 @@ TEST_F(OrderTrackerTest, CancelRequestedProgressiveFillPublishesDeltaAndKeepsRes
     rec.avg_fill_price_ticks = 5000;
     const InFlightHandle h = in_flight.register_submit_handle(rec.client_order_id.view());
     ASSERT_TRUE(h.valid());
-    ASSERT_TRUE(tracker_.track(h, rec, 0));
+    ASSERT_TRUE(tracker_.track(h, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::CancelRequested, 555, 60, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
     drain_reconcile_events(in_flight, &audit, outbound_, 1000, &truth);
 
     EXPECT_EQ(truth.net_qty_ticks(1), 20) << "only 60 - 40 is newly credited";
@@ -331,7 +336,7 @@ TEST_F(OrderTrackerTest, CancelRequestedProgressiveFillPublishesDeltaAndKeepsRes
     // do not credit that quantity a second time.
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 60, 5000};
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
-              1000 + policy_.live_poll_interval_ms);
+              test::reconcile_at_ms(1000 + policy_.live_poll_interval_ms));
     drain_reconcile_events(in_flight, &audit, outbound_, 2000, &truth);
 
     EXPECT_EQ(truth.net_qty_ticks(1), 20);
@@ -341,10 +346,10 @@ TEST_F(OrderTrackerTest, CancelRequestedProgressiveFillPublishesDeltaAndKeepsRes
 
 TEST_F(OrderTrackerTest, PartialFillOrderReachesCancelled) {
     auto rec = make_live_record("HY-LIVE", OrderState::PartialFill);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Cancelled, 555, 40, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
@@ -355,10 +360,10 @@ TEST_F(OrderTrackerTest, PartialFillOrderReachesCancelled) {
 
 TEST_F(OrderTrackerTest, StillRestingLiveOrderEmitsNoEventAndStaysTracked) {
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev)) << "no state change means no event";
@@ -370,12 +375,12 @@ TEST_F(OrderTrackerTest, LiveOrderIsNeverEscalated) {
     // A resting order polled many times must NOT trip the Ambiguous quarantine
     // criterion (R-10): a live order is a normal steady state, not an anomaly.
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
 
     std::int64_t now = 1000;
     for (int i = 0; i < 20; ++i) {
-        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, now);
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(now));
         now += policy_.live_poll_interval_ms;
     }
 
@@ -387,29 +392,29 @@ TEST_F(OrderTrackerTest, LiveOrderIsNeverEscalated) {
 
 TEST_F(OrderTrackerTest, LiveOrderRespectsFlatPollInterval) {
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
     ASSERT_EQ(g_mock_query_call_count, 1);
 
     // Too soon: no second query.
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
-              1000 + policy_.live_poll_interval_ms - 1);
+              test::reconcile_at_ms(1000 + policy_.live_poll_interval_ms - 1));
     EXPECT_EQ(g_mock_query_call_count, 1);
 
     // Interval elapsed: query again.
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
-              1000 + policy_.live_poll_interval_ms);
+              test::reconcile_at_ms(1000 + policy_.live_poll_interval_ms));
     EXPECT_EQ(g_mock_query_call_count, 2);
 }
 
 TEST_F(OrderTrackerTest, LivePartialFillGrowthPublishesEventBeforeTerminal) {
     auto rec = make_live_record("HY-LIVE", OrderState::PartialFill);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::PartialFill, 555, 60, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
@@ -421,7 +426,7 @@ TEST_F(OrderTrackerTest, LivePartialFillGrowthPublishesEventBeforeTerminal) {
     // remaining cumulative delta rather than the full 100 a second time.
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
-              1000 + policy_.live_poll_interval_ms);
+              test::reconcile_at_ms(1000 + policy_.live_poll_interval_ms));
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::Filled);
     EXPECT_EQ(ev.fill_delta_qty_ticks, 40);
@@ -434,10 +439,10 @@ TEST_F(OrderTrackerTest, ReconcileEventCarriesSymbolIdSideAndFillDelta) {
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
     rec.symbol_id = 7;
     rec.side = OrderSide::Sell;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
@@ -455,10 +460,10 @@ TEST_F(OrderTrackerTest, ReconcileEventFillDeltaIsIncrementalNotCumulative) {
     auto rec = make_live_record("HY-LIVE", OrderState::PartialFill);
     rec.filled_qty_ticks = 40;
     rec.avg_fill_price_ticks = 5000;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
@@ -470,10 +475,10 @@ TEST_F(OrderTrackerTest, FilledWithShortQuantityIsRejected) {
     // intended must not release the in-flight slot on an order that still has
     // quantity resting.
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 99, 5000};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
@@ -482,10 +487,10 @@ TEST_F(OrderTrackerTest, FilledWithShortQuantityIsRejected) {
 
 TEST_F(OrderTrackerTest, LiveOrderCannotRegressToAmbiguous) {
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Ambiguous, 555, 0, 0};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
@@ -505,7 +510,7 @@ TEST_F(OrderTrackerTest, AmbiguousToLiveToTerminalReleasesInFlightSlot) {
 
     // 1) reconcile discovers the order is actually still live
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
     drain_reconcile_events(in_flight, &audit, outbound_, 1000);
     EXPECT_TRUE(in_flight.is_in_flight("HY-CHAIN")) << "still live: slot correctly retained";
     EXPECT_EQ(tracker_.count(), 1u) << "still live: still tracked";
@@ -513,7 +518,7 @@ TEST_F(OrderTrackerTest, AmbiguousToLiveToTerminalReleasesInFlightSlot) {
     // 2) later it fills
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
     poll_once(tracker_, inbound_, outbound_, query_port_, policy_,
-              1000 + policy_.live_poll_interval_ms);
+              test::reconcile_at_ms(1000 + policy_.live_poll_interval_ms));
     drain_reconcile_events(in_flight, &audit, outbound_, 2000);
 
     EXPECT_FALSE(in_flight.is_in_flight("HY-CHAIN")) << "terminal: slot must be released";
@@ -538,7 +543,7 @@ TEST_F(OrderTrackerTest, SustainedAcceptedOrdersDoNotExhaustInFlightRegistry) {
 
         const std::int64_t now = 1000 + static_cast<std::int64_t>(i) * policy_.live_poll_interval_ms;
         g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 555, 100, 5000};
-        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, now);
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(now));
         drain_reconcile_events(in_flight, &audit, outbound_, now);
     }
 
@@ -550,10 +555,10 @@ TEST_F(OrderTrackerTest, SustainedAcceptedOrdersDoNotExhaustInFlightRegistry) {
 
 TEST_F(OrderTrackerTest, InconclusiveStaysTrackedAndAmbiguous) {
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
     g_mock_query_result = QueryResult{};  // Inconclusive by default
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u);
     ReconcileEvent ev{};
@@ -566,9 +571,9 @@ TEST_F(OrderTrackerTest, NullQueryPortIsNotSentAndNeverCounted) {
     EXPECT_EQ(empty_port.call(OrderExpectation{}).outcome, QueryOutcome::NotSent)
         << "nothing can be sent through a port that is not wired";
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
 
-    poll_once(tracker_, inbound_, outbound_, empty_port, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, empty_port, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u) << "null port must not crash/hang and must not resolve or escalate anything";
     ReconcileEvent ev{};
@@ -580,11 +585,11 @@ TEST_F(OrderTrackerTest, NullQueryPortIsNotSentAndNeverCounted) {
 
 TEST_F(OrderTrackerTest, IllegalConfirmedStateRejected) {
     auto rec = make_ambiguous_record("HY-A", 100);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
     // Intent is not a legal Ambiguous target under any circumstance.
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Intent, 1, 0, 0};
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u) << "must stay tracked, not silently transitioned";
     ReconcileEvent ev{};
@@ -593,11 +598,11 @@ TEST_F(OrderTrackerTest, IllegalConfirmedStateRejected) {
 
 TEST_F(OrderTrackerTest, FilledQtyExceedingIntendedQtyRejected) {
     auto rec = make_ambiguous_record("HY-A", /*intended_qty_ticks=*/100);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 1,
                                        /*filled_qty=*/101, /*avg_price=*/5000};
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u);
     ReconcileEvent ev{};
@@ -606,10 +611,10 @@ TEST_F(OrderTrackerTest, FilledQtyExceedingIntendedQtyRejected) {
 
 TEST_F(OrderTrackerTest, NegativeFilledQtyRejected) {
     auto rec = make_ambiguous_record("HY-A", 100);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::PartialFill, 1, -1, 0};
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u);
 }
@@ -623,13 +628,13 @@ TEST_F(OrderTrackerTest, CumulativeFillCannotRegressDuringCancelFillRace) {
         auto rec = make_live_record("HY-REGRESS", OrderState::CancelRequested);
         rec.filled_qty_ticks = 40;
         rec.avg_fill_price_ticks = 5000;
-        ASSERT_TRUE(tracker.track(InFlightHandle{2, 4}, rec, 0));
+        ASSERT_TRUE(tracker.track(InFlightHandle{2, 4}, rec, test::reconcile_at_ms(0)));
 
         // Both the same-state report and the otherwise-legal reverse transition
         // would compute a negative delta if the cumulative high-water mark were
         // not checked before any state mutation.
         g_mock_query_result = QueryResult{QueryOutcome::Found, target, 555, 20, 5000};
-        poll_once(tracker, inbound, outbound, query_port_, policy_, 1000);
+        poll_once(tracker, inbound, outbound, query_port_, policy_, test::reconcile_at_ms(1000));
 
         ReconcileEvent ev{};
         EXPECT_FALSE(outbound.try_pop(ev));
@@ -641,11 +646,11 @@ TEST_F(OrderTrackerTest, CumulativeFillCannotRegressDuringCancelFillRace) {
 
 TEST_F(OrderTrackerTest, NonzeroPriceWithZeroFilledQtyRejected) {
     auto rec = make_ambiguous_record("HY-A", 100);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
     // Inconsistent: claims a fill price but zero quantity filled.
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 1, 0, 5000};
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u);
 }
@@ -661,17 +666,17 @@ TEST_F(OrderTrackerTest, NonzeroPriceWithZeroFilledQtyRejected) {
 TEST_F(OrderTrackerTest, EscalatesOnceEnoughSentQueriesAndEnoughTimeHavePassed) {
     auto rec = make_ambiguous_record("HY-A");
     rec.query_attempts = 5;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 3}, rec, 1000));  // first became Ambiguous at 1000
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 3}, rec, test::reconcile_at_ms(1000)));  // first became Ambiguous at 1000
 
     // 5 queries already sent, but only 4999 ms in: keep asking (the query is sent, the count moves on).
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000 + 4999);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000 + 4999));
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
     EXPECT_EQ(g_mock_query_call_count, 1);
     EXPECT_EQ(tracked_record(tracker_, "HY-A")->query_attempts, 6);
 
     // 5000 ms in: quarantine, without firing another query.
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000 + 5000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000 + 5000));
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
     EXPECT_EQ(ev.handle.generation, 3u);
@@ -683,9 +688,9 @@ TEST_F(OrderTrackerTest, TheThirdInconclusiveQueryNoLongerEscalates) {
     // The pre-R-10 cap: three inconclusive queries in about a second -> EscalatedToOperator.
     auto rec = make_ambiguous_record("HY-A");
     rec.query_attempts = 3;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000 + 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000 + 1000));
 
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
@@ -698,10 +703,10 @@ TEST_F(OrderTrackerTest, HardCapEscalatesEvenIfNoQueryWasEverSent) {
     // "actually sent", so none counts -- but the time it burns still runs into the 15 s cap.
     g_mock_query_result = QueryResult::not_sent();
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     for (std::int64_t t = 0; t < 15'000; t += 250) {
-        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, t);
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(t));
     }
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev)) << "not before the cap";
@@ -710,7 +715,7 @@ TEST_F(OrderTrackerTest, HardCapEscalatesEvenIfNoQueryWasEverSent) {
     EXPECT_GT(g_mock_query_call_count, 10) << "the loop kept trying to send meanwhile";
 
     const int calls_before = g_mock_query_call_count;
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 15'000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(15'000));
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
     EXPECT_EQ(tracker_.count(), 0u);
@@ -718,16 +723,16 @@ TEST_F(OrderTrackerTest, HardCapEscalatesEvenIfNoQueryWasEverSent) {
 }
 
 TEST_F(OrderTrackerTest, OnlySentQueriesCountTowardTheQuarantineCriterion) {
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, make_ambiguous_record("HY-A"), 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, make_ambiguous_record("HY-A"), test::reconcile_at_ms(0)));
 
     g_mock_query_result = QueryResult::not_sent();
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 0);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(0));
     EXPECT_EQ(tracked_record(tracker_, "HY-A")->query_attempts, 0) << "NotSent is not a sent query";
 
     g_mock_query_result = QueryResult{};  // Inconclusive: the request WAS sent
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
     EXPECT_EQ(tracked_record(tracker_, "HY-A")->query_attempts, 1);
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000 + policy_.base_interval_ms);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000 + policy_.base_interval_ms));
     EXPECT_EQ(tracked_record(tracker_, "HY-A")->query_attempts, 2);
 }
 
@@ -737,13 +742,13 @@ TEST_F(OrderTrackerTest, LocallyRefusedPollsKeepTheBaseBackoffNotTheMaximum) {
     // left the process. The base interval must apply instead.
     g_mock_query_result = QueryResult::not_sent();
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 0);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(0));
     ASSERT_EQ(g_mock_query_call_count, 1);
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.base_interval_ms - 1);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(policy_.base_interval_ms - 1));
     EXPECT_EQ(g_mock_query_call_count, 1) << "before the base interval: no new attempt";
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.base_interval_ms);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(policy_.base_interval_ms));
     EXPECT_EQ(g_mock_query_call_count, 2) << "at the base interval, not five seconds later";
 }
 
@@ -755,11 +760,11 @@ TEST_F(OrderTrackerTest, DefaultCadenceQuarantinesAfterFiveSentQueriesAboutNineS
     g_mock_query_result = QueryResult{};  // Inconclusive, every time
     constexpr std::int64_t kStart = 10'000;
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, kStart));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(kStart)));
 
     std::int64_t escalated_at = -1;
     for (std::int64_t t = kStart; t <= kStart + 20'000 && escalated_at < 0; t += 100) {
-        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, t);
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(t));
         ReconcileEvent ev{};
         if (outbound_.try_pop(ev)) {
             EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
@@ -777,13 +782,13 @@ TEST_F(OrderTrackerTest, WallClockAloneCanQuarantineWhenTheMonotonicClockStoodSt
     // A suspended host: the monotonic clock did not move, the wall clock did.
     constexpr std::int64_t kWall = 1'700'000'000'000;
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000, kWall));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000), kWall));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000, kWall + 14'999);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000), kWall + 14'999);
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000, kWall + 15'000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000), kWall + 15'000);
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
 }
@@ -791,10 +796,10 @@ TEST_F(OrderTrackerTest, WallClockAloneCanQuarantineWhenTheMonotonicClockStoodSt
 TEST_F(OrderTrackerTest, WallClockSteppingBackwardsNeverPostponesQuarantine) {
     constexpr std::int64_t kWall = 1'700'000'000'000;
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000, kWall));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000), kWall));
 
     // The wall clock is now an hour in the past; the monotonic clock says 15 s have gone by.
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000 + 15'000, kWall - 3'600'000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000 + 15'000), kWall - 3'600'000);
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
@@ -803,11 +808,11 @@ TEST_F(OrderTrackerTest, WallClockSteppingBackwardsNeverPostponesQuarantine) {
 TEST_F(OrderTrackerTest, CallersWithoutAWallClockDecideOnTheMonotonicClockAlone) {
     // Every call site that predates R-10 passes no wall clock and must keep working.
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000 + 14'999);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000 + 14'999));
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000 + 15'000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000 + 15'000));
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
 }
@@ -818,12 +823,12 @@ TEST_F(OrderTrackerTest, QuarantinePolicyIsConfigurable) {
     policy_.quarantine.hard_cap_ms = 2000;
     auto rec = make_ambiguous_record("HY-A");
     rec.query_attempts = 1;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 499);  // one short of the floor
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(499));  // one short of the floor
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 500);  // the configured floor
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(500));  // the configured floor
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
 }
@@ -834,28 +839,28 @@ TEST_F(OrderTrackerTest, SentQueryCountSaturatesInsteadOfWrapping) {
     policy_.quarantine.min_elapsed_ms = std::numeric_limits<std::int64_t>::max();
     auto rec = make_ambiguous_record("HY-A");
     rec.query_attempts = 254;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0)));
 
     std::int64_t t = 0;
-    for (int i = 0; i < 4; ++i, t += 5000) poll_once(tracker_, inbound_, outbound_, query_port_, policy_, t);
+    for (int i = 0; i < 4; ++i, t += 5000) poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(t));
     EXPECT_EQ(tracked_record(tracker_, "HY-A")->query_attempts, 255);
 }
 
 TEST_F(OrderTrackerTest, TrackStampsFirstSightOnBothClocksAndKeepsAnAnchorAlreadySet) {
     auto fresh = make_ambiguous_record("HY-FRESH");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, fresh, 1000, 5000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, fresh, test::reconcile_at_ms(1000), 5000));
     EXPECT_EQ(tracked_record(tracker_, "HY-FRESH")->unknown_since_mono_ms, 1000);
     EXPECT_EQ(tracked_record(tracker_, "HY-FRESH")->unknown_since_wall_ms, 5000);
 
     auto stamped = make_ambiguous_record("HY-STAMPED");
     stamped.unknown_since_mono_ms = 42;
     stamped.unknown_since_wall_ms = 4200;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{1, 1}, stamped, 1000, 5000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{1, 1}, stamped, test::reconcile_at_ms(1000), 5000));
     EXPECT_EQ(tracked_record(tracker_, "HY-STAMPED")->unknown_since_mono_ms, 42) << "an anchor already set is kept";
     EXPECT_EQ(tracked_record(tracker_, "HY-STAMPED")->unknown_since_wall_ms, 4200);
 
     auto live = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 1}, live, 1000, 5000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{2, 1}, live, test::reconcile_at_ms(1000), 5000));
     EXPECT_EQ(tracked_record(tracker_, "HY-LIVE")->unknown_since_mono_ms, OrderRecord::kClockUnset)
         << "a live order was never UNKNOWN in this loop: nothing is stamped";
 }
@@ -865,7 +870,7 @@ TEST_F(OrderTrackerTest, IngressIsStampedOnTheReconcileLoopsOwnClocks) {
     ASSERT_TRUE(inbound_.try_push(ReconcileIngress{InFlightHandle{2, 9}, rec}));
     g_mock_query_result = QueryResult{};
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 7000, 9000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(7000), 9000);
 
     ASSERT_TRUE(tracked_record(tracker_, "HY-A").has_value());
     EXPECT_EQ(tracked_record(tracker_, "HY-A")->unknown_since_mono_ms, 7000);
@@ -876,13 +881,13 @@ TEST_F(OrderTrackerTest, PollOnceStampsARecordThatArrivedWithoutAnAnchor) {
     // Defense in depth: track() with no monotonic reading leaves the anchor unset; the first
     // poll_once() must close that door (an unset anchor reads as "no time has passed" for ever).
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, OrderRecord::kClockUnset));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(OrderRecord::kClockUnset)));
     ASSERT_EQ(tracked_record(tracker_, "HY-A")->unknown_since_mono_ms, OrderRecord::kClockUnset);
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 5000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(5000));
     EXPECT_EQ(tracked_record(tracker_, "HY-A")->unknown_since_mono_ms, 5000);
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 5000 + 15'000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(5000 + 15'000));
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
     EXPECT_EQ(ev.resulting_state, OrderState::EscalatedToOperator);
@@ -890,12 +895,12 @@ TEST_F(OrderTrackerTest, PollOnceStampsARecordThatArrivedWithoutAnAnchor) {
 
 TEST_F(OrderTrackerTest, LiveOrderIsNeverQuarantinedHoweverLongItRests) {
     auto rec = make_live_record("HY-LIVE", OrderState::Accepted);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 0, 1'700'000'000'000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(0), 1'700'000'000'000));
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Accepted, 555, 0, 0};
 
     // A day of ticks on both clocks: far past every quarantine threshold.
     for (std::int64_t t = 0; t <= 86'400'000; t += 60'000) {
-        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, t, 1'700'000'000'000 + t);
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(t), 1'700'000'000'000 + t);
     }
     ReconcileEvent ev{};
     EXPECT_FALSE(outbound_.try_pop(ev));
@@ -916,7 +921,7 @@ TEST_F(OrderTrackerTest, TheInFlightSlotIsHeldThroughTheWholeWindowAndAfterQuara
 
     bool quarantined = false;
     for (std::int64_t t = 0; t <= 20'000 && !quarantined; t += 100) {
-        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, t);
+        poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(t));
         drain_reconcile_events(in_flight, &audit, outbound_, t);
         EXPECT_TRUE(in_flight.is_in_flight("HY-Q")) << "the slot must be held at t=" << t;
         quarantined = (tracker_.count() == 0);  // poll_once untracks an escalated order
@@ -938,9 +943,9 @@ TEST_F(OrderTrackerTest, EscalationEventCarriesTheOrdersIdentityButNoFillFields)
     rec.symbol_id = 7;
     rec.side = OrderSide::Sell;
     rec.exchange_order_id = 4242;
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 5}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 5}, rec, test::reconcile_at_ms(0)));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.quarantine.hard_cap_ms);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(policy_.quarantine.hard_cap_ms));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
@@ -963,9 +968,9 @@ TEST_F(OrderTrackerTest, EscalatedAuditRecordCarriesSymbolSideAndExchangeOrderId
     rec.exchange_order_id = 4242;
     auto handle = in_flight.register_submit_handle(rec.client_order_id.view());
     ASSERT_TRUE(handle.valid());
-    ASSERT_TRUE(tracker_.track(handle, rec, 0));
+    ASSERT_TRUE(tracker_.track(handle, rec, test::reconcile_at_ms(0)));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.quarantine.hard_cap_ms);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(policy_.quarantine.hard_cap_ms));
     drain_reconcile_events(in_flight, &audit, outbound_, policy_.quarantine.hard_cap_ms);
 
     ASSERT_NE(audit.count(), 0u);
@@ -980,19 +985,58 @@ TEST_F(OrderTrackerTest, EscalatedAuditRecordCarriesSymbolSideAndExchangeOrderId
 
 TEST_F(OrderTrackerTest, BackoffDelaysNextQueryForSameOrder) {
     auto rec = make_ambiguous_record("HY-A");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, /*now_ms=*/1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, /*now_ms=*/test::reconcile_at_ms(1000)));
     g_mock_query_result = QueryResult{};  // stays Inconclusive every time
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
     EXPECT_EQ(g_mock_query_call_count, 1);
 
     // base_interval_ms defaults to 200; well before that has elapsed, must not
     // query again.
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1050);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1050));
     EXPECT_EQ(g_mock_query_call_count, 1) << "too soon, must skip";
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1250);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1250));
     EXPECT_EQ(g_mock_query_call_count, 2) << "backoff elapsed, must query again";
+}
+
+TEST_F(OrderTrackerTest, RetryWaitUsesSteadyTimeAcrossClockReversalAndWallClockSteps) {
+    constexpr std::int64_t kWall = 1'700'000'000'000;
+    policy_.live_poll_interval_ms = 200;
+    auto rec = make_live_record("HY-STEADY", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
+    g_mock_query_result = QueryResult{};
+
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000), kWall);
+    ASSERT_EQ(g_mock_query_call_count, 1);
+
+    // A backward steady reading and an hour-forward wall step cannot end the retry wait.
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(900), kWall + 3'600'000);
+    EXPECT_EQ(g_mock_query_call_count, 1);
+
+    // The retry is still gated one millisecond before the interval, despite the wall clock stepping back.
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1199), kWall - 3'600'000);
+    EXPECT_EQ(g_mock_query_call_count, 1);
+
+    // At the exact 200 ms steady interval, the next query is due.
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1200), kWall - 3'600'000);
+    EXPECT_EQ(g_mock_query_call_count, 2);
+}
+
+TEST_F(OrderTrackerTest, RetryWaitDoesNotOverflowAcrossTimePointExtremes) {
+    constexpr std::int64_t kLow = std::numeric_limits<std::int64_t>::min() + 1;
+    constexpr std::int64_t kHigh = std::numeric_limits<std::int64_t>::max();
+    policy_.live_poll_interval_ms = 200;
+    auto rec = make_live_record("HY-WIDE-INTERVAL", OrderState::Accepted);
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(kLow)));
+    g_mock_query_result = QueryResult{};
+
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(kLow));
+    ASSERT_EQ(g_mock_query_call_count, 1);
+
+    // The elapsed interval exceeds int64 milliseconds; it must be treated as due without signed overflow.
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(kHigh));
+    EXPECT_EQ(g_mock_query_call_count, 2);
 }
 
 TEST_F(OrderTrackerTest, BackoffGrowsWithAttemptCount) {
@@ -1018,10 +1062,10 @@ TEST_F(OrderTrackerTest, MaxQueriesPerTickThrottles) {
     for (int i = 0; i < 5; ++i) {
         std::snprintf(coid, sizeof(coid), "HY-%d", i);
         auto rec = make_ambiguous_record(coid);
-        ASSERT_TRUE(tracker_.track(InFlightHandle{static_cast<std::size_t>(i), 1}, rec, 0));
+        ASSERT_TRUE(tracker_.track(InFlightHandle{static_cast<std::size_t>(i), 1}, rec, test::reconcile_at_ms(0)));
     }
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(g_mock_query_call_count, 2) << "must stop at the per-tick budget, not query all 5";
     EXPECT_EQ(tracker_.count(), 5u) << "none resolved (Inconclusive), all remain tracked";
@@ -1034,7 +1078,7 @@ TEST_F(OrderTrackerTest, IngressIsDrainedIntoTracker) {
     ASSERT_TRUE(inbound_.try_push(ReconcileIngress{InFlightHandle{2, 9}, rec}));
 
     g_mock_query_result = QueryResult{};  // Inconclusive; just verify it got tracked at all
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u);
     EXPECT_EQ(g_mock_query_call_count, 1) << "the ingested record must actually be polled";
@@ -1348,10 +1392,10 @@ TEST_F(OrderTrackerTest, FullOutboundRingKeepsOrderTrackedForRetry) {
     }
 
     auto rec = make_ambiguous_record("HY-A", 100);
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, 1000));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 1}, rec, test::reconcile_at_ms(1000)));
     g_mock_query_result = QueryResult{QueryOutcome::Found, OrderState::Filled, 1, 100, 5000};
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, 1000);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(1000));
 
     EXPECT_EQ(tracker_.count(), 1u)
         << "publish failed (ring full) -- the resolution must not be lost, order stays tracked";
@@ -1391,12 +1435,12 @@ TEST_F(OrderTrackerTest, EventsCarryTheStateThePollStartedFrom) {
         OrderTracker tracker;
         ToReconcileRing inbound;
         ReconcileEventRing outbound;
-        ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, c.record, 0));
+        ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, c.record, test::reconcile_at_ms(0)));
         const std::int64_t filled = c.found == OrderState::Filled ? c.record.intended_qty_ticks
                                     : c.found == OrderState::PartialFill ? 40 : 0;
         g_mock_query_result = QueryResult{QueryOutcome::Found, c.found, 555, filled, filled > 0 ? 5000 : 0};
 
-        poll_once(tracker, inbound, outbound, query_port_, policy_, 1000);
+        poll_once(tracker, inbound, outbound, query_port_, policy_, test::reconcile_at_ms(1000));
 
         ReconcileEvent ev{};
         ASSERT_TRUE(outbound.try_pop(ev));
@@ -1407,9 +1451,9 @@ TEST_F(OrderTrackerTest, EventsCarryTheStateThePollStartedFrom) {
 
 TEST_F(OrderTrackerTest, AnEscalationEventSaysItsOrderWasAmbiguous) {
     auto rec = make_ambiguous_record("HY-ESC");
-    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 5}, rec, 0));
+    ASSERT_TRUE(tracker_.track(InFlightHandle{0, 5}, rec, test::reconcile_at_ms(0)));
 
-    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, policy_.quarantine.hard_cap_ms);
+    poll_once(tracker_, inbound_, outbound_, query_port_, policy_, test::reconcile_at_ms(policy_.quarantine.hard_cap_ms));
 
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound_.try_pop(ev));
