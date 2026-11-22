@@ -7,6 +7,7 @@
 // (recovery runs in the constructor), exactly as test_durable_audit_sink.cpp does it.
 
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 #include <hengyuan/startup_recovery.hpp>
 
 #include <array>
@@ -373,7 +374,7 @@ protected:
     // One reconcile-loop tick, exactly as a main loop runs it. `wall_ms` is the wall clock (R-10),
     // or OrderRecord::kClockUnset for a loop that has none.
     void tick(std::int64_t now_ms, std::int64_t wall_ms = OrderRecord::kClockUnset) {
-        poll_once(tracker_, to_reconcile_, reconcile_events_, port(), policy_, now_ms, wall_ms);
+        poll_once(tracker_, to_reconcile_, reconcile_events_, port(), policy_, hy::test::reconcile_at_ms(now_ms), wall_ms);
         drain_reconcile_events(in_flight_, nullptr, reconcile_events_, now_ms, &truth_, &fill_context_);
     }
 
@@ -512,7 +513,7 @@ TEST_F(StartupRecoveryLogTest, ACrashLoopDoesNotResetTheUnresolvedTime) {
                                                             truth, fill_context, &rules_for_test, wall_start);
         EXPECT_TRUE(applied.ok());
         for (std::int64_t mono = 0; mono <= lifetime_ms; mono += 100) {
-            poll_once(tracker, to_reconcile, events, port(), policy_, mono, wall_start + mono);
+            poll_once(tracker, to_reconcile, events, port(), policy_, hy::test::reconcile_at_ms(mono), wall_start + mono);
             drain_reconcile_events(in_flight, nullptr, events, mono, &truth, &fill_context);
             if (tracker.count() == 0) return wall_start + mono;  // only an escalation empties it here
         }
@@ -719,7 +720,7 @@ TEST_F(StartupRecoveryLogTest, DurableCancelRecoveryKeepsCancelIdentityPrecision
 
     ReconcileDurablePublisher publisher(port_of(restarted));
     const auto durable_tick = [&](std::int64_t now_ms) {
-        poll_once(tracker_, to_reconcile_, reconcile_events_, port(), policy_, now_ms);
+        poll_once(tracker_, to_reconcile_, reconcile_events_, port(), policy_, hy::test::reconcile_at_ms(now_ms));
         drain_reconcile_events(in_flight_, nullptr, reconcile_events_, now_ms, &truth_, &fill_context_, &publisher);
     };
     StartupRecovery sm(60'000);
@@ -1096,7 +1097,7 @@ protected:
     // One reconcile-loop tick of that life, its drain publishing durable-first through `publisher`.
     void tick_life(Life& life, ReconcileDurablePublisher& publisher, std::int64_t mono_ms,
                    std::int64_t wall_ms = OrderRecord::kClockUnset) {
-        poll_once(life.tracker, life.to_reconcile, life.events, port(), policy_, mono_ms, wall_ms);
+        poll_once(life.tracker, life.to_reconcile, life.events, port(), policy_, hy::test::reconcile_at_ms(mono_ms), wall_ms);
         drain_reconcile_events(life.in_flight, nullptr, life.events, mono_ms, &life.truth, &life.fill_context,
                                &publisher);
     }
@@ -1258,7 +1259,7 @@ TEST_F(DurableReconcileLogTest, AnAcknowledgedResolutionIsNotReconciledAgainAfte
         auto life = std::make_unique<Life>();
         recover(*life, sink);
         ReconcileDurablePublisher publisher(port_of(sink));
-        poll_once(life->tracker, life->to_reconcile, life->events, port(), policy_, 0);
+        poll_once(life->tracker, life->to_reconcile, life->events, port(), policy_, hy::test::reconcile_at_ms(0));
 
         ReconcileEvent ev{};
         AuditRecord record{};

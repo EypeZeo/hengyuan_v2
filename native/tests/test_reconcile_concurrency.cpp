@@ -44,6 +44,7 @@
 // Governance: L1, no network/token/order. GTest only.
 
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include <hengyuan/live_submit_orchestrator.hpp>
@@ -299,7 +300,7 @@ TEST(ReconcileConcurrency, HotThreadAndReconcileThreadRaceCleanly) {
         // a few extra times costs nothing and removes any doubt).
         int extra_passes_after_done = 0;
         while (true) {
-            poll_once(tracker, to_reconcile, reconcile_events, query_port, policy, now_ms++);
+            poll_once(tracker, to_reconcile, reconcile_events, query_port, policy, hy::test::reconcile_at_ms(now_ms++));
             if (hot_done.load(std::memory_order_acquire)) {
                 if (tracker.count() == 0) {
                     ++extra_passes_after_done;

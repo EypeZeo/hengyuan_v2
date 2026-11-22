@@ -12,6 +12,7 @@
 //   * drain_reconcile_events() hands the marker to the sink only after every resolution in front of it was durably acknowledged and published, and the
 //     marker itself touches nothing: no durable frame, no audit record, no PositionTruth, no slot.
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include <hengyuan/order_tracker.hpp>
 
@@ -110,11 +111,11 @@ protected:
     std::size_t next_slot_{0};
 
     void track(const OrderRecord& rec, std::int64_t now_ms = 0) {
-        ASSERT_TRUE(tracker_.track(InFlightHandle{next_slot_++, 1}, rec, now_ms));
+        ASSERT_TRUE(tracker_.track(InFlightHandle{next_slot_++, 1}, rec, hy::test::reconcile_at_ms(now_ms)));
     }
     void post(std::uint64_t epoch) { ASSERT_TRUE(requests_.try_push(SweepRequest{epoch})); }
-    void tick(std::int64_t now_ms) { poll_once(tracker_, inbound_, outbound_, port_, policy_, now_ms, OrderRecord::kClockUnset, &job_); }
-    void tick_without_sweep(std::int64_t now_ms) { poll_once(tracker_, inbound_, outbound_, port_, policy_, now_ms); }
+    void tick(std::int64_t now_ms) { poll_once(tracker_, inbound_, outbound_, port_, policy_, hy::test::reconcile_at_ms(now_ms), OrderRecord::kClockUnset, &job_); }
+    void tick_without_sweep(std::int64_t now_ms) { poll_once(tracker_, inbound_, outbound_, port_, policy_, hy::test::reconcile_at_ms(now_ms)); }
 };
 
 }  // namespace
@@ -123,7 +124,7 @@ protected:
 
 TEST(OrderTrackerSweepBookkeeping, AnAnswerBelongsToOneEpochAndAFreshSlotStartsUnanswered) {
     OrderTracker tracker;
-    ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, make_record("HY-A", OrderState::Accepted), 0));
+    ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, make_record("HY-A", OrderState::Accepted), hy::test::reconcile_at_ms(0)));
     EXPECT_EQ(tracker.answered_epoch("HY-A"), 0U);
     EXPECT_EQ(tracker.count_unanswered(5), 1U);
     tracker.note_answered("HY-A", 5);
@@ -132,7 +133,7 @@ TEST(OrderTrackerSweepBookkeeping, AnAnswerBelongsToOneEpochAndAFreshSlotStartsU
     EXPECT_EQ(tracker.count_unanswered(6), 1U) << "a newer epoch starts with every order unanswered again";
 
     tracker.untrack("HY-A");
-    ASSERT_TRUE(tracker.track(InFlightHandle{0, 2}, make_record("HY-B", OrderState::Accepted), 0));
+    ASSERT_TRUE(tracker.track(InFlightHandle{0, 2}, make_record("HY-B", OrderState::Accepted), hy::test::reconcile_at_ms(0)));
     EXPECT_EQ(tracker.answered_epoch("HY-B"), 0U) << "the reused slot must not inherit the previous order's answer";
     EXPECT_EQ(tracker.answered_epoch("HY-GONE"), 0U);
     tracker.note_answered("HY-GONE", 5);  // not tracked: ignored, no crash
@@ -140,11 +141,11 @@ TEST(OrderTrackerSweepBookkeeping, AnAnswerBelongsToOneEpochAndAFreshSlotStartsU
 
 TEST(OrderTrackerSweepBookkeeping, OnlyOrdersThatCanBePolledAreWaitedFor) {
     OrderTracker tracker;
-    ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, make_record("HY-AMB", OrderState::Ambiguous), 0));
-    ASSERT_TRUE(tracker.track(InFlightHandle{1, 1}, make_record("HY-LIVE", OrderState::Accepted), 0));
-    ASSERT_TRUE(tracker.track(InFlightHandle{2, 1}, make_record("HY-PART", OrderState::PartialFill), 0));
-    ASSERT_TRUE(tracker.track(InFlightHandle{3, 1}, make_record("HY-CANCEL", OrderState::CancelRequested), 0));
-    ASSERT_TRUE(tracker.track(InFlightHandle{4, 1}, make_record("HY-ESC", OrderState::EscalatedToOperator), 0));
+    ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, make_record("HY-AMB", OrderState::Ambiguous), hy::test::reconcile_at_ms(0)));
+    ASSERT_TRUE(tracker.track(InFlightHandle{1, 1}, make_record("HY-LIVE", OrderState::Accepted), hy::test::reconcile_at_ms(0)));
+    ASSERT_TRUE(tracker.track(InFlightHandle{2, 1}, make_record("HY-PART", OrderState::PartialFill), hy::test::reconcile_at_ms(0)));
+    ASSERT_TRUE(tracker.track(InFlightHandle{3, 1}, make_record("HY-CANCEL", OrderState::CancelRequested), hy::test::reconcile_at_ms(0)));
+    ASSERT_TRUE(tracker.track(InFlightHandle{4, 1}, make_record("HY-ESC", OrderState::EscalatedToOperator), hy::test::reconcile_at_ms(0)));
     EXPECT_EQ(tracker.count_unanswered(1), 4U) << "CancelRequested is pollable; only the escalated one is never asked about";
     EXPECT_EQ(tracker.count_unknown_fate(), 1U) << "...but its fate is unknown, and that is reported";
 }
@@ -155,7 +156,7 @@ TEST(OrderTrackerSweepBookkeeping, AnEscalationIsRememberedAfterTheOrderLeftTheT
     tracker.note_escalated();
     tracker.note_escalated();
     EXPECT_EQ(tracker.count_unknown_fate(), 2U);
-    ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, make_record("HY-ESC", OrderState::EscalatedToOperator), 0));
+    ASSERT_TRUE(tracker.track(InFlightHandle{0, 1}, make_record("HY-ESC", OrderState::EscalatedToOperator), hy::test::reconcile_at_ms(0)));
     EXPECT_EQ(tracker.count_unknown_fate(), 3U);
     tracker.untrack("HY-ESC");
     EXPECT_EQ(tracker.count_unknown_fate(), 2U) << "an order that was tracked and then untracked leaves only the escalation counter";
@@ -736,7 +737,7 @@ TEST_F(SweepDrainTest, ARealSweepEndToEndThroughTheRingsLeavesMemoryConsistentAt
     ASSERT_TRUE(inbound.try_push(ReconcileIngress{h, rec}));
     ASSERT_TRUE(requests.try_push(SweepRequest{11}));
 
-    poll_once(tracker, inbound, events_, port, ReconcilePollPolicy{}, 1000, OrderRecord::kClockUnset, &job);
+    poll_once(tracker, inbound, events_, port, ReconcilePollPolicy{}, hy::test::reconcile_at_ms(1000), OrderRecord::kClockUnset, &job);
     drain(&sink_, &publisher_);
 
     ASSERT_EQ(seen_.calls.size(), 1U);

@@ -12,6 +12,7 @@
 //     rules lookup fails closed (the state machine degrades);
 //   * the wiring: the context the pipeline makes carries every field the private stream needs, and they are the objects the pipeline itself drains with.
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include <hengyuan/durable_kill_switch.hpp>
 #include <hengyuan/preflight_probe.hpp>
@@ -357,7 +358,7 @@ protected:
     void cycle(std::int64_t advance_ms = 10) {
         g_now += advance_ms;
         pipe_->hot_tick(g_now);
-        pipe_->reconcile_tick(g_now);
+        pipe_->reconcile_tick(hy::test::reconcile_at_ms(g_now));
     }
 
     void connect() {
@@ -412,7 +413,7 @@ TEST_F(PipelineTest, FromNothingToATokenStepByStep) {
     EXPECT_EQ(pipe_->sweep_pump().stats().requests_sent, 1U);
     EXPECT_FALSE(pipe_->holder().has_snapshot());
 
-    pipe_->reconcile_tick(g_now += 10);  // the periodic fetch, the sweep request, no orders to ask about: the account step, then the marker
+    pipe_->reconcile_tick(hy::test::reconcile_at_ms(g_now += 10));  // the periodic fetch, the sweep request, no orders to ask about: the account step, then the marker
     EXPECT_EQ(pipe_->sweep_job().stats().sweeps_started, 1U);
     EXPECT_EQ(pipe_->sweep_job().stats().account_steps, 1U);
     EXPECT_EQ(pipe_->sweep_job().stats().sweeps_completed, 1U);
@@ -546,7 +547,7 @@ TEST_F(PipelineTest, AStaleAccountTakesTheProcessOutOfReadinessAgain) {
     EXPECT_FALSE(stale.ready());
     EXPECT_EQ(stale.reason, NotReadyReason::StartupNotReady);
     // The reconcile half comes back: a periodic fetch and the account is fresh again.
-    pipe_->reconcile_tick(g_now);
+    pipe_->reconcile_tick(hy::test::reconcile_at_ms(g_now));
     pipe_->hot_tick(g_now);
     EXPECT_TRUE(pipe_->readiness().authorize(g_now).ready());
 }
@@ -980,7 +981,7 @@ TEST_F(PipelineTest, TheTicksAreCountedAndTheHalvesAreIndependent) {
     EXPECT_EQ(pipe_->stats().hot_ticks, 2U);
     EXPECT_EQ(pipe_->reconcile_ticks(), 0U);
     EXPECT_EQ(account_.calls, 0U) << "the hot half never touches the account port";
-    pipe_->reconcile_tick(g_now += 5);
+    pipe_->reconcile_tick(hy::test::reconcile_at_ms(g_now += 5));
     EXPECT_EQ(pipe_->reconcile_ticks(), 1U);
     EXPECT_EQ(account_.calls, 1U) << "the first reconcile tick fetches at once";
     EXPECT_EQ(sessions_.size(), 1U) << "the reconcile half starts no session";

@@ -14,6 +14,7 @@
 //   * end to end: the barrier completes only on the account the sweep itself fetched; a failed or refused step fetch leaves it Sweeping, whatever
 //     periodic updates -- older or newer than the request -- are on the ring.
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include <hengyuan/account_refresh.hpp>
 #include <hengyuan/kill_switch.hpp>
@@ -472,9 +473,9 @@ protected:
     ReconcilePollPolicy policy_{};
     std::size_t next_slot_{0};
 
-    void track(const OrderRecord& rec) { ASSERT_TRUE(tracker_.track(InFlightHandle{next_slot_++, 1}, rec, 0)); }
+    void track(const OrderRecord& rec) { ASSERT_TRUE(tracker_.track(InFlightHandle{next_slot_++, 1}, rec, hy::test::reconcile_at_ms(0))); }
     void post(std::uint64_t epoch) { ASSERT_TRUE(requests_.try_push(SweepRequest{epoch})); }
-    void tick(std::int64_t now_ms) { poll_once(tracker_, inbound_, outbound_, port_, policy_, now_ms, OrderRecord::kClockUnset, &job_); }
+    void tick(std::int64_t now_ms) { poll_once(tracker_, inbound_, outbound_, port_, policy_, hy::test::reconcile_at_ms(now_ms), OrderRecord::kClockUnset, &job_); }
     std::vector<ReconcileEvent> drain_events() {
         std::vector<ReconcileEvent> out;
         ReconcileEvent ev{};
@@ -580,7 +581,7 @@ TEST(SweepStepAbsent, AJobWithoutAStepSweepsAsBefore) {
     ScriptedExchange exchange;
     const QueryPort port{&scripted_query, &exchange};
     ASSERT_TRUE(requests.try_push(SweepRequest{1}));
-    poll_once(tracker, inbound, outbound, port, ReconcilePollPolicy{}, 1'000, OrderRecord::kClockUnset, &job);
+    poll_once(tracker, inbound, outbound, port, ReconcilePollPolicy{}, hy::test::reconcile_at_ms(1'000), OrderRecord::kClockUnset, &job);
     ReconcileEvent ev{};
     ASSERT_TRUE(outbound.try_pop(ev));
     EXPECT_EQ(ev.kind, ReconcileEventKind::SweepDone);
@@ -656,7 +657,7 @@ protected:
         drain_reconcile_events(in_flight_, &audit_, events_, now_ms, &truth_, &fill_context_, &publisher_, &sink);
     }
     void reconcile_tick(std::int64_t now_ms) {
-        poll_once(tracker_, inbound_, events_, query_port_, ReconcilePollPolicy{}, now_ms, OrderRecord::kClockUnset, &job_);
+        poll_once(tracker_, inbound_, events_, query_port_, ReconcilePollPolicy{}, hy::test::reconcile_at_ms(now_ms), OrderRecord::kClockUnset, &job_);
     }
     [[nodiscard]] BarrierState state() const { return readiness_.barrier().state(); }
 };

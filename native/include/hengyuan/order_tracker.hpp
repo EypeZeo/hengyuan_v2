@@ -65,6 +65,12 @@
 
 namespace hy {
 
+using ReconcileTime = std::chrono::time_point<std::chrono::steady_clock, std::chrono::milliseconds>;
+
+[[nodiscard]] inline ReconcileTime reconcile_steady_now() noexcept {
+    return std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now());
+}
+
 // Wall clock in milliseconds since the Unix epoch, for poll_once()'s `wall_now_ms` (R-10).
 // system_clock on purpose: the second clock earns its keep by still counting through a host
 // suspend (which stops the monotonic clock) -- and by being able to step, which can only
@@ -224,7 +230,7 @@ public:
     // InFlightRegistry::register_submit_handle()'s own contract deliberately.
     //
     // R-10: an Ambiguous record is stamped here with the moment the reconcile loop first sees
-    // it, on `now_ms` (the monotonic clock this loop runs its backoff on) and `wall_now_ms` (the
+    // it, on `now` (the monotonic clock this loop runs its backoff on) and `wall_now_ms` (the
     // wall clock; OrderRecord::kClockUnset when the caller has none). This is the single choke
     // point every Ambiguous record passes through, on the reconcile thread and in that thread's
     // own clock domain by construction, so the elapsed time the quarantine criterion compares is
@@ -234,7 +240,7 @@ public:
     // back to draining its ring -- one poll_once() iteration, which can include blocking
     // queries (up to max_queries_per_tick times the REST timeout in the worst case). The lag can
     // only postpone escalation, never advance it. An anchor already set on the record is kept.
-    bool track(InFlightHandle handle, const OrderRecord& record, std::int64_t now_ms,
+    bool track(InFlightHandle handle, const OrderRecord& record, ReconcileTime now,
                std::int64_t wall_now_ms = OrderRecord::kClockUnset) noexcept {
         auto coid = record.client_order_id.view();
         if (coid.empty()) return false;
@@ -245,7 +251,7 @@ public:
                 slots_[i].handle = handle;
                 slots_[i].record = record;
                 if (record.state == OrderState::Ambiguous) {
-                    stamp_unknown_since(slots_[i].record, now_ms, wall_now_ms);
+                    stamp_unknown_since(slots_[i].record, now.time_since_epoch().count(), wall_now_ms);
                 }
                 slots_[i].last_poll_ms = kNeverPolled;
                 slots_[i].answered_epoch = 0;
@@ -287,9 +293,9 @@ public:
 
     // Lets poll_once() record that a query was just attempted for a still-
     // tracked (not untracked) order, without exposing a general-purpose mutator.
-    void note_polled(std::string_view coid, std::int64_t now_ms) noexcept {
+    void note_polled(std::string_view coid, ReconcileTime now) noexcept {
         auto idx = find_index(coid);
-        if (idx != kNotFound) slots_[idx].last_poll_ms = now_ms;
+        if (idx != kNotFound) slots_[idx].last_poll_ms = now.time_since_epoch().count();
     }
 
     // --- the barrier sweep's bookkeeping (M3b, barrier_sweep.hpp) ------------------------------------------------
@@ -580,9 +586,9 @@ inline bool next_memory_only(ReconcileEventRing& events, std::int64_t now_ms, Re
 inline bool poll_gate_closed(std::int64_t now_ms, std::int64_t last_poll_ms, std::int64_t normal_gap_ms, bool sweep_due,
                               std::int64_t sweep_started_ms, std::int64_t sweep_retry_ms) noexcept {
     if (last_poll_ms == OrderTracker::kNeverPolled) return false;
-    if (!sweep_due) return now_ms - last_poll_ms < normal_gap_ms;
-    if (last_poll_ms < sweep_started_ms) return false;
-    return now_ms - last_poll_ms < (normal_gap_ms < sweep_retry_ms ? normal_gap_ms : sweep_retry_ms);
+    if (sweep_due && last_poll_ms < sweep_started_ms) return false;
+    const std::int64_t gap_ms = sweep_due && sweep_retry_ms < normal_gap_ms ? sweep_retry_ms : normal_gap_ms;
+    return elapsed_since_ms(now_ms, last_poll_ms) < gap_ms;
 }
 
 }  // namespace detail
@@ -627,7 +633,7 @@ inline bool poll_gate_closed(std::int64_t now_ms, std::int64_t last_poll_ms, std
 // in time, and the hot thread, having popped the marker, finds it. A step that delivers nothing (a refused or failed fetch) does not hold the marker
 // back: the hot thread finds no update for this epoch and the barrier asks again.
 //
-// CLOCKS (R-10): `now_ms` is the monotonic reading the backoff runs on, as before.
+// CLOCKS (R-10): `now` is the steady-clock reading used for polling and backoff.
 // `wall_now_ms` is the wall clock in milliseconds, or OrderRecord::kClockUnset when the
 // caller has none (every pre-R-10 call site keeps compiling and then decides on the
 // monotonic reading alone). The two anchors stamped at first sight of an Ambiguous
@@ -638,14 +644,15 @@ inline void poll_once(OrderTracker& tracker,
                        ReconcileEventRing& outbound,
                        const QueryPort& query_port,
                        const ReconcilePollPolicy& policy,
-                       std::int64_t now_ms,
+                       ReconcileTime now,
                        std::int64_t wall_now_ms = OrderRecord::kClockUnset,
                        SweepJob* sweep = nullptr) noexcept {
+    const std::int64_t now_ms = now.time_since_epoch().count();
     if (sweep != nullptr) (void)sweep->take_requests(now_ms);
 
     ReconcileIngress in{};
     while (inbound.try_pop(in)) {
-        (void)tracker.track(in.handle, in.record, now_ms, wall_now_ms);
+        (void)tracker.track(in.handle, in.record, now, wall_now_ms);
         // A false return (capacity exhausted / duplicate coid) is silently
         // dropped here rather than asserted: ToReconcileRing's capacity already
         // equals kMaxInFlight, matching InFlightRegistry's own cap, so under
@@ -737,7 +744,7 @@ inline void poll_once(OrderTracker& tracker,
             }
         }
 
-        tracker.note_polled(coid, now_ms);
+        tracker.note_polled(coid, now);
         ++queries_this_tick;
 
         QueryResult result = query_port.call(OrderExpectation::from(record));
@@ -830,7 +837,7 @@ inline void poll_once(OrderTracker& tracker,
                 // the live cadence starts from now rather than inheriting an
                 // Ambiguous backoff position.
                 record = resolved;
-                tracker.note_polled(coid, now_ms);
+                tracker.note_polled(coid, now);
                 if (sweep_epoch != 0) tracker.note_answered(coid, sweep_epoch);  // identified, changed, and handed to the hot thread
             }
         } else {

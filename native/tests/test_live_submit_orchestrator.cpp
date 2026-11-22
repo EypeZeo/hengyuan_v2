@@ -1,6 +1,7 @@
 // P2-EXEC-LIVE-01 D12-9: live submit orchestrator integration tests.
 // All gates tested with mock submit port. No real network. No real money.
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include "test_helpers/account_snapshot_fixtures.hpp"
 #include "test_helpers/alloc_probe.hpp"
@@ -1959,7 +1960,7 @@ TEST_F(LiveSubmitDurableIntegrationTest, AReconcileResolutionIsDurableBeforeItsS
     // The real reconcile loop, with an exchange that says the order was cancelled.
     OrderTracker tracker;
     const QueryPort query_port{&cancelled_query, nullptr};
-    poll_once(tracker, to_reconcile, reconcile_events, query_port, ReconcilePollPolicy{}, ctx_.now_ms);
+    poll_once(tracker, to_reconcile, reconcile_events, query_port, ReconcilePollPolicy{}, hy::test::reconcile_at_ms(ctx_.now_ms));
     ASSERT_TRUE(in_flight_.is_in_flight(r1.order.client_order_id.view())) << "found, but not yet drained";
 
     kill_switch_.trigger();  // the next call only drains (and stops at Gate 2)

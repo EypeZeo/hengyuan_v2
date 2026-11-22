@@ -30,6 +30,7 @@
 // Governance: L1, no network/token/order. GTest only.
 
 #include <gtest/gtest.h>
+#include "reconcile_test_clock.hpp"
 
 #include <hengyuan/account_refresh.hpp>
 #include <hengyuan/kill_switch.hpp>
@@ -260,7 +261,7 @@ void run_scenario(bool misbehave, std::uint64_t min_reconciled, Outcome& result)
         while (!stop.load(std::memory_order_acquire)) {
             const std::int64_t now = steady_ms();
             refresher.tick(now);
-            poll_once(tracker, to_reconcile, events, query_port, policy, now, OrderRecord::kClockUnset, &job);
+            poll_once(tracker, to_reconcile, events, query_port, policy, hy::test::reconcile_at_ms(now), OrderRecord::kClockUnset, &job);
             ++ticks;
             std::this_thread::yield();
         }
