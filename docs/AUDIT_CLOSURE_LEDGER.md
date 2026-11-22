@@ -126,7 +126,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P2-002** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-003** | MEDIUM | lib | REMEDIATING | 下单状态转换 | BLOCKED | runtime |
 | **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | fault, runtime, budget |
-| **P2-005** | MEDIUM | lib | REMEDIATING | 订单跟踪器 | BLOCKED | code, fault, test, runtime |
+| **P2-005** | MEDIUM | lib | REMEDIATING | 订单跟踪器 | BLOCKED | runtime |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
 | **P2-007** | MEDIUM | build | PARTIAL | CI 增强 | BLOCKED | code, test |
 | **P2-008** | MEDIUM | lib | PARTIAL | 平台安全测试 | BLOCKED | test, runtime |
@@ -471,15 +471,15 @@ status: REMEDIATING
 task: SAFE-06
 gate: 订单跟踪器
 gate_result: BLOCKED
-open: open:native/include/hengyuan/order_tracker.hpp#"std::int64_t now_ms," open:native/include/hengyuan/order_tracker.hpp#"void note_polled(std::string_view coid, std::int64_t now_ms) noexcept {"
+open: open:native/include/hengyuan/order_tracker.hpp#"inline bool poll_gate_closed(std::int64_t now_ms,"
 refs: code:native/include/hengyuan/order_tracker.hpp#reconcile_wall_now_ms test:native/tests/test_order_tracker.cpp#WallClockSteppingBackwardsNeverPostponesQuarantine
-seg.code: MISSING -- 计时参数仍是普通 int64 毫秒，接口不强制单调时钟；下溢已有哨兵值保护，现有调用者均传单调时钟，缺口是时钟回拨会静默延迟轮询而不是报错（R-10 已为隔离判据加入挂钟，不改变这一点）
+seg.code: PRESENT code:native/include/hengyuan/order_tracker.hpp#ReconcileTime code:native/include/hengyuan/order_tracker.hpp#"void note_polled(std::string_view coid, ReconcileTime now) noexcept {" -- track、note_polled、poll_once 的计时参数改为 steady_clock 毫秒时间点，传入挂钟或裸整数无法编译；poll_gate_closed 用 elapsed_since_ms 计算间隔。类型约束止于 poll_once：内部辅助函数 poll_gate_closed 等仍以 int64 毫秒接收其换算值（R-10 的 wall_now_ms 隔离判据不变）
 seg.contract: PRESENT doc:docs/SPEC_INVARIANTS.md#OrderTracker bp:"任务 SAFE-06" -- 任务已定义单调时钟约束
-seg.fault: MISSING -- 没有对应的 FI 编号
-seg.test: MISSING test:native/tests/test_order_tracker.cpp#WallClockSteppingBackwardsNeverPostponesQuarantine -- 现有用例覆盖隔离判据的挂钟回拨，不覆盖轮询与退避计时的单调性
-seg.runtime: MISSING -- 无 CI run 可引：修复尚未落地
+seg.fault: PRESENT:UT test:native/tests/test_order_tracker.cpp#RetryWaitUsesSteadyTimeAcrossClockReversalAndWallClockSteps test:native/tests/test_order_tracker.cpp#RetryWaitDoesNotOverflowAcrossTimePointExtremes -- 注入时钟回拨与挂钟跳变，以及时间点取极值，核对重试等待不被延后也不溢出
+seg.test: PRESENT test:native/tests/test_order_tracker.cpp#RetryWaitUsesSteadyTimeAcrossClockReversalAndWallClockSteps test:native/tests/test_order_tracker.cpp#RetryWaitDoesNotOverflowAcrossTimePointExtremes -- 轮询与退避计时的单调性与溢出边界
+seg.runtime: MISSING -- 待登记本项合入后的主分支 CI Native 运行结果
 seg.budget: NA -- 类型层面的约束，不增加运行期成本
-closure: SAFE-06 完成：计时接口强制单调时钟类型，单调时钟超时测试通过
+closure: 本项合入后，确认主分支 CI Native 通过并登记运行记录
 ```
 
 ```ledger
