@@ -132,6 +132,62 @@ def test_coverage_shortfall_from_unclosed_bars_surfaced_not_hidden(tmp_path: Pat
     assert report.fetch_coverage_end_utc < _BASE + timedelta(days=10)
 
 
+def test_fetched_head_that_leaves_a_hole_after_the_stored_tail_is_refused_before_any_write(tmp_path: Path) -> None:
+    wh.write_records(tmp_path, [_rec(i) for i in range(5)])  # covered_end_utc = day 5
+    partition = wh.partition_path(tmp_path, _CRYPTO, _BTC, _1D, 2024, 1)
+    original_bytes = partition.read_bytes()
+
+    records = [_rec(i) for i in range(6, 9)]  # day 5 is missing between the tail and the new head
+    with (
+        mock.patch.object(bf, "fetch_binance_ohlcv", return_value=(records, _meta(_BASE + timedelta(days=9)))),
+        mock.patch.object(wh, "write_records") as fake_write,
+        pytest.raises(bf.BackfillContinuityError),
+    ):
+        bf.backfill(tmp_path, _CRYPTO, _BTC, _1D, _BASE, _BASE + timedelta(days=10))
+    fake_write.assert_not_called()
+    assert partition.read_bytes() == original_bytes
+
+
+def test_fetched_head_exactly_at_the_stored_tail_joins_and_reports_contiguous(tmp_path: Path) -> None:
+    wh.write_records(tmp_path, [_rec(i) for i in range(5)])
+    records = [_rec(i) for i in range(5, 8)]
+    with mock.patch.object(bf, "fetch_binance_ohlcv", return_value=(records, _meta(_BASE + timedelta(days=8)))):
+        report = bf.backfill(tmp_path, _CRYPTO, _BTC, _1D, _BASE, _BASE + timedelta(days=10))
+    assert report.is_contiguous is True
+    cov = wh.coverage(tmp_path, _CRYPTO, _BTC, _1D)
+    assert cov is not None and cov.is_contiguous is True and cov.record_count == 8
+
+
+def test_fresh_identity_may_start_later_than_start_utc_and_is_contiguous(tmp_path: Path) -> None:
+    # Nothing is stored, so there is no endpoint to leave a hole against: an exchange that has no data
+    # before the listing date is not a continuity failure.
+    records = [_rec(i) for i in range(3, 6)]
+    with mock.patch.object(bf, "fetch_binance_ohlcv", return_value=(records, _meta(_BASE + timedelta(days=6)))):
+        report = bf.backfill(tmp_path, _CRYPTO, _BTC, _1D, _BASE, _BASE + timedelta(days=10))
+    assert report.is_contiguous is True
+    assert report.fetched_records == 3
+
+
+def test_report_is_not_contiguous_when_the_stored_data_already_had_a_gap(tmp_path: Path) -> None:
+    wh.write_records(tmp_path, [_rec(0), _rec(1), _rec(3), _rec(4)])  # day 2 is missing inside the stored data
+    stored = wh.coverage(tmp_path, _CRYPTO, _BTC, _1D)
+    assert stored is not None and stored.is_contiguous is False
+
+    records = [_rec(5), _rec(6)]
+    with mock.patch.object(bf, "fetch_binance_ohlcv", return_value=(records, _meta(_BASE + timedelta(days=7)))):
+        report = bf.backfill(tmp_path, _CRYPTO, _BTC, _1D, _BASE, _BASE + timedelta(days=10))
+    assert report.is_contiguous is False, "backfill does not repair internal gaps and must not claim it did"
+
+
+def test_already_current_report_carries_the_stored_continuity(tmp_path: Path) -> None:
+    wh.write_records(tmp_path, [_rec(i) for i in range(5)])
+    with mock.patch.object(bf, "fetch_binance_ohlcv") as fake_fetch:
+        report = bf.backfill(tmp_path, _CRYPTO, _BTC, _1D, _BASE, _BASE + timedelta(days=5))
+    assert report.already_current is True
+    assert report.is_contiguous is True
+    fake_fetch.assert_not_called()
+
+
 def test_fetch_exception_propagates_unchanged(tmp_path: Path) -> None:
     from py_core.market_data.binance_public_rest import BinanceRateLimitedError
 

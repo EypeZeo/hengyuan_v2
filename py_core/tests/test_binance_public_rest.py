@@ -198,6 +198,34 @@ def test_stale_cursor_raises_instead_of_looping() -> None:
         fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(5))
 
 
+def test_first_page_that_starts_before_the_request_start_is_rejected_whole() -> None:
+    # P1-005: before the fix a first page whose bars straddle the requested start was accepted
+    # wholesale, so records older than start_time_utc were returned to the caller.
+    rows = _consecutive_rows(_BASE_MS - 2 * _INTERVAL_MS, 5)  # two bars before start, three from it
+    patcher, _ = _patched_opener([_response_json(rows)])
+    with patcher, pytest.raises(BinanceKlineGapError, match="早于请求游标"):
+        fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(5))
+
+
+def test_first_page_starting_exactly_at_the_request_start_is_accepted() -> None:
+    # The boundary of the check above: open_time == cursor is fine, only strictly earlier is refused.
+    rows = _consecutive_rows(_BASE_MS, 3)
+    patcher, _ = _patched_opener([_response_json(rows)])
+    with patcher:
+        records, _meta = fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(3))
+    assert records[0].event_time_utc == _dt(0)
+    assert all(r.event_time_utc >= _dt(0) for r in records)
+
+
+def test_later_page_that_starts_before_its_cursor_is_rejected() -> None:
+    page1 = _consecutive_rows(_BASE_MS, 1000)
+    # page2 re-sends the last bar of page1: it starts one interval before the cursor.
+    page2 = _consecutive_rows(_BASE_MS + 999 * _INTERVAL_MS, 10)
+    patcher, _ = _patched_opener([_response_json(page1), _response_json(page2)])
+    with patcher, pytest.raises(BinanceKlineGapError):
+        fetch_binance_ohlcv("BTCUSDT", _INTERVAL, _dt(0), _dt(0) + timedelta(days=1010))
+
+
 def test_exceeds_max_requests_raises() -> None:
     full_page = _consecutive_rows(_BASE_MS, 1000)
     # Every page is full, so the loop keeps requesting more pages than max_requests allows.
