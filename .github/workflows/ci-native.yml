@@ -147,12 +147,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed ($LASTEXITCODE)" }
           Test-Path "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\include\boost\beast.hpp" | ForEach-Object { if (-not $_) { throw "boost/beast.hpp not found after vcpkg install" } }
 
+      # Diagnostics only: it names the toolchain in the log and must never fail the job (vswhere.exe lives under
+      # Program Files (x86)).
       - name: Show the toolchain
         shell: pwsh
         run: |
           cmake --version
-          & "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property displayName
-          & "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationVersion
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -property displayName
+            & $vswhere -latest -products * -property installationVersion
+          } else {
+            Write-Host "vswhere.exe not found at $vswhere"
+          }
+          exit 0
 
       - name: Configure (MSVC, Release, with demo)
         shell: pwsh
