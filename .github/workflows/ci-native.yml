@@ -115,6 +115,84 @@ jobs:
         working-directory: native/build
         run: ctest --output-on-failure
 
+  # MSVC on Windows (REM-0.1, audit P2-005/P2-008/P2-009): the only job that builds with the compiler the owner
+  # develops with and that runs the Windows-only tests (test_windows_native_io, the lease layer's junction test).
+  # NOT part of `gate` yet: it is reported on its own, and making it a required check is the owner's ruleset call
+  # (docs/REQUIRED_CHECKS_RUNBOOK.md). The repository is public, so standard runner minutes are not billed; the
+  # 2000 min/month note above predates that.
+  windows-msvc:
+    name: "native: windows-msvc"
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # OpenSSL and the Boost headers come from the runner's own vcpkg, in the same static-md triplet the
+      # owner's local MSVC build uses (static libraries, dynamic CRT). Header-only Boost: the project defines
+      # its own Boost::system target. The versions are whatever the runner image's vcpkg baseline gives.
+      - name: Cache vcpkg installed tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\vcpkg\installed
+          key: native-vcpkg-${{ runner.os }}-static-md-openssl-boost-beast-v1
+
+      - name: Install OpenSSL and Boost headers (vcpkg, x64-windows-static-md)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows-static-md boost-asio:x64-windows-static-md boost-beast:x64-windows-static-md
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed ($LASTEXITCODE)" }
+          Test-Path "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md\include\boost\beast.hpp" | ForEach-Object { if (-not $_) { throw "boost/beast.hpp not found after vcpkg install" } }
+
+      - name: Show the toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          & "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property displayName
+          & "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationVersion
+
+      - name: Configure (MSVC, Release, with demo)
+        shell: pwsh
+        run: |
+          $v = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" -replace '\\', '/'
+          cmake -S native -B native/build -A x64 -DCMAKE_BUILD_TYPE=Release -DHY_BUILD_DEMO=ON "-DBoost_INCLUDE_DIR=$v/include" "-DOPENSSL_ROOT_DIR=$v" "-DCMAKE_PREFIX_PATH=$v"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
+
+      - name: Build (/W4 /WX /permissive-)
+        shell: pwsh
+        run: |
+          cmake --build native/build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+
+      - name: Test
+        shell: pwsh
+        working-directory: native/build
+        run: |
+          ctest -C Release --output-on-failure -j4
+          if ($LASTEXITCODE -ne 0) { throw "ctest failed ($LASTEXITCODE)" }
+
+      # gtest reports a test that called GTEST_SKIP() as "Passed" to ctest, so a runner that cannot create a
+      # directory junction would turn the reparse-point tests into silent passes. Run them directly and refuse
+      # any skip.
+      - name: The junction tests ran and were not skipped
+        shell: pwsh
+        working-directory: native/build/Release
+        run: |
+          $runs = @(
+            @('test_windows_native_io.exe', 'OpenDirectory.RejectsDirectoryJunction'),
+            @('test_compaction_lease.exe', 'CandidateLease.AcquireRejectsALinkedCandidateDirectoryAndTouchesNothingBehindIt')
+          )
+          foreach ($r in $runs) {
+            $out = & ".\$($r[0])" "--gtest_filter=$($r[1])" 2>&1 | Out-String
+            Write-Host $out
+            if ($LASTEXITCODE -ne 0) { throw "$($r[1]) failed" }
+            if ($out -match 'SKIPPED') { throw "$($r[1]) was skipped: a junction could not be created on this runner" }
+            if ($out -notmatch '\[  PASSED  \] 1 test') { throw "$($r[1]) did not pass exactly once" }
+          }
+
   # Always runs and is the only check of this workflow meant to be a required status check: it passes only if
   # the path decision succeeded and every guarded job ended exactly as that decision calls for (success when
   # run=true, skipped when run=false). Any other combination, including a failed or cancelled `changes` job,
