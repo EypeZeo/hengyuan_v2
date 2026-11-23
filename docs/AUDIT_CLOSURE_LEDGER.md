@@ -121,7 +121,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P1-002** | HIGH | live | PARTIAL | 订单生命周期 | BLOCKED | runtime, budget |
 | **P1-003** | HIGH | lib | CLOSED | 账户数据解析 | CLEARED | — |
 | **P1-004** | HIGH | lib | PARTIAL | 策略回测准入 | BLOCKED | contract |
-| **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | code, fault, test, runtime, budget |
+| **P1-005** | HIGH | lib | REMEDIATING | 数据质量门禁 | BLOCKED | runtime |
 | **P2-001** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-002** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-003** | MEDIUM | lib | CLOSED | 下单状态转换 | CLEARED | — |
@@ -371,15 +371,14 @@ status: REMEDIATING
 task: SAFE-06
 gate: 数据质量门禁
 gate_result: BLOCKED
-open: open:py_core/market_data/binance_public_rest.py#"if last_accumulated_open_time_ms is not None:" absent:py_core/market_data/binance_public_rest.py#"open_time_ms < start_ms" absent:py_core/market_data/warehouse_backfill.py#is_contiguous
+open: open:docs/AUDIT_CLOSURE_LEDGER.md#"待登记本项合入后的主分支 CI 运行结果（py_core: pytest）"
 refs: code:py_core/market_data/warehouse.py#is_contiguous
-seg.code: MISSING code:py_core/market_data/binance_public_rest.py#BinanceKlineGapError -- 跨页连续性只在已累积过上一页时校验，返回前没有按请求起点过滤，早于游标的首页会被整体接受；BackfillReport 没有连续性字段（覆盖度报告 warehouse.py 已有 is_contiguous）
+seg.code: PRESENT code:py_core/market_data/binance_public_rest.py#"页首 K 线早于请求游标" code:py_core/market_data/warehouse_backfill.py#BackfillContinuityError code:py_core/market_data/warehouse_backfill.py#"is_contiguous: bool" -- 每一页（含首页）的第一根 open_time 不得早于该页请求的游标，否则整页拒绝（BinanceKlineGapError），所以返回的每一根都不早于请求起点；已有覆盖时，首根拉取 bar 必须恰好等于覆盖终点，否则在写入前抛 BackfillContinuityError；BackfillReport 增加 is_contiguous，名称与语义同 warehouse.py 的 Coverage.is_contiguous。新标的（无已存数据）不做衔接断言：交易所可能在上市日之前没有数据，没有已存端点可留洞
 seg.contract: PRESENT bp:"任务 SAFE-06" -- 任务已定义请求窗口与游标语义
-seg.fault: MISSING -- 没有对应的故障注入用例编号；也没有“首页早于游标”的负向测试
-seg.test: MISSING test:py_core/tests/test_binance_public_rest.py#test_gap_between_pages_raises_gap_error test:py_core/tests/test_binance_public_rest.py#test_pagination_advances_cursor_and_stitches_pages -- 现有测试覆盖页间与页内缺口，不覆盖起点之前的页
-seg.runtime: MISSING -- 无 CI run 可引：修复尚未落地
-seg.budget: MISSING -- 未测量
-closure: SAFE-06 完成：首页按起点过滤并校验、回填报告带连续性字段、请求窗口与游标单测通过
+seg.fault: PRESENT:UT test:py_core/tests/test_binance_public_rest.py#test_first_page_that_starts_before_the_request_start_is_rejected_whole test:py_core/tests/test_warehouse_backfill.py#test_fetched_head_that_leaves_a_hole_after_the_stored_tail_is_refused_before_any_write -- 注入起点之前的首页和存量尾部之后留洞的拉取头，核对整页拒绝、写入前拒绝且磁盘不变；5 个变异体全部被杀死
+seg.test: PRESENT test:py_core/tests/test_binance_public_rest.py#test_first_page_starting_exactly_at_the_request_start_is_accepted test:py_core/tests/test_binance_public_rest.py#test_later_page_that_starts_before_its_cursor_is_rejected test:py_core/tests/test_warehouse_backfill.py#test_fresh_identity_may_start_later_than_start_utc_and_is_contiguous test:py_core/tests/test_warehouse_backfill.py#test_report_is_not_contiguous_when_the_stored_data_already_had_a_gap test:py_core/tests/test_market_data_cli.py#test_cmd_backfill_prints_continuity_and_reports_a_hole_as_an_error -- 起点边界（等于通过、早于拒绝）、新标的、存量已有缺口时报告为否、命令行输出与退出码
+seg.runtime: MISSING -- 待登记本项合入后的主分支 CI 运行结果（py_core: pytest）
+seg.budget: NA -- 每页一次整数比较，回填一次时间戳比较，不增加可测的运行期成本
 ```
 
 ```ledger
