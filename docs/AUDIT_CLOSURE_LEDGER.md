@@ -126,7 +126,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P2-002** | MEDIUM | lib | CLOSED | REST 通信门禁 | CLEARED | — |
 | **P2-003** | MEDIUM | lib | CLOSED | 下单状态转换 | CLEARED | — |
 | **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | fault, runtime, budget |
-| **P2-005** | MEDIUM | lib | REMEDIATING | 订单跟踪器 | BLOCKED | runtime |
+| **P2-005** | MEDIUM | lib | CLOSED | 订单跟踪器 | CLEARED | — |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
 | **P2-007** | MEDIUM | build | PARTIAL | CI 增强 | BLOCKED | code, test |
 | **P2-008** | MEDIUM | lib | PARTIAL | 平台安全测试 | BLOCKED | test, runtime |
@@ -154,7 +154,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | REST 通信门禁 | CLEARED | — |
 | 下单状态转换 | CLEARED | — |
 | 实盘发单风控 | BLOCKED | P2-004 |
-| 订单跟踪器 | BLOCKED | P2-005 |
+| 订单跟踪器 | CLEARED | — |
 | 鲁棒性优化 | DEFERRED | P2-006 |
 | CI 增强 | BLOCKED | P2-007 |
 | 平台安全测试 | BLOCKED | P2-008 |
@@ -163,7 +163,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 5，DEFERRED 3，PARTIAL 4，CLOSED 14，合计 26。
+状态计数：REMEDIATING 4，DEFERRED 3，PARTIAL 4，CLOSED 15，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -466,19 +466,17 @@ legacy: P2-005
 title: 订单跟踪器的轮询与超时计时接口不强制单调时钟
 severity: MEDIUM
 kind: lib
-status: REMEDIATING
+status: CLOSED
 task: SAFE-06
 gate: 订单跟踪器
-gate_result: BLOCKED
-open: open:native/include/hengyuan/order_tracker.hpp#"inline bool poll_gate_closed(std::int64_t now_ms,"
-refs: code:native/include/hengyuan/order_tracker.hpp#reconcile_wall_now_ms test:native/tests/test_order_tracker.cpp#WallClockSteppingBackwardsNeverPostponesQuarantine
+gate_result: CLEARED
+refs: pr:300@03004d8 code:native/include/hengyuan/order_tracker.hpp#reconcile_wall_now_ms test:native/tests/test_order_tracker.cpp#WallClockSteppingBackwardsNeverPostponesQuarantine
 seg.code: PRESENT code:native/include/hengyuan/order_tracker.hpp#ReconcileTime code:native/include/hengyuan/order_tracker.hpp#"void note_polled(std::string_view coid, ReconcileTime now) noexcept {" -- track、note_polled、poll_once 的计时参数改为 steady_clock 毫秒时间点，传入挂钟或裸整数无法编译；poll_gate_closed 用 elapsed_since_ms 计算间隔。类型约束止于 poll_once：内部辅助函数 poll_gate_closed 等仍以 int64 毫秒接收其换算值（R-10 的 wall_now_ms 隔离判据不变）
 seg.contract: PRESENT doc:docs/SPEC_INVARIANTS.md#OrderTracker bp:"任务 SAFE-06" -- 任务已定义单调时钟约束
 seg.fault: PRESENT:UT test:native/tests/test_order_tracker.cpp#RetryWaitUsesSteadyTimeAcrossClockReversalAndWallClockSteps test:native/tests/test_order_tracker.cpp#RetryWaitDoesNotOverflowAcrossTimePointExtremes -- 注入时钟回拨与挂钟跳变，以及时间点取极值，核对重试等待不被延后也不溢出
 seg.test: PRESENT test:native/tests/test_order_tracker.cpp#RetryWaitUsesSteadyTimeAcrossClockReversalAndWallClockSteps test:native/tests/test_order_tracker.cpp#RetryWaitDoesNotOverflowAcrossTimePointExtremes -- 轮询与退避计时的单调性与溢出边界
-seg.runtime: MISSING -- 待登记本项合入后的主分支 CI Native 运行结果
+seg.runtime: PRESENT run:"45030024077@03004d8b4/ci-native.yml[native-build-test]" -- 主分支合并提交上的 GCC-14 Release 构建及完整回归通过。
 seg.budget: NA -- 类型层面的约束，不增加运行期成本
-closure: 本项合入后，确认主分支 CI Native 通过并登记运行记录
 ```
 
 ```ledger
