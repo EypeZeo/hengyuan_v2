@@ -41,6 +41,16 @@ class BackfillPrefixNotSupportedError(BackfillError):
     """
 
 
+class BackfillContinuityError(BackfillError):
+    """The first fetched bar does not join the existing coverage end exactly.
+
+    Raised BEFORE anything is written: appending the fetched bars would leave a hole between
+    the stored tail and the new head, and the stored data would silently stop being
+    contiguous (audit P1-005). backfill() does not repair internal gaps (scan_gaps() finds
+    them), so it refuses instead of papering over one.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class BackfillReport:
     already_current: bool
@@ -48,6 +58,9 @@ class BackfillReport:
     fetch_coverage_end_utc: datetime | None
     write_report: wh.WriteReport
     resumed_from: datetime
+    # Same name and meaning as wh.Coverage.is_contiguous: the stored coverage of this identity
+    # has no gap after this call. False when the data stored before the call already had one.
+    is_contiguous: bool
 
 
 def backfill(
@@ -77,8 +90,10 @@ def backfill(
     with resume >= end_utc would hit its own start<end ValueError -- being already caught up
     is a legitimate idempotent outcome, not a failure).
 
-    Otherwise calls fetch_binance_ohlcv() for [resume, end_utc) and writes the result via
-    write_records(). Exceptions from either (BinancePublicRestError,
+    Otherwise calls fetch_binance_ohlcv() for [resume, end_utc). If coverage already exists, the
+    first fetched bar must equal the resume point exactly, else BackfillContinuityError is raised
+    before anything is written. The result is written via write_records(); the report's
+    is_contiguous says whether the stored coverage has no gap. Exceptions from either (BinancePublicRestError,
     ManualOhlcvValidationError, any Warehouse*Error) propagate unchanged -- this function
     does not wrap or swallow them.
     """
@@ -100,6 +115,9 @@ def backfill(
             )
         resume_from = existing.covered_end_utc
 
+    # A fresh identity has nothing stored, hence nothing to be non-contiguous with.
+    stored_contiguous = True if existing is None else existing.is_contiguous
+
     if resume_from >= end_utc:
         return BackfillReport(
             already_current=True,
@@ -107,6 +125,7 @@ def backfill(
             fetch_coverage_end_utc=None,
             write_report=wh.WriteReport(rows_written=0, rows_skipped_duplicate=0, partitions_touched=()),
             resumed_from=resume_from,
+            is_contiguous=stored_contiguous,
         )
 
     records, meta = fetch_binance_ohlcv(
@@ -117,6 +136,14 @@ def backfill(
         market=market,
         max_requests=max_requests,
     )
+    # Strict join with the stored tail. Only when coverage already exists: for a brand-new identity
+    # the exchange may legitimately start later than start_utc (e.g. before the listing date), and
+    # there is no stored endpoint to leave a hole against.
+    if existing is not None and records and records[0].event_time_utc != resume_from:
+        raise BackfillContinuityError(
+            f"first fetched bar {records[0].event_time_utc.isoformat()} does not join the existing "
+            f"coverage end {resume_from.isoformat()} -- nothing was written"
+        )
     write_report = wh.write_records(root, records)
 
     return BackfillReport(
@@ -125,4 +152,5 @@ def backfill(
         fetch_coverage_end_utc=meta.coverage_end_utc,
         write_report=write_report,
         resumed_from=resume_from,
+        is_contiguous=stored_contiguous,
     )

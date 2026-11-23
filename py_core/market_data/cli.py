@@ -283,6 +283,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 
     if report.already_current:
         print(f"[INFO] 已是最新（resume 点 {report.resumed_from.isoformat()} >= 请求终点），未发起网络请求")
+        print(f"[INFO] is_contiguous: {report.is_contiguous}")
         print(NON_AUTH_NOTICE)
         return 0
 
@@ -292,6 +293,12 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         f"[INFO] 写入 {report.write_report.rows_written} 条，跳过 "
         f"{report.write_report.rows_skipped_duplicate} 条重复"
     )
+    print(f"[INFO] is_contiguous: {report.is_contiguous}")
+    if not report.is_contiguous:
+        print(
+            "[WARNING] 该标的的已存数据内部本来就有缺口（回填不修复内部缺口，请用 scan_gaps 定位）。",
+            file=sys.stderr,
+        )
     if report.fetch_coverage_end_utc is not None and report.fetch_coverage_end_utc < end:
         print(
             f"[WARNING] 实际覆盖到 {report.fetch_coverage_end_utc.isoformat()}，早于请求的终点 "

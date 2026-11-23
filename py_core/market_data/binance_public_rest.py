@@ -383,6 +383,15 @@ def fetch_binance_ohlcv(
             open_time_ms, _close_time_ms = _validate_kline_row_shape(row, interval_ms)
             page_open_times.append(open_time_ms)
 
+        # 起点校验（对每一页，含首页）：第一根 open_time 不得早于本页请求的游标。此前只有“已累积过
+        # 上一页”时才做跨页校验，单页请求拿到早于请求起点的数据会被整体接受（审计 P1-005）。游标从
+        # start_ms 起只增不减，所以逐页满足本条件即保证返回的每一根都不早于请求起点。
+        if page_open_times[0] < cursor_ms:
+            raise BinanceKlineGapError(
+                f"页首 K 线早于请求游标: open_time={page_open_times[0]} < cursor={cursor_ms}"
+                f"（请求起点 {start_ms}），拒绝整页，不返回任何早于请求窗口的数据"
+            )
+
         # 页内连续性：相邻 open_time 必须恰好差一个 interval_ms。
         for prev_ot, next_ot in itertools.pairwise(page_open_times):
             if next_ot - prev_ot != interval_ms:

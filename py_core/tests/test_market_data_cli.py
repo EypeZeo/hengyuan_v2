@@ -386,6 +386,30 @@ def test_cmd_backfill_fresh_identity_success(tmp_path: Path) -> None:
     assert cov.record_count == 5
 
 
+def test_cmd_backfill_prints_continuity_and_reports_a_hole_as_an_error(tmp_path: Path, capsys: Any) -> None:
+    meta = _meta(coverage_end_utc=_BASE_DT + timedelta(days=5))
+    with mock.patch(
+        "py_core.market_data.warehouse_backfill.fetch_binance_ohlcv",
+        return_value=([_rec(i) for i in range(5)], meta),
+    ):
+        assert cmd_backfill(_wh_args(tmp_path, "backfill", end="2024-01-10")) == 0
+    assert "is_contiguous: True" in capsys.readouterr().out
+
+    # a second run whose fetched head skips day 5: refused, exit code 1, the stored data untouched
+    with mock.patch(
+        "py_core.market_data.warehouse_backfill.fetch_binance_ohlcv",
+        return_value=([_rec(i) for i in range(6, 8)], meta),
+    ):
+        rc = cmd_backfill(_wh_args(tmp_path, "backfill", end="2024-01-10"))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "does not join" in captured.err
+    cov = wh.coverage(
+        tmp_path / "wh", ManualMarket.CRYPTO_SPOT, CanonicalMarketSymbol("BTCUSDT"), OhlcvTimeframe("1d")
+    )
+    assert cov is not None and cov.record_count == 5
+
+
 def test_cmd_backfill_already_current_zero_network_calls(tmp_path: Path, capsys: Any) -> None:
     records = [_rec(i) for i in range(5)]
     meta = _meta(coverage_end_utc=_BASE_DT + timedelta(days=5))
