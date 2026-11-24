@@ -163,7 +163,8 @@ wsl -d Ubuntu-24.04 -- bash -lc "bash ~/repos/hengyuan_v2/tools/wsl_verify.sh al
 and turns repeat edit/build/verify loops into mostly cache hits.
 
 **WSL2 instability → auto-fallback to `tokyo-vps`, no need to ask each time (owner decision,
-2026-09-04):** WSL2 on this machine periodically wedges (`Wsl/Service/E_UNEXPECTED`, sometimes
+2026-09-04; host order since superseded for compilation by "Remote build hosts" below —
+`tokyo-build` first, then WSL2, then `tokyo-vps`):** WSL2 on this machine periodically wedges (`Wsl/Service/E_UNEXPECTED`, sometimes
 self-inflicted by overlapping `wsl.exe` invocations from the same session). If a WSL2
 validation step (any `wsl_verify.sh` tier, or the one-time setup) fails, hangs, or times out
 **twice in a row**, stop retrying WSL2 for that validation and continue from the `tokyo-vps`
@@ -188,6 +189,40 @@ region. `native/CMakeLists.txt` works around this via `CROSSCOMPILING_EMULATOR` 
 invocation, including CMake's own build-time `gtest_discover_tests` enumeration, with
 `setarch <arch> -R`); `tools/wsl_verify.sh` applies the same wrapper to the TSan control binary,
 which isn't ctest-registered. Harmless on runners that don't need it (plain Ubuntu CI).
+
+## Remote build hosts (tokyo-build / WSL2 / tokyo-vps)
+
+Owner decision, 2026-11-23. Host order for Linux-side **compilation**: `tokyo-build` > local
+WSL2 > `tokyo-vps`. This replaces the "WSL2 first" ordering above; the WSL2 rule "two failures
+in a row → stop retrying WSL2" stays and now applies after `tokyo-build` is unavailable. MSVC
+builds stay local. Validation tiers (`none`/`address`/`thread`/`all`) and run frequency are
+unchanged.
+
+- **`tokyo-build`**: Tencent Cloud, 8 vCPU / 32 GB, Ubuntu 24.04, pay-as-you-go, normally
+  powered **off** (~¥2/h while on). Reach it with `ssh tokyo-build` (user `ubuntu`, key-only);
+  the alias and key live in the owner's `~/.ssh` — never put IPs or key material in this repo.
+- **Build only.** Tencent Cloud prohibits using its services for any cryptocurrency-related
+  activity, direct or indirect (trading, settlement, ...). On `tokyo-build` never run ctest,
+  test binaries, harnesses or sanitizer runs; never connect to any exchange or market-data/chain
+  endpoint (testnet and public data included); never fetch or store market/backtest data; never
+  place API keys, key files or credential configs there. Verification *execution* runs on
+  `tokyo-vps` (or local WSL2, which is not Tencent Cloud).
+- **Fixed tree**: `~/repos/hengyuan_v2` (not a git repo) with persistent build dirs
+  (`native/build-linux-{none,asan,tsan}`); never a per-task directory (it discards FetchContent
+  and ccache). Sync = `git archive HEAD` → one scp → temp dir, strip CR → `rsync -rc --delete
+  --exclude 'native/build-*'` (`-c` keeps mtimes so ninja stays incremental). Parallelism:
+  `-j8` none, `-j6` address/thread (an ASan translation unit can need ~3 GB; drop `-j` on
+  `cc1plus Killed`); `tokyo-vps` stays `-j1`.
+- Before running a binary built on `tokyo-build` on another host, check that OS and runtime
+  libs (libasan/libtsan) match; otherwise rebuild incrementally there.
+- **Power is the owner's action.** Agents never run `poweroff`/`shutdown`/`reboot` on it. Before
+  the first Linux compile of a session, ask the owner to power it on; after a round, if no
+  compile is expected in the next few tasks or ~1 hour, tell the owner it can be shut down
+  (console "关机不收费"; an in-OS or default shutdown keeps billing). If it is unreachable after
+  3 probes ~15 s apart, fall back to WSL2, then `tokyo-vps`. A small one-off incremental
+  compile while it is off does not warrant asking for power-on: use WSL2, then `tokyo-vps`.
+- Infrastructure changes (security group, EIP, billing, sshd, system upgrades) only on explicit
+  owner request. Say in the validation summary which host was actually used.
 
 ## py_core (research stack)
 
