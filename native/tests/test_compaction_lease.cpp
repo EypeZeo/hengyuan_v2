@@ -13,6 +13,7 @@
 // extension lands).
 #include <gtest/gtest.h>
 #include <hengyuan/compaction_lease.hpp>
+#include "test_helpers/windows_junction.hpp"
 
 #include <array>
 #include <chrono>
@@ -181,6 +182,40 @@ TEST(CandidateLease, AcquireFailsOnMissingDirectory) {
     auto dir = make_temp_candidate_dir("missing") / "does_not_exist";
     CandidateLease lease(dir);
     EXPECT_EQ(lease.acquire(), LeaseAcquireStatus::DirectoryMissing);
+}
+
+// The candidate directory is a LINK (an NTFS directory junction on Windows, a symlink elsewhere): the lease must refuse
+// it instead of following it, and must not create its lock file in the directory the link points at. This is the
+// lease layer's own end-to-end check of the rule windows_native_io.hpp's open_directory() enforces at the primitive
+// layer (test_windows_native_io.cpp, OpenDirectory.RejectsDirectoryJunction) and compaction_lease.hpp's POSIX branch
+// enforces with O_NOFOLLOW. Creating the link is ASSERTed, not skipped: a skipped test would read as a pass on a CI
+// runner that cannot create one.
+TEST(CandidateLease, AcquireRejectsALinkedCandidateDirectoryAndTouchesNothingBehindIt) {
+    const auto target = make_temp_candidate_dir("link_target");
+    const auto link = target.parent_path() / (target.filename().string() + "_link");
+
+#ifdef _WIN32
+    ASSERT_TRUE(hy::test_helpers::create_directory_junction(link, target));
+#else
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(target, link, ec);
+    ASSERT_FALSE(ec) << ec.message();
+#endif
+
+    {
+        CandidateLease lease(link);
+        EXPECT_EQ(lease.acquire(), LeaseAcquireStatus::RejectedSymlinkOrReparse);
+        EXPECT_FALSE(lease.held());
+    }
+    EXPECT_TRUE(std::filesystem::is_empty(target)) << "the lease wrote into the directory the link points at";
+
+    // Remove the link's own entry without touching (or recursing into) its target.
+#ifdef _WIN32
+    ::RemoveDirectoryW(link.wstring().c_str());
+#else
+    std::filesystem::remove(link);
+#endif
+    std::filesystem::remove_all(target);
 }
 
 TEST(CandidateLease, SecondInstanceCannotAcquireSameDirectory) {
