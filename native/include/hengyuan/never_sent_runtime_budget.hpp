@@ -95,6 +95,19 @@ private:
             case Reason::DuplicateInFlight: return static_cast<std::size_t>(IntentOrphanReason::DuplicateInFlight);
             case Reason::InFlightCapacityExceeded:
                 return static_cast<std::size_t>(IntentOrphanReason::InFlightCapacityExceeded);
+            case Reason::AccountChanged:
+            case Reason::AccountPeriodChanged:
+            case Reason::AccountPeriodRefused:
+            case Reason::AuthorizationExpired:
+            case Reason::ConfirmationExpired:
+            case Reason::PreconditionsChanged:
+            case Reason::ReadinessRevoked:
+            case Reason::ReservationLost:
+            case Reason::RestrictedExitRefused:
+            case Reason::SlotOwnershipLost:
+            case Reason::TradeScopeBudgetExhausted:
+            case Reason::TradeScopeInvalidated:
+            case Reason::TradeScopeRefused:
             default: return static_cast<std::size_t>(IntentOrphanReason::Unknown);
         }
     }

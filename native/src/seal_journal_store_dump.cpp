@@ -176,6 +176,8 @@ const char* decode_failure_name(SealJournalCommitTombstoneDecodeStatus st) noexc
         case SealJournalCommitTombstoneDecodeStatus::UnknownVersion: return "unknown version";
         case SealJournalCommitTombstoneDecodeStatus::TotalBytesInvalid: return "total_bytes invalid";
         case SealJournalCommitTombstoneDecodeStatus::MalformedField: return "malformed field";
+        case SealJournalCommitTombstoneDecodeStatus::Ok:
+        case SealJournalCommitTombstoneDecodeStatus::ChecksumMismatch:
         default: return "decode failed";
     }
 }

@@ -97,6 +97,10 @@ ClosureAppendResult append_to_real_sink_with_fault(void* user_data, const never_
         case NeverSentAppendStatus::NotTradingOpen:
             result.status = ClosureAppendStatus::NotEnabled;
             break;
+        case NeverSentAppendStatus::NotAttempted:
+        case NeverSentAppendStatus::Refused:
+        case NeverSentAppendStatus::EmptyClientOrderId:
+        case NeverSentAppendStatus::SinkFenced:
         default:
             result.status = ClosureAppendStatus::Refused;
             break;

@@ -363,6 +363,9 @@ private:
             case PrivateRestError::InvalidConfig: return "invalid REST configuration";
             case PrivateRestError::ClockNotFresh: return "signing clock is not fresh";
             case PrivateRestError::SigningFailed: return "request signing failed";
+            case PrivateRestError::None:
+            case PrivateRestError::MalformedResponse:
+            case PrivateRestError::CapacityExceeded:
             default: return "REST error " + std::to_string(static_cast<int>(error));
         }
     }

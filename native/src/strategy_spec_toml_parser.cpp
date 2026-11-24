@@ -29,6 +29,21 @@ constexpr bool is_window_op(SpecOp op) noexcept {
         case SpecOp::Roc:
         case SpecOp::Rsi:
             return true;
+        case SpecOp::Add:
+        case SpecOp::Sub:
+        case SpecOp::Mul:
+        case SpecOp::Div:
+        case SpecOp::Gt:
+        case SpecOp::Lt:
+        case SpecOp::Ge:
+        case SpecOp::Le:
+        case SpecOp::And:
+        case SpecOp::Or:
+        case SpecOp::Not:
+        case SpecOp::IfThenElse:
+        case SpecOp::Lag:
+        case SpecOp::CrossesAbove:
+        case SpecOp::CrossesBelow:
         default:
             return false;
     }

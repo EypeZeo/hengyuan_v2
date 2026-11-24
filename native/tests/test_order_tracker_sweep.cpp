@@ -56,6 +56,14 @@ OrderRecord make_record(const char* coid, OrderState target, std::int64_t qty = 
             rec.transition_to(OrderState::Ambiguous);
             rec.transition_to(OrderState::EscalatedToOperator);
             break;
+        case OrderState::Intent:
+        case OrderState::Submitting:
+        case OrderState::Filled:
+        case OrderState::Cancelled:
+        case OrderState::Rejected:
+        case OrderState::Expired:
+        case OrderState::Reconciled:
+        case OrderState::NeverSent:
         default:
             break;
     }

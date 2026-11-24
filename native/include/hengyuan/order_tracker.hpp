@@ -489,6 +489,15 @@ inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
             return to == OrderState::Accepted || to == OrderState::PartialFill ||
                    to == OrderState::Filled || to == OrderState::Cancelled ||
                    to == OrderState::Expired;
+        case OrderState::Intent:
+        case OrderState::Submitting:
+        case OrderState::Filled:
+        case OrderState::Cancelled:
+        case OrderState::Rejected:
+        case OrderState::Expired:
+        case OrderState::Reconciled:
+        case OrderState::NeverSent:
+        case OrderState::EscalatedToOperator:
         default:
             return false;
     }

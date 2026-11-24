@@ -2,6 +2,11 @@
 # Usage: hengyuan_set_warnings(<target>)
 #        hengyuan_allow_third_party_tsan_fences(<target>)   [Asio consumers only]
 
+# Enum exhaustiveness: a switch over an enum names every enumerator, so adding one is a compile error at each
+# switch that would otherwise silently route it to a `default:` branch. GCC/Clang -Wswitch-enum and MSVC C4061
+# (switch has a default:) / C4062 (it has none) both fire on a missing enumerator; the latter two are off by
+# default even at /W4, hence the explicit /w4. A `default:` stays legal and stays the runtime fallback for values
+# outside the enum (wire data cast into an enum class).
 function(hengyuan_set_warnings target)
     target_compile_options(${target} PRIVATE
         $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:
@@ -10,10 +15,12 @@ function(hengyuan_set_warnings target)
             -Wnon-virtual-dtor -Wcast-align
             -Woverloaded-virtual
             -Wdouble-promotion -Wformat=2
+            -Wswitch-enum
         >
         $<$<CXX_COMPILER_ID:MSVC>:
             /W4 /WX /permissive- /utf-8 /bigobj
             /wd4324
+            /w44061 /w44062
         >
     )
 endfunction()

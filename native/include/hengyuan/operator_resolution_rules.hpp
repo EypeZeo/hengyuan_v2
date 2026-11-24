@@ -96,6 +96,16 @@ inline ResolutionCheck check_order_resolvable(const ResolutionTarget& target) no
                 return ResolutionCheck::NotInAResolvableState;
             }
             break;
+        case OrderState::Intent:
+        case OrderState::Accepted:
+        case OrderState::PartialFill:
+        case OrderState::Filled:
+        case OrderState::CancelRequested:
+        case OrderState::Cancelled:
+        case OrderState::Rejected:
+        case OrderState::Expired:
+        case OrderState::Reconciled:
+        case OrderState::NeverSent:
         default:
             return ResolutionCheck::NotInAResolvableState;
     }

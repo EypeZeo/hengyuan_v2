@@ -474,7 +474,9 @@ private:
                 case KlineParseResult::Unclosed:
                     ++stats_.unclosed_skipped;
                     break;
-                default:
+                case KlineParseResult::MalformedJson:
+                case KlineParseResult::MissingFields:
+                default:  // the listed failures, and any value outside the enum
                     ++stats_.parse_failed;
                     break;
             }

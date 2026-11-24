@@ -893,6 +893,18 @@ TEST(AccountSnapshotFuzz, FI033MalformedAccountDataNeverBecomesAMalformedSnapsho
                 ++capacity;
                 expect_sentinel_untouched(out, 2);
                 break;
+            case PrivateRestError::Resolve:
+            case PrivateRestError::Connect:
+            case PrivateRestError::TlsHandshake:
+            case PrivateRestError::Write:
+            case PrivateRestError::Read:
+            case PrivateRestError::HttpStatus:
+            case PrivateRestError::ClockSkewTooLarge:
+            case PrivateRestError::RateLimitExhausted:
+            case PrivateRestError::CancelNotAuthorized:
+            case PrivateRestError::InvalidConfig:
+            case PrivateRestError::ClockNotFresh:
+            case PrivateRestError::SigningFailed:
             default:
                 FAIL() << "unexpected error " << static_cast<int>(err) << " for: " << body;
         }

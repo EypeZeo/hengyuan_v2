@@ -503,7 +503,10 @@ private:
                 return;
             case WsApiParseResult::FrameTooLarge:
                 return fail(beast::error_code{}, "frame_too_large");  // cannot happen under the read cap; defensive
-            default:  // malformed JSON, an unrecognized frame, an event without a type
+            case WsApiParseResult::MalformedJson:
+            case WsApiParseResult::UnrecognizedFrame:
+            case WsApiParseResult::MissingEventType:
+            default:  // malformed JSON, an unrecognized frame, an event without a type, or a value outside the enum
                 {
                     std::lock_guard<std::mutex> lock(stats_mutex_);
                     ++stats_.parse_failed;

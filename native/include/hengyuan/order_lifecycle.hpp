@@ -225,6 +225,14 @@ constexpr TransitionResult validate_transition(OrderState from, OrderState to) n
                 to == OrderState::Expired)
                 return TransitionResult::Ok;
             break;
+        // Terminal or operator-owned states have no outgoing edge in this table.
+        case OrderState::Filled:
+        case OrderState::Cancelled:
+        case OrderState::Rejected:
+        case OrderState::Expired:
+        case OrderState::Reconciled:
+        case OrderState::NeverSent:
+        case OrderState::EscalatedToOperator:
         default:
             break;
     }

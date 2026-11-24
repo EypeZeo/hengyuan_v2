@@ -360,6 +360,9 @@ struct Rig {
             case Invalid::KlineNotSynced: seen.kline_not_synced = true; break;
             case Invalid::DepthNotTracking: seen.depth_not_tracking = true; break;
             case Invalid::DepthStale: seen.depth_stale = true; break;
+            case Invalid::None:
+            case Invalid::KlineFeedGaveUp:
+            case Invalid::DepthFeedGaveUp:
             default: break;
         }
     }
