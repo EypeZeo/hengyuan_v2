@@ -84,6 +84,15 @@ inline ResolutionCheck check_order_resolvable(const ResolutionTarget& target) no
     // 1. The order is in a state nothing automatic can finish. Submitting and Ambiguous already reach Rejected through the
     //    shared state machine; EscalatedToOperator only through the operator edge, which validate_transition() deliberately
     //    does not have.
+    // Enum exhaustiveness is off for this one switch on purpose: the default refuses, so a new OrderState fails closed, and
+    // test_never_sent_guard.cpp pins that this live-path file does not name OrderState::NeverSent.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4061 4062)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+#endif
     switch (target.state) {
         case OrderState::Submitting:
         case OrderState::Ambiguous:
@@ -96,19 +105,14 @@ inline ResolutionCheck check_order_resolvable(const ResolutionTarget& target) no
                 return ResolutionCheck::NotInAResolvableState;
             }
             break;
-        case OrderState::Intent:
-        case OrderState::Accepted:
-        case OrderState::PartialFill:
-        case OrderState::Filled:
-        case OrderState::CancelRequested:
-        case OrderState::Cancelled:
-        case OrderState::Rejected:
-        case OrderState::Expired:
-        case OrderState::Reconciled:
-        case OrderState::NeverSent:
         default:
             return ResolutionCheck::NotInAResolvableState;
     }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     // 6. The order must never have shown a sign of existing on the exchange: no exchange id, no fill (the average price is
     //    only ever recorded together with a fill, so it needs no check of its own).
     if (target.exchange_order_id != 0 || target.filled_qty_ticks != 0) return ResolutionCheck::OrderShowsExistence;

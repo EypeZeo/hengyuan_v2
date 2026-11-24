@@ -213,8 +213,8 @@ TEST(NeverSentGuard, TheNeverSentEventIsNamedOnlyByItsDefinitionAndReviewedReade
 
 TEST(NeverSentGuard, TheNeverSentStateIsNamedOnlyByItsModelAndReviewedReaders) {
     expect_named_only_in("NeverSent",
-                         {{kLifecycle, 6, "the enumerator, order_state_name(), is_terminal(), is_resolved() and the two edges "
-                                          "of validate_transition()"},
+                         {{kLifecycle, 7, "the enumerator, order_state_name(), is_terminal(), is_resolved(), the two edges of "
+                                          "validate_transition(), and its switch listing the states with no outgoing edge"},
                           {kCodec, 1, "is_legal_order_state_for_version(): the v6 bound"},
                           {kRules, 4, "check_order_closable() asks the state machine about the edge; pairing_holds() and "
                                       "check_closing_frame() read the frame's state; class_a_closure_of() sets it"},
