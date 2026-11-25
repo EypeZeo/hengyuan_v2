@@ -129,7 +129,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P2-005** | MEDIUM | lib | CLOSED | 订单跟踪器 | CLEARED | — |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
 | **P2-007** | MEDIUM | build | PARTIAL | CI 增强 | BLOCKED | code, test |
-| **P2-008** | MEDIUM | lib | PARTIAL | 平台安全测试 | BLOCKED | runtime |
+| **P2-008** | MEDIUM | lib | CLOSED | 平台安全测试 | CLEARED | — |
 | **P2-009** | MEDIUM | build | REMEDIATING | 全项目研发准入 | BLOCKED | code, test, runtime |
 | **P3-001** | LOW | lib | DEFERRED | 日志健壮性 | DEFERRED | code, contract, fault, test, runtime, budget |
 | **P3-002** | LOW | build | DEFERRED | 供应链安全 | DEFERRED | code, contract, test, runtime |
@@ -157,13 +157,13 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 订单跟踪器 | CLEARED | — |
 | 鲁棒性优化 | DEFERRED | P2-006 |
 | CI 增强 | BLOCKED | P2-007 |
-| 平台安全测试 | BLOCKED | P2-008 |
+| 平台安全测试 | CLEARED | — |
 | 全项目研发准入 | BLOCKED | P2-009 |
 | 日志健壮性 | DEFERRED | P3-001 |
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 3，DEFERRED 3，PARTIAL 4，CLOSED 16，合计 26。
+状态计数：REMEDIATING 3，DEFERRED 3，PARTIAL 3，CLOSED 17，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -526,20 +526,18 @@ legacy: P2-008
 title: Windows 平台缺少目录联接与重解析点防穿透专项测试
 severity: MEDIUM
 kind: lib
-status: PARTIAL
+status: CLOSED
+task: REM-0.1
 gate: 平台安全测试
-gate_result: BLOCKED
+gate_result: CLEARED
 bkl: BKL-003
-trigger: 开展 Windows 平台生产部署合规专项测试时激活
-open: open:docs/AUDIT_CLOSURE_LEDGER.md#"待登记 native: windows-msvc 作业在主分支上的成功运行"
-refs: code:native/include/hengyuan/windows_native_io.hpp#open_directory code:native/include/hengyuan/compaction_lease.hpp#RejectedSymlinkOrReparse
+refs: pr:306@82f4351 code:native/include/hengyuan/windows_native_io.hpp#open_directory code:native/include/hengyuan/compaction_lease.hpp#RejectedSymlinkOrReparse
 seg.code: PRESENT code:native/include/hengyuan/windows_native_io.hpp#open_directory code:native/include/hengyuan/compaction_lease.hpp#RejectedSymlinkOrReparse code:native/include/hengyuan/env_loader.hpp#FILE_ATTRIBUTE_REPARSE_POINT -- 原语层与租约层都拒绝重解析点
 seg.contract: PRESENT code:native/include/hengyuan/windows_native_io.hpp#RejectedReparsePoint -- 原语的返回值即合同；租约层把它映射为 RejectedSymlinkOrReparse
 seg.fault: PRESENT:UT test:native/tests/test_windows_native_io.cpp#RejectsDirectoryJunction test:native/tests/test_compaction_lease.cpp#AcquireRejectsALinkedCandidateDirectoryAndTouchesNothingBehindIt -- 真实 NTFS 目录联接：原语层断言 open_directory 返回 RejectedReparsePoint，租约层断言 acquire 返回 RejectedSymlinkOrReparse 且链接指向的目录里没有被创建任何文件；租约层用例在 POSIX 上用符号链接走同一断言；两个变异体被杀死
 seg.test: PRESENT test:native/tests/test_windows_native_io.cpp#RejectsDirectoryJunction test:native/tests/test_compaction_lease.cpp#AcquireRejectsALinkedCandidateDirectoryAndTouchesNothingBehindIt -- 原语层与租约层各有端到端的联接用例；创建链接失败是断言失败而不是跳过；控制面层没有单独的联接用例
-seg.runtime: MISSING -- native: windows-msvc 作业已加入 ci-native.yml（REM-0.1），且作业会拒绝被跳过的联接测试；待登记 native: windows-msvc 作业在主分支上的成功运行
+seg.runtime: PRESENT run:"45400328252@82f435174/ci-native.yml[native: windows-msvc]" -- 主分支合并提交上的 MSVC Release 构建（/W4 /WX /permissive-）与完整回归通过，其中两个联接用例各通过一次，且防跳过步骤确认它们没有被 GTEST_SKIP 放过。
 seg.budget: NA -- 测试覆盖项，不改变运行期路径
-closure: native: windows-msvc 作业在主分支上成功运行并登记运行记录
 ```
 
 ```ledger
@@ -557,8 +555,8 @@ refs: pr:110@5aa42428d pr:137@e75316caf pr:126@a6739fa1a pr:129@d401ed78e
 seg.code: MISSING code:.github/workflows/ci-native.yml#"windows-msvc" code:.github/workflows/ci-native-sanitizers.yml#"timeout-minutes: 90" -- 已新增 native: windows-msvc 作业（REM-0.1），但它不在 native: gate 的 needs 里，也不是必需检查（规则集归 Owner）；Sanitizer 通道仍只在每周一定时触发，不是每次提交
 seg.contract: PRESENT doc:docs/REQUIRED_CHECKS_RUNBOOK.md#gate bp:"任务 REM-0.1" -- 必需检查与 gate 汇总的契约见 runbook；REM-0.1 定义了覆盖矩阵
 seg.fault: NA -- 构建与 CI 配置缺陷，没有运行期故障路径；Sanitizer 作业内的两个负控另行证明检测有效
-seg.test: MISSING -- MSVC 构建测试作业已存在但尚无主分支上的成功运行；Sanitizer 不是每次提交触发
-seg.runtime: MISSING run:37586509738@e75316caf/ci-native.yml run:"37258555091@d401ed78e/ci-native-sanitizers.yml[ASan+UBSan: full suite]" -- 已有真实成功的 CI Native 与 Sanitizer run（见引用），但它们只覆盖 GCC-14 与周更；native: windows-msvc 尚无主分支上的成功运行
+seg.test: MISSING -- MSVC 构建测试作业已在主分支上成功运行（见 seg.runtime），但它不在 native: gate 内，也不是必需检查；Sanitizer 不是每次提交触发
+seg.runtime: MISSING run:37586509738@e75316caf/ci-native.yml run:"45400328252@82f435174/ci-native.yml[native: windows-msvc]" run:"37258555091@d401ed78e/ci-native-sanitizers.yml[ASan+UBSan: full suite]" -- 已有真实成功的 CI Native、Windows 与 Sanitizer run（见引用）：native: windows-msvc 已在主分支上成功运行，但它不在 gate 内；Sanitizer 通道只覆盖周更。
 seg.budget: PRESENT run:"37258555091@d401ed78e/ci-native-sanitizers.yml[ASan+UBSan: full suite]" -- 实测：ASan+UBSan 28.5 分钟（上限 90）、TSan 1.0 分钟（上限 25，只构建并发目标）、ARM64 1.4 分钟；每次提交触发的预算前提尚待评估
 closure: REM-0.1 新增 Windows 与 MSVC 必需作业，Sanitizer 在预算前提下改为每次提交触发
 ```
