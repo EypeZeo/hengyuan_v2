@@ -128,7 +128,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | fault, runtime, budget |
 | **P2-005** | MEDIUM | lib | CLOSED | 订单跟踪器 | CLEARED | — |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
-| **P2-007** | MEDIUM | build | PARTIAL | CI 增强 | BLOCKED | code, test |
+| **P2-007** | MEDIUM | build | PARTIAL | CI 增强 | BLOCKED | test, runtime |
 | **P2-008** | MEDIUM | lib | CLOSED | 平台安全测试 | CLEARED | — |
 | **P2-009** | MEDIUM | build | REMEDIATING | 全项目研发准入 | BLOCKED | code, test, runtime |
 | **P3-001** | LOW | lib | DEFERRED | 日志健壮性 | DEFERRED | code, contract, fault, test, runtime, budget |
@@ -509,15 +509,15 @@ gate: CI 增强
 gate_result: BLOCKED
 bkl: BKL-002
 trigger: 仓库转为公开或获得高级安全授权时激活——条件已满足（仓库 2026-09-30 公开，默认配置 CodeQL 2026-10-01 启用）；剩余 Python 综合覆盖率门禁
-open: absent:.github/workflows/ci-python.yml#--cov absent:py_core/requirements.txt#pytest-cov absent:py_core/pyproject.toml#pytest-cov
+open: open:docs/AUDIT_CLOSURE_LEDGER.md#"待登记 py_core: pytest 覆盖率门禁在主分支上的成功运行"
 refs: pr:132@826f7f36f pr:127@819844e19 pr:128@eb0250f19 pr:137@e75316caf
-seg.code: MISSING code:.github/workflows/ci-python.yml#"python -m pytest" -- 代码扫描部分已落地（默认配置 CodeQL，自带高级配置已于 PR #132 移除）；Python 通道没有覆盖率工具与门禁
-seg.contract: PRESENT doc:docs/REQUIRED_CHECKS_RUNBOOK.md#CodeQL -- 必需检查与 CodeQL 的契约见 runbook 与蓝图 2.2.3；覆盖率门禁的阈值合同尚未定义
+seg.code: PRESENT code:.github/workflows/ci-python.yml#"--cov" code:py_core/pyproject.toml#fail_under code:py_core/requirements.txt#pytest-cov -- 代码扫描部分已落地（默认配置 CodeQL，自带高级配置已于 PR #132 移除）；Python 通道现在测量分支覆盖率并在低于 fail_under 时失败
+seg.contract: PRESENT doc:docs/REQUIRED_CHECKS_RUNBOOK.md#CodeQL code:py_core/pyproject.toml#fail_under -- 必需检查与 CodeQL 的契约见 runbook 与蓝图 2.2.3；覆盖率阈值合同在 pyproject.toml 的 fail_under（Owner 于 2026-11-25 定为 90，口径：库代码，排除 tests/ 与 tools/）
 seg.fault: NA -- 构建与 CI 配置缺陷，没有运行期故障路径
-seg.test: MISSING -- 无覆盖率测量，谈不上覆盖率回归
-seg.runtime: PRESENT run:37618152776@68c393a07/ci-python.yml -- CI Python 在主干上真实运行并全绿；仅代表通道本身可用，不代表覆盖率门禁存在
-seg.budget: NA -- 覆盖率门禁尚未引入，没有可量化的成本
-closure: 引入覆盖率工具与阈值并列为必需检查
+seg.test: MISSING -- 覆盖率已测量，实测库代码 92.80%；fail_under 取 99 时本地运行必然失败的负向对照是手工做的，没有进 CI，配置被改动或 --cov 被移除时没有测试会报警
+seg.runtime: MISSING -- 待登记 py_core: pytest 覆盖率门禁在主分支上的成功运行；此前引用的 run 37618152776 早于门禁，只代表通道可用
+seg.budget: NA -- 覆盖率运行使测试步骤增加约 10 秒，不构成预算问题
+closure: 覆盖率门禁在主分支上成功运行并登记运行记录，且阈值与配置有回归保护
 ```
 
 ```ledger
