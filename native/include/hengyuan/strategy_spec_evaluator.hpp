@@ -54,6 +54,18 @@ inline std::uint32_t node_own_warmup(SpecOp op, std::int32_t param) noexcept {
         case SpecOp::CrossesAbove:
         case SpecOp::CrossesBelow:
             return 1;  // needs t AND t-1
+        case SpecOp::Add:
+        case SpecOp::Sub:
+        case SpecOp::Mul:
+        case SpecOp::Div:
+        case SpecOp::Gt:
+        case SpecOp::Lt:
+        case SpecOp::Ge:
+        case SpecOp::Le:
+        case SpecOp::And:
+        case SpecOp::Or:
+        case SpecOp::Not:
+        case SpecOp::IfThenElse:
         default:
             return 0;  // arithmetic/comparison/logical/if_then_else contribute none of their own
     }
@@ -68,6 +80,22 @@ inline bool is_window_class_op(SpecOp op) noexcept {
         case SpecOp::Roc:
         case SpecOp::Lag:
             return true;
+        case SpecOp::Add:
+        case SpecOp::Sub:
+        case SpecOp::Mul:
+        case SpecOp::Div:
+        case SpecOp::Gt:
+        case SpecOp::Lt:
+        case SpecOp::Ge:
+        case SpecOp::Le:
+        case SpecOp::And:
+        case SpecOp::Or:
+        case SpecOp::Not:
+        case SpecOp::IfThenElse:
+        case SpecOp::Ema:
+        case SpecOp::Rsi:
+        case SpecOp::CrossesAbove:
+        case SpecOp::CrossesBelow:
         default:
             return false;
     }

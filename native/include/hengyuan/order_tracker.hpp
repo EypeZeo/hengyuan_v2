@@ -467,6 +467,15 @@ inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
         return from == OrderState::Accepted || from == OrderState::PartialFill ||
                from == OrderState::CancelRequested;
     }
+// Enum exhaustiveness is off for this one switch on purpose: the default is `false` (an illegal edge), so a new OrderState
+// fails closed, and test_never_sent_guard.cpp pins that this live-path file does not name OrderState::NeverSent.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4061 4062)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+#endif
     switch (from) {
         case OrderState::Ambiguous:
             return is_legal_ambiguous_target(to);
@@ -492,6 +501,11 @@ inline bool is_legal_query_target(OrderState from, OrderState to) noexcept {
         default:
             return false;
     }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 // Never trust an injected QueryFn (mock today, network-backed later) to return

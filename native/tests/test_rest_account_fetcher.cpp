@@ -93,6 +93,15 @@ TEST(AccountFetchOutcomeOf, EveryErrorHasItsAnswer) {
             case PrivateRestError::ClockSkewTooLarge:
             case PrivateRestError::RateLimitExhausted:
             case PrivateRestError::CancelNotAuthorized: expected = AccountFetchOutcome::NotSent; break;
+            case PrivateRestError::Resolve:
+            case PrivateRestError::Connect:
+            case PrivateRestError::TlsHandshake:
+            case PrivateRestError::Write:
+            case PrivateRestError::Read:
+            case PrivateRestError::HttpStatus:
+            case PrivateRestError::JsonParse:
+            case PrivateRestError::MalformedResponse:
+            case PrivateRestError::CapacityExceeded:
             default: expected = AccountFetchOutcome::Failed; break;
         }
         EXPECT_EQ(account_fetch_outcome_of(e), expected) << static_cast<int>(e);

@@ -272,6 +272,12 @@ void print_env_load_error(EnvLoadStatus status) {
         case EnvLoadStatus::PermissionTooWide:
             std::fprintf(stderr, "ERROR: failed to load .env (PermissionTooWide). chmod 600 .env\n");
             break;
+        case EnvLoadStatus::Ok:
+        case EnvLoadStatus::IsSymlink:
+        case EnvLoadStatus::FileTooLarge:
+        case EnvLoadStatus::ReadError:
+        case EnvLoadStatus::ParseError:
+        case EnvLoadStatus::LockFailed:
         default:
             std::fprintf(stderr, "ERROR: failed to load .env (status=%d).\n", static_cast<int>(status));
             break;

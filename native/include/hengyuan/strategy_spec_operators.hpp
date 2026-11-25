@@ -273,6 +273,18 @@ inline double apply_binary(SpecOp op, double left, double right) noexcept {
         case SpecOp::Or:
             if (std::isnan(left) || std::isnan(right)) return kNaN;
             return (left != 0.0 || right != 0.0) ? 1.0 : 0.0;
+        case SpecOp::Not:
+        case SpecOp::IfThenElse:
+        case SpecOp::Sma:
+        case SpecOp::Ema:
+        case SpecOp::Stddev:
+        case SpecOp::RollingMax:
+        case SpecOp::RollingMin:
+        case SpecOp::Roc:
+        case SpecOp::Lag:
+        case SpecOp::Rsi:
+        case SpecOp::CrossesAbove:
+        case SpecOp::CrossesBelow:
         default:
             return kNaN;  // unreachable given the caller's own dispatch, defensive only
     }

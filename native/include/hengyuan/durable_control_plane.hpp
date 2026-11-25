@@ -1786,6 +1786,15 @@ constexpr bool is_seal_journal_embeddable_type(DurableRecordType t) noexcept {
         case DurableRecordType::FreezeWaitArm:
         case DurableRecordType::FreezeWaitSatisfied:
             return true;
+        case DurableRecordType::GenerationBridge:
+        case DurableRecordType::OperatorOverride:
+        case DurableRecordType::SealJournalApplied:
+        case DurableRecordType::CompactedFreezeWaitEvidence:
+        case DurableRecordType::RateLimitFreezeSnapshot:
+        case DurableRecordType::RateLimitUsageSnapshot:
+        case DurableRecordType::SymbolRegistrySnapshot:
+        case DurableRecordType::EndpointWeightConfigSet:
+        case DurableRecordType::TransportFailover:
         default:
             return false;
     }
