@@ -110,7 +110,7 @@ jobs:
       # -q, not -v: a green run should be one line. Failures print in full either way.
       - name: Run tests
         working-directory: py_core
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q --cov
 
       # Promoted from advisory (continue-on-error) to a hard gate once the
       # pre-existing 70-finding backlog this comment used to describe was fully

@@ -12,6 +12,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
   "pytest>=8.3,<10.0",
+  "pytest-cov>=7.1,<8.0",
 ]
 
 [tool.setuptools]
@@ -34,3 +35,20 @@ testpaths = ["tests"]
 # that ad-hoc flag to a permanent config closes the gate so a *future* regression that
 # introduces a swallowed warning fails loudly instead of passing silently.
 filterwarnings = ["error::RuntimeWarning"]
+
+# Coverage gate (audit P2-007). `python -m pytest tests/ -q --cov` in ci-python.yml measures branch coverage of every
+# library module under this directory and fails below `fail_under`. Excluded: the tests themselves, and tools/ -- the
+# experiment and calibration scripts, four of which (compare_plan04*, generate_strategy_spec_fixture) no test imports at
+# all. Measured on 2026-11-25: 93% with tools/ left out (5116 statements, 1498 branches), 87% with it in, so a threshold of
+# 90 is 3 points under the library figure. `source = ["."]` is deliberate: it counts a library module that no test imports
+# as 0% instead of leaving it out, which would hide exactly the gap this gate is for. Raise `fail_under` when the number
+# rises; do not lower it to make a red run green.
+[tool.coverage.run]
+branch = true
+source = ["."]
+omit = ["tests/*", "tools/*", ".venv/*", "*.egg-info/*"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = false
+skip_covered = true
