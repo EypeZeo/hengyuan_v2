@@ -128,7 +128,7 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | **P2-004** | MEDIUM | live | REMEDIATING | 实盘发单风控 | BLOCKED | fault, runtime, budget |
 | **P2-005** | MEDIUM | lib | CLOSED | 订单跟踪器 | CLEARED | — |
 | **P2-006** | MEDIUM | lib | DEFERRED | 鲁棒性优化 | DEFERRED | code, contract, fault, test, runtime, budget |
-| **P2-007** | MEDIUM | build | PARTIAL | CI 增强 | BLOCKED | test, runtime |
+| **P2-007** | MEDIUM | build | CLOSED | CI 增强 | CLEARED | — |
 | **P2-008** | MEDIUM | lib | CLOSED | 平台安全测试 | CLEARED | — |
 | **P2-009** | MEDIUM | build | REMEDIATING | 全项目研发准入 | BLOCKED | code, test, runtime |
 | **P3-001** | LOW | lib | DEFERRED | 日志健壮性 | DEFERRED | code, contract, fault, test, runtime, budget |
@@ -156,14 +156,14 @@ Code 与 Contract 两段永不可 `NA`。仓库至今没有任何真实或测试
 | 实盘发单风控 | BLOCKED | P2-004 |
 | 订单跟踪器 | CLEARED | — |
 | 鲁棒性优化 | DEFERRED | P2-006 |
-| CI 增强 | BLOCKED | P2-007 |
+| CI 增强 | CLEARED | — |
 | 平台安全测试 | CLEARED | — |
 | 全项目研发准入 | BLOCKED | P2-009 |
 | 日志健壮性 | DEFERRED | P3-001 |
 | 供应链安全 | DEFERRED | P3-002 |
 | 无（蓝图 4.3 不登记阻塞门禁） | CLEARED | — |
 
-状态计数：REMEDIATING 3，DEFERRED 3，PARTIAL 3，CLOSED 17，合计 26。
+状态计数：REMEDIATING 3，DEFERRED 3，PARTIAL 2，CLOSED 18，合计 26。
 
 | 故障用例 | 门禁标签 | 级别 | 实装状态 | 结果 | 门禁结果 | 基线 |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -504,20 +504,18 @@ legacy: P2-007
 title: 代码扫描曾被短路空绿；Python 通道缺综合覆盖率门禁
 severity: MEDIUM
 kind: build
-status: PARTIAL
+status: CLOSED
 gate: CI 增强
-gate_result: BLOCKED
+gate_result: CLEARED
 bkl: BKL-002
 trigger: 仓库转为公开或获得高级安全授权时激活——条件已满足（仓库 2026-09-30 公开，默认配置 CodeQL 2026-10-01 启用）；剩余 Python 综合覆盖率门禁
-open: open:docs/AUDIT_CLOSURE_LEDGER.md#"待登记 py_core: pytest 覆盖率门禁在主分支上的成功运行"
-refs: pr:132@826f7f36f pr:127@819844e19 pr:128@eb0250f19 pr:137@e75316caf
+refs: pr:310@015d17c pr:132@826f7f36f pr:127@819844e19 pr:128@eb0250f19 pr:137@e75316caf
 seg.code: PRESENT code:.github/workflows/ci-python.yml#"--cov" code:py_core/pyproject.toml#fail_under code:py_core/requirements.txt#pytest-cov -- 代码扫描部分已落地（默认配置 CodeQL，自带高级配置已于 PR #132 移除）；Python 通道现在测量分支覆盖率并在低于 fail_under 时失败
 seg.contract: PRESENT doc:docs/REQUIRED_CHECKS_RUNBOOK.md#CodeQL code:py_core/pyproject.toml#fail_under -- 必需检查与 CodeQL 的契约见 runbook 与蓝图 2.2.3；覆盖率阈值合同在 pyproject.toml 的 fail_under（Owner 于 2026-11-25 定为 90，口径：库代码，排除 tests/ 与 tools/）
 seg.fault: NA -- 构建与 CI 配置缺陷，没有运行期故障路径
-seg.test: MISSING -- 覆盖率已测量，实测库代码 92.80%；fail_under 取 99 时本地运行必然失败的负向对照是手工做的，没有进 CI，配置被改动或 --cov 被移除时没有测试会报警
-seg.runtime: MISSING -- 待登记 py_core: pytest 覆盖率门禁在主分支上的成功运行；此前引用的 run 37618152776 早于门禁，只代表通道可用
+seg.test: PRESENT test:py_core/tests/test_coverage_gate_config.py#test_fail_under_is_not_below_the_floor_the_owner_set test:py_core/tests/test_coverage_gate_config.py#test_ci_python_workflow_runs_pytest_with_cov -- 配置回归保护：fail_under 不得低于 90、--cov 必须在 CI 命令里且不得被 --cov-fail-under 或 --no-cov 覆盖、分支覆盖与 source 保持整个目录、omit 只能是 tests/tools/环境目录、coverage 与 pytest-cov 在锁文件里带哈希；六种破坏（降阈值、去 --cov、命令行覆盖阈值、扩大 omit、收窄 source、删 pin）都被抓到
+seg.runtime: PRESENT run:"45615056999@015d17c08/ci-python.yml[py_core: pytest]" -- 主分支合并提交上的 py_core: pytest 带覆盖率门禁通过：Required test coverage of 90.0% reached，总覆盖率 92.79%（库代码，排除 tests/ 与 tools/）。
 seg.budget: NA -- 覆盖率运行使测试步骤增加约 10 秒，不构成预算问题
-closure: 覆盖率门禁在主分支上成功运行并登记运行记录，且阈值与配置有回归保护
 ```
 
 ```ledger
