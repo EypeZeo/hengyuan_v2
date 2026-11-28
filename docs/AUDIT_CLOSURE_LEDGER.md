@@ -548,13 +548,13 @@ status: REMEDIATING
 task: REM-0.1
 gate: 全项目研发准入
 gate_result: BLOCKED
-open: open:.github/workflows/ci-native.yml#"needs: [changes, native-build-test]" open:.github/workflows/ci-native-sanitizers.yml#"- cron: '0 3 * * 1'"
+open: open:.github/workflows/ci-native.yml#"needs: [changes, native-build-test]"
 refs: pr:110@5aa42428d pr:137@e75316caf pr:126@a6739fa1a pr:129@d401ed78e
-seg.code: MISSING code:.github/workflows/ci-native.yml#"windows-msvc" code:.github/workflows/ci-native-sanitizers.yml#"timeout-minutes: 90" -- 已新增 native: windows-msvc 作业（REM-0.1），但它不在 native: gate 的 needs 里，也不是必需检查（规则集归 Owner）；Sanitizer 通道仍只在每周一定时触发，不是每次提交
+seg.code: MISSING code:.github/workflows/ci-native.yml#"windows-msvc" code:.github/workflows/ci-native-sanitizers.yml#"branches: [master]" -- 已新增 native: windows-msvc 作业（REM-0.1），它不在 native: gate 的 needs 里，也不是必需检查：Owner 于 2026-11-28 认为每个 PR 都等它会让等待翻倍，改为关键节点再确认；Sanitizer 通道现在在合入 master 且改动 native/** 之后自动触发，不在 PR 上、不是必需检查
 seg.contract: PRESENT doc:docs/REQUIRED_CHECKS_RUNBOOK.md#gate bp:"任务 REM-0.1" -- 必需检查与 gate 汇总的契约见 runbook；REM-0.1 定义了覆盖矩阵
 seg.fault: NA -- 构建与 CI 配置缺陷，没有运行期故障路径；Sanitizer 作业内的两个负控另行证明检测有效
 seg.test: MISSING -- MSVC 构建测试作业已在主分支上成功运行（见 seg.runtime），但它不在 native: gate 内，也不是必需检查；Sanitizer 不是每次提交触发
-seg.runtime: MISSING run:37586509738@e75316caf/ci-native.yml run:"45400328252@82f435174/ci-native.yml[native: windows-msvc]" run:"37258555091@d401ed78e/ci-native-sanitizers.yml[ASan+UBSan: full suite]" -- 已有真实成功的 CI Native、Windows 与 Sanitizer run（见引用）：native: windows-msvc 已在主分支上成功运行，但它不在 gate 内；Sanitizer 通道只覆盖周更。
+seg.runtime: MISSING run:37586509738@e75316caf/ci-native.yml run:"45400328252@82f435174/ci-native.yml[native: windows-msvc]" run:"37258555091@d401ed78e/ci-native-sanitizers.yml[ASan+UBSan: full suite]" -- 已有真实成功的 CI Native、Windows 与 Sanitizer run（见引用）；Sanitizer 合入后触发的第一次主干运行尚待登记
 seg.budget: PRESENT run:"37258555091@d401ed78e/ci-native-sanitizers.yml[ASan+UBSan: full suite]" -- 实测：ASan+UBSan 28.5 分钟（上限 90）、TSan 1.0 分钟（上限 25，只构建并发目标）、ARM64 1.4 分钟；每次提交触发的预算前提尚待评估
 closure: REM-0.1 新增 Windows 与 MSVC 必需作业，Sanitizer 在预算前提下改为每次提交触发
 ```
