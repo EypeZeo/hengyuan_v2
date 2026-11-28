@@ -41,7 +41,7 @@
 | `Analyze (actions)`、`Analyze (c-cpp)`、`Analyze (javascript-typescript)`、`Analyze (python)` | GitHub Actions（15368），CodeQL 默认配置，每个 PR 都有 |
 | `CodeQL` | GitHub Advanced Security（57789），代码扫描结果 |
 
-不要把 `changes` job 设为必需：它的失败会让对应的 gate 失败，已经被覆盖。`CI Native Sanitizers` 只在每周定时与手动派发时运行，不在 PR 上，不能设为必需。
+不要把 `changes` job 设为必需：它的失败会让对应的 gate 失败，已经被覆盖。`CI Native Sanitizers` 在合入 master 且改动 `native/**` 之后自动运行（Owner 2026-11-28 决定），另有每周定时与手动派发；它不在 PR 上，不能设为必需，所以 PR 合并不等它。动并发或内存生命周期的改动，合并前仍手动派发一次。
 
 `CodeQL`（代码扫描结果）检查在 `Analyze (…)` 还在运行时先显示 neutral，四个 Analyze 全部完成后才变 success（#139、#140 实测）。受保护分支文档写明必需检查把 success、skipped、neutral 都算通过，所以真正等待分析完成的是四个 `Analyze (…)`；两类都要设为必需。
 

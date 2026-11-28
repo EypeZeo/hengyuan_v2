@@ -18,14 +18,22 @@ name: CI Native Sanitizers
 #                  payload checksums in test_spsc_concurrency.cpp observe it
 #                  with no tooling involved.
 #
-# Weekly rather than nightly: ci-native.yml's own comment flags the private-repo
-# 2000 min/month Actions budget as a real constraint. Nightly full-ASan would
-# spend roughly a third of it on findings that are rarely time-critical.
+# WHEN IT RUNS. After a merge, not before it: a push to master that touches native/** (or this file) starts it, so a
+# sanitizer finding surfaces about an hour after the change landed instead of up to a week later. It is NOT a pull
+# request check and not a required one: a full ASan+UBSan run is roughly an hour and would double every native PR's
+# wait. A change that touches concurrency or memory lifetime is still run by hand (workflow_dispatch) before the
+# merge. The weekly schedule stays as the backstop for pushes the path filter does not see (a dependency moving
+# under a pinned toolchain, for one). The repository is public, so runner minutes are not billed; the old
+# private-repo 2000 min/month note in ci-native.yml predates that. Concurrent runs queue (cancel-in-progress is
+# false), and GitHub keeps only the newest queued one, so a burst of merges costs one extra run, not one each.
 
 permissions:
   contents: read
 
 on:
+  push:
+    branches: [master]
+    paths: ['native/**', '.github/workflows/ci-native-sanitizers.yml']
   schedule:
     - cron: '0 3 * * 1'   # Mondays 03:00 UTC
   workflow_dispatch:
